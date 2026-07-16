@@ -1003,13 +1003,10 @@ class SessionBridgeCoordinator:
                         )
                         worktree_snapshot: WorktreeSnapshot | None = None
                         if snapshot_aware:
-                            indexed_git_metadata = any(
-                                value is not None
-                                for value in (
-                                    candidate.git_root,
-                                    candidate.git_branch,
-                                    candidate.git_head,
-                                )
+                            indexed_git_metadata = (
+                                candidate.git_root is not None
+                                or candidate.git_head is not None
+                                or candidate.git_branch not in (None, "HEAD")
                             )
                             worktree_snapshot = await asyncio.to_thread(
                                 capture_worktree_snapshot,

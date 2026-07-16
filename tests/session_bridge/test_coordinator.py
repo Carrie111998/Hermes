@@ -3514,6 +3514,48 @@ async def test_sidebar_registration_accepts_plain_source_without_indexed_git_met
     assert snapshot.git_root is None
 
 
+@pytest.mark.asyncio
+async def test_sidebar_registration_accepts_head_sentinel_without_git_identity(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    source = tmp_path / "plain-head-source"
+    source.mkdir()
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="plain-head-hermes",
+        content="Continue this non Git directory session",
+        last_active=now,
+        cwd=str(source),
+    )
+
+    def set_head_sentinel(conn: Any) -> None:
+        conn.execute(
+            "UPDATE sessions SET git_branch = 'HEAD', git_repo_root = NULL "
+            "WHERE id = ?",
+            ("plain-head-hermes",),
+        )
+
+    sidebar_db._execute_write(set_head_sentinel)
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(now=now, limit=1)
+
+    assert summary.queued == 1
+    assert summary.failed == 0
+    snapshot = store.get_worktree_snapshot("plain-head-hermes")
+    assert snapshot is not None
+    assert snapshot.git_root is None
+
+
 class _SidebarScanStore(_RecordingStore):
     def __init__(self) -> None:
         super().__init__()
