@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from nostr_sdk import Kind, Keys, Message, Filter, Tag, EventBuilder, Client, NostrSigner
 
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult, Platform
+from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
 
@@ -152,21 +153,18 @@ class NostrAdapter(BasePlatformAdapter):
     async def _handle_incoming_message(self, sender_pubkey: str, content: str, event_id: str, timestamp: int):
         """Handle an incoming message and dispatch to the gateway."""
         try:
-            # Convert timestamp to datetime
             dt = datetime.fromtimestamp(timestamp)
-
-            # Create a message event
-            event = MessageEvent(
+            source = SessionSource(
                 platform=Platform.NOSTR,
-                channel_id=sender_pubkey,  # Use sender's pubkey as channel ID for DMs
-                thread_id=None,  # Nostr doesn't have threads in the same way; we could use event ID?
+                chat_id=sender_pubkey,
                 user_id=sender_pubkey,
-                user_name=sender_pubkey[:8] + "...",  # Shortened pubkey for display
-                message_type=MessageType.TEXT,
-                text_content=content,
-                timestamp=dt
+                user_name=sender_pubkey[:8] + "...",
             )
-            # Dispatch to the gateway via self.handle_message(event)
+            event = MessageEvent(
+                source=source,
+                text=content,
+                timestamp=dt,
+            )
             await self.handle_message(event)
         except Exception as e:
             logger.exception(f"Error handling incoming Nostr message: {e}")
@@ -180,30 +178,22 @@ class NostrAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a text message via Nostr."""
         if not self.client or not self.keys:
-            return SendResult.error("Not connected to Nostr relays")
+            return SendResult(success=False, error="Not connected to Nostr relays")
 
         try:
-            # Determine if we are sending an encrypted direct message (kind 4) or a plain note (kind 1)
-            # We'll treat the chat_id as the recipient's pubkey (in hex)
             recipient_pubkey = chat_id
 
-            # Encrypt the message for the recipient
             ciphertext = self.keys.encrypt(recipient_pubkey, content)
-            # Create the event
             event_builder = EventBuilder(Kind.EncryptedDirectMessage, ciphertext)
-            # Add the recipient's pubkey as a 'p' tag
             event_builder.tag(Tag.pubkey(recipient_pubkey))
-            # Sign and send the event
             signed_event = event_builder.sign_with_keys(self.keys)
             await self.client.send_event(signed_event)
 
-            # Wait for the event to be stored? We'll consider it sent when the client accepts it.
-            # The client's send_event returns when the event has been published to at least one relay.
-            return SendResult.success(message_id=signed_event.id().to_hex())
+            return SendResult(success=True, message_id=signed_event.id().to_hex())
 
         except Exception as e:
             logger.exception(f"Failed to send Nostr message: {e}")
-            return SendResult.error(f"Failed to send message: {str(e)}")
+            return SendResult(success=False, error=f"Failed to send message: {str(e)}")
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send a typing indicator. Nostr doesn't have a native typing indicator, so we skip."""
