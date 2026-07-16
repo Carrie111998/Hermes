@@ -420,6 +420,9 @@ class CodexSourceAdapter:
         if wanted is None:
             return None
         self._ensure_initialized()
+        cached = self._inventory_cache.get(wanted)
+        if cached is not None:
+            return cached
         active, used = self._bounded_sidebar_inventory_kind(
             archived=False,
             deadline=deadline,

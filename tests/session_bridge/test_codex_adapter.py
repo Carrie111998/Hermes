@@ -99,6 +99,42 @@ def _read_with_items(*items: dict[str, Any]) -> dict[str, Any]:
 
 
 class TestInventory:
+    def test_find_sidebar_thread_reuses_scanner_cache_without_relisting(self) -> None:
+        client = FakeInitializingClient({
+            "thread/list": [
+                {
+                    "data": [
+                        {
+                            "id": "thread-cached",
+                            "title": "Cached registration",
+                            "cwd": "C:/work/cached",
+                            "createdAt": 1783850400,
+                            "updatedAt": 1783850700,
+                            "archived": False,
+                            "revision": "cached-revision",
+                        }
+                    ]
+                }
+            ]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+        assert [
+            summary.native_id
+            for summary in adapter.list_full_inventory(archived=False)
+        ] == ["thread-cached"]
+        client.calls.clear()
+
+        found = adapter.find_sidebar_thread(
+            "thread-cached",
+            deadline=None,
+            page_cap=1,
+        )
+
+        assert found is not None
+        assert found.native_id == "thread-cached"
+        assert found.revision == "cached-revision"
+        assert client.calls == []
+
     def test_initializes_lazily_once_and_pages_aliases(self) -> None:
         pages = _fixture("thread-list-pages.json")
         client = FakeInitializingClient({"thread/list": pages["active"]})
