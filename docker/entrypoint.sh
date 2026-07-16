@@ -368,7 +368,7 @@ fi
 # ephemeral; /opt/data persists). Shared across profiles — same API key.
 export CLAUDE_CONFIG_DIR="$HERMES_HOME/claude-code"
 mkdir -p "$CLAUDE_CONFIG_DIR"
-echo "[entrypoint] Claude Code: CLAUDE_CONFIG_DIR → $CLAUDE_CONFIG_DIR (ANTHROPIC_API_KEY ${ANTHROPIC_API_KEY:+set}${ANTHROPIC_API_KEY:-MISSING})"
+echo "[entrypoint] Claude Code: CLAUDE_CONFIG_DIR → $CLAUDE_CONFIG_DIR (ANTHROPIC_API_KEY $([ -n "$ANTHROPIC_API_KEY" ] && echo set || echo MISSING))"
 
 # Debug: verify Google OAuth files exist
 echo "[entrypoint] google_token.json: $([ -f "$HERMES_HOME/google_token.json" ] && echo "EXISTS ($(wc -c < "$HERMES_HOME/google_token.json") bytes)" || echo "MISSING")"
