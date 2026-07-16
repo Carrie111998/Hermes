@@ -544,6 +544,75 @@ Each provider's data is isolated per [profile](/user-guide/profiles):
 - **Cloud providers** (RetainDB) auto-derive profile-scoped project names
 - **Env var providers** (OpenViking) are configured via each profile's `.env` file
 
+## Seeding & Dreams
+
+You don't have to start an agent cold. The **memstore seeding** workflow
+bootstraps memory with knowledge *before* the first conversation, and an
+offline **dream** pass consolidates what the agent already knows.
+
+The store of record is a **canonical markdown file tree** — plain files any
+agent framework can read, which is what makes the design provider-agnostic.
+Whatever external provider is active is mirrored as a bonus.
+
+### The canonical file tree
+
+Written under `HERMES_HOME` (profile-scoped):
+
+```
+SOUL.md                agent identity prose (read at boot)
+memories/
+  IDENTITY.md          structured agent persona
+  USER.md              the user profile
+  AGENTS.md            operating instructions (memstore-scoped)
+  TOOLS.md             tools & environment
+  MEMORY.md            rolled-up notes + synthesised insights
+  daily/2026-07-16.md  one digest per day — the base layer of the tree
+```
+
+Facts live inside `<!-- hermes:seed:begin … -->` managed blocks, so re-seeding
+merges (de-duplicating bullets) and never clobbers hand-written content.
+
+### Seed from persona docs and transcripts
+
+```bash
+# Preview the extraction (no writes):
+hermes memory seed --persona about-me.md --transcript last-session.json --dry-run
+
+# Seed the file tree (+ per-day digests, + provider mirror):
+hermes memory seed --persona about-me.md --transcript last-session.json
+
+# File tree only, no external provider:
+hermes memory seed --persona about-me.md --no-mirror
+```
+
+- **Persona docs** — a markdown "about the user / project / agent" file.
+  Headings route to files: *About the User* → USER.md, *About the Agent* →
+  IDENTITY.md + SOUL.md, *Project* → AGENTS.md, *Tools* → TOOLS.md.
+- **Transcripts** — prior conversation JSON/JSONL, split into
+  `memories/daily/*.md` by message timestamp and mined for preferences
+  (`I always …`), identity (`my name is …`), decisions (`we decided …`), and
+  explicit `remember that …` cues.
+
+### Dreams: two-layer consolidation
+
+The base layer is the per-day digests; the higher layer is the roll-up. A dream
+de-duplicates near-identical facts, flags contradictions about the same entity
+(demoting the weaker fact), optionally decays/prunes low-trust facts, and
+synthesises higher-level `insight` facts — then folds the result into MEMORY.md
+and USER.md.
+
+```bash
+hermes memory dream                 # roll up all daily digests
+hermes memory dream --days 7        # only the last 7 days
+
+# Or consolidate a standalone JSONL corpus:
+hermes memory dream --corpus corpus.jsonl --min-trust 0.3 --export refined.jsonl
+```
+
+See [`docs/memstore-seed/`](https://github.com/hermes-ai/hermes-agent/tree/main/docs/memstore-seed)
+for runnable sample inputs, and `agent.memstore_files` /
+`agent.memstore_seeding` for the programmatic API.
+
 ## Building a Memory Provider
 
 See the [Developer Guide: Memory Provider Plugins](/developer-guide/memory-provider-plugin) for how to create your own.

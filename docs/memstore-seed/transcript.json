@@ -1,0 +1,16 @@
+{
+  "messages": [
+    { "role": "user", "content": "Hey, quick thing before we start.", "timestamp": "2026-07-15T09:01:00Z" },
+    { "role": "assistant", "content": "Sure, what's up?", "timestamp": "2026-07-15T09:01:05Z" },
+    { "role": "user", "content": "Remember that I deploy on Fridays only after 2pm, never before.", "timestamp": "2026-07-15T09:02:00Z" },
+    { "role": "assistant", "content": "Got it, I'll keep that in mind.", "timestamp": "2026-07-15T09:02:10Z" },
+    { "role": "user", "content": "My name is Ade and I prefer dark-mode dashboards.", "timestamp": "2026-07-15T09:03:00Z" },
+    { "role": "assistant", "content": "Noted.", "timestamp": "2026-07-15T09:03:05Z" },
+    { "role": "user", "content": "We decided to use PostgreSQL for the new service, not MySQL.", "timestamp": "2026-07-16T11:20:00Z" },
+    { "role": "assistant", "content": "Makes sense.", "timestamp": "2026-07-16T11:20:08Z" },
+    { "role": "user", "content": "I always run the test suite with pytest -x before pushing.", "timestamp": "2026-07-16T11:22:00Z" },
+    { "role": "assistant", "content": "Understood.", "timestamp": "2026-07-16T11:22:05Z" },
+    { "role": "user", "content": "thanks", "timestamp": "2026-07-16T11:23:00Z" },
+    { "role": "user", "content": "Oh and for future reference, the on-call rotation lives in PagerDuty.", "timestamp": "2026-07-16T11:24:00Z" }
+  ]
+}

@@ -12785,6 +12785,94 @@ Examples:
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+
+    _seed_parser = memory_sub.add_parser(
+        "seed",
+        help="Seed the canonical markdown memstore from persona docs and transcripts",
+        description=(
+            "Bootstrap the canonical markdown memory tree (USER.md, AGENTS.md,\n"
+            "IDENTITY.md, …) — the provider-agnostic store of record — with\n"
+            "knowledge before the first conversation. Transcripts are also\n"
+            "split into per-day digests under memories/daily/.\n\n"
+            "By default facts are consolidated by a 'dream' pass (dedupe,\n"
+            "contradiction check, insight synthesis) and mirrored into the\n"
+            "active external provider. Use --no-dream / --no-mirror / --no-daily\n"
+            "to turn those off."
+        ),
+    )
+    _seed_parser.add_argument(
+        "--persona", action="append", metavar="FILE",
+        help="Markdown 'about the user/project/agent' doc (repeatable)",
+    )
+    _seed_parser.add_argument(
+        "--transcript", action="append", metavar="FILE",
+        help="Conversation transcript JSON/JSONL to mine for facts (repeatable)",
+    )
+    _seed_parser.add_argument(
+        "--home", metavar="DIR",
+        help="Memstore root (default: HERMES_HOME)",
+    )
+    _seed_parser.add_argument(
+        "--date", metavar="YYYY-MM-DD",
+        help="Fallback date for undated transcript messages (default: today)",
+    )
+    _seed_parser.add_argument(
+        "--no-dream", action="store_true",
+        help="Skip the consolidation pass; seed the raw extracted facts",
+    )
+    _seed_parser.add_argument(
+        "--no-daily", action="store_true",
+        help="Skip writing per-day digest files",
+    )
+    _seed_parser.add_argument(
+        "--no-mirror", action="store_true",
+        help="Write only the file tree; don't mirror to the external provider",
+    )
+    _seed_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be written without writing anything",
+    )
+
+    _dream_parser = memory_sub.add_parser(
+        "dream",
+        help="Roll up the daily memory tree (dedupe, de-conflict, synthesise)",
+        description=(
+            "Run an offline 'dream' consolidation. By default it reads recent\n"
+            "memories/daily/*.md digests, merges near-duplicates, flags\n"
+            "contradictions, decays/prunes stale facts, synthesises higher-level\n"
+            "insights, and folds the result into MEMORY.md / USER.md.\n\n"
+            "With --corpus FILE it consolidates a standalone JSONL corpus\n"
+            "instead, writing to the canonical files or re-exporting (--export)."
+        ),
+    )
+    _dream_parser.add_argument(
+        "--days", type=int, default=None,
+        help="Only roll up the most recent N daily digests (default: all)",
+    )
+    _dream_parser.add_argument(
+        "--home", metavar="DIR",
+        help="Memstore root (default: HERMES_HOME)",
+    )
+    _dream_parser.add_argument(
+        "--corpus", metavar="FILE",
+        help="Consolidate a standalone JSONL corpus instead of the daily tree",
+    )
+    _dream_parser.add_argument(
+        "--export", metavar="FILE",
+        help="With --corpus: write the refined corpus to FILE instead of the files",
+    )
+    _dream_parser.add_argument(
+        "--min-trust", type=float, default=0.25, dest="min_trust",
+        help="Prune facts whose trust falls below this (default: 0.25)",
+    )
+    _dream_parser.add_argument(
+        "--decay", type=float, default=1.0,
+        help="Multiply every fact's trust by this factor (default: 1.0 = none)",
+    )
+    _dream_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --corpus: consolidate and report without writing",
+    )
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",
