@@ -8,6 +8,7 @@ import {
   db, id, log, emit, startRun, cancelRun, startLeadScanRun, generateLeadsForCountry,
 } from './db.js';
 import { COUNTRY_NAMES } from './seed.js';
+import { DEFAULT_RESEARCH_CONFIG } from '../research-state.js';
 
 const ok = (extra = {}) => ({ ok: true, ...extra });
 const listOf = (items) => ({ items, total: items.length });
@@ -52,6 +53,247 @@ function generateEmail({ lead, contact, product, language = 'en' }) {
 function ccEmailsForRule(ruleId) {
   const rule = db.ccRules.find(r => r.id === ruleId) || db.ccRules.find(r => r.is_default);
   return rule ? rule.cc_emails.slice() : [];
+}
+
+/* ============================================================
+   Lead research (evidence-first campaigns) — mock backing.
+   Reproduces server/routes/research_campaigns.py response shapes so
+   mock and real modes stay contract-identical. Runtime artifacts live
+   in db.researchRuntime / db.researchClaims / db.dataSourceCatalog and
+   are lazily seeded (and re-seeded after each reset) by ensureResearch().
+   ============================================================ */
+
+const RESEARCH_SECTORS = [
+  { sector_id: 'household-appliances', name: 'Household appliances' },
+  { sector_id: 'kitchen-furniture', name: 'Kitchen furniture & fit-out' },
+  { sector_id: 'hospitality-equipment', name: 'Hospitality & catering equipment' },
+  { sector_id: 'consumer-electronics', name: 'Consumer electronics' },
+  { sector_id: 'building-materials', name: 'Building materials' },
+  { sector_id: 'lighting-fixtures', name: 'Lighting & fixtures' },
+  { sector_id: 'sanitaryware', name: 'Sanitaryware & bathroom' },
+  { sector_id: 'home-textiles', name: 'Home textiles' },
+];
+
+const RESEARCH_MODEL_PROFILES = [
+  { id: 'hermes-local-balanced', name: 'Hermes local (balanced)', local: true, available: true },
+];
+
+const DEFAULT_SCORING_PROFILE = {
+  profile_id: 'default-high-precision', name: 'High precision',
+  weights: {
+    product_sector_fit: 25, buyer_channel_fit: 20, buying_intent: 15,
+    market_coverage: 15, commercial_scale: 10, trade_activity: 10, contactability: 5,
+  },
+  bands: {
+    A: { min_fit: 80, min_confidence: 0.72 },
+    B: { min_fit: 60, min_confidence: 0.45 },
+    C: { min_fit: 35, min_confidence: 0.2 },
+  },
+};
+
+const ISO = () => new Date().toISOString();
+
+// Base provider catalog. `available` is derived on read (computeAvailable),
+// never stored, so install/enable/disable toggles recompute consistently.
+const RESEARCH_CATALOG_BASE = [
+  { source_id: 'fixture-directory', version: '1.0.0', display_name: 'Verified buyer directory', publisher: 'interfaze reference data', jurisdiction: ['Global'], categories: ['registry'], homepage: 'https://reference.example.test', access_tier: 'public', entity_levels: ['named_company'], capabilities: ['identity', 'contactability'], countries: ['DE', 'AT', 'NL', 'GB'], sector_ids: ['household-appliances', 'kitchen-furniture'], freshness_days: 30, adapter_mode: 'live', default_enabled: true, health: 'active', last_verified_at: ISO(), license_note: null, installed: true, enabled: true, unavailable_reason: null, last_checked_at: ISO() },
+  { source_id: 'eurostat-comext', version: '2.1.0', display_name: 'Eurostat COMEXT', publisher: 'Eurostat', jurisdiction: ['EU'], categories: ['trade'], homepage: 'https://ec.europa.eu/eurostat', access_tier: 'public', entity_levels: ['market'], capabilities: ['trade_activity'], countries: ['DE', 'AT', 'FR', 'NL'], sector_ids: ['household-appliances'], freshness_days: 90, adapter_mode: 'live', default_enabled: true, health: 'active', last_verified_at: ISO(), license_note: null, installed: true, enabled: true, unavailable_reason: null, last_checked_at: ISO() },
+  { source_id: 'ted-eu', version: '1.4.0', display_name: 'TED EU tenders', publisher: 'Publications Office of the EU', jurisdiction: ['EU'], categories: ['procurement'], homepage: 'https://ted.europa.eu', access_tier: 'public', entity_levels: ['opportunity'], capabilities: ['buying_intent'], countries: ['DE', 'AT', 'FR'], sector_ids: ['household-appliances', 'hospitality-equipment'], freshness_days: 7, adapter_mode: 'live', default_enabled: true, health: 'active', last_verified_at: ISO(), license_note: null, installed: true, enabled: true, unavailable_reason: null, last_checked_at: ISO() },
+  { source_id: 'auma', version: '0.9.0', display_name: 'AUMA exhibitor lists', publisher: 'AUMA', jurisdiction: ['DE'], categories: ['exhibition'], homepage: 'https://auma.de', access_tier: 'public', entity_levels: ['event', 'named_company'], capabilities: ['identity', 'buying_intent'], countries: ['DE'], sector_ids: ['household-appliances', 'kitchen-furniture'], freshness_days: 60, adapter_mode: 'snapshot', default_enabled: true, health: 'degraded', last_verified_at: ISO(), license_note: null, installed: true, enabled: true, unavailable_reason: null, last_checked_at: ISO() },
+  { source_id: 'companies-house', version: '3.0.0', display_name: 'UK Companies House', publisher: 'Companies House', jurisdiction: ['GB'], categories: ['registry'], homepage: 'https://find-and-update.company-information.service.gov.uk', access_tier: 'credentialed_public', entity_levels: ['named_company'], capabilities: ['identity'], countries: ['GB'], sector_ids: [], freshness_days: 14, adapter_mode: 'live', default_enabled: false, health: 'active', last_verified_at: ISO(), license_note: null, installed: false, enabled: false, unavailable_reason: 'credential_required', last_checked_at: ISO() },
+  { source_id: 'b2match-export', version: '1.1.0', display_name: 'B2Match hosted buyers', publisher: 'B2Match', jurisdiction: ['Global'], categories: ['matchmaking'], homepage: 'https://b2match.com', access_tier: 'credentialed_public', entity_levels: ['named_company'], capabilities: ['buying_intent', 'contactability'], countries: ['DE', 'AT', 'TR'], sector_ids: ['household-appliances'], freshness_days: 45, adapter_mode: 'live', default_enabled: false, health: 'active', last_verified_at: ISO(), license_note: null, installed: false, enabled: false, unavailable_reason: 'credential_required', last_checked_at: ISO() },
+  { source_id: 'panjiva-shipments', version: '2.0.0', display_name: 'Global shipment index', publisher: 'Licensed provider', jurisdiction: ['Global'], categories: ['licensed'], homepage: 'https://example.test/licensed', access_tier: 'licensed', entity_levels: ['named_company'], capabilities: ['trade_activity'], countries: ['DE', 'AT', 'NL', 'GB'], sector_ids: ['household-appliances'], freshness_days: 30, adapter_mode: 'live', default_enabled: false, health: 'active', last_verified_at: ISO(), license_note: 'Redistribution restricted; retained per license window.', installed: false, enabled: false, unavailable_reason: 'license_required', last_checked_at: ISO() },
+  { source_id: 'tenant-upload', version: '1.0.0', display_name: 'Customer CRM upload', publisher: 'This tenant', jurisdiction: ['Global'], categories: ['customer_upload'], homepage: null, access_tier: 'customer_upload', entity_levels: ['named_company'], capabilities: ['identity', 'contactability'], countries: [], sector_ids: [], freshness_days: 365, adapter_mode: 'upload', default_enabled: false, health: 'active', last_verified_at: ISO(), license_note: null, installed: true, enabled: false, unavailable_reason: 'no_data_uploaded', last_checked_at: ISO() },
+];
+
+const RESEARCH_NAME_STEMS = ['Northstar', 'Alpenland', 'Rheintal', 'Continental', 'Meridian', 'Vantage', 'Hansa', 'Blueport'];
+const RESEARCH_NAME_KINDS = ['Retail', 'Distribution', 'Import', 'Trading', 'Group'];
+
+function researchSeed(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0) / 4294967295;
+}
+function seededInt(str, min, max) { return Math.floor(min + researchSeed(str) * (max - min + 1)); }
+function slugify(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32); }
+
+function computeAvailable(source) {
+  return !!source.installed && !!source.enabled && source.health !== 'retired' && !source.unavailable_reason;
+}
+function catalogView() {
+  return (db.dataSourceCatalog || []).map(source => ({ ...source, available: computeAvailable(source) }));
+}
+
+function bandFor(bands, fit, confidence) {
+  const b = bands || DEFAULT_SCORING_PROFILE.bands;
+  if (fit >= (b.A?.min_fit ?? 80) && confidence >= (b.A?.min_confidence ?? 0.72)) return 'A';
+  if (fit >= (b.B?.min_fit ?? 60) && confidence >= (b.B?.min_confidence ?? 0.45)) return 'B';
+  return 'C';
+}
+function dimsFromWeights(weights, prefix) {
+  const keys = Object.keys(weights || DEFAULT_SCORING_PROFILE.weights);
+  const out = {};
+  keys.forEach(key => { out[key] = seededInt(`${prefix}:${key}`, 42, 95); });
+  return out;
+}
+function researchLeadName(cc, i) {
+  const stem = RESEARCH_NAME_STEMS[(cc.charCodeAt(0) + i) % RESEARCH_NAME_STEMS.length];
+  return `${stem} ${cc} ${RESEARCH_NAME_KINDS[i % RESEARCH_NAME_KINDS.length]}`;
+}
+
+function newCampaign(config) {
+  const now = ISO();
+  return {
+    id: id('rc'), company_id: db.company?.id || 'cmp_mock', name: config.name || 'Untitled research',
+    status: 'draft', version: 1, config: structuredClone(config), estimate: null, run_id: null,
+    created_at: now, updated_at: now,
+  };
+}
+function serializeCampaign(campaign) { return structuredClone(campaign); }
+function getCampaign(campaignId) {
+  const campaign = (db.researchCampaigns || []).find(c => c.id === campaignId);
+  if (!campaign) notFound('Research campaign');
+  return campaign;
+}
+
+function buildEstimate(campaign) {
+  const cfg = campaign.config;
+  const chosen = catalogView().filter(s => (cfg.enabled_source_ids || []).includes(s.source_id));
+  const unavailable = chosen.filter(s => !s.available).map(s => s.source_id);
+  const availableCount = chosen.length - unavailable.length;
+  if (!availableCount) {
+    return { status: 'unavailable', basis: 'No selected source can report counts yet.', unavailable_source_ids: unavailable };
+  }
+  const targets = Math.max(1, (cfg.target_countries || []).length);
+  const partitions = availableCount * targets;
+  const base = availableCount * targets * 4;
+  const ceiling = Number(cfg.max_qualified_leads_per_country) || 50;
+  const qLo = Math.max(1, Math.round(base * 0.12));
+  const qHi = Math.max(qLo + 1, Math.round(base * 0.22));
+  return {
+    status: 'available',
+    basis: 'Current source-reported counts and deterministic provider coverage',
+    confidence: availableCount >= 2 ? 'medium' : 'low',
+    named_candidate_range: [base, Math.round(base * 1.6)],
+    eligible_range: [Math.round(base * 0.35), Math.round(base * 0.6)],
+    qualified_range: [Math.min(ceiling * targets, qLo), Math.min(ceiling * targets, qHi)],
+    unavailable_source_ids: unavailable,
+    expected_partitions: partitions,
+  };
+}
+
+function buildClaims(campaign, lead) {
+  const now = ISO();
+  const src = lead.source_ids[0] || 'fixture-directory';
+  const provenance = `https://registry.example.test/${lead.country}/${slugify(lead.company_name)}`;
+  const evidence = [{ source_id: src, provenance_url: provenance, retrieved_at: now, snapshot_id: id('snap') }];
+  return [
+    { id: id('claim'), field: 'brands_carried', value: seededInt(`${lead.id}:brands`, 6, 40), status: 'observed', confidence: 0.92, method: 'observed', evidence_ids: evidence.map(e => e.snapshot_id), evidence, verified_at: now, source_ids: lead.source_ids, period: '2025', unit: null, currency: null, applicability: 'useful' },
+    { id: id('claim'), field: 'relevant_import_activity', value: `€${seededInt(`${lead.id}:imp`, 4, 14)}m–€${seededInt(`${lead.id}:imp2`, 15, 28)}m`, status: 'estimated', confidence: 0.55, method: 'estimated_range', evidence_ids: evidence.map(e => e.snapshot_id), evidence, verified_at: now, source_ids: lead.source_ids, period: '2024', unit: 'EUR', currency: 'EUR', applicability: 'useful' },
+    { id: id('claim'), field: 'store_count', value: seededInt(`${lead.id}:stores`, 3, 120), status: 'observed', confidence: 0.8, method: 'observed', evidence_ids: evidence.map(e => e.snapshot_id), evidence, verified_at: now, source_ids: lead.source_ids, period: 'FY2025', unit: 'stores', currency: null, applicability: 'useful' },
+    { id: id('claim'), field: 'private_company_value', value: null, status: 'unknown', confidence: 0.2, method: 'not_found', evidence_ids: [], evidence: [], verified_at: now, source_ids: lead.source_ids, period: null, unit: null, currency: null, applicability: 'useful' },
+  ];
+}
+
+function buildLead(campaign, cc, i) {
+  const cfg = campaign.config;
+  const buyerTypes = (cfg.buyer_types && cfg.buyer_types.length) ? cfg.buyer_types : ['distributor'];
+  const buyer = buyerTypes[i % buyerTypes.length];
+  const sector = (cfg.sector_ids && cfg.sector_ids[0]) || 'household-appliances';
+  const fit = seededInt(`${campaign.id}:${cc}:${i}:fit`, 48, 92);
+  const confidence = Number((seededInt(`${campaign.id}:${cc}:${i}:conf`, 35, 96) / 100).toFixed(3));
+  const name = researchLeadName(cc, i);
+  const sourceIds = (cfg.enabled_source_ids || []).slice();
+  const firstSrc = (db.dataSourceCatalog || []).find(s => s.source_id === sourceIds[0]);
+  const lead = {
+    id: id('lead'), company_name: name, website: `${slugify(name)}.example.test`, country: cc,
+    status: 'qualified', organization_id: id('org'), research_campaign_id: campaign.id,
+    industry: sector, buyer_type: buyer, fit_score: fit, evidence_confidence: confidence,
+    priority_band: bandFor(cfg.scoring?.bands, fit, confidence),
+    score_dimensions: dimsFromWeights(cfg.scoring?.weights, `${campaign.id}:${cc}:${i}`),
+    confidence_factors: { authority: 0.9, corroboration: 0.45, freshness: 0.85, conflict_penalty: 0, estimate_share: 0.1 },
+    eligibility: { resolved_identity: 'pass', target_geography: 'pass', product_sector_relevance: 'pass', buyer_role: 'pass', compliance: 'pass' },
+    applicable_feature_completeness: seededInt(`${campaign.id}:${cc}:${i}:comp`, 40, 90),
+    source_ids: sourceIds, top_evidence_sources: [firstSrc?.display_name || 'Verified buyer directory'],
+  };
+  db.researchClaims[lead.id] = buildClaims(campaign, lead);
+  return lead;
+}
+
+function executeCampaign(campaign) {
+  const cfg = campaign.config;
+  const targets = (cfg.target_countries && cfg.target_countries.length) ? cfg.target_countries : ['DE'];
+  const chosen = catalogView().filter(s => (cfg.enabled_source_ids || []).includes(s.source_id));
+  const usable = chosen.filter(s => s.available).length ? chosen.filter(s => s.available) : chosen.slice(0, 1);
+  const anyUnavailable = chosen.some(s => !s.available);
+  const anyDegraded = usable.some(s => s.health === 'degraded');
+  const sources = [];
+  const leads = [];
+  targets.forEach(cc => {
+    usable.forEach(src => {
+      const records = seededInt(`${campaign.id}:${cc}:${src.source_id}:rec`, 3, 8);
+      sources.push({
+        id: id('part'), company_id: campaign.company_id, campaign_id: campaign.id, source_id: src.source_id,
+        target_country: cc, sector_id: (cfg.sector_ids && cfg.sector_ids[0]) || null,
+        status: src.health === 'degraded' ? 'partial' : 'succeeded', checkpoint: null,
+        metrics: { records, normalized: Math.max(1, records - 1), named_candidates: Math.max(1, records - 2), eligible: Math.max(1, records - 3) },
+        error_category: src.health === 'degraded' ? 'stale_snapshot_used' : null, updated_at: ISO(),
+      });
+    });
+    const ceiling = Number(cfg.max_qualified_leads_per_country) || 50;
+    const perCountry = Math.min(ceiling, seededInt(`${campaign.id}:${cc}:nl`, 2, 3));
+    for (let i = 0; i < perCountry; i++) leads.push(buildLead(campaign, cc, i));
+  });
+  const qualified = leads.length;
+  const eligible = qualified + seededInt(`${campaign.id}:el`, 0, 3);
+  const resolved = eligible + seededInt(`${campaign.id}:re`, 0, 3);
+  const named = resolved + seededInt(`${campaign.id}:na`, 1, 4);
+  const raw = named + seededInt(`${campaign.id}:rw`, 2, 6);
+  const metrics = [{
+    dimension: 'overall', value: 'all', raw_records: raw, named_candidates: named,
+    resolved_organizations: resolved, eligible_companies: eligible, qualified_leads: qualified, contactable_leads: 0,
+  }];
+  const issues = [];
+  if ((anyDegraded || anyUnavailable) && leads[0]) {
+    issues.push({ id: id('iss'), issue_type: 'stale_only_evidence', status: 'open', organization_id: leads[0].organization_id, created_at: ISO(), data: {} });
+  }
+  campaign.status = (anyDegraded || anyUnavailable) ? 'partial' : 'completed';
+  campaign.run_id = id('run');
+  campaign.updated_at = ISO();
+  db.researchRuntime[campaign.id] = { metrics, sources, issues, leads };
+}
+
+function seedResearchDemo() {
+  const config = {
+    ...structuredClone(DEFAULT_RESEARCH_CONFIG),
+    name: 'DACH appliance distributors',
+    target_countries: ['DE', 'AT'],
+    sector_ids: ['household-appliances'],
+    buyer_types: ['importer', 'distributor', 'retailer', 'wholesaler'],
+    enabled_source_ids: ['fixture-directory', 'eurostat-comext', 'auma', 'companies-house'],
+  };
+  const campaign = newCampaign(config);
+  db.researchCampaigns.push(campaign);
+  campaign.estimate = buildEstimate(campaign);
+  executeCampaign(campaign);
+}
+
+function ensureResearch() {
+  if (db.researchCampaigns) return;
+  db.researchCampaigns = [];
+  db.researchRuntime = {};
+  db.researchClaims = {};
+  db.dataSourceCatalog = RESEARCH_CATALOG_BASE.map(source => ({ ...source }));
+  seedResearchDemo();
+}
+
+function setSourceState(sourceId, patch) {
+  ensureResearch();
+  const source = (db.dataSourceCatalog || []).find(s => s.source_id === sourceId);
+  if (!source) return ok(); // legacy tenant data source — no catalog entry, no-op
+  Object.assign(source, patch);
+  if (!source.installed) source.enabled = false;
+  return { ...source, available: computeAvailable(source) };
 }
 
 /* ============================================================ */
@@ -539,6 +781,134 @@ export const handlers = {
   },
   'research.regenerateInsights': ({ params }) => handlers['leads.research']({ params: { leadId: params.leadId } }),
 
+  /* ---------- evidence-first research campaigns ---------- */
+  'researchCampaigns.list': () => {
+    ensureResearch();
+    return db.researchCampaigns.slice().sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+  },
+  'researchCampaigns.create': ({ body }) => {
+    ensureResearch();
+    const config = (body && body.config) ? body.config : (body || {});
+    const campaign = newCampaign(config);
+    db.researchCampaigns.unshift(campaign);
+    log('research', `Research draft created — ${campaign.name}`, { campaign_id: campaign.id });
+    return serializeCampaign(campaign);
+  },
+  'researchCampaigns.get': ({ params }) => { ensureResearch(); return serializeCampaign(getCampaign(params.campaignId)); },
+  'researchCampaigns.patch': ({ params, body }) => {
+    ensureResearch();
+    const campaign = getCampaign(params.campaignId);
+    campaign.config = structuredClone(body.config);
+    campaign.name = body.config?.name || campaign.name;
+    campaign.version = (campaign.version || 1) + 1;
+    campaign.estimate = null;
+    campaign.updated_at = ISO();
+    return serializeCampaign(campaign);
+  },
+  'researchCampaigns.delete': ({ params }) => {
+    ensureResearch();
+    const index = db.researchCampaigns.findIndex(c => c.id === params.campaignId);
+    if (index < 0) notFound('Research campaign');
+    db.researchCampaigns.splice(index, 1);
+    delete db.researchRuntime[params.campaignId];
+    return ok();
+  },
+  'researchCampaigns.estimate': ({ params }) => {
+    ensureResearch();
+    const campaign = getCampaign(params.campaignId);
+    campaign.estimate = buildEstimate(campaign);
+    campaign.updated_at = ISO();
+    return campaign.estimate;
+  },
+  'researchCampaigns.start': ({ params }) => {
+    ensureResearch();
+    const campaign = getCampaign(params.campaignId);
+    executeCampaign(campaign);
+    log('research', `Research ${campaign.status} — ${campaign.name}`, { campaign_id: campaign.id });
+    return { status: campaign.status, run_id: campaign.run_id, campaign_id: campaign.id };
+  },
+  'researchCampaigns.cancel': ({ params }) => {
+    ensureResearch();
+    const campaign = getCampaign(params.campaignId);
+    campaign.status = 'cancelled';
+    campaign.updated_at = ISO();
+    return serializeCampaign(campaign);
+  },
+  'researchCampaigns.retry': ({ params }) => handlers['researchCampaigns.start']({ params }),
+  'researchCampaigns.clone': ({ params }) => {
+    ensureResearch();
+    const source = getCampaign(params.campaignId);
+    const config = structuredClone(source.config);
+    config.name = `${source.name} copy`;
+    const campaign = newCampaign(config);
+    db.researchCampaigns.unshift(campaign);
+    return serializeCampaign(campaign);
+  },
+  'researchCampaigns.metrics': ({ params }) => { ensureResearch(); getCampaign(params.campaignId); return db.researchRuntime[params.campaignId]?.metrics || []; },
+  'researchCampaigns.sources': ({ params }) => { ensureResearch(); getCampaign(params.campaignId); return db.researchRuntime[params.campaignId]?.sources || []; },
+  'researchCampaigns.issues': ({ params }) => { ensureResearch(); getCampaign(params.campaignId); return db.researchRuntime[params.campaignId]?.issues || []; },
+  'researchCampaigns.leads': ({ params }) => { ensureResearch(); getCampaign(params.campaignId); return db.researchRuntime[params.campaignId]?.leads || []; },
+  'researchCampaigns.export': ({ params }) => { ensureResearch(); getCampaign(params.campaignId); return db.researchRuntime[params.campaignId]?.leads || []; },
+
+  'research.configuration': () => {
+    ensureResearch();
+    return {
+      origins: { seller_countries: 'system-safe default', scoring: 'tenant default' },
+      limits: { target_countries: 25, max_qualified_leads_per_country: 200 },
+      buyer_types: ['importer', 'distributor', 'retailer', 'brand', 'wholesaler', 'procurement_organization'],
+      products: (db.products || []).map(p => ({ id: p.id, name: p.name })),
+      default_seller_countries: ['TR'],
+      refresh_schedules: ['none', 'weekly', 'monthly', 'quarterly'],
+    };
+  },
+  'research.sectors': () => RESEARCH_SECTORS,
+  'research.scoringProfiles': () => [DEFAULT_SCORING_PROFILE],
+  'research.enrichmentProfiles': () => [{ profile_id: 'local-balanced', name: 'Local balanced', local: true, available: true }],
+  'research.modelProfiles': () => RESEARCH_MODEL_PROFILES,
+  'research.leadClaims': ({ params }) => { ensureResearch(); return db.researchClaims[params.leadId] || []; },
+
+  'dataSources.catalog': () => { ensureResearch(); return catalogView(); },
+  'dataSources.impact': ({ params }) => {
+    ensureResearch();
+    const source = (db.dataSourceCatalog || []).find(s => s.source_id === params.sourceId);
+    if (!source) notFound('Data source');
+    const campaigns = db.researchCampaigns.filter(c => (c.config.enabled_source_ids || []).includes(params.sourceId));
+    const orgs = new Set();
+    let leadsAtRisk = 0;
+    let claims = 0;
+    campaigns.forEach(campaign => {
+      (db.researchRuntime[campaign.id]?.leads || []).forEach(lead => {
+        if ((lead.source_ids || []).includes(params.sourceId)) {
+          leadsAtRisk += 1;
+          orgs.add(lead.organization_id);
+          claims += (db.researchClaims[lead.id] || []).length;
+        }
+      });
+    });
+    return {
+      source_id: params.sourceId, campaigns: campaigns.length, organizations: orgs.size, claims,
+      evidence_records: claims, leads_may_lose_qualification: leadsAtRisk, storage_bytes: 512 + claims * 80,
+    };
+  },
+  'dataSources.install': ({ params }) => setSourceState(params.sourceId, { installed: true }),
+  'dataSources.uninstall': ({ params }) => setSourceState(params.sourceId, { installed: false, enabled: false }),
+  'dataSources.purge': ({ params, body }) => {
+    ensureResearch();
+    const source = (db.dataSourceCatalog || []).find(s => s.source_id === params.sourceId);
+    if (!source) notFound('Data source');
+    if (!body || body.confirmation !== source.display_name) throw new ApiError('Type the source name exactly', 422);
+    const impact = handlers['dataSources.impact']({ params });
+    db.researchCampaigns.forEach(campaign => {
+      (db.researchRuntime[campaign.id]?.leads || []).forEach(lead => {
+        if ((lead.source_ids || []).includes(params.sourceId)) {
+          lead.status = 'unqualified_after_source_removal';
+          lead.evidence_confidence = 0;
+        }
+      });
+    });
+    return { purged: true, impact, message: 'Raw and normalized evidence removed; affected leads require recalculation.' };
+  },
+
   /* ---------- contacts ---------- */
   'contacts.list': ({ query }) => {
     let items = db.contacts;
@@ -994,8 +1364,8 @@ export const handlers = {
   'dataSources.update': ({ body }) => ok(body || {}),
   'dataSources.delete': () => ok(),
   'dataSources.test': () => ok({ latency_ms: 240 }),
-  'dataSources.enable': () => ok(),
-  'dataSources.disable': () => ok(),
+  'dataSources.enable': ({ params }) => setSourceState(params.sourceId, { enabled: true }),
+  'dataSources.disable': ({ params }) => setSourceState(params.sourceId, { enabled: false }),
 
   /* ---------- activity ---------- */
   'activity.list': ({ query }) => listOf(db.activity.slice(0, query.limit ? Number(query.limit) : 50)),

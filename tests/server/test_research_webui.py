@@ -15,6 +15,23 @@ def test_research_modules_routes_and_evidence_copy_are_served():
     assert "Fit score" in leads and "Evidence confidence" in leads
 
 
+def test_mock_mode_research_handlers_are_wired():
+    """Mock mode must serve the same research contract as the real backend
+    (research-page-UI-guidelines.md §15, acceptance criterion §16.14)."""
+    _, client, _, _ = make_client()
+    handlers = client.get("/js/mocks/handlers.js").text
+    for key in (
+        "researchCampaigns.list", "researchCampaigns.create", "researchCampaigns.estimate",
+        "researchCampaigns.start", "researchCampaigns.metrics", "researchCampaigns.leads",
+        "research.configuration", "research.sectors", "research.modelProfiles",
+        "research.leadClaims", "dataSources.catalog", "dataSources.impact", "dataSources.purge",
+    ):
+        assert f"'{key}'" in handlers, key
+    # enable/disable now mutate the provider catalog instead of returning a no-op.
+    assert "setSourceState" in handlers
+    assert "DEFAULT_RESEARCH_CONFIG" in handlers
+
+
 def test_source_picker_is_catalog_driven_and_admin_copy_is_distinct():
     _, client, _, _ = make_client()
     picker = client.get("/js/pages/research-source-picker.js").text
