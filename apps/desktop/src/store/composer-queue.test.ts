@@ -10,6 +10,7 @@ import {
   migrateQueuedPrompts,
   promoteQueuedPrompt,
   QUEUE_STORAGE_KEY,
+  QUEUE_TOMBSTONES_STORAGE_KEY,
   readFreshQueuedPrompts,
   removeQueuedPrompt,
   shouldAutoDrain,
@@ -548,6 +549,28 @@ describe('tombstone lifetime', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('clamps future-dated tombstone garbage so it cannot evict genuine tombstones', () => {
+    // Corruption scenario: the sidecar is stuffed with future-dated stamps.
+    // Unclamped, they would never expire, always sort newest, permanently
+    // occupy the cap, and evict every genuine tombstone at the next prune.
+    const garbage: Record<string, number> = {}
+
+    for (let i = 0; i < 70; i++) {
+      garbage[`junk-${i}`] = Date.parse('2199-01-01T00:00:00Z') + i * 1_000
+    }
+
+    window.localStorage.setItem(QUEUE_TOMBSTONES_STORAGE_KEY, JSON.stringify(garbage))
+
+    const a = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'genuinely removed A' })
+    const b = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'genuinely removed B' })
+    removeQueuedPrompt(SESSION_KEY, a!.id)
+    removeQueuedPrompt(SESSION_KEY, b!.id) // this prune must NOT evict A's tombstone
+
+    otherWindowWrites({ [SESSION_KEY]: [a!, b!] }) // stale save resurrects both
+
+    expect(readFreshQueuedPrompts(SESSION_KEY)).toEqual([])
   })
 
   it('evicts the oldest tombstones beyond the cap, keeping the newest effective', () => {

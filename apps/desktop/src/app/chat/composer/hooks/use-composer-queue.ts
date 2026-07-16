@@ -106,9 +106,11 @@ export function useComposerQueue({
   const migrationChainRef = useRef<Promise<unknown>>(Promise.resolve())
   const autoDrainRef = useRef<() => void>(() => {})
   const busyRef = useRef(busy)
+  const sessionKeyRef = useRef(activeQueueSessionKey)
   const mountedRef = useRef(true)
 
   busyRef.current = busy
+  sessionKeyRef.current = activeQueueSessionKey
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (!activeQueueSessionKey || queueEdit) {
@@ -267,8 +269,11 @@ export function useComposerQueue({
             // The session may have started a turn while we waited for the
             // lane or the claim (typically: the very drain we waited on got
             // accepted). Submitting now would just bounce off the gateway;
-            // the caller decides what busy means for its flow.
-            if (busyRef.current) {
+            // the caller decides what busy means for its flow. Only honored
+            // while the hook still shows the session this drain belongs to:
+            // after a mid-drain session switch, the window-global busy
+            // describes the NEW session and must not veto the old one's send.
+            if (busyRef.current && sessionKeyRef.current === activeQueueSessionKey) {
               return 'busy'
             }
 
@@ -346,7 +351,18 @@ export function useComposerQueue({
   )
 
   const drainNextQueued = useCallback(
-    () => runDrain(pickDrainHead).then(({ outcome }) => outcome === 'sent'),
+    () =>
+      runDrain(pickDrainHead).then(({ outcome }) => {
+        // Like sendQueuedNow: a manual drain that didn't send consumed no
+        // auto-drain wake-up, but may have dropped one that landed while it
+        // was in flight — one bounded re-check keeps the lane live. ('sent'
+        // needs none: its storage write re-runs the auto-drain effect.)
+        if (outcome !== 'sent') {
+          setTimeout(() => autoDrainRef.current(), 0)
+        }
+
+        return outcome === 'sent'
+      }),
     [pickDrainHead, runDrain]
   )
 
