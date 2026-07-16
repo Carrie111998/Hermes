@@ -1508,6 +1508,9 @@ export const en: Translations = {
     queueDelete: 'Delete',
     queueStuckTitle: 'Queued message not sent',
     queueStuckBody: 'A queued turn kept failing to send. It is still in the queue — try sending it again.',
+    queueBusyElsewhereTitle: 'Queued message not sent yet',
+    queueBusyElsewhereBody:
+      'Another window is currently sending from this session’s queue. Your message is still queued — try again in a moment.',
     previewUnavailable: 'Preview unavailable',
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,

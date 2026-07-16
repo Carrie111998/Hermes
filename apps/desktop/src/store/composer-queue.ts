@@ -11,20 +11,55 @@ export interface QueuedPromptEntry {
 
 type QueueState = Record<string, QueuedPromptEntry[]>
 
-const STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+export const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
 
-const load = (): QueueState => {
+/** See the tombstone block below for why this lives under its own key. */
+export const QUEUE_TOMBSTONES_STORAGE_KEY = 'hermes.desktop.composerQueue.sent.v1'
+
+// True after a persistence attempt failed; cleared by the next success. While
+// set, mutations and drain picks base themselves on the in-memory atom instead
+// of storage — entries that never reached storage would otherwise vanish from
+// every subsequent operation. Storage that cannot be written cannot sync
+// windows anyway, so degrading to single-window in-memory semantics is the
+// correct fallback, and recovery is automatic on the first save that succeeds.
+let persistFailed = false
+
+// Cache of the last parsed queue map, keyed by the exact raw string. Repeated
+// reads (every mutation + drain pick + storage event re-reads the whole map)
+// then parse once per distinct content, and — critically — return the SAME
+// per-session array references, preserving the referential stability that
+// useSessionSlice's re-render bail-out depends on.
+let cachedQueueRaw: null | string = null
+let cachedQueueState: null | QueueState = null
+
+// null = storage unreadable (disabled/corrupt access), distinct from empty.
+const readStorage = (): null | QueueState => {
   if (typeof window === 'undefined') {
-    return {}
+    return null
   }
 
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
-    const parsed = raw ? JSON.parse(raw) : null
+    const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY)
 
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as QueueState) : {}
+    if (raw === null) {
+      return {}
+    }
+
+    if (cachedQueueRaw === raw && cachedQueueState) {
+      return cachedQueueState
+    }
+
+    const parsed = JSON.parse(raw) as unknown
+
+    const state =
+      parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as QueueState) : {}
+
+    cachedQueueRaw = raw
+    cachedQueueState = state
+
+    return state
   } catch {
-    return {}
+    return null
   }
 }
 
@@ -35,16 +70,136 @@ const save = (state: QueueState) => {
 
   try {
     if (Object.keys(state).length === 0) {
-      window.localStorage.removeItem(STORAGE_KEY)
+      window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+      cachedQueueRaw = null
+      cachedQueueState = null
     } else {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+      const raw = JSON.stringify(state)
+      window.localStorage.setItem(QUEUE_STORAGE_KEY, raw)
+      cachedQueueRaw = raw
+      cachedQueueState = state
     }
+
+    persistFailed = false
   } catch {
-    // best-effort: storage may be unavailable, queue still works in-memory
+    // Best-effort: the queue keeps working in-memory — freshState() serves the
+    // atom while this flag is set, so nothing is lost from the UI or drains.
+    persistFailed = true
   }
 }
 
-export const $queuedPromptsBySession = atom<QueueState>(load())
+// ---------------------------------------------------------------------------
+// Removal tombstones.
+//
+// The queue map alone cannot survive one interleaving: a mutation in window B
+// that loaded the map BEFORE window A removed entry X and saved AFTER puts X
+// back into storage. If X was just drained, the next auto-drain would submit
+// it a second time; if the user deleted X, it would send something they
+// explicitly discarded. localStorage has no compare-and-swap and synchronous
+// mutators cannot take async Web Locks, so instead every removal records the
+// entry id here FIRST, and every queue read/write filters tombstoned ids — a
+// resurrected entry can reappear in the raw map, but never in a drainable or
+// visible state, and the next write purges it. The sidecar lives under its own
+// key so queue-map writes can never clobber it wholesale; concurrent sidecar
+// writers can at worst lose one id to each other (falling back to today's
+// behavior, never worse). TTL + cap bound its size: a tombstone only needs to
+// outlive the seconds-wide stale-save window it defends against.
+// ---------------------------------------------------------------------------
+
+type RemovalTombstones = Record<string, number>
+
+const TOMBSTONE_TTL_MS = 5 * 60_000
+const TOMBSTONE_CAP = 64
+
+let cachedTombstonesRaw: null | string = null
+let cachedTombstones: null | RemovalTombstones = null
+
+const readTombstones = (): RemovalTombstones => {
+  if (typeof window === 'undefined') {
+    return {}
+  }
+
+  try {
+    const raw = window.localStorage.getItem(QUEUE_TOMBSTONES_STORAGE_KEY)
+
+    if (raw === null) {
+      return {}
+    }
+
+    if (cachedTombstonesRaw === raw && cachedTombstones) {
+      return cachedTombstones
+    }
+
+    const parsed = JSON.parse(raw) as unknown
+
+    const tombstones =
+      parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as RemovalTombstones) : {}
+
+    cachedTombstonesRaw = raw
+    cachedTombstones = tombstones
+
+    return tombstones
+  } catch {
+    return {}
+  }
+}
+
+const recordTombstones = (ids: string[]) => {
+  if (typeof window === 'undefined' || ids.length === 0) {
+    return
+  }
+
+  try {
+    const cutoff = Date.now() - TOMBSTONE_TTL_MS
+    const alive = Object.entries(readTombstones()).filter(([, at]) => at > cutoff)
+    alive.sort((a, b) => a[1] - b[1])
+
+    const next: RemovalTombstones = Object.fromEntries(alive.slice(-TOMBSTONE_CAP))
+    const now = Date.now()
+
+    for (const id of ids) {
+      next[id] = now
+    }
+
+    const raw = JSON.stringify(next)
+    window.localStorage.setItem(QUEUE_TOMBSTONES_STORAGE_KEY, raw)
+    cachedTombstonesRaw = raw
+    cachedTombstones = next
+  } catch {
+    // Best-effort: without the tombstone we degrade to pre-tombstone behavior.
+  }
+}
+
+/** Preserves the input reference when nothing is filtered. */
+const filterTombstoned = (queue: QueuedPromptEntry[], tombstones = readTombstones()): QueuedPromptEntry[] => {
+  const cutoff = Date.now() - TOMBSTONE_TTL_MS
+  const next = queue.filter(e => !(tombstones[e.id] !== undefined && tombstones[e.id]! > cutoff))
+
+  return next.length === queue.length ? queue : next
+}
+
+/** Filter every session's queue; preserves references (and the map) when clean. */
+const filterState = (state: QueueState): QueueState => {
+  const tombstones = readTombstones()
+  let changed = false
+  const next: QueueState = {}
+
+  for (const [sid, queue] of Object.entries(state)) {
+    const filtered = filterTombstoned(queue, tombstones)
+
+    if (filtered.length > 0) {
+      next[sid] = filtered
+    }
+
+    if (filtered !== queue || filtered.length === 0) {
+      changed = true
+    }
+  }
+
+  return changed ? next : state
+}
+
+export const $queuedPromptsBySession = atom<QueueState>(filterState(readStorage() ?? {}))
 
 // Cross-window sync: every desktop window boots this store from the same
 // localStorage key, but without this listener each window keeps a private,
@@ -54,46 +209,78 @@ export const $queuedPromptsBySession = atom<QueueState>(load())
 // the windows that did NOT write, so there is no self-echo to guard against.
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', event => {
-    if (event.key === STORAGE_KEY || event.key === null) {
-      $queuedPromptsBySession.set(load())
+    if (
+      event.key === QUEUE_STORAGE_KEY ||
+      event.key === QUEUE_TOMBSTONES_STORAGE_KEY ||
+      event.key === null
+    ) {
+      $queuedPromptsBySession.set(filterState(readStorage() ?? $queuedPromptsBySession.get()))
     }
   })
 }
 
-// Operation-based cross-window mutation: reload the persisted map and apply
-// `op` to the freshest version of THIS session's queue — never to an array the
-// caller derived from the in-memory atom. Reloading the map alone only
-// protected other sessions' keys: two windows mutating the same session would
-// still replace its array with competing stale versions (window B's append
-// built on a queue that predates window A's), silently dropping entries.
-// `op` receives the fresh queue and returns the next one, or null for "nothing
-// to do" (no write, no atom churn). Returns whether a write happened.
-//
-// The load→op→save sequence is synchronous, so the only remaining race is two
-// renderer processes interleaving inside it at the exact same instant —
-// microseconds, versus the seconds-wide stale-snapshot window this closes.
-// Fully eliminating it would need cross-window mutual exclusion (Web Locks)
-// around every mutation, which forces all these APIs async; the drain path,
-// where a race double-submits a prompt into the model, does exactly that via
-// withSessionDrainClaim below.
-const mutateSession = (sid: string, op: (fresh: QueuedPromptEntry[]) => null | QueuedPromptEntry[]): boolean => {
-  const next = { ...load() }
-  const queue = op(next[sid] ?? [])
+// The freshest queue map a mutation or drain pick may act on: persisted
+// storage — the only synchronously cross-window source — unless persistence is
+// broken or storage is unreadable, in which case the in-memory atom is the
+// best (and only) truth this window has.
+const freshState = (): QueueState =>
+  persistFailed ? $queuedPromptsBySession.get() : (readStorage() ?? $queuedPromptsBySession.get())
 
-  if (queue === null) {
+// Map-level operation-based mutation: `op` receives a copy of the freshest
+// visible state and returns the next state, or null for "nothing to do".
+// Basing every write on freshState() — never on an array a caller computed
+// from the atom — is what stops two windows from replacing the same session's
+// queue with competing stale versions (#57516 review). The remaining race is
+// two renderer processes interleaving inside one another's load→op→save; its
+// worst case is a briefly resurrected or lost entry in the raw map, and the
+// tombstone filter above guarantees a resurrected entry is never drained or
+// shown again. Cross-window double-SUBMIT protection does not rest on this
+// path at all — that is withSessionDrainClaim's job.
+const mutateState = (op: (fresh: QueueState) => null | QueueState): boolean => {
+  const next = op({ ...freshState() })
+
+  if (next === null) {
     return false
   }
 
-  if (queue.length === 0) {
-    delete next[sid]
-  } else {
-    next[sid] = queue
-  }
-
-  $queuedPromptsBySession.set(next)
-  save(next)
+  const filtered = filterState(next)
+  $queuedPromptsBySession.set(filtered)
+  save(filtered)
 
   return true
+}
+
+// Returns whether `op` applied (its null = "didn't apply", which is what the
+// mutators' booleans report). The write itself can additionally happen for a
+// non-applying op when tombstoned entries got purged from the stored queue:
+// the remove/clear path tombstones FIRST, so its op sees the entry already
+// filtered out — but the atom and storage still hold it and must be rewritten
+// without it.
+const mutateSession = (sid: string, op: (fresh: QueuedPromptEntry[]) => null | QueuedPromptEntry[]): boolean => {
+  let applied = false
+
+  mutateState(state => {
+    const stored = state[sid] ?? []
+    const filtered = filterTombstoned(stored)
+    const queue = op(filtered)
+    applied = queue !== null
+
+    if (queue === null && filtered === stored) {
+      return null
+    }
+
+    const next = queue ?? filtered
+
+    if (next.length === 0) {
+      delete state[sid]
+    } else {
+      state[sid] = next
+    }
+
+    return state
+  })
+
+  return applied
 }
 
 const sidOf = (key: string | null | undefined): null | string => {
@@ -108,6 +295,12 @@ const nextId = () => `queued-${Date.now()}-${Math.random().toString(36).slice(2,
 
 const cloneAttachments = (attachments: ComposerAttachment[]) => attachments.map(a => ({ ...a }))
 
+/**
+ * Rendered-state reader (the atom): right for display and render-time checks.
+ * Drains and mutations must NOT pick from this — the storage event that syncs
+ * the atom is asynchronous, so it can trail what another window just did; they
+ * use {@link readFreshQueuedPrompts} / the internal fresh-state path instead.
+ */
 export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
   const sid = sidOf(key)
 
@@ -115,53 +308,14 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
 }
 
 /**
- * Read a session's queue straight from persisted storage, bypassing the atom.
- * The `storage` event that syncs the atom is asynchronous, so around a drain
- * the atom can still list an entry another window already removed. Drain paths
- * must pick from this — inside {@link withSessionDrainClaim} — so they never
- * act on that stale echo.
+ * Read a session's queue from the freshest source (persisted storage, or the
+ * atom when persistence is broken), with removal tombstones filtered. This is
+ * the ONLY read drain paths may pick from, inside {@link withSessionDrainClaim}.
  */
-export const readPersistedQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
+export const readFreshQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
   const sid = sidOf(key)
 
-  return sid ? (load()[sid] ?? []) : []
-}
-
-/**
- * Run `task` while holding the exclusive cross-window drain claim for this
- * session, resolving null WITHOUT running it when another window already holds
- * the claim. A renderer-local lock cannot stop two windows from picking the
- * same queued entry and double-submitting it — every idle window schedules
- * auto-drain — so the mutex must live outside the renderer. Web Locks are
- * arbitrated by the browser process across all windows of the origin, and the
- * claim is released automatically if the holding window closes or crashes,
- * unlike a localStorage claim flag which would leak and jam the queue forever.
- * `ifAvailable` keeps losers non-blocking: they skip this attempt and try
- * again when the winner's removal lands as a storage event.
- *
- * Environments without Web Locks (non-Chromium test DOMs) run `task` directly:
- * there is no second window to exclude there, and the caller's renderer-local
- * lock still serializes attempts within this one.
- */
-export const withSessionDrainClaim = async <T>(
-  key: string | null | undefined,
-  task: () => Promise<T>
-): Promise<null | T> => {
-  const sid = sidOf(key)
-
-  if (!sid) {
-    return null
-  }
-
-  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
-
-  if (!locks) {
-    return task()
-  }
-
-  return (await locks.request(`${STORAGE_KEY}.drain.${sid}`, { ifAvailable: true }, grant =>
-    grant ? task() : Promise.resolve(null)
-  )) as null | T
+  return sid ? filterTombstoned(freshState()[sid] ?? []) : []
 }
 
 export const enqueueQueuedPrompt = (
@@ -193,17 +347,13 @@ export const dequeueQueuedPrompt = (key: string | null | undefined): null | Queu
     return null
   }
 
-  let head: null | QueuedPromptEntry = null
+  const head = readFreshQueuedPrompts(sid)[0] ?? null
 
-  mutateSession(sid, fresh => {
-    if (fresh.length === 0) {
-      return null
-    }
+  if (!head) {
+    return null
+  }
 
-    head = fresh[0]!
-
-    return fresh.slice(1)
-  })
+  removeQueuedPrompt(sid, head.id)
 
   return head
 }
@@ -215,11 +365,22 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
     return false
   }
 
-  return mutateSession(sid, fresh => {
+  if (!readFreshQueuedPrompts(sid).some(e => e.id === id)) {
+    return false
+  }
+
+  // Tombstone FIRST: from this instant no stale concurrent save can resurrect
+  // the entry into a drainable or visible state, even though the map write
+  // below has not happened yet.
+  recordTombstones([id])
+
+  mutateSession(sid, fresh => {
     const next = fresh.filter(e => e.id !== id)
 
     return next.length === fresh.length ? null : next
   })
+
+  return true
 }
 
 export const promoteQueuedPrompt = (key: string | null | undefined, id: string): boolean => {
@@ -286,6 +447,10 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
     return
   }
 
+  // Cleared entries are removals too: without tombstones a concurrent stale
+  // save could resurrect a deleted session's prompts and later send them.
+  recordTombstones(readFreshQueuedPrompts(sid).map(e => e.id))
+
   mutateSession(sid, fresh => (fresh.length === 0 ? null : []))
 }
 
@@ -295,8 +460,17 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
  * resume can mint a fresh runtime session id for the *same* conversation; the
  * entries enqueued under the old id would otherwise be stranded under a key
  * nothing reads anymore. No-op unless both keys resolve and differ.
+ *
+ * Async on purpose: it WAITS on the source key's drain claim. A drain in
+ * flight under the old key must finish — and remove its entry under that key —
+ * before the remainder moves, or the moved copy would be picked up under the
+ * new key's (different) claim while the original submit is still in flight and
+ * be submitted twice.
  */
-export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: string | null | undefined): boolean => {
+export const migrateQueuedPrompts = async (
+  fromKey: string | null | undefined,
+  toKey: string | null | undefined
+): Promise<boolean> => {
   const from = sidOf(fromKey)
   const to = sidOf(toKey)
 
@@ -304,23 +478,116 @@ export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: 
     return false
   }
 
-  // Same operation-based rule as mutateSession, spanning two keys: both the
-  // migrated entries and the target queue come from the fresh persisted map,
-  // not the atom, so entries another window just enqueued are not dropped.
-  const next = { ...load() }
-  const pending = next[from] ?? []
+  const moved = await withSessionDrainClaim(
+    from,
+    async () =>
+      mutateState(state => {
+        const tombstones = readTombstones()
+        const pending = filterTombstoned(state[from] ?? [], tombstones)
 
-  if (pending.length === 0) {
-    return false
+        if (pending.length === 0) {
+          return null
+        }
+
+        delete state[from]
+        state[to] = [...filterTombstoned(state[to] ?? [], tombstones), ...pending]
+
+        return state
+      }),
+    { wait: true }
+  )
+
+  return moved ?? false
+}
+
+export interface DrainClaimOptions {
+  /** Wait for the current holder to release instead of skipping. */
+  wait?: boolean
+  /** Bound the wait (ms); a timed-out wait resolves null. Unbounded when omitted. */
+  timeoutMs?: number
+}
+
+/**
+ * Run `task` while holding the exclusive cross-window drain claim for this
+ * session, resolving null WITHOUT running it when the claim is unavailable
+ * (held by another window and not waited for, or the wait timed out). A
+ * renderer-local lock cannot stop two windows from picking the same queued
+ * entry and double-submitting it — every idle window schedules auto-drain —
+ * so the mutex must live outside the renderer. Web Locks are arbitrated by
+ * the browser process across all windows of the origin, and the claim is
+ * released automatically if the holding window closes or crashes, unlike a
+ * localStorage claim flag which would leak and jam the queue forever.
+ *
+ * Environments without Web Locks (non-Chromium test DOMs) run `task` directly:
+ * there is no second window to exclude there, and the caller's renderer-local
+ * lock still serializes attempts within this one.
+ */
+export const withSessionDrainClaim = async <T>(
+  key: string | null | undefined,
+  task: () => Promise<T>,
+  options: DrainClaimOptions = {}
+): Promise<null | T> => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return null
   }
 
-  delete next[from]
-  next[to] = [...(next[to] ?? []), ...pending]
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
 
-  $queuedPromptsBySession.set(next)
-  save(next)
+  if (!locks) {
+    return task()
+  }
 
-  return true
+  const name = `${QUEUE_STORAGE_KEY}.drain.${sid}`
+
+  try {
+    if (!options.wait) {
+      return (await locks.request(name, { ifAvailable: true }, grant =>
+        grant ? task() : Promise.resolve(null)
+      )) as null | T
+    }
+
+    const signal = options.timeoutMs === undefined ? undefined : AbortSignal.timeout(options.timeoutMs)
+
+    return (await locks.request(name, signal ? { signal } : {}, () => task())) as T
+  } catch (error) {
+    // An aborted wait (timeout) means the holder outlasted our patience —
+    // report contention rather than surfacing a DOMException to drain logic.
+    if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
+      return null
+    }
+
+    throw error
+  }
+}
+
+/**
+ * Resolve once this session's drain claim is free (acquiring and instantly
+ * releasing it). Losers of an `ifAvailable` attempt use this as their wake-up:
+ * a winner whose submit is rejected — or whose window dies mid-submit — never
+ * writes storage, so no storage event will re-trigger them, but the browser
+ * always releases a dead window's locks. Resolves immediately when Web Locks
+ * are unavailable (single-window environments have no winner to wait on).
+ */
+export const whenSessionDrainClaimReleased = async (key: string | null | undefined): Promise<void> => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return
+  }
+
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
+
+  if (!locks) {
+    return
+  }
+
+  try {
+    await locks.request(`${QUEUE_STORAGE_KEY}.drain.${sid}`, {}, async () => undefined)
+  } catch {
+    // A failed wait must never break the caller's drain loop.
+  }
 }
 
 /** Inputs to {@link shouldAutoDrain}. */
@@ -345,3 +612,6 @@ export const shouldAutoDrain = ({ isBusy, queueLength }: AutoDrainInput): boolea
 /** Auto-drain attempts for one entry before we stop retrying and toast. The
  * entry stays queued for a manual send; a remount/reconnect resets the count. */
 export const MAX_AUTO_DRAIN_ATTEMPTS = 4
+
+/** Base delay between bounded auto-drain retries (attempt N waits N × this). */
+export const AUTO_DRAIN_RETRY_BASE_MS = 1_000

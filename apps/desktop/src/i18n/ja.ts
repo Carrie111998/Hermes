@@ -1614,6 +1614,9 @@ export const ja = defineLocale({
     queueStuckTitle: 'キュー内のメッセージを送信できません',
     queueStuckBody:
       'キューに入れたターンの送信が繰り返し失敗しました。まだキューに残っています。もう一度送信してください。',
+    queueBusyElsewhereTitle: 'キュー内のメッセージはまだ送信されていません',
+    queueBusyElsewhereBody:
+      '別のウィンドウがこのセッションのキューから送信中です。メッセージはまだキューに残っています。しばらくしてからもう一度お試しください。',
     previewUnavailable: 'プレビューは利用できません',
     previewLabel: label => `${label} のプレビュー`,
     couldNotPreview: label => `${label} をプレビューできませんでした`,

@@ -9,17 +9,24 @@ import {
   getQueuedPrompts,
   migrateQueuedPrompts,
   promoteQueuedPrompt,
-  type QueuedPromptEntry,
-  readPersistedQueuedPrompts,
+  QUEUE_STORAGE_KEY,
+  readFreshQueuedPrompts,
   removeQueuedPrompt,
   shouldAutoDrain,
   updateQueuedPrompt,
   updateQueuedPromptText,
+  whenSessionDrainClaimReleased,
   withSessionDrainClaim
 } from './composer-queue'
+import {
+  installFakeLocks,
+  otherWindowWrites,
+  persistedQueueTexts,
+  remoteEntry,
+  resetQueueStorage
+} from './composer-queue-test-utils'
 
 const SESSION_KEY = 'session-abc'
-const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
 
 function attachment(id: string, kind: ComposerAttachment['kind'] = 'file'): ComposerAttachment {
   return {
@@ -32,8 +39,7 @@ function attachment(id: string, kind: ComposerAttachment['kind'] = 'file'): Comp
 
 describe('composer queue store', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
-    $queuedPromptsBySession.set({})
+    resetQueueStorage()
   })
 
   it('queues prompts in FIFO order', () => {
@@ -113,95 +119,119 @@ describe('composer queue store', () => {
   it('persists queue entries into local storage', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'persist me' })
 
-    const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY)
-    expect(raw).toBeTruthy()
-
-    const parsed = JSON.parse(String(raw)) as Record<string, { text: string }[]>
-    expect(parsed[SESSION_KEY]?.[0]?.text).toBe('persist me')
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['persist me'])
   })
 })
 
 describe('migrateQueuedPrompts', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
-    $queuedPromptsBySession.set({})
+    resetQueueStorage()
   })
 
-  it('moves entries from a dead runtime key onto the live one', () => {
+  it('moves entries from a dead runtime key onto the live one', async () => {
     enqueueQueuedPrompt('rt-old', { attachments: [], text: 'stranded' })
 
-    expect(migrateQueuedPrompts('rt-old', 'rt-new')).toBe(true)
+    await expect(migrateQueuedPrompts('rt-old', 'rt-new')).resolves.toBe(true)
     expect(getQueuedPrompts('rt-old')).toEqual([])
     expect(getQueuedPrompts('rt-new').map(e => e.text)).toEqual(['stranded'])
     // The dead key is dropped from the store entirely.
     expect($queuedPromptsBySession.get()['rt-old']).toBeUndefined()
   })
 
-  it('appends after existing target entries (FIFO preserved)', () => {
+  it('appends after existing target entries (FIFO preserved)', async () => {
     enqueueQueuedPrompt('rt-new', { attachments: [], text: 'already here' })
     enqueueQueuedPrompt('rt-old', { attachments: [], text: 'migrated' })
 
-    migrateQueuedPrompts('rt-old', 'rt-new')
+    await migrateQueuedPrompts('rt-old', 'rt-new')
 
     expect(getQueuedPrompts('rt-new').map(e => e.text)).toEqual(['already here', 'migrated'])
   })
 
-  it('is a no-op when source is empty or keys match', () => {
-    expect(migrateQueuedPrompts('rt-old', 'rt-new')).toBe(false)
-    expect(migrateQueuedPrompts('rt-x', 'rt-x')).toBe(false)
+  it('is a no-op when source is empty or keys match', async () => {
+    await expect(migrateQueuedPrompts('rt-old', 'rt-new')).resolves.toBe(false)
+    await expect(migrateQueuedPrompts('rt-x', 'rt-x')).resolves.toBe(false)
+  })
+
+  it('waits for an in-flight drain on the source key before moving (#57516 follow-up)', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      const entry = enqueueQueuedPrompt('rt-old', { attachments: [], text: 'in flight' })
+
+      // A drain holds rt-old's claim, mid-submit.
+      let settleDrain!: () => void
+      const drain = withSessionDrainClaim('rt-old', () => new Promise<void>(res => (settleDrain = res)))
+      await Promise.resolve()
+
+      // Migration must NOT move the in-flight entry while the claim is held.
+      let migrated = false
+
+      const migration = migrateQueuedPrompts('rt-old', 'rt-new').then(moved => {
+        migrated = true
+
+        return moved
+      })
+
+      await Promise.resolve()
+
+      expect(migrated).toBe(false)
+      expect(persistedQueueTexts('rt-old')).toEqual(['in flight'])
+
+      // The drain finishes and removes its entry under the OLD key, exactly as
+      // it would in the hook; only then does migration proceed (with nothing
+      // left to move here).
+      removeQueuedPrompt('rt-old', entry!.id)
+      settleDrain()
+      await drain
+
+      await expect(migration).resolves.toBe(false)
+      expect(persistedQueueTexts('rt-new')).toEqual([])
+    } finally {
+      restore()
+    }
   })
 })
 
 describe('cross-window sync (#46732)', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
-    $queuedPromptsBySession.set({})
+    resetQueueStorage()
   })
 
-  // Simulate another window writing the shared key: localStorage mutates and a
-  // `storage` event fires — that event never fires in the writing window itself,
-  // so dispatching it manually is exactly the other-window signal.
-  function otherWindowWrites(state: Record<string, unknown>) {
-    const value = JSON.stringify(state)
-    window.localStorage.setItem(QUEUE_STORAGE_KEY, value)
-    window.dispatchEvent(new StorageEvent('storage', { key: QUEUE_STORAGE_KEY, newValue: value }))
-  }
-
-  it('adopts another window\u2019s write into the local atom', () => {
-    otherWindowWrites({ 'session-remote': [{ id: 'q-1', text: 'from window B', attachments: [], queuedAt: 1 }] })
+  it('adopts another window’s write into the local atom', () => {
+    otherWindowWrites(
+      { 'session-remote': [remoteEntry('q-1', 'from window B')] },
+      { fireEvent: true }
+    )
 
     expect(getQueuedPrompts('session-remote').map(e => e.text)).toEqual(['from window B'])
   })
 
-  it('does not clobber another window\u2019s entries when saving its own', () => {
+  it('does not clobber another window’s entries when saving its own', () => {
     // Window B enqueues for its session; this window then enqueues for a
     // different session. Both must survive in storage.
-    otherWindowWrites({ 'session-b': [{ id: 'q-b', text: 'B entry', attachments: [], queuedAt: 1 }] })
+    otherWindowWrites({ 'session-b': [remoteEntry('q-b', 'B entry')] }, { fireEvent: true })
     enqueueQueuedPrompt('session-a', { attachments: [], text: 'A entry' })
 
-    const persisted = JSON.parse(window.localStorage.getItem(QUEUE_STORAGE_KEY) ?? '{}')
-    expect(Object.keys(persisted).sort()).toEqual(['session-a', 'session-b'])
+    expect(persistedQueueTexts('session-a')).toEqual(['A entry'])
+    expect(persistedQueueTexts('session-b')).toEqual(['B entry'])
   })
 
   it('merges over live storage even without a storage event (same-frame race)', () => {
     // The `storage` event is asynchronous in real browsers; a write racing it
-    // must still be preserved because writeSession re-reads storage at save time.
-    window.localStorage.setItem(
-      QUEUE_STORAGE_KEY,
-      JSON.stringify({ 'session-b': [{ id: 'q-b', text: 'unsynced B entry', attachments: [], queuedAt: 1 }] })
-    )
+    // must still be preserved because mutations re-read storage at save time.
+    otherWindowWrites({ 'session-b': [remoteEntry('q-b', 'unsynced B entry')] })
 
     enqueueQueuedPrompt('session-a', { attachments: [], text: 'A entry' })
 
-    const persisted = JSON.parse(window.localStorage.getItem(QUEUE_STORAGE_KEY) ?? '{}')
-    expect(Object.keys(persisted).sort()).toEqual(['session-a', 'session-b'])
+    expect(persistedQueueTexts('session-a')).toEqual(['A entry'])
+    expect(persistedQueueTexts('session-b')).toEqual(['unsynced B entry'])
   })
 
   it('drops entries locally once another window drains them', () => {
     enqueueQueuedPrompt('session-a', { attachments: [], text: 'about to be drained elsewhere' })
 
     // Window B drains session-a and persists the now-empty map.
-    otherWindowWrites({})
+    otherWindowWrites({}, { fireEvent: true })
 
     expect(getQueuedPrompts('session-a')).toEqual([])
     expect(dequeueQueuedPrompt('session-a')).toBeNull()
@@ -227,137 +257,176 @@ describe('cross-window sync (#46732)', () => {
 
 describe('same-session cross-window races (#57516 review)', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
-    $queuedPromptsBySession.set({})
+    resetQueueStorage()
   })
 
-  const remoteEntry = (id: string, text: string): QueuedPromptEntry => ({ id, text, attachments: [], queuedAt: 1 })
-
-  // The worst case: another window wrote OUR session's key and the async
-  // `storage` event has not landed yet, so the local atom is stale. Writing
-  // directly (no event dispatch) simulates exactly that gap.
-  function otherWindowPersists(state: Record<string, QueuedPromptEntry[]>) {
-    window.localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(state))
-  }
-
-  const persistedTexts = (sid: string): string[] => {
-    const parsed = JSON.parse(window.localStorage.getItem(QUEUE_STORAGE_KEY) ?? '{}') as Record<
-      string,
-      { text: string }[]
-    >
-
-    return (parsed[sid] ?? []).map(e => e.text)
-  }
-
   it('enqueue appends to the other window’s unsynced same-session write instead of clobbering it', () => {
-    otherWindowPersists({ [SESSION_KEY]: [remoteEntry('q-b', 'B entry')] })
+    otherWindowWrites({ [SESSION_KEY]: [remoteEntry('q-b', 'B entry')] })
 
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'local entry' })
 
-    expect(persistedTexts(SESSION_KEY)).toEqual(['B entry', 'local entry'])
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['B entry', 'local entry'])
     // The merge also lands in the local atom, not just storage.
     expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['B entry', 'local entry'])
   })
 
   it('update edits the fresh queue, preserving entries the local atom has not seen', () => {
     const mine = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'mine' })
-    otherWindowPersists({ [SESSION_KEY]: [mine!, remoteEntry('q-b', 'B entry')] })
+    otherWindowWrites({ [SESSION_KEY]: [mine!, remoteEntry('q-b', 'B entry')] })
 
     expect(updateQueuedPromptText(SESSION_KEY, mine!.id, 'mine edited')).toBe(true)
 
-    expect(persistedTexts(SESSION_KEY)).toEqual(['mine edited', 'B entry'])
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['mine edited', 'B entry'])
   })
 
   it('remove filters the fresh queue, preserving entries the local atom has not seen', () => {
     const mine = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'mine' })
-    otherWindowPersists({ [SESSION_KEY]: [mine!, remoteEntry('q-b', 'B entry')] })
+    otherWindowWrites({ [SESSION_KEY]: [mine!, remoteEntry('q-b', 'B entry')] })
 
     expect(removeQueuedPrompt(SESSION_KEY, mine!.id)).toBe(true)
 
-    expect(persistedTexts(SESSION_KEY)).toEqual(['B entry'])
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['B entry'])
   })
 
   it('remove reports false for an entry another window already drained', () => {
     const mine = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'mine' })
-    otherWindowPersists({})
+    otherWindowWrites({})
 
     expect(removeQueuedPrompt(SESSION_KEY, mine!.id)).toBe(false)
   })
 
   it('dequeue takes the head of the fresh queue, not the stale atom’s head', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'already drained elsewhere' })
-    otherWindowPersists({ [SESSION_KEY]: [remoteEntry('q-b', 'B entry')] })
+    otherWindowWrites({ [SESSION_KEY]: [remoteEntry('q-b', 'B entry')] })
 
     expect(dequeueQueuedPrompt(SESSION_KEY)?.text).toBe('B entry')
-    expect(persistedTexts(SESSION_KEY)).toEqual([])
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual([])
   })
 
   it('promote reorders the fresh queue, preserving entries the local atom has not seen', () => {
     const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first' })
     const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second' })
-    otherWindowPersists({ [SESSION_KEY]: [first!, second!, remoteEntry('q-b', 'B entry')] })
+    otherWindowWrites({ [SESSION_KEY]: [first!, second!, remoteEntry('q-b', 'B entry')] })
 
     expect(promoteQueuedPrompt(SESSION_KEY, second!.id)).toBe(true)
 
-    expect(persistedTexts(SESSION_KEY)).toEqual(['second', 'first', 'B entry'])
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['second', 'first', 'B entry'])
   })
 
-  it('migrate moves the fresh source queue and appends to the fresh target queue', () => {
+  it('migrate moves the fresh source queue and appends to the fresh target queue', async () => {
     enqueueQueuedPrompt('rt-old', { attachments: [], text: 'seen locally' })
-    otherWindowPersists({
+    otherWindowWrites({
       'rt-old': [remoteEntry('q-o', 'unsynced source entry')],
       'rt-new': [remoteEntry('q-n', 'unsynced target entry')]
     })
 
-    expect(migrateQueuedPrompts('rt-old', 'rt-new')).toBe(true)
+    await expect(migrateQueuedPrompts('rt-old', 'rt-new')).resolves.toBe(true)
 
-    expect(persistedTexts('rt-old')).toEqual([])
-    expect(persistedTexts('rt-new')).toEqual(['unsynced target entry', 'unsynced source entry'])
+    expect(persistedQueueTexts('rt-old')).toEqual([])
+    expect(persistedQueueTexts('rt-new')).toEqual(['unsynced target entry', 'unsynced source entry'])
   })
 
-  it('readPersistedQueuedPrompts bypasses the stale atom', () => {
+  it('readFreshQueuedPrompts bypasses the stale atom', () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'stale' })
-    otherWindowPersists({ [SESSION_KEY]: [remoteEntry('q-b', 'B entry')] })
+    otherWindowWrites({ [SESSION_KEY]: [remoteEntry('q-b', 'B entry')] })
 
     expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['stale'])
-    expect(readPersistedQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['B entry'])
+    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['B entry'])
+  })
+})
+
+describe('removal tombstones (#57516 follow-up)', () => {
+  beforeEach(() => {
+    resetQueueStorage()
+  })
+
+  it('a stale concurrent save cannot resurrect a removed entry into reads', () => {
+    const sent = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'sent already' })
+    removeQueuedPrompt(SESSION_KEY, sent!.id)
+
+    // Window B loaded the map before the removal and saves after it: the raw
+    // map now contains the removed entry again, plus B's own new entry.
+    otherWindowWrites({ [SESSION_KEY]: [sent!, remoteEntry('q-b', 'B entry')] })
+
+    // Neither drains nor displays may ever see the resurrected entry.
+    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['B entry'])
+
+    window.dispatchEvent(
+      new StorageEvent('storage', { key: QUEUE_STORAGE_KEY, newValue: window.localStorage.getItem(QUEUE_STORAGE_KEY) })
+    )
+    expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['B entry'])
+
+    // The next write purges it from storage too.
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'local entry' })
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['B entry', 'local entry'])
+  })
+
+  it('cleared entries cannot be resurrected either', () => {
+    const a = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'cleared A' })
+    const b = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'cleared B' })
+
+    clearQueuedPrompts(SESSION_KEY)
+    otherWindowWrites({ [SESSION_KEY]: [a!, b!] })
+
+    expect(readFreshQueuedPrompts(SESSION_KEY)).toEqual([])
+  })
+
+  it('does not affect entries that were never removed', () => {
+    const kept = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'kept' })
+    const removed = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'removed' })
+
+    removeQueuedPrompt(SESSION_KEY, removed!.id)
+
+    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['kept'])
+    expect(kept).not.toBeNull()
+  })
+})
+
+describe('storage-failure in-memory fallback', () => {
+  beforeEach(() => {
+    resetQueueStorage()
+  })
+
+  it('keeps queueing, reading, and removing in-memory while saves fail, and recovers', () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota exceeded', 'QuotaExceededError')
+    })
+
+    try {
+      const a = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first (unsaved)' })
+      const b = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'second (unsaved)' })
+
+      expect(a).not.toBeNull()
+      expect(b).not.toBeNull()
+
+      // Both entries survive in the atom AND in the fresh read drains use —
+      // the second enqueue must not rebuild from empty storage and drop the first.
+      expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['first (unsaved)', 'second (unsaved)'])
+      expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['first (unsaved)', 'second (unsaved)'])
+
+      // In-memory entries stay mutable: remove works without storage.
+      expect(removeQueuedPrompt(SESSION_KEY, a!.id)).toBe(true)
+      expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['second (unsaved)'])
+
+      // Clearing a session with in-memory-only entries works too.
+      clearQueuedPrompts(SESSION_KEY)
+      expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
+    } finally {
+      setItem.mockRestore()
+    }
+
+    // Recovery: the first successful save re-persists and re-enables storage
+    // as the fresh source.
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'persisted again' })
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['persisted again'])
+    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['persisted again'])
   })
 })
 
 describe('withSessionDrainClaim', () => {
-  // Minimal Web Locks stand-in with real exclusivity + ifAvailable semantics;
-  // jsdom has no navigator.locks, which is also what the fallback test relies on.
-  function installFakeLocks() {
-    const held = new Set<string>()
-
-    const request = async (
-      name: string,
-      options: { ifAvailable?: boolean },
-      callback: (lock: null | { name: string }) => Promise<unknown>
-    ): Promise<unknown> => {
-      if (held.has(name)) {
-        if (!options.ifAvailable) {
-          throw new Error('fake lock manager only implements ifAvailable')
-        }
-
-        return callback(null)
-      }
-
-      held.add(name)
-
-      try {
-        return await callback({ name })
-      } finally {
-        held.delete(name)
-      }
-    }
-
-    Object.defineProperty(window.navigator, 'locks', { configurable: true, value: { request } })
-
-    return () => {
-      delete (window.navigator as { locks?: unknown }).locks
-    }
-  }
+  beforeEach(() => {
+    resetQueueStorage()
+  })
 
   it('runs the task directly when Web Locks are unavailable (single-window env)', async () => {
     expect('locks' in window.navigator).toBe(false)
@@ -393,6 +462,112 @@ describe('withSessionDrainClaim', () => {
 
       // Released claim is available again.
       await expect(withSessionDrainClaim('session-x', () => Promise.resolve('second ran'))).resolves.toBe('second ran')
+    } finally {
+      restore()
+    }
+  })
+
+  it('wait: true queues behind the holder and runs after release', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      let releaseWinner!: () => void
+      const winner = withSessionDrainClaim('session-x', () => new Promise<void>(res => (releaseWinner = res)))
+      await Promise.resolve()
+
+      const order: string[] = []
+
+      const waiter = withSessionDrainClaim(
+        'session-x',
+        async () => {
+          order.push('waiter ran')
+
+          return 'waited'
+        },
+        { wait: true }
+      )
+
+      await Promise.resolve()
+
+      expect(order).toEqual([])
+
+      releaseWinner()
+      await winner
+
+      await expect(waiter).resolves.toBe('waited')
+      expect(order).toEqual(['waiter ran'])
+    } finally {
+      restore()
+    }
+  })
+
+  it('wait with timeoutMs resolves null (not a rejection) when the holder outlasts it', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      let releaseWinner!: () => void
+      const winner = withSessionDrainClaim('session-x', () => new Promise<void>(res => (releaseWinner = res)))
+      await Promise.resolve()
+
+      const task = vi.fn(() => Promise.resolve('late'))
+      await expect(withSessionDrainClaim('session-x', task, { timeoutMs: 20, wait: true })).resolves.toBeNull()
+      expect(task).not.toHaveBeenCalled()
+
+      releaseWinner()
+      await winner
+    } finally {
+      restore()
+    }
+  })
+})
+
+describe('whenSessionDrainClaimReleased', () => {
+  beforeEach(() => {
+    resetQueueStorage()
+  })
+
+  it('resolves immediately when the claim is free or Web Locks are unavailable', async () => {
+    await expect(whenSessionDrainClaimReleased('session-x')).resolves.toBeUndefined()
+
+    const restore = installFakeLocks()
+
+    try {
+      await expect(whenSessionDrainClaimReleased('session-x')).resolves.toBeUndefined()
+    } finally {
+      restore()
+    }
+  })
+
+  it('resolves only after the current holder releases — including a failed winner', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      let failWinner!: (error: Error) => void
+
+      const winner = withSessionDrainClaim(
+        'session-x',
+        () => new Promise<never>((_resolve, reject) => (failWinner = reject))
+      ).catch(() => 'winner failed')
+
+      await Promise.resolve()
+
+      let released = false
+
+      const waiter = whenSessionDrainClaimReleased('session-x').then(() => {
+        released = true
+      })
+
+      await Promise.resolve()
+
+      expect(released).toBe(false)
+
+      // The winner FAILS (rejected submit / crash analogue): it writes nothing,
+      // but the claim release alone must wake the waiter.
+      failWinner(new Error('submit rejected'))
+      await winner
+      await waiter
+
+      expect(released).toBe(true)
     } finally {
       restore()
     }

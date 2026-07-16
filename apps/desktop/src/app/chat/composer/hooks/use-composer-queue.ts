@@ -7,21 +7,27 @@ import { clearComposerAttachments, type ComposerAttachment } from '@/store/compo
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $queuedPromptsBySession,
+  AUTO_DRAIN_RETRY_BASE_MS,
   enqueueQueuedPrompt,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
   promoteQueuedPrompt,
   type QueuedPromptEntry,
-  readPersistedQueuedPrompts,
+  readFreshQueuedPrompts,
   removeQueuedPrompt,
   shouldAutoDrain,
   updateQueuedPrompt,
+  whenSessionDrainClaimReleased,
   withSessionDrainClaim
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import type { ChatBarProps } from '../types'
+
+/** How long a manual "send now" waits for another window's in-flight drain
+ * before giving up and telling the user (the entry stays queued). */
+const MANUAL_SEND_WAIT_MS = 15_000
 
 interface UseComposerQueueArgs {
   activeQueueSessionKey: string | null
@@ -85,6 +91,16 @@ export function useComposerQueue({
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
   const drainingQueueRef = useRef(false)
   const drainFailuresRef = useRef(new Map<string, number>())
+
+  // Liveness plumbing for auto-drain: a bounded-backoff retry timer (rejected
+  // sends), a single pending claim-release waiter (lost cross-window races),
+  // and a ref to the latest autoDrainNext so both re-trigger fresh logic. The
+  // mounted flag stops a late-firing timer/waiter from draining on behalf of
+  // an unmounted composer.
+  const retryTimerRef = useRef<null | ReturnType<typeof setTimeout>>(null)
+  const claimWaiterArmedRef = useRef(false)
+  const autoDrainRef = useRef<() => void>(() => {})
+  const mountedRef = useRef(true)
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (!activeQueueSessionKey || queueEdit) {
@@ -192,7 +208,8 @@ export function useComposerQueue({
   // count only genuine send failures toward its retry cap.
   const runDrain = useCallback(
     async (
-      pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined
+      pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined,
+      claim: { wait?: boolean; timeoutMs?: number } = {}
     ): Promise<'contended' | 'empty' | 'rejected' | 'sent'> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {
         return 'contended'
@@ -204,12 +221,12 @@ export function useComposerQueue({
         const outcome = await withSessionDrainClaim(
           activeQueueSessionKey,
           async (): Promise<'empty' | 'rejected' | 'sent'> => {
-            // Pick INSIDE the claim, and from persisted storage rather than the
-            // rendered slice or the atom: the storage event that syncs them is
-            // asynchronous, so only storage itself is guaranteed to reflect a
-            // removal another window just made. Picking any earlier (or from
-            // anything staler) is what allowed the double submit.
-            const entry = pickEntry(readPersistedQueuedPrompts(activeQueueSessionKey))
+            // Pick INSIDE the claim, and from the fresh store read rather than
+            // the rendered slice or the atom: the storage event that syncs them
+            // is asynchronous, so only the fresh read reflects a removal
+            // another window just made. Picking any earlier (or from anything
+            // staler) is what allowed the double submit.
+            const entry = pickEntry(readFreshQueuedPrompts(activeQueueSessionKey))
 
             if (!entry) {
               return 'empty'
@@ -228,10 +245,12 @@ export function useComposerQueue({
             resetBrowseState(sessionId)
 
             return 'sent'
-          }
+          },
+          claim
         )
 
-        // null grant = another window holds the claim; the entry is theirs now.
+        // null = the claim was unavailable (or the wait timed out); whoever
+        // holds it owns the entry for now.
         return outcome ?? 'contended'
       } finally {
         drainingQueueRef.current = false
@@ -255,8 +274,15 @@ export function useComposerQueue({
   )
 
   const sendQueuedNow = useCallback(
-    (id: string) => {
+    async (id: string) => {
       if (!activeQueueSessionKey || id === queueEdit?.entryId) {
+        return false
+      }
+
+      // The tapped entry may be a phantom: another window drained or deleted
+      // it and our storage-event sync hasn't landed, so the panel still shows
+      // it. Bail before interrupting a live turn for something that is gone.
+      if (!readFreshQueuedPrompts(activeQueueSessionKey).some(e => e.id === id)) {
         return false
       }
 
@@ -275,17 +301,34 @@ export function useComposerQueue({
       // taps gets a fresh attempt (and re-enables auto-retry on success).
       drainFailuresRef.current.delete(id)
 
-      return runDrain(entries => entries.find(e => e.id === id)).then(outcome => outcome === 'sent')
+      // An explicit tap must not be silently swallowed by a race: WAIT for an
+      // in-flight drain elsewhere (bounded), and say so if it outlasts us —
+      // the entry stays queued either way.
+      const outcome = await runDrain(entries => entries.find(e => e.id === id), {
+        timeoutMs: MANUAL_SEND_WAIT_MS,
+        wait: true
+      })
+
+      if (outcome === 'contended') {
+        notify({
+          id: 'composer-queue-busy-elsewhere',
+          kind: 'info',
+          title: t.composer.queueBusyElsewhereTitle,
+          message: t.composer.queueBusyElsewhereBody
+        })
+      }
+
+      return outcome === 'sent'
     },
-    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
+    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain, t]
   )
 
   // Edge-independent auto-drain: send the head whenever the session is idle and
   // the queue is non-empty, bounding retries so a thrown/rejected onSubmit (e.g.
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
-  // drain lock serializes sends; a remount/reconnect resets the failure counts.
+  // drain locks serialize sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (busy || drainingQueueRef.current || !activeQueueSessionKey) {
+    if (!mountedRef.current || busy || drainingQueueRef.current || !activeQueueSessionKey) {
       return
     }
 
@@ -293,6 +336,21 @@ export function useComposerQueue({
 
     if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
       return
+    }
+
+    // The effect below only re-fires when its deps change, and neither a
+    // rejected send nor a lost claim changes them — each non-sent outcome must
+    // therefore schedule its own wake-up or the entry strands in an idle
+    // window (and MAX_AUTO_DRAIN_ATTEMPTS could never actually be reached).
+    const scheduleRetry = (attempt: number) => {
+      if (retryTimerRef.current !== null) {
+        return
+      }
+
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null
+        autoDrainRef.current()
+      }, AUTO_DRAIN_RETRY_BASE_MS * attempt)
     }
 
     const onFail = () => {
@@ -306,11 +364,32 @@ export function useComposerQueue({
           title: t.composer.queueStuckTitle,
           message: t.composer.queueStuckBody
         })
+      } else {
+        scheduleRetry(fails)
       }
     }
 
+    // A lost cross-window race needs a different wake-up than a failed send:
+    // the winner only writes storage (and thus emits the event that re-runs
+    // us) when it SENDS. A winner that gets rejected — or whose window dies
+    // mid-submit — leaves no trace, so wait for its claim to release (the
+    // browser frees a dead window's locks) and re-check then. One waiter at a
+    // time is enough: it re-enters this function, which re-arms if still needed.
+    const onContended = () => {
+      if (claimWaiterArmedRef.current) {
+        return
+      }
+
+      claimWaiterArmedRef.current = true
+
+      void whenSessionDrainClaimReleased(activeQueueSessionKey).then(() => {
+        claimWaiterArmedRef.current = false
+        autoDrainRef.current()
+      })
+    }
+
     // Re-locate the entry by id rather than submitting the captured object:
-    // runDrain picks from live persisted state inside the drain claim, so an
+    // runDrain picks from the fresh store read inside the drain claim, so an
     // entry another window drained meanwhile simply isn't found ('empty').
     // Only a rejected send counts toward the retry cap — burning attempts on
     // 'empty'/'contended' (races this window lost) would strand a healthy
@@ -319,10 +398,29 @@ export function useComposerQueue({
       .then(outcome => {
         if (outcome === 'rejected') {
           onFail()
+        } else if (outcome === 'contended') {
+          onContended()
         }
       })
       .catch(onFail)
   }, [activeQueueSessionKey, busy, pickDrainHead, queuedPrompts, runDrain, t])
+
+  // Keep the liveness wake-ups (retry timer, claim waiter) pointing at the
+  // latest closure, and never let a timer outlive the composer.
+  autoDrainRef.current = autoDrainNext
+
+  useEffect(() => {
+    mountedRef.current = true
+
+    return () => {
+      mountedRef.current = false
+
+      if (retryTimerRef.current !== null) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
+    }
+  }, [])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
   // never churns, so a change there is a real session switch and must NOT
@@ -336,7 +434,7 @@ export function useComposerQueue({
       return
     }
 
-    migrateQueuedPrompts(prev, activeQueueSessionKey)
+    void migrateQueuedPrompts(prev, activeQueueSessionKey)
   }, [activeQueueSessionKey, queueSessionKey])
 
   // Queued turns flow whenever the session is idle — on the busy→false settle

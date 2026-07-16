@@ -1,8 +1,10 @@
-import { act, renderHook } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import type { RefObject } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $queuedPromptsBySession, enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
+import { installFakeLocks, resetQueueStorage } from '@/store/composer-queue-test-utils'
+import { notify } from '@/store/notifications'
 
 import type { QueueEditState } from '../composer-utils'
 
@@ -10,9 +12,18 @@ import { useComposerQueue } from './use-composer-queue'
 
 vi.mock('@/lib/haptics', () => ({ triggerHaptic: () => {} }))
 vi.mock('@/i18n', () => ({
-  useI18n: () => ({ t: { composer: { queueStuckBody: 'stuck body', queueStuckTitle: 'stuck title' } } })
+  useI18n: () => ({
+    t: {
+      composer: {
+        queueBusyElsewhereBody: 'busy elsewhere body',
+        queueBusyElsewhereTitle: 'busy elsewhere title',
+        queueStuckBody: 'stuck body',
+        queueStuckTitle: 'stuck title'
+      }
+    }
+  })
 }))
-vi.mock('@/store/notifications', () => ({ notify: () => {} }))
+vi.mock('@/store/notifications', () => ({ notify: vi.fn() }))
 vi.mock('@/store/composer', () => ({ clearComposerAttachments: () => {} }))
 vi.mock('@/store/composer-input-history', () => ({ resetBrowseState: () => {} }))
 vi.mock('../composer-utils', () => ({
@@ -20,7 +31,6 @@ vi.mock('../composer-utils', () => ({
 }))
 
 const SESSION_KEY = 'session-drain'
-const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
 
 type OnSubmit = (value: string, options?: { fromQueue?: boolean }) => Promise<boolean> | boolean
 
@@ -50,44 +60,10 @@ function renderWindow(onSubmit: OnSubmit, { busy = false }: { busy?: boolean } =
   )
 }
 
-// Minimal Web Locks stand-in (jsdom has none) with real exclusivity +
-// ifAvailable semantics, so two hook instances contend like two windows.
-function installFakeLocks() {
-  const held = new Set<string>()
-
-  const request = async (
-    name: string,
-    options: { ifAvailable?: boolean },
-    callback: (lock: null | { name: string }) => Promise<unknown>
-  ): Promise<unknown> => {
-    if (held.has(name)) {
-      if (!options.ifAvailable) {
-        throw new Error('fake lock manager only implements ifAvailable')
-      }
-
-      return callback(null)
-    }
-
-    held.add(name)
-
-    try {
-      return await callback({ name })
-    } finally {
-      held.delete(name)
-    }
-  }
-
-  Object.defineProperty(window.navigator, 'locks', { configurable: true, value: { request } })
-
-  return () => {
-    delete (window.navigator as { locks?: unknown }).locks
-  }
-}
-
 describe('useComposerQueue cross-window drain (#57516 review)', () => {
   beforeEach(() => {
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
-    $queuedPromptsBySession.set({})
+    vi.mocked(notify).mockClear()
+    resetQueueStorage()
   })
 
   it('auto-drains an entry exactly once across two concurrently idle windows', async () => {
@@ -134,7 +110,7 @@ describe('useComposerQueue cross-window drain (#57516 review)', () => {
 
     // Another window drains the entry; its storage write is visible but the
     // `storage` event syncing our atom has not fired yet.
-    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    window.localStorage.removeItem('hermes.desktop.composerQueue.v1')
 
     await act(async () => {
       await expect(result.current.drainNextQueued()).resolves.toBe(false)
@@ -156,4 +132,161 @@ describe('useComposerQueue cross-window drain (#57516 review)', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
     unmount()
   })
+})
+
+describe('useComposerQueue drain liveness (#57516 follow-up)', () => {
+  beforeEach(() => {
+    vi.mocked(notify).mockClear()
+    resetQueueStorage()
+  })
+
+  it('a losing window retries after the winner’s claim releases without a send (winner rejected/crashed)', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'strand me not' })
+
+      // Window A wins the claim, then its submit is REJECTED: it writes no
+      // storage, so no storage event will ever reach window B.
+      let settleA!: (accepted: boolean) => void
+      const onSubmitA = vi.fn(() => new Promise<boolean>(resolve => (settleA = resolve)))
+      const windowA = renderWindow(onSubmitA)
+      await act(async () => {})
+
+      expect(onSubmitA).toHaveBeenCalledTimes(1)
+
+      const onSubmitB = vi.fn(() => Promise.resolve(true))
+      const windowB = renderWindow(onSubmitB)
+      await act(async () => {})
+
+      expect(onSubmitB).not.toHaveBeenCalled()
+
+      // A's submit is rejected → A releases the claim with no storage write.
+      // B's claim-release waiter must wake it up to drain the entry itself.
+      await act(async () => {
+        settleA(false)
+      })
+
+      await waitFor(() => expect(onSubmitB).toHaveBeenCalledTimes(1))
+      await act(async () => {})
+
+      expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
+
+      windowA.unmount()
+      windowB.unmount()
+    } finally {
+      restore()
+    }
+  })
+
+  it('a manual send-now waits for another window’s in-flight drain instead of silently dropping the tap', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'auto head' })
+      const second = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'tapped entry' })
+
+      expect(first).not.toBeNull()
+      expect(second).not.toBeNull()
+
+      // Window A auto-drains the head and is mid-submit, holding the claim.
+      let settleA!: (accepted: boolean) => void
+      const onSubmitA = vi.fn(() => new Promise<boolean>(resolve => (settleA = resolve)))
+      const windowA = renderWindow(onSubmitA)
+      await act(async () => {})
+
+      expect(onSubmitA).toHaveBeenCalledTimes(1)
+
+      // The user taps "send now" on the second entry in window B: the tap must
+      // wait for A's claim, not vanish.
+      const onSubmitB = vi.fn(() => Promise.resolve(true))
+      const windowB = renderWindow(onSubmitB, { busy: true }) // busy: isolate the manual path
+
+      let sendResolved: null | boolean = null
+      let sendNow!: Promise<boolean>
+
+      // windowB renders busy, so sendQueuedNow's busy branch would promote
+      // instead of sending. Re-render idle w/o triggering auto-drain first:
+      // manual path only.
+      windowB.unmount()
+      const windowB2 = renderWindow(onSubmitB, { busy: false })
+      await act(async () => {})
+
+      // Auto-drain in B2 lost the claim (contended) — expected. Now the tap:
+      await act(async () => {
+        sendNow = windowB2.result.current.sendQueuedNow(second!.id)
+        void sendNow.then(sent => (sendResolved = sent))
+      })
+
+      expect(sendResolved).toBeNull()
+      expect(onSubmitB).not.toHaveBeenCalled()
+
+      // A's drain completes; B's waiting tap acquires the claim and sends the
+      // exact entry the user tapped.
+      await act(async () => {
+        settleA(true)
+      })
+
+      await waitFor(() => expect(onSubmitB).toHaveBeenCalledTimes(1))
+      expect(onSubmitB).toHaveBeenCalledWith('tapped entry', { attachments: [], fromQueue: true })
+      await expect(sendNow).resolves.toBe(true)
+
+      windowA.unmount()
+      windowB2.unmount()
+    } finally {
+      restore()
+    }
+  })
+
+  it('a tapped entry that no longer exists does not interrupt a live turn', async () => {
+    const onCancel = vi.fn()
+    const onSubmit = vi.fn(() => Promise.resolve(true))
+    const draftRef: RefObject<string> = { current: '' }
+    const queueEditRef: RefObject<QueueEditState | null> = { current: null }
+
+    const { result, unmount } = renderHook(() =>
+      useComposerQueue({
+        activeQueueSessionKey: SESSION_KEY,
+        attachments: [],
+        busy: true,
+        clearDraft: () => {},
+        draftRef,
+        focusInput: () => {},
+        loadIntoComposer: () => {},
+        onCancel,
+        onSubmit,
+        queueEditRef,
+        queueSessionKey: SESSION_KEY,
+        sessionId: SESSION_KEY
+      })
+    )
+
+    await act(async () => {
+      await expect(result.current.sendQueuedNow('queued-phantom-id')).resolves.toBe(false)
+    })
+
+    expect(onCancel).not.toHaveBeenCalled()
+    unmount()
+  })
+
+  it('retries a rejected auto-drain with backoff until it sends (bounded)', async () => {
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'flaky send' })
+
+    // First two submits are rejected, the third succeeds — well inside
+    // MAX_AUTO_DRAIN_ATTEMPTS. Without the retry timer nothing would ever
+    // re-run auto-drain: the effect deps do not change on a rejected send.
+    let attempts = 0
+    const onSubmit = vi.fn(() => Promise.resolve(++attempts >= 3))
+
+    const { unmount } = renderWindow(onSubmit)
+    await act(async () => {})
+
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(3), { timeout: 8_000 })
+    await waitFor(() => expect(getQueuedPrompts(SESSION_KEY)).toEqual([]))
+
+    expect(vi.mocked(notify)).not.toHaveBeenCalled()
+    unmount()
+  }, 15_000)
 })
