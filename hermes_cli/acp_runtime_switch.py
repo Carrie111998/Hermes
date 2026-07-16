@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Config key names
 _KEY_PROVIDER = "provider"
+_KEY_DEFAULT = "default"
 _KEY_ACP_COMMAND = "acp_command"
 _KEY_ACP_ARGS = "acp_args"
 _MODEL_SECTION = "model"
@@ -77,13 +78,46 @@ def parse_args(arg_string: str) -> tuple[Optional[str], list[str]]:
 
 def get_current_state(config: dict) -> str:
     """Read the current ACP runtime state from a config dict.
-    Returns 'acp_client' when active, 'auto' otherwise."""
+    Returns 'acp_client' when active, 'auto' otherwise.
+
+    A runtime is considered active when ``model.provider`` is either the
+    canonical ``acp-client`` or a registered ACP runtime / delegation
+    provider whose resolver produces ``api_mode = "acp_client"``.
+    Additionally, when ``model.acp_command`` is set and a backup snapshot
+    exists (set by ``enable_runtime``), the runtime is considered active
+    even if the display provider name is not directly resolvable.
+    """
     if not isinstance(config, dict):
         return "auto"
     model_cfg = config.get(_MODEL_SECTION) or {}
     if not isinstance(model_cfg, dict):
         return "auto"
-    if str(model_cfg.get(_KEY_PROVIDER) or "").strip().lower() == _PROVIDER_ACP:
+    provider_val = str(model_cfg.get(_KEY_PROVIDER) or "").strip().lower()
+    if provider_val == _PROVIDER_ACP or provider_val == _PROVIDER_ACP.replace("-", "_"):
+        return "acp_client"
+    # Check if the provider is a registered ACP runtime provider that
+    # resolves to acp_client transport.
+    if provider_val:
+        requested_model = model_cfg.get(_KEY_DEFAULT)
+        # Try ACP runtime provider registry first (primary)
+        try:
+            from hermes_cli.acp_runtime_provider_registry import (
+                resolve_acp_runtime_provider,
+                get_acp_runtime_provider,
+            )
+            if get_acp_runtime_provider(provider_val):
+                descriptor = resolve_acp_runtime_provider(
+                    provider_val, requested_model, model_cfg,
+                )
+                if descriptor and descriptor.get("api_mode") == "acp_client":
+                    return "acp_client"
+        except Exception:
+            pass
+    # Fallback: if acp_command is set and a backup snapshot exists,
+    # the runtime was enabled by enable_runtime and is still active.
+    # The display provider name may not be resolvable via the registry
+    # (e.g. "claude-code-acp" is a display name, not the registry key).
+    if model_cfg.get(_KEY_ACP_COMMAND) and "_acp_runtime_backup" in config:
         return "acp_client"
     return "auto"
 
@@ -111,24 +145,89 @@ def get_current_args(config: dict) -> list[str]:
     return []
 
 
-def enable_runtime(config: dict, acp_command: str, acp_args: list[str]) -> str:
-    """Mutate config dict to enable ACP client runtime.  Returns old state."""
+def enable_runtime(
+    config: dict,
+    acp_command: str,
+    acp_args: list[str],
+    *,
+    display_provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
+    """Mutate config dict to enable ACP client runtime.  Returns old state.
+
+    When *display_provider* is set (e.g. ``claude-code-acp`` from a
+    plugin-registered resolver), it is written as ``model.provider`` so the
+    banner and session metadata show the logical provider name.  The
+    canonical provider remains ``acp_client`` — resolved at agent init time
+    via the ``api_mode == "acp_client"`` check in ``agent_init.py``.
+
+    When *model* is set, it is written as ``model.default`` so new sessions
+    pick up the ACP agent's intended model (e.g. ``opus[1m]``).
+
+    A snapshot of the pre-enable ``model.provider``, ``model.default``,
+    ``model.acp_command``, ``model.acp_args`` is saved under the
+    ``_acp_runtime_backup`` key so ``disable_runtime`` can restore them.
+    """
     old = get_current_state(config)
     if not isinstance(config.get(_MODEL_SECTION), dict):
         config[_MODEL_SECTION] = {}
-    config[_MODEL_SECTION][_KEY_PROVIDER] = _PROVIDER_ACP
-    config[_MODEL_SECTION][_KEY_ACP_COMMAND] = acp_command
-    config[_MODEL_SECTION][_KEY_ACP_ARGS] = list(acp_args)
+    model_cfg = config[_MODEL_SECTION]
+
+    # Snapshot the pre-enable values so disable_runtime can restore them.
+    backup = {
+        "provider": model_cfg.get(_KEY_PROVIDER),
+        "default": model_cfg.get(_KEY_DEFAULT),
+        "acp_command": model_cfg.get(_KEY_ACP_COMMAND),
+        "acp_args": model_cfg.get(_KEY_ACP_ARGS),
+    }
+    # Only store backup when transitioning from non-acp to acp.
+    if old != "acp_client":
+        if not isinstance(config.get("_acp_runtime_backup"), dict):
+            config["_acp_runtime_backup"] = {}
+        config["_acp_runtime_backup"] = backup
+
+    model_cfg[_KEY_PROVIDER] = display_provider or _PROVIDER_ACP
+    model_cfg[_KEY_ACP_COMMAND] = acp_command
+    model_cfg[_KEY_ACP_ARGS] = list(acp_args)
+    if model:
+        model_cfg[_KEY_DEFAULT] = model
     return old
 
 
 def disable_runtime(config: dict) -> str:
-    """Mutate config dict to disable ACP client runtime.  Returns old state."""
+    """Mutate config dict to disable ACP client runtime.  Returns old state.
+
+    Restores the pre-enable ``model.provider``, ``model.default``,
+    ``model.acp_command``, ``model.acp_args`` from the backup snapshot
+    saved by ``enable_runtime`` (stored under ``_acp_runtime_backup``).
+    If no backup exists (e.g. config was hand-edited or enabled before this
+    fix), falls back to simply removing the ACP-specific keys.
+    """
     old = get_current_state(config)
     if not isinstance(config.get(_MODEL_SECTION), dict):
         return old
     model_cfg = config[_MODEL_SECTION]
-    if model_cfg.get(_KEY_PROVIDER) == _PROVIDER_ACP:
+
+    # Try restoring from the backup snapshot.
+    backup = config.pop("_acp_runtime_backup", None)
+    if isinstance(backup, dict):
+        for key in (_KEY_PROVIDER, _KEY_DEFAULT, _KEY_ACP_COMMAND, _KEY_ACP_ARGS):
+            if key in backup:
+                val = backup[key]
+                if val is not None:
+                    model_cfg[key] = val
+                else:
+                    model_cfg.pop(key, None)
+            else:
+                model_cfg.pop(key, None)
+        return old
+
+    # No backup: remove ACP-specific keys conservatively.
+    current_provider = str(model_cfg.get(_KEY_PROVIDER) or "").strip().lower()
+    if current_provider in (_PROVIDER_ACP, _PROVIDER_ACP.replace("-", "_")):
+        model_cfg.pop(_KEY_PROVIDER, None)
+    elif old == "acp_client":
+        # Provider is a registered display name; remove it.
         model_cfg.pop(_KEY_PROVIDER, None)
     model_cfg.pop(_KEY_ACP_COMMAND, None)
     model_cfg.pop(_KEY_ACP_ARGS, None)
@@ -167,6 +266,39 @@ def check_acp_command_ok(command: str) -> tuple[bool, Optional[str]]:
     return False, f"{command!r} not found on PATH"
 
 
+def _try_registry_resolve(
+    command: str,
+) -> Optional[tuple[str, dict]]:
+    """Look up *command* as a registered ACP runtime provider key.
+
+    Returns ``(normalised_key, descriptor)`` when *command* matches a
+    plugin-registered resolver, or ``None`` otherwise.  The descriptor is the
+    dict returned by the resolver (contains ``command``, ``args``, ``model``,
+    ``provider``, ``display_provider``, ``metadata``, …).
+
+    Import-safe: if the runtime registry module is unavailable we return
+    ``None`` and the caller falls through to the built-in PATH-based path.
+
+    **Runtime registry only.**  This function backs ``/acp-client-runtime``,
+    which manages the main agent's ACP runtime.  The delegation provider
+    registry has a separate contract (subagent delegation) and is NOT
+    consulted here — mixing them caused config-propagation ambiguity.
+    """
+    try:
+        from hermes_cli.acp_runtime_provider_registry import (
+            resolve_acp_runtime_provider,
+            get_acp_runtime_provider,
+        )
+        if get_acp_runtime_provider(command):
+            descriptor = resolve_acp_runtime_provider(command, None, {})
+            if descriptor and descriptor.get("command"):
+                return command, descriptor
+    except ImportError:
+        pass
+
+    return None
+
+
 def apply(
     config: dict,
     new_value: Optional[str],
@@ -181,14 +313,22 @@ def apply(
         config:          in-memory config dict (mutated when new_value is set)
         new_value:       "acp_client" to enable, "auto" to disable, None for
                          read-only state report
-        acp_command:     ACP agent binary (required when enabling; ignored on
-                         disable).  Falls back to currently configured value if
-                         the runtime is already enabled.
+        acp_command:     ACP agent binary or registered provider key (required
+                         when enabling; ignored on disable).  Falls back to
+                         currently configured value if the runtime is already
+                         enabled.
         acp_args:        Extra args for the binary (optional).
         persist_callback: Optional callable taking the mutated config dict and
                          persisting it to disk.  Skipped when None.
 
     Returns: ACPRuntimeStatus describing the outcome.
+
+    When *acp_command* matches a plugin-registered delegation provider key
+    (e.g. ``claude-agent-acp`` → resolver key ``claude-code-acp``), the
+    resolver produces the real ``command``/``args``/``model``/display
+    ``provider``.  The PATH check is skipped for registry-resolved providers
+    (the resolver is trusted, and the underlying binary may be ``npx`` which
+    fetches the agent on first run).
     """
     current = get_current_state(config)
     current_cmd = get_current_command(config)
@@ -246,21 +386,46 @@ def apply(
                 ),
                 acp_command_ok=False,
             )
-        effective_args = acp_args if acp_args is not None else get_current_args(config)
-        ok, ver_or_msg = check_acp_command_ok(effective_cmd)
-        if not ok:
-            return ACPRuntimeStatus(
-                success=False,
-                new_value=None,
-                old_value=current,
-                message=(
-                    f"Cannot enable acp_client runtime: {ver_or_msg}\n"
-                    f"Ensure {effective_cmd!r} is installed and on PATH."
-                ),
-                acp_command_ok=False,
-            )
 
-        enable_runtime(config, effective_cmd, effective_args)
+        # --- Registry-resolved provider path (e.g. claude-agent-acp) ---------
+        # When the command string matches a registered delegation provider key,
+        # the plugin resolver produces the real binary, args, model, and display
+        # provider.  We skip the PATH check (resolver is trusted; binary may be
+        # ``npx`` which is always present) and write all resolved fields.
+        registry_hit = _try_registry_resolve(effective_cmd)
+        display_provider: Optional[str] = None
+        resolved_model: Optional[str] = None
+
+        if registry_hit is not None:
+            _key, descriptor = registry_hit
+            effective_cmd = descriptor.get("command") or effective_cmd
+            effective_args = list(descriptor.get("args") or [])
+            resolved_model = descriptor.get("model")
+            # display_provider is the human-readable name (e.g.
+            # ``claude-code-acp``); falls back to canonical ``acp_client``.
+            display_provider = descriptor.get("display_provider") or descriptor.get("provider")
+            # Trust the resolver — skip subprocess PATH check.
+            ok, ver_or_msg = True, "(resolved via plugin provider)"
+        else:
+            effective_args = acp_args if acp_args is not None else get_current_args(config)
+            ok, ver_or_msg = check_acp_command_ok(effective_cmd)
+            if not ok:
+                return ACPRuntimeStatus(
+                    success=False,
+                    new_value=None,
+                    old_value=current,
+                    message=(
+                        f"Cannot enable acp_client runtime: {ver_or_msg}\n"
+                        f"Ensure {effective_cmd!r} is installed and on PATH."
+                    ),
+                    acp_command_ok=False,
+                )
+
+        enable_runtime(
+            config, effective_cmd, effective_args,
+            display_provider=display_provider,
+            model=resolved_model,
+        )
         if persist_callback is not None:
             try:
                 persist_callback(config)
@@ -280,6 +445,10 @@ def apply(
             f"acp_client runtime: {current} → {new_value}",
             f"command: {cmd_display}",
         ]
+        if display_provider:
+            msg_lines.append(f"provider: {display_provider}")
+        if resolved_model:
+            msg_lines.append(f"model: {resolved_model}")
         if ver_or_msg:
             msg_lines.append(f"binary: {ver_or_msg}")
         msg_lines.append(
