@@ -129,6 +129,27 @@ _log = logging.getLogger(__name__)
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+# A machine gateway writes events/paths.gateway_heartbeat_path() every 60s
+# (events.gateway_integration.HEARTBEAT_INTERVAL_SECONDS); 3 missed writes
+# means it is genuinely gone, not just paging under memory pressure.
+_GATEWAY_HEARTBEAT_FRESH_SECONDS = 180
+
+
+def _machine_gateway_alive(threshold_seconds: float = _GATEWAY_HEARTBEAT_FRESH_SECONDS) -> bool:
+    """Whether a machine gateway wrote its liveness heartbeat recently.
+
+    Missing file, unreadable file, or any resolver error counts as NOT alive —
+    the safe default is to keep ticking (a desktop-only install has no
+    gateway and no heartbeat file at all).
+    """
+    try:
+        from events.paths import gateway_heartbeat_path
+
+        return (time.time() - gateway_heartbeat_path().stat().st_mtime) < threshold_seconds
+    except Exception:
+        return False
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -142,12 +163,64 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
     real gateway on the same HERMES_HOME — whichever process grabs the lock
     first wins the tick.
+
+    Defer-to-gateway guard: the lock only prevents DOUBLE-firing; on a machine
+    where a real gateway IS running, the two 60s loops phase-lock and this
+    backend can win every tick for hours — running LLM cron jobs inside the
+    process serving the dashboard/TUI (GIL stalls), without the gateway's live
+    delivery adapters, and dying with the app. So while the machine gateway's
+    heartbeat is fresh we skip the tick entirely and let the gateway own cron;
+    a stale/missing heartbeat restores the historical behavior (desktop-only
+    installs, and fallback coverage during gateway downtime/restarts).
+
+    ``HERMES_DESKTOP_CRON`` overrides the guard: ``0`` = never tick, ``1`` =
+    legacy always-tick, unset/anything else = auto (heartbeat guard). The
+    guard only applies to the built-in provider — an external provider (e.g.
+    chronos) arms remote schedules rather than looping locally, so it keeps
+    the plain ``start()`` path.
     """
+    mode = (os.getenv("HERMES_DESKTOP_CRON") or "").strip()
+    if mode == "0":
+        _log.info("Desktop cron ticker disabled (HERMES_DESKTOP_CRON=0)")
+        return
+
     from cron.scheduler_provider import resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    if provider.name != "builtin" or mode == "1":
+        _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
+        provider.start(stop_event, interval=interval)
+        return
+
+    from cron.jobs import record_ticker_heartbeat
+    from cron.scheduler import tick as cron_tick
+
+    _log.info(
+        "Desktop cron scheduler started (provider=builtin, interval=%ds, defer-to-gateway guard on)",
+        interval,
+    )
+    deferring: "bool | None" = None  # unknown → log the first state either way
+    while not stop_event.is_set():
+        if _machine_gateway_alive():
+            if deferring is not True:
+                _log.info("Machine gateway heartbeat is fresh — desktop cron ticker deferring to the gateway")
+                deferring = True
+            # No tick and no ticker-heartbeat write: the gateway owns both.
+        else:
+            if deferring is not False:
+                _log.info("Gateway heartbeat stale or missing — desktop cron ticker active")
+                deferring = False
+            ok = False
+            try:
+                cron_tick(verbose=False, sync=False)
+                ok = True
+            except BaseException as e:
+                # Mirror InProcessCronScheduler.start: BaseException so a
+                # SystemExit from a provider SDK can't silently kill the
+                # thread; shutdown is driven by stop_event, not exceptions.
+                _log.error("Cron tick error: %s", e, exc_info=True)
+            record_ticker_heartbeat(success=ok)
+        stop_event.wait(interval)
 
 
 def _warm_gateway_module() -> None:
