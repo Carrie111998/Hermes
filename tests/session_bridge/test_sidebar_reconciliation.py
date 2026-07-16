@@ -232,6 +232,24 @@ async def test_inventory_budget_exhaustion_is_retryable_and_exposes_no_claim() -
 
 
 @pytest.mark.asyncio
+async def test_native_not_indexed_defers_reconciliation_to_native_broker() -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(SidebarVerificationError("native_task_not_indexed"))
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert len(claims) == 1
+    assert claims[0].source_session_id == SOURCE
+    assert claims[0].bridge_id == BRIDGE
+    assert claims[0].reconcile_required is True
+    assert claims[0].rename_required is False
+    assert claims[0].recovered_thread is None
+    assert store.failures == []
+    assert store.commits == []
+
+
+@pytest.mark.asyncio
 async def test_recovered_rename_failure_renames_same_thread_before_verified_commit() -> None:
     events: list[tuple[str, str]] = []
     store = FakeSidebarStore()

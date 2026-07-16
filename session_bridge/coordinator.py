@@ -575,18 +575,21 @@ class SessionBridgeCoordinator:
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     raise
                 except SidebarVerificationError as exc:
-                    code = (
-                        exc.code
-                        if exc.code
-                        in {
-                            "marker_conflict",
-                            "source_identity_mismatch",
-                            "provider_mismatch",
-                        }
-                        else "bridge_temporarily_unavailable"
-                    )
-                    await self._fail_sidebar_delivery_claim(lease_token, code)
-                    continue
+                    if exc.code == "native_task_not_indexed":
+                        recovered = None
+                    else:
+                        code = (
+                            exc.code
+                            if exc.code
+                            in {
+                                "marker_conflict",
+                                "source_identity_mismatch",
+                                "provider_mismatch",
+                            }
+                            else "bridge_temporarily_unavailable"
+                        )
+                        await self._fail_sidebar_delivery_claim(lease_token, code)
+                        continue
                 except Exception:
                     await self._fail_sidebar_delivery_claim(
                         lease_token,

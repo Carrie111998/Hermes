@@ -67,6 +67,7 @@ _SIDEBAR_SKILL_PATH = (
 
 @dataclass(frozen=True)
 class _SidebarSkillContract:
+    status_tool: str
     pending_tool: str
     pending_limit: int
     projects_tool: str
@@ -98,9 +99,11 @@ class _SidebarSkillContract:
             if set(steps) != set(range(1, 10)):
                 raise ValueError("procedure steps")
 
+            status = re.search(r"Call `(session_status)` exactly once", steps[1])
             pending = re.search(
-                r"Call `(session_sidebar_[a-z_]+)\(limit=(\d+)\)` exactly once",
-                steps[1],
+                r"call `(session_sidebar_[a-z_]+)\(limit=(\d+)\)` exactly once",
+                steps[2],
+                re.IGNORECASE,
             )
             projects = re.search(
                 r"native tool `(list_[a-z_]+)\(\{\}\)` exactly once",
@@ -116,6 +119,7 @@ class _SidebarSkillContract:
             commit = re.search(r"Call `(session_sidebar_commit)\(", steps[8])
             fail = re.search(r"call `(session_sidebar_fail)\(", steps[9])
             matches = (
+                status,
                 pending,
                 projects,
                 list_threads,
@@ -127,7 +131,7 @@ class _SidebarSkillContract:
             )
             if any(match is None for match in matches):
                 raise ValueError("required call schemas")
-            assert pending and projects and list_threads
+            assert status and pending and projects and list_threads
             assert read_thread and create and rename and commit and fail
 
             precedence: list[str] = []
@@ -181,6 +185,7 @@ class _SidebarSkillContract:
             if any(text.count(rule) != 1 for rule in required_rules):
                 raise ValueError("required rule")
             return cls(
+                status_tool=status.group(1),
                 pending_tool=pending.group(1),
                 pending_limit=int(pending.group(2)),
                 projects_tool=projects.group(1),
@@ -220,16 +225,20 @@ class _SidebarSkillContract:
         raise ValueError(self.failure_code("Project listing or canonical lookup failed"))
 
     def validate_trace(self, trace: list[dict[str, Any]]) -> None:
-        if not trace or trace[0]["tool"] != self.pending_tool:
-            raise AssertionError("sidebar worker must start with pending")
-        if sum(event["tool"] == self.pending_tool for event in trace) != 1:
-            raise AssertionError("pending must be called exactly once")
+        if not trace or trace[0]["tool"] != self.status_tool:
+            raise AssertionError("sidebar worker must start with status")
+        if sum(event["tool"] == self.status_tool for event in trace) != 1:
+            raise AssertionError("status must be called exactly once")
         if len(trace) == 1:
             return
         if trace[1]["tool"] != self.projects_tool:
-            raise AssertionError("projects must be listed after pending")
+            raise AssertionError("projects must be listed before pending")
         if sum(event["tool"] == self.projects_tool for event in trace) != 1:
             raise AssertionError("projects must be listed exactly once")
+        if len(trace) < 3 or trace[2]["tool"] != self.pending_tool:
+            raise AssertionError("pending must be called after projects")
+        if sum(event["tool"] == self.pending_tool for event in trace) != 1:
+            raise AssertionError("pending must be called exactly once")
         if any("app-server" in event["tool"] for event in trace):
             raise AssertionError("app-server creation is forbidden")
 
@@ -1661,10 +1670,30 @@ class _SidebarEndToEndHarness:
         self,
         client: Any,
     ) -> list[dict[str, Any]]:
-        trace: list[dict[str, Any]] = [{
+        trace: list[dict[str, Any]] = [
+            {"tool": self.contract.status_tool, "arguments": {}}
+        ]
+        status = _sidebar_call_tool(client, self.contract.status_tool, {})
+        counts = status["sidebar"]["counts"]
+        if not (counts["sidebar_pending"] or counts["sidebar_retry"]):
+            self.contract.validate_trace(trace)
+            self.worker_traces.append(trace)
+            return []
+
+        trace.append({"tool": self.contract.projects_tool, "arguments": {}})
+        listed_projects = getattr(
+            self.native,
+            self.contract.projects_tool,
+        )()
+        projects = {
+            project["path"]: project["projectId"]
+            for project in listed_projects
+        }
+
+        trace.append({
             "tool": self.contract.pending_tool,
             "arguments": {"limit": self.contract.pending_limit},
-        }]
+        })
         jobs = _sidebar_call_tool(
             client,
             self.contract.pending_tool,
@@ -1676,15 +1705,6 @@ class _SidebarEndToEndHarness:
             self.worker_traces.append(trace)
             return outcomes
 
-        trace.append({"tool": self.contract.projects_tool, "arguments": {}})
-        listed_projects = getattr(
-            self.native,
-            self.contract.projects_tool,
-        )()
-        projects = {
-            project["path"]: project["projectId"]
-            for project in listed_projects
-        }
         for ordinal, job in enumerate(jobs):
             job_id = job.get("source_session_id", f"job-{ordinal}")
             cwd = _canonical_sidebar_path(job["cwd"])
@@ -2011,8 +2031,9 @@ def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
             "[Claude] " if provider is Provider.CLAUDE else "[Hermes] "
         )
         assert [event["tool"] for event in harness.worker_traces[-1]] == [
-            harness.contract.pending_tool,
+            harness.contract.status_tool,
             harness.contract.projects_tool,
+            harness.contract.pending_tool,
             "project_choice",
             harness.contract.list_threads_tool,
             harness.contract.create_tool,
