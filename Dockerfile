@@ -165,15 +165,18 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-# Also install the Google Workspace CLI (gws-cli skill), the Netlify CLI and the
-# Firebase CLI (used by the web-dev profile for deploys/previews) globally.
+# Also install the Google Workspace CLI (gws-cli skill), the Netlify CLI, the
+# Firebase CLI (used by the web-dev profile for deploys/previews) and the
+# Claude Code CLI (headless coding delegate for the web-dev profile, auth via
+# ANTHROPIC_API_KEY) globally.
 # DL3016 (pin npm versions) intentionally not applied: we want the latest
-# @googleworkspace/cli + netlify-cli + firebase-tools, refreshed via the periodic base-image rebuild — same
+# @googleworkspace/cli + netlify-cli + firebase-tools + @anthropic-ai/claude-code,
+# refreshed via the periodic base-image rebuild — same
 # rationale as the DL3008 apt ignore in .hadolint.yaml. The unscoped
 # `npm install` below reads pinned versions from package-lock.json regardless.
 # hadolint ignore=DL3016
 RUN npm install --prefer-offline --no-audit && \
-    npm install -g @googleworkspace/cli netlify-cli firebase-tools && \
+    npm install -g @googleworkspace/cli netlify-cli firebase-tools @anthropic-ai/claude-code && \
     npx playwright install --with-deps chromium --only-shell && \
     npm cache clean --force
 

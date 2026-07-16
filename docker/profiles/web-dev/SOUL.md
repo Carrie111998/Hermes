@@ -31,6 +31,11 @@ sites et back-offices web, de bout en bout et de façon autonome.
   ne la code jamais en dur. Auth = **Bearer token** sur `https://v2.convertapi.com`,
   ex. docx→pdf :
   `curl -X POST https://v2.convertapi.com/convert/docx/to/pdf -H "Authorization: Bearer $CONVERT_API_KEY" -F "File=@/chemin/mon_fichier.docx"`
+- **Claude Code → CLI `claude`** (auth déjà en place via `ANTHROPIC_API_KEY`) :
+  délégué de code headless pour les tâches lourdes (refactoring multi-fichiers,
+  feature complète, migration). Vois le skill `claude-code` pour le motif d'appel ;
+  réserve-le aux grosses tâches (facturation API), les petites éditions restent
+  à ta main.
 - Préfère toujours un outil MCP à une commande terminale quand les deux existent :
   c'est plus fiable et ça évite l'étape d'approbation du shell.
 

@@ -361,6 +361,15 @@ else
     echo "[entrypoint] Firebase: no service account (set FIREBASE_SERVICE_ACCOUNT_B64 to enable)"
 fi
 
+# Claude Code CLI — headless coding delegate for the web-dev profile.
+# Auth is non-interactive via ANTHROPIC_API_KEY (Railway var, already visible
+# to the whole container). Pin its config/state dir onto the volume so
+# onboarding state and settings survive redeploys (the image filesystem is
+# ephemeral; /opt/data persists). Shared across profiles — same API key.
+export CLAUDE_CONFIG_DIR="$HERMES_HOME/claude-code"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+echo "[entrypoint] Claude Code: CLAUDE_CONFIG_DIR → $CLAUDE_CONFIG_DIR (ANTHROPIC_API_KEY ${ANTHROPIC_API_KEY:+set}${ANTHROPIC_API_KEY:-MISSING})"
+
 # Debug: verify Google OAuth files exist
 echo "[entrypoint] google_token.json: $([ -f "$HERMES_HOME/google_token.json" ] && echo "EXISTS ($(wc -c < "$HERMES_HOME/google_token.json") bytes)" || echo "MISSING")"
 echo "[entrypoint] google_client_secret.json: $([ -f "$HERMES_HOME/google_client_secret.json" ] && echo "EXISTS" || echo "MISSING")"
