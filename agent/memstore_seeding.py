@@ -325,6 +325,7 @@ def parse_persona_doc(
     current_heading = ""
     line_no = 0
     paragraph: list[str] = []
+    paragraph_start_line = 0
 
     def flush_paragraph() -> None:
         nonlocal paragraph
@@ -333,9 +334,9 @@ def parse_persona_doc(
         blob = " ".join(paragraph).strip()
         paragraph = []
         for sentence in _split_sentences(blob):
-            _emit(sentence)
+            _emit(sentence, override_line_no=paragraph_start_line)
 
-    def _emit(chunk: str) -> None:
+    def _emit(chunk: str, override_line_no: int | None = None) -> None:
         chunk = chunk.strip().lstrip("-*+ ").strip()
         if len(chunk) < min_len:
             return
@@ -343,13 +344,14 @@ def parse_persona_doc(
         tags = ("persona",)
         if current_heading:
             tags = tags + (_slug(current_heading),)
+        src_line = override_line_no if override_line_no is not None else line_no
         facts.append(
             SeedFact(
                 content=chunk,
                 category=current_category,
                 tags=tags,
                 trust=_TRUST_PREFERENCE if current_category == CATEGORY_USER else _TRUST_DEFAULT,
-                source=f"{source}:L{line_no}",
+                source=f"{source}:L{src_line}",
                 entities=extract_entities(chunk),
             )
         )
@@ -371,6 +373,8 @@ def parse_persona_doc(
         if not line.strip():
             flush_paragraph()
             continue
+        if not paragraph:
+            paragraph_start_line = line_no
         paragraph.append(line.strip())
 
     flush_paragraph()
@@ -779,8 +783,14 @@ class DreamConsolidator:
         # Opposite negation polarity over a shared subject is a likely conflict.
         if shared >= 0.15 and neg_a != neg_b:
             return True
+        # Word-boundary matching so substring antonyms don't false-positive
+        # (e.g. "like" inside "dislike", "enable" inside "disable").
         for x, y in _ANTONYMS:
-            if (x in la and y in lb) or (y in la and x in lb):
+            px = rf"\b{re.escape(x)}\b"
+            py = rf"\b{re.escape(y)}\b"
+            has_xa, has_yb = re.search(px, la), re.search(py, lb)
+            has_ya, has_xb = re.search(py, la), re.search(px, lb)
+            if (has_xa and has_yb) or (has_ya and has_xb):
                 if shared >= 0.15:
                     return True
         return False
@@ -823,7 +833,15 @@ class DreamConsolidator:
                 continue  # avoid overlapping insights over the same facts
             used_keys |= member_keys
             entity = cluster_key.split(":", 1)[1]
-            label = members[0].entities[0] if members[0].entities else entity
+            # Label with the member entity that matches this cluster (preserving
+            # its original casing) — not just the first entity of the first
+            # member, which may belong to a different cluster.
+            label = entity
+            for m in members:
+                match = next((e for e in m.entities if e.lower() == entity), None)
+                if match:
+                    label = match
+                    break
             avg_trust = sum(m.trust for m in members) / len(members)
             content = (
                 f"{label}: recurring theme across {len(members)} related memories — "

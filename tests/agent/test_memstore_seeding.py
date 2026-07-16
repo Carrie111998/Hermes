@@ -168,6 +168,14 @@ class TestPersonaParsing:
         facts = parse_persona_doc(self.DOC, source="persona")
         assert all(f.source.startswith("persona:L") for f in facts)
 
+    def test_paragraph_provenance_points_to_start_line(self):
+        # Paragraph starts on line 3; a fact from it must cite L3, not the
+        # blank/heading line that flushed the paragraph.
+        doc = "# H\n\nThe project uses Python 3.11. We chose pytest.\n\n"
+        facts = parse_persona_doc(doc)
+        assert facts, "expected at least one fact"
+        assert all(f.source == "persona:L3" for f in facts)
+
 
 # ---------------------------------------------------------------------------
 # Transcript parsing
@@ -369,6 +377,35 @@ class TestDreamConsolidator:
         corpus = FactCorpus([SeedFact("Redis caches things", entities=("Redis",))])
         _, report = DreamConsolidator(min_cluster=3).consolidate(corpus)
         assert report.insights == 0
+
+    def test_substring_antonym_not_a_contradiction(self):
+        # "like" is a substring of "dislike" — must not trigger a contradiction.
+        corpus = FactCorpus([
+            SeedFact("Ade dislikes Python for scripting", entities=("Python",)),
+            SeedFact("Ade dislikes Python in general", entities=("Python",)),
+        ])
+        _, report = DreamConsolidator(synthesize=False, dedupe_threshold=0.99).consolidate(corpus)
+        assert report.contradictions == 0
+
+    def test_real_antonym_still_detected(self):
+        corpus = FactCorpus([
+            SeedFact("we enable telemetry for Redis", entities=("Redis",)),
+            SeedFact("we disable telemetry for Redis", entities=("Redis",)),
+        ])
+        _, report = DreamConsolidator(synthesize=False).consolidate(corpus)
+        assert report.contradictions >= 1
+
+    def test_insight_label_matches_cluster_entity(self):
+        # Each fact lists an unrelated entity first, then the shared one.
+        corpus = FactCorpus([
+            SeedFact("Redis caches sessions", entities=("Nginx", "Redis")),
+            SeedFact("Redis stores rate limits", entities=("Kafka", "Redis")),
+            SeedFact("Redis backs the job queue", entities=("Celery", "Redis")),
+        ])
+        refined, report = DreamConsolidator(min_cluster=3).consolidate(corpus)
+        insight = [f for f in refined if f.category == CATEGORY_INSIGHT][0]
+        assert insight.content.startswith("Redis:")
+        assert insight.entities == ("Redis",)
 
 
 # ---------------------------------------------------------------------------
