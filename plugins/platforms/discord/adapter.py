@@ -4240,7 +4240,7 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_architect(interaction: discord.Interaction, args: str = ""):
             await self._handle_architect_thread_slash(interaction, args)
 
-        @tree.command(name="done", description="Confirm and delete the current Discord thread")
+        @tree.command(name="done", description="Delete the current Discord thread")
         async def slash_done(interaction: discord.Interaction):
             await self._handle_done_slash(interaction)
 
@@ -4891,7 +4891,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
     async def _handle_done_slash(self, interaction: discord.Interaction) -> None:
-        """Require explicit invoking-user confirmation before deleting a thread."""
+        """Delete the current thread when an authorized member invokes /done."""
         if not await self._check_slash_authorization(interaction, "/done"):
             return
 
@@ -4904,205 +4904,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         await interaction.response.defer(ephemeral=True)
-        view = DoneThreadDeleteConfirmView(
-            adapter=self,
-            thread=channel,
-            invoking_user=interaction.user,
-        )
-        message = await interaction.followup.send(
-            "Delete this thread? This permanently removes its messages and cannot be undone.",
-            view=view,
-            ephemeral=True,
-        )
         try:
-            view._message = message
-        except Exception:
-            pass
-
-    async def _complete_done_thread_delete(
-        self,
-        *,
-        thread: Any,
-        acting_user: Any,
-    ) -> Dict[str, Any]:
-        """Serialize confirmed deletion transitions for one Discord thread."""
-        thread_id = getattr(thread, "id", None)
-        lock_key = str(thread_id) if thread_id is not None else f"object:{id(thread)}"
-        registry = getattr(self, "_done_thread_delete_transitions", None)
-        if registry is None:
-            registry = {}
-            self._done_thread_delete_transitions = registry
-
-        entry = registry.get(lock_key)
-        if entry is None:
-            entry = [asyncio.Lock(), 0]
-            registry[lock_key] = entry
-        entry[1] += 1
-
-        try:
-            async with entry[0]:
-                return await self._complete_done_thread_delete_serialized(
-                    thread=thread,
-                    acting_user=acting_user,
-                )
-        finally:
-            entry[1] -= 1
-            if entry[1] == 0 and registry.get(lock_key) is entry:
-                registry.pop(lock_key, None)
-
-    async def _complete_done_thread_delete_serialized(
-        self,
-        *,
-        thread: Any,
-        acting_user: Any,
-    ) -> Dict[str, Any]:
-        """Freeze the confirmed thread, delete it, then write a truthful audit."""
-        original_locked = bool(getattr(thread, "locked", False))
-        original_archived = bool(getattr(thread, "archived", False))
-        edit = getattr(thread, "edit", None)
-        if edit is None:
-            return {"success": False, "error": "thread cannot be locked before deletion"}
-
-        try:
-            await edit(
-                locked=True,
-                archived=True,
-                reason="Explicit /done confirmation",
-            )
-        except Exception as exc:
-            logger.warning("[%s] /done thread lock failed: %s", self.name, exc, exc_info=True)
-            return {"success": False, "error": f"could not lock thread before deletion: {exc}"}
-
-        async def restore_thread_state() -> Optional[Exception]:
-            try:
-                await edit(
-                    locked=original_locked,
-                    archived=original_archived,
-                    reason="Restore thread after failed /done deletion",
-                )
-            except Exception as restore_exc:
-                logger.error(
-                    "[%s] /done could not restore thread after interrupted deletion: %s",
-                    self.name,
-                    restore_exc,
-                    exc_info=True,
-                )
-                return restore_exc
-            return None
-
-        try:
-            display_name = getattr(acting_user, "display_name", None) or getattr(
-                acting_user,
-                "name",
-                "unknown user",
-            )
-            reason = (
-                "/done requested in private thread"
-                if self._done_thread_is_private(thread)
-                else f"/done explicitly confirmed by {display_name}"
-            )
-            await thread.delete(reason=reason)
-        except asyncio.CancelledError:
-            await restore_thread_state()
-            raise
+            await channel.delete(reason="Authorized /done slash command")
         except Exception as exc:
             logger.warning("[%s] /done thread delete failed: %s", self.name, exc, exc_info=True)
-            restore_error = await restore_thread_state()
-            error = str(exc)
-            if restore_error is not None:
-                error += f"; thread restoration also failed: {restore_error}"
-            return {"success": False, "error": error}
-
-        try:
-            await self._send_done_audit(
-                thread=thread,
-                acting_user=acting_user,
+            await interaction.followup.send(
+                f"I couldn't delete this thread: {exc}",
+                ephemeral=True,
             )
-        except Exception as exc:
-            # Deletion succeeded. Never suggest retrying an irreversible action.
-            logger.warning("[%s] /done audit failed after delete: %s", self.name, exc, exc_info=True)
-            return {"success": True, "warning": f"thread deleted but audit failed: {exc}"}
-        return {"success": True}
-
-    async def _send_done_audit(
-        self,
-        *,
-        thread: Any,
-        acting_user: Any,
-    ) -> None:
-        """Post a compact /done deletion audit to the parent channel/context."""
-        parent = getattr(thread, "parent", None)
-        if parent is None and self._client is not None:
-            parent_id = self._get_parent_channel_id(thread)
-            if parent_id:
-                parent = self._client.get_channel(int(parent_id))
-                if parent is None:
-                    parent = await self._client.fetch_channel(int(parent_id))
-        if parent is None:
-            raise RuntimeError("could not resolve parent channel for /done audit")
-
-        text = self._format_done_audit(thread, acting_user)
-        if self._is_forum_parent(parent):
-            audit_thread_name = (
-                "/done audit: private thread"
-                if self._done_thread_is_private(thread)
-                else f"/done audit: {getattr(thread, 'name', 'thread')}"
-            )
-            result = await self._forum_post_file(
-                parent,
-                thread_name=audit_thread_name,
-                content=text,
-            )
-            if getattr(result, "success", False) is False:
-                raise RuntimeError(getattr(result, "error", "forum audit post failed"))
-            return
-
-        send = getattr(parent, "send", None)
-        if send is None:
-            raise RuntimeError("parent channel cannot receive audit messages")
-        await send(text)
-
-    def _done_thread_is_private(self, thread: Any) -> bool:
-        """Return whether a Discord thread has private-thread visibility."""
-        type_value = getattr(getattr(thread, "type", None), "value", getattr(thread, "type", None))
-        if type_value == 12 or str(type_value).lower() == "private_thread":
-            return True
-        probe = getattr(thread, "is_private", None)
-        if callable(probe):
-            try:
-                return bool(probe())
-            except Exception:
-                return False
-        return False
-
-    def _format_done_audit(
-        self,
-        thread: Any,
-        acting_user: Any,
-    ) -> str:
-        user_name = getattr(acting_user, "display_name", None) or getattr(
-            acting_user,
-            "name",
-            "unknown user",
-        )
-        user_id = str(getattr(acting_user, "id", "?"))
-        ts = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
-        if self._done_thread_is_private(thread):
-            return "\n".join([
-                "`/done` deleted a private thread (details withheld)",
-                f"Deleted at: {ts}",
-                "Invoking member: withheld for private-thread confidentiality",
-                "Explicit invoking-user confirmation: yes",
-            ])
-
-        thread_name = getattr(thread, "name", None) or "thread"
-        thread_id = str(getattr(thread, "id", "?"))
-        return "\n".join([
-            f"`/done` deleted thread: **{thread_name}** (`{thread_id}`)",
-            f"Invoked by: {user_name} (`{user_id}`)",
-            f"Deleted at: {ts}",
-            "Explicit invoking-user confirmation: yes",
-        ])
 
     async def _handle_thread_create_slash(
         self,
@@ -7314,7 +7123,8 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, DoneThreadDeleteConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView
+    global ModelPickerView, ClarifyChoiceView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -7577,115 +7387,6 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
-
-    class DoneThreadDeleteConfirmView(discord.ui.View):
-        """Confirm /done deletion, bound to the user who invoked the command."""
-
-        def __init__(
-            self,
-            *,
-            adapter: Any,
-            thread: Any,
-            invoking_user: Any,
-        ):
-            super().__init__(timeout=300)
-            self.adapter = adapter
-            self.thread = thread
-            self.invoking_user = invoking_user
-            self.resolved = False
-            self._message = None
-
-        def _check_auth(self, interaction: discord.Interaction) -> bool:
-            interaction_user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
-            invoking_user_id = str(getattr(self.invoking_user, "id", ""))
-            return bool(
-                interaction_user_id
-                and interaction_user_id == invoking_user_id
-            )
-
-        async def _disable_buttons(self, interaction: discord.Interaction, label: str) -> None:
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-            try:
-                await interaction.response.edit_message(
-                    content=f"{label} — deleting this thread now.",
-                    view=self,
-                )
-            except Exception:
-                try:
-                    await interaction.response.defer(ephemeral=True)
-                except Exception:
-                    pass
-
-        @discord.ui.button(label="Delete thread", style=discord.ButtonStyle.red, emoji="🗑️")
-        async def delete_thread(
-            self, interaction: discord.Interaction, button: discord.ui.Button,
-        ):
-            if self.resolved:
-                await interaction.response.send_message(
-                    "This /done prompt has already been resolved.", ephemeral=True,
-                )
-                return
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(
-                    "Only the member who invoked `/done` can confirm this deletion.",
-                    ephemeral=True,
-                )
-                return
-
-            await self._disable_buttons(interaction, "Confirmed")
-            result = await self.adapter._complete_done_thread_delete(
-                thread=self.thread,
-                acting_user=self.invoking_user,
-            )
-            if result.get("success"):
-                message = "Deleted this thread."
-                if result.get("warning"):
-                    message += " The audit record could not be written; operators were notified."
-                try:
-                    await interaction.followup.send(message, ephemeral=True)
-                except Exception:
-                    pass
-            else:
-                await interaction.followup.send(
-                    f"I couldn't delete this thread: {result.get('error', 'unknown error')}",
-                    ephemeral=True,
-                )
-
-        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
-        async def cancel(
-            self, interaction: discord.Interaction, button: discord.ui.Button,
-        ):
-            if self.resolved:
-                await interaction.response.send_message(
-                    "This /done prompt has already been resolved.", ephemeral=True,
-                )
-                return
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(
-                    "You're not authorized to answer this prompt.", ephemeral=True,
-                )
-                return
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-            await interaction.response.edit_message(
-                content="Cancelled — thread was not deleted.",
-                view=self,
-            )
-
-        async def on_timeout(self):
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-            msg = getattr(self, '_message', None)
-            if msg:
-                try:
-                    await msg.edit(content="/done confirmation expired — thread was not deleted.", view=self)
-                except Exception:
-                    pass
-
 
     class UpdatePromptView(discord.ui.View):
         """Interactive Yes/No buttons for ``hermes update`` prompts.

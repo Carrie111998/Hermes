@@ -1,8 +1,6 @@
 """Tests for native Discord slash command fast-paths (thread creation & auto-thread)."""
 
 import asyncio
-from pathlib import Path
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1404,21 +1402,9 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
 
 
 class _FakeDoneThread(_FakeThreadChannel):
-    def __init__(self, *, parent=None, locked=False, archived=False, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.parent = parent or SimpleNamespace(send=AsyncMock())
-        self.locked = locked
-        self.archived = archived
         self.delete = AsyncMock()
-
-        async def _edit(**edit_kwargs):
-            if "locked" in edit_kwargs:
-                self.locked = edit_kwargs["locked"]
-            if "archived" in edit_kwargs:
-                self.archived = edit_kwargs["archived"]
-            return self
-
-        self.edit = AsyncMock(side_effect=_edit)
 
 
 def _done_interaction(channel, *, user_id=123, user_name="Edward"):
@@ -1465,19 +1451,8 @@ async def test_done_slash_rejects_non_thread_context(adapter):
 
 
 @pytest.mark.asyncio
-async def test_done_slash_always_waits_for_explicit_confirmation(adapter, monkeypatch):
-    from plugins.platforms.discord import adapter as discord_adapter
-
-    created_views = []
-
-    class FakeDoneView:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            created_views.append(self)
-
-    monkeypatch.setattr(discord_adapter, "DoneThreadDeleteConfirmView", FakeDoneView)
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="Architect: /done")
+async def test_done_slash_deletes_thread_immediately_without_confirmation_or_analysis(adapter):
+    thread = _FakeDoneThread(channel_id=200, name="Architect: /done")
     interaction = _done_interaction(thread)
     adapter._fetch_done_thread_messages = AsyncMock(
         side_effect=AssertionError("/done must not inspect or classify thread history")
@@ -1487,395 +1462,44 @@ async def test_done_slash_always_waits_for_explicit_confirmation(adapter, monkey
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     adapter._fetch_done_thread_messages.assert_not_awaited()
-    thread.delete.assert_not_awaited()
-    parent.send.assert_not_awaited()
-    interaction.followup.send.assert_awaited_once()
-    prompt = interaction.followup.send.await_args.args[0]
-    assert "Delete this thread?" in prompt
-    assert "cannot be undone" in prompt
-    assert created_views[0].kwargs == {
-        "adapter": adapter,
-        "thread": thread,
-        "invoking_user": interaction.user,
-    }
-
-
-def test_done_confirmation_is_bound_to_invoking_user(adapter):
-    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
-
-    adapter._allowed_user_ids = {123, 456}
-    thread = _FakeDoneThread(channel_id=200, name="important")
-    invoker = _done_interaction(thread, user_id=123).user
-    view = DoneThreadDeleteConfirmView(
-        adapter=adapter,
-        thread=thread,
-        invoking_user=invoker,
-    )
-
-    assert view._check_auth(_done_interaction(thread, user_id=123)) is True
-    assert view._check_auth(_done_interaction(thread, user_id=456)) is False
-
-
-def test_done_confirmation_does_not_narrow_prior_slash_authorization(
-    adapter,
-    monkeypatch,
-):
-    from plugins.platforms.discord import adapter as discord_adapter
-    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
-
-    # `/done` has already passed the adapter's full slash authorization, which
-    # includes channel-scoped policy. The component boundary must bind identity,
-    # not rerun the narrower user/role-only helper.
-    monkeypatch.setattr(discord_adapter, "_component_check_auth", lambda *_args: False)
-    thread = _FakeDoneThread(channel_id=200, name="important")
-    invoker = _done_interaction(thread, user_id=123).user
-    view = DoneThreadDeleteConfirmView(
-        adapter=adapter,
-        thread=thread,
-        invoking_user=invoker,
-    )
-
-    assert view._check_auth(_done_interaction(thread, user_id=123)) is True
-    assert view._check_auth(_done_interaction(thread, user_id=456)) is False
-
-
-def test_done_real_discord_button_callback_preserves_slash_authorization():
-    script = r'''
-import asyncio
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
-
-import discord
-from plugins.platforms.discord import adapter as discord_adapter
-
-
-def interaction(user_id):
-    return SimpleNamespace(
-        user=SimpleNamespace(id=user_id),
-        response=SimpleNamespace(
-            send_message=AsyncMock(),
-            edit_message=AsyncMock(),
-        ),
-        followup=SimpleNamespace(send=AsyncMock()),
-    )
-
-
-async def main():
-    adapter = SimpleNamespace(
-        _complete_done_thread_delete=AsyncMock(
-            return_value={"success": False, "error": "blocked"}
-        )
-    )
-    thread = SimpleNamespace(id=200)
-    invoker = SimpleNamespace(id=123)
-
-    def unexpected_reauthorization(*_args):
-        raise AssertionError("component policy was incorrectly rerun")
-
-    discord_adapter._component_check_auth = unexpected_reauthorization
-    view = discord_adapter.DoneThreadDeleteConfirmView(
-        adapter=adapter,
-        thread=thread,
-        invoking_user=invoker,
-    )
-    assert all(isinstance(child, discord.ui.Button) for child in view.children)
-    delete = next(child for child in view.children if child.label == "Delete thread")
-
-    other = interaction(456)
-    await delete.callback(other)
-    adapter._complete_done_thread_delete.assert_not_awaited()
-    other.response.send_message.assert_awaited_once()
-
-    same = interaction(123)
-    await delete.callback(same)
-    adapter._complete_done_thread_delete.assert_awaited_once_with(
-        thread=thread,
-        acting_user=invoker,
-    )
-    same.response.edit_message.assert_awaited_once()
-    same.followup.send.assert_awaited_once()
-    print("REAL_DISCORD_DONE_CALLBACK_OK")
-
-
-asyncio.run(main())
-'''
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).parents[2],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "REAL_DISCORD_DONE_CALLBACK_OK" in completed.stdout
+    thread.delete.assert_awaited_once_with(reason="Authorized /done slash command")
+    interaction.followup.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_done_delete_button_rejects_different_authorized_user(adapter):
-    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
-
-    adapter._allowed_user_ids = {123, 456}
-    adapter._complete_done_thread_delete = AsyncMock()
+async def test_done_slash_reports_delete_failure(adapter):
     thread = _FakeDoneThread(channel_id=200, name="important")
-    invoker = _done_interaction(thread, user_id=123).user
-    view = DoneThreadDeleteConfirmView(
-        adapter=adapter,
-        thread=thread,
-        invoking_user=invoker,
-    )
-    other = _done_interaction(thread, user_id=456)
-
-    await view.delete_thread(other, None)
-
-    adapter._complete_done_thread_delete.assert_not_awaited()
-    other.response.send_message.assert_awaited_once()
-    assert view.resolved is False
-
-
-@pytest.mark.asyncio
-async def test_done_delete_button_uses_original_invoking_user(adapter):
-    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
-
-    adapter._allowed_user_ids = {123}
-    adapter._complete_done_thread_delete = AsyncMock(
-        return_value={"success": False, "error": "test stop"}
-    )
-    thread = _FakeDoneThread(channel_id=200, name="important")
-    invoker = _done_interaction(thread, user_id=123).user
-    view = DoneThreadDeleteConfirmView(
-        adapter=adapter,
-        thread=thread,
-        invoking_user=invoker,
-    )
-    interaction = _done_interaction(thread, user_id=123)
-
-    await view.delete_thread(interaction, None)
-
-    adapter._complete_done_thread_delete.assert_awaited_once_with(
-        thread=thread,
-        acting_user=invoker,
-    )
-
-
-@pytest.mark.asyncio
-async def test_done_confirmation_serializes_overlapping_thread_transitions(adapter):
-    thread = _FakeDoneThread(channel_id=200, name="important")
-    state = {"deleted": False, "delete_calls": 0}
-    delete_started = asyncio.Event()
-    release_delete = asyncio.Event()
-
-    async def edit_thread(**_kwargs):
-        if state["deleted"]:
-            raise RuntimeError("thread no longer exists")
-
-    async def delete_thread(**_kwargs):
-        state["delete_calls"] += 1
-        if state["delete_calls"] == 1:
-            delete_started.set()
-            await release_delete.wait()
-            state["deleted"] = True
-            return
-        await release_delete.wait()
-        if state["deleted"]:
-            raise RuntimeError("thread no longer exists")
-
-    thread.edit = AsyncMock(side_effect=edit_thread)
-    thread.delete = AsyncMock(side_effect=delete_thread)
-    acting_user = SimpleNamespace(id=123, display_name="Edward")
-
-    first = asyncio.create_task(
-        adapter._complete_done_thread_delete(
-            thread=thread,
-            acting_user=acting_user,
-        )
-    )
-    await asyncio.wait_for(delete_started.wait(), timeout=1)
-    second = asyncio.create_task(
-        adapter._complete_done_thread_delete(
-            thread=thread,
-            acting_user=acting_user,
-        )
-    )
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    edit_calls_before_release = thread.edit.await_count
-
-    release_delete.set()
-    first_result, second_result = await asyncio.gather(first, second)
-
-    assert edit_calls_before_release == 1
-    assert first_result["success"] is True
-    assert second_result["success"] is False
-    thread.parent.send.assert_awaited_once()
-    assert adapter._done_thread_delete_transitions == {}
-
-
-@pytest.mark.asyncio
-async def test_done_confirmation_locks_then_deletes_then_audits(adapter):
-    events = []
-
-    async def _audit_send(_text):
-        events.append("audit")
-
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock(side_effect=_audit_send))
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
-
-    async def _edit(**kwargs):
-        events.append("lock")
-        thread.locked = kwargs.get("locked", thread.locked)
-        thread.archived = kwargs.get("archived", thread.archived)
-        return thread
-
-    async def _delete(**_kwargs):
-        events.append("delete")
-
-    thread.edit.side_effect = _edit
-    thread.delete.side_effect = _delete
-    actor = _done_interaction(thread).user
-
-    result = await adapter._complete_done_thread_delete(
-        thread=thread,
-        acting_user=actor,
-    )
-
-    assert result == {"success": True}
-    assert events == ["lock", "delete", "audit"]
-    thread.edit.assert_awaited_once_with(
-        locked=True,
-        archived=True,
-        reason="Explicit /done confirmation",
-    )
-    audit = parent.send.await_args.args[0]
-    assert "`/done` deleted thread" in audit
-    assert "Explicit invoking-user confirmation: yes" in audit
-
-
-@pytest.mark.asyncio
-async def test_done_delete_cancellation_restores_thread_and_reraises(adapter):
-    thread = _FakeDoneThread(channel_id=200, name="important")
-    delete_started = asyncio.Event()
-
-    async def delete_forever(**_kwargs):
-        delete_started.set()
-        await asyncio.Event().wait()
-
-    thread.delete = AsyncMock(side_effect=delete_forever)
-    task = asyncio.create_task(
-        adapter._complete_done_thread_delete(
-            thread=thread,
-            acting_user=_done_interaction(thread).user,
-        )
-    )
-    await asyncio.wait_for(delete_started.wait(), timeout=1)
-    assert thread.locked is True
-    assert thread.archived is True
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert thread.locked is False
-    assert thread.archived is False
-    assert thread.edit.await_count == 2
-    assert thread.edit.await_args_list[1].kwargs == {
-        "locked": False,
-        "archived": False,
-        "reason": "Restore thread after failed /done deletion",
-    }
-    thread.parent.send.assert_not_awaited()
-    assert adapter._done_thread_delete_transitions == {}
-
-
-@pytest.mark.asyncio
-async def test_done_delete_failure_restores_thread_and_never_audits(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(
-        parent=parent,
-        channel_id=200,
-        name="important",
-        locked=False,
-        archived=False,
-    )
     thread.delete.side_effect = RuntimeError("missing permission")
-    actor = _done_interaction(thread).user
+    interaction = _done_interaction(thread)
 
-    result = await adapter._complete_done_thread_delete(
-        thread=thread,
-        acting_user=actor,
+    await adapter._handle_done_slash(interaction)
+
+    interaction.followup.send.assert_awaited_once_with(
+        "I couldn't delete this thread: missing permission",
+        ephemeral=True,
     )
-
-    assert result["success"] is False
-    assert "missing permission" in result["error"]
-    assert thread.edit.await_count == 2
-    assert thread.edit.await_args_list[0].kwargs == {
-        "locked": True,
-        "archived": True,
-        "reason": "Explicit /done confirmation",
-    }
-    assert thread.edit.await_args_list[1].kwargs == {
-        "locked": False,
-        "archived": False,
-        "reason": "Restore thread after failed /done deletion",
-    }
-    assert thread.locked is False
-    assert thread.archived is False
-    parent.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_done_lock_failure_never_attempts_delete_or_audit(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
-    thread.edit.side_effect = RuntimeError("cannot lock")
+async def test_done_slash_does_nothing_when_unauthorized(adapter):
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    interaction = _done_interaction(thread)
+    adapter._check_slash_authorization = AsyncMock(return_value=False)
 
-    result = await adapter._complete_done_thread_delete(
-        thread=thread,
-        acting_user=_done_interaction(thread).user,
-    )
+    await adapter._handle_done_slash(interaction)
 
-    assert result["success"] is False
-    assert "cannot lock" in result["error"]
     thread.delete.assert_not_awaited()
-    parent.send.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+    interaction.followup.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_done_private_thread_delete_reason_and_audit_withhold_actor(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="private")
-    thread.type = 12
-    actor = _done_interaction(thread, user_id=456, user_name="SECRET_ACTOR").user
+async def test_done_slash_propagates_delete_cancellation(adapter):
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    thread.delete.side_effect = asyncio.CancelledError()
+    interaction = _done_interaction(thread)
 
-    result = await adapter._complete_done_thread_delete(
-        thread=thread,
-        acting_user=actor,
-    )
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._handle_done_slash(interaction)
 
-    assert result["success"] is True
-    reason = thread.delete.await_args.kwargs["reason"]
-    audit = parent.send.await_args.args[0]
-    assert "SECRET_ACTOR" not in reason
-    assert "SECRET_ACTOR" not in audit
-    assert "456" not in audit
-    assert "private" in reason.lower()
-    assert "private thread" in audit.lower()
-
-
-@pytest.mark.asyncio
-async def test_done_reports_post_delete_audit_failure_without_suggesting_retry(adapter):
-    parent = SimpleNamespace(
-        id=100,
-        name="system-ops",
-        send=AsyncMock(side_effect=RuntimeError("audit unavailable")),
-    )
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
-
-    result = await adapter._complete_done_thread_delete(
-        thread=thread,
-        acting_user=_done_interaction(thread).user,
-    )
-
-    assert result["success"] is True
-    assert "audit failed" in result["warning"]
-    thread.delete.assert_awaited_once()
+    interaction.followup.send.assert_not_awaited()
