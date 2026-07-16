@@ -64,6 +64,8 @@ except ModuleNotFoundError:
 import os
 import sys
 
+from hermes_cli.macos_stderr import install_macos_malloc_stderr_filter
+
 
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
@@ -12921,6 +12923,11 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    # macOS libmalloc can write a known-benign diagnostic directly to fd 2 in
+    # forked children. Install the narrow fd-level filter before startup work
+    # begins so descendants inherit it; every unrelated stderr byte is kept.
+    install_macos_malloc_stderr_filter()
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
