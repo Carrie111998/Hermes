@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -67,7 +68,7 @@ class JobFields:
 def _strip_html(text: Optional[str]) -> Optional[str]:
     if not text:
         return text
-    return _TAG_RE.sub("", text).strip()
+    return html.unescape(_TAG_RE.sub("", text).strip())
 
 
 def _iter_jsonld_objects(html: str):
@@ -130,8 +131,8 @@ def _salary_from(node: dict) -> Optional[str]:
     return None
 
 
-def parse_job_html(html: str) -> JobFields:
-    node = _first_jobposting(html)
+def parse_job_html(page_html: str) -> JobFields:
+    node = _first_jobposting(page_html)
     if node:
         org = node.get("hiringOrganization")
         company = org.get("name") if isinstance(org, dict) else (
@@ -148,12 +149,12 @@ def parse_job_html(html: str) -> JobFields:
             return jf
 
     # Fallback: OpenGraph / <title>.
-    og = {k.lower(): v for k, v in _OG_RE.findall(html)}
-    title = og.get("title")
+    og = {k.lower(): v for k, v in _OG_RE.findall(page_html)}
+    title = html.unescape(og["title"]) if og.get("title") else None
     if not title:
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+        m = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.IGNORECASE | re.DOTALL)
         title = _strip_html(m.group(1)) if m else None
-    company = og.get("site_name")
+    company = html.unescape(og["site_name"]) if og.get("site_name") else None
     if title:
         return JobFields(title=title, company=company, enrichment_status="partial")
     return JobFields(enrichment_status="failed")
@@ -175,7 +176,7 @@ def _default_fetch(url: str) -> str:
 def extract_job(url: str, *, fetch: Optional[Callable[[str], str]] = None) -> JobFields:
     fetcher = fetch or _default_fetch
     try:
-        html = fetcher(url)
+        page_html = fetcher(url)
     except Exception:  # noqa: BLE001 — graceful fallback to URL-only
         return JobFields(enrichment_status="failed")
-    return parse_job_html(html)
+    return parse_job_html(page_html)

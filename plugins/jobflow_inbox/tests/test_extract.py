@@ -69,3 +69,39 @@ def test_extract_job_fetch_error_returns_failed():
 def test_extract_job_uses_injected_fetch():
     jf = extract.extract_job("https://x.test/job/1", fetch=lambda u: _read("jsonld_full.html"))
     assert jf.title == "Senior Data Engineer"
+
+
+def test_jsonld_decodes_html_entities():
+    html = """
+    <script type="application/ld+json">
+    {"@type": "JobPosting",
+     "title": "Head of Data &amp; BI Platform Engineering",
+     "hiringOrganization": {"name": "Pfizer &amp; Seagen"},
+     "description": "Own the &lt;data&gt; roadmap &amp; strategy."}
+    </script>
+    """
+    jf = extract.parse_job_html(html)
+    assert jf.enrichment_status == "enriched"
+    assert jf.title == "Head of Data & BI Platform Engineering"
+    assert jf.company == "Pfizer & Seagen"
+    assert jf.description == "Own the <data> roadmap & strategy."
+
+
+def test_og_fallback_decodes_html_entities():
+    html = """
+    <html><head>
+    <meta property="og:title" content="Head of Data &amp; BI at Globex" />
+    <meta property="og:site_name" content="Globex &amp; Co Careers" />
+    </head></html>
+    """
+    jf = extract.parse_job_html(html)
+    assert jf.enrichment_status == "partial"
+    assert jf.title == "Head of Data & BI at Globex"
+    assert jf.company == "Globex & Co Careers"
+
+
+def test_title_tag_fallback_decodes_html_entities():
+    html = "<html><head><title>Head of Data &amp; BI &mdash; Initech</title></head></html>"
+    jf = extract.parse_job_html(html)
+    assert jf.enrichment_status == "partial"
+    assert jf.title == "Head of Data & BI — Initech"
