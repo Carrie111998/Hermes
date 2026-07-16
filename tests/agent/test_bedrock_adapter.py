@@ -1303,6 +1303,57 @@ class TestBedrockContextProbe:
             assert get_bedrock_context_length(
                 "anthropic.claude-opus-4-6", region="eu-central-1") == 1_000_000
 
+    def test_claude_fable_5_is_1m(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-fable-5") == 1_000_000
+
+    def test_claude_sonnet_5_is_1m(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-sonnet-5") == 1_000_000
+
+    def test_claude_opus_4_8_is_1m(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-opus-4-8") == 1_000_000
+
+    def test_claude_opus_4_7_is_1m(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        assert get_bedrock_context_length("anthropic.claude-opus-4-7") == 1_000_000
+
+    def test_1m_models_regional_inference_profiles_resolve(self):
+        """Geo/global inference-profile IDs must hit the same 1M table entries.
+
+        IDs match the AWS Bedrock model cards, e.g.
+        https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-fable-5.html
+        """
+        from agent.bedrock_adapter import get_bedrock_context_length
+        for profile_id in (
+            "us.anthropic.claude-fable-5",
+            "global.anthropic.claude-fable-5",
+            "us.anthropic.claude-sonnet-5",
+            "eu.anthropic.claude-sonnet-5",
+            "au.anthropic.claude-sonnet-5",
+            "us.anthropic.claude-opus-4-8",
+            "jp.anthropic.claude-opus-4-8",
+            "global.anthropic.claude-opus-4-7",
+        ):
+            assert get_bedrock_context_length(profile_id) == 1_000_000, profile_id
+
+    def test_sonnet_5_does_not_shadow_sonnet_4_x(self):
+        """Longest-key matching must keep versioned 4.x IDs on their own entries."""
+        from agent.bedrock_adapter import get_bedrock_context_length, BEDROCK_CONTEXT_LENGTHS
+        # sonnet-4-5 (200K) must not be shadowed by the sonnet-5 (1M) entry.
+        assert get_bedrock_context_length("us.anthropic.claude-sonnet-4-5") == 200_000
+        # And the 4-6 ID must resolve via its own table entry, not the sonnet-5 one.
+        assert get_bedrock_context_length("us.anthropic.claude-sonnet-4-6") == \
+            BEDROCK_CONTEXT_LENGTHS["anthropic.claude-sonnet-4-6"]
+
+    def test_opus_4_8_does_not_shadow_opus_4_x(self):
+        from agent.bedrock_adapter import get_bedrock_context_length, BEDROCK_CONTEXT_LENGTHS
+        # Generic opus-4 (200K) must not be shadowed by opus-4-8 (1M).
+        assert get_bedrock_context_length("anthropic.claude-opus-4-20250514-v1:0") == 200_000
+        assert get_bedrock_context_length("us.anthropic.claude-opus-4-6") == \
+            BEDROCK_CONTEXT_LENGTHS["anthropic.claude-opus-4-6"]
+
 
 # ---------------------------------------------------------------------------
 # Tool-calling capability detection
