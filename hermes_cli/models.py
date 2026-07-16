@@ -4333,14 +4333,47 @@ def github_model_reasoning_efforts(
     return _github_reasoning_efforts_for_model_id(str(model_id or normalized))
 
 
+def _catalog_model_ids(payload: Any) -> list[str]:
+    """Extract callable model identifiers from common catalog response shapes."""
+    native_models = False
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        items = payload["data"]
+    elif isinstance(payload, dict) and isinstance(payload.get("models"), list):
+        items = payload["models"]
+        native_models = True
+    else:
+        return []
+
+    model_ids: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if native_models and str(item.get("type") or "").lower() in {
+            "embedding",
+            "embeddings",
+        }:
+            continue
+        model_id = item.get("key") or item.get("id")
+        if isinstance(model_id, str) and model_id.strip():
+            model_ids.append(model_id.strip())
+    return model_ids
+
+
 def probe_api_models(
     api_key: Optional[str],
     base_url: Optional[str],
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
     request_headers: Optional[dict[str, str]] = None,
+    models_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """Probe a ``/models`` endpoint with light URL heuristics.
+
+    When ``models_url`` is provided, it is treated as the complete catalog URL
+    and the inference base URL is left untouched. The usual ``/v1`` fallback is
+    only used when no explicit catalog URL is configured.
 
     For ``anthropic_messages`` mode, uses ``x-api-key`` and
     ``anthropic-version`` headers (Anthropic's native auth) instead of
@@ -4348,7 +4381,8 @@ def probe_api_models(
     identical, so the same parser works for both.
     """
     normalized = (base_url or "").strip().rstrip("/")
-    if not normalized:
+    explicit_models_url = (models_url or "").strip()
+    if not normalized and not explicit_models_url:
         return {
             "models": None,
             "probed_url": None,
@@ -4357,7 +4391,7 @@ def probe_api_models(
             "used_fallback": False,
         }
 
-    if _is_github_models_base_url(normalized):
+    if not explicit_models_url and _is_github_models_base_url(normalized):
         models = _fetch_github_models(api_key=api_key, timeout=timeout)
         return {
             "models": models,
@@ -4367,18 +4401,22 @@ def probe_api_models(
             "used_fallback": False,
         }
 
-    if normalized.endswith("/v1"):
+    if explicit_models_url:
+        alternate_base = ""
+        candidates: list[tuple[str, bool]] = [(normalized, False)]
+    elif normalized.endswith("/v1"):
         alternate_base = normalized[:-3].rstrip("/")
+        candidates = [(normalized, False)]
     else:
         alternate_base = normalized + "/v1"
-
-    candidates: list[tuple[str, bool]] = [(normalized, False)]
-    if alternate_base and alternate_base != normalized:
+        candidates = [(normalized, False)]
+    if not explicit_models_url and alternate_base and alternate_base != normalized:
         candidates.append((alternate_base, True))
 
     tried: list[str] = []
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
+    header_url = explicit_models_url or normalized
+    if urllib.parse.urlparse(header_url).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{_HERMES_VERSION}"
     if api_key and api_mode == "anthropic_messages":
         headers["x-api-key"] = api_key
@@ -4395,17 +4433,21 @@ def probe_api_models(
         headers.update(normalize_extra_headers(request_headers))
 
     for candidate_base, is_fallback in candidates:
-        url = candidate_base.rstrip("/") + "/models"
+        url = explicit_models_url or candidate_base.rstrip("/") + "/models"
         tried.append(url)
         req = urllib.request.Request(url, headers=headers)
         try:
             with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
                 return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "models": _catalog_model_ids(data),
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
-                    "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
+                    "suggested_base_url": (
+                        None
+                        if explicit_models_url
+                        else alternate_base if alternate_base != candidate_base else normalized
+                    ),
                     "used_fallback": is_fallback,
                 }
         except Exception:
@@ -4413,9 +4455,17 @@ def probe_api_models(
 
     return {
         "models": None,
-        "probed_url": tried[0] if tried else normalized.rstrip("/") + "/models",
+        "probed_url": (
+            tried[0]
+            if tried
+            else explicit_models_url or normalized.rstrip("/") + "/models"
+        ),
         "resolved_base_url": normalized,
-        "suggested_base_url": alternate_base if alternate_base != normalized else None,
+        "suggested_base_url": (
+            None
+            if explicit_models_url
+            else alternate_base if alternate_base != normalized else None
+        ),
         "used_fallback": False,
     }
 
@@ -4677,8 +4727,12 @@ def fetch_api_models(
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
     headers: Optional[dict[str, str]] = None,
+    models_url: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fetch the list of available model IDs from the provider's ``/models`` endpoint.
+
+    ``models_url`` may override the complete catalog URL independently of the
+    inference ``base_url``.
 
     Returns a list of model ID strings, or ``None`` if the endpoint could not
     be reached (network error, timeout, auth failure, etc.).
@@ -4689,6 +4743,7 @@ def fetch_api_models(
         timeout=timeout,
         api_mode=api_mode,
         request_headers=headers,
+        models_url=models_url,
     ).get("models")
 
 
@@ -4741,6 +4796,7 @@ def cached_fetch_api_models(
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
     headers: Optional[dict[str, str]] = None,
+    models_url: Optional[str] = None,
     force_refresh: bool = False,
     cache_only: bool = False,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
@@ -4751,7 +4807,9 @@ def cached_fetch_api_models(
     stale-while-revalidate tier — but keys ``provider_models_cache.json``
     off ``custom:<base_url>`` instead of a ``PROVIDER_REGISTRY`` slug, since
     custom endpoints (named ``custom_providers`` rows, bare
-    ``provider: custom``, and per-endpoint-map entries) have none. Same
+    ``provider: custom``, and per-endpoint-map entries) have none. Explicit
+    catalog URLs extend that key so providers sharing an inference endpoint
+    cannot reuse each other's discovered catalog. Same
     stale-beats-nothing fallback policy: a live-fetch failure serves the
     last same-fingerprint result rather than an empty list. Returns whatever
     :func:`fetch_api_models` would (a list or ``None``); corrupt cache rows
@@ -4765,16 +4823,24 @@ def cached_fetch_api_models(
     reaches the picker instead of collapsing to the config-declared subset.
     """
     normalized_url = str(base_url or "").strip().rstrip("/").lower()
-    if not normalized_url:
+    normalized_models_url = str(models_url or "").strip().rstrip("/").lower()
+    if not normalized_url and not normalized_models_url:
         if cache_only:
             return None
         # No base_url means nothing to key the cache on — fall through to a
         # live call so callers keep getting fetch_api_models' own behavior.
         return fetch_api_models(
-            api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+            api_key,
+            base_url,
+            timeout=timeout,
+            api_mode=api_mode,
+            headers=headers,
+            models_url=models_url,
         )
 
     cache_key = f"custom:{normalized_url}"
+    if normalized_models_url:
+        cache_key += f"|models:{normalized_models_url}"
     fp = _custom_endpoint_fingerprint(api_key, api_mode, headers)
     cache = _load_provider_models_cache()
     entry = cache.get(cache_key)
@@ -4804,6 +4870,7 @@ def cached_fetch_api_models(
                 live = fetch_api_models(
                     api_key, base_url,
                     timeout=timeout, api_mode=api_mode, headers=headers,
+                    models_url=models_url,
                 )
                 if not live:
                     return None
@@ -4813,7 +4880,12 @@ def cached_fetch_api_models(
             return list(entry["models"])
 
     live = fetch_api_models(
-        api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
+        api_key,
+        base_url,
+        timeout=timeout,
+        api_mode=api_mode,
+        headers=headers,
+        models_url=models_url,
     )
     if live:
         cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}
@@ -4967,6 +5039,7 @@ def validate_requested_model(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     api_mode: Optional[str] = None,
+    models_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Validate a ``/model`` value for the active provider.
@@ -5062,9 +5135,14 @@ def validate_requested_model(
     if normalized == "custom" or normalized.startswith("custom:"):
         # Try probing with correct auth for the api_mode.
         if api_mode == "anthropic_messages":
-            probe = probe_api_models(api_key, base_url, api_mode=api_mode)
+            probe = probe_api_models(
+                api_key,
+                base_url,
+                api_mode=api_mode,
+                models_url=models_url,
+            )
         else:
-            probe = probe_api_models(api_key, base_url)
+            probe = probe_api_models(api_key, base_url, models_url=models_url)
         api_models = probe.get("models")
         if api_models is not None:
             if requested_for_lookup in set(api_models):

@@ -621,6 +621,7 @@ def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch)
             "name": "my-gateway",
             "api_key": "sk-gateway-key",
             "base_url": "https://gateway.example.com/v1",
+            "models_url": "https://catalog.example.com/models",
             "model": "gateway-model-a",
             "models": {
                 "gateway-model-a": {"context_length": 128000},
@@ -650,7 +651,12 @@ def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch)
         (
             "sk-gateway-key",
             "https://gateway.example.com/v1",
-            {"timeout": 5.0, "api_mode": None, "headers": None},
+            {
+                "timeout": 5.0,
+                "api_mode": None,
+                "headers": None,
+                "models_url": "https://catalog.example.com/models",
+            },
         )
     ], "fetch_api_models must be called with the custom provider's credentials"
     assert gateway_prov["models"] == [
@@ -733,6 +739,7 @@ def test_resolve_custom_provider_passes_key_env():
             {
                 "name": "token-plan",
                 "base_url": "https://token-plan-sgp.xiaomimimo.com/v1",
+                "models_url": "https://catalog.xiaomimimo.com/models",
                 "key_env": "XIAOMI_MIMO_API_KEY",
                 "model": "mimo-v2-pro",
             }
@@ -742,6 +749,7 @@ def test_resolve_custom_provider_passes_key_env():
     assert resolved is not None
     assert resolved.api_key_env_vars == ("XIAOMI_MIMO_API_KEY",)
     assert resolved.base_url == "https://token-plan-sgp.xiaomimimo.com/v1"
+    assert resolved.models_url == "https://catalog.xiaomimimo.com/models"
 
 
 def test_discovered_models_auto_saved_to_cache(monkeypatch):

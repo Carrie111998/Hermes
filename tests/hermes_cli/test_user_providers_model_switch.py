@@ -169,6 +169,68 @@ def test_list_authenticated_providers_uses_live_models_for_user_provider(monkeyp
     assert user_prov["total_models"] == 2
 
 
+def test_user_provider_live_model_probe_uses_models_url(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    calls = []
+
+    def fake_fetch_api_models(api_key, base_url, **kwargs):
+        calls.append((api_key, base_url, kwargs))
+        return ["catalog-model"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fake_fetch_api_models)
+    monkeypatch.setattr(
+        "hermes_cli.models._load_provider_models_cache", lambda: {}
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="remote-lm-studio",
+        user_providers={
+            "remote-lm-studio": {
+                "base_url": "https://lm.example.com/v1",
+                "models_url": "https://lm.example.com/api/v1/models",
+                "api_key": "local-key",
+            }
+        },
+        custom_providers=[],
+    )
+
+    user_prov = next(p for p in providers if p.get("is_user_defined"))
+    assert calls == [
+        (
+            "local-key",
+            "https://lm.example.com/v1",
+            {
+                "timeout": 5.0,
+                "api_mode": None,
+                "headers": None,
+                "models_url": "https://lm.example.com/api/v1/models",
+            },
+        )
+    ]
+    assert user_prov["models"] == ["catalog-model"]
+
+
+def test_resolve_user_provider_preserves_models_url():
+    from hermes_cli.providers import resolve_provider_full
+
+    provider = resolve_provider_full(
+        "private-gateway",
+        {
+            "private-gateway": {
+                "base_url": "https://inference.example.com/v1",
+                "models_url": "https://catalog.example.com/models",
+            }
+        },
+        [],
+    )
+
+    assert provider is not None
+    assert provider.base_url == "https://inference.example.com/v1"
+    assert provider.models_url == "https://catalog.example.com/models"
+
+
 
 
 

@@ -1671,14 +1671,24 @@ def switch_model(
 
     provider_changed = target_provider != current_provider
     provider_label = get_label(target_provider)
+    models_url = ""
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
+    target_pdef: ProviderDef | None = None
     if target_provider.startswith("custom:"):
-        custom_pdef = resolve_provider_full(
+        target_pdef = resolve_provider_full(
             target_provider,
             user_providers,
             custom_providers,
         )
+    elif isinstance(user_providers, dict) and target_provider in user_providers:
+        from hermes_cli.providers import resolve_user_provider
+
+        target_pdef = resolve_user_provider(target_provider, user_providers)
+    if target_pdef is not None:
+        models_url = target_pdef.models_url
+    if target_provider.startswith("custom:"):
+        custom_pdef = target_pdef
         if custom_pdef is not None:
             provider_label = custom_pdef.name
 
@@ -1701,6 +1711,7 @@ def switch_model(
             if _user_pdef is None:
                 _user_pdef = _ruser(target_provider, user_providers)
         if _user_pdef is not None and _user_pdef.base_url:
+            models_url = _user_pdef.models_url
             _ucfg = (user_providers or {}).get(explicit_provider.strip().lower()) \
                 or (user_providers or {}).get(target_provider) or {}
             _ukey = str(_ucfg.get("api_key", "") or "").strip()
@@ -1802,12 +1813,17 @@ def switch_model(
 
     # --- Validate ---
     try:
+        validation_options: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "api_mode": api_mode or None,
+        }
+        if models_url:
+            validation_options["models_url"] = models_url
         validation = validate_requested_model(
             new_model,
             target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
+            **validation_options,
         )
     except Exception as e:
         validation = {
@@ -2692,6 +2708,7 @@ def list_authenticated_providers(
                 or ep_cfg.get("url", "")
                 or ""
             )
+            models_url = str(ep_cfg.get("models_url") or "").strip()
             key_env = str(ep_cfg.get("key_env", "") or "").strip()
             inline_api_key = str(ep_cfg.get("api_key", "") or "").strip()
             api_mode = str(
@@ -2712,7 +2729,13 @@ def list_authenticated_providers(
             # URL, routed by header) and must keep distinct picker rows.
             entry_extra_headers = _extra_headers_from_config(ep_cfg)
             headers_identity = tuple(sorted(entry_extra_headers.items()))
-            group_key = (api_url_norm, credential_identity, api_mode, headers_identity)
+            group_key = (
+                api_url_norm,
+                models_url,
+                credential_identity,
+                api_mode,
+                headers_identity,
+            )
 
             # ``default_model`` is the legacy key; ``model`` matches what
             # custom_providers entries use, so accept either.
@@ -2758,6 +2781,7 @@ def list_authenticated_providers(
                     "slug": grp_slug,
                     "name": grp_display or display_name,
                     "api_url": api_url,
+                    "models_url": models_url,
                     "models": [],
                     "has_explicit_models": False,
                     "ep_cfg": ep_cfg,  # used below for discover_models / api_key
@@ -2864,6 +2888,7 @@ def list_authenticated_providers(
                         timeout=1.5 if for_picker else 5.0,  # picker: fail fast so a slow custom endpoint doesn't block /model
                         api_mode=grp.get("api_mode") or None,
                         headers=_extra_headers_from_config(ep_cfg) or None,
+                        models_url=grp.get("models_url") or None,
                         cache_only=not _probe_live,
                     )
                     if live_models:
@@ -2990,6 +3015,7 @@ def list_authenticated_providers(
                 or entry.get("api", "")
                 or ""
             ).strip().rstrip("/")
+            models_url = str(entry.get("models_url") or "").strip()
             if not raw_name or not api_url:
                 continue
             inline_api_key = (entry.get("api_key") or "").strip()
@@ -3030,7 +3056,14 @@ def list_authenticated_providers(
                     _display_prefix = _display_prefix.split(sep)[0].strip()
                     break
 
-            group_key = (api_url, credential_identity, api_mode, headers_identity, _display_prefix.lower())
+            group_key = (
+                api_url,
+                models_url,
+                credential_identity,
+                api_mode,
+                headers_identity,
+                _display_prefix.lower(),
+            )
             if group_key not in groups:
                 # Reuse the prefix computed above as the row display name;
                 # fall back to the raw name if stripping left it empty.
@@ -3042,6 +3075,7 @@ def list_authenticated_providers(
                     "name": display_name,
                     "api_url": api_url,
                     "api_key": api_key,
+                    "models_url": models_url,
                     "models": [],
                     "has_explicit_models": False,
                     "discover_models": discover,
@@ -3207,6 +3241,7 @@ def list_authenticated_providers(
                         timeout=1.5 if for_picker else 5.0,  # picker: fail fast so a slow custom endpoint doesn't block /model
                         api_mode=grp.get("api_mode") or None,
                         headers=grp.get("extra_headers") or None,
+                        models_url=grp.get("models_url") or None,
                         cache_only=not _probe_live,
                     )
                     if live_models:
