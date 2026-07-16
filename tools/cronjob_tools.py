@@ -1556,6 +1556,16 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "allow_silent": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Default: True (the agent may suppress delivery by responding with [SILENT] when there's nothing new to report). "
+                    "Set False to opt out of [SILENT] suppression for AGENT-generated final responses — the job will ALWAYS deliver its response, even when the agent emits [SILENT]. "
+                    "Use this for recurring briefings / heartbeats that should always send an all-clear, never go quiet. "
+                    "Note: internal silences from no_agent script jobs (empty stdout or wakeAgent=false) remain silent regardless of this flag — the flag only controls whether an LLM agent's explicit [SILENT] response is honoured."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -1615,6 +1625,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        allow_silent=args.get("allow_silent"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),
