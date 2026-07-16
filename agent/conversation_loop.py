@@ -1838,6 +1838,11 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
+        # A malformed/repeated provider 402 must not cause an unbounded
+        # same-request retry cycle. One strictly lower clamp is permitted;
+        # subsequent 402s use the normal bounded rate-limit path.
+        affordable_clamp_attempts = 0
+        max_affordable_clamp_attempts = 1
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
@@ -4022,14 +4027,33 @@ def run_conversation(
                 )
                 if affordable_tokens is not None:
                     safe_out = max(1, affordable_tokens - 64)
-                    agent._ephemeral_max_output_tokens = safe_out
+                    # Bound the clamp: only retry if it STRICTLY lowers the cap and we
+                    # still have clamp budget. A provider that keeps returning
+                    # "can only afford N" must not spin the loop forever (the old code
+                    # reset retry_count=0). Once budget is spent, fall through to the
+                    # standard rate-limit path below (fallback/backoff), bounded by
+                    # max_retries.
+                    _cur_cap = getattr(agent, "_ephemeral_max_output_tokens", None)
+                    _clamp_helps = _cur_cap is None or safe_out < _cur_cap
+                    if (
+                        affordable_clamp_attempts < max_affordable_clamp_attempts
+                        and _clamp_helps
+                    ):
+                        affordable_clamp_attempts += 1
+                        agent._ephemeral_max_output_tokens = safe_out
+                        agent._buffer_vprint(
+                            f"⚠️  Requested max_tokens exceeds affordable balance — "
+                            f"retrying with max_tokens={safe_out:,} "
+                            f"(affordable={affordable_tokens:,}, "
+                            f"attempt {affordable_clamp_attempts}/"
+                            f"{max_affordable_clamp_attempts})"
+                        )
+                        continue
                     agent._buffer_vprint(
-                        f"⚠️  Requested max_tokens exceeds affordable balance — "
-                        f"retrying with max_tokens={safe_out:,} "
-                        f"(affordable={affordable_tokens:,})"
+                        "⚠️  Affordable-tokens clamp did not resolve the 402 — "
+                        "handing off to fallback/backoff."
                     )
-                    retry_count = 0
-                    continue
+                    # No retry_count reset: fall through to rate-limit handling.
 
                 # Eager fallback for rate-limit errors (429 or quota exhaustion)
                 # and transport errors (connection failure / timeout / provider
