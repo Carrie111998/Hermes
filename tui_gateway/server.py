@@ -1581,12 +1581,11 @@ def _ensure_session_db_row(session: dict) -> None:
     Uses INSERT OR IGNORE under the hood, so re-calls (and the AIAgent's own
     lazy create) are no-ops.
 
-    Only an *explicitly chosen* workspace is persisted as the session's cwd.
-    The agent still runs in the auto-detected directory (session["cwd"]), but
-    we don't stamp that onto the row — otherwise every session the user never
-    picked a folder for gets grouped under whatever directory the desktop
-    happened to launch in (e.g. "desktop"). Leaving it null groups them under
-    "No workspace", which is the desired default.
+    Persist the resolved cwd that this session actually uses. It may come from
+    an explicit workspace choice or from the configured/default launch cwd;
+    either way it is the authoritative execution context needed to resume the
+    conversation safely in another harness. Drafts still leave no clutter
+    because this function is called only on first meaningful activity.
     """
     key = session.get("session_key")
     if not key:
@@ -1669,7 +1668,7 @@ def _ensure_session_db_row(session: dict) -> None:
             model=row_model,
             model_config=model_config or None,
             parent_session_id=parent_session_id,
-            cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            cwd=str(session.get("cwd") or "").strip() or None,
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)

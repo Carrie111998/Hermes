@@ -2246,9 +2246,13 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     ]
 
 
-def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
-    """Without an explicit workspace, cwd is left null so the session groups
-    under "No workspace" rather than the gateway's launch directory."""
+def test_ensure_session_db_row_persists_resolved_session_cwd(monkeypatch, tmp_path):
+    """The cwd actually used by a meaningful TUI session is durable.
+
+    The resolved cwd may come from ``terminal.cwd`` rather than an explicit
+    workspace picker selection.  It is still the authoritative execution
+    context and must survive so another harness can continue the session.
+    """
     created = []
 
     class _FakeDB:
@@ -2263,7 +2267,13 @@ def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": None}
+        {
+            "key": "k1",
+            "source": "tui",
+            "model": "test-model",
+            "model_config": None,
+            "cwd": str(tmp_path),
+        }
     ]
 
 
