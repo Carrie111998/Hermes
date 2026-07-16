@@ -43,6 +43,22 @@ whatsapp:
 compression:
   enabled: true
 
+# Voix Discord — ElevenLabs des deux côtés, une seule clé (ELEVENLABS_API_KEY,
+# var Railway). TTS : bulles vocales (/voice on|tts) + voice channels
+# (/voice join). STT : Scribe transcrit ce qui est dit dans le voice channel.
+# Sans le bloc stt, l'auto-sélection préférerait groq/openai si leurs clés
+# existent (tools/transcription_tools.py) — on pin donc explicitement.
+# eleven_multilingual_v2 gère le français ; voice_id = Adam (défaut), à
+# remplacer par une voix FR de la bibliothèque ElevenLabs si besoin.
+tts:
+  provider: "elevenlabs"
+  elevenlabs:
+    voice_id: "pNInz6obpgDQGcFmaJgB"   # Adam
+    model_id: "eleven_multilingual_v2"
+
+stt:
+  provider: "elevenlabs"               # Scribe — même clé que le TTS
+
 # Kanban multi-agent coordination. This (default) profile runs the foreground
 # gateway on Railway, so it hosts the dispatcher that claims tasks and spawns
 # workers (`hermes -p <assignee> chat -q "work kanban task <id>"`) into the

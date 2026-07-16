@@ -40,7 +40,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # (each ~a few MB); see `tesseract --list-langs` at runtime.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg libopus0 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils \
     tesseract-ocr tesseract-ocr-eng tesseract-ocr-fra poppler-utils && \
     rm -rf /var/lib/apt/lists/*
 
@@ -235,6 +235,14 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 # below keeps the packages readable/executable by the runtime hermes user.
 RUN uv pip install --no-cache-dir pytesseract pillow pdf2image pymupdf pymupdf4llm \
     beautifulsoup4 tinycss2
+
+# ---------- ElevenLabs TTS (Discord voice) ----------
+# tts.provider=elevenlabs in docker/railway-config.yaml. The SDK is normally
+# lazy-installed at first use (tools/lazy_deps.py "tts.elevenlabs"), but a
+# runtime install lands in the image-layer venv and is lost on every container
+# recreate — same trap as the OCR deps above. Pin matches the tts-premium
+# extra in pyproject.toml.
+RUN uv pip install --no-cache-dir elevenlabs==1.59.0
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
