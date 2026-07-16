@@ -143,7 +143,7 @@ def test_sidebar_skill_metadata_matches_the_personal_codex_contract() -> None:
 def test_sidebar_skill_encodes_the_single_batch_native_delivery_protocol() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "session_sidebar_pending(limit=5)" in skill
+    assert "session_sidebar_pending(limit=1)" in skill
     assert "exactly once" in skill
     assert "no user-facing message" in skill
     assert "list" in skill.casefold() and "projects" in skill.casefold()
@@ -193,6 +193,19 @@ def test_sidebar_skill_unconditionally_renames_every_task_before_commit() -> Non
         "On rename failure, call `session_sidebar_fail` with `rename_failed`; "
         "do not commit and do not create a replacement task."
     ) in rename_step
+
+
+def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
+
+    assert "returned `threadId`" in create_step
+    assert "`read_thread`" in create_step
+    assert "same thread ID" in create_step
+    assert "status is `idle`" in create_step
+    assert "60 seconds" in create_step
+    assert "`native_task_not_indexed`" in create_step
+    assert create_step.index("`read_thread`") > create_step.index("returned `threadId`")
 
 
 def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
