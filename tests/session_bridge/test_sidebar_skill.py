@@ -140,10 +140,13 @@ def test_sidebar_skill_metadata_matches_the_personal_codex_contract() -> None:
     )
 
 
-def test_sidebar_skill_encodes_the_single_batch_native_delivery_protocol() -> None:
+def test_sidebar_skill_encodes_the_bounded_parallel_native_delivery_protocol() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "session_sidebar_pending(limit=1)" in skill
+    assert "session_sidebar_pending(limit=5)" in skill
+    assert "at most five" in skill
+    assert "concurrently across leases" in skill
+    assert "preserve the procedure order within each lease" in skill
     assert "exactly once" in skill
     assert "no user-facing message" in skill
     assert "list" in skill.casefold() and "projects" in skill.casefold()
@@ -169,7 +172,7 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
 
     assert skill.index("session_status") < skill.index("list_projects({})")
     assert skill.index("list_projects({})") < skill.index(
-        "session_sidebar_pending(limit=1)"
+        "session_sidebar_pending(limit=5)"
     )
     assert "do not call `session_sidebar_pending`" in skill
     assert "no job attempt is consumed" in skill
@@ -855,7 +858,7 @@ def test_process_lock_times_out_without_stealing_held_descriptor(
         "skills, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
         "with _filesystem_install_lock(skills):\n"
         "    ready.write_text('ready', encoding='utf-8')\n"
-        "    time.sleep(0.8)\n",
+        "    time.sleep(5.0)\n",
         skills,
         ready,
     )
