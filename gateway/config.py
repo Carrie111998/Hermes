@@ -1011,6 +1011,19 @@ class GatewayConfig:
     # raising this fleet-wide would only delay genuine-wedge recovery.
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
 
+    # Routing-only multiplexing (opt-in refinement of multiplex_profiles; no
+    # effect unless multiplex_profiles is on). When True, the gateway does NOT
+    # start secondary-profile adapters — every profile shares the default
+    # profile's connections and credentials. Secondary profiles are still
+    # REGISTERED: ``_profile_adapters[profile]`` points at the shared adapter
+    # map and each profile gets its own PairingStore, so a stamped
+    # ``source.profile`` resolves to a live adapter for authorization and
+    # egress instead of failing closed. For deployments that route personas
+    # per-chat over ONE shared connection via ``gateway.profile_routes``
+    # (e.g. one Matrix account serving a different profile per room), where
+    # per-profile adapters could only poll the same credential twice.
+    multiplex_routing_only: bool = False
+
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
 
@@ -1153,6 +1166,7 @@ class GatewayConfig:
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
             "loop_watchdog_probe_timeout_s": self.loop_watchdog_probe_timeout_s,
             "loop_watchdog_max_strikes": self.loop_watchdog_max_strikes,
+            "multiplex_routing_only": self.multiplex_routing_only,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -1284,6 +1298,11 @@ class GatewayConfig:
         env_multiplex = _env_multiplex_profiles_override()
         if env_multiplex is not None:
             multiplex_profiles = env_multiplex
+        multiplex_routing_only = data.get("multiplex_routing_only")
+        if multiplex_routing_only is None and isinstance(nested_gateway, dict):
+            # Also honor gateway.multiplex_routing_only, mirroring
+            # gateway.multiplex_profiles above.
+            multiplex_routing_only = nested_gateway.get("multiplex_routing_only")
         if "max_concurrent_sessions" in data:
             max_concurrent_raw = data.get("max_concurrent_sessions")
             max_concurrent_key = "max_concurrent_sessions"
@@ -1333,6 +1352,7 @@ class GatewayConfig:
             loop_watchdog_probe_interval_s=loop_watchdog_probe_interval_s,
             loop_watchdog_probe_timeout_s=loop_watchdog_probe_timeout_s,
             loop_watchdog_max_strikes=loop_watchdog_max_strikes,
+            multiplex_routing_only=_coerce_bool(multiplex_routing_only, False),
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
@@ -1485,6 +1505,10 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["multiplex_profile_allowlist"] = gateway_section[
                     "multiplex_profile_allowlist"
                 ]
+            # Routing-only refinement: same top-level + nested acceptance as
+            # multiplex_profiles.
+            if "multiplex_routing_only" in yaml_cfg:
+                gw_data["multiplex_routing_only"] = yaml_cfg["multiplex_routing_only"]
 
             # Profile-based routing rules: accept either top-level
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form
@@ -1499,6 +1523,8 @@ def load_gateway_config() -> GatewayConfig:
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
+                if "multiplex_routing_only" in gateway_section and "multiplex_routing_only" not in gw_data:
+                    gw_data["multiplex_routing_only"] = gateway_section["multiplex_routing_only"]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
                 if "systemd_watchdog_seconds" in gateway_section:
