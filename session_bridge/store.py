@@ -2015,6 +2015,7 @@ class SessionBridgeStore:
     def sidebar_delivery_status(self, *, now: float | None = None) -> dict[str, Any]:
         status_time = _finite_number(self._clock() if now is None else now, "now")
         counts = self.sidebar_job_counts()
+        counts["sidebar_excluded"] = self.sidebar_exclusion_counts()["total"]
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None

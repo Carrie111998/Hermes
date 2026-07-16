@@ -2976,6 +2976,28 @@ def test_sidebar_exclusion_recording_is_idempotent_counted_and_bounded(db) -> No
     }
 
 
+def test_sidebar_delivery_status_reports_exclusions_without_degradation(db) -> None:
+    store = SessionBridgeStore(db)
+    candidate = _sidebar_candidate(db, native_id="status-exclusion")
+    store.record_sidebar_exclusion(
+        candidate.source_session_id,
+        candidate.provider,
+        "source_cwd_missing",
+        now=125.0,
+    )
+
+    status = store.sidebar_delivery_status(now=200.0)
+
+    assert status["counts"]["sidebar_excluded"] == 1
+    assert status["recent_error_codes"] == []
+    assert status["oldest_pending_age_seconds"] is None
+    assert status["delivery_latency_seconds"] == {
+        "p50": None,
+        "p95": None,
+        "p99": None,
+    }
+
+
 def test_sidebar_exclusion_replay_fails_closed_on_corrupted_digest(db) -> None:
     store = SessionBridgeStore(db)
     candidate = _sidebar_candidate(db, native_id="corrupt-exclusion")

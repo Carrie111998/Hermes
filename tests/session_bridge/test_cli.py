@@ -85,6 +85,8 @@ class FakeBackend:
             "queued": 0,
             "by_provider": {"claude": 0, "hermes": 0},
             "failed": 0,
+            "excluded": 0,
+            "excluded_by_reason": {"source_cwd_missing": 0},
         }
     )
     calls: list[tuple[Any, ...]] = field(default_factory=list)
@@ -291,6 +293,35 @@ def test_sidebar_backfill_candidate_failures_exit_degraded(
         backend,
     ) == 3
     assert _json_output(capsys)["failed"] == 1
+
+
+@pytest.mark.parametrize("apply", (False, True))
+def test_sidebar_backfill_exclusions_do_not_exit_degraded(
+    capsys: pytest.CaptureFixture[str],
+    apply: bool,
+) -> None:
+    backend = FakeBackend(
+        sidebar_backfill_payload={
+            "mode": "apply" if apply else "dry_run",
+            "days": 30,
+            "limit": 10,
+            "examined": 1,
+            "queued": 0,
+            "by_provider": {"claude": 0, "hermes": 0},
+            "failed": 0,
+            "excluded": 1,
+            "excluded_by_reason": {"source_cwd_missing": 1},
+        }
+    )
+    mode = "--apply" if apply else "--dry-run"
+
+    assert _run(
+        ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
+        backend,
+    ) == 0
+    assert _json_output(capsys)["excluded_by_reason"] == {
+        "source_cwd_missing": 1
+    }
 
 
 def test_sidebar_backfill_rejects_a_limit_above_ten() -> None:
