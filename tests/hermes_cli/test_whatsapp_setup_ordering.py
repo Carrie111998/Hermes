@@ -138,3 +138,41 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
 
     # The skip-rebar branch should have set the env var on its way out.
     assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+
+
+def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monkeypatch):
+    """Fresh setup must pair into the same modern path used by the gateway."""
+    from hermes_cli.main import cmd_whatsapp
+
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/npm")
+
+    original_exists = Path.exists
+
+    def stub_exists(self):
+        if self.name == "node_modules":
+            return True
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", stub_exists)
+
+    paired_session: Path | None = None
+
+    def fake_run(args, *_a, **_kw):
+        nonlocal paired_session
+        if "--pair-only" in args:
+            paired_session = Path(args[args.index("--session") + 1])
+            paired_session.mkdir(parents=True, exist_ok=True)
+            (paired_session / "creds.json").write_text("{}")
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with redirect_stdout(io.StringIO()):
+        cmd_whatsapp(MagicMock())
+
+    assert paired_session == isolated_home / "platforms" / "whatsapp" / "session"
+    assert not (isolated_home / "whatsapp" / "session").exists()
