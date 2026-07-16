@@ -1,0 +1,5 @@
+name: jobflow_inbox
+version: 1.0.0
+description: "Add a forwarded job posting to the JobFlow pipeline with /job <url> — works on WhatsApp, Telegram, desktop, and email."
+author: "Diego"
+kind: standalone
