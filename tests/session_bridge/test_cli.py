@@ -388,6 +388,27 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
     assert fresh_pending.sidebar_status()["healthy"] is True
 
 
+def test_sidebar_status_preserves_exclusion_count_without_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 0},
+        "counts": {"sidebar_excluded": 7},
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["counts"]["sidebar_excluded"] == 7
+    assert status["healthy"] is True
+    assert status["degraded_reasons"] == []
+
+
 def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

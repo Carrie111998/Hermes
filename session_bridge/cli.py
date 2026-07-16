@@ -1070,6 +1070,9 @@ def _public_sidebar_status(
         )
         for state in SidebarJobState
     }
+    state_counts["sidebar_excluded"] = _status_count(
+        counts.get("sidebar_excluded", 0)
+    )
     raw_providers = raw.get("eligible_by_provider")
     providers = raw_providers if isinstance(raw_providers, Mapping) else {}
     eligible_by_provider = {
