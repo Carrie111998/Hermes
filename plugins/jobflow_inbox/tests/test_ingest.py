@@ -74,3 +74,55 @@ def test_write_to_tracker_inbox_atomic(tmp_path):
     written = json.loads((inbox / fname).read_text(encoding="utf-8"))
     assert written["type"] == "USER_SUBMITTED_JOB"
     assert not list(inbox.glob("*.tmp"))  # no leftover temp files
+
+
+import datetime
+
+
+class _Ids:
+    def __call__(self):
+        return ("cid00000-1111", "mid00000-2222")
+
+
+def _now():
+    return datetime.datetime(2026, 7, 16, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_ingest_invalid_url(tmp_path):
+    r = ingest.ingest_job("no link", pipeline_path=tmp_path / "p.json",
+                          inbox_dir=tmp_path / "inbox")
+    assert r.status == "invalid"
+    assert "/job <url>" in r.reply
+
+
+def test_ingest_duplicate(tmp_path):
+    p = tmp_path / "p.json"
+    p.write_text(json.dumps({"jobs": {"j": {"url": "https://x.test/a"}}}), encoding="utf-8")
+    r = ingest.ingest_job("https://x.test/a", pipeline_path=p, inbox_dir=tmp_path / "inbox")
+    assert r.status == "duplicate"
+    assert "Already tracking" in r.reply
+
+
+def test_ingest_added_enriched(tmp_path):
+    p = tmp_path / "p.json"
+    p.write_text(json.dumps({"jobs": {}}), encoding="utf-8")
+    inbox = tmp_path / "inbox"
+    jf = extract.JobFields(title="Data Engineer", company="Acme",
+                           enrichment_status="enriched")
+    r = ingest.ingest_job("https://x.test/j/1", pipeline_path=p, inbox_dir=inbox,
+                          extract_fn=lambda u: jf, now=_now, ids=_Ids())
+    assert r.status == "added"
+    assert "Data Engineer" in r.reply and "Acme" in r.reply
+    assert len(list(inbox.glob("*_USER_SUBMITTED_JOB_*.json"))) == 1
+
+
+def test_ingest_url_only_on_failed_extract(tmp_path):
+    p = tmp_path / "p.json"
+    p.write_text(json.dumps({"jobs": {}}), encoding="utf-8")
+    inbox = tmp_path / "inbox"
+    jf = extract.JobFields(enrichment_status="failed")
+    r = ingest.ingest_job("https://x.test/j/2", pipeline_path=p, inbox_dir=inbox,
+                          extract_fn=lambda u: jf, now=_now, ids=_Ids())
+    assert r.status == "url_only"
+    assert "queued the URL only" in r.reply
+    assert len(list(inbox.glob("*_USER_SUBMITTED_JOB_*.json"))) == 1

@@ -86,3 +86,69 @@ def write_to_tracker_inbox(msg: dict, inbox_dir) -> str:
     tmp.write_text(json.dumps(msg, indent=2), encoding="utf-8")
     os.replace(tmp, inbox / fname)
     return fname
+
+
+import datetime
+import uuid
+from dataclasses import dataclass
+
+
+@dataclass
+class IngestResult:
+    status: str
+    reply: str
+
+
+def default_pipeline_path() -> pathlib.Path:
+    from hermes_constants import get_default_hermes_root
+    return get_default_hermes_root() / "profiles" / "tracker" / "workspace" / "pipeline.json"
+
+
+def default_inbox_dir() -> pathlib.Path:
+    from events.paths import mailbox_root
+    return mailbox_root() / "tracker" / "inbox"
+
+
+def _default_ids():
+    return (str(uuid.uuid4()), str(uuid.uuid4()))
+
+
+def _default_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def ingest_job(raw_args, *, surface="", pipeline_path=None, inbox_dir=None,
+               extract_fn=None, now=None, ids=None) -> IngestResult:
+    try:
+        url = extract.find_first_url(raw_args or "")
+        if not url:
+            return IngestResult("invalid",
+                                "That doesn't look like a job URL. Usage: /job <url>")
+
+        pipeline_path = pipeline_path or default_pipeline_path()
+        inbox_dir = inbox_dir or default_inbox_dir()
+        normalized = extract.normalize_url(url)
+
+        if is_duplicate(normalized, pipeline_path):
+            return IngestResult("duplicate",
+                                "ℹ️ Already tracking this one — no duplicate added.")
+
+        jf = (extract_fn or extract.extract_job)(url)
+        cid, message_id = (ids or _default_ids)()
+        ts_iso = (now or _default_now)().isoformat()
+        msg = build_message(jf, url=url, normalized_url=normalized, cid=cid,
+                            message_id=message_id, ts_iso=ts_iso)
+        write_to_tracker_inbox(msg, inbox_dir)
+
+        if jf.enrichment_status == "failed" or not jf.title:
+            return IngestResult(
+                "url_only",
+                f"⚠️ Couldn't read that page — queued the URL only "
+                f"(needs enrichment): {url}")
+        company = f" at {jf.company}" if jf.company else ""
+        return IngestResult(
+            "added",
+            f"✅ Queued *{jf.title}*{company} to your pipeline (fast-tracked).")
+    except Exception as exc:  # noqa: BLE001 — never raise to the gateway
+        logger.warning("jobflow_inbox: ingest_job failed: %s", exc, exc_info=True)
+        return IngestResult("error", "Couldn't queue that job — please retry.")
