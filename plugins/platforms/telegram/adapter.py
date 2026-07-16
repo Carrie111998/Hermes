@@ -55,11 +55,6 @@ def _scoped_gate_env(name: str, default: str = "") -> str:
         return (os.getenv(name) or default).strip()
 
 
-def _redact_proxy_url_for_log(proxy_url: object) -> str:
-    text = "" if proxy_url is None else str(proxy_url)
-    return re.sub(r"(://)[^/@]+@", r"\1***@", text, count=1)
-
-
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -296,6 +291,7 @@ from gateway.platforms.base import (
     cache_video_from_bytes,
     cache_document_from_bytes,
     resolve_proxy_url,
+    safe_url_for_log,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
@@ -3879,7 +3875,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info(
                     "[%s] Proxy detected; passing explicitly to HTTPXRequest: %s",
                     self.name,
-                    _redact_proxy_url_for_log(proxy_url),
+                    safe_url_for_log(proxy_url),
                 )
                 request = HTTPXRequest(
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
