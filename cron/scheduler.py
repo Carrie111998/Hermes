@@ -321,19 +321,41 @@ CRON_EVENT_SUMMARY_MAX_CHARS = 4000
 _event_emitter = None
 
 def _get_event_emitter():
-    """Lazy-load the CronEventEmitter using the gateway's shared EventBus."""
+    """Lazy-load the CronEventEmitter.
+
+    Prefers the gateway's shared EventBus.  When this process is NOT the
+    gateway — ``get_bus()`` is None because ``gateway_integration.startup()``
+    never ran here (e.g. ``hermes serve``/the TUI web server, the dashboard,
+    or a CLI cron run) — fall back to a process-local EventBus on the
+    canonical events DB.  SQLite WAL + busy_timeout makes cross-process
+    writes safe, and FailureClusterDetector's state file was already
+    designed for the cross-process case.
+
+    Before 2026-07-16 the no-gateway-bus case cached the ``False`` sentinel
+    forever, so any non-gateway process that won the jobs.json claim races
+    ran jobs normally while silently dropping every cron_started/
+    cron_completed/cron_failed emit — the multi-hour "emission dark
+    windows" that made watchdog_sweep raise false silence alarms.
+    """
     global _event_emitter
     if _event_emitter is None:
         try:
             from events.gateway_integration import get_bus
+            from events.bus import EventBus
             from events.producers.cron_emitter import CronEventEmitter
             bus = get_bus()
-            if bus:
-                _event_emitter = CronEventEmitter(bus)
-            else:
-                _event_emitter = False  # sentinel: gateway not started yet
+            if bus is None:
+                bus = EventBus()
+                logger.info(
+                    "Cron event emitter: gateway bus not initialized in this "
+                    "process; using direct EventBus at %s", bus.db_path,
+                )
+            _event_emitter = CronEventEmitter(bus)
         except Exception as e:
-            logger.debug("Event bus not available: %s", e)
+            logger.warning(
+                "Cron event emitter unavailable — cron lifecycle events "
+                "will NOT be recorded by this process: %s", e,
+            )
             _event_emitter = False  # sentinel: don't retry
     return _event_emitter if _event_emitter else None
 
@@ -747,7 +769,7 @@ def _emit_cron_skipped_duplicate(
                 reason=reason,
             )
         except Exception as ee:
-            logger.debug(
+            logger.warning(
                 "Event emit failed for cron_skipped_duplicate: %s", ee
             )
 
@@ -859,7 +881,7 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
                 consecutive_errors=0,
             )
         except Exception as ee:
-            logger.debug("Event emit failed for deadline timeout: %s", ee)
+            logger.warning("Event emit failed for deadline timeout: %s", ee)
 
     if not abandon_on_timeout:
         t.join()
@@ -4655,7 +4677,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                                 min_seconds_between_fires=_min_interval,
                             )
                         except Exception as ee:
-                            logger.debug(
+                            logger.warning(
                                 "Event emit failed for "
                                 "cron_skipped_min_interval: %s", ee
                             )
@@ -4673,7 +4695,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     )
                     _attach_started_event_id(_job_id, _started_event_id)
                 except Exception as ee:
-                    logger.debug("Event emit failed: %s", ee)
+                    logger.warning("Event emit failed for cron_started: %s", ee)
 
             import time as _time
             # OTel: one span per cron fire. Covers run_job + delivery + event emission.
@@ -4770,7 +4792,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                             consecutive_errors=consecutive,
                         )
                     except Exception as ee:
-                        logger.debug("Event emit failed: %s", ee)
+                        logger.warning(
+                            "Event emit failed for cron_completed/cron_failed: %s", ee
+                        )
 
                 # Tailor structured iteration event (2026-04-29).
                 # Gated by job name inside the helper; runs ALONGSIDE the
