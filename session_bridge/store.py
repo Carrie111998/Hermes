@@ -1455,6 +1455,20 @@ class SessionBridgeStore:
             raise ValueError("sidebar lease duration must be exactly 300 seconds")
 
         def _write(conn):
+            due = conn.execute(
+                """SELECT * FROM session_sidebar_jobs
+                   WHERE state IN (?, ?) AND next_attempt_at <= ?
+                   ORDER BY CASE WHEN state = ? THEN 0 ELSE 1 END,
+                            eligible_at, id
+                   LIMIT ?""",
+                (
+                    SidebarJobState.PENDING.value,
+                    SidebarJobState.RETRY.value,
+                    claim_time,
+                    SidebarJobState.RETRY.value,
+                    _SIDEBAR_CLAIM_SCAN_LIMIT,
+                ),
+            ).fetchall()
             conn.execute(
                 """UPDATE session_sidebar_jobs
                    SET state = ?, next_attempt_at = ?, lease_digest = NULL,
@@ -1468,18 +1482,6 @@ class SessionBridgeStore:
                     claim_time,
                 ),
             )
-            due = conn.execute(
-                """SELECT * FROM session_sidebar_jobs
-                   WHERE state IN (?, ?) AND next_attempt_at <= ?
-                   ORDER BY eligible_at, id
-                   LIMIT ?""",
-                (
-                    SidebarJobState.PENDING.value,
-                    SidebarJobState.RETRY.value,
-                    claim_time,
-                    _SIDEBAR_CLAIM_SCAN_LIMIT,
-                ),
-            ).fetchall()
             claimed: list[dict[str, Any]] = []
             for raw_row in due:
                 if len(claimed) >= limit:

@@ -3262,6 +3262,32 @@ def test_sidebar_claims_are_ordered_bounded_and_digest_tokens_at_rest(db) -> Non
     assert store.claim_sidebar_jobs(now=200.0, limit=1) == []
 
 
+def test_sidebar_claim_prioritizes_ready_retry_before_older_pending(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("initial-token", "recovery-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    retry = _sidebar_candidate(db, native_id="retry-first", eligible_at=200.0)
+    store.enqueue_sidebar_job(retry)
+    lease = store.claim_sidebar_jobs(now=300.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="rename_failed",
+        now=301.0,
+    )
+    pending = _sidebar_candidate(db, native_id="older-pending", eligible_at=100.0)
+    store.enqueue_sidebar_job(pending)
+
+    claimed = store.claim_sidebar_jobs(now=400.0, limit=1)
+
+    assert claimed[0]["source_session_id"] == retry.source_session_id
+    assert claimed[0]["lease_token"] == "recovery-token"
+    assert store.get_sidebar_job_for_source(pending.source_session_id)["state"] == (
+        SidebarJobState.PENDING.value
+    )
+
+
 @pytest.mark.parametrize("limit", [0, 11, True, 1.5])
 def test_sidebar_claim_validates_the_fixed_batch_bound(db, limit) -> None:
     store = SessionBridgeStore(db)
@@ -4356,7 +4382,8 @@ def test_sidebar_claim_scans_bounded_pages_and_eventually_passes_malformed_rows(
         " ".join(statement.upper().split())
         for statement in statements
         if "SELECT * FROM SESSION_SIDEBAR_JOBS" in statement.upper()
-        and "ORDER BY ELIGIBLE_AT, ID" in " ".join(statement.upper().split())
+        and "ORDER BY CASE WHEN STATE =" in " ".join(statement.upper().split())
+        and "ELIGIBLE_AT, ID" in " ".join(statement.upper().split())
     ]
     assert first == []
     assert after_first[SidebarJobState.FAILED.value] == 40
