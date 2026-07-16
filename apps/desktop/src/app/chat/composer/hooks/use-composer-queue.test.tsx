@@ -6,7 +6,9 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   markQueuedPromptSent,
-  QUEUE_STORAGE_KEY
+  QUEUE_STORAGE_KEY,
+  QUEUE_TOMBSTONES_STORAGE_KEY,
+  withSessionDrainClaim
 } from '@/store/composer-queue'
 import { installFakeLocks, persistedQueueTexts, resetQueueStorage } from '@/store/composer-queue-test-utils'
 import { notify } from '@/store/notifications'
@@ -171,6 +173,44 @@ describe('useComposerQueue cross-window drain (#57516 review)', () => {
       expect(onSubmit).not.toHaveBeenCalled()
       await waitFor(() => expect(persistedQueueTexts(SESSION_KEY)).toEqual([]))
       unmount()
+    } finally {
+      restore()
+    }
+  })
+
+  it('a real successful drain marks its entry sent, protecting it even if tombstones are lost', async () => {
+    const restore = installFakeLocks()
+
+    try {
+      const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'sent for real' })
+
+      // Window A drains the entry through the real flow (this is what must
+      // call markQueuedPromptSent — the producer half of the protection).
+      const onSubmitA = vi.fn(() => Promise.resolve(true))
+      const windowA = renderWindow(onSubmitA)
+      await act(async () => {})
+
+      expect(onSubmitA).toHaveBeenCalledTimes(1)
+
+      // Simulate total loss of the storage-side protection: tombstones wiped
+      // and the entry resurrected by a stale save (event included, so the
+      // atom adopts the resurrected entry like a real cross-window write).
+      window.localStorage.removeItem(QUEUE_TOMBSTONES_STORAGE_KEY)
+      const resurrected = JSON.stringify({ [SESSION_KEY]: [entry] })
+      window.localStorage.setItem(QUEUE_STORAGE_KEY, resurrected)
+      window.dispatchEvent(new StorageEvent('storage', { key: QUEUE_STORAGE_KEY, newValue: resurrected }))
+
+      // A fresh idle window must purge the entry via A's held sent claim, not
+      // submit it a second time.
+      const onSubmitB = vi.fn(() => Promise.resolve(true))
+      const windowB = renderWindow(onSubmitB)
+      await act(async () => {})
+
+      expect(onSubmitB).not.toHaveBeenCalled()
+      await waitFor(() => expect(persistedQueueTexts(SESSION_KEY)).toEqual([]))
+
+      windowA.unmount()
+      windowB.unmount()
     } finally {
       restore()
     }
@@ -466,19 +506,38 @@ describe('useComposerQueue unmount safety', () => {
     }
   })
 
-  it('a pending backoff retry is cancelled by unmount', async () => {
+  it('a pending backoff retry is cancelled by unmount (timer actually cleared, not just guarded)', async () => {
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'no zombie retries' })
 
-    const onSubmit = vi.fn(() => Promise.resolve(false))
-    const { unmount } = renderWindow(onSubmit)
-    await act(async () => {})
+    const setSpy = vi.spyOn(globalThis, 'setTimeout')
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout')
 
-    expect(onSubmit).toHaveBeenCalledTimes(1) // rejected; retry timer armed
+    try {
+      const onSubmit = vi.fn(() => Promise.resolve(false))
+      const { unmount } = renderWindow(onSubmit)
+      await act(async () => {})
 
-    unmount()
-    await new Promise(resolve => setTimeout(resolve, 150))
+      expect(onSubmit).toHaveBeenCalledTimes(1) // rejected; retry timer armed
 
-    expect(onSubmit).toHaveBeenCalledTimes(1)
+      // Pin the clearTimeout itself — the mountedRef guard alone would also
+      // suppress the submit, so counting submits cannot distinguish them.
+      // The retry timer is the setTimeout armed with the mocked backoff
+      // (AUTO_DRAIN_RETRY_BASE_MS × 1 = 20ms).
+      const retryIndex = setSpy.mock.calls.findIndex(call => call[1] === 20)
+
+      expect(retryIndex).toBeGreaterThanOrEqual(0)
+
+      const retryHandle = setSpy.mock.results[retryIndex]!.value as ReturnType<typeof setTimeout>
+
+      unmount()
+      expect(clearSpy).toHaveBeenCalledWith(retryHandle)
+
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(onSubmit).toHaveBeenCalledTimes(1)
+    } finally {
+      setSpy.mockRestore()
+      clearSpy.mockRestore()
+    }
   })
 })
 
@@ -488,11 +547,19 @@ describe('useComposerQueue runtime re-key migration', () => {
     resetQueueStorage()
   })
 
-  it('chains two quick re-keys so entries land under the final key', async () => {
+  it('chains two quick re-keys so entries land under the final key even when the first move must wait', async () => {
     const restore = installFakeLocks()
 
     try {
       enqueueQueuedPrompt('rt-1', { attachments: [], text: 'follow me' })
+
+      // A drain claim is held on rt-1 (an in-flight submit under the old key),
+      // so the rt-1 → rt-2 migration must WAIT. Without chaining, the
+      // rt-2 → rt-3 migration would run first (moving nothing) and the entry
+      // would strand under the dead intermediate key rt-2 forever.
+      let releaseDrain!: () => void
+      const heldDrain = withSessionDrainClaim('rt-1', () => new Promise<void>(resolve => (releaseDrain = resolve)))
+      await Promise.resolve()
 
       const onSubmit = vi.fn(() => Promise.resolve(true))
       const draftRef: RefObject<string> = { current: '' }
@@ -520,10 +587,15 @@ describe('useComposerQueue runtime re-key migration', () => {
       // Two re-keys in quick succession, no flush in between.
       rerender({ sessionKey: 'rt-2' })
       rerender({ sessionKey: 'rt-3' })
-
       await act(async () => {})
-      await waitFor(() => expect(persistedQueueTexts('rt-3')).toEqual(['follow me']))
 
+      // Both migrations are queued behind the held rt-1 claim; nothing moved.
+      expect(persistedQueueTexts('rt-1')).toEqual(['follow me'])
+
+      releaseDrain()
+      await heldDrain
+
+      await waitFor(() => expect(persistedQueueTexts('rt-3')).toEqual(['follow me']))
       expect(persistedQueueTexts('rt-1')).toEqual([])
       expect(persistedQueueTexts('rt-2')).toEqual([])
 

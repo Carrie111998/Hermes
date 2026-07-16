@@ -93,7 +93,11 @@ const readStorage = (): null | QueueState => {
   }
 }
 
-const save = (state: QueueState) => {
+// `quiet` writes never touch persistFailed: the storage-event listener's
+// opportunistic ghost purge must not flip a purely PASSIVE window into
+// degraded in-memory mode — such a window performs no mutations, so nothing
+// would ever clear the flag again and it would ignore every future event.
+const save = (state: QueueState, { quiet = false } = {}) => {
   if (typeof window === 'undefined') {
     return
   }
@@ -110,11 +114,15 @@ const save = (state: QueueState) => {
       cachedQueueState = state
     }
 
-    persistFailed = false
+    if (!quiet) {
+      persistFailed = false
+    }
   } catch {
     // Best-effort: the queue keeps working in-memory — freshState() serves the
     // atom while this flag is set, so nothing is lost from the UI or drains.
-    persistFailed = true
+    if (!quiet) {
+      persistFailed = true
+    }
   }
 }
 
@@ -158,10 +166,14 @@ const sanitizeTombstones = (parsed: unknown): RemovalTombstones => {
   }
 
   const tombstones: RemovalTombstones = {}
+  const now = Date.now()
 
   for (const [id, at] of Object.entries(parsed as Record<string, unknown>)) {
     if (typeof at === 'number' && Number.isFinite(at)) {
-      tombstones[id] = at
+      // Clamp to now: a future-dated stamp (corruption — all windows share
+      // one clock) would never expire, sort newest, and 64 of them would
+      // permanently occupy the cap, evicting every genuine tombstone.
+      tombstones[id] = Math.min(at, now)
     }
   }
 
@@ -292,8 +304,9 @@ if (typeof window !== 'undefined') {
     // purged map back so the ghost leaves storage now, not "on the next
     // write" — an idle queue might not see one before the tombstone expires.
     // Idempotent across windows: whoever writes last writes the same content.
+    // Quiet: an opportunistic purge failing must not enter degraded mode.
     if (filtered !== stored) {
-      save(filtered)
+      save(filtered, { quiet: true })
     }
   })
 }

@@ -96,18 +96,19 @@ export function useComposerQueue({
 
   // Liveness plumbing for auto-drain: a bounded-backoff retry timer (rejected
   // sends), one pending claim-release waiter per session key (lost
-  // cross-window races), a swallowed-wakeup flag (wake-ups that landed while
-  // this window's own drain was in flight and must be replayed), a settle
-  // promise waiting manual sends can queue on, and a ref to the latest
-  // autoDrainNext so every wake-up re-triggers fresh logic. The mounted flag
+  // cross-window races), a settle promise waiting manual sends can queue on,
+  // and refs to the latest autoDrainNext / busy so every wake-up and every
+  // in-claim decision sees fresh state, not a stale closure. The mounted flag
   // stops a late-firing timer/waiter from draining for an unmounted composer.
   const retryTimerRef = useRef<null | ReturnType<typeof setTimeout>>(null)
   const claimWaiterKeyRef = useRef<null | string>(null)
-  const swallowedWakeupRef = useRef(false)
   const drainSettledRef = useRef<null | Promise<void>>(null)
   const migrationChainRef = useRef<Promise<unknown>>(Promise.resolve())
   const autoDrainRef = useRef<() => void>(() => {})
+  const busyRef = useRef(busy)
   const mountedRef = useRef(true)
+
+  busyRef.current = busy
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (!activeQueueSessionKey || queueEdit) {
@@ -218,7 +219,7 @@ export function useComposerQueue({
     async (
       pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined,
       claim: { wait?: boolean; timeoutMs?: number } = {}
-    ): Promise<{ entryId: null | string; outcome: 'contended' | 'empty' | 'rejected' | 'sent' }> => {
+    ): Promise<{ entryId: null | string; outcome: 'busy' | 'contended' | 'empty' | 'rejected' | 'sent' }> => {
       if (!activeQueueSessionKey) {
         return { entryId: null, outcome: 'contended' }
       }
@@ -230,15 +231,23 @@ export function useComposerQueue({
 
         // A waiting caller (manual send) must not be bounced by THIS window's
         // own in-flight drain — that is local contention, not "another
-        // window". Wait for the local lane to clear, inside the same budget.
+        // window". Wait for the local lane to clear, inside the same budget:
+        // the settle promise is raced against the remaining time so a hung
+        // in-flight drain cannot suspend the deadline check itself.
         const deadline = claim.timeoutMs === undefined ? Infinity : Date.now() + claim.timeoutMs
 
         while (drainingQueueRef.current) {
-          if (Date.now() >= deadline) {
+          const remaining = deadline - Date.now()
+
+          if (remaining <= 0) {
             return { entryId: null, outcome: 'contended' }
           }
 
-          await (drainSettledRef.current ?? Promise.resolve())
+          const settled = drainSettledRef.current ?? Promise.resolve()
+
+          await (remaining === Infinity
+            ? settled
+            : Promise.race([settled, new Promise(resolve => setTimeout(resolve, remaining))]))
         }
 
         if (claim.timeoutMs !== undefined) {
@@ -254,7 +263,15 @@ export function useComposerQueue({
       try {
         const outcome = await withSessionDrainClaim(
           activeQueueSessionKey,
-          async (): Promise<'empty' | 'rejected' | 'sent'> => {
+          async (): Promise<'busy' | 'empty' | 'rejected' | 'sent'> => {
+            // The session may have started a turn while we waited for the
+            // lane or the claim (typically: the very drain we waited on got
+            // accepted). Submitting now would just bounce off the gateway;
+            // the caller decides what busy means for its flow.
+            if (busyRef.current) {
+              return 'busy'
+            }
+
             // Pick INSIDE the claim, and from the fresh store read rather than
             // the rendered slice or the atom: the storage event that syncs them
             // is asynchronous, so only the fresh read reflects a removal
@@ -277,9 +294,18 @@ export function useComposerQueue({
               return 'empty'
             }
 
-            const accepted = await Promise.resolve(
-              onSubmit(entry.text, { attachments: entry.attachments, fromQueue: true })
-            )
+            let accepted: boolean | void
+
+            try {
+              accepted = await Promise.resolve(
+                onSubmit(entry.text, { attachments: entry.attachments, fromQueue: true })
+              )
+            } catch {
+              // A thrown submit is a rejection of THIS entry — reporting it
+              // through the outcome keeps the failure count attributed to the
+              // entry actually attempted, not a pre-claim guess.
+              return 'rejected'
+            }
 
             if (accepted === false) {
               return 'rejected'
@@ -298,19 +324,13 @@ export function useComposerQueue({
         // null = the claim was unavailable (or the wait timed out); whoever
         // holds it owns the entry for now.
         return { entryId: attemptedId, outcome: outcome ?? 'contended' }
+      } catch {
+        // Lock-manager failure. Post-pick it is a rejection of the attempted
+        // entry; pre-pick it is indistinguishable from contention.
+        return { entryId: attemptedId, outcome: attemptedId ? 'rejected' : 'contended' }
       } finally {
         drainingQueueRef.current = false
         settleDrain()
-
-        // A wake-up (claim-release waiter, storage-event effect, retry timer)
-        // that landed while this drain was in flight was swallowed by the
-        // local guard above. Re-check once the lane is clear — each re-entry
-        // either finds nothing to do or arms its own bounded wake-up, so this
-        // cannot loop.
-        if (swallowedWakeupRef.current) {
-          swallowedWakeupRef.current = false
-          setTimeout(() => autoDrainRef.current(), 0)
-        }
       }
     },
     [activeQueueSessionKey, onSubmit, sessionId]
@@ -330,6 +350,21 @@ export function useComposerQueue({
     [pickDrainHead, runDrain]
   )
 
+  // Send-now while a turn runs: promote to the head, then interrupt. The
+  // gateway always emits a settle (message.complete + session.info
+  // running:false) when the turn unwinds, and the busy→false auto-drain
+  // sends the promoted entry.
+  const promoteAndInterrupt = useCallback(
+    (id: string) => {
+      promoteQueuedPrompt(activeQueueSessionKey, id)
+      triggerHaptic('selection')
+      void Promise.resolve(onCancel())
+
+      return true
+    },
+    [activeQueueSessionKey, onCancel]
+  )
+
   const sendQueuedNow = useCallback(
     async (id: string) => {
       if (!activeQueueSessionKey || id === queueEdit?.entryId) {
@@ -344,14 +379,7 @@ export function useComposerQueue({
       }
 
       if (busy) {
-        // Promote to the head, then interrupt. The gateway always emits a
-        // settle (message.complete + session.info running:false) when the
-        // turn unwinds, and the busy→false auto-drain below sends this entry.
-        promoteQueuedPrompt(activeQueueSessionKey, id)
-        triggerHaptic('selection')
-        void Promise.resolve(onCancel())
-
-        return true
+        return promoteAndInterrupt(id)
       }
 
       // A manual send clears the auto-drain backoff so a stuck entry the user
@@ -365,6 +393,12 @@ export function useComposerQueue({
         timeoutMs: MANUAL_SEND_WAIT_MS,
         wait: true
       })
+
+      // A turn started while we waited (usually the very drain we waited on
+      // being accepted): the tap now means what a tap-during-busy means.
+      if (outcome === 'busy' && readFreshQueuedPrompts(activeQueueSessionKey).some(e => e.id === id)) {
+        return promoteAndInterrupt(id)
+      }
 
       if (outcome === 'contended') {
         notify({
@@ -384,7 +418,7 @@ export function useComposerQueue({
 
       return outcome === 'sent'
     },
-    [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain, t]
+    [activeQueueSessionKey, busy, promoteAndInterrupt, queueEdit, runDrain, t]
   )
 
   // Edge-independent auto-drain: send the head whenever the session is idle and
@@ -397,11 +431,11 @@ export function useComposerQueue({
     }
 
     if (drainingQueueRef.current) {
-      // A drain is already in flight in this window: don't drop this wake-up
-      // (it may be the claim waiter's one shot) — flag it for replay when the
-      // in-flight drain settles.
-      swallowedWakeupRef.current = true
-
+      // A drain is already in flight in this window; drop this wake-up. Every
+      // outcome of the in-flight drain produces its own follow-up signal —
+      // 'sent' writes storage (event → effect), 'rejected' schedules a
+      // backoff retry, 'contended' arms the claim waiter, manual sends kick a
+      // re-check when they finish — so nothing is lost by not replaying.
       return
     }
 
@@ -474,12 +508,13 @@ export function useComposerQueue({
 
     // Re-pick the head INSIDE the claim from fresh state (not the captured
     // entry object): another window's removal, edit, or PROMOTE must all be
-    // honored at send time. The cap guard rides along in the picker so an
-    // entry that exhausted its attempts blocks auto-drain without burning a
-    // claim cycle; failure counts land on whatever entry was actually
-    // attempted. Only a rejected send counts toward the retry cap — burning
-    // attempts on 'empty'/'contended' (races this window lost) would strand a
-    // healthy entry and raise the stuck-queue toast spuriously.
+    // honored at send time. The cap guard rides along in the picker as a
+    // defensive backstop for rendered-vs-fresh skew (tombstones make that
+    // skew nearly unreachable, so the pre-check above is the pinned path).
+    // Failure counts land on whatever entry was actually attempted — runDrain
+    // converts thrown submits into 'rejected' with the attempted id, so only
+    // genuine send failures burn attempts; 'busy' waits for the busy→false
+    // effect edge, 'empty'/'contended' are races this window lost.
     void runDrain(entries => {
       const candidate = pickDrainHead(entries)
 
@@ -488,15 +523,13 @@ export function useComposerQueue({
       }
 
       return candidate
+    }).then(({ entryId, outcome }) => {
+      if (outcome === 'rejected' && entryId) {
+        onFail(entryId)
+      } else if (outcome === 'contended') {
+        onContended()
+      }
     })
-      .then(({ entryId, outcome }) => {
-        if (outcome === 'rejected' && entryId) {
-          onFail(entryId)
-        } else if (outcome === 'contended') {
-          onContended()
-        }
-      })
-      .catch(() => onFail(entry.id))
   }, [activeQueueSessionKey, busy, pickDrainHead, queuedPrompts, runDrain, t])
 
   // Keep the liveness wake-ups (retry timer, claim waiter) pointing at the
