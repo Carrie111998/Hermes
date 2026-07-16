@@ -60,11 +60,29 @@ if (typeof window !== 'undefined') {
   })
 }
 
-const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
-  // Merge over the freshly-persisted map, not the in-memory atom: another
-  // window may have written between our last sync event and now, and basing
-  // the save on a stale snapshot would silently revert its change.
+// Operation-based cross-window mutation: reload the persisted map and apply
+// `op` to the freshest version of THIS session's queue — never to an array the
+// caller derived from the in-memory atom. Reloading the map alone only
+// protected other sessions' keys: two windows mutating the same session would
+// still replace its array with competing stale versions (window B's append
+// built on a queue that predates window A's), silently dropping entries.
+// `op` receives the fresh queue and returns the next one, or null for "nothing
+// to do" (no write, no atom churn). Returns whether a write happened.
+//
+// The load→op→save sequence is synchronous, so the only remaining race is two
+// renderer processes interleaving inside it at the exact same instant —
+// microseconds, versus the seconds-wide stale-snapshot window this closes.
+// Fully eliminating it would need cross-window mutual exclusion (Web Locks)
+// around every mutation, which forces all these APIs async; the drain path,
+// where a race double-submits a prompt into the model, does exactly that via
+// withSessionDrainClaim below.
+const mutateSession = (sid: string, op: (fresh: QueuedPromptEntry[]) => null | QueuedPromptEntry[]): boolean => {
   const next = { ...load() }
+  const queue = op(next[sid] ?? [])
+
+  if (queue === null) {
+    return false
+  }
 
   if (queue.length === 0) {
     delete next[sid]
@@ -74,6 +92,8 @@ const writeSession = (sid: string, queue: QueuedPromptEntry[]) => {
 
   $queuedPromptsBySession.set(next)
   save(next)
+
+  return true
 }
 
 const sidOf = (key: string | null | undefined): null | string => {
@@ -94,6 +114,56 @@ export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEn
   return sid ? queueFor(sid) : []
 }
 
+/**
+ * Read a session's queue straight from persisted storage, bypassing the atom.
+ * The `storage` event that syncs the atom is asynchronous, so around a drain
+ * the atom can still list an entry another window already removed. Drain paths
+ * must pick from this — inside {@link withSessionDrainClaim} — so they never
+ * act on that stale echo.
+ */
+export const readPersistedQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
+  const sid = sidOf(key)
+
+  return sid ? (load()[sid] ?? []) : []
+}
+
+/**
+ * Run `task` while holding the exclusive cross-window drain claim for this
+ * session, resolving null WITHOUT running it when another window already holds
+ * the claim. A renderer-local lock cannot stop two windows from picking the
+ * same queued entry and double-submitting it — every idle window schedules
+ * auto-drain — so the mutex must live outside the renderer. Web Locks are
+ * arbitrated by the browser process across all windows of the origin, and the
+ * claim is released automatically if the holding window closes or crashes,
+ * unlike a localStorage claim flag which would leak and jam the queue forever.
+ * `ifAvailable` keeps losers non-blocking: they skip this attempt and try
+ * again when the winner's removal lands as a storage event.
+ *
+ * Environments without Web Locks (non-Chromium test DOMs) run `task` directly:
+ * there is no second window to exclude there, and the caller's renderer-local
+ * lock still serializes attempts within this one.
+ */
+export const withSessionDrainClaim = async <T>(
+  key: string | null | undefined,
+  task: () => Promise<T>
+): Promise<null | T> => {
+  const sid = sidOf(key)
+
+  if (!sid) {
+    return null
+  }
+
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
+
+  if (!locks) {
+    return task()
+  }
+
+  return (await locks.request(`${STORAGE_KEY}.drain.${sid}`, { ifAvailable: true }, grant =>
+    grant ? task() : Promise.resolve(null)
+  )) as null | T
+}
+
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
   payload: { text: string; attachments: ComposerAttachment[] }
@@ -111,7 +181,7 @@ export const enqueueQueuedPrompt = (
     queuedAt: Date.now()
   }
 
-  writeSession(sid, [...queueFor(sid), entry])
+  mutateSession(sid, fresh => [...fresh, entry])
 
   return entry
 }
@@ -123,13 +193,17 @@ export const dequeueQueuedPrompt = (key: string | null | undefined): null | Queu
     return null
   }
 
-  const [head, ...rest] = queueFor(sid)
+  let head: null | QueuedPromptEntry = null
 
-  if (!head) {
-    return null
-  }
+  mutateSession(sid, fresh => {
+    if (fresh.length === 0) {
+      return null
+    }
 
-  writeSession(sid, rest)
+    head = fresh[0]!
+
+    return fresh.slice(1)
+  })
 
   return head
 }
@@ -141,16 +215,11 @@ export const removeQueuedPrompt = (key: string | null | undefined, id: string): 
     return false
   }
 
-  const queue = queueFor(sid)
-  const next = queue.filter(e => e.id !== id)
+  return mutateSession(sid, fresh => {
+    const next = fresh.filter(e => e.id !== id)
 
-  if (next.length === queue.length) {
-    return false
-  }
-
-  writeSession(sid, next)
-
-  return true
+    return next.length === fresh.length ? null : next
+  })
 }
 
 export const promoteQueuedPrompt = (key: string | null | undefined, id: string): boolean => {
@@ -160,17 +229,17 @@ export const promoteQueuedPrompt = (key: string | null | undefined, id: string):
     return false
   }
 
-  const queue = queueFor(sid)
-  const index = queue.findIndex(e => e.id === id)
+  return mutateSession(sid, fresh => {
+    const index = fresh.findIndex(e => e.id === id)
 
-  if (index <= 0) {
-    return false
-  }
+    if (index <= 0) {
+      return null
+    }
 
-  const entry = queue[index]!
-  writeSession(sid, [entry, ...queue.slice(0, index), ...queue.slice(index + 1)])
+    const entry = fresh[index]!
 
-  return true
+    return [entry, ...fresh.slice(0, index), ...fresh.slice(index + 1)]
+  })
 }
 
 export const updateQueuedPrompt = (
@@ -184,32 +253,27 @@ export const updateQueuedPrompt = (
     return false
   }
 
-  const queue = queueFor(sid)
-  let changed = false
+  return mutateSession(sid, fresh => {
+    let changed = false
 
-  const next = queue.map(entry => {
-    if (entry.id !== id) {
-      return entry
-    }
+    const next = fresh.map(entry => {
+      if (entry.id !== id) {
+        return entry
+      }
 
-    const attachments = update.attachments ? cloneAttachments(update.attachments) : entry.attachments
+      const attachments = update.attachments ? cloneAttachments(update.attachments) : entry.attachments
 
-    if (entry.text === update.text && !update.attachments) {
-      return entry
-    }
+      if (entry.text === update.text && !update.attachments) {
+        return entry
+      }
 
-    changed = true
+      changed = true
 
-    return { ...entry, text: update.text, attachments }
+      return { ...entry, text: update.text, attachments }
+    })
+
+    return changed ? next : null
   })
-
-  if (!changed) {
-    return false
-  }
-
-  writeSession(sid, next)
-
-  return true
 }
 
 export const updateQueuedPromptText = (key: string | null | undefined, id: string, text: string): boolean =>
@@ -218,11 +282,11 @@ export const updateQueuedPromptText = (key: string | null | undefined, id: strin
 export const clearQueuedPrompts = (key: string | null | undefined) => {
   const sid = sidOf(key)
 
-  if (!sid || !(sid in $queuedPromptsBySession.get())) {
+  if (!sid) {
     return
   }
 
-  writeSession(sid, [])
+  mutateSession(sid, fresh => (fresh.length === 0 ? null : []))
 }
 
 /**
@@ -240,15 +304,18 @@ export const migrateQueuedPrompts = (fromKey: string | null | undefined, toKey: 
     return false
   }
 
-  const pending = queueFor(from)
+  // Same operation-based rule as mutateSession, spanning two keys: both the
+  // migrated entries and the target queue come from the fresh persisted map,
+  // not the atom, so entries another window just enqueued are not dropped.
+  const next = { ...load() }
+  const pending = next[from] ?? []
 
   if (pending.length === 0) {
     return false
   }
 
-  const next = { ...load() }
   delete next[from]
-  next[to] = [...queueFor(to), ...pending]
+  next[to] = [...(next[to] ?? []), ...pending]
 
   $queuedPromptsBySession.set(next)
   save(next)
@@ -269,8 +336,9 @@ export interface AutoDrainInput {
  * idle and has pending entries, NOT only on an observed busy true → false edge.
  * A backend bounce / websocket reconnect remounts the composer and resets the
  * busy ref to the current value, swallowing the settle edge — an edge-gated
- * drain would then strand the entry forever. The caller's drain lock
- * (`drainingQueueRef`) serializes sends so being edge-free can't double-submit.
+ * drain would then strand the entry forever. Being edge-free can't
+ * double-submit: the caller serializes sends within a window (its drain ref)
+ * and across windows ({@link withSessionDrainClaim}).
  */
 export const shouldAutoDrain = ({ isBusy, queueLength }: AutoDrainInput): boolean => !isBusy && queueLength > 0
 

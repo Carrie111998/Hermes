@@ -8,14 +8,15 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
-  getQueuedPrompts,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
   promoteQueuedPrompt,
   type QueuedPromptEntry,
+  readPersistedQueuedPrompts,
   removeQueuedPrompt,
   shouldAutoDrain,
-  updateQueuedPrompt
+  updateQueuedPrompt,
+  withSessionDrainClaim
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
 
@@ -40,7 +41,8 @@ interface UseComposerQueueArgs {
 /**
  * The composer's queue engine — everything about queued turns: the per-session
  * queue store binding, in-place queued-prompt editing (begin/step/exit), the
- * shared drain lock + send-then-remove sequence, manual send-now, and the
+ * drain locks (renderer-local + cross-window claim) + send-then-remove
+ * sequence, manual send-now, and the
  * edge-independent auto-drain with bounded retries. It consumes the draft API
  * (draftRef/clearDraft/loadIntoComposer/focusInput) and writes the
  * coordinator-owned `queueEditRef` so the draft engine can read the edit state
@@ -180,40 +182,57 @@ export function useComposerQueue({
     return true
   }, [activeQueueSessionKey, attachments, clearDraft, draftRef])
 
-  // All queue drain paths share one lock + send-then-remove sequence.
-  // `pickEntry` lets each caller choose head, by-id, or skip-edited.
+  // All queue drain paths share one send-then-remove sequence behind two
+  // exclusion layers: the renderer-local ref serializes attempts within THIS
+  // window, and the session's cross-window drain claim serializes across
+  // windows — every idle window schedules auto-drain, so without the claim two
+  // of them could pick the same head and each submit it before either reaches
+  // the removal below (#46732). `pickEntry` lets each caller choose head,
+  // by-id, or skip-edited; the outcome (not a bare boolean) lets auto-drain
+  // count only genuine send failures toward its retry cap.
   const runDrain = useCallback(
-    async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
+    async (
+      pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined
+    ): Promise<'contended' | 'empty' | 'rejected' | 'sent'> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {
-        return false
-      }
-
-      // Pick from the live store, not the rendered slice: with several windows
-      // open, another window may have drained (removed) this entry after our
-      // last render, and sending from the stale slice would double-submit the
-      // prompt into the session (#46732).
-      const entry = pickEntry(getQueuedPrompts(activeQueueSessionKey))
-
-      if (!entry) {
-        return false
+        return 'contended'
       }
 
       drainingQueueRef.current = true
 
       try {
-        const accepted = await Promise.resolve(
-          onSubmit(entry.text, { attachments: entry.attachments, fromQueue: true })
+        const outcome = await withSessionDrainClaim(
+          activeQueueSessionKey,
+          async (): Promise<'empty' | 'rejected' | 'sent'> => {
+            // Pick INSIDE the claim, and from persisted storage rather than the
+            // rendered slice or the atom: the storage event that syncs them is
+            // asynchronous, so only storage itself is guaranteed to reflect a
+            // removal another window just made. Picking any earlier (or from
+            // anything staler) is what allowed the double submit.
+            const entry = pickEntry(readPersistedQueuedPrompts(activeQueueSessionKey))
+
+            if (!entry) {
+              return 'empty'
+            }
+
+            const accepted = await Promise.resolve(
+              onSubmit(entry.text, { attachments: entry.attachments, fromQueue: true })
+            )
+
+            if (accepted === false) {
+              return 'rejected'
+            }
+
+            drainFailuresRef.current.delete(entry.id)
+            removeQueuedPrompt(activeQueueSessionKey, entry.id)
+            resetBrowseState(sessionId)
+
+            return 'sent'
+          }
         )
 
-        if (accepted === false) {
-          return false
-        }
-
-        drainFailuresRef.current.delete(entry.id)
-        removeQueuedPrompt(activeQueueSessionKey, entry.id)
-        resetBrowseState(sessionId)
-
-        return true
+        // null grant = another window holds the claim; the entry is theirs now.
+        return outcome ?? 'contended'
       } finally {
         drainingQueueRef.current = false
       }
@@ -230,7 +249,10 @@ export function useComposerQueue({
     [queueEditRef] // reads the edit id off a ref so the lock-holder always sees the latest
   )
 
-  const drainNextQueued = useCallback(() => runDrain(pickDrainHead), [pickDrainHead, runDrain])
+  const drainNextQueued = useCallback(
+    () => runDrain(pickDrainHead).then(outcome => outcome === 'sent'),
+    [pickDrainHead, runDrain]
+  )
 
   const sendQueuedNow = useCallback(
     (id: string) => {
@@ -253,7 +275,7 @@ export function useComposerQueue({
       // taps gets a fresh attempt (and re-enables auto-retry on success).
       drainFailuresRef.current.delete(id)
 
-      return runDrain(entries => entries.find(e => e.id === id))
+      return runDrain(entries => entries.find(e => e.id === id)).then(outcome => outcome === 'sent')
     },
     [activeQueueSessionKey, busy, onCancel, queueEdit, runDrain]
   )
@@ -287,9 +309,15 @@ export function useComposerQueue({
       }
     }
 
-    void runDrain(() => entry)
-      .then(sent => {
-        if (!sent) {
+    // Re-locate the entry by id rather than submitting the captured object:
+    // runDrain picks from live persisted state inside the drain claim, so an
+    // entry another window drained meanwhile simply isn't found ('empty').
+    // Only a rejected send counts toward the retry cap — burning attempts on
+    // 'empty'/'contended' (races this window lost) would strand a healthy
+    // entry and raise the stuck-queue toast spuriously.
+    void runDrain(entries => entries.find(candidate => candidate.id === entry.id))
+      .then(outcome => {
+        if (outcome === 'rejected') {
           onFail()
         }
       })
