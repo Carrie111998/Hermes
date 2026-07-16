@@ -3480,6 +3480,127 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                 _client_cache.clear()
 
 
+    def test_codex_timeout_skips_eviction_for_adhoc_client(self):
+        """Ad-hoc clients (no api_key/base_url/_real_client) must not trigger cache eviction.
+
+        When the adapter wraps a minimal client that doesn't look like a cached
+        provider client, the timeout handler skips cache scanning entirely.
+        This ensures ad-hoc clients don't accidentally evict unrelated cache
+        entries and that timeout processing stays on the fast path.
+        """
+        from agent.auxiliary_client import (
+            _client_cache, _client_cache_lock,
+            _CodexCompletionsAdapter,
+        )
+
+        class _SlowStream:
+            def __iter__(self):
+                for _ in range(20):
+                    time.sleep(0.01)
+                    yield SimpleNamespace(type="response.in_progress")
+
+            def close(self): pass
+
+        class AdhocClient:
+            """Minimal client without api_key, base_url, or _real_client."""
+            def __init__(self):
+                self.responses = SimpleNamespace(create=lambda **k: _SlowStream())
+
+            def close(self): pass
+
+        dummy_cache_key = ("dummy-provider", False, None, None, None)
+        dummy_entry = (MagicMock(name="dummy_client"), "dummy-model", None)
+
+        with _client_cache_lock:
+            _client_cache.clear()
+            _client_cache[dummy_cache_key] = dummy_entry
+        try:
+            adhoc = AdhocClient()
+            adapter = _CodexCompletionsAdapter(adhoc, "gpt-5.5")
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "x"}],
+                    timeout=0.05,
+                )
+            # The dummy cache entry must remain untouched — ad-hoc clients
+            # cannot poison the cache so eviction is skipped entirely.
+            assert dummy_cache_key in _client_cache, (
+                "ad-hoc client timeout must not evict unrelated cache entries"
+            )
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
+
+    def test_codex_timeout_deadline_counts_from_call_start(self):
+        """Timeout deadline must count time consumed BEFORE stream iteration.
+
+        The deadline is computed from ``call_started`` at the top of ``create()``,
+        so time spent in ``_chat_messages_to_responses_input()`` counts against
+        the total timeout budget.  This test proves the regression by injecting
+        a 0.04s delay into the message-conversion step plus a 0.04s stream delay.
+
+        With timeout=0.06s:
+          - Current (correct): 0.04s conversion + 0.04s stream > 0.06s → TimeoutError
+          - Old (buggy):       deadline set AFTER conversion, so only 0.04s stream
+                               time counted and the call would have succeeded
+
+        This distinguishes "deadline from call start" from "deadline from after
+        message conversion" — the latter is what the old code did.
+        """
+        from agent.auxiliary_client import (
+            _client_cache, _client_cache_lock,
+            _CodexCompletionsAdapter,
+        )
+
+        class _QuickStream:
+            """Stream that takes 0.04s total before yielding final event."""
+            def __iter__(self):
+                time.sleep(0.04)
+                yield SimpleNamespace(type="response.output_item.done",
+                                      item=SimpleNamespace(type="message",
+                                                          content=[SimpleNamespace(type="output_text", text="done")]))
+
+            def close(self): pass
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = SimpleNamespace(create=lambda **k: _QuickStream())
+                self.api_key = "k"
+                self.base_url = "https://chatgpt.com/backend-api/codex"
+
+            def close(self): pass
+
+        cache_key = ("openai-codex", False, None, None, None)
+        with _client_cache_lock:
+            _client_cache.clear()
+        try:
+            fake = FakeClient()
+            adapter = _CodexCompletionsAdapter(fake, "gpt-5.5")
+
+            # Wrap the message-converter to inject 0.04s delay BEFORE delegation.
+            # This simulates expensive work that happens before the old deadline
+            # location (which was after conversion).
+            original_converter = adapter._chat_messages_to_responses_input
+
+            def slow_converter(messages):
+                time.sleep(0.04)
+                return original_converter(messages)
+
+            adapter._chat_messages_to_responses_input = slow_converter
+
+            # Timeout of 0.06s: conversion (0.04s) + stream (0.04s) = 0.08s > 0.06s
+            # Under the old code, deadline was set AFTER conversion, so only
+            # the 0.04s stream time would count → it would succeed.  Now it
+            # must raise TimeoutError because conversion time is included.
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "x"}],
+                    timeout=0.06,
+                )
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
+
     def test_call_llm_evicts_on_connection_error_with_explicit_provider(self):
         """Connection error on an explicit provider must drop the cached client.
 
