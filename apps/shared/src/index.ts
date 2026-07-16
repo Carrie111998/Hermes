@@ -44,6 +44,7 @@ export {
   JsonRpcGatewayClient,
   type WebSocketLike
 } from './json-rpc-gateway'
+export { isLinkTitleFetchableUrl } from './link-title-url'
 export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,
