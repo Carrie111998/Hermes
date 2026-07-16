@@ -24,19 +24,60 @@ _GATEWAY_LIFECYCLE_SUBCOMMANDS = frozenset(
     {"start", "stop", "restart", "install", "uninstall"}
 )
 
+_GATEWAY_LIFECYCLE_PATTERNS = (
+    # hermes gateway <sub>, python -m hermes_cli.main gateway <sub>,
+    # hermes_cli/main.py gateway <sub>
+    re.compile(
+        rf"\b(?:hermes|hermes_cli\.main|hermes_cli/main\.py)\s+gateway\s+"
+        rf"(?:{'|'.join(sorted(_GATEWAY_LIFECYCLE_SUBCOMMANDS))})\b",
+        re.IGNORECASE,
+    ),
+    # Service managers acting on a hermes service (launchd on macOS,
+    # systemd on Linux) reach the same gateway process from outside.
+    re.compile(
+        r"\blaunchctl\s+(?:kickstart|bootout|unload|load|stop|start)\b[^\n]*hermes",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bsystemctl\s+(?:\S+\s+)*?(?:restart|stop|start)\b[^\n]*hermes",
+        re.IGNORECASE,
+    ),
+    # Killing the gateway process directly.
+    re.compile(r"\bp?kill\b[^\n]*hermes[^\n]*gateway", re.IGNORECASE),
+)
+
 
 def _contains_gateway_lifecycle_command(text: str) -> bool:
-    """Return True if *text* contains a hermes gateway lifecycle command.
+    """Return True if *text* contains a gateway lifecycle command.
 
-    Matches patterns such as ``hermes gateway stop`` or
-    ``hermes gateway restart`` (including ``start``, ``install``, and
-    ``uninstall``).  Used by the cron CLI to warn when a job prompt or
+    Matches ``hermes gateway stop``/``restart``/``start``/``install``/
+    ``uninstall`` in any invocation form (CLI, ``python -m
+    hermes_cli.main``, direct script path), plus service-manager and
+    process-kill equivalents (``launchctl``/``systemctl``/``pkill``)
+    targeting hermes.  Used by the cron CLI to warn when a job prompt or
     script references a command that would affect the gateway process that
     is actually running the job — stopping or restarting the gateway from
     inside a cron tick can deadlock or silently kill the job.
     """
-    subcommands = "|".join(_GATEWAY_LIFECYCLE_SUBCOMMANDS)
-    return bool(re.search(rf"\bhermes\s+gateway\s+(?:{subcommands})\b", text))
+    if not text:
+        return False
+    normalized = text.replace("\\", "/")
+    return any(p.search(normalized) for p in _GATEWAY_LIFECYCLE_PATTERNS)
+
+
+def _warn_if_gateway_lifecycle(*texts: Optional[str]) -> None:
+    """Print a warning when a job prompt/script touches the gateway lifecycle."""
+    if any(_contains_gateway_lifecycle_command(t or "") for t in texts):
+        print(
+            color(
+                "Warning: this job references a gateway lifecycle command "
+                "(start/stop/restart). Running it from inside the gateway's "
+                "own cron scheduler can deadlock or kill the job mid-run. "
+                "Prefer an OS-level scheduler (launchd/cron) for gateway "
+                "maintenance.",
+                Colors.YELLOW,
+            )
+        )
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
@@ -189,6 +230,7 @@ def cron_status():
 
 
 def cron_create(args):
+    _warn_if_gateway_lifecycle(getattr(args, "prompt", None), getattr(args, "script", None))
     result = _cron_api(
         action="create",
         schedule=args.schedule,
@@ -254,6 +296,7 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    _warn_if_gateway_lifecycle(getattr(args, "prompt", None), getattr(args, "script", None))
     result = _cron_api(
         action="update",
         job_id=args.job_id,

@@ -118,9 +118,15 @@ def _scan_cron_prompt(prompt: str) -> str:
     """Scan a cron prompt for critical threats. Returns error string if blocked, else empty."""
     # Allow every bundled GitHub skill curl block (not just the first match).
     # See #31570 — github-issues alone has four api.github.com auth-header curls.
+    # A single curl may span lines via backslash continuations, so match
+    # those too — but never a bare newline: letting the scrub cross command
+    # boundaries (e.g. re.DOTALL) would swallow unrelated text between two
+    # GitHub curls, including injected commands that must stay visible to
+    # the threat patterns below.
+    _curl_span = r"(?:[^\n]|\\\n)*?"
     _github_skill_curl = re.compile(
-        rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?:/|\b)[^\n]*',
+        rf'curl\s+{_curl_span}(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
+        rf'{_curl_span}["\']?https://api\.github\.com(?:/|\b)(?:[^\n]|\\\n)*',
         re.IGNORECASE,
     )
     prompt_to_scan = _github_skill_curl.sub(

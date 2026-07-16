@@ -111,3 +111,59 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["profile"] == "default"
+
+
+class TestGatewayLifecycleDetection:
+    """_contains_gateway_lifecycle_command must catch every invocation form
+    that stops/restarts the gateway executing the cron job (observed as the
+    2026-07-04 frozen-scheduler incident), without flagging ordinary prompts."""
+
+    def test_hermes_cli_forms(self):
+        from hermes_cli.cron import _contains_gateway_lifecycle_command as hit
+
+        assert hit("run hermes gateway restart if unhealthy")
+        assert hit("hermes gateway stop")
+        assert hit("hermes gateway install")
+        assert hit("HERMES GATEWAY RESTART")
+
+    def test_module_and_script_forms(self):
+        from hermes_cli.cron import _contains_gateway_lifecycle_command as hit
+
+        assert hit("python -m hermes_cli.main gateway restart")
+        assert hit("venv/bin/python hermes_cli/main.py gateway stop")
+        assert hit(r"python hermes_cli\main.py gateway restart")  # windows path
+
+    def test_service_manager_and_kill_forms(self):
+        from hermes_cli.cron import _contains_gateway_lifecycle_command as hit
+
+        assert hit("launchctl kickstart -k gui/501/ai.hermes.gateway")
+        assert hit("launchctl bootout gui/501/ai.hermes.gateway")
+        assert hit("systemctl --user restart hermes-gateway.service")
+        assert hit("pkill -f 'hermes.*gateway run'")
+
+    def test_benign_prompts_pass(self):
+        from hermes_cli.cron import _contains_gateway_lifecycle_command as hit
+
+        assert not hit("")
+        assert not hit("check hermes gateway status and report")
+        assert not hit("restart nginx if it is down")
+        assert not hit("summarize the gateway logs")
+        assert not hit("launchctl list | grep something-else")
+
+    def test_create_warns_on_lifecycle_prompt(self, tmp_cron_dir, capsys):
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 1h",
+                prompt="If unhealthy, run hermes gateway restart",
+                name="Bad watchdog",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+            )
+        )
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "lifecycle" in out
+        assert "Created job" in out  # warning is non-blocking
