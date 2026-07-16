@@ -56,6 +56,16 @@ def test_enqueue_preserves_order_after_an_image_turn():
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
 
+def test_hybrid_config_maps_to_queue_outside_messaging_gateway(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"display": {"busy_input_mode": "hybrid"}},
+    )
+
+    assert server._load_busy_input_mode() == "queue"
+
+
 def test_busy_interrupt_mode_redirects_active_turn(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     seen = []

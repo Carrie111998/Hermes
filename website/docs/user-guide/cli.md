@@ -302,11 +302,12 @@ The `display.busy_input_mode` config key controls what happens when you press En
 | `"interrupt"` (default) | Your message redirects the active turn. Model generation restarts with displayed reasoning and completed work preserved; running tools finish first |
 | `"queue"` | Your message is silently queued and sent as the next turn after the agent finishes |
 | `"steer"` | Your message is injected into the current run via `/steer`, arriving at the agent after the next tool call — no interrupt, no new turn |
+| `"hybrid"` | Messaging gateways steer an edit of the message that started the active turn and queue other input; CLI/TUI input has no message-edit identity, so it behaves as `"queue"` |
 
 ```yaml
 # ~/.hermes/config.yaml
 display:
-  busy_input_mode: "steer"   # or "queue" or "interrupt" (default)
+  busy_input_mode: "steer"   # or "queue", "hybrid", or "interrupt" (default)
 ```
 
 `"queue"` mode prepares a separate follow-up turn. `"steer"` always waits for the next tool-result boundary. The default `"interrupt"` mode responds sooner during model generation while avoiding cancellation of a running tool. Use `/stop` when you want to cancel the turn and its foreground work. Unknown values fall back to `"interrupt"`.

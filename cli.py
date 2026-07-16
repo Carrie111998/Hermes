@@ -4164,7 +4164,6 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
-
 def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Map a ``moa:<preset>`` model string to ``(provider, preset)``.
 
@@ -4201,6 +4200,16 @@ class _VoiceInputMessage:
 
     def __str__(self) -> str:
         return self.text
+
+
+def _normalize_cli_busy_input_mode(raw: object) -> str:
+    """Resolve shared busy config for the classic CLI surface."""
+    mode = str(raw or "").strip().lower()
+    if mode in {"queue", "hybrid"}:
+        return "queue"
+    if mode == "steer":
+        return "steer"
+    return "interrupt"
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -4285,14 +4294,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         # busy_input_mode: "interrupt" (Enter redirects current run),
         # "queue" (Enter queues for next turn), or "steer" (Enter injects
-        # mid-run via /steer, arriving after the next tool call).
+        # mid-run via /steer, arriving after the next tool call). ``hybrid`` is
+        # gateway-only (it relies on edited-message identity), so CLI maps it to
+        # its non-edit behavior: queue.
         _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
-        if _bim == "queue":
-            self.busy_input_mode = "queue"
-        elif _bim == "steer":
-            self.busy_input_mode = "steer"
-        else:
-            self.busy_input_mode = "interrupt"
+        self.busy_input_mode = _normalize_cli_busy_input_mode(_bim)
 
         # self.verbose ONLY controls global DEBUG logging (root logger level).
         # display.tool_progress="verbose" controls tool-call rendering (full args,
