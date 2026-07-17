@@ -25,6 +25,7 @@ from session_bridge.models import (
     SessionLink,
     SessionProjection,
 )
+from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
 from session_bridge.store import SessionBridgeStore
 
 
@@ -829,6 +830,84 @@ def test_native_pack_rejects_messages_appended_after_snapshot_refresh(
     with pytest.raises(ValueError, match="snapshot identity mismatch"):
         ContextPackBuilder(db, store).build(request)
     assert store.get_context_pack("native-race-bridge", budget_chars=8000) is None
+
+
+def test_profile_native_pack_reads_real_profile_transcript(db: SessionDB, tmp_path: Path):
+    profile_path = tmp_path / "profiles" / "main" / "state.db"
+    profile_path.parent.mkdir(parents=True)
+    profile_db = SessionDB(profile_path)
+    try:
+        profile_db.create_session(
+            "profile-native-source", "tui", cwd=str(tmp_path)
+        )
+        profile_db.append_message(
+            "profile-native-source",
+            "user",
+            "continue the real profile transcript",
+            timestamp=101.0,
+        )
+    finally:
+        profile_db.close()
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 900.0,
+        hermes_profile_db_paths=lambda: (("main", profile_path),),
+    )
+    source = store.get_native_session_snapshot("profile-native-source")
+    assert source is not None
+    bridge_id = sidebar_bridge_id("profile-native-source")
+    store.enqueue_sidebar_job(
+        SidebarCandidate(
+            source_session_id="profile-native-source",
+            provider=Provider.HERMES,
+            bridge_id=bridge_id,
+            title="[Hermes] Profile source",
+            cwd=str(tmp_path),
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=101.0,
+        )
+    )
+    store.upsert_projection(
+        SessionProjection(
+            provider=Provider.CODEX,
+            native_id="profile-target",
+            title="Profile target",
+            cwd=str(tmp_path),
+            started_at=100.0,
+            last_active=101.0,
+            messages=[],
+            native_cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="profile-native-link",
+            from_session_id="profile-native-source",
+            to_session_id="codex:profile-target",
+            relation=Relation.MIRRORS,
+            bridge_id=bridge_id,
+            source_cursor=None,
+            source_hash=None,
+            created_at=110.0,
+        )
+    )
+
+    pack = ContextPackBuilder(db, store).build(
+        ContextPackRequest(
+            source_session_id="profile-native-source",
+            target_provider=Provider.CODEX,
+            bridge_id=bridge_id,
+            source_cursor=source["cursor"],
+            source_hash=source["source_hash"],
+            budget_chars=8000,
+        )
+    )
+
+    assert "continue the real profile transcript" in pack.payload
 
 
 def test_existing_explicitly_stale_pack_replay_keeps_visible_warning(db: SessionDB):

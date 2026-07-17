@@ -355,18 +355,50 @@ class ContextPackBuilder:
 
         session = dict(session_row) if session_row is not None else None
         message_records = [dict(row) for row in message_rows]
+        decode_content = self.db._decode_content
+        if session is not None and session.get("source") == "session_bridge_profile":
+            profile_matches: list[
+                tuple[dict[str, Any], list[dict[str, Any]], Any]
+            ] = []
+            with self.store._native_hermes_databases() as databases:
+                for _profile, database, owned in databases:
+                    if not owned or not self.store._profile_catalog_compatible(database):
+                        continue
+                    with database._lock:
+                        profile_conn = database._conn
+                        assert profile_conn is not None
+                        profile_session = profile_conn.execute(
+                            "SELECT * FROM sessions WHERE id = ?",
+                            (request.source_session_id,),
+                        ).fetchone()
+                        if profile_session is None:
+                            continue
+                        profile_messages = profile_conn.execute(
+                            "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                            (request.source_session_id,),
+                        ).fetchall()
+                    profile_matches.append(
+                        (
+                            dict(profile_session),
+                            [dict(row) for row in profile_messages],
+                            database._decode_content,
+                        )
+                    )
+            if len(profile_matches) != 1:
+                raise ValueError("profile-native source identity is ambiguous")
+            session, message_records, decode_content = profile_matches[0]
         native_identity = (
             _native_session_snapshot_identity(
                 session,
                 message_records,
-                decode_content=self.db._decode_content,
+                decode_content=decode_content,
             )
             if session is not None and external_row is None
             else None
         )
         messages: list[dict[str, Any]] = []
         for message in message_records:
-            message["content"] = self.db._decode_content(message.get("content"))
+            message["content"] = decode_content(message.get("content"))
             if message.get("tool_calls"):
                 try:
                     message["tool_calls"] = json.loads(message["tool_calls"])
