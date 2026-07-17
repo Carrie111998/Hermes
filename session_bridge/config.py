@@ -593,6 +593,13 @@ def _positive_decimal(value: object, name: str) -> Decimal:
         raise ValueError(f"{name} must be finite")
     if parsed <= 0:
         raise ValueError(f"{name} must be greater than 0")
+    exponent = parsed.as_tuple().exponent
+    if not isinstance(exponent, int):
+        raise ValueError(f"{name} must be finite")
+    if exponent < -6:
+        raise ValueError(f"{name} supports at most 6 decimal places")
+    if parsed > Decimal("1000000"):
+        raise ValueError(f"{name} cannot exceed 1000000 USD")
     return parsed
 
 

@@ -139,7 +139,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -967,6 +967,7 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     next_attempt_at REAL NOT NULL,
     lease_digest TEXT,
     lease_expires_at REAL,
+    lease_kind TEXT CHECK (lease_kind IN ('launch', 'reconciliation')),
     error_code TEXT,
     error_detail TEXT,
     completion_digest TEXT,
@@ -975,8 +976,10 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     updated_at REAL NOT NULL,
     visible_at REAL,
     CHECK (
-        (state = 'claude_leased' AND lease_digest IS NOT NULL AND lease_expires_at IS NOT NULL)
-        OR (state != 'claude_leased' AND lease_digest IS NULL AND lease_expires_at IS NULL)
+        (state = 'claude_leased' AND lease_digest IS NOT NULL
+         AND lease_expires_at IS NOT NULL AND lease_kind IS NOT NULL)
+        OR (state != 'claude_leased' AND lease_digest IS NULL
+            AND lease_expires_at IS NULL AND lease_kind IS NULL)
     ),
     CHECK (
         state != 'claude_visible'
@@ -991,6 +994,26 @@ CREATE TABLE IF NOT EXISTS session_claude_registration_usage (
     reserved_estimated_cost_usd TEXT NOT NULL,
     reserved_at REAL NOT NULL,
     UNIQUE(job_id, attempt_ordinal)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_claude_job_id_reserved_uuid
+    ON session_claude_visibility_jobs(id, reserved_claude_uuid);
+
+CREATE TABLE IF NOT EXISTS session_claude_visibility_reconciliations (
+    job_id TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
+    outcome TEXT NOT NULL CHECK (outcome IN ('absent', 'exact_match', 'conflict')),
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    checked_at REAL NOT NULL,
+    consumed_at REAL,
+    PRIMARY KEY (job_id, attempt_ordinal, outcome, checked_at),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS session_context_packs (
@@ -1044,6 +1067,9 @@ CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_lease_digest
     WHERE lease_digest IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_session_claude_registration_usage_local_day
     ON session_claude_registration_usage(local_day, reserved_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_claude_reconciliation_unconsumed_absent
+    ON session_claude_visibility_reconciliations(job_id, attempt_ordinal)
+    WHERE outcome = 'absent' AND consumed_at IS NULL;
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1061,6 +1087,30 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE TRIGGER IF NOT EXISTS trg_claude_visibility_lease_kind_insert
+BEFORE INSERT ON session_claude_visibility_jobs
+WHEN NOT (
+    (NEW.state = 'claude_leased' AND NEW.lease_digest IS NOT NULL
+     AND NEW.lease_expires_at IS NOT NULL AND NEW.lease_kind IS NOT NULL)
+    OR
+    (NEW.state != 'claude_leased' AND NEW.lease_digest IS NULL
+     AND NEW.lease_expires_at IS NULL AND NEW.lease_kind IS NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Claude visibility lease fields');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_claude_visibility_lease_kind_update
+BEFORE UPDATE ON session_claude_visibility_jobs
+WHEN NOT (
+    (NEW.state = 'claude_leased' AND NEW.lease_digest IS NOT NULL
+     AND NEW.lease_expires_at IS NOT NULL AND NEW.lease_kind IS NOT NULL)
+    OR
+    (NEW.state != 'claude_leased' AND NEW.lease_digest IS NULL
+     AND NEW.lease_expires_at IS NULL AND NEW.lease_kind IS NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Claude visibility lease fields');
+END;
 """
 
 FTS_SQL = """
@@ -1856,6 +1906,39 @@ class SessionDB:
                     # means consumers fall back to sessions.json for those
                     # rows until the gateway rewrites them.
                     logger.debug("v18 gateway metadata backfill skipped: %s", exc)
+            if current_version < 24:
+                # v24: legacy v23 Claude visibility lease/error sentinels were
+                # not authenticated authorization. Never promote them into the
+                # reconciliation audit table. Invalidate every active legacy
+                # lease and force an exact-ID reconciliation while retaining
+                # the old sentinel in bounded diagnostic detail.
+                cursor.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_retry',
+                           next_attempt_at = updated_at,
+                           lease_digest = NULL, lease_expires_at = NULL,
+                           lease_kind = NULL,
+                           error_code = 'lease_expired',
+                           error_detail = substr(
+                               'v23 active lease invalidated during v24 migration; '
+                               || COALESCE(error_code, 'no prior diagnostic') || '; '
+                               || COALESCE(error_detail, ''), 1, 512
+                           )
+                       WHERE state = 'claude_leased'"""
+                )
+                cursor.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET error_code = 'creation_ambiguous',
+                           error_detail = substr(
+                               'v23 authorization sentinel invalidated during v24 migration; '
+                               || error_code || '; ' || COALESCE(error_detail, ''), 1, 512
+                           )
+                       WHERE state = 'claude_retry'
+                         AND error_code IN (
+                             'exact_id_absent_reconciled',
+                             'exact_id_reconciliation_in_progress'
+                         )"""
+                )
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",

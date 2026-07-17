@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 from dataclasses import dataclass
 from decimal import Decimal
 import hashlib
@@ -15,8 +13,10 @@ from .models import (
     Provider,
     SessionProjection,
     canonical_session_id,
+    decode_bridge_marker,
     encode_bridge_marker,
 )
+from .context_pack import _redact
 from .sidebar import is_meaningful_user_text, normalize_meaningful_user_text, sidebar_title
 
 
@@ -59,14 +59,8 @@ CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
     "duplicate_identity",
     "unknown_error_code",
 })
-CLAUDE_VISIBILITY_INTERNAL_CODES = frozenset({
-    "exact_id_reconciliation_in_progress",
-    "exact_id_absent_reconciled",
-})
 CLAUDE_VISIBILITY_ERROR_CODES = (
-    CLAUDE_VISIBILITY_RETRY_CODES
-    | CLAUDE_VISIBILITY_FATAL_CODES
-    | CLAUDE_VISIBILITY_INTERNAL_CODES
+    CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
 )
 
 _ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready"})
@@ -197,6 +191,8 @@ def build_claude_visibility_candidate(
         for message in projection.messages
         if message.role == "user" and is_meaningful_user_text(message.content)
     )
+    if not isinstance(first_request, str):
+        raise ValueError("Claude visibility request text must be a string")
     title_provider = (
         Provider.CLAUDE if projection.provider is Provider.CODEX else Provider.HERMES
     )
@@ -257,21 +253,24 @@ def _identity_values(
 def build_claude_registration_prompt(
     candidate: ClaudeVisibilityCandidate,
     identity: ClaudeVisibilityIdentity,
+    marker_secret: bytes,
 ) -> str:
-    validate_claude_visibility_identity_binding(candidate, identity)
+    validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+    if _redact(candidate.source_session_id) != candidate.source_session_id:
+        raise ValueError("source session ID cannot be represented safely")
     metadata = {
         "bridge_id": identity.bridge_id,
-        "git_branch": candidate.git_branch,
-        "git_head": candidate.git_head,
-        "git_root": candidate.git_root,
-        "source_cwd": candidate.source_cwd,
+        "git_branch": _safe_prompt_metadata(candidate.git_branch),
+        "git_head": _safe_prompt_metadata(candidate.git_head),
+        "git_root": _safe_prompt_metadata(candidate.git_root),
+        "source_cwd": _safe_prompt_metadata(candidate.source_cwd),
         "source_provider": candidate.source_provider.value,
         "source_session_id": candidate.source_session_id,
-        "worktree_id": candidate.worktree_id,
+        "worktree_id": _safe_prompt_metadata(candidate.worktree_id),
     }
     serialized = json.dumps(
         metadata,
-        ensure_ascii=False,
+        ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -302,6 +301,7 @@ def normalized_claude_visibility_error(error_code: object) -> tuple[str, bool]:
 def validate_claude_visibility_identity_binding(
     candidate: ClaudeVisibilityCandidate,
     identity: ClaudeVisibilityIdentity,
+    marker_secret: bytes,
 ) -> None:
     _validate_candidate(candidate)
     if not isinstance(identity, ClaudeVisibilityIdentity):
@@ -314,31 +314,22 @@ def validate_claude_visibility_identity_binding(
     ) != _identity_values(candidate):
         raise ValueError("Claude visibility identity does not match candidate")
     try:
-        prefix, encoded_and_signature = identity.signed_marker.split(":", 1)
-        encoded, signature = encoded_and_signature.split(".", 1)
-        if prefix != "HERMES_SESSION_BRIDGE_V1" or not encoded or not signature:
-            raise ValueError
-        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-        if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != encoded:
-            raise ValueError
-        raw_signature = base64.urlsafe_b64decode(
-            signature + "=" * (-len(signature) % 4)
-        )
-        if len(raw_signature) != hashlib.sha256().digest_size or (
-            base64.urlsafe_b64encode(raw_signature).decode("ascii").rstrip("=")
-            != signature
-        ):
-            raise ValueError
-        payload = json.loads(raw.decode("utf-8"))
-    except (AttributeError, binascii.Error, UnicodeError, ValueError) as exc:
+        payload = decode_bridge_marker(identity.signed_marker, marker_secret)
+    except ValueError as exc:
         raise ValueError("Claude visibility signed marker is malformed") from exc
-    if payload != {
-        "bridge_id": identity.bridge_id,
-        "policy_generation": 1,
-        "source_session_id": candidate.source_session_id,
-        "target_provider": Provider.CLAUDE.value,
-    }:
+    if payload != BridgeMarkerPayload(
+        bridge_id=identity.bridge_id,
+        policy_generation=1,
+        source_session_id=candidate.source_session_id,
+        target_provider=Provider.CLAUDE,
+    ):
         raise ValueError("Claude visibility signed marker does not match candidate")
+
+
+def _safe_prompt_metadata(value: str | None) -> str | None:
+    """Redact untrusted metadata before ASCII-only canonical JSON serialization."""
+
+    return None if value is None else _redact(value)
 
 
 def _validate_candidate(candidate: ClaudeVisibilityCandidate) -> None:
@@ -387,11 +378,33 @@ def _finite_float(value: object, label: str) -> float:
     return normalized
 
 
-def decimal_cost(value: object, label: str) -> Decimal:
+def usd_microdollars(value: object, label: str) -> int:
     try:
         normalized = Decimal(str(value))
     except Exception as exc:
         raise ValueError(f"{label} must be a decimal amount") from exc
-    if not normalized.is_finite() or normalized < 0:
-        raise ValueError(f"{label} must be a non-negative decimal amount")
-    return normalized
+    if not normalized.is_finite() or normalized <= 0:
+        raise ValueError(f"{label} must be a positive decimal amount")
+    exponent = normalized.as_tuple().exponent
+    if not isinstance(exponent, int):
+        raise ValueError(f"{label} must be a finite decimal amount")
+    if exponent < -6:
+        raise ValueError(f"{label} supports at most 6 decimal places")
+    if normalized > Decimal("1000000"):
+        raise ValueError(f"{label} cannot exceed 1000000 USD")
+    sign, digits, exponent = normalized.as_tuple()
+    if not isinstance(exponent, int):
+        raise ValueError(f"{label} must be a finite decimal amount")
+    if sign:
+        raise ValueError(f"{label} must be a positive decimal amount")
+    coefficient = 0
+    for digit in digits:
+        coefficient = coefficient * 10 + digit
+    return coefficient * (10 ** (exponent + 6))
+
+
+def canonical_usd(microdollars: int) -> str:
+    if not isinstance(microdollars, int) or isinstance(microdollars, bool) or microdollars < 0:
+        raise ValueError("microdollars must be a non-negative integer")
+    whole, fraction = divmod(microdollars, 1_000_000)
+    return f"{whole}.{fraction:06d}"

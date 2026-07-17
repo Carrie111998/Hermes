@@ -387,6 +387,21 @@ def test_claude_visibility_config_parses_every_valid_override(
             "not-money",
             "emergency_daily_cost_usd must be a decimal number",
         ),
+        (
+            "reserved_cost_per_attempt_usd",
+            "0.0000001",
+            "reserved_cost_per_attempt_usd supports at most 6 decimal places",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "1000000.000001",
+            "emergency_daily_cost_usd cannot exceed 1000000 USD",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "1e1000000",
+            "emergency_daily_cost_usd cannot exceed 1000000 USD",
+        ),
     ),
 )
 def test_claude_visibility_config_rejects_unsafe_values(

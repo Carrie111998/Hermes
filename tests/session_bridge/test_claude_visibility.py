@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -12,6 +12,7 @@ from session_bridge.claude_visibility import (
     derive_claude_visibility_identity,
     evaluate_claude_visibility,
     normalized_claude_visibility_error,
+    validate_claude_visibility_identity_binding,
 )
 from session_bridge.models import OriginKind, ProjectedMessage, Provider, SessionProjection
 
@@ -173,7 +174,7 @@ def test_registration_prompt_is_bounded_signed_metadata_without_transcript() -> 
     )
     identity = derive_claude_visibility_identity(candidate, SECRET)
 
-    prompt = build_claude_registration_prompt(candidate, identity)
+    prompt = build_claude_registration_prompt(candidate, identity, SECRET)
 
     assert identity.signed_marker in prompt
     assert candidate.source_session_id in prompt
@@ -197,8 +198,44 @@ def test_registration_prompt_rejects_mismatched_deterministic_identity() -> None
 
     with pytest.raises(ValueError, match="does not match candidate"):
         build_claude_registration_prompt(
-            candidate, derive_claude_visibility_identity(other, SECRET)
+            candidate, derive_claude_visibility_identity(other, SECRET), SECRET
         )
+
+
+def test_identity_validation_and_prompt_reject_canonical_forged_signature() -> None:
+    candidate = build_claude_visibility_candidate(
+        _projection(Provider.CODEX), eligible_at=30.0
+    )
+    identity = derive_claude_visibility_identity(candidate, SECRET)
+    replacement = "A" if identity.signed_marker[-1] != "A" else "B"
+    forged = replace(
+        identity, signed_marker=identity.signed_marker[:-1] + replacement
+    )
+
+    with pytest.raises(ValueError, match="signed marker"):
+        validate_claude_visibility_identity_binding(candidate, forged, SECRET)
+    with pytest.raises(ValueError, match="signed marker"):
+        build_claude_registration_prompt(candidate, forged, SECRET)
+
+
+def test_registration_prompt_redacts_secrets_and_ascii_escapes_line_separators() -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    candidate = build_claude_visibility_candidate(
+        _projection(Provider.HERMES, content="safe request"),
+        eligible_at=30.0,
+        git_root=f"C:/work/{secret}",
+        git_head="abc123",
+        worktree_id="tree\u2028injected\u2029line",
+    )
+    candidate = replace(candidate, git_branch=f"feature/token={secret}\x1enext")
+    identity = derive_claude_visibility_identity(candidate, SECRET)
+
+    prompt = build_claude_registration_prompt(candidate, identity, SECRET)
+
+    assert secret not in prompt
+    assert "\\u2028" in prompt and "\\u2029" in prompt and "\\u001e" in prompt
+    assert "\u2028" not in prompt and "\u2029" not in prompt and "\x1e" not in prompt
+    assert len(prompt.splitlines()) == 7
 
 
 def test_error_codes_are_fixed_and_malformed_values_fail_closed() -> None:

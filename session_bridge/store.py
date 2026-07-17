@@ -44,6 +44,7 @@ from .models import (
 if TYPE_CHECKING:
     from .claude_visibility import (
         ClaudeVisibilityCandidate,
+        ClaudeVisibilityClaim,
         ClaudeVisibilityIdentity,
     )
     from .sidebar import SidebarCandidate
@@ -363,6 +364,7 @@ class SessionBridgeStore:
         self,
         candidate: ClaudeVisibilityCandidate,
         identity: ClaudeVisibilityIdentity,
+        marker_secret: bytes,
     ) -> dict[str, Any]:
         from .claude_visibility import (
             ClaudeVisibilityCandidate,
@@ -374,10 +376,11 @@ class SessionBridgeStore:
             raise TypeError("candidate must be a ClaudeVisibilityCandidate")
         if not isinstance(identity, ClaudeVisibilityIdentity):
             raise TypeError("identity must be a ClaudeVisibilityIdentity")
-        validate_claude_visibility_identity_binding(candidate, identity)
-        now = _finite_number(self._clock(), "clock")
-
+        validate_claude_visibility_identity_binding(
+            candidate, identity, marker_secret
+        )
         def _write(conn):
+            now = _finite_number(self._clock(), "clock")
             collisions = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
                    WHERE source_session_id = ? OR bridge_id = ?
@@ -464,17 +467,25 @@ class SessionBridgeStore:
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None
+            operation_time = _finite_number(self._clock(), "clock")
             due = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
                    WHERE (
                        state = 'claude_retry'
-                       AND error_code <> 'exact_id_absent_reconciled'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_reconciliations r
+                           WHERE r.job_id = session_claude_visibility_jobs.id
+                             AND r.attempt_ordinal = session_claude_visibility_jobs.attempts
+                             AND r.reserved_claude_uuid = session_claude_visibility_jobs.reserved_claude_uuid
+                             AND r.outcome = 'absent' AND r.consumed_at IS NULL
+                       )
                        AND next_attempt_at <= ?
                    ) OR (
                        state = 'claude_leased' AND lease_expires_at <= ?
                    )
                    ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
-                (inspection_time, inspection_time),
+                (inspection_time, operation_time),
             ).fetchone()
         if due is None:
             return ClaudeVisibilityClaim(status="no_due_job")
@@ -516,21 +527,29 @@ class SessionBridgeStore:
             raise ValueError("lease_seconds must be positive")
 
         def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
             conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = 'claude_retry', next_attempt_at = ?,
                        lease_digest = NULL, lease_expires_at = NULL,
+                       lease_kind = NULL,
                        error_code = 'lease_expired',
                        error_detail = 'active lease expired before completion',
                        updated_at = ?
                    WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
-                (claim_time, claim_time, claim_time),
+                (claim_time, operation_time, operation_time),
             )
             due = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
-                   WHERE state = 'claude_retry'
-                     AND error_code <> 'exact_id_absent_reconciled'
-                     AND next_attempt_at <= ?
+                   WHERE state = 'claude_retry' AND next_attempt_at <= ?
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM session_claude_visibility_reconciliations r
+                         WHERE r.job_id = session_claude_visibility_jobs.id
+                           AND r.attempt_ordinal = session_claude_visibility_jobs.attempts
+                           AND r.reserved_claude_uuid = session_claude_visibility_jobs.reserved_claude_uuid
+                           AND r.outcome = 'absent' AND r.consumed_at IS NULL
+                     )
                    ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
                 (claim_time,),
             ).fetchone()
@@ -539,7 +558,7 @@ class SessionBridgeStore:
             return self._lease_claude_visibility_reconciliation(
                 conn,
                 due,
-                claim_time=claim_time,
+                claim_time=operation_time,
                 lease_duration=lease_duration,
             )
 
@@ -549,6 +568,8 @@ class SessionBridgeStore:
         self,
         job_id: str,
         lease_digest: str,
+        reserved_claude_uuid: str,
+        attempt_ordinal: int,
         evidence_digest: str,
     ) -> dict[str, Any]:
         """Persist exact reserved-UUID absence under a reconciliation lease."""
@@ -557,6 +578,15 @@ class SessionBridgeStore:
         normalized_lease = _exact_nonempty_text(
             lease_digest, "Claude visibility lease digest"
         )
+        normalized_uuid = _exact_nonempty_text(
+            reserved_claude_uuid, "reserved Claude UUID"
+        )
+        if (
+            not isinstance(attempt_ordinal, int)
+            or isinstance(attempt_ordinal, bool)
+            or attempt_ordinal < 0
+        ):
+            raise ValueError("attempt ordinal must be a non-negative integer")
         evidence = _exact_nonempty_text(
             evidence_digest, "Claude reconciliation evidence digest"
         )
@@ -564,21 +594,41 @@ class SessionBridgeStore:
             raise ValueError(
                 "Claude reconciliation evidence digest must be lowercase SHA-256"
             )
-        reconciled_at = _finite_number(self._clock(), "clock")
-
         def _write(conn):
+            reconciled_at = _finite_number(self._clock(), "clock")
+            inserted = conn.execute(
+                """INSERT INTO session_claude_visibility_reconciliations (
+                       job_id, reserved_claude_uuid, attempt_ordinal, outcome,
+                       evidence_digest, checked_at, consumed_at
+                   )
+                   SELECT id, reserved_claude_uuid, attempts, 'absent', ?, ?, NULL
+                   FROM session_claude_visibility_jobs
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ? AND lease_expires_at > ?
+                     AND lease_kind = 'reconciliation'
+                     AND reserved_claude_uuid = ? AND attempts = ?""",
+                (
+                    evidence,
+                    reconciled_at,
+                    normalized_job_id,
+                    normalized_lease,
+                    reconciled_at,
+                    normalized_uuid,
+                    attempt_ordinal,
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise ValueError("exact active Claude reconciliation lease required")
             cursor = conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = 'claude_retry', next_attempt_at = ?,
                        lease_digest = NULL, lease_expires_at = NULL,
-                       error_code = 'exact_id_absent_reconciled',
-                       error_detail = ?, updated_at = ?
+                       lease_kind = NULL, updated_at = ?
                    WHERE id = ? AND state = 'claude_leased'
                      AND lease_digest = ? AND lease_expires_at > ?
-                     AND error_code = 'exact_id_reconciliation_in_progress'""",
+                     AND lease_kind = 'reconciliation'""",
                 (
                     reconciled_at,
-                    f"absence-evidence:{evidence}",
                     reconciled_at,
                     normalized_job_id,
                     normalized_lease,
@@ -604,7 +654,11 @@ class SessionBridgeStore:
         cost_limit: object,
         reserved_cost: object,
     ) -> ClaudeVisibilityClaim:
-        from .claude_visibility import ClaudeVisibilityClaim, decimal_cost
+        from .claude_visibility import (
+            ClaudeVisibilityClaim,
+            canonical_usd,
+            usd_microdollars,
+        )
 
         claim_time = _finite_number(now, "now")
         lease_duration = _finite_number(lease_seconds, "lease_seconds")
@@ -614,22 +668,22 @@ class SessionBridgeStore:
             raise ValueError("daily_limit must be a positive integer")
         if daily_limit > 25:
             raise ValueError("daily_limit cannot exceed 25")
-        maximum_cost = decimal_cost(cost_limit, "cost_limit")
-        attempt_cost = decimal_cost(reserved_cost, "reserved_cost")
-        if attempt_cost <= 0:
-            raise ValueError("reserved_cost must be positive")
-        local_day = self._claude_visibility_local_day(claim_time)
+        maximum_cost = usd_microdollars(cost_limit, "cost_limit")
+        attempt_cost = usd_microdollars(reserved_cost, "reserved_cost")
 
         def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            local_day = self._claude_visibility_local_day(operation_time)
             conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = 'claude_retry', next_attempt_at = ?,
                        lease_digest = NULL, lease_expires_at = NULL,
+                       lease_kind = NULL,
                        error_code = 'lease_expired',
                        error_detail = 'active lease expired before completion',
                        updated_at = ?
                    WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
-                (claim_time, claim_time, claim_time),
+                (claim_time, operation_time, operation_time),
             )
             due = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
@@ -640,17 +694,23 @@ class SessionBridgeStore:
             ).fetchone()
             if due is None:
                 return ClaudeVisibilityClaim(status="no_due_job")
-            launch_permitted = (
+            fresh_pending = (
                 due["state"] == "claude_pending" and int(due["attempts"]) == 0
-            ) or (
-                due["state"] == "claude_retry"
-                and due["error_code"] == "exact_id_absent_reconciled"
             )
+            absence = conn.execute(
+                """SELECT rowid FROM session_claude_visibility_reconciliations
+                   WHERE job_id = ? AND reserved_claude_uuid = ?
+                     AND attempt_ordinal = ? AND outcome = 'absent'
+                     AND consumed_at IS NULL
+                   ORDER BY checked_at DESC LIMIT 1""",
+                (due["id"], due["reserved_claude_uuid"], due["attempts"]),
+            ).fetchone()
+            launch_permitted = fresh_pending or absence is not None
             if not launch_permitted:
                 return self._lease_claude_visibility_reconciliation(
                     conn,
                     due,
-                    claim_time=claim_time,
+                    claim_time=operation_time,
                     lease_duration=lease_duration,
                 )
             usage = conn.execute(
@@ -662,8 +722,11 @@ class SessionBridgeStore:
             if len(usage) >= daily_limit:
                 return ClaudeVisibilityClaim(status="daily_limit")
             spent = sum(
-                (Decimal(row["reserved_estimated_cost_usd"]) for row in usage),
-                Decimal("0"),
+                usd_microdollars(
+                    row["reserved_estimated_cost_usd"],
+                    "persisted reserved cost",
+                )
+                for row in usage
             )
             if spent + attempt_cost > maximum_cost:
                 return ClaudeVisibilityClaim(status="cost_limit")
@@ -679,17 +742,25 @@ class SessionBridgeStore:
                 raise ValueError("Claude visibility lease factory returned a duplicate")
             attempt = int(due["attempts"]) + 1
             prior_error_code = due["error_code"]
+            if absence is not None:
+                consumed = conn.execute(
+                    """UPDATE session_claude_visibility_reconciliations
+                       SET consumed_at = ?
+                       WHERE rowid = ? AND consumed_at IS NULL""",
+                    (operation_time, absence["rowid"]),
+                )
+                if consumed.rowcount != 1:
+                    raise ValueError("stale Claude reconciliation authorization")
             cursor = conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = 'claude_leased', attempts = ?, lease_digest = ?,
-                       lease_expires_at = ?, error_code = NULL,
-                       error_detail = NULL, updated_at = ?
+                       lease_expires_at = ?, lease_kind = 'launch', updated_at = ?
                    WHERE id = ? AND state = ? AND attempts = ?""",
                 (
                     attempt,
                     lease_digest,
-                    claim_time + lease_duration,
-                    claim_time,
+                    operation_time + lease_duration,
+                    operation_time,
                     due["id"],
                     due["state"],
                     due["attempts"],
@@ -706,8 +777,8 @@ class SessionBridgeStore:
                     local_day,
                     due["id"],
                     attempt,
-                    str(attempt_cost),
-                    claim_time,
+                    canonical_usd(attempt_cost),
+                    operation_time,
                 ),
             )
             return ClaudeVisibilityClaim(
@@ -757,8 +828,7 @@ class SessionBridgeStore:
             """UPDATE session_claude_visibility_jobs
                SET state = 'claude_leased', lease_digest = ?,
                    lease_expires_at = ?,
-                   error_code = 'exact_id_reconciliation_in_progress',
-                   error_detail = NULL, updated_at = ?
+                   lease_kind = 'reconciliation', updated_at = ?
                WHERE id = ? AND state = ? AND attempts = ?""",
             (
                 lease_digest,
@@ -845,13 +915,36 @@ class SessionBridgeStore:
         )
         completion = _exact_nonempty_text(transcript_digest, "transcript digest")
         timestamp = _finite_number(visible_at, "visible_at")
-        operation_time = _finite_number(self._clock(), "clock")
 
         def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            active = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ? AND lease_expires_at > ?""",
+                (normalized_job_id, normalized_lease, operation_time),
+            ).fetchone()
+            if active is None:
+                raise ValueError("exact active Claude visibility lease required")
+            if active["lease_kind"] == "reconciliation":
+                conn.execute(
+                    """INSERT INTO session_claude_visibility_reconciliations (
+                           job_id, reserved_claude_uuid, attempt_ordinal, outcome,
+                           evidence_digest, checked_at, consumed_at
+                       ) VALUES (?, ?, ?, 'exact_match', ?, ?, NULL)""",
+                    (
+                        normalized_job_id,
+                        active["reserved_claude_uuid"],
+                        active["attempts"],
+                        hashlib.sha256(completion.encode("utf-8")).hexdigest(),
+                        operation_time,
+                    ),
+                )
             cursor = conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = 'claude_visible', lease_digest = NULL,
-                       lease_expires_at = NULL, completion_digest = ?,
+                       lease_expires_at = NULL, lease_kind = NULL,
+                       completion_digest = ?,
                        error_code = NULL, error_detail = NULL,
                        visible_at = ?, updated_at = ?
                    WHERE id = ? AND state = 'claude_leased'
@@ -890,13 +983,39 @@ class SessionBridgeStore:
         normalized_lease = _exact_nonempty_text(
             lease_digest, "Claude visibility lease digest"
         )
-        updated_at = _finite_number(self._clock(), "clock")
-
         def _write(conn):
+            updated_at = _finite_number(self._clock(), "clock")
+            active = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ? AND lease_expires_at > ?""",
+                (normalized_job_id, normalized_lease, updated_at),
+            ).fetchone()
+            if active is None:
+                raise ValueError("exact active Claude visibility lease required")
+            if error_code == "uuid_conflict":
+                if active["lease_kind"] != "reconciliation":
+                    raise ValueError(
+                        "UUID conflict requires a Claude reconciliation lease"
+                    )
+                conn.execute(
+                    """INSERT INTO session_claude_visibility_reconciliations (
+                           job_id, reserved_claude_uuid, attempt_ordinal, outcome,
+                           evidence_digest, checked_at, consumed_at
+                       ) VALUES (?, ?, ?, 'conflict', ?, ?, NULL)""",
+                    (
+                        normalized_job_id,
+                        active["reserved_claude_uuid"],
+                        active["attempts"],
+                        hashlib.sha256(error_detail.encode("utf-8")).hexdigest(),
+                        updated_at,
+                    ),
+                )
             cursor = conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = ?, next_attempt_at = COALESCE(?, next_attempt_at),
                        lease_digest = NULL, lease_expires_at = NULL,
+                       lease_kind = NULL,
                        error_code = ?, error_detail = ?, updated_at = ?
                    WHERE id = ? AND state = 'claude_leased'
                      AND lease_digest = ? AND lease_expires_at > ?""",
