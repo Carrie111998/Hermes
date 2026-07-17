@@ -371,6 +371,46 @@ def test_registration_prompt_must_pair_with_immediate_exact_assistant_reply() ->
     assert result.status == "failed" and result.error_code == "bridge_conflict"
 
 
+def test_registration_turn_aggregates_split_text_blocks_from_same_assistant_event() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(item)
+    assistant = projection.messages[1]
+    messages = [
+        projection.messages[0],
+        replace(assistant, ordinal=0, content="REGIS"),
+        replace(assistant, ordinal=1, content="TERED"),
+    ]
+    result = registrar(
+        FakeSource([replace(projection, messages=messages)]), FakeFactory()
+    ).process(item)
+    assert result.status == "visible"
+
+
+def test_registration_turn_rejects_extra_block_in_same_assistant_event() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(item)
+    assistant = projection.messages[1]
+    messages = [
+        projection.messages[0],
+        assistant,
+        replace(assistant, ordinal=1, content="extra"),
+    ]
+    result = registrar(
+        FakeSource([replace(projection, messages=messages)]), FakeFactory()
+    ).process(item)
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
+
+
 def test_exact_transcript_must_use_windows_encoded_source_project_directory() -> None:
     item = claim(
         lease_kind="reconciliation",
@@ -537,6 +577,48 @@ def test_winpty_reader_drains_extra_output_after_registered_before_acceptance() 
     output = _WinPtyProcess(process).read_until(0.2)
     assert output.strip().splitlines() == ["REGISTERED", "extra"]
     assert process.calls >= 2
+
+
+def test_winpty_quiet_period_resets_for_each_partial_post_response_chunk() -> None:
+    class Process:
+        def __init__(self):
+            self.chunks = iter(["REGISTERED\r\n", "ex", "tra\r\n"])
+            self.calls = 0
+
+        def read(self, size: int = 1024) -> str:
+            self.calls += 1
+            if self.calls in {2, 3}:
+                time.sleep(0.08)
+            return next(self.chunks)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until(0.5)
+    assert output.strip().splitlines() == ["REGISTERED", "extra"]
+    assert process.calls == 4
+
+
+def test_winpty_slow_drip_after_candidate_stays_bounded_by_global_timeout() -> None:
+    release = threading.Event()
+
+    class Process:
+        def __init__(self):
+            self.chunks = iter(["REGISTERED\r\n", "e", "x", "t"])
+
+        def read(self, size: int = 1024) -> str:
+            try:
+                chunk = next(self.chunks)
+            except StopIteration:
+                release.wait(2)
+                raise EOFError
+            time.sleep(0.06)
+            return chunk
+
+    started = time.monotonic()
+    output = _WinPtyProcess(Process()).read_until(0.22)
+    elapsed = time.monotonic() - started
+    release.set()
+    assert output.startswith("REGISTERED")
+    assert elapsed < 0.5
 
 
 def test_winpty_reader_accepts_registered_split_across_chunks() -> None:

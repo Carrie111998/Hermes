@@ -27,7 +27,7 @@ from .claude_visibility import (
     derive_claude_visibility_identity,
     validate_claude_visibility_identity_binding,
 )
-from .models import OriginKind, Provider, SessionProjection
+from .models import OriginKind, ProjectedMessage, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
@@ -134,6 +134,7 @@ class _WinPtyProcess:
         threading.Thread(target=_read, daemon=True).start()
         deadline = time.monotonic() + timeout
         settle_deadline: float | None = None
+        candidate_seen = False
         chunks: list[str] = []
         while True:
             now = time.monotonic()
@@ -141,9 +142,8 @@ class _WinPtyProcess:
             remaining = wake_at - now
             if remaining <= 0:
                 joined = "".join(chunks)
-                exact_response = _exact_registered_suffix(joined)
-                if exact_response is not None and settle_deadline is not None:
-                    return exact_response
+                if candidate_seen:
+                    return _registered_suffix(joined, require_complete=False) or joined
                 raise TimeoutError
             try:
                 value = result.get(timeout=remaining)
@@ -151,14 +151,18 @@ class _WinPtyProcess:
                 continue
             if value is None:
                 joined = "".join(chunks)
-                return _exact_registered_suffix(joined) or joined
+                if candidate_seen:
+                    return _registered_suffix(joined, require_complete=False) or joined
+                return joined
             if isinstance(value, BaseException):
                 raise RuntimeError("PTY read unavailable") from value
             chunks.append(value)
             joined = "".join(chunks)
             if len(joined) > _MAX_RESPONSE_CHARS:
                 return joined
-            if _exact_registered_suffix(joined) is not None:
+            if not candidate_seen and _exact_registered_suffix(joined) is not None:
+                candidate_seen = True
+            if candidate_seen:
                 settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
 
     def write(self, data: str) -> None:
@@ -485,7 +489,38 @@ def _validate_projection(
     if prompt_index + 1 >= len(projection.messages):
         raise _TranscriptConflict("bridge_conflict")
     response = projection.messages[prompt_index + 1]
-    if response.role != "assistant" or not _is_exact_registered_text(response.content):
+    if response.role != "assistant":
+        raise _TranscriptConflict("bridge_conflict")
+    turn_messages = []
+    for message in projection.messages[prompt_index + 1:]:
+        if message.role == "user":
+            break
+        turn_messages.append(message)
+    event_order: list[str] = []
+    by_event: dict[str, list[ProjectedMessage]] = {}
+    for message in turn_messages:
+        if (
+            message.role != "assistant"
+            or message.tool_calls
+            or message.tool_name
+            or message.reasoning
+        ):
+            raise _TranscriptConflict("bridge_conflict")
+        if message.native_event_id not in by_event:
+            event_order.append(message.native_event_id)
+            by_event[message.native_event_id] = []
+        by_event[message.native_event_id].append(message)
+    ordered_messages = [
+        message
+        for event_id in event_order
+        for message in sorted(by_event[event_id], key=lambda item: item.ordinal)
+    ]
+    aggregate = "".join(
+        message.content
+        for message in ordered_messages
+        if isinstance(message.content, str)
+    )
+    if not _is_exact_registered_text(aggregate):
         raise _TranscriptConflict("bridge_conflict")
 
 
@@ -523,7 +558,11 @@ def _has_exact_registered_response(output: str, prompt: str) -> bool:
 
 
 def _exact_registered_suffix(output: str) -> str | None:
-    if not output.endswith(("\r", "\n")):
+    return _registered_suffix(output, require_complete=True)
+
+
+def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
+    if require_complete and not output.endswith(("\r", "\n")):
         return None
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
     lines = cleaned.splitlines()
