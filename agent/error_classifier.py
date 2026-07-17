@@ -129,6 +129,25 @@ _BILLING_PATTERNS = [
     "not available on the free tier",
 ]
 
+# xAI's explicit Grok credit-exhaustion code. Keep the HTTP 403 special case
+# provider-scoped: other providers' generic billing codes historically remain
+# auth failures when they arrive as 403.
+_XAI_SPENDING_LIMIT_ERROR_CODE = "personal-team-blocked:spending-limit"
+
+# Structured provider codes that mean the account cannot serve paid traffic
+# until credits/subscription capacity is restored. xAI returns its explicit
+# Grok spending-limit signal as HTTP 403 rather than 402.
+_BILLING_ERROR_CODES = frozenset({
+    "insufficient_quota",
+    "billing_not_active",
+    "payment_required",
+    "insufficient_credits",
+    "no_usable_credits",
+    "balance_depleted",
+    "model_not_supported_on_free_tier",
+    _XAI_SPENDING_LIMIT_ERROR_CODE,
+})
+
 # Patterns that indicate rate limiting (transient, will resolve)
 _RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -273,6 +292,8 @@ _CONTEXT_OVERFLOW_PATTERNS = [
     # Chinese error messages (some providers return these)
     "超过最大长度",
     "上下文长度",
+    # Z.AI / Zhipu GLM pattern (English form; error code 1210)
+    "tokens in request more than max tokens allowed",
     # AWS Bedrock Converse API error patterns
     "input is too long",
     "max input token",
@@ -872,7 +893,29 @@ def classify_api_error(
         return _result(FailoverReason.timeout, retryable=True,
                        is_stream_stale=_sd_stale)
 
-    # ── 7. Transport / timeout heuristics ───────────────────────────
+    # ── 7b. Stale-call circuit breaker → failover immediately ──────
+    # _check_stale_giveup() in agent/chat_completion_helpers.py raises a
+    # RuntimeError when the provider has been unresponsive for N
+    # consecutive stale attempts (default 5).  The error is NOT a transport
+    # timeout — the circuit breaker fires *before* any network call to avoid
+    # an indefinite stall.  Without this classification the RuntimeError
+    # falls through to FailoverReason.unknown (retryable=True), which burns
+    # all max_retries against the same dead provider (each retry hitting the
+    # circuit breaker instantly with zero network overhead) before fallback
+    # is attempted.  Classify as non-retryable + should_fallback so the
+    # retry loop activates the next fallback provider on the first hit.
+    if (
+        error_type == "RuntimeError"
+        and "consecutive stale attempts" in error_msg
+        and "aborting this call" in error_msg
+    ):
+        return _result(
+            FailoverReason.timeout,
+            retryable=False,
+            should_fallback=True,
+        )
+
+    # ── 8. Transport / timeout heuristics ───────────────────────────
 
     # Check for stream-stale / broken-pipe patterns on any transport error
     # so the retry loop can use shorter backoff.  Apply across all transport
@@ -886,7 +929,7 @@ def classify_api_error(
             is_stream_stale=_matched_stale_pattern,
         )
 
-    # ── 8. Fallback: unknown ────────────────────────────────────────
+    # ── 9. Fallback: unknown ────────────────────────────────────────
 
     return _result(FailoverReason.unknown, retryable=True)
 
@@ -925,7 +968,11 @@ def _classify_by_status(
         # OpenRouter 403 "key limit exceeded" is actually billing. Other
         # providers also use 403 for account-plan or credit exhaustion.
         if (
-            "key limit exceeded" in error_msg
+            (
+                provider == "xai-oauth"
+                and error_code.lower() == _XAI_SPENDING_LIMIT_ERROR_CODE
+            )
+            or "key limit exceeded" in error_msg
             or "spending limit" in error_msg
             or any(p in error_msg for p in _BILLING_PATTERNS)
         ):
@@ -1203,6 +1250,7 @@ def _classify_400(
             "encrypted content for item" in error_msg
             and "could not be verified" in error_msg
         )
+        or "could not decrypt the provided encrypted_content" in error_msg
     ):
         return result_fn(
             FailoverReason.invalid_encrypted_content,
@@ -1325,15 +1373,7 @@ def _classify_by_error_code(
             should_rotate_credential=True,
         )
 
-    if code_lower in {
-        "insufficient_quota",
-        "billing_not_active",
-        "payment_required",
-        "insufficient_credits",
-        "no_usable_credits",
-        "balance_depleted",
-        "model_not_supported_on_free_tier",
-    }:
+    if code_lower in _BILLING_ERROR_CODES:
         return result_fn(
             FailoverReason.billing,
             retryable=False,
