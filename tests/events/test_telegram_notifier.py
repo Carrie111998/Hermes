@@ -777,7 +777,8 @@ class TestAgentFailureClusterDedup:
 
         Without this dedup the cron-emitter and mailbox-translator paths
         each fire a cluster event for the same Applier exit-126 incident
-        and the user sees two ``#watchdog_alerts`` messages back-to-back.
+        and the user sees two ``#jobflow_firehose`` messages back-to-back
+        (JobFlow-agent clusters route there since 2026-07-16).
         """
         sent = []
         notifier = TelegramNotifier(
@@ -790,10 +791,10 @@ class TestAgentFailureClusterDedup:
         notifier.handle(evt1)
         notifier.handle(evt2)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 1, (
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 1, (
             f"second cluster for same source in same 30-min bucket must "
-            f"be suppressed; got {len(watchdog_deliveries)} deliveries: "
+            f"be suppressed; got {len(firehose_deliveries)} deliveries: "
             f"{sent!r}"
         )
 
@@ -815,10 +816,10 @@ class TestAgentFailureClusterDedup:
         notifier.handle(evt1)
         notifier.handle(evt2)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 2, (
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 2, (
             f"expected 2 deliveries across 2 buckets; got "
-            f"{len(watchdog_deliveries)}: {sent!r}"
+            f"{len(firehose_deliveries)}: {sent!r}"
         )
 
     def test_different_sources_same_bucket_both_deliver(
@@ -837,8 +838,8 @@ class TestAgentFailureClusterDedup:
         notifier.handle(evt_a)
         notifier.handle(evt_b)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 2, (
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 2, (
             f"different sources must both deliver; got {sent!r}"
         )
 
@@ -863,8 +864,8 @@ class TestAgentFailureClusterDedup:
         notifier.handle(cluster)
         notifier.handle(cron_failed)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 2, (
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 2, (
             f"cron_failed must deliver after a cluster from same source; "
             f"got {sent!r}"
         )
@@ -900,7 +901,7 @@ class TestAgentFailureClusterDedup:
 
         applier_lines = [
             s for s in sent
-            if s[0] == "100" and "applier" in s[1] and "agent-" not in s[1]
+            if s[0] == "101" and "applier" in s[1] and "agent-" not in s[1]
         ]
         assert len(applier_lines) == 2, (
             f"after LRU eviction, replay must deliver again; "
@@ -982,8 +983,8 @@ class TestAgentFailureClusterDedup:
         for evt in clusters:
             notifier.handle(evt)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 1, (
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 1, (
             f"Option A+C must deliver exactly 1 cluster Telegram alert "
             f"despite {len(clusters)} bus events; got {sent!r}"
         )
@@ -1021,8 +1022,8 @@ class TestAgentFailureClusterDedup:
         # Bus retains both copies (audit / Critic still see the duplicate).
         assert len(bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)) == 2
         # Telegram side: only the first one delivers.
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 1
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 1
 
 
 class TestWatchdogDailySummary:
@@ -1630,4 +1631,134 @@ class TestCronLifecycleRouting:
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
         )
         ev = Event.create(EventType.CRON_COMPLETED, "postgres-sync", {})
+        assert notifier.resolve_target(ev)[2] == "100"
+
+
+class TestJobflowFailureRouting:
+    """2026-07-16 operator request: failure events sourced from JobFlow
+    pipeline agents (applier, tracker, scout, ...) belong in jobflow_firehose,
+    not watchdog_alerts — their errors are pipeline telemetry, and burying
+    them among infrastructure alerts drowns the operator stream. System-
+    sourced failures (postgres-sync, jaum, watchdog itself) stay on
+    watchdog_alerts. AGENT_FAILURE_CLUSTER keeps its WhatsApp escalation
+    path regardless of Telegram topic.
+    """
+
+    def _notifier(self, bus, topics_path, verbosity_path):
+        return TelegramNotifier(
+            bus, topics_path=topics_path, verbosity_path=verbosity_path,
+        )
+
+    def test_agent_error_from_jobflow_agent_routes_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        for agent in ("applier", "tracker", "scout"):
+            ev = Event.create(
+                EventType.AGENT_ERROR, f"mailbox:{agent}",
+                {"message": "boom", "source_agent": agent},
+            )
+            assert notifier.resolve_target(ev)[2] == "101", \
+                f"agent_error from {agent} should route to jobflow_firehose"
+
+    def test_agent_error_falls_back_to_event_source_when_payload_missing(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # mailbox: transport prefix on event.source must be stripped before
+        # the agent lookup when payload.source_agent is absent.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_ERROR, "mailbox:applier", {"message": "boom"},
+        )
+        assert notifier.resolve_target(ev)[2] == "101"
+
+    def test_agent_error_from_non_jobflow_agent_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        for agent in ("jaum", "watchdog", "postgres-sync", "mempalace"):
+            ev = Event.create(
+                EventType.AGENT_ERROR, f"mailbox:{agent}",
+                {"message": "boom", "source_agent": agent},
+            )
+            assert notifier.resolve_target(ev)[2] == "100", \
+                f"agent_error from {agent} should stay on watchdog_alerts"
+
+    def test_failure_cluster_for_jobflow_agent_routes_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, "applier",
+            {"source": "applier", "count": 3},
+        )
+        assert notifier.resolve_target(ev)[2] == "101"
+
+    def test_failure_cluster_for_system_agent_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, "postgres-sync",
+            {"source": "postgres-sync", "count": 3},
+        )
+        assert notifier.resolve_target(ev)[2] == "100"
+
+    def test_jobflow_cron_failures_route_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        for et in (
+            EventType.CRON_FAILED, EventType.CRON_FAILED_CONSECUTIVE,
+            EventType.CRON_STALE,
+        ):
+            for job in ("jobflow-tracker-cycle", "jobflow-applier",
+                        "sentinel-vip-evening"):
+                ev = Event.create(et, job, {"job_name": job})
+                assert notifier.resolve_target(ev)[2] == "101", \
+                    f"{et.type_string} from {job} should route to jobflow_firehose"
+
+    def test_jobflow_prefixed_cron_without_canonical_agent_still_reroutes(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # 'jobflow-approved-release' canonicalises to 'approved' (not a
+        # known agent) but the jobflow- prefix alone marks it as pipeline.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.CRON_FAILED, "jobflow-approved-release",
+            {"job_name": "jobflow-approved-release"},
+        )
+        assert notifier.resolve_target(ev)[2] == "101"
+
+    def test_main_agent_failures_stay_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # 'main' maps to jobflow_firehose for AGENT_ITERATION chatter, but
+        # its FAILURES are Hermes-core signals — keep them operator-visible.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_ERROR, "mailbox:main",
+            {"message": "boom", "source_agent": "main"},
+        )
+        assert notifier.resolve_target(ev)[2] == "100"
+
+    def test_missing_jobflow_firehose_topic_falls_back_to_watchdog_alerts(
+        self, bus, tmp_path, verbosity_config,
+    ):
+        # topics.json without jobflow_firehose must degrade to
+        # watchdog_alerts, not leak to General via an empty thread_id.
+        config = {
+            "group_chat_id": "-1001234567890",
+            "topics": {
+                "watchdog_alerts": {"thread_id": 100, "name": "Watchdog Alerts"},
+            },
+        }
+        path = tmp_path / "telegram" / "topics_no_firehose.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config))
+        notifier = self._notifier(bus, path, verbosity_config)
+        ev = Event.create(
+            EventType.CRON_FAILED, "jobflow-applier",
+            {"job_name": "jobflow-applier"},
+        )
         assert notifier.resolve_target(ev)[2] == "100"

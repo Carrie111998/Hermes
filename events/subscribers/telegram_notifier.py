@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
 from events.paths import notifier_batch_path
+from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
 from events.state import load_state, save_state
 from events.subscribers.base import BaseSubscriber
@@ -218,6 +219,40 @@ AGENT_TOPIC_MAP: Dict[str, str] = {
     'scribe': 'scribe_daily',
 }
 AGENT_ITERATION_DEFAULT_TOPIC = 'jobflow_firehose'
+
+# Failure events whose SOURCE decides the topic (2026-07-16 operator
+# request): when the failing party is a JobFlow pipeline agent, the event
+# is pipeline telemetry and belongs in jobflow_firehose with the rest of
+# the pipeline stream — burying applier/tracker errors among gateway_health
+# flaps and resource-pressure alerts drowned watchdog_alerts. System-sourced
+# failures (postgres-sync, jaum, mempalace, the watchdog itself) keep the
+# TOPIC_ROUTING default of watchdog_alerts. AGENT_FAILURE_CLUSTER's WhatsApp
+# escalation (whatsapp_escalator.py, URGENT tier) is independent of this
+# Telegram topic choice, so 3-in-a-row pipeline failures still page.
+JOBFLOW_FAILURE_REROUTE_TYPES = frozenset({
+    EventType.AGENT_ERROR,
+    EventType.AGENT_FAILURE_CLUSTER,
+    EventType.CRON_FAILED,
+    EventType.CRON_FAILED_CONSECUTIVE,
+    EventType.CRON_STALE,
+})
+
+# JobFlow pipeline agents (canonical identities per agent_source_mapping).
+# Deliberately EXCLUDES 'main' — it maps to jobflow_firehose for
+# AGENT_ITERATION chatter, but its failures are Hermes-core signals that
+# must stay operator-visible on watchdog_alerts.
+JOBFLOW_PIPELINE_AGENTS = frozenset({
+    'applier',
+    'archiver',
+    'cv-handler',
+    'matcher',
+    'matcher-shadow',
+    'notifier',
+    'scout',
+    'sentinel',
+    'tailor',
+    'tracker',
+})
 
 # Events that cross-post to alerts when high/critical
 CROSS_POST_TO_ALERTS = {
@@ -501,6 +536,17 @@ class TelegramNotifier(BaseSubscriber):
                     thread_id = str(topic.get("thread_id", ""))
                 return ("telegram", self.group_chat_id, thread_id)
 
+        # Source-aware failure routing (2026-07-16): failure events from
+        # JobFlow pipeline agents go to jobflow_firehose, not watchdog_alerts.
+        # Falls through to the TOPIC_ROUTING default when topics.json lacks
+        # the topic (mirrors the cron_firehose degrade below).
+        if (event.event_type in JOBFLOW_FAILURE_REROUTE_TYPES
+                and self._is_jobflow_failure_source(event)):
+            topic = self.topics.get("jobflow_firehose", {})
+            thread_id = str(topic.get("thread_id", ""))
+            if thread_id:
+                return ("telegram", self.group_chat_id, thread_id)
+
         topic_key = TOPIC_ROUTING.get(event.event_type.type_string, "system")
 
         # User-facing NOTIFICATION messages (morning digest, follow-up alerts,
@@ -534,6 +580,28 @@ class TelegramNotifier(BaseSubscriber):
             topic = self.topics.get("watchdog_alerts", {})
         thread_id = str(topic.get("thread_id", ""))
         return ("telegram", self.group_chat_id, thread_id)
+
+    @staticmethod
+    def _is_jobflow_failure_source(event: Event) -> bool:
+        """True iff the failing party behind a failure event is a JobFlow
+        pipeline agent (or a jobflow-* cron job).
+
+        Source attribution varies by producer: AGENT_ERROR carries the
+        transport label in event.source ('mailbox:applier') with the real
+        agent in payload.source_agent; AGENT_FAILURE_CLUSTER carries the
+        canonical agent; cron failures carry the raw job name
+        ('jobflow-tracker-cycle'). Normalise all three through
+        canonical_agent_source().
+        """
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        raw = (payload.get("source_agent") or event.source or "").strip()
+        if raw.startswith("mailbox:"):
+            raw = raw[len("mailbox:"):]
+        # Any jobflow-* cron is pipeline work even when the remainder isn't
+        # a known agent (e.g. 'jobflow-approved-release' -> 'approved').
+        if raw.startswith("jobflow-"):
+            return True
+        return canonical_agent_source(raw) in JOBFLOW_PIPELINE_AGENTS
 
     def resolve_all_targets(self, event: Event) -> List[Tuple[str, str, str]]:
         """Resolve all targets including cross-posts."""
