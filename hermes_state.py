@@ -7079,6 +7079,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "api_content, display_kind, display_metadata"
     )
 
+
     def _rows_to_conversation(
         self,
         rows,
