@@ -68,13 +68,29 @@ number of days (`45`), or shorthand (`6w`, `3m`, `1y`). `none` clears it.
 ### The daily nudge (the whole point of Dex)
 
 `crm digest` renders a ready-to-deliver summary and honors the `[SILENT]`
-no-spam convention when nothing is due:
+no-spam convention when nothing is due. The digest must be generated fresh
+at every fire — don't use shell `$(...)` substitution, which would run once
+at creation time and freeze that instant's text into the job. Two working
+patterns:
+
+**Agent-run** — the scheduled prompt tells the agent to run the CLI:
 
 ```bash
 hermes cron create "0 9 * * *" \
-  "$(hermes crm digest --silent-if-empty)" \
+  "Run \`hermes crm digest --silent-if-empty\` in the terminal and relay its
+   output verbatim. If it prints [SILENT], reply with just [SILENT]." \
   --name "Keep in touch" \
   --deliver telegram
+```
+
+**Script mode** — zero LLM cost; stdout is delivered verbatim and `[SILENT]`
+suppresses delivery (see the [cron automation guide](../website/docs/guides/automate-with-cron.md)):
+
+```bash
+printf '#!/bin/sh\nexec hermes crm digest --silent-if-empty\n' > ~/.hermes/scripts/crm-digest.sh
+chmod +x ~/.hermes/scripts/crm-digest.sh
+hermes cron create "0 9 * * *" --script crm-digest.sh --no-agent \
+  --name "Keep in touch" --deliver telegram
 ```
 
 You now get a morning text listing exactly who to reach out to and whose

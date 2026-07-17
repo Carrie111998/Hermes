@@ -23,6 +23,15 @@ from hermes_constants import get_hermes_home
 DEFAULT_CRM_STORE_FILENAME = "crm_store.json"
 
 
+class CrmStoreError(RuntimeError):
+    """Raised when the store file exists but cannot be read safely.
+
+    Deliberately loud: silently treating a corrupt store as empty would let
+    the next write atomically replace it, destroying every contact. Callers
+    surface this to the operator and never persist over the damaged file.
+    """
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -63,12 +72,27 @@ class CrmStore:
                 return
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8") or "{}")
-            except json.JSONDecodeError:
-                return
+            except json.JSONDecodeError as exc:
+                raise CrmStoreError(
+                    f"CRM store at {self.path} is not valid JSON ({exc}). "
+                    "Repair or move the file aside; refusing to load (and "
+                    "potentially overwrite) it."
+                ) from exc
             if not isinstance(data, dict):
-                return
-            self._state["contacts"] = dict(data.get("contacts") or {})
-            self._state["interactions"] = dict(data.get("interactions") or {})
+                raise CrmStoreError(
+                    f"CRM store at {self.path} must be a JSON object, "
+                    f"found {type(data).__name__}."
+                )
+            for key in ("contacts", "interactions"):
+                collection = data.get(key) or {}
+                if not isinstance(collection, dict) or any(
+                    not isinstance(record, dict) for record in collection.values()
+                ):
+                    raise CrmStoreError(
+                        f"CRM store at {self.path} has a malformed {key!r} "
+                        "section (expected an object of record objects)."
+                    )
+                self._state[key] = dict(collection)
 
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,4 +214,9 @@ class CrmStore:
             return sorted(tags)
 
 
-__all__ = ["CrmStore", "resolve_crm_store_path", "DEFAULT_CRM_STORE_FILENAME"]
+__all__ = [
+    "CrmStore",
+    "CrmStoreError",
+    "resolve_crm_store_path",
+    "DEFAULT_CRM_STORE_FILENAME",
+]

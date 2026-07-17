@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Literal, cast
 
 
@@ -23,6 +23,10 @@ InteractionKind = Literal["call", "email", "meeting", "message", "note", "other"
 VALID_INTERACTION_KINDS: frozenset[str] = frozenset(
     {"call", "email", "meeting", "message", "note", "other"}
 )
+
+# Hard ceiling on keep-in-touch cadences. Beyond ~100 years the next-due
+# arithmetic overflows datetime, and no real cadence is that long anyway.
+MAX_CADENCE_DAYS = 36500
 
 # Human-friendly cadence presets → number of days between touchpoints. Callers
 # may also pass a raw integer number of days.
@@ -121,11 +125,24 @@ def normalize_cadence(value: Any) -> int | None:
         return None
     if isinstance(value, bool):  # guard: bool is an int subclass
         raise ValueError("cadence must be a preset name or number of days")
-    if isinstance(value, (int, float)):
-        days = int(value)
+
+    def _check_days(days: int) -> int:
         if days <= 0:
             raise ValueError("cadence days must be a positive integer")
+        if days > MAX_CADENCE_DAYS:
+            raise ValueError(
+                f"cadence is capped at {MAX_CADENCE_DAYS} days (~100 years)"
+            )
         return days
+
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("cadence days must be a whole number")
+        try:
+            days = int(value)
+        except (OverflowError, ValueError):
+            raise ValueError("cadence days must be a positive integer")
+        return _check_days(days)
     text = str(value).strip().lower()
     if text in {"", "none", "off", "never", "0"}:
         return None
@@ -137,10 +154,7 @@ def normalize_cadence(value: Any) -> int | None:
         amount = int(match.group(1))
         unit = match.group(2) or "d"
         multiplier = {"d": 1, "w": 7, "m": 30, "y": 365}[unit]
-        days = amount * multiplier
-        if days <= 0:
-            raise ValueError("cadence days must be a positive integer")
-        return days
+        return _check_days(amount * multiplier)
     raise ValueError(
         f"Unrecognized cadence {value!r}. Use a number of days or one of: "
         + ", ".join(sorted(CADENCE_PRESETS))
@@ -163,10 +177,23 @@ class ImportantDate:
         self.day = int(self.day)
         if not 1 <= self.month <= 12:
             raise ValueError("ImportantDate.month must be between 1 and 12.")
-        if not 1 <= self.day <= 31:
-            raise ValueError("ImportantDate.day must be between 1 and 31.")
+        # Month-aware day check so Feb 30 / Apr 31 never persist and crash the
+        # digest later. Year 2000 is a leap year, keeping Feb 29 valid here;
+        # the pipeline clamps it to Feb 28 in non-leap years at occurrence time.
+        try:
+            date(2000, self.month, self.day)
+        except ValueError:
+            raise ValueError(
+                f"ImportantDate: {self.month:02d}-{self.day:02d} is not a "
+                "valid calendar date."
+            )
         if self.year is not None:
             self.year = int(self.year)
+            if not 1000 <= self.year <= 9999:
+                raise ValueError(
+                    "ImportantDate.year must be a 4-digit year "
+                    "(write dates as YYYY-MM-DD or MM-DD)."
+                )
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ImportantDate":
@@ -245,6 +272,10 @@ class Contact:
             self.keep_in_touch_days = int(self.keep_in_touch_days)
             if self.keep_in_touch_days <= 0:
                 raise ValueError("Contact.keep_in_touch_days must be positive or None.")
+        self.important_dates = [
+            d if isinstance(d, ImportantDate) else ImportantDate.from_dict(d)
+            for d in (self.important_dates or [])
+        ]
         self.last_contacted_at = _parse_datetime(self.last_contacted_at)
         self.created_at = _parse_datetime(self.created_at)
         self.updated_at = _parse_datetime(self.updated_at)
@@ -352,6 +383,7 @@ class Interaction:
 
 __all__ = [
     "CADENCE_PRESETS",
+    "MAX_CADENCE_DAYS",
     "VALID_INTERACTION_KINDS",
     "Contact",
     "ImportantDate",

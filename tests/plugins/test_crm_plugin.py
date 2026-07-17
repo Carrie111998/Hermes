@@ -61,6 +61,36 @@ def test_normalize_cadence_rejects_bad_values():
         normalize_cadence(True)
 
 
+def test_normalize_cadence_caps_and_float_edges():
+    from plugins.crm.models import MAX_CADENCE_DAYS, normalize_cadence
+
+    assert normalize_cadence(MAX_CADENCE_DAYS) == MAX_CADENCE_DAYS
+    assert normalize_cadence(45.0) == 45  # integral float OK
+    # Over-cap values would overflow date arithmetic in every read command.
+    with pytest.raises(ValueError, match="capped"):
+        normalize_cadence("9999y")
+    with pytest.raises(ValueError, match="capped"):
+        normalize_cadence(MAX_CADENCE_DAYS + 1)
+    # Documented contract is ValueError, never OverflowError or truncation.
+    with pytest.raises(ValueError):
+        normalize_cadence(float("inf"))
+    with pytest.raises(ValueError):
+        normalize_cadence(float("nan"))
+    with pytest.raises(ValueError, match="whole number"):
+        normalize_cadence(2.9)
+
+
+def test_compute_status_clamps_stored_overflow_cadence():
+    from plugins.crm.pipeline import compute_status
+
+    # A hand-edited store can carry a cadence past normalize_cadence's cap;
+    # reads must not crash with OverflowError.
+    c = _contact("hand-edited", keep_in_touch_days=10**8,
+                 last_contacted_at="2026-01-01T00:00:00Z")
+    st = compute_status(c, now=_dt(2026, 3, 1))
+    assert st.status == "on_track"
+
+
 def test_slugify_contact_id_dedupes_and_strips_accents():
     from plugins.crm.models import slugify_contact_id
 
@@ -126,6 +156,42 @@ def test_important_date_parse_formats():
         ImportantDate.parse("x", "not-a-date")
 
 
+def test_important_date_rejects_impossible_calendar_days():
+    from plugins.crm.models import ImportantDate
+
+    # These used to persist and then crash every `dates`/`digest` run.
+    for bad in ("02-30", "02-31", "04-31", "06-31", "2026-02-31"):
+        with pytest.raises(ValueError, match="not a valid calendar date"):
+            ImportantDate.parse("birthday", bad)
+    with pytest.raises(ValueError, match="not a valid calendar date"):
+        ImportantDate(label="x", month=2, day=30)
+    # Feb 29 stays valid (clamped to Feb 28 in non-leap years at render time).
+    ok = ImportantDate(label="birthday", month=2, day=29)
+    assert (ok.month, ok.day) == (2, 29)
+
+
+def test_important_date_rejects_two_digit_years():
+    from plugins.crm.models import ImportantDate
+
+    # '10-11-98' used to store year=98 and render "turning 1928" in digests.
+    with pytest.raises(ValueError, match="4-digit year"):
+        ImportantDate.parse("birthday", "10-11-98")
+    with pytest.raises(ValueError, match="4-digit year"):
+        ImportantDate(label="x", month=6, day=15, year=90)
+    assert ImportantDate.parse("birthday", "1998-10-11").year == 1998
+
+
+def test_contact_coerces_important_date_dicts():
+    from plugins.crm.models import Contact, ImportantDate
+
+    c = Contact(
+        contact_id="b", name="B",
+        important_dates=[{"label": "birthday", "month": 1, "day": 2}],
+    )
+    assert isinstance(c.important_dates[0], ImportantDate)
+    assert c.to_dict()["important_dates"][0]["label"] == "birthday"
+
+
 # ---------------------------------------------------------------------------
 # store
 # ---------------------------------------------------------------------------
@@ -168,13 +234,49 @@ def test_store_upsert_clears_none_fields(tmp_path):
     assert "keep_in_touch_days" not in store.get_contact("jane")
 
 
-def test_store_survives_corrupt_file(tmp_path):
-    from plugins.crm.store import CrmStore
+def test_store_refuses_corrupt_file_and_never_clobbers_it(tmp_path):
+    from plugins.crm.store import CrmStore, CrmStoreError
+
+    path = tmp_path / "crm.json"
+    corrupt = '{"contacts": {"jane": {"name": "Jane"'  # truncated mid-write
+    path.write_text(corrupt, encoding="utf-8")
+    with pytest.raises(CrmStoreError, match="not valid JSON"):
+        CrmStore(path)
+    # The damaged file must be left untouched for manual recovery.
+    assert path.read_text(encoding="utf-8") == corrupt
+
+
+def test_store_refuses_wrong_shape_files(tmp_path):
+    from plugins.crm.store import CrmStore, CrmStoreError
+
+    list_shaped = tmp_path / "list.json"
+    list_shaped.write_text('{"contacts": [1, 2]}', encoding="utf-8")
+    with pytest.raises(CrmStoreError, match="malformed 'contacts'"):
+        CrmStore(list_shaped)
+
+    non_dict_record = tmp_path / "record.json"
+    non_dict_record.write_text('{"contacts": {"x": "not-a-dict"}}', encoding="utf-8")
+    with pytest.raises(CrmStoreError, match="malformed 'contacts'"):
+        CrmStore(non_dict_record)
+
+    top_level_list = tmp_path / "top.json"
+    top_level_list.write_text("[]", encoding="utf-8")
+    with pytest.raises(CrmStoreError, match="JSON object"):
+        CrmStore(top_level_list)
+
+
+def test_cli_reports_corrupt_store_as_error_not_traceback(tmp_path, capsys):
+    from plugins.crm import cli
 
     path = tmp_path / "crm.json"
     path.write_text("{ not valid json", encoding="utf-8")
-    store = CrmStore(path)  # should not raise
-    assert store.stats()["contacts"] == 0
+    ns = argparse.Namespace(
+        crm_action="list", store_path=str(path), tag="", search="", limit=100, json=False
+    )
+    rc = cli.crm_command(ns)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "not valid JSON" in out
 
 
 # ---------------------------------------------------------------------------
@@ -311,16 +413,45 @@ def test_render_digest_content_and_silent():
     assert "caught up" in caught_up
 
 
+def test_digest_tag_filters_dates_and_respects_silent():
+    from plugins.crm.models import ImportantDate
+    from plugins.crm.pipeline import render_digest, upcoming_dates
+
+    now = _dt(2026, 3, 1)
+    friend = _contact("a", name="Friend Person", tags=["friend"])
+    work = _contact("b", name="Work Person", tags=["work"])
+    work.important_dates = [ImportantDate(label="birthday", month=3, day=5)]
+
+    # A friend-tagged digest must not leak the work contact's birthday...
+    text = render_digest([friend, work], now=now, tag="friend",
+                         silent_if_empty=True)
+    # ...and with nothing due for #friend, it must go [SILENT].
+    assert text == "[SILENT]"
+
+    # The work digest still sees it.
+    assert "Work Person" in render_digest([friend, work], now=now, tag="work")
+
+    # upcoming_dates supports the same filter directly.
+    assert upcoming_dates([friend, work], now=now, within_days=30, tag="friend") == []
+    assert len(upcoming_dates([friend, work], now=now, within_days=30, tag="work")) == 1
+
+
 # ---------------------------------------------------------------------------
 # CLI end-to-end
 # ---------------------------------------------------------------------------
 
-def _run(action, **kw):
-    """Invoke a CLI handler with an argparse.Namespace built from kwargs."""
-    from plugins.crm import cli
+def _cli(argv, capsys):
+    """Drive the real argparse tree end-to-end and return (rc, stdout).
 
-    ns = argparse.Namespace(crm_action=action, store_path="", **kw)
-    return cli.crm_command(ns)
+    Parsing real argv (instead of hand-building Namespaces) verifies the
+    parser dest names and the handlers' getattr defaults together.
+    """
+    from plugins.crm.cli import crm_command, register_cli
+
+    parser = argparse.ArgumentParser(prog="hermes crm")
+    register_cli(parser)
+    rc = crm_command(parser.parse_args(argv))
+    return rc, capsys.readouterr().out
 
 
 def test_cli_add_show_log_flow(tmp_path, capsys):
@@ -391,6 +522,16 @@ def test_cli_cadence_and_board(tmp_path, capsys):
     assert "cleared" in out
 
 
+def test_cli_add_rejects_impossible_birthday(tmp_path, capsys):
+    rc, out = _cli(
+        ["add", "Bad Birthday", "--birthday", "04-31",
+         "--store-path", str(tmp_path / "crm.json")],
+        capsys,
+    )
+    assert rc == 1
+    assert "not a valid calendar date" in out
+
+
 def test_cli_bad_cadence_reports_error(tmp_path, capsys):
     from plugins.crm import cli
 
@@ -403,6 +544,161 @@ def test_cli_bad_cadence_reports_error(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Unrecognized cadence" in out
+
+
+def test_cli_edit_updates_and_clears_fields(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    rc, _ = _cli(["add", "Edit Me", "--company", "Acme", "--tag", "vc", *sp], capsys)
+    assert rc == 0
+
+    rc, out = _cli(
+        ["edit", "edit-me", "--name", "Edited Name", "--company", "", *sp], capsys
+    )
+    assert rc == 0 and "Updated edit-me" in out
+
+    rc, out = _cli(["show", "edit-me", "--json", *sp], capsys)
+    payload = json.loads(out)["contact"]
+    assert payload["name"] == "Edited Name"
+    assert "company" not in payload  # empty string clears the field
+
+    rc, out = _cli(["edit", "unknown-id", "--name", "X", *sp], capsys)
+    assert rc == 1 and "Unknown contact" in out
+
+    rc, out = _cli(["edit", "edit-me", *sp], capsys)
+    assert rc == 1 and "Nothing to update" in out
+
+
+def test_cli_edit_persists_normalized_lists(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Norm Test", *sp], capsys)
+    # An empty-string tag/email must not persist as a phantom "" entry.
+    rc, out = _cli(["edit", "norm-test", "--tag", "", *sp], capsys)
+    assert rc == 0
+
+    rc, out = _cli(["show", "norm-test", "--json", *sp], capsys)
+    payload = json.loads(out)["contact"]
+    assert "tags" not in payload or payload["tags"] == []
+
+    rc, out = _cli(["tags", *sp], capsys)
+    assert rc == 0 and "No tags in use" in out
+
+
+def test_cli_rm_deletes_contact_and_interactions(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Delete Me", *sp], capsys)
+    _cli(["log", "delete-me", "--kind", "note", "--summary", "x", *sp], capsys)
+
+    rc, out = _cli(["rm", "delete-me", *sp], capsys)
+    assert rc == 0 and "Deleted" in out
+
+    rc, out = _cli(["show", "delete-me", *sp], capsys)
+    assert rc == 1 and "Unknown contact" in out
+
+    rc, out = _cli(["rm", "delete-me", *sp], capsys)
+    assert rc == 1
+
+
+def test_cli_touch_logs_message_and_advances_clock(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Touch Me", "--cadence", "weekly", *sp], capsys)
+
+    rc, out = _cli(["touch", "touch-me", *sp], capsys)
+    assert rc == 0 and "Logged message" in out
+
+    rc, out = _cli(["show", "touch-me", "--json", *sp], capsys)
+    payload = json.loads(out)
+    assert payload["contact"]["last_contacted_at"]
+    assert payload["interactions"][0]["kind"] == "message"
+    assert payload["interactions"][0]["summary"] == "reached out"
+
+
+def test_cli_date_adds_and_replaces_by_label(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Date Test", *sp], capsys)
+
+    rc, out = _cli(["date", "date-test", "birthday", "07-04", *sp], capsys)
+    assert rc == 0 and "07-04" in out
+
+    # Same label, different case -> replaces rather than duplicating.
+    rc, out = _cli(["date", "date-test", "Birthday", "12-25", *sp], capsys)
+    assert rc == 0 and "12-25" in out
+
+    rc, out = _cli(["show", "date-test", "--json", *sp], capsys)
+    dates = json.loads(out)["contact"]["important_dates"]
+    assert len(dates) == 1
+    assert dates[0]["month"] == 12 and dates[0]["day"] == 25
+
+
+def test_cli_date_rejects_impossible_calendar_day(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Bad Date", *sp], capsys)
+    rc, out = _cli(["date", "bad-date", "anniversary", "04-31", *sp], capsys)
+    assert rc == 1
+    assert "not a valid calendar date" in out
+
+
+def test_cli_log_rejects_future_timestamp(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Future Log", *sp], capsys)
+    rc, out = _cli(
+        ["log", "future-log", "--kind", "note", "--at", "2099-01-01", *sp], capsys
+    )
+    assert rc == 1
+    assert "future" in out.lower()
+
+
+def test_cli_list_filters_and_json(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Alice Friend", "--tag", "friend", *sp], capsys)
+    _cli(["add", "Bob Work", "--tag", "work", *sp], capsys)
+
+    rc, out = _cli(["list", "--tag", "friend", "--json", *sp], capsys)
+    assert rc == 0
+    names = [c["name"] for c in json.loads(out)]
+    assert names == ["Alice Friend"]
+
+    rc, out = _cli(["list", "--search", "bob", *sp], capsys)
+    assert rc == 0 and "Bob Work" in out and "Alice Friend" not in out
+
+    rc, out = _cli(["list", "--limit", "1", "--json", *sp], capsys)
+    assert len(json.loads(out)) == 1
+
+
+def test_cli_export_round_trips_contacts_and_interactions(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Export Me", *sp], capsys)
+    _cli(["log", "export-me", "--kind", "call", *sp], capsys)
+
+    rc, out = _cli(["export", *sp], capsys)
+    assert rc == 0
+    payload = json.loads(out)
+    assert set(payload.keys()) == {"contacts", "interactions"}
+    assert "export-me" in payload["contacts"]
+    assert len(payload["interactions"]) == 1
+
+
+def test_cli_stats_reports_health_snapshot(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    _cli(["add", "Stats Test", "--cadence", "monthly", "--tag", "vc", *sp], capsys)
+
+    rc, out = _cli(["stats", *sp], capsys)
+    assert rc == 0
+    payload = json.loads(out)
+    assert payload["stats"]["contacts"] == 1
+    assert payload["with_cadence"] == 1
+    assert payload["tags"] == ["vc"]
+
+
+def test_cli_digest_end_to_end(tmp_path, capsys):
+    sp = ["--store-path", str(tmp_path / "crm.json")]
+    rc, out = _cli(["digest", "--silent-if-empty", *sp], capsys)
+    assert rc == 0 and out.strip() == "[SILENT]"
+
+    _cli(["add", "Digest Test", "--cadence", "monthly", *sp], capsys)
+    _cli(["log", "digest-test", "--kind", "note",
+          "--at", "2000-01-01", *sp], capsys)
+    rc, out = _cli(["digest", *sp], capsys)
+    assert rc == 0 and "Keep in touch" in out
 
 
 # ---------------------------------------------------------------------------

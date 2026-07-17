@@ -10,10 +10,18 @@ Operator surface for a Dex-style personal relationship manager:
     hermes crm digest --silent-if-empty       # cron-ready daily nudge
     hermes crm dates --within 30              # upcoming birthdays
 
-Wire the digest to a scheduled nudge:
+Wire the digest to a scheduled nudge. The digest must be generated fresh at
+each fire (shell ``$(...)`` substitution would freeze it at create time), so
+tell the agent to run the CLI:
 
     hermes cron create "0 9 * * *" \\
-      "$(hermes crm digest --silent-if-empty)" --name "Keep in touch" --deliver telegram
+      "Run \\`hermes crm digest --silent-if-empty\\` in the terminal and relay \\
+    its output verbatim. If it prints [SILENT], reply with just [SILENT]." \\
+      --name "Keep in touch" --deliver telegram
+
+Or zero-LLM-cost via script mode (stdout becomes the delivery, [SILENT]
+suppresses): put ``hermes crm digest --silent-if-empty`` in
+``~/.hermes/scripts/crm-digest.sh`` and use ``--script crm-digest.sh --no-agent``.
 """
 
 from __future__ import annotations
@@ -21,7 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +49,7 @@ from plugins.crm.pipeline import (
     render_digest,
     upcoming_dates,
 )
-from plugins.crm.store import CrmStore, resolve_crm_store_path
+from plugins.crm.store import CrmStore, CrmStoreError, resolve_crm_store_path
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +154,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     dates_p = subs.add_parser("dates", help="Upcoming birthdays and important dates")
     dates_p.add_argument("--within", type=int, default=30)
+    dates_p.add_argument("--tag", default="")
     dates_p.add_argument("--json", action="store_true")
     dates_p.add_argument("--store-path", default="")
 
@@ -201,7 +210,7 @@ def crm_command(args: argparse.Namespace) -> int:
     try:
         globals()[handler_name](args)
         return 0
-    except CrmCliError as exc:
+    except (CrmCliError, CrmStoreError) as exc:
         print(str(exc))
         return 1
 
@@ -242,7 +251,9 @@ def _fmt_ago(value: datetime | None, now: datetime) -> str:
     if value is None:
         return "never"
     days = (now.date() - value.astimezone(timezone.utc).date()).days
-    if days <= 0:
+    if days < 0:
+        return f"in {-days}d"
+    if days == 0:
         return "today"
     if days == 1:
         return "yesterday"
@@ -427,9 +438,13 @@ def _cmd_edit(args) -> None:
     if not payload:
         raise CrmCliError("Nothing to update — pass at least one field to change.")
 
-    # Validate the merged record before persisting.
+    # Validate the merged record, then persist the NORMALIZED values (deduped
+    # lists, trimmed strings) rather than the raw argv, so `edit` writes the
+    # same shape `add` does. Normalized-empty fields come back as None and
+    # clear the stored key via the store's None-clearing merge.
     merged = {**contact.to_dict(), **payload}
-    Contact.from_dict(merged)
+    normalized = Contact.from_dict(merged).to_dict()
+    payload = {key: normalized.get(key) for key in payload}
     store.upsert_contact(contact.contact_id, payload)
     print(f"✅ Updated {contact.contact_id}: {', '.join(sorted(payload))}")
 
@@ -471,6 +486,13 @@ def _cmd_log(args) -> None:
             occurred = interaction.occurred_at
         except ValueError as exc:
             raise CrmCliError(f"Could not parse --at: {exc}")
+        # A future timestamp (usually a year typo) would silently mark the
+        # contact "on track" for years and mute every reminder until then.
+        if occurred > _now() + timedelta(minutes=5):
+            raise CrmCliError(
+                f"--at {occurred.date().isoformat()} is in the future — log "
+                "interactions after they happen."
+            )
 
     interaction_id = uuid.uuid4().hex
     record = Interaction(
@@ -613,7 +635,10 @@ def _cmd_dates(args) -> None:
     store = _store(args)
     contacts = _load_contacts(store)
     items = upcoming_dates(
-        contacts, now=_now(), within_days=int(getattr(args, "within", 30) or 30)
+        contacts,
+        now=_now(),
+        within_days=int(getattr(args, "within", 30) or 30),
+        tag=str(getattr(args, "tag", "") or "").strip() or None,
     )
     if getattr(args, "json", False):
         print(json.dumps([i.to_dict() for i in items], indent=2, sort_keys=True))

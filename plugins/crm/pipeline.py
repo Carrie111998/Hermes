@@ -111,7 +111,12 @@ def compute_status(
         )
 
     anchor = c.last_contacted_at or c.created_at or now
-    next_due = anchor + timedelta(days=cadence)
+    try:
+        next_due = anchor + timedelta(days=cadence)
+    except OverflowError:
+        # A hand-edited store can carry a cadence past datetime's range;
+        # clamp instead of crashing every read command.
+        next_due = datetime.max.replace(tzinfo=timezone.utc)
     # Whole-day granularity so "due today" reads cleanly regardless of time.
     delta_days = (now.date() - next_due.date()).days
 
@@ -232,14 +237,18 @@ def upcoming_dates(
     *,
     now: Optional[datetime] = None,
     within_days: int = 30,
+    tag: Optional[str] = None,
 ) -> list[UpcomingDate]:
     """Return important dates (birthdays, anniversaries) within ``within_days``."""
     now = now or _utc_now()
     today = now.date()
     horizon = today + timedelta(days=within_days)
+    tag_filter = (tag or "").strip().lower() or None
     results: list[UpcomingDate] = []
     for contact in contacts:
         c = _as_contact(contact)
+        if tag_filter and tag_filter not in {t.lower() for t in c.tags}:
+            continue
         for d in c.important_dates:
             occ = _next_occurrence(d, today)
             if occ > horizon:
@@ -277,10 +286,19 @@ def render_digest(
     When ``silent_if_empty`` is set and there is nothing to report, returns
     ``silent_token`` (the ``[SILENT]`` convention used by Hermes automations
     to suppress empty notifications).
+
+    ``tag`` filters the whole digest — both the due list and the upcoming
+    dates — so a tagged digest never leaks other groups' birthdays and
+    ``silent_if_empty`` fires correctly for quiet tags.
     """
     now = now or _utc_now()
-    contacts = list(contacts)
-    due = due_contacts(contacts, now=now, soon_days=soon_days, tag=tag)
+    contacts = [_as_contact(c) for c in contacts]
+    tag_filter = (tag or "").strip().lower() or None
+    if tag_filter:
+        contacts = [
+            c for c in contacts if tag_filter in {t.lower() for t in c.tags}
+        ]
+    due = due_contacts(contacts, now=now, soon_days=soon_days)
     dates = upcoming_dates(contacts, now=now, within_days=dates_within_days)
 
     if not due and not dates:

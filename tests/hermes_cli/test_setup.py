@@ -179,6 +179,11 @@ def test_setup_gateway_skips_service_install_when_systemctl_missing(monkeypatch,
     monkeypatch.setattr(setup_mod, "get_env_value", lambda key: env.get(key, ""))
     monkeypatch.setattr(gateway_mod, "get_env_value", lambda key: env.get(key, ""))
     monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *args, **kwargs: False)
+    # _setup_standard_platform() (gateway.py) calls its own imported
+    # prompt_yes_no reference -- Matrix is now pre-selected (already
+    # configured), so _configure_platform() reaches the "Reconfigure
+    # Matrix?" prompt. Decline it so the already-set credentials are kept.
+    monkeypatch.setattr(gateway_mod, "prompt_yes_no", lambda *args, **kwargs: False)
     # setup_gateway() now drives platform selection through an interactive
     # checkbox picker; simulate a user who accepts the pre-selected (already
     # configured) platforms rather than toggling anything.
@@ -226,6 +231,11 @@ def test_setup_gateway_in_container_shows_docker_guidance(monkeypatch, capsys):
     monkeypatch.setattr(setup_mod, "get_env_value", lambda key: env.get(key, ""))
     monkeypatch.setattr(gateway_mod, "get_env_value", lambda key: env.get(key, ""))
     monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *args, **kwargs: False)
+    # _setup_standard_platform() (gateway.py) calls its own imported
+    # prompt_yes_no reference -- Matrix is now pre-selected (already
+    # configured), so _configure_platform() reaches the "Reconfigure
+    # Matrix?" prompt. Decline it so the already-set credentials are kept.
+    monkeypatch.setattr(gateway_mod, "prompt_yes_no", lambda *args, **kwargs: False)
     # setup_gateway() now drives platform selection through an interactive
     # checkbox picker; simulate a user who accepts the pre-selected (already
     # configured) platforms rather than toggling anything.
