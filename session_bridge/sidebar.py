@@ -156,7 +156,7 @@ def sidebar_title(provider: Provider, title: str | None, first_request: str) -> 
     if not compact:
         raise ValueError("sidebar title source must not be empty")
     prefix = _TITLE_PREFIXES[provider]
-    return prefix + compact[: _MAX_TITLE_CHARS - len(prefix)]
+    return prefix + compact[: _MAX_TITLE_CHARS - len(prefix)].rstrip()
 
 
 def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:

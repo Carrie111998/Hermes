@@ -506,6 +506,15 @@ def test_sidebar_title_falls_back_to_first_meaningful_request(
     assert sidebar_title(Provider.CLAUDE, title, first_request) == expected
 
 
+def test_sidebar_title_does_not_end_with_whitespace_at_length_boundary() -> None:
+    source = "x" * 110 + " y"
+
+    result = sidebar_title(Provider.CLAUDE, source, "unused first request")
+
+    assert result == "[Claude] " + "x" * 110
+    assert result == result.strip()
+
+
 def test_sidebar_title_rejects_unsupported_provider_and_empty_source() -> None:
     with pytest.raises(
         ValueError,
