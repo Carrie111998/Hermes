@@ -176,6 +176,7 @@ class ClaudeVisibilityApplyResult:
     candidates: tuple[ClaudeVisibilityCandidateResult, ...] = ()
     exclusions: tuple[ClaudeVisibilityExclusion, ...] = ()
     applied: int = 0
+    duplicates: int = 0
     degraded: bool = False
     open_reasons: tuple[str, ...] = ()
     fatal_reasons: tuple[str, ...] = ()
@@ -209,6 +210,11 @@ class _ClaudeVisibilityStore(Protocol):
         identity: ClaudeVisibilityIdentity,
         marker_secret: bytes,
     ) -> object: ...
+    def enqueue_claude_visibility_batch_if_idle(
+        self,
+        items: Sequence[tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]],
+        marker_secret: bytes,
+    ) -> Mapping[str, Any]: ...
     def claim_claude_visibility_job(
         self,
         now: float,
@@ -224,7 +230,6 @@ _CLAUDE_VISIBILITY_DISCOVERY_CODES = CLAUDE_VISIBILITY_EXCLUSION_CODES | {
     "duplicate_source",
 }
 _CLAUDE_VISIBILITY_MANUAL_LIMIT = 10
-_CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT = 1_000
 _CLAUDE_VISIBILITY_OPEN_STATES = (
     "claude_pending",
     "claude_leased",
@@ -255,11 +260,14 @@ def _claude_visibility_enqueue_gates(
     counts = status_mapping.get("counts")
     retry_codes = status_mapping.get("retry_codes")
     failed_codes = status_mapping.get("failed_codes")
+    fatal_rows = status_mapping.get("fatal", [])
     if not isinstance(counts, Mapping):
         return (), ("invalid_visibility_status",)
     if not isinstance(retry_codes, Mapping):
         return (), ("invalid_visibility_status",)
     if not isinstance(failed_codes, Mapping):
+        return (), ("invalid_visibility_status",)
+    if not isinstance(fatal_rows, list):
         return (), ("invalid_visibility_status",)
 
     def _validated_counts(values: Mapping[object, object]) -> dict[str, int] | None:
@@ -282,6 +290,16 @@ def _claude_visibility_enqueue_gates(
         else ()
     )
     fatal: set[str] = set()
+    for item in fatal_rows:
+        if not isinstance(item, Mapping):
+            fatal.add("invalid_visibility_status")
+            continue
+        fatal_item = cast(Mapping[object, object], item)
+        code = fatal_item.get("code")
+        if code in ("unknown_job_state", "unknown_error_code"):
+            fatal.add(str(code))
+        else:
+            fatal.add("invalid_visibility_status")
     for code, count in retry_values.items():
         if count > 0 and code not in CLAUDE_VISIBILITY_RETRY_CODES:
             fatal.add("unknown_retry_code")
@@ -335,61 +353,64 @@ class ClaudeVisibilityCoordinator:
                 self._config.claude_visibility.manual_batch_limit,
             )
             if manual
-            else min(limit, _CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT)
+            else limit
         )
-        now = float(self._clock())
-        after = now - days * 86400
+        try:
+            now = float(self._clock())
+            if not math.isfinite(now):
+                raise ValueError("clock must be finite")
+            after = now - days * 86400
+        except Exception:
+            return ClaudeVisibilityDiscoveryResult(
+                enabled=True, degraded=True, reasons=("inventory_invalid",)
+            )
         try:
             sources = tuple(self._inventory(after))
         except Exception:
             return ClaudeVisibilityDiscoveryResult(
-                enabled=True, degraded=True, reasons=("source_discovery_failed",)
+                enabled=True, degraded=True, reasons=("provider_degraded",)
             )
-        ordered = sorted(
-            sources,
-            key=lambda item: (
-                -float(item.projection.last_active),
-                item.source_session_id,
-                item.projection.provider.value,
-            ),
-        )
-        candidates: list[ClaudeVisibilityCandidateResult] = []
-        exclusions: list[ClaudeVisibilityExclusion] = []
-        seen: set[tuple[str, Provider]] = set()
-        for source in ordered[:_CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT]:
-            projection = source.projection
-            activity = float(projection.last_active)
-            key = (source.source_session_id, projection.provider)
-            if key in seen:
-                reason = "duplicate_source"
-            elif activity < after:
-                reason = "outside_activity_window"
-            else:
-                reason = evaluate_claude_visibility(
-                    projection,
-                    automation_only=source.automation_only,
-                    subagent_only=source.subagent_only,
-                )
-            seen.add(key)
-            if reason != "eligible":
-                if reason not in _CLAUDE_VISIBILITY_DISCOVERY_CODES:
-                    return ClaudeVisibilityDiscoveryResult(
-                        enabled=True,
-                        candidates=tuple(candidates),
-                        exclusions=tuple(exclusions),
-                        degraded=True,
-                        reasons=("unknown_exclusion",),
+        try:
+            ordered = sorted(
+                sources,
+                key=lambda item: (
+                    -float(item.projection.last_active),
+                    item.source_session_id,
+                    item.projection.provider.value,
+                ),
+            )
+            candidates: list[ClaudeVisibilityCandidateResult] = []
+            exclusions: list[ClaudeVisibilityExclusion] = []
+            seen: set[tuple[str, Provider]] = set()
+            for source in ordered:
+                projection = source.projection
+                activity = float(projection.last_active)
+                if not math.isfinite(activity):
+                    raise ValueError("activity must be finite")
+                key = (source.source_session_id, projection.provider)
+                if key in seen:
+                    reason = "duplicate_source"
+                elif activity < after:
+                    reason = "outside_activity_window"
+                else:
+                    reason = evaluate_claude_visibility(
+                        projection,
+                        automation_only=source.automation_only,
+                        subagent_only=source.subagent_only,
                     )
-                exclusions.append(
-                    ClaudeVisibilityExclusion(
-                        source_session_id=source.source_session_id,
-                        source_provider=projection.provider.value,
-                        activity=activity,
-                        reason=reason,
+                seen.add(key)
+                if reason != "eligible":
+                    if reason not in _CLAUDE_VISIBILITY_DISCOVERY_CODES:
+                        raise ValueError("unknown exclusion")
+                    exclusions.append(
+                        ClaudeVisibilityExclusion(
+                            source_session_id=source.source_session_id,
+                            source_provider=projection.provider.value,
+                            activity=activity,
+                            reason=reason,
+                        )
                     )
-                )
-                continue
-            try:
+                    continue
                 candidate = build_claude_visibility_candidate(
                     projection,
                     eligible_at=activity,
@@ -402,20 +423,16 @@ class ClaudeVisibilityCoordinator:
                 identity = derive_claude_visibility_identity(
                     candidate, self._marker_secret
                 )
-            except Exception:
-                return ClaudeVisibilityDiscoveryResult(
-                    enabled=True,
-                    candidates=tuple(candidates),
-                    exclusions=tuple(exclusions),
-                    degraded=True,
-                    reasons=("candidate_construction_failed",),
+                candidates.append(
+                    ClaudeVisibilityCandidateResult(candidate, identity, activity)
                 )
-            candidates.append(
-                ClaudeVisibilityCandidateResult(candidate, identity, activity)
+        except Exception:
+            return ClaudeVisibilityDiscoveryResult(
+                enabled=True, degraded=True, reasons=("inventory_invalid",)
             )
         return ClaudeVisibilityDiscoveryResult(
             enabled=True,
-            candidates=tuple(candidates[:bounded_limit]),
+            candidates=tuple(candidates[:bounded_limit] if manual else candidates),
             exclusions=tuple(exclusions),
         )
 
@@ -443,28 +460,31 @@ class ClaudeVisibilityCoordinator:
                 exclusions=discovery.exclusions,
             )
         try:
-            status = self._store.claude_visibility_status(float(self._clock()))
-            open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(status)
-            if open_reasons or fatal_reasons:
+            batch = tuple(
+                (item.candidate, item.identity) for item in discovery.candidates[:10]
+            )
+            atomic = self._store.enqueue_claude_visibility_batch_if_idle(
+                batch, self._marker_secret
+            )
+            status = atomic.get("status")
+            if status == "open_work":
                 return ClaudeVisibilityApplyResult(
                     enabled=True,
                     mode=mode,
                     candidates=discovery.candidates,
                     exclusions=discovery.exclusions,
-                    degraded=bool(fatal_reasons),
-                    open_reasons=open_reasons,
-                    fatal_reasons=fatal_reasons,
+                    open_reasons=("open_visibility_work",),
                 )
-            applied = 0
-            for item in discovery.candidates[:10]:
-                if self._store.has_claude_visibility_source(
-                    item.candidate.source_session_id
-                ):
-                    continue
-                self._store.enqueue_claude_visibility_job(
-                    item.candidate, item.identity, self._marker_secret
+            if status != "inserted":
+                fatal = atomic.get("fatal_reasons")
+                return ClaudeVisibilityApplyResult(
+                    enabled=True, mode=mode, candidates=discovery.candidates,
+                    exclusions=discovery.exclusions, degraded=True,
+                    fatal_reasons=tuple(fatal) if isinstance(fatal, (list, tuple))
+                    else ("enqueue_failed",),
                 )
-                applied += 1
+            applied = int(atomic.get("inserted", 0))
+            duplicates = int(atomic.get("duplicates", 0))
         except Exception:
             return ClaudeVisibilityApplyResult(
                 enabled=True,
@@ -480,6 +500,7 @@ class ClaudeVisibilityCoordinator:
             candidates=discovery.candidates,
             exclusions=discovery.exclusions,
             applied=applied,
+            duplicates=duplicates,
         )
 
     def continuous_once(self) -> ClaudeVisibilityApplyResult:
@@ -489,7 +510,7 @@ class ClaudeVisibilityCoordinator:
             return ClaudeVisibilityApplyResult(enabled=True, mode="continuous_disabled")
         discovery = self._discover(
             days=self._config.claude_visibility.backfill_days,
-            limit=_CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT,
+            limit=1,
             manual=False,
         )
         if discovery.degraded:
@@ -499,16 +520,6 @@ class ClaudeVisibilityCoordinator:
                 fatal_reasons=discovery.reasons,
             )
         try:
-            status = self._store.claude_visibility_status(float(self._clock()))
-            open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(status)
-            if open_reasons or fatal_reasons:
-                return ClaudeVisibilityApplyResult(
-                    enabled=True, mode="continuous",
-                    candidates=discovery.candidates, exclusions=discovery.exclusions,
-                    degraded=bool(fatal_reasons),
-                    open_reasons=open_reasons,
-                    fatal_reasons=fatal_reasons,
-                )
             candidate = next(
                 (
                     item for item in discovery.candidates
@@ -523,9 +534,23 @@ class ClaudeVisibilityCoordinator:
                     enabled=True, mode="continuous",
                     candidates=discovery.candidates, exclusions=discovery.exclusions,
                 )
-            self._store.enqueue_claude_visibility_job(
-                candidate.candidate, candidate.identity, self._marker_secret
+            atomic = self._store.enqueue_claude_visibility_batch_if_idle(
+                ((candidate.candidate, candidate.identity),), self._marker_secret
             )
+            if atomic.get("status") == "open_work":
+                return ClaudeVisibilityApplyResult(
+                    enabled=True, mode="continuous",
+                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                    open_reasons=("open_visibility_work",),
+                )
+            if atomic.get("status") != "inserted":
+                return ClaudeVisibilityApplyResult(
+                    enabled=True, mode="continuous", degraded=True,
+                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                    fatal_reasons=("enqueue_failed",),
+                )
+            applied = int(atomic.get("inserted", 0))
+            duplicates = int(atomic.get("duplicates", 0))
         except Exception:
             return ClaudeVisibilityApplyResult(
                 enabled=True, mode="continuous", degraded=True,
@@ -534,7 +559,7 @@ class ClaudeVisibilityCoordinator:
             )
         return ClaudeVisibilityApplyResult(
             enabled=True, mode="continuous", candidates=discovery.candidates,
-            exclusions=discovery.exclusions, applied=1,
+            exclusions=discovery.exclusions, applied=applied, duplicates=duplicates,
         )
 
     def run_once(self, *, discover_continuous: bool = False) -> ClaudeVisibilityRunResult:
@@ -547,6 +572,13 @@ class ClaudeVisibilityCoordinator:
             )
         policy = self._config.claude_visibility
         try:
+            status = self._store.claude_visibility_status(float(self._clock()))
+            _open, fatal_reasons = _claude_visibility_enqueue_gates(status)
+            if fatal_reasons:
+                return ClaudeVisibilityRunResult(
+                    enabled=True, status="degraded", error_code=fatal_reasons[0],
+                    degraded=True, fatal=True, discovery=discovery,
+                )
             claim = self._store.claim_claude_visibility_job(
                 float(self._clock()),
                 policy.lease_seconds,
@@ -1582,6 +1614,7 @@ class SessionBridgeCoordinator:
                                         or capture_attempt == 2
                                     ):
                                         raise
+                            assert worktree_snapshot is not None
                             if (
                                 indexed_git_metadata
                                 and worktree_snapshot.git_root is None

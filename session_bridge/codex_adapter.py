@@ -69,6 +69,10 @@ class CodexThreadSummary:
     last_active: float
     archived: bool
     revision: str
+    git_root: str | None = None
+    git_branch: str | None = None
+    git_head: str | None = None
+    worktree_id: str | None = None
 
 
 class SidebarVerificationError(RuntimeError):
@@ -619,6 +623,43 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return summaries
 
+    def list_claude_visibility_sources(self, *, after: float) -> tuple[Any, ...]:
+        """Read every active and archived native Codex thread without bridge state."""
+
+        cutoff = float(after)
+        if not math.isfinite(cutoff):
+            raise ValueError("Codex visibility cutoff must be finite")
+        combined: dict[str, CodexThreadSummary] = {}
+        for archived in (False, True):
+            for summary in self.list_full_inventory(archived=archived):
+                if summary.last_active < cutoff:
+                    continue
+                prior = combined.get(summary.native_id)
+                if prior is None or (
+                    summary.last_active, not summary.archived, summary.revision
+                ) > (prior.last_active, not prior.archived, prior.revision):
+                    combined[summary.native_id] = summary
+        summaries = sorted(
+            combined.values(), key=lambda item: (-item.last_active, item.native_id)
+        )
+        from .store import SidebarSource
+
+        sources: list[SidebarSource] = []
+        for summary in summaries:
+            projection = self.read_sidebar_thread(summary, deadline=None)
+            sources.append(SidebarSource(
+                source_session_id=canonical_session_id(
+                    Provider.CODEX, summary.native_id
+                ),
+                projection=projection,
+                git_root=summary.git_root,
+                git_head=summary.git_head,
+                worktree_id=summary.worktree_id,
+                automation_only=False,
+                subagent_only=False,
+            ))
+        return tuple(sources)
+
     def project_thread(
         self,
         summary: CodexThreadSummary,
@@ -735,6 +776,7 @@ class CodexSourceAdapter:
             parser_version=_PARSER_VERSION,
             origin_kind=origin_kind,
             origin_bridge_id=origin_bridge_id,
+            git_branch=summary.git_branch,
         )
 
     def projection_has_marker_payload(
@@ -1729,7 +1771,24 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         last_active=last_active,
         archived=archived_value,
         revision=revision,
+        git_root=_summary_metadata(
+            entry, "gitRoot", "git_root", "repositoryRoot", "repository_root"
+        ),
+        git_branch=_summary_metadata(entry, "gitBranch", "git_branch", "branch"),
+        git_head=_summary_metadata(entry, "gitHead", "git_head", "head"),
+        worktree_id=_summary_metadata(
+            entry, "worktreeId", "worktree_id", "worktree"
+        ),
     )
+
+
+def _summary_metadata(entry: dict[str, Any], *aliases: str) -> str | None:
+    value = _first(entry, *aliases)
+    if value is None:
+        git = entry.get("gitInfo", entry.get("git_info"))
+        if isinstance(git, dict):
+            value = _first(git, *aliases)
+    return _optional_string(value)
 
 
 def _normalize_revision(value: Any) -> str | None:

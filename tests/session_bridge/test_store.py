@@ -5614,6 +5614,118 @@ def test_claude_visibility_claims_at_most_one_due_job_and_status_is_exact(
     assert status["failed_codes"] == {"marker_conflict": 1}
 
 
+def test_claude_visibility_status_reports_unknown_state_as_sanitized_fatal(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    with db._lock:
+        assert db._conn is not None
+        db._conn.execute("PRAGMA ignore_check_constraints = ON")
+        db._conn.execute(
+            "UPDATE session_claude_visibility_jobs SET state = ?, error_code = ?",
+            ("future_state", "future-code"),
+        )
+        db._conn.commit()
+        db._conn.execute("PRAGMA ignore_check_constraints = OFF")
+
+    status = store.claude_visibility_status(100.0)
+
+    assert status["fatal"] == [{
+        "code": "unknown_job_state",
+        "state": "future_state",
+        "error_code": "future-code",
+        "count": 1,
+    }]
+
+
+def test_atomic_idle_batch_rolls_back_all_rows_when_second_insert_fails(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    items = [_claude_visibility_identity(str(index)) for index in range(2)]
+    original = store._insert_claude_visibility_job
+    calls = 0
+
+    def fail_second(conn, candidate, identity, marker_secret, now):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected")
+        return original(conn, candidate, identity, marker_secret, now)
+
+    monkeypatch.setattr(store, "_insert_claude_visibility_job", fail_second)
+    with pytest.raises(RuntimeError, match="injected"):
+        store.enqueue_claude_visibility_batch_if_idle(items, _CLAUDE_MARKER_SECRET)
+
+    assert _rows(db, "SELECT * FROM session_claude_visibility_jobs") == []
+
+
+def test_atomic_idle_batch_reports_exact_duplicates_and_blocks_open_work(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    duplicate = _claude_visibility_identity("duplicate")
+    _enqueue_claude_visibility_job(store, *duplicate)
+    store.commit_claude_visibility_job(
+        duplicate[1].job_id,
+        store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").lease_digest,
+        "digest", 100.0,
+    )
+    fresh = _claude_visibility_identity("fresh")
+
+    result = store.enqueue_claude_visibility_batch_if_idle(
+        [duplicate, fresh], _CLAUDE_MARKER_SECRET
+    )
+    blocked = store.enqueue_claude_visibility_batch_if_idle(
+        [_claude_visibility_identity("later")], _CLAUDE_MARKER_SECRET
+    )
+
+    assert result == {"status": "inserted", "inserted": 1, "duplicates": 1}
+    assert blocked == {"status": "open_work", "inserted": 0, "duplicates": 0}
+    assert len(_rows(db, "SELECT * FROM session_claude_visibility_jobs")) == 2
+
+
+def test_atomic_idle_batch_two_connections_allow_only_one_coordinator(
+    tmp_path,
+) -> None:
+    path = tmp_path / "claude-idle-batch-race.db"
+    seed = SessionDB(path)
+    seed.close()
+    first_db = SessionDB(path)
+    second_db = SessionDB(path)
+    try:
+        stores = (
+            SessionBridgeStore(first_db, clock=lambda: 100.0),
+            SessionBridgeStore(second_db, clock=lambda: 100.0),
+        )
+        batches = tuple(
+            [_claude_visibility_identity(f"{owner}-{index}") for index in range(10)]
+            for owner in range(2)
+        )
+        barrier = Barrier(2)
+
+        def enqueue(args):
+            store, batch = args
+            barrier.wait()
+            return store.enqueue_claude_visibility_batch_if_idle(
+                batch, _CLAUDE_MARKER_SECRET
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(enqueue, zip(stores, batches)))
+
+        assert sorted(result["status"] for result in results) == [
+            "inserted", "open_work"
+        ]
+        assert sorted(result["inserted"] for result in results) == [0, 10]
+        assert len(_rows(first_db, "SELECT * FROM session_claude_visibility_jobs")) == 10
+    finally:
+        first_db.close()
+        second_db.close()
+
+
 def test_claude_visibility_daily_limit_blocks_twenty_sixth_attempt_atomically(
     db: SessionDB,
 ) -> None:

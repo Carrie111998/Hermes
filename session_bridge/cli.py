@@ -30,7 +30,6 @@ from .claude_registrar import ClaudeNativeRegistrar
 from .claude_visibility import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
-    ClaudeVisibilityClaim,
 )
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter, SidebarThreadVerifier
 from .config import BridgeConfig
@@ -50,7 +49,7 @@ from .mirror import (
     enqueue_mirror_job,
     should_halt_batch,
 )
-from .models import MirrorJobState, Provider, SidebarJobState, canonical_session_id
+from .models import MirrorJobState, Provider, SidebarJobState
 from .sidebar_skill import install_sidebar_skill
 from .store import (
     SIDEBAR_FATAL_ERRORS,
@@ -137,14 +136,6 @@ class _Backend(Protocol):
     ) -> Mapping[str, Any]: ...
     def mirror_preview(self, *, session_id: str, target: str) -> Mapping[str, Any]: ...
     def apply_mirror(self, *, session_id: str, target: str) -> Mapping[str, Any]: ...
-
-
-class _ReadOnlyClaudeVisibilityRegistrar:
-    def process(self, _claim: ClaudeVisibilityClaim) -> object:
-        raise RuntimeError("read_only_claude_visibility_coordinator")
-
-
-_READ_ONLY_CLAUDE_VISIBILITY_REGISTRAR: Any = _ReadOnlyClaudeVisibilityRegistrar()
 
 
 class ConfigurationFailure(RuntimeError):
@@ -421,18 +412,6 @@ class ProductionBackend:
         if not config.enabled:
             return _disabled_claude_visibility_payload(config.continuous)
         store = self._require_store()
-        coordinator = ClaudeVisibilityCoordinator(
-            config=self.config,
-            store=store,
-            inventory=self._claude_visibility_inventory,
-            registrar=_READ_ONLY_CLAUDE_VISIBILITY_REGISTRAR,
-            marker_secret=resolve_marker_key(),
-            clock=time.time,
-        )
-        discovery = coordinator.discover(
-            days=config.backfill_days,
-            limit=config.manual_batch_limit,
-        )
         raw = store.claude_visibility_status(time.time())
         status_fatal = _claude_visibility_fatal_reasons(raw)
         return {
@@ -442,16 +421,14 @@ class ProductionBackend:
             "retry_codes": dict(raw["retry_codes"]),
             "failed_codes": dict(raw["failed_codes"]),
             "usage": dict(raw["usage"]),
-            "candidates": [_public_claude_candidate(item) for item in discovery.candidates],
-            "exclusions": [asdict(item) for item in discovery.exclusions],
+            "fatal": list(raw.get("fatal", [])),
+            "candidates": [],
+            "exclusions": [],
             "open_reasons": _claude_visibility_open_reasons(raw),
-            "fatal_reasons": [
-                *status_fatal,
-                *(list(discovery.reasons) if discovery.degraded else []),
-            ],
-            "degraded_reasons": list(discovery.reasons) if discovery.degraded else [],
-            "last_empty_cycle": None,
-            "last_registrar_result": None,
+            "fatal_reasons": status_fatal,
+            "degraded_reasons": status_fatal,
+            "last_empty_cycle": {"tracked": False, "value": None},
+            "last_registrar_result": {"tracked": False, "value": None},
         }
 
     def claude_visibility_backfill(
@@ -550,7 +527,9 @@ class ProductionBackend:
             self._claude_visibility_coordinator = ClaudeVisibilityCoordinator(
                 config=self.config,
                 store=store,
-                inventory=self._claude_visibility_inventory,
+                inventory=lambda after: self._claude_visibility_inventory(
+                    after, marker_secret=marker_secret
+                ),
                 registrar=registrar,
                 marker_secret=marker_secret,
                 clock=time.time,
@@ -561,29 +540,32 @@ class ProductionBackend:
         except Exception as exc:
             raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
 
-    def _claude_visibility_inventory(self, after: float) -> Sequence[SidebarSource]:
+    def _claude_visibility_inventory(
+        self, after: float, *, marker_secret: bytes
+    ) -> Sequence[SidebarSource]:
         store = self._require_store()
-        sources = list(store.list_claude_visibility_hermes_sources(after, 1000))
-        page = store.list_native_projections(after, 1000)
+        sources = list(store.list_claude_visibility_hermes_sources(after, None))
+        if self._codex_client is None:
+            codex_command = resolve_cli_executable("codex")
+            if len(codex_command) != 1:
+                raise RuntimeError("codex_direct_runtime_required")
+            self._codex_client = CodexAppServerClient(codex_bin=codex_command[0])
+        codex = CodexSourceAdapter(self._codex_client, marker_secret=marker_secret)
+        page = codex.list_claude_visibility_sources(after=after)
         existing = {
             (item.projection.provider, item.source_session_id) for item in sources
         }
-        for projection in page:
-            if projection.provider is not Provider.CODEX:
+        for source in page:
+            key = (source.projection.provider, source.source_session_id)
+            if key in existing:
                 continue
-            source_id = canonical_session_id(projection.provider, projection.native_id)
-            if (projection.provider, source_id) in existing:
-                continue
-            sources.append(SidebarSource(
-                source_session_id=source_id,
-                projection=projection,
-                git_root=None,
-                git_head=None,
-                worktree_id=None,
-                automation_only=False,
-                subagent_only=False,
-            ))
-            existing.add((projection.provider, source_id))
+            sources.append(source)
+            existing.add(key)
+        sources.sort(key=lambda item: (
+            -float(item.projection.last_active),
+            item.source_session_id,
+            item.projection.provider.value,
+        ))
         return tuple(sources)
 
     def characterize(self, *, provider: str) -> Mapping[str, Any]:
@@ -1347,6 +1329,7 @@ def _public_claude_apply(result: Any, *, continuous: bool) -> dict[str, Any]:
         "dry_run": result.mode == "dry_run",
         "applied": result.mode == "apply",
         "enqueued": result.applied,
+        "duplicates": result.duplicates,
         "candidates": [_public_claude_candidate(item) for item in result.candidates],
         "exclusions": [asdict(item) for item in result.exclusions],
         "open_reasons": list(result.open_reasons),
@@ -1394,6 +1377,16 @@ def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:
     if not isinstance(retry_codes, Mapping) or not isinstance(failed_codes, Mapping):
         return ["invalid_status"]
     reasons: list[str] = []
+    fatal = raw.get("fatal", [])
+    if not isinstance(fatal, list):
+        return ["invalid_status"]
+    for item in fatal:
+        if not isinstance(item, Mapping) or item.get("code") not in (
+            "unknown_job_state", "unknown_error_code"
+        ):
+            reasons.append("invalid_status")
+        else:
+            reasons.append(str(item["code"]))
     for code, count in retry_codes.items():
         if code not in CLAUDE_VISIBILITY_RETRY_CODES and int(count) > 0:
             reasons.append("unknown_retry_code")
@@ -1419,14 +1412,15 @@ def _disabled_claude_visibility_payload(continuous: bool) -> dict[str, Any]:
         },
         "retry_codes": {},
         "failed_codes": {},
+        "fatal": [],
         "usage": {"local_day": None, "attempts": 0, "reserved_cost_usd": "0"},
         "candidates": [],
         "exclusions": [],
         "open_reasons": [],
         "fatal_reasons": [],
         "degraded_reasons": [],
-        "last_empty_cycle": None,
-        "last_registrar_result": None,
+        "last_empty_cycle": {"tracked": False, "value": None},
+        "last_registrar_result": {"tracked": False, "value": None},
     }
 
 

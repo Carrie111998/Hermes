@@ -5,7 +5,10 @@ from decimal import Decimal
 
 from session_bridge.claude_visibility import ClaudeVisibilityClaim
 from session_bridge.config import BridgeConfig
-from session_bridge.coordinator import ClaudeVisibilityCoordinator
+from session_bridge.coordinator import (
+    ClaudeVisibilityCoordinator,
+    _claude_visibility_enqueue_gates,
+)
 from session_bridge.models import OriginKind, ProjectedMessage, Provider, SessionProjection
 from session_bridge.store import SidebarSource
 
@@ -86,6 +89,26 @@ class FakeStore:
         self.open_sources.add(candidate.source_session_id)
         return {"id": identity.job_id}
 
+    def enqueue_claude_visibility_batch_if_idle(self, items, marker_secret):
+        assert marker_secret == SECRET
+        open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(self.raw_status)
+        if fatal_reasons:
+            return {
+                "status": "fatal", "inserted": 0, "duplicates": 0,
+                "fatal_reasons": list(fatal_reasons),
+            }
+        if open_reasons:
+            return {"status": "open_work", "inserted": 0, "duplicates": 0}
+        inserted = 0
+        duplicates = 0
+        for candidate, identity in items:
+            if candidate.source_session_id in self.open_sources:
+                duplicates += 1
+                continue
+            self.enqueue_claude_visibility_job(candidate, identity, marker_secret)
+            inserted += 1
+        return {"status": "inserted", "inserted": inserted, "duplicates": duplicates}
+
     def claim_claude_visibility_job(self, *args):
         self.claim_calls += 1
         return self.claim
@@ -164,6 +187,24 @@ def test_discovery_is_stable_bounded_and_reports_fixed_exclusions() -> None:
     assert result.degraded is False
 
 
+def test_discovery_interleaves_hermes_and_codex_newest_first_stably() -> None:
+    coordinator, _calls = _coordinator([
+        _source("hermes-older", provider=Provider.HERMES, active=NOW - 3),
+        _source("codex-newer", active=NOW - 1),
+        _source("hermes-tie", provider=Provider.HERMES, active=NOW - 2),
+        _source("codex-tie", active=NOW - 2),
+    ])
+
+    result = coordinator.discover(days=30, limit=10)
+
+    assert [item.candidate.source_session_id for item in result.candidates] == [
+        "codex:codex-newer",
+        "codex:codex-tie",
+        "hermes-tie",
+        "hermes-older",
+    ]
+
+
 def test_dry_run_never_writes_claims_or_invokes_registrar() -> None:
     store = FakeStore()
     registrar = FakeRegistrar()
@@ -213,6 +254,7 @@ def test_apply_does_not_count_or_enqueue_an_already_queued_source() -> None:
     result = coordinator.backfill(days=30, limit=10, apply=True)
 
     assert result.applied == 1
+    assert result.duplicates == 1
     assert [candidate.source_session_id for candidate, _identity in store.enqueued] == [
         "codex:new"
     ]
@@ -267,7 +309,7 @@ def test_provider_exception_is_sanitized_degraded_result() -> None:
     result = coordinator.discover(days=30, limit=10)
 
     assert result.degraded is True
-    assert result.reasons == ("source_discovery_failed",)
+    assert result.reasons == ("provider_degraded",)
     assert "secret" not in repr(result)
 
 
@@ -326,6 +368,66 @@ def test_continuous_scans_past_ten_already_queued_candidates() -> None:
     assert store.enqueued[0][0].source_session_id == "codex:source-10"
 
 
+def test_continuous_scans_past_one_thousand_already_queued_candidates() -> None:
+    store = FakeStore()
+    sources = [_source(f"source-{index:04d}", active=NOW - index) for index in range(1001)]
+    store.open_sources.update(source.source_session_id for source in sources[:1000])
+    coordinator, _calls = _coordinator(
+        sources, store=store, config=_config(continuous=True)
+    )
+
+    result = coordinator.continuous_once()
+
+    assert result.applied == 1
+    assert store.enqueued[0][0].source_session_id == "codex:source-1000"
+
+
+def test_discovery_malformed_item_bad_clock_and_evaluator_are_typed_degraded(
+    monkeypatch,
+) -> None:
+    coordinator, _calls = _coordinator([object()])
+    malformed = coordinator.discover(days=30, limit=10)
+    assert malformed.degraded is True
+    assert malformed.reasons == ("inventory_invalid",)
+
+    bad_clock = ClaudeVisibilityCoordinator(
+        config=_config(), store=FakeStore(), inventory=lambda _after: [],
+        registrar=FakeRegistrar(), marker_secret=SECRET,
+        clock=lambda: "secret-bad-clock",
+    ).discover(days=30, limit=10)
+    assert bad_clock.degraded is True
+    assert bad_clock.reasons == ("inventory_invalid",)
+
+    monkeypatch.setattr(
+        "session_bridge.coordinator.evaluate_claude_visibility",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("secret")),
+    )
+    evaluator, _calls = _coordinator([_source("one")])
+    result = evaluator.discover(days=30, limit=10)
+    assert result.degraded is True
+    assert result.reasons == ("inventory_invalid",)
+    assert "secret" not in repr(result)
+
+
+def test_inventory_iteration_failure_on_later_page_is_provider_degraded() -> None:
+    def inventory(_after):
+        def pages():
+            yield _source("first")
+            raise RuntimeError("later-page-secret")
+        return pages()
+
+    coordinator = ClaudeVisibilityCoordinator(
+        config=_config(), store=FakeStore(), inventory=inventory,
+        registrar=FakeRegistrar(), marker_secret=SECRET, clock=lambda: NOW,
+    )
+    result = coordinator.discover(days=30, limit=10)
+
+    assert result.degraded is True
+    assert result.reasons == ("provider_degraded",)
+    assert result.candidates == ()
+    assert "secret" not in repr(result)
+
+
 def test_run_once_fails_closed_on_unknown_claim_and_registrar_statuses() -> None:
     unknown_claim = FakeStore(claim=ClaudeVisibilityClaim(status="future_gate"))
     coordinator, _calls = _coordinator([], store=unknown_claim)
@@ -354,3 +456,19 @@ def test_run_once_fails_closed_on_unknown_claim_and_registrar_statuses() -> None
     assert registrar_result.fatal is True
     assert registrar_result.error_code == "unknown_registrar_status"
     assert registrar.claims == [claimed]
+
+
+def test_run_once_blocks_before_claim_on_unknown_persisted_job_state() -> None:
+    store = FakeStore()
+    store.raw_status["fatal"] = [{
+        "code": "unknown_job_state", "state": "future_state",
+        "error_code": "future-code", "count": 1,
+    }]
+    coordinator, _calls = _coordinator([], store=store)
+
+    result = coordinator.run_once()
+
+    assert result.status == "degraded"
+    assert result.error_code == "unknown_job_state"
+    assert result.fatal is True
+    assert store.claim_calls == 0

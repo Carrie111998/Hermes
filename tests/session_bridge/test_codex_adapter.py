@@ -99,6 +99,64 @@ def _read_with_items(*items: dict[str, Any]) -> dict[str, Any]:
 
 
 class TestInventory:
+    def test_claude_visibility_inventory_is_complete_paginated_and_preserves_metadata(
+        self,
+    ) -> None:
+        def entry(native_id, updated, *, archived=False):
+            return {
+                "id": native_id,
+                "title": "ignored title",
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": updated - 10,
+                "updatedAt": updated,
+                "archived": archived,
+                "gitRoot": "C:/work",
+                "gitBranch": f"feature/{native_id}",
+                "gitHead": f"head-{native_id}",
+                "worktreeId": f"wt-{native_id}",
+            }
+
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [entry("linked-or-uncataloged", 300)], "nextCursor": "p2"},
+                {"data": [entry("older", 100)]},
+                {"data": [entry("archived", 200, archived=True)]},
+            ],
+            "thread/read": [
+                {"thread": {"id": "linked-or-uncataloged", "turns": [{"items": [{
+                    "type": "userMessage", "id": "u1",
+                    "content": [{"type": "text", "text": "Build API"}],
+                }]}]}},
+                {"thread": {"id": "archived", "turns": [{"items": [{
+                    "type": "userMessage", "id": "u3",
+                    "content": [{"type": "text", "text": "Archived request"}],
+                }]}]}},
+                {"thread": {"id": "older", "turns": [{"items": [{
+                    "type": "userMessage", "id": "u2",
+                    "content": [{"type": "text", "text": "Older request"}],
+                }]}]}},
+            ],
+        })
+
+        sources = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=50)
+
+        assert [source.source_session_id for source in sources] == [
+            "codex:linked-or-uncataloged", "codex:archived", "codex:older"
+        ]
+        newest = sources[0]
+        assert newest.projection.messages[0].content == "Build API"
+        assert newest.git_root == "C:/work"
+        assert newest.projection.git_branch == "feature/linked-or-uncataloged"
+        assert newest.git_head == "head-linked-or-uncataloged"
+        assert newest.worktree_id == "wt-linked-or-uncataloged"
+        assert sources[1].projection.native_status == "archived"
+        assert [call[0] for call in client.calls] == [
+            "thread/list", "thread/list", "thread/list",
+            "thread/read", "thread/read", "thread/read",
+        ]
+
     def test_find_sidebar_thread_reuses_scanner_cache_without_relisting(self) -> None:
         client = FakeInitializingClient({
             "thread/list": [

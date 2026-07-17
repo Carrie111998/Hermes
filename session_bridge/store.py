@@ -376,12 +376,24 @@ class SessionBridgeStore:
             raise TypeError("candidate must be a ClaudeVisibilityCandidate")
         if not isinstance(identity, ClaudeVisibilityIdentity):
             raise TypeError("identity must be a ClaudeVisibilityIdentity")
-        validate_claude_visibility_identity_binding(
-            candidate, identity, marker_secret
-        )
+        validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
         def _write(conn):
             now = _finite_number(self._clock(), "clock")
-            collisions = conn.execute(
+            row, _created = self._insert_claude_visibility_job(
+                conn, candidate, identity, marker_secret, now
+            )
+            return row
+
+        return self.db._execute_write(_write)
+
+    def _insert_claude_visibility_job(
+        self, conn: Any, candidate: Any, identity: Any,
+        marker_secret: bytes, now: float,
+    ) -> tuple[dict[str, Any], bool]:
+        from .claude_visibility import validate_claude_visibility_identity_binding
+
+        validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+        collisions = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
                    WHERE source_session_id = ? OR bridge_id = ?
                       OR idempotency_key = ? OR reserved_claude_uuid = ?
@@ -393,10 +405,10 @@ class SessionBridgeStore:
                     identity.claude_uuid,
                 ),
             ).fetchall()
-            if collisions:
-                if len(collisions) == 1:
-                    existing = dict(collisions[0])
-                    immutable = {
+        if collisions:
+            if len(collisions) == 1:
+                existing = dict(collisions[0])
+                immutable = {
                         "id": identity.job_id,
                         "source_session_id": candidate.source_session_id,
                         "bridge_id": identity.bridge_id,
@@ -411,12 +423,12 @@ class SessionBridgeStore:
                         "worktree_id": candidate.worktree_id,
                         "signed_marker": identity.signed_marker,
                         "eligible_at": candidate.eligible_at,
-                    }
-                    if all(existing[key] == value for key, value in immutable.items()):
-                        return existing
-                raise ValueError("Claude visibility identity collision")
-            try:
-                conn.execute(
+                }
+                if all(existing[key] == value for key, value in immutable.items()):
+                    return existing, False
+            raise ValueError("Claude visibility identity collision")
+        try:
+            conn.execute(
                     """INSERT INTO session_claude_visibility_jobs (
                        id, source_session_id, bridge_id, idempotency_key,
                        reserved_claude_uuid, native_name, source_provider,
@@ -444,15 +456,106 @@ class SessionBridgeStore:
                         now,
                         now,
                     ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError("Claude visibility identity collision") from exc
-            return dict(
-                conn.execute(
-                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
-                    (identity.job_id,),
-                ).fetchone()
             )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Claude visibility identity collision") from exc
+        return dict(
+            conn.execute(
+                "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                (identity.job_id,),
+            ).fetchone()
+        ), True
+
+    def enqueue_claude_visibility_batch_if_idle(
+        self, items: Sequence[tuple[Any, Any]], marker_secret: bytes
+    ) -> dict[str, Any]:
+        from .claude_visibility import (
+            CLAUDE_VISIBILITY_FATAL_CODES,
+            CLAUDE_VISIBILITY_RETRY_CODES,
+            ClaudeVisibilityCandidate,
+            ClaudeVisibilityIdentity,
+            validate_claude_visibility_identity_binding,
+        )
+
+        batch = tuple(items)
+        if len(batch) > 10:
+            raise ValueError("Claude visibility batch cannot exceed 10")
+        for item in batch:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError("Claude visibility batch item must be a pair")
+            candidate, identity = item
+            if not isinstance(candidate, ClaudeVisibilityCandidate):
+                raise TypeError("candidate must be a ClaudeVisibilityCandidate")
+            if not isinstance(identity, ClaudeVisibilityIdentity):
+                raise TypeError("identity must be a ClaudeVisibilityIdentity")
+            validate_claude_visibility_identity_binding(
+                candidate, identity, marker_secret
+            )
+
+        def _write(conn):
+            grouped = conn.execute(
+                """SELECT state, error_code, COUNT(*) AS count
+                     FROM session_claude_visibility_jobs
+                    GROUP BY state, error_code"""
+            ).fetchall()
+            known = {
+                "claude_pending", "claude_leased", "claude_retry",
+                "claude_visible", "claude_failed",
+            }
+            unknown = [row for row in grouped if row["state"] not in known]
+            if unknown:
+                return {
+                    "status": "fatal", "inserted": 0, "duplicates": 0,
+                    "fatal_reasons": ["unknown_job_state"],
+                }
+            fatal_reasons: set[str] = set()
+            for row in grouped:
+                code = row["error_code"]
+                if row["state"] == "claude_retry" and code is not None:
+                    if code not in CLAUDE_VISIBILITY_RETRY_CODES:
+                        fatal_reasons.add("unknown_retry_code")
+                if row["state"] == "claude_failed" and code is not None:
+                    fatal_reasons.add(
+                        code if code in CLAUDE_VISIBILITY_FATAL_CODES
+                        else "unknown_failed_code"
+                    )
+                if row["state"] in {
+                    "claude_pending", "claude_visible"
+                } and code is not None:
+                    fatal_reasons.add("unknown_error_code")
+                if (
+                    row["state"] == "claude_leased"
+                    and code is not None
+                    and code not in (
+                        CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
+                    )
+                ):
+                    fatal_reasons.add("unknown_error_code")
+            if fatal_reasons:
+                return {
+                    "status": "fatal", "inserted": 0, "duplicates": 0,
+                    "fatal_reasons": sorted(fatal_reasons),
+                }
+            if any(
+                row["state"] in {
+                    "claude_pending", "claude_leased", "claude_retry", "claude_failed"
+                } and int(row["count"]) > 0
+                for row in grouped
+            ):
+                return {"status": "open_work", "inserted": 0, "duplicates": 0}
+            now = _finite_number(self._clock(), "clock")
+            inserted = 0
+            duplicates = 0
+            for candidate, identity in batch:
+                _row, created = self._insert_claude_visibility_job(
+                    conn, candidate, identity, marker_secret, now
+                )
+                inserted += int(created)
+                duplicates += int(not created)
+            return {
+                "status": "inserted", "inserted": inserted,
+                "duplicates": duplicates,
+            }
 
         return self.db._execute_write(_write)
 
@@ -1073,15 +1176,45 @@ class SessionBridgeStore:
                 (local_day,),
             ).fetchall()
         counts = {state: 0 for state in states}
+        fatal: list[dict[str, Any]] = []
         for row in count_rows:
             if row["state"] in counts:
                 counts[row["state"]] = int(row["count"])
+            else:
+                matching_codes = [
+                    code_row for code_row in code_rows
+                    if code_row["state"] == row["state"]
+                ]
+                if not matching_codes:
+                    matching_codes = [{"error_code": None, "count": row["count"]}]
+                for code_row in matching_codes:
+                    fatal.append({
+                        "code": "unknown_job_state",
+                        "state": _claude_status_token(row["state"]),
+                        "error_code": _claude_status_token(
+                            code_row["error_code"], optional=True
+                        ),
+                        "count": int(
+                            code_row["count"]
+                            if code_row["count"] is not None else 0
+                        ),
+                    })
         retry_codes: dict[str, int] = {}
         failed_codes: dict[str, int] = {}
         for row in code_rows:
-            target = retry_codes if row["state"] == "claude_retry" else failed_codes
-            if row["state"] in ("claude_retry", "claude_failed"):
-                target[row["error_code"]] = int(row["count"])
+            safe_code = _claude_status_token(row["error_code"])
+            assert safe_code is not None
+            if row["state"] == "claude_retry":
+                retry_codes[safe_code] = retry_codes.get(safe_code, 0) + int(row["count"])
+            elif row["state"] == "claude_failed":
+                failed_codes[safe_code] = failed_codes.get(safe_code, 0) + int(row["count"])
+            elif row["state"] in counts:
+                fatal.append({
+                    "code": "unknown_error_code",
+                    "state": _claude_status_token(row["state"]),
+                    "error_code": safe_code,
+                    "count": int(row["count"]),
+                })
         total_cost = sum(
             (Decimal(row["reserved_estimated_cost_usd"]) for row in usage_rows),
             Decimal("0"),
@@ -1095,6 +1228,7 @@ class SessionBridgeStore:
                 "attempts": len(usage_rows),
                 "reserved_cost_usd": str(total_cost),
             },
+            "fatal": fatal,
         }
 
     def has_claude_visibility_source(self, source_session_id: str) -> bool:
@@ -1757,15 +1891,13 @@ class SessionBridgeStore:
         return {"total": total, "by_reason": by_reason}
 
     def list_claude_visibility_hermes_sources(
-        self, after: float, limit: int
+        self, after: float, limit: int | None
     ) -> tuple[SidebarSource, ...]:
         """Read native Hermes sources independently of all delivery queues."""
 
         cutoff = _finite_number(after, "Claude visibility candidate cutoff")
-        if (
-            not isinstance(limit, int)
-            or isinstance(limit, bool)
-            or not 1 <= limit <= 1000
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000
         ):
             raise ValueError("Claude visibility candidate limit must be between 1 and 1000")
         sources: list[SidebarSource] = []
@@ -1787,11 +1919,11 @@ class SessionBridgeStore:
                 source.source_session_id,
             )
         )
-        return tuple(sources[:limit])
+        return tuple(sources if limit is None else sources[:limit])
 
     @staticmethod
     def _list_claude_visibility_hermes_sources_from_db(
-        database: SessionDB, *, after: float, limit: int
+        database: SessionDB, *, after: float, limit: int | None
     ) -> list[SidebarSource]:
         with database._lock:
             conn = database._conn
@@ -1837,7 +1969,7 @@ class SessionBridgeStore:
                     WHERE last_active IS NOT NULL AND last_active >= ?
                     ORDER BY last_active DESC, session_id
                     LIMIT ?""",
-                (_PROFILE_SHADOW_SOURCE, after, limit),
+                (_PROFILE_SHADOW_SOURCE, after, -1 if limit is None else limit),
             ).fetchall()
             messages: dict[str, list[ProjectedMessage]] = {
                 row["session_id"]: [] for row in rows
@@ -5627,6 +5759,24 @@ def _active_message_counters(conn, session_id: str) -> tuple[int, int]:
         value = json.loads(row["tool_calls"])
         tool_calls += len(value) if isinstance(value, list) else 1
     return len(rows), tool_calls
+
+
+def _claude_status_token(value: Any, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    if (
+        isinstance(value, str)
+        and 1 <= len(value) <= 64
+        and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
+    ):
+        folded = value.casefold()
+        if any(
+            fragment in folded
+            for fragment in ("authorization", "bearer", "password", "secret", "token")
+        ):
+            return "redacted"
+        return value
+    return "invalid"
 
 
 def _mirror_state(job_states: Sequence[str], links: Sequence[dict[str, Any]]) -> str:

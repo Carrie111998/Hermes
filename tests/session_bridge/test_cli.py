@@ -755,12 +755,6 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ReadOnlyStore:
-        def list_claude_visibility_hermes_sources(self, _after, _limit):
-            return ()
-
-        def list_native_projections(self, _after, _limit):
-            return ()
-
         def claude_visibility_status(self, _now):
             return {
                 "counts": {state: 0 for state in (
@@ -779,7 +773,8 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     ))
     monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
     monkeypatch.setattr(
-        "session_bridge.cli.resolve_marker_key", lambda: b"read-only-status-secret"
+        "session_bridge.cli.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(AssertionError("marker key")),
     )
     monkeypatch.setattr(
         "session_bridge.cli.resolve_cli_executable",
@@ -795,6 +790,40 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     assert result["enabled"] is True
     assert result["candidates"] == []
     assert result["degraded_reasons"] == []
+    assert result["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert result["last_registrar_result"] == {"tracked": False, "value": None}
+
+
+def test_claude_visibility_status_exposes_sanitized_unknown_state_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {state: 0 for state in (
+                    "claude_pending", "claude_leased", "claude_retry",
+                    "claude_visible", "claude_failed",
+                )},
+                "retry_codes": {}, "failed_codes": {},
+                "usage": {"local_day": "2026-07-17", "attempts": 0,
+                          "reserved_cost_usd": "0"},
+                "fatal": [{"code": "unknown_job_state", "state": "future_state",
+                           "error_code": "future-code", "count": 1}],
+            }
+
+    config = BridgeConfig()
+    backend = ProductionBackend(replace(
+        config, claude_visibility=replace(config.claude_visibility, enabled=True)
+    ))
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["fatal_reasons"] == ["unknown_job_state"]
+    assert result["fatal"] == [{
+        "code": "unknown_job_state", "state": "future_state",
+        "error_code": "future-code", "count": 1,
+    }]
 
 
 def test_claude_visibility_json_is_one_sanitized_stdout_document(capsys) -> None:
