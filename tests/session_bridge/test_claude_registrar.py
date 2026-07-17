@@ -17,7 +17,12 @@ import pytest
 from hermes_state import SessionDB
 
 from session_bridge.claude_adapter import claude_project_directory_name
-from session_bridge.claude_registrar import ClaudeNativeRegistrar, _WinPtyProcess
+from session_bridge.claude_registrar import (
+    ClaudeNativeRegistrar,
+    PtyCleanupResult,
+    WindowsConPtyFactory,
+    _WinPtyProcess,
+)
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
     ClaudeVisibilityClaim,
@@ -70,9 +75,16 @@ def claim(**changes: Any) -> ClaudeVisibilityClaim:
     return replace(base, **changes)
 
 
+def test_claude_visibility_claim_rejects_positional_construction() -> None:
+    with pytest.raises(TypeError):
+        ClaudeVisibilityClaim("claimed", "launch")  # type: ignore[misc]
+
+
 @dataclass
 class FakeParse:
     projection: SessionProjection
+    malformed_lines: int = 0
+    unknown_records: int = 0
 
 
 class FakeSource:
@@ -82,11 +94,17 @@ class FakeSource:
         *,
         parse_error: Exception | None = None,
         project_name: str | None = None,
+        duplicate_paths: list[Path] | None = None,
+        malformed_lines: int = 0,
+        unknown_records: int = 0,
     ):
         self.projections = list(projections or [None])
         self.lookups: list[str] = []
         self.parse_error = parse_error
         self.project_name = project_name
+        self.duplicate_paths = duplicate_paths
+        self.malformed_lines = malformed_lines
+        self.unknown_records = unknown_records
 
     def find_native_session(self, native_id: str) -> Path | None:
         self.lookups.append(native_id)
@@ -99,11 +117,23 @@ class FakeSource:
         )
         return Path("C:/Users/test/.claude/projects") / project_name / f"{native_id}.jsonl"
 
+    def find_native_sessions(self, native_id: str) -> list[Path]:
+        if self.duplicate_paths is not None:
+            self.lookups.append(native_id)
+            self.current = self.projections[0]
+            return self.duplicate_paths
+        found = self.find_native_session(native_id)
+        return [] if found is None else [found]
+
     def parse(self, path: Path) -> FakeParse:
         if self.parse_error is not None:
             raise self.parse_error
         assert self.current is not None
-        return FakeParse(self.current)
+        return FakeParse(
+            self.current,
+            malformed_lines=self.malformed_lines,
+            unknown_records=self.unknown_records,
+        )
 
     def projection_has_exact_marker(self, projection: SessionProjection, marker: str) -> bool:
         return any(marker in (message.content or "") for message in projection.messages)
@@ -139,6 +169,7 @@ class FakePty:
         self.waits: list[float] = []
         self.terminated = False
         self.closed = False
+        self.cleanup_result = PtyCleanupResult(True, True, True, exit_code)
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
         if self.read_error:
@@ -152,11 +183,13 @@ class FakePty:
         self.waits.append(timeout)
         return self.exit_code
 
-    def terminate(self) -> None:
+    def terminate(self, timeout: float = 1.0) -> bool:
         self.terminated = True
+        return True
 
-    def close(self) -> None:
+    def close(self, timeout: float = 1.0) -> PtyCleanupResult:
         self.closed = True
+        return self.cleanup_result
 
 
 class FakeFactory:
@@ -442,6 +475,92 @@ def test_paid_exact_path_parse_failure_is_terminal_and_never_spawns() -> None:
     assert store.calls[0][0] == "fail"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        lambda projection: FakeSource([projection], malformed_lines=1),
+        lambda projection: FakeSource([projection], unknown_records=1),
+    ],
+)
+def test_registration_transcript_rejects_malformed_or_unknown_records(source: Any) -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    result = registrar(source(projection_for(item)), FakeFactory()).process(item)
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
+
+
+def test_registration_transcript_rejects_any_unrelated_projected_message() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(item)
+    extra = replace(
+        projection.messages[1], native_event_id="later", content="unrelated work"
+    )
+    result = registrar(
+        FakeSource([replace(projection, messages=[*projection.messages, extra])]),
+        FakeFactory(),
+    ).process(item)
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        lambda projection: [
+            replace(projection.messages[0], native_event_id="earlier", content="old work"),
+            *projection.messages,
+        ],
+        lambda projection: [
+            projection.messages[0],
+            replace(projection.messages[1], ordinal=1, content="REGISTERED"),
+        ],
+        lambda projection: [
+            projection.messages[0],
+            projection.messages[1],
+            replace(projection.messages[1], content=""),
+        ],
+    ],
+)
+def test_registration_transcript_rejects_extra_turns_and_bad_block_ordinals(
+    messages: Any,
+) -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(item)
+    result = registrar(
+        FakeSource([replace(projection, messages=messages(projection))]), FakeFactory()
+    ).process(item)
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
+
+
+def test_duplicate_exact_uuid_is_fatal_before_spawn_or_commit() -> None:
+    item = claim()
+    project = claude_project_directory_name(item.source_cwd or "")
+    paths = [
+        Path("C:/Users/test/.claude/projects") / project / f"{item.reserved_claude_uuid}.jsonl",
+        Path("D:/other/.claude/projects/C--other") / f"{item.reserved_claude_uuid}.jsonl",
+    ]
+    store = FakeStore()
+    factory = FakeFactory()
+    result = registrar(
+        FakeSource([projection_for(item)], duplicate_paths=paths), factory, store
+    ).process(item)
+    assert result.status == "failed" and result.error_code == "duplicate_uuid"
+    assert factory.spawns == [] and store.calls[0][0] == "fail"
+
+
 def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     item = claim()
     source = FakeSource([None, projection_for(item)])
@@ -597,6 +716,18 @@ def test_winpty_quiet_period_resets_for_each_partial_post_response_chunk() -> No
     assert process.calls == 4
 
 
+def test_winpty_retains_substantive_pre_response_output_for_rejection() -> None:
+    class Process:
+        def __init__(self):
+            self.chunks = iter(["UNRELATED WORK\r\n", "REGISTERED\r\n"])
+
+        def read(self, size: int = 1024) -> str:
+            return next(self.chunks)
+
+    output = _WinPtyProcess(Process()).read_until(0.3, prompt="registration prompt")
+    assert "UNRELATED WORK" in output
+
+
 def test_winpty_slow_drip_after_candidate_stays_bounded_by_global_timeout() -> None:
     release = threading.Event()
 
@@ -645,6 +776,82 @@ def test_winpty_reader_timeout_is_bounded_when_underlying_read_blocks() -> None:
         _WinPtyProcess(Process()).read_until(0.05)
     assert time.monotonic() - started < 0.5
     release.set()
+
+
+def test_none_exit_code_is_never_accepted_as_clean() -> None:
+    item = claim()
+    process = FakePty(exit_code=None)  # type: ignore[arg-type]
+    result = registrar(
+        FakeSource([None, projection_for(item)]), FakeFactory(process)
+    ).process(item)
+    assert result.status == "retry"
+    assert result.error_code == "clean_exit_not_observed"
+
+
+def test_cleanup_failure_after_spawn_overrides_success_as_creation_ambiguous() -> None:
+    item = claim()
+    process = FakePty()
+    process.cleanup_result = PtyCleanupResult(False, False, False, 0)
+    store = FakeStore()
+    result = registrar(
+        FakeSource([None, projection_for(item)]), FakeFactory(process), store
+    ).process(item)
+    assert result.status == "retry" and result.error_code == "creation_ambiguous"
+    assert not any(call[0] == "commit" for call in store.calls)
+
+
+def test_winpty_close_is_idempotent_and_reports_all_cleanup_postconditions() -> None:
+    released = threading.Event()
+
+    class Resource:
+        def __init__(self, descriptor: int):
+            self.descriptor = descriptor
+
+        def close(self) -> None:
+            self.descriptor = -1
+            released.set()
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+    class NativePty:
+        fd = 42
+
+        def isalive(self) -> bool:
+            return False
+
+        def get_exitstatus(self) -> int:
+            return 0
+
+    class Process:
+        def __init__(self):
+            self.fileobj = Resource(10)
+            self._server = Resource(11)
+            self.pty = NativePty()
+            self.fd = 10
+            self.closed = False
+            self.exitstatus = 0
+            self._thread = threading.Thread(target=lambda: None)
+            self._thread.start()
+
+        def read(self, size: int = 1024) -> str:
+            released.wait(1)
+            raise EOFError
+
+        def isalive(self) -> bool:
+            return False
+
+    wrapped = _WinPtyProcess(Process())
+    with pytest.raises(TimeoutError):
+        wrapped.read_until(0.02)
+    first = wrapped.close(0.5)
+    second = wrapped.close(0.5)
+    assert first == second == PtyCleanupResult(True, True, True, 0)
+
+
+def test_winpty_unknown_private_resource_layout_fails_closed() -> None:
+    with pytest.raises(RuntimeError, match="unsupported pywinpty resource layout"):
+        _WinPtyProcess(object(), require_supported_layout=True)
 
 
 def test_paid_launch_exact_reconciles_existing_uuid_before_any_spawn() -> None:
@@ -802,3 +1009,69 @@ def test_offline_fixture_named_terminating_scenarios_record_exit(
         "scenario": scenario,
         "sequence": expected_code,
     }
+
+
+def _real_conpty_available() -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winpty  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
+@pytest.mark.parametrize(
+    ("scenario", "expected_exit", "expected_lines"),
+    [("registered", 0, ["REGISTERED"]), ("nonzero", 9, ["REGISTERED"]),
+     ("delayed_extra", 0, ["REGISTERED", "extra"])],
+)
+def test_real_windows_conpty_fixture_exit_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_exit: int,
+    expected_lines: list[str],
+) -> None:
+    record = tmp_path / f"{scenario}.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", scenario)
+    monkeypatch.setenv("FAKE_CLAUDE_EXTRA_DELAY", "0.03")
+    process = WindowsConPtyFactory().spawn(
+        [sys.executable, str(fixture), "--session-id", "real-conpty-uuid"],
+        cwd=str(tmp_path),
+    )
+    process.write("\x1b[200~registration prompt\x1b[201~\r")
+    output = process.read_until(10.0, prompt="registration prompt")
+    process.write("/exit\r")
+    assert output.strip().splitlines() == expected_lines
+    assert process.wait(10.0) == expected_exit
+    cleanup = process.close(5.0)
+    assert cleanup == PtyCleanupResult(True, True, True, expected_exit)
+    assert process.close(5.0) == cleanup
+    events = json.loads(record.read_text(encoding="utf-8"))
+    assert events[0]["cwd"] == str(tmp_path)
+    assert events[0]["argv"] == ["--session-id", "real-conpty-uuid"]
+    assert "registration prompt" in events[1]["frame"]
+
+
+@pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
+def test_real_windows_conpty_timeout_terminates_and_releases_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = tmp_path / "timeout.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "timeout_after_native_creation")
+    process = WindowsConPtyFactory().spawn(
+        [sys.executable, str(fixture), "--session-id", "real-timeout-uuid"],
+        cwd=str(tmp_path),
+    )
+    process.write("registration prompt\r")
+    with pytest.raises(TimeoutError):
+        process.read_until(0.1, prompt="registration prompt")
+    assert process.terminate(5.0)
+    cleanup = process.close(5.0)
+    assert cleanup.process_dead and cleanup.reader_stopped and cleanup.descriptors_closed

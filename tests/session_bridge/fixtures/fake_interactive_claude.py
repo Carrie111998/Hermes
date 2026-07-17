@@ -17,13 +17,14 @@ def _record(**values: object) -> None:
 
 
 def _read_frame() -> str:
-    end = b"\x1b[201~\r"
     data = bytearray()
-    while not data.endswith(end):
+    while True:
         byte = sys.stdin.buffer.read(1)
         if not byte:
             break
         data.extend(byte)
+        if byte in (b"\r", b"\n"):
+            break
     return bytes(data).decode("utf-8", errors="replace")
 
 
@@ -49,7 +50,16 @@ def main() -> int:
     else:
         sys.stdout.write("REGISTERED\r\n")
     sys.stdout.flush()
-    exit_frame = sys.stdin.buffer.readline().decode("utf-8", errors="replace")
+    if scenario == "delayed_extra":
+        time.sleep(float(os.environ.get("FAKE_CLAUDE_EXTRA_DELAY", "0.05")))
+        sys.stdout.write("extra\r\n")
+        sys.stdout.flush()
+    exit_frame = ""
+    while not exit_frame.strip():
+        raw_exit = sys.stdin.buffer.readline()
+        if not raw_exit:
+            break
+        exit_frame = raw_exit.decode("utf-8", errors="replace")
     _record(event="stdin", frame=exit_frame)
     if exit_frame.strip() != "/exit":
         return _exit(scenario, 7)

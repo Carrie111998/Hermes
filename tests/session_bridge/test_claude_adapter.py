@@ -1222,6 +1222,19 @@ def test_find_native_session_uses_record_id_without_writes(tmp_path):
     assert adapter.find_native_session("missing-synthetic-id") is None
 
 
+def test_find_native_sessions_returns_every_exact_uuid_match_across_projects(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "C--first" / f"{BASIC_SESSION_ID}.jsonl"
+    second = tmp_path / "D--second" / f"{BASIC_SESSION_ID}.jsonl"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("{}\n", encoding="utf-8")
+    second.write_text("{}\n", encoding="utf-8")
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    assert adapter.find_native_sessions(BASIC_SESSION_ID) == [first, second]
+
+
 def test_find_native_session_skips_corrupt_probe_before_valid_target(tmp_path):
     corrupt = tmp_path / "a-corrupt-mixed-id.jsonl"
     corrupt.write_bytes(

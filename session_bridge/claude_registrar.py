@@ -8,6 +8,8 @@ import json
 import os
 import queue
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -27,11 +29,12 @@ from .claude_visibility import (
     derive_claude_visibility_identity,
     validate_claude_visibility_identity_binding,
 )
-from .models import OriginKind, ProjectedMessage, Provider, SessionProjection
+from .models import OriginKind, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
 _RESPONSE_SETTLE_SECONDS = 0.1
+_WINPTY_SPAWN_LOCK = threading.Lock()
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
@@ -39,9 +42,9 @@ _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 class InteractivePty(Protocol):
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str: ...
     def write(self, data: str) -> None: ...
-    def wait(self, timeout: float) -> int: ...
-    def terminate(self) -> None: ...
-    def close(self) -> None: ...
+    def wait(self, timeout: float) -> int | None: ...
+    def terminate(self, timeout: float = 1.0) -> bool: ...
+    def close(self, timeout: float = 1.0) -> PtyCleanupResult: ...
 
 
 class InteractivePtyFactory(Protocol):
@@ -75,6 +78,22 @@ class ClaudeRegistrarOutcome:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class PtyCleanupResult:
+    process_dead: bool
+    reader_stopped: bool
+    descriptors_closed: bool
+    exit_code: int | None
+
+    @property
+    def succeeded(self) -> bool:
+        return (
+            self.process_dead
+            and self.reader_stopped
+            and self.descriptors_closed
+        )
+
+
 class _TranscriptConflict(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
@@ -84,7 +103,11 @@ class _TranscriptConflict(ValueError):
 @dataclass(frozen=True)
 class _ExactTranscript:
     path: Path
-    projection: SessionProjection
+    parsed: ClaudeParseResult
+
+    @property
+    def projection(self) -> SessionProjection:
+        return self.parsed.projection
 
 
 class WindowsConPtyFactory:
@@ -95,33 +118,111 @@ class WindowsConPtyFactory:
             raise RuntimeError("pty unavailable")
         try:
             from winpty import PtyProcess
+            from winpty import ptyprocess as winpty_module
         except ImportError as exc:
             raise RuntimeError("pty unavailable") from exc
         try:
-            process = PtyProcess.spawn(
-                list(argv), cwd=cwd, env=os.environ.copy(), dimensions=(24, 120)
-            )
+            with _WINPTY_SPAWN_LOCK:
+                previous_blocking = os.environ.get("PYWINPTY_BLOCK")
+                original_reader = getattr(winpty_module, "_read_in_thread")
+                os.environ["PYWINPTY_BLOCK"] = "0"
+                setattr(winpty_module, "_read_in_thread", _winpty_nonblocking_reader)
+                try:
+                    process = PtyProcess.spawn(
+                        list(argv), cwd=cwd, env=os.environ.copy(), dimensions=(24, 120)
+                    )
+                finally:
+                    setattr(winpty_module, "_read_in_thread", original_reader)
+                    if previous_blocking is None:
+                        os.environ.pop("PYWINPTY_BLOCK", None)
+                    else:
+                        os.environ["PYWINPTY_BLOCK"] = previous_blocking
         except FileNotFoundError:
             raise
         except Exception as exc:
             raise RuntimeError("pty unavailable") from exc
-        return _WinPtyProcess(process)
+        return _WinPtyProcess(
+            process, require_supported_layout=True, direct_native_pty=True
+        )
+
+
+def _winpty_nonblocking_reader(address: object, pty: object, blocking: bool) -> None:
+    """Disable pywinpty 2.x's unjoinable reader; the wrapper reads the PTY directly."""
+
+    del pty, blocking
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        client.connect(address)  # type: ignore[arg-type]
+    except Exception:
+        return
+    finally:
+        client.close()
 
 
 class _WinPtyProcess:
-    def __init__(self, process: object) -> None:
+    def __init__(
+        self,
+        process: object,
+        *,
+        require_supported_layout: bool = False,
+        direct_native_pty: bool = False,
+    ) -> None:
         self._process = process
         self._closed = False
+        self._cleanup_result: PtyCleanupResult | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._reader_result: queue.Queue[str | BaseException | None] | None = None
+        self._reader_stop = threading.Event()
+        self._close_lock = threading.Lock()
+        self._direct_native_pty = direct_native_pty
+        if require_supported_layout:
+            self._resources()
+
+    def _resources(self) -> tuple[object, object, threading.Thread]:
+        fileobj = getattr(self._process, "fileobj", None)
+        server = getattr(self._process, "_server", None)
+        reader = getattr(self._process, "_thread", None)
+        pty = getattr(self._process, "pty", None)
+        direct_layout_supported = not self._direct_native_pty or all(
+            callable(getattr(pty, name, None))
+            for name in ("read", "write", "iseof", "get_exitstatus")
+        )
+        if not (
+            callable(getattr(fileobj, "close", None))
+            and callable(getattr(fileobj, "fileno", None))
+            and callable(getattr(server, "close", None))
+            and callable(getattr(server, "fileno", None))
+            and isinstance(reader, threading.Thread)
+            and hasattr(self._process, "fd")
+            and hasattr(self._process, "closed")
+            and callable(getattr(self._process, "isalive", None))
+            and direct_layout_supported
+        ):
+            raise RuntimeError("unsupported pywinpty resource layout")
+        return fileobj, server, reader
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
-        del prompt
+        if self._reader_thread is not None:
+            raise RuntimeError("PTY reader already started")
         result: queue.Queue[str | BaseException | None] = queue.Queue()
+        self._reader_result = result
 
         def _read() -> None:
             try:
                 while True:
-                    chunk = self._process.read(4096)  # type: ignore[attr-defined]
+                    if self._reader_stop.is_set():
+                        return
+                    if self._direct_native_pty:
+                        pty = getattr(self._process, "pty")
+                        chunk = pty.read(4096, blocking=False)
+                        if not chunk and pty.iseof():
+                            result.put(None)
+                            return
+                    else:
+                        chunk = self._process.read(4096)  # type: ignore[attr-defined]
                     if not chunk:
+                        if self._reader_stop.is_set():
+                            return
                         time.sleep(0.01)
                         continue
                     text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
@@ -131,7 +232,9 @@ class _WinPtyProcess:
             except BaseException as exc:
                 result.put(exc)
 
-        threading.Thread(target=_read, daemon=True).start()
+        reader = threading.Thread(target=_read, daemon=True, name="session-bridge-winpty-reader")
+        self._reader_thread = reader
+        reader.start()
         deadline = time.monotonic() + timeout
         settle_deadline: float | None = None
         candidate_seen = False
@@ -143,7 +246,8 @@ class _WinPtyProcess:
             if remaining <= 0:
                 joined = "".join(chunks)
                 if candidate_seen:
-                    return _registered_suffix(joined, require_complete=False) or joined
+                    return self._finish_read(_normalized_terminal_output(joined, prompt))
+                self._stop_reader()
                 raise TimeoutError
             try:
                 value = result.get(timeout=remaining)
@@ -152,44 +256,144 @@ class _WinPtyProcess:
             if value is None:
                 joined = "".join(chunks)
                 if candidate_seen:
-                    return _registered_suffix(joined, require_complete=False) or joined
-                return joined
+                    return self._finish_read(_normalized_terminal_output(joined, prompt))
+                return self._finish_read(_normalized_terminal_output(joined, prompt))
             if isinstance(value, BaseException):
+                self._stop_reader()
                 raise RuntimeError("PTY read unavailable") from value
             chunks.append(value)
             joined = "".join(chunks)
             if len(joined) > _MAX_RESPONSE_CHARS:
-                return joined
+                return self._finish_read(joined)
             if not candidate_seen and _exact_registered_suffix(joined) is not None:
                 candidate_seen = True
             if candidate_seen:
                 settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
 
-    def write(self, data: str) -> None:
-        self._process.write(data)  # type: ignore[attr-defined]
+    def _finish_read(self, value: str) -> str:
+        self._stop_reader()
+        return value
 
-    def wait(self, timeout: float) -> int:
+    def _stop_reader(self) -> None:
+        self._reader_stop.set()
+        if self._direct_native_pty and self._reader_thread is not None:
+            self._reader_thread.join(2.0)
+
+    def write(self, data: str) -> None:
+        if self._direct_native_pty:
+            self._process.pty.write(data)  # type: ignore[attr-defined]
+        else:
+            self._process.write(data)  # type: ignore[attr-defined]
+
+    def wait(self, timeout: float) -> int | None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not self._process.isalive():  # type: ignore[attr-defined]
-                return int(getattr(self._process, "exitstatus", 0) or 0)
+                value = getattr(self._process, "exitstatus", None)
+                if value is None:
+                    pty = getattr(self._process, "pty", None)
+                    getter = getattr(pty, "get_exitstatus", None)
+                    value = getter() if callable(getter) else None
+                return value if type(value) is int else None
             time.sleep(0.01)
         raise TimeoutError
 
-    def terminate(self) -> None:
+    def terminate(self, timeout: float = 1.0) -> bool:
         try:
-            self._process.terminate(force=True)  # type: ignore[attr-defined]
+            terminated = self._process.terminate(force=True)  # type: ignore[attr-defined]
         except Exception:
-            pass
+            terminated = False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if not self._process.isalive():  # type: ignore[attr-defined]
+                    return terminated is not False
+            except Exception:
+                return False
+            time.sleep(0.01)
+        pid = getattr(self._process, "pid", None)
+        if sys.platform.startswith("win") and type(pid) is int:
+            try:
+                completed = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                    timeout=max(0.1, timeout),
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if completed.returncode == 0:
+                final_deadline = time.monotonic() + timeout
+                while time.monotonic() < final_deadline:
+                    if self._is_dead():
+                        return True
+                    time.sleep(0.01)
+        return False
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+    def close(self, timeout: float = 1.0) -> PtyCleanupResult:
+        with self._close_lock:
+            if self._cleanup_result is not None:
+                return self._cleanup_result
+            try:
+                fileobj, server, native_reader = self._resources()
+            except RuntimeError:
+                result = PtyCleanupResult(False, False, False, self._exit_code())
+                self._cleanup_result = result
+                return result
+            process_dead = self._is_dead()
+            if not process_dead:
+                process_dead = self.terminate(timeout)
+            for resource in (fileobj, server):
+                try:
+                    shutdown = getattr(resource, "shutdown", None)
+                    if callable(shutdown):
+                        shutdown(2)
+                except Exception:
+                    pass
+                try:
+                    resource.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            try:
+                setattr(self._process, "fd", -1)
+                setattr(self._process, "closed", True)
+            except Exception:
+                pass
+            deadline = time.monotonic() + timeout
+            for reader in (self._reader_thread, native_reader):
+                if reader is not None and reader is not threading.current_thread():
+                    reader.join(max(0.0, deadline - time.monotonic()))
+            reader_stopped = all(
+                reader is None or not reader.is_alive()
+                for reader in (self._reader_thread, native_reader)
+            )
+            descriptors_closed = (
+                _fileno_closed(fileobj)
+                and _fileno_closed(server)
+                and getattr(self._process, "fd", None) == -1
+            )
+            self._closed = True
+            result = PtyCleanupResult(
+                process_dead, reader_stopped, descriptors_closed, self._exit_code()
+            )
+            self._cleanup_result = result
+            return result
+
+    def _is_dead(self) -> bool:
         try:
-            self._process.close()  # type: ignore[attr-defined]
+            return not bool(self._process.isalive())  # type: ignore[attr-defined]
         except Exception:
-            pass
+            return False
+
+    def _exit_code(self) -> int | None:
+        value = getattr(self._process, "exitstatus", None)
+        if value is None:
+            getter = getattr(getattr(self._process, "pty", None), "get_exitstatus", None)
+            try:
+                value = getter() if callable(getter) else None
+            except Exception:
+                value = None
+        return value if type(value) is int else None
 
 
 class ClaudeNativeRegistrar:
@@ -316,6 +520,8 @@ class ClaudeNativeRegistrar:
     ) -> ClaudeRegistrarOutcome:
         try:
             found = self._read_exact(identity.claude_uuid)
+        except _TranscriptConflict as exc:
+            return self._fail(claim, exc.code, "exact transcript identity conflict")
         except ValueError:
             return self._fail(claim, "uuid_conflict", "exact transcript identity conflict")
         except (OSError, RuntimeError):
@@ -341,6 +547,8 @@ class ClaudeNativeRegistrar:
     ) -> ClaudeRegistrarOutcome:
         try:
             existing = self._read_exact(identity.claude_uuid)
+        except _TranscriptConflict as exc:
+            return self._fail(claim, exc.code, "exact transcript identity conflict")
         except ValueError:
             return self._fail(
                 claim, "bridge_conflict", "exact transcript identity conflict"
@@ -358,6 +566,7 @@ class ClaudeNativeRegistrar:
         process: InteractivePty | None = None
         launched = False
         clean_exit = False
+        pending: tuple[str, str, str] | None = None
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
@@ -365,39 +574,60 @@ class ClaudeNativeRegistrar:
             process.write(f"\x1b[200~{prompt}\x1b[201~\r")
             output = process.read_until(self._process_timeout, prompt=prompt)
             if _is_authentication_failure(output):
-                return self._retry(claim, "claude_authentication_unavailable", "Claude authentication unavailable")
-            if not _has_exact_registered_response(output, prompt):
-                return self._fail(claim, "bridge_conflict", "registration response malformed")
-            process.write("/exit\r")
-            if process.wait(self._exit_timeout) != 0:
-                return self._retry(claim, "clean_exit_not_observed", "Claude did not exit cleanly")
-            clean_exit = True
+                pending = ("retry", "claude_authentication_unavailable", "Claude authentication unavailable")
+            elif not _has_exact_registered_response(output, prompt):
+                pending = ("fail", "bridge_conflict", "registration response malformed")
+            else:
+                process.write("/exit\r")
+                exit_code = process.wait(self._exit_timeout)
+                if type(exit_code) is not int or exit_code != 0:
+                    pending = ("retry", "clean_exit_not_observed", "Claude did not exit cleanly")
+                else:
+                    clean_exit = True
         except FileNotFoundError:
-            return self._retry(claim, "claude_executable_unavailable", "Claude executable unavailable")
+            pending = ("retry", "claude_executable_unavailable", "Claude executable unavailable")
         except TimeoutError:
-            return self._retry(claim, "creation_ambiguous", "registration result ambiguous")
+            pending = ("retry", "creation_ambiguous", "registration result ambiguous")
         except RuntimeError:
             code = "creation_ambiguous" if launched else "pty_unavailable"
-            return self._retry(claim, code, "interactive PTY unavailable")
+            pending = ("retry", code, "interactive PTY unavailable")
         except Exception:
             code = "creation_ambiguous" if launched else "pty_unavailable"
-            return self._retry(claim, code, "interactive registration unavailable")
+            pending = ("retry", code, "interactive registration unavailable")
         finally:
             if process is not None:
                 if not clean_exit:
                     try:
-                        process.terminate()
+                        terminated = process.terminate(self._exit_timeout)
                     except Exception:
-                        pass
+                        terminated = False
+                    if not terminated:
+                        pending = (
+                            "retry", "creation_ambiguous",
+                            "PTY termination was not confirmed",
+                        )
                 try:
-                    process.close()
+                    cleanup = process.close(self._exit_timeout)
                 except Exception:
-                    pass
+                    cleanup = PtyCleanupResult(False, False, False, None)
+                if not cleanup.succeeded:
+                    pending = (
+                        "retry", "creation_ambiguous",
+                        "PTY cleanup postconditions failed",
+                    )
+
+        if pending is not None:
+            transition, code, detail = pending
+            if transition == "fail":
+                return self._fail(claim, code, detail)
+            return self._retry(claim, code, detail)
 
         deadline = self._monotonic() + self._discovery_timeout
         while True:
             try:
                 found = self._read_exact(identity.claude_uuid)
+            except _TranscriptConflict as exc:
+                return self._fail(claim, exc.code, "exact transcript identity conflict")
             except ValueError:
                 return self._fail(
                     claim, "bridge_conflict", "exact transcript identity conflict"
@@ -411,12 +641,19 @@ class ClaudeNativeRegistrar:
             self._sleep(self._poll_interval)
 
     def _read_exact(self, native_id: str) -> _ExactTranscript | None:
-        path = self._source.find_native_session(native_id)
-        if path is None:
+        finder = getattr(self._source, "find_native_sessions", None)
+        if callable(finder):
+            paths = list(finder(native_id))
+        else:
+            found = self._source.find_native_session(native_id)
+            paths = [] if found is None else [found]
+        if len(paths) > 1:
+            raise _TranscriptConflict("duplicate_uuid")
+        if not paths:
             return None
-        exact_path = Path(path)
+        exact_path = Path(paths[0])
         parsed: ClaudeParseResult = self._source.parse(exact_path)
-        return _ExactTranscript(path=exact_path, projection=parsed.projection)
+        return _ExactTranscript(path=exact_path, parsed=parsed)
 
     def _validate_and_commit(
         self, claim: ClaudeVisibilityClaim, candidate: ClaudeVisibilityCandidate,
@@ -467,6 +704,8 @@ def _validate_projection(
     identity: ClaudeVisibilityIdentity, marker_secret: bytes,
 ) -> None:
     projection = transcript.projection
+    if transcript.parsed.malformed_lines or transcript.parsed.unknown_records:
+        raise _TranscriptConflict("bridge_conflict")
     if projection.provider is not Provider.CLAUDE or projection.native_id != identity.claude_uuid:
         raise _TranscriptConflict("uuid_conflict")
     if transcript.path.parent.name != claude_project_directory_name(candidate.source_cwd):
@@ -478,46 +717,43 @@ def _validate_projection(
     if projection.origin_bridge_id != identity.bridge_id or projection.origin_kind is not OriginKind.BRIDGE_PLACEHOLDER:
         raise _TranscriptConflict("bridge_conflict")
     expected = build_claude_registration_prompt(candidate, identity, marker_secret)
-    prompt_indexes = [
-        index
-        for index, message in enumerate(projection.messages)
-        if message.role == "user" and message.content == expected
-    ]
+    messages = list(projection.messages)
+    prompt_indexes = [index for index, message in enumerate(messages) if message.role == "user" and message.content == expected]
     if len(prompt_indexes) != 1:
         raise _TranscriptConflict("marker_conflict")
-    prompt_index = prompt_indexes[0]
-    if prompt_index + 1 >= len(projection.messages):
+    if prompt_indexes != [0]:
         raise _TranscriptConflict("bridge_conflict")
-    response = projection.messages[prompt_index + 1]
+    prompt = messages[0]
+    if (
+        prompt.ordinal != 0
+        or prompt.tool_calls
+        or prompt.tool_name
+        or prompt.tool_call_id
+        or prompt.reasoning
+    ):
+        raise _TranscriptConflict("bridge_conflict")
+    if len(messages) < 2:
+        raise _TranscriptConflict("bridge_conflict")
+    response = messages[1]
     if response.role != "assistant":
         raise _TranscriptConflict("bridge_conflict")
-    turn_messages = []
-    for message in projection.messages[prompt_index + 1:]:
-        if message.role == "user":
-            break
-        turn_messages.append(message)
-    event_order: list[str] = []
-    by_event: dict[str, list[ProjectedMessage]] = {}
+    turn_messages = messages[1:]
+    response_event_id = response.native_event_id
     for message in turn_messages:
         if (
             message.role != "assistant"
+            or message.native_event_id != response_event_id
             or message.tool_calls
             or message.tool_name
+            or message.tool_call_id
             or message.reasoning
         ):
             raise _TranscriptConflict("bridge_conflict")
-        if message.native_event_id not in by_event:
-            event_order.append(message.native_event_id)
-            by_event[message.native_event_id] = []
-        by_event[message.native_event_id].append(message)
-    ordered_messages = [
-        message
-        for event_id in event_order
-        for message in sorted(by_event[event_id], key=lambda item: item.ordinal)
-    ]
+    if [message.ordinal for message in turn_messages] != list(range(len(turn_messages))):
+        raise _TranscriptConflict("bridge_conflict")
     aggregate = "".join(
         message.content
-        for message in ordered_messages
+        for message in turn_messages
         if isinstance(message.content, str)
     )
     if not _is_exact_registered_text(aggregate):
@@ -534,6 +770,40 @@ def _is_exact_registered_text(content: object) -> bool:
 def _is_authentication_failure(output: str) -> bool:
     folded = output.casefold()
     return "authentication required" in folded or "not authenticated" in folded or "please log in" in folded
+
+
+def _fileno_closed(resource: object) -> bool:
+    try:
+        return int(resource.fileno()) < 0  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
+
+def _normalized_terminal_output(output: str, prompt: str | None) -> str:
+    """Remove only recognized terminal echo/UI framing, preserving other output."""
+
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    prompt_lines = (
+        {line.strip() for line in prompt.splitlines()} if prompt is not None else set()
+    )
+    meaningful: list[str] = []
+    for raw in cleaned.splitlines():
+        line = raw.strip()
+        for prefix in ("Claude>", ">"):
+            if line.startswith(prefix):
+                line = line[len(prefix):].strip()
+                break
+        if not line or line in prompt_lines:
+            continue
+        if (
+            line == "Claude Code ready"
+            or line == "status: connected"
+            or line == "metadata continuation"
+            or line.startswith("Signed marker: ")
+        ):
+            continue
+        meaningful.append(line)
+    return "\n".join(meaningful) + ("\n" if meaningful else "")
 
 
 def _has_exact_registered_response(output: str, prompt: str) -> bool:
@@ -586,4 +856,5 @@ def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
 __all__ = [
     "ClaudeNativeRegistrar", "ClaudeRegistrarOutcome", "InteractivePty",
     "InteractivePtyFactory", "WindowsConPtyFactory",
+    "PtyCleanupResult",
 ]

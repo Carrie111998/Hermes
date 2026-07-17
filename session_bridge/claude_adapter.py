@@ -81,6 +81,8 @@ class ClaudeParseResult:
 class ClaudeReadableSource(Protocol):
     def find_native_session(self, native_id: str) -> Path | None: ...
 
+    def find_native_sessions(self, native_id: str) -> list[Path]: ...
+
     def parse(self, path: Path) -> ClaudeParseResult: ...
 
 
@@ -298,21 +300,28 @@ class ClaudeSourceAdapter:
         )
 
     def find_native_session(self, native_id: str) -> Path | None:
+        matches = self.find_native_sessions(native_id)
+        return matches[0] if matches else None
+
+    def find_native_sessions(self, native_id: str) -> list[Path]:
         if not isinstance(native_id, str) or not native_id.strip():
-            return None
+            return []
         wanted = native_id.strip()
         paths = self.discover()
+        matches: list[Path] = []
         for path in paths:
             if path.stem == wanted:
-                return path
+                matches.append(path)
         for path in paths:
+            if path in matches:
+                continue
             try:
                 probed_native_id = _probe_native_id(path)
             except (OSError, ValueError):
                 continue
             if probed_native_id == wanted:
-                return path
-        return None
+                matches.append(path)
+        return matches
 
     def projection_has_exact_marker(
         self, projection: SessionProjection, marker: str

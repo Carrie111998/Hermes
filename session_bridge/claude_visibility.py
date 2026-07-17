@@ -101,7 +101,7 @@ class ClaudeVisibilityIdentity:
     signed_marker: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ClaudeVisibilityClaim:
     status: str
     lease_kind: Literal["launch", "reconciliation"] | None = None
