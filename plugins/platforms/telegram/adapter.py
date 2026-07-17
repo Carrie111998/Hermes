@@ -2026,8 +2026,13 @@ class TelegramAdapter(BasePlatformAdapter):
         connection silently dies; without this handler the bot never recovers.
 
         Strategy: exponential back-off (5s, 10s, 20s, 40s, 60s cap) up to
-        MAX_NETWORK_RETRIES attempts, then mark the adapter retryable-fatal so
-        the supervisor restarts the gateway process.
+        MAX_NETWORK_RETRIES attempts, then mark the adapter *retryable*-fatal.
+        The retryable fatal is routed by ``GatewayRunner._handle_adapter_fatal_error``
+        into the ``_failed_platforms`` reconnect-watcher queue, which re-initializes
+        the Telegram adapter on its own backoff cadence. The gateway process and
+        every other platform (WhatsApp, api_server, cron, event bus) stay up — a
+        transient DNS/VPN flap must not bounce the whole multi-platform gateway
+        (death forensics 2026-07-16).
         """
         if self.has_fatal_error:
             return
@@ -2043,7 +2048,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if attempt > MAX_NETWORK_RETRIES:
             message = (
                 "Telegram polling could not reconnect after %d network error retries. "
-                "Restarting gateway." % MAX_NETWORK_RETRIES
+                "Re-initializing the Telegram adapter via the reconnect watcher; "
+                "the gateway and other platforms stay up." % MAX_NETWORK_RETRIES
             )
             logger.error("[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error))
             self._set_fatal_error("telegram_network_error", message, retryable=True)
