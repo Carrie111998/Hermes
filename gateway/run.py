@@ -1411,30 +1411,27 @@ from contextlib import contextmanager as _contextmanager
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
 # multiplexer the default profile owns the single shared listener and serves
 # every profile through the /p/<profile>/ URL prefix, so a SECONDARY profile
-# enabling one of these is always a misconfiguration: it would try to bind a
-# port already held by the default's listener. We hard-error on it rather than
-# silently dropping the adapter (see _start_one_profile_adapters).
-# Stored as platform .value strings since the Platform enum is imported below.
-_PORT_BINDING_PLATFORM_VALUES = frozenset({
-    "webhook",
-    "api_server",
-    "msgraph_webhook",
-    "feishu",
-    "wecom_callback",
-    "bluebubbles",
-    "sms",
-    "whatsapp_cloud",
-    "line",
-})
+# enabling one of these is always a misconfiguration. We skip that secondary
+# profile (SecondaryPortBindingConfigError) so a single bad profile cannot
+# take down the whole multiplexer. The set lives in gateway.config so the
+# dashboard's pre-write validation enforces the same policy.
+from gateway.config import (
+    PORT_BINDING_PLATFORM_VALUES as _PORT_BINDING_PLATFORM_VALUES,
+    platform_binds_port as _platform_binds_port,
+)
 
 
 class MultiplexConfigError(RuntimeError):
-    """A profile multiplexer config is invalid (fail-fast at startup).
+    """A profile multiplexer config is invalid.
 
-    Distinct from a transient adapter-connect failure: a transient error is
-    logged and the gateway stays alive to retry, but a config error means the
-    operator must fix config.yaml, so it aborts startup cleanly.
+    Distinct from a transient adapter-connect failure: a config error means the
+    operator must fix config.yaml. Fatal configuration errors propagate to the
+    startup guard instead of being treated as retryable adapter noise.
     """
+
+
+class SecondaryPortBindingConfigError(MultiplexConfigError):
+    """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
 @_contextmanager
@@ -2041,17 +2038,12 @@ def _try_resolve_fallback_provider() -> dict | None:
             return None
         for entry in fb_list:
             try:
-                explicit_api_key = entry.get("api_key")
-                if not explicit_api_key:
-                    key_env = str(
-                        entry.get("key_env") or entry.get("api_key_env") or ""
-                    ).strip()
-                    if key_env:
-                        explicit_api_key = os.getenv(key_env, "").strip() or None
+                from hermes_cli.fallback_config import resolve_entry_api_key
+
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
                     explicit_base_url=entry.get("base_url"),
-                    explicit_api_key=explicit_api_key,
+                    explicit_api_key=resolve_entry_api_key(entry),
                 )
                 # Log the literal `provider` key from config, not the resolved
                 # runtime category — an Ollama fallback resolves through the
@@ -8754,10 +8746,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
                 )
+            except SecondaryPortBindingConfigError as e:
+                logger.warning(
+                    "Skipping secondary profile '%s' due to port-binding config error: %s",
+                    profile_name,
+                    e,
+                )
             except MultiplexConfigError:
-                # Config error (e.g. a secondary profile binding a port) is not
-                # transient — propagate so startup aborts cleanly instead of
-                # limping along with a half-configured multiplexer.
                 raise
             except Exception as e:
                 logger.error(
@@ -8800,6 +8795,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "'open'."
             )
 
+        port_binding_platforms = sorted(
+            platform.value
+            for platform, platform_config in profile_cfg.platforms.items()
+            if platform_config.enabled
+            and _platform_binds_port(platform.value, platform_config.extra)
+        )
+        if port_binding_platforms:
+            joined = ", ".join(port_binding_platforms)
+            raise SecondaryPortBindingConfigError(
+                f"Profile '{profile_name}' enables port-binding platform(s) "
+                f"{joined}, but gateway.multiplex_profiles is on. The default "
+                f"profile owns the single shared HTTP listener and serves every "
+                f"profile through the /p/{profile_name}/ URL prefix. Remove "
+                f"these platform entries from profile '{profile_name}'s config.yaml "
+                f"or configure them only on the default profile."
+            )
+
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
@@ -8813,24 +8825,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and platform is Platform.RELAY
             ):
                 continue
-            # A secondary profile must NOT enable a port-binding platform: the
-            # default profile's listener already serves every profile via the
-            # /p/<profile>/ prefix, so a second bind can only collide. This is a
-            # config error, not a transient failure — fail fast and loud.
-            if platform.value in _PORT_BINDING_PLATFORM_VALUES:
-                raise MultiplexConfigError(
-                    f"Profile '{profile_name}' enables the port-binding platform "
-                    f"'{platform.value}', but gateway.multiplex_profiles is on. The "
-                    f"default profile owns the single shared HTTP listener and "
-                    f"serves every profile through the /p/{profile_name}/ URL "
-                    f"prefix — a secondary profile cannot bind its own port. "
-                    f"Remove platforms.{platform.value} from profile "
-                    f"'{profile_name}'s config.yaml (configure it only on the "
-                    f"default profile)."
+            try:
+                with _profile_runtime_scope(profile_home):
+                    adapter = self._create_adapter(platform, platform_config)
+            except Exception as e:
+                logger.error(
+                    "[MULTIPLEX] Profile '%s': _create_adapter('%s') raised %s",
+                    profile_name,
+                    platform.value,
+                    e,
+                    exc_info=True,
                 )
-            with _profile_runtime_scope(profile_home):
-                adapter = self._create_adapter(platform, platform_config)
+                continue
             if not adapter:
+                logger.warning(
+                    "[MULTIPLEX] Profile '%s': skipping platform '%s' - adapter creation returned None",
+                    profile_name,
+                    platform.value,
+                )
                 continue
 
             # Same-token conflict detection — refuse a duplicate poll.
@@ -8858,7 +8870,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter.set_authorization_check(
+                self._make_adapter_auth_check(adapter.platform, profile_name=profile_name)
+            )
             adapter._busy_text_mode = self._busy_text_mode
 
             try:
@@ -8877,14 +8891,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return connected
 
     def _make_profile_message_handler(self, profile_name: str):
-        """Return a message handler that stamps source.profile then delegates."""
+        """Return a message handler that stamps source.profile then delegates.
+
+        Auth runs inside ``_handle_message`` *before* the agent-turn scope is
+        installed. For secondary profiles under multiplex, wrap the whole
+        handler in ``_profile_runtime_scope`` so allowlists/tokens from that
+        profile's ``.env`` are visible to ``get_secret`` / authz.
+        """
+        from hermes_cli.profiles import get_profile_dir
+
+        try:
+            profile_home = get_profile_dir(profile_name)
+        except Exception:
+            profile_home = None
+
         async def _handler(event):
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
                     event.source.profile = profile_name
             except Exception:
                 pass
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_message(event)
             return await self._handle_message(event)
+
         return _handler
 
     @staticmethod
@@ -8986,8 +9017,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return WhatsAppCloudAdapter(config)
         
         elif platform == Platform.SIGNAL:
-            from gateway.platforms.signal import SignalAdapter, check_signal_requirements
+            from gateway.platforms.signal import (
+                SignalAdapter,
+                check_signal_requirements,
+                validate_signal_config,
+            )
             if not check_signal_requirements():
+                logger.warning("Signal: runtime requirements not met")
+                return None
+            if not validate_signal_config(config):
                 logger.warning("Signal: SIGNAL_HTTP_URL or SIGNAL_ACCOUNT not configured")
                 return None
             return SignalAdapter(config)
@@ -9004,7 +9042,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -9051,6 +9091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _make_adapter_auth_check(
         self,
         platform: Platform,
+        profile_name: Optional[str] = None,
     ) -> Callable[[str, Optional[str], Optional[str]], bool]:
         """Build a platform-bound auth callback for adapter use.
 
@@ -9063,6 +9104,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The returned callback delegates to :meth:`_is_user_authorized` so the
         full auth chain — platform allowlists, group allowlists, pairing
         store, allow-all flags — stays the single source of truth.
+
+        ``profile_name`` binds the callback to the secondary adapter's own
+        multiplex profile, so its ``SessionSource`` resolves that profile's
+        secret scope instead of falling back to the active profile.
         """
         def check(
             user_id: str,
@@ -9076,6 +9121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=chat_id or "",
                 chat_type=chat_type or "group",
                 user_id=user_id,
+                profile=profile_name,
             )
             return self._is_user_authorized(source)
         return check
@@ -9723,7 +9769,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /fast and /reasoning are config-only and take effect next
             # message, so they fall through to the catch-all busy response
             # below — users should wait and set them between turns.
-            if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose"}:
+            if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose", "footer"}:
                 if _cmd_def_inner.name == "yolo":
                     return await self._handle_yolo_command(event)
                 if _cmd_def_inner.name == "verbose":
@@ -10210,6 +10256,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "background":
             return await self._handle_background_command(event)
+
+        if canonical == "queue":
+            queue_payload = event.get_command_args().strip()
+            if not queue_payload:
+                return "Usage: /queue <prompt>"
+            try:
+                event.text = queue_payload
+            except Exception:
+                pass
 
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
@@ -11813,7 +11868,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            # Multiplex: home channel may live only in the profile secret
+            # scope / PlatformConfig, not process os.environ.
+            home_env = ""
+            try:
+                from agent.secret_scope import get_secret
+
+                home_env = (get_secret(env_key) or "").strip() if env_key else ""
+            except Exception:
+                home_env = ""
+            if not home_env:
+                home_env = (os.getenv(env_key) or "").strip() if env_key else ""
+            # Also honor in-memory / yaml home_channel on this platform.
+            try:
+                if not home_env and self.config.get_home_channel(source.platform):
+                    home_env = "set"
+            except Exception:
+                pass
+            # Secondary-profile platforms (e.g. Slack on yolo) may only exist
+            # under that profile's loaded config — check after scope install.
+            if not home_env:
+                try:
+                    from hermes_cli.profiles import get_profile_dir
+                    from gateway.config import load_gateway_config as _lgc
+                    prof = (getattr(source, "profile", None) or "").strip()
+                    if prof and prof != "default":
+                        # Already inside profile scope for secondary handlers;
+                        # re-read live config for home_channel.
+                        _pcfg = _lgc()
+                        if _pcfg.get_home_channel(source.platform):
+                            home_env = "set"
+                except Exception:
+                    pass
+            if not home_env:
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
@@ -13686,6 +13773,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
     ) -> None:
+        """Profile-scoping wrapper around the background agent task.
+
+        When multiplexing is active, resolve the inbound source's profile and
+        run the whole task inside ``_profile_runtime_scope`` so credentials
+        resolve from that profile's secret scope. Mirrors the pattern in
+        ``_run_agent``.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._run_background_task_inner(
+                prompt, source, task_id, event_message_id, media_urls, media_types,
+            )
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            return await self._run_background_task_inner(
+                prompt, source, task_id, event_message_id, media_urls, media_types,
+            )
+
+    async def _run_background_task_inner(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        event_message_id: Optional[str] = None,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
+    ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
@@ -14019,7 +14133,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Best-effort semantic rename of a newly auto-created Discord thread."""
         if not await asyncio.to_thread(self._is_discord_auto_thread_lane, source):
             return
-        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
         if adapter is None:
             return
         rename_thread = getattr(adapter, "rename_thread", None)
@@ -19755,6 +19869,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Gateway auto-title failure suppressed (not user-visible): %s: %s",
                             task, exc,
                         )
+                    # Snapshot the runtime identity; the validator lets the
+                    # background titler skip its LLM call if the session's
+                    # model changed before it fires (a stale request would
+                    # reload an unloaded Ollama model, #19027).
+                    _title_model = getattr(agent, "model", None) if agent else None
+                    _title_provider = getattr(agent, "provider", None) if agent else None
                     maybe_auto_title_kwargs = {
                         "failure_callback": _title_failure_cb,
                         "main_runtime": {
@@ -19764,6 +19884,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "api_key": getattr(agent, "api_key", None),
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
+                        "runtime_validator": (lambda: (
+                            getattr(agent, "model", None) == _title_model
+                            and getattr(agent, "provider", None) == _title_provider
+                        )) if agent else None,
                     }
                     if self._is_telegram_topic_lane(source):
                         maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(

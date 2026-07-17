@@ -1777,12 +1777,39 @@ class SessionDB:
                     (SCHEMA_VERSION,),
                 )
 
-        # Unique title index — always ensure it exists
+        # Unique title index — always ensure it exists. Older databases may
+        # contain duplicate aliases from before the constraint was enforced;
+        # preserve every session while letting the newest one retain the alias.
+        title_index_sql = (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+            "ON sessions(title) WHERE title IS NOT NULL"
+        )
         try:
-            cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
-                "ON sessions(title) WHERE title IS NOT NULL"
-            )
+            cursor.execute(title_index_sql)
+        except sqlite3.IntegrityError:
+            # The index is an optimization — its creation must never abort
+            # opening the database, so the repair itself is also guarded.
+            try:
+                cursor.execute(
+                    """UPDATE sessions AS older
+                       SET title = NULL
+                       WHERE title IS NOT NULL
+                         AND EXISTS (
+                             SELECT 1 FROM sessions AS newer
+                             WHERE newer.title = older.title
+                               AND newer.rowid > older.rowid
+                         )"""
+                )
+                logger.warning(
+                    "Cleared %d duplicate session title(s) while restoring the unique index",
+                    cursor.rowcount,
+                )
+                cursor.execute(title_index_sql)
+            except sqlite3.Error:
+                logger.exception(
+                    "Could not repair duplicate session titles; "
+                    "unique title index not created"
+                )
         except sqlite3.OperationalError:
             pass  # Index already exists
 
@@ -3195,16 +3222,24 @@ class SessionDB:
         ).fetchone()
         return row is not None
 
-    def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
-
-        Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
-        Empty/whitespace-only strings are normalized to None (clearing the title).
-        """
+    def _set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        only_if_empty: bool,
+    ) -> bool:
         title = self.sanitize_title(title)
+
         def _do(conn):
+            if only_if_empty:
+                current = conn.execute(
+                    "SELECT title FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if current is None or current["title"] is not None:
+                    return 0
+
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
@@ -3236,13 +3271,34 @@ class SessionDB:
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
+            predicate = " AND title IS NULL" if only_if_empty else ""
             cursor = conn.execute(
-                "UPDATE sessions SET title = ? WHERE id = ?",
+                f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
                 (title, session_id),
             )
             return cursor.rowcount
+
         rowcount = self._execute_write(_do)
         return rowcount > 0
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """Set or update a session's title.
+
+        Returns True if session was found and title was set.
+        Raises ValueError if title is already in use by another session,
+        or if the title fails validation (too long, invalid characters).
+        Empty/whitespace-only strings are normalized to None (clearing the title).
+        """
+        return self._set_session_title(session_id, title, only_if_empty=False)
+
+    def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
+        """Set an auto-generated title only when the current title is NULL.
+
+        The predicate and write run in one transaction so a concurrent manual
+        rename cannot be overwritten. Validation and uniqueness behavior match
+        :meth:`set_session_title`.
+        """
+        return self._set_session_title(session_id, title, only_if_empty=True)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -4581,6 +4637,7 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool = False,
         include_inactive: bool = False,
+        repair_alternation: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -4589,6 +4646,16 @@ class SessionDB:
         By default only active messages are returned. Pass
         ``include_inactive=True`` to load soft-deleted (rewound) rows
         as well. See :meth:`rewind_to_message`.
+
+        ``repair_alternation=True`` runs ``repair_message_sequence`` over the
+        loaded list before returning it. Callers that restore a session for
+        LIVE REPLAY should pass it: a durable alternation violation (e.g. a
+        ``user;user`` pair left by a turn that persisted no assistant row)
+        otherwise re-triggers the pre-request defensive repair on every
+        single request for the rest of the session's life — the repair
+        mutates only the per-request list, never the stored transcript.
+        Inspection/export consumers keep the default and see the transcript
+        verbatim.
         """
         session_ids = [session_id]
         if include_ancestors:
@@ -4685,6 +4752,21 @@ class SessionDB:
         # assistant reply immediately following it, so a polluted session
         # resumes clean even if stray rows exist.
         messages = _strip_background_review_harness(messages)
+        if repair_alternation and messages:
+            # Lazy import: hermes_state already depends on agent.* (see
+            # sanitize_context above), but keep this optional path from
+            # widening the import surface at module load.
+            from agent.agent_runtime_helpers import repair_message_sequence
+
+            repaired = repair_message_sequence(None, messages)
+            if repaired:
+                logger.info(
+                    "Repaired %d message-alternation violation(s) while "
+                    "restoring session %s — durable transcript kept them, "
+                    "see repair_message_sequence",
+                    repaired,
+                    session_id,
+                )
         return messages
 
     def get_conversation_root(self, session_id: str) -> str:

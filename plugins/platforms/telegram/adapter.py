@@ -294,6 +294,74 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 
+def _coerce_duration_seconds(value: Any) -> Optional[int]:
+    """Round a raw length to whole positive seconds, or None if unusable."""
+    try:
+        secs = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return secs if secs > 0 else None
+
+
+def _probe_voice_duration_seconds(path: str) -> Optional[int]:
+    """Best-effort audio length in whole seconds for outgoing voice/audio.
+
+    Telegram only auto-derives a clip's duration from container metadata for
+    short recordings; longer ones (roughly 5 min+) are sent with duration 0
+    and render as ``0:00`` in the player. We read the length locally and pass
+    it explicitly so the bubble shows the real time.
+
+    Mirrors ``gateway.run._probe_audio_duration``: stdlib ``wave`` for WAV,
+    then mutagen for OGG/Opus/MP3/M4A metadata, then an ``ffprobe`` fallback.
+    All three are optional — when none can read the file we return ``None``
+    and the caller omits ``duration``, falling back to Telegram's own
+    (possibly absent) metadata, i.e. the prior behavior. Blocking (mutagen
+    read + ffprobe subprocess), so call it via ``asyncio.to_thread``.
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".wav":
+        try:
+            import wave
+
+            with wave.open(path, "rb") as wf:
+                rate = wf.getframerate() or 0
+                if rate:
+                    secs = _coerce_duration_seconds(wf.getnframes() / float(rate))
+                    if secs is not None:
+                        return secs
+        except Exception:
+            pass
+
+    try:
+        import mutagen
+
+        audio = mutagen.File(path)
+        secs = _coerce_duration_seconds(
+            getattr(getattr(audio, "info", None), "length", None)
+        )
+        if secs is not None:
+            return secs
+    except Exception:
+        pass
+
+    try:
+        import shutil
+        import subprocess
+
+        if shutil.which("ffprobe"):
+            proc = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=5,
+            )
+            if proc.returncode == 0:
+                return _coerce_duration_seconds(proc.stdout.strip())
+    except Exception:
+        pass
+
+    return None
+
 
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available.
@@ -710,6 +778,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
+        self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -5145,6 +5214,128 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
     _PROVIDER_PAGE_SIZE = 10
+
+    async def send_choice_picker(
+        self,
+        chat_id: str,
+        title: str,
+        choices: list,
+        session_key: str,
+        on_choice_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a flat inline-keyboard choice picker (one tap → one value).
+
+        Generic single-level companion to ``send_model_picker`` used by
+        `/reasoning`, `/fast`, and any future finite-choice command. Each
+        choice dict: ``{"value": str, "label": str, "is_current": bool}``.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            buttons = []
+            for i, choice in enumerate(choices):
+                label = str(choice.get("label") or choice.get("value") or "")
+                if choice.get("is_current"):
+                    label = f"✓ {label}"
+                buttons.append(
+                    InlineKeyboardButton(label, callback_data=f"cp:{i}")
+                )
+            if not buttons:
+                return SendResult(success=False, error="No choices")
+            # Two buttons per row keeps labels readable on mobile.
+            keyboard = InlineKeyboardMarkup(
+                [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+            )
+
+            thread_id = metadata.get("thread_id") if metadata else None
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=self.format_message(title),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode
+                ),
+                **self._link_preview_kwargs(),
+            )
+
+            self._choice_picker_state[str(chat_id)] = {
+                "msg_id": msg.message_id,
+                "choices": choices,
+                "session_key": session_key,
+                "on_choice_selected": on_choice_selected,
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_choice_picker failed: %s", self.name, _redact_telegram_error_text(e))
+            return SendResult(success=False, error=_redact_telegram_error_text(e))
+
+    async def _handle_choice_picker_callback(
+        self, query, data: str, chat_id: str
+    ) -> None:
+        """Handle choice picker button taps (cp:<index>)."""
+        state = self._choice_picker_state.get(chat_id)
+        if not state:
+            await query.answer(text="Picker expired — run the command again.")
+            return
+
+        # Same authorization gate as approval buttons: unauthorized users in a
+        # shared group must not flip session/config state via someone else's
+        # picker message.
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        if not self._is_callback_user_authorized(
+            str(getattr(query.from_user, "id", "")),
+            chat_id=getattr(query_message, "chat_id", None),
+            chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
+            thread_id=str(getattr(query_message, "message_thread_id", None)) if getattr(query_message, "message_thread_id", None) is not None else None,
+            user_name=getattr(query.from_user, "first_name", None),
+        ):
+            await query.answer(text="⛔ You are not authorized to change this setting.")
+            return
+
+        try:
+            idx = int(data[3:])
+            choice = state["choices"][idx]
+        except (ValueError, IndexError):
+            await query.answer(text="Invalid selection.")
+            return
+
+        callback = state.get("on_choice_selected")
+        if not callback:
+            await query.answer(text="Picker expired.")
+            return
+
+        try:
+            result_text = await callback(chat_id, str(choice.get("value") or ""))
+        except Exception as exc:
+            logger.error("Choice picker selection failed: %s", exc)
+            result_text = f"Error applying selection: {exc}"
+
+        try:
+            await query.edit_message_text(
+                text=self.format_message(result_text),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    text=result_text, parse_mode=None, reply_markup=None,
+                )
+            except Exception:
+                pass
+        await query.answer()
+        self._choice_picker_state.pop(chat_id, None)
+
     _MODEL_PAGE_SIZE = 8
 
     def _build_provider_keyboard(self, providers: list, page: int = 0) -> tuple:
@@ -5639,6 +5830,13 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Generic choice picker callbacks (/reasoning, /fast) ---
+        if data.startswith("cp:"):
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_choice_picker_callback(query, data, chat_id)
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---
@@ -6150,6 +6348,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
             
+            # Compute duration locally — Telegram drops it for long clips
+            # (~5 min+), which then show 0:00 in the player.
+            _duration_secs = await asyncio.to_thread(
+                _probe_voice_duration_seconds, audio_path
+            )
+
             with open(audio_path, "rb") as audio_file:
                 ext = os.path.splitext(audio_path)[1].lower()
                 # .ogg / .opus files -> send as voice (round playable bubble)
@@ -6170,6 +6374,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "voice": audio_file,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
+                            "duration": _duration_secs,
                             **voice_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -6196,6 +6401,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             "audio": audio_file,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
+                            "duration": _duration_secs,
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
@@ -7042,6 +7248,32 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> set[str]:
+        """Return topic-level free-response allowlist entries as ``<chat_id>:<thread_id>``.
+
+        Unlike ``free_response_chats`` (whole-chat), each entry opens a single
+        forum topic for free-response. A missing/omitted thread id on incoming
+        messages is normalized to the General topic (``1``).
+        """
+        raw = self.config.extra.get("free_response_topics")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_is_free_response_topic(self, message: Message) -> bool:
+        """True when the message's chat/topic pair is in ``free_response_topics``."""
+        topics = self._telegram_free_response_topics()
+        if not topics:
+            return False
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        if not chat_id:
+            return False
+        thread_id = self._effective_message_thread_id(message)
+        topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+        return f"{chat_id}:{topic_id}" in topics
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -7395,6 +7627,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # message would be processed normally, let the dispatcher handle it;
         # if require_mention is disabled, every group message is a request.
         if chat_id_str in self._telegram_free_response_chats():
+            return False
+        if self._telegram_is_free_response_topic(message):
             return False
         if not self._telegram_require_mention():
             return False
@@ -7760,6 +7994,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if guest_mention:
             return True
         if chat_id_str in self._telegram_free_response_chats():
+            return True
+        if self._telegram_is_free_response_topic(message):
             return True
         if not self._telegram_require_mention():
             return True
@@ -9022,6 +9258,11 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
         os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+    frt = telegram_cfg.get("free_response_topics")
+    if frt is not None and not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
+        if isinstance(frt, list):
+            frt = ",".join(str(v) for v in frt)
+        os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = str(frt)
     ac = telegram_cfg.get("allowed_chats")
     if ac is not None and not os.getenv("TELEGRAM_ALLOWED_CHATS"):
         if isinstance(ac, list):
@@ -9064,7 +9305,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         if isinstance(group_allowed_chats, list):
             group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
         os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
-    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages"):
+    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])
     # Pass through telegram-specific extra keys (e.g. base_url proxy override),
