@@ -2206,6 +2206,12 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     deduplicated.  With a single match — the common case, and always the
     case outside a git repo — output is identical to the historical
     single-file behavior.
+
+    When the chain yields nothing, fall back to ``$HERMES_HOME/AGENTS.md``
+    so profile-level agent instructions still load when the process cwd is
+    not the active profile (#66118) — matching how ``SOUL.md`` is read from
+    HERMES_HOME independently of cwd. Project / cwd chain content always
+    wins when present.
     """
     cwd_resolved = cwd_path.resolve()
     sections: List[str] = []
@@ -2238,6 +2244,30 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             sections.append(section)
             break  # first name match wins per directory
     if not sections:
+        # Profile-level fallback when no project AGENTS.md exists (#66118).
+        try:
+            home = get_hermes_home().resolve()
+        except Exception as e:
+            logger.debug("Could not resolve HERMES_HOME for AGENTS.md fallback: %s", e)
+            return ""
+        if home != cwd_resolved:
+            for name in ["AGENTS.md", "agents.md"]:
+                candidate = home / name
+                if not candidate.exists():
+                    continue
+                try:
+                    content = candidate.read_text(encoding="utf-8").strip()
+                except Exception as e:
+                    logger.debug("Could not read %s: %s", candidate, e)
+                    continue
+                if not content:
+                    continue
+                scanned = _scan_context_content(content, name)
+                section = f"## {name}\n\n{scanned}"
+                return _truncate_content(
+                    section, "AGENTS.md", context_length=context_length,
+                    read_path=str(candidate),
+                )
         return ""
     if len(sections) == 1:
         return sections[0]
