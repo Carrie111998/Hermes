@@ -31,13 +31,16 @@ def _isolated_cwd(tmp_path, monkeypatch):
     decoy = tmp_path / "decoy"
     workspace.mkdir()
     decoy.mkdir()
-    (workspace / "target.py").write_text("WORKSPACE_ORIGINAL\n")
-    (decoy / "target.py").write_text("DECOY_ORIGINAL\n")
+    (workspace / "target.py").write_text(
+        "WORKSPACE_ORIGINAL\n", encoding="utf-8"
+    )
+    (decoy / "target.py").write_text("DECOY_ORIGINAL\n", encoding="utf-8")
     # Process cwd = decoy, analogous to "main repo" while the terminal is in
     # the worktree.
     monkeypatch.chdir(decoy)
     # No session cwd recorded yet (fresh-session condition).
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd_authority_scopes", {})
     return workspace, decoy
 
 
@@ -77,6 +80,58 @@ def test_live_tracking_cwd_wins_over_relative_terminal_cwd(_isolated_cwd, monkey
     resolved = ft._resolve_path_for_task("target.py", task_id="default")
 
     assert resolved == (workspace / "target.py")
+
+
+def test_authoritative_context_cwd_beats_stale_default_record(tmp_path, monkeypatch):
+    from agent.runtime_cwd import (
+        reset_authoritative_session_cwd,
+        set_authoritative_session_cwd,
+    )
+
+    cron_cwd = tmp_path / "cron"
+    stale_cwd = tmp_path / "stale"
+    cron_cwd.mkdir()
+    stale_cwd.mkdir()
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {"default": str(stale_cwd)})
+
+    tokens = set_authoritative_session_cwd(str(cron_cwd))
+    try:
+        assert ft._authoritative_workspace_root("default") == str(cron_cwd)
+        assert ft._resolve_path_for_task("target.py", "default") == cron_cwd / "target.py"
+    finally:
+        reset_authoritative_session_cwd(tokens)
+
+
+def test_authoritative_host_cwd_maps_to_docker_workspace(monkeypatch):
+    from agent.runtime_cwd import (
+        reset_authoritative_session_cwd,
+        set_authoritative_session_cwd,
+    )
+
+    config = {
+        "env_type": "docker",
+        "cwd": "/workspace",
+        "host_cwd": "/mnt/project",
+        "docker_mount_cwd_to_workspace": True,
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd_authority_scopes", {})
+
+    tokens = set_authoritative_session_cwd("/mnt/project")
+    try:
+        assert terminal_tool._resolve_command_cwd(
+            workdir=None,
+            default_cwd="/workspace",
+            session_key="default",
+            config=config,
+        ) == "/workspace"
+        assert ft._resolve_path_for_task("child.txt", "default") == PurePosixPath(
+            "/workspace/child.txt"
+        )
+    finally:
+        reset_authoritative_session_cwd(tokens)
 
 
 def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
@@ -220,11 +275,12 @@ def _two_worktree_sessions(tmp_path, monkeypatch):
     main = tmp_path / "main"
     for d in (wt_a, wt_b, main):
         d.mkdir()
-        (d / "target.py").write_text(f"{d.name}\n")
+        (d / "target.py").write_text(f"{d.name}\n", encoding="utf-8")
     monkeypatch.chdir(main)
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd_authority_scopes", {})
     monkeypatch.setattr(ft, "_file_ops_cache", {})
     # Both sessions register their worktree cwd (TUI/desktop registration path;
     # registration seeds each session's record).

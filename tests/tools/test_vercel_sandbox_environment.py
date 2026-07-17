@@ -290,7 +290,7 @@ class TestFileSync:
         self, make_env, vercel_sdk, monkeypatch, tmp_path
     ):
         src = tmp_path / "token.txt"
-        src.write_text("secret-token")
+        src.write_text("secret-token", encoding="utf-8")
         monkeypatch.setattr(
             "tools.credential_files.get_credential_file_mounts",
             lambda: [
@@ -317,7 +317,7 @@ class TestFileSync:
         self, make_env, vercel_sdk, monkeypatch, tmp_path
     ):
         src = tmp_path / "token.txt"
-        src.write_text("secret-token")
+        src.write_text("secret-token", encoding="utf-8")
         monkeypatch.setattr(
             "tools.credential_files.get_credential_file_mounts",
             lambda: [
@@ -331,13 +331,17 @@ class TestFileSync:
         monkeypatch.setattr("tools.credential_files.iter_cache_files", lambda **kwargs: [])
 
         env = make_env()
-        src.write_text("updated-secret-token")
+        src.write_text("updated-secret-token", encoding="utf-8")
         monkeypatch.setenv("HERMES_FORCE_FILE_SYNC", "1")
         vercel_sdk.current.run_command_side_effects.append(_cwd_result("hello"))
 
         result = env.execute("echo hello")
 
-        assert result == {"output": "hello\n", "returncode": 0}
+        assert result == {
+            "output": "hello\n",
+            "returncode": 0,
+            "cwd": "/vercel/sandbox",
+        }
         assert vercel_sdk.current.write_files_calls[-1] == [
             {
                 "path": "/home/vercel/.hermes/credentials/token.txt",
@@ -351,7 +355,7 @@ class TestFileSync:
         hermes_home = tmp_path / ".hermes"
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         src = tmp_path / "token.txt"
-        src.write_text("host-token")
+        src.write_text("host-token", encoding="utf-8")
         monkeypatch.setattr(
             "tools.credential_files.get_credential_file_mounts",
             lambda: [
@@ -400,7 +404,7 @@ class TestFileSync:
         self, make_env, vercel_sdk, monkeypatch, tmp_path
     ):
         src = tmp_path / "token.txt"
-        src.write_text("host-token")
+        src.write_text("host-token", encoding="utf-8")
         monkeypatch.setattr(
             "tools.credential_files.get_credential_file_mounts",
             lambda: [
@@ -480,7 +484,11 @@ class TestExecute:
 
         result = env.execute("echo hello")
 
-        assert result == {"output": "hello\n", "returncode": 0}, label
+        assert result == {
+            "output": "hello\n",
+            "returncode": 0,
+            "cwd": "/vercel/sandbox",
+        }, label
         assert original.closed == 1
         assert vercel_sdk.current is replacement
 

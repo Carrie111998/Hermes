@@ -240,14 +240,10 @@ def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
 
 
 def _configured_terminal_cwd() -> str | None:
-    """Return ``$TERMINAL_CWD`` only when it names a real directory anchor.
+    """Return a task-local or configured cwd when it is an absolute anchor."""
+    from agent.runtime_cwd import resolve_tool_cwd
 
-    Sentinel values (see ``_TERMINAL_CWD_SENTINELS``) and relative paths are
-    rejected — a relative anchor is meaningless without knowing which cwd it is
-    relative to, which is exactly the ambiguity that misroutes worktree edits.
-    Only an absolute, sentinel-free value is honored.
-    """
-    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+    return _sentinel_free_abs_cwd(resolve_tool_cwd())
 
 
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:
@@ -269,26 +265,59 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
-def _authoritative_workspace_root(task_id: str = "default") -> str | None:
-    """Best-effort absolute workspace root for divergence checks.
+def _backend_native_workspace_root(
+    root: str | None,
+    task_id: str = "default",
+    *,
+    authoritative_host: bool = False,
+) -> str | None:
+    """Map a host cwd to the path used by the active container backend.
 
-    Resolution:
-
-      1. The session's own cwd RECORD (``terminal_tool.get_session_cwd``) —
-         written on every completed terminal command and seeded by workspace
-         registration, keyed by the raw session id. Because the record is
-         per-session, one session's ``cd`` can never leak into another
-         session's resolution.
-      2. A registered task/session cwd override (TUI/Desktop/ACP sessions
-         register a raw-keyed cwd before any tool runs). Normally already
-         mirrored into the record at registration; kept as a direct fallback
-         so a cleared/never-written record still resolves the workspace.
-      3. A sentinel-free absolute ``$TERMINAL_CWD`` (the worktree path set by
-         ``cli.py``/``main.py`` for ``-w`` sessions).
-
-    Returns ``None`` only when there is genuinely no reliable anchor, in which
-    case callers fall back to the process cwd.
+    Terminal dispatch already sanitizes host-only paths (for example a Docker
+    auto-mounted ``/home/user/project``) to its backend-native cwd
+    (``/workspace``). File tools must apply the same mapping before resolving a
+    relative path, including before the first terminal command records a live
+    container cwd.
     """
+    if not root or not _uses_container_paths(task_id):
+        return root
+    try:
+        from tools.terminal_tool import (
+            _get_env_config,
+            _map_cwd_to_backend,
+        )
+
+        config = _get_env_config()
+        default_cwd = _sentinel_free_abs_cwd(config.get("cwd"))
+        if default_cwd:
+            return _map_cwd_to_backend(
+                root,
+                default_cwd,
+                config,
+                authoritative_host=authoritative_host,
+            )
+    except Exception:
+        pass
+    return root
+
+
+def _authoritative_workspace_root(task_id: str = "default") -> str | None:
+    """Resolve workspace: live fixed scope, cron root, session, override, config."""
+    from agent.runtime_cwd import resolve_authoritative_tool_cwd
+    from tools.terminal_tool import get_authoritative_session_cwd
+
+    live_context_root = _sentinel_free_abs_cwd(
+        get_authoritative_session_cwd(task_id)
+    )
+    if live_context_root:
+        return _backend_native_workspace_root(live_context_root, task_id)
+    context_root = _sentinel_free_abs_cwd(resolve_authoritative_tool_cwd())
+    if context_root:
+        return _backend_native_workspace_root(
+            context_root,
+            task_id,
+            authoritative_host=True,
+        )
     try:
         from tools.terminal_tool import get_session_cwd
 
@@ -296,11 +325,11 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     except Exception:
         recorded = None
     if recorded:
-        return recorded
+        return _backend_native_workspace_root(recorded, task_id)
     registered = _registered_task_cwd_override(task_id)
     if registered:
-        return registered
-    return _configured_terminal_cwd()
+        return _backend_native_workspace_root(registered, task_id)
+    return _backend_native_workspace_root(_configured_terminal_cwd(), task_id)
 
 
 def _resolve_base_dir(

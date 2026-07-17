@@ -3,7 +3,16 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import tools.terminal_tool as terminal_tool
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cwd_registries(monkeypatch):
+    """Keep cwd values and their authority-scope tags isolated together."""
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd_authority_scopes", {})
 
 
 def _minimal_terminal_config(cwd="/default"):
@@ -141,3 +150,146 @@ def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
     assert terminal_tool._safe_getcwd() == "/home/me"
+
+
+def test_authoritative_context_cwd_overrides_stale_session_record(monkeypatch):
+    import agent.runtime_cwd as runtime_cwd
+
+    monkeypatch.setattr(
+        terminal_tool, "_session_cwd", {"default": "/workspace/stale-persona"}
+    )
+    tokens = runtime_cwd.set_authoritative_session_cwd("/workspace/cron-job")
+    try:
+        assert terminal_tool._resolve_command_cwd(
+            workdir=None,
+            default_cwd="/workspace/config",
+            session_key="default",
+        ) == "/workspace/cron-job"
+    finally:
+        runtime_cwd.reset_authoritative_session_cwd(tokens)
+
+
+def test_authoritative_context_accepts_live_cwd_recorded_in_same_scope():
+    import agent.runtime_cwd as runtime_cwd
+    import tools.file_tools as file_tools
+    from tools.code_execution_tool import _resolve_child_cwd
+
+    task_id = "cron-live-cwd"
+    tokens = runtime_cwd.set_authoritative_session_cwd("/workspace/cron-job")
+    try:
+        terminal_tool.record_session_cwd(task_id, "/workspace/cron-job/packages/api")
+        assert terminal_tool._resolve_command_cwd(
+            workdir=None,
+            default_cwd="/workspace/config",
+            session_key=task_id,
+        ) == "/workspace/cron-job/packages/api"
+        assert file_tools._authoritative_workspace_root(task_id) == (
+            "/workspace/cron-job/packages/api"
+        )
+        assert _resolve_child_cwd("project", "/staging", task_id) == (
+            "/workspace/cron-job/packages/api"
+        )
+    finally:
+        terminal_tool.clear_session_cwd(task_id)
+        runtime_cwd.reset_authoritative_session_cwd(tokens)
+
+
+def test_authoritative_host_cwd_maps_to_workspace_for_docker_dispatch(monkeypatch):
+    import agent.runtime_cwd as runtime_cwd
+
+    calls = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace"
+
+        def execute(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"output": "ok", "returncode": 0, "cwd": self.cwd}
+
+    config = _minimal_terminal_config(cwd="/workspace")
+    config.update(
+        {
+            "env_type": "docker",
+            "docker_image": "python:3.12",
+            "host_cwd": "/mnt/project",
+            "docker_mount_cwd_to_workspace": True,
+            "docker_volumes": [],
+        }
+    )
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    tokens = runtime_cwd.set_authoritative_session_cwd("/mnt/project")
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="pwd"))
+    finally:
+        runtime_cwd.reset_authoritative_session_cwd(tokens)
+
+    assert result["exit_code"] == 0
+    assert calls == [
+        ("pwd", {"timeout": 60, "cwd": "/workspace", "bounded_capture": True})
+    ]
+
+
+def test_authoritative_cwd_preserves_backend_native_semantics():
+    import agent.runtime_cwd as runtime_cwd
+
+    tokens = runtime_cwd.set_authoritative_session_cwd("/mnt/project")
+    try:
+        assert terminal_tool._resolve_command_cwd(
+            workdir=None,
+            default_cwd="/root",
+            config={"env_type": "docker", "docker_mount_cwd_to_workspace": False},
+        ) == "/root"
+        assert terminal_tool._resolve_command_cwd(
+            workdir=None,
+            default_cwd="~",
+            config={"env_type": "ssh"},
+        ) == "/mnt/project"
+    finally:
+        runtime_cwd.reset_authoritative_session_cwd(tokens)
+
+
+def test_authoritative_record_uses_command_result_not_shared_env_cwd(monkeypatch):
+    import agent.runtime_cwd as runtime_cwd
+
+    class FakeEnv:
+        env = {}
+        cwd = "/cron/root"
+
+        def execute(self, command, **kwargs):
+            self.cwd = "/foreign/session"
+            return {"output": "ok", "returncode": 0, "cwd": "/cron/root/subdir"}
+
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _minimal_terminal_config(cwd="/cron/root"),
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    tokens = runtime_cwd.set_authoritative_session_cwd("/cron/root")
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="cd subdir"))
+        assert result["exit_code"] == 0
+        assert terminal_tool.get_authoritative_session_cwd(None) == (
+            "/cron/root/subdir"
+        )
+    finally:
+        terminal_tool.clear_session_cwd("default")
+        runtime_cwd.reset_authoritative_session_cwd(tokens)
