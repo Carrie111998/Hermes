@@ -967,7 +967,11 @@ class SessionBridgeCoordinator:
             and examined < examined_budget
         ):
             remaining_queue_capacity = (
-                limit - queued if persist_cursor else _SIDEBAR_REGISTRATION_PAGE_SIZE
+                _SIDEBAR_REGISTRATION_PAGE_SIZE
+                if persist_cursor and newest_probe
+                else limit - queued
+                if persist_cursor
+                else _SIDEBAR_REGISTRATION_PAGE_SIZE
             )
             page_size = max(
                 1,

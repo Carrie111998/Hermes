@@ -3758,7 +3758,7 @@ async def test_sidebar_registration_drains_pages_past_ineligible_and_existing_ro
         "eligible-hermes-second-page",
     ]
     assert store.list_calls == [
-        (now - 30 * 86_400, 2, None),
+        (now - 30 * 86_400, 10, None),
         (now - 30 * 86_400, 2, first_cursor),
     ]
 
@@ -3814,7 +3814,7 @@ async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
 ) -> None:
     now = 3_000_000.0
     store = _BudgetRecordingSidebarStore(sidebar_db, clock=lambda: now)
-    for offset in range(12):
+    for offset in range(20):
         _add_hermes_sidebar_source(
             sidebar_db,
             session_id=f"ack-{offset:02d}",
@@ -3853,6 +3853,14 @@ async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
         content="Queue this newly arrived request",
         last_active=now + 1,
     )
+    for offset in range(5):
+        _add_hermes_sidebar_source(
+            sidebar_db,
+            session_id=f"newer-automation-{offset}",
+            content="Automated maintenance result",
+            last_active=now + 2 + offset,
+            source="cron",
+        )
     restarted = SessionBridgeCoordinator(
         config=_sidebar_config(),
         store=store,
@@ -4051,7 +4059,7 @@ async def test_successful_provider_scan_only_registers_sidebar_in_continuous_mod
     assert len(store.sidebar_list_calls) == int(continuous)
     if continuous:
         assert store.sidebar_list_calls == [
-            (now - 30 * 86_400, SidebarConfig().continuous_batch_limit, None)
+            (now - 30 * 86_400, 10, None)
         ]
 
 
