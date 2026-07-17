@@ -1,0 +1,391 @@
+from __future__ import annotations
+
+import base64
+import binascii
+from dataclasses import dataclass
+from decimal import Decimal
+import hashlib
+import json
+import math
+import uuid
+
+from .models import (
+    BridgeMarkerPayload,
+    OriginKind,
+    Provider,
+    SessionProjection,
+    canonical_session_id,
+    encode_bridge_marker,
+)
+from .sidebar import is_meaningful_user_text, normalize_meaningful_user_text, sidebar_title
+
+
+CLAUDE_VISIBILITY_UUID_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    "https://hermes-agent/session-bridge/claude-visibility/v1",
+)
+CLAUDE_VISIBILITY_EXCLUSION_CODES = frozenset({
+    "source_claude",
+    "unsupported_provider",
+    "bridge_placeholder",
+    "bridge_continuation",
+    "automation_only",
+    "subagent_only",
+    "acknowledgement_only",
+    "control_only",
+    "no_meaningful_request",
+    "unstable_identity",
+})
+CLAUDE_VISIBILITY_RETRY_CODES = frozenset({
+    "claude_executable_unavailable",
+    "claude_authentication_unavailable",
+    "desktop_unavailable",
+    "pty_unavailable",
+    "native_transcript_not_indexed",
+    "clean_exit_not_observed",
+    "session_bridge_unavailable",
+    "creation_ambiguous",
+    "lease_expired",
+})
+CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
+    "uuid_conflict",
+    "source_conflict",
+    "bridge_conflict",
+    "provider_conflict",
+    "cwd_conflict",
+    "name_conflict",
+    "marker_conflict",
+    "duplicate_uuid",
+    "duplicate_identity",
+    "unknown_error_code",
+})
+CLAUDE_VISIBILITY_ERROR_CODES = (
+    CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
+)
+
+_ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready"})
+_CONTROLS = frozenset({
+    "resume",
+    "/resume",
+    "clear",
+    "/clear",
+    "help",
+    "/help",
+    "quit",
+    "/quit",
+})
+_MAX_PROMPT_CHARS = 8192
+_MAX_METADATA_CHARS = 4096
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityCandidate:
+    source_session_id: str
+    source_provider: Provider
+    native_name: str
+    source_cwd: str
+    git_root: str | None
+    git_branch: str | None
+    git_head: str | None
+    worktree_id: str | None
+    eligible_at: float
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityIdentity:
+    job_id: str
+    bridge_id: str
+    idempotency_key: str
+    claude_uuid: str
+    signed_marker: str
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityClaim:
+    status: str
+    job_id: str | None = None
+    source_session_id: str | None = None
+    source_provider: Provider | None = None
+    reserved_claude_uuid: str | None = None
+    native_name: str | None = None
+    source_cwd: str | None = None
+    git_root: str | None = None
+    git_branch: str | None = None
+    git_head: str | None = None
+    worktree_id: str | None = None
+    signed_marker: str | None = None
+    lease_digest: str | None = None
+    attempt_ordinal: int | None = None
+    prior_error_code: str | None = None
+    requires_exact_id_reconciliation: bool = False
+    registration_reserved: bool = False
+    launch_permitted: bool = False
+
+    @property
+    def claimed(self) -> bool:
+        return self.status == "claimed"
+
+
+def evaluate_claude_visibility(
+    projection: SessionProjection,
+    *,
+    automation_only: bool = False,
+    subagent_only: bool = False,
+) -> str:
+    if projection.provider is Provider.CLAUDE:
+        return "source_claude"
+    if projection.provider not in (Provider.CODEX, Provider.HERMES):
+        return "unsupported_provider"
+    if projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER:
+        return "bridge_placeholder"
+    if projection.origin_kind is OriginKind.BRIDGE_CONTINUATION:
+        return "bridge_continuation"
+    if projection.origin_kind is not OriginKind.NATIVE or projection.origin_bridge_id:
+        return "bridge_continuation"
+    if automation_only:
+        return "automation_only"
+    if subagent_only:
+        return "subagent_only"
+    try:
+        canonical_session_id(projection.provider, projection.native_id)
+    except ValueError:
+        return "unstable_identity"
+
+    normalized_user_texts = tuple(
+        normalized
+        for message in projection.messages
+        if message.role == "user"
+        if (normalized := normalize_meaningful_user_text(message.content)) is not None
+    )
+    if any(is_meaningful_user_text(value) for value in normalized_user_texts):
+        return "eligible"
+    folded = {value.casefold() for value in normalized_user_texts}
+    if folded and folded <= _ACKNOWLEDGEMENTS:
+        return "acknowledgement_only"
+    if folded and folded <= _CONTROLS:
+        return "control_only"
+    return "no_meaningful_request"
+
+
+def build_claude_visibility_candidate(
+    projection: SessionProjection,
+    *,
+    eligible_at: float,
+    git_root: str | None = None,
+    git_head: str | None = None,
+    worktree_id: str | None = None,
+    automation_only: bool = False,
+    subagent_only: bool = False,
+) -> ClaudeVisibilityCandidate:
+    reason = evaluate_claude_visibility(
+        projection,
+        automation_only=automation_only,
+        subagent_only=subagent_only,
+    )
+    if reason != "eligible":
+        raise ValueError(f"Claude visibility candidate is excluded: {reason}")
+    timestamp = _finite_float(eligible_at, "eligible_at")
+    source_cwd = _required_metadata(projection.cwd, "source cwd")
+    first_request = next(
+        message.content
+        for message in projection.messages
+        if message.role == "user" and is_meaningful_user_text(message.content)
+    )
+    title_provider = (
+        Provider.CLAUDE if projection.provider is Provider.CODEX else Provider.HERMES
+    )
+    sanitized = sidebar_title(title_provider, None, first_request)
+    if projection.provider is Provider.CODEX:
+        sanitized = "[Codex] " + sanitized.removeprefix("[Claude] ")
+    return ClaudeVisibilityCandidate(
+        source_session_id=canonical_session_id(projection.provider, projection.native_id),
+        source_provider=projection.provider,
+        native_name=sanitized,
+        source_cwd=source_cwd,
+        git_root=_optional_metadata(git_root, "git root"),
+        git_branch=_optional_metadata(projection.git_branch, "git branch"),
+        git_head=_optional_metadata(git_head, "git head"),
+        worktree_id=_optional_metadata(worktree_id, "worktree id"),
+        eligible_at=timestamp,
+    )
+
+
+def derive_claude_visibility_identity(
+    candidate: ClaudeVisibilityCandidate,
+    marker_secret: bytes,
+) -> ClaudeVisibilityIdentity:
+    _validate_candidate(candidate)
+    job_id, bridge_id, idempotency_key, claude_uuid = _identity_values(candidate)
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id=candidate.source_session_id,
+            target_provider=Provider.CLAUDE,
+            policy_generation=1,
+        ),
+        marker_secret,
+    )
+    return ClaudeVisibilityIdentity(
+        job_id=job_id,
+        bridge_id=bridge_id,
+        idempotency_key=idempotency_key,
+        claude_uuid=claude_uuid,
+        signed_marker=marker,
+    )
+
+
+def _identity_values(
+    candidate: ClaudeVisibilityCandidate,
+) -> tuple[str, str, str, str]:
+    source_identity = (
+        f"v1:{candidate.source_provider.value}:{candidate.source_session_id}"
+    )
+    identity_digest = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
+    bridge_id = f"claude-visibility:{identity_digest}"
+    idempotency_key = f"claude-visibility:{identity_digest}:v1"
+    claude_uuid = str(uuid.uuid5(CLAUDE_VISIBILITY_UUID_NAMESPACE, bridge_id))
+    job_id = f"claude-visibility-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+    return job_id, bridge_id, idempotency_key, claude_uuid
+
+
+def build_claude_registration_prompt(
+    candidate: ClaudeVisibilityCandidate,
+    identity: ClaudeVisibilityIdentity,
+) -> str:
+    validate_claude_visibility_identity_binding(candidate, identity)
+    metadata = {
+        "bridge_id": identity.bridge_id,
+        "git_branch": candidate.git_branch,
+        "git_head": candidate.git_head,
+        "git_root": candidate.git_root,
+        "source_cwd": candidate.source_cwd,
+        "source_provider": candidate.source_provider.value,
+        "source_session_id": candidate.source_session_id,
+        "worktree_id": candidate.worktree_id,
+    }
+    serialized = json.dumps(
+        metadata,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    prompt = "\n".join((
+        "This is a Hermes Session Bridge Claude visibility registration.",
+        "Do not perform project work or use tools.",
+        f"Signed marker: {identity.signed_marker}",
+        f"Bounded metadata: {serialized}",
+        "You must reply exactly REGISTERED.",
+        "After the first subsequent substantive user request, call session_continue ",
+        "with the canonical source session identity before performing project work.",
+    ))
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        raise ValueError("Claude registration prompt exceeds its fixed bound")
+    return prompt
+
+
+def normalized_claude_visibility_error(error_code: object) -> tuple[str, bool]:
+    if not isinstance(error_code, str):
+        return "unknown_error_code", False
+    if error_code in CLAUDE_VISIBILITY_RETRY_CODES:
+        return str(error_code), True
+    if error_code in CLAUDE_VISIBILITY_FATAL_CODES:
+        return str(error_code), False
+    return "unknown_error_code", False
+
+
+def validate_claude_visibility_identity_binding(
+    candidate: ClaudeVisibilityCandidate,
+    identity: ClaudeVisibilityIdentity,
+) -> None:
+    _validate_candidate(candidate)
+    if not isinstance(identity, ClaudeVisibilityIdentity):
+        raise ValueError("Claude visibility identity is malformed")
+    if (
+        identity.job_id,
+        identity.bridge_id,
+        identity.idempotency_key,
+        identity.claude_uuid,
+    ) != _identity_values(candidate):
+        raise ValueError("Claude visibility identity does not match candidate")
+    try:
+        prefix, encoded_and_signature = identity.signed_marker.split(":", 1)
+        encoded, signature = encoded_and_signature.split(".", 1)
+        if prefix != "HERMES_SESSION_BRIDGE_V1" or not encoded or not signature:
+            raise ValueError
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != encoded:
+            raise ValueError
+        raw_signature = base64.urlsafe_b64decode(
+            signature + "=" * (-len(signature) % 4)
+        )
+        if len(raw_signature) != hashlib.sha256().digest_size or (
+            base64.urlsafe_b64encode(raw_signature).decode("ascii").rstrip("=")
+            != signature
+        ):
+            raise ValueError
+        payload = json.loads(raw.decode("utf-8"))
+    except (AttributeError, binascii.Error, UnicodeError, ValueError) as exc:
+        raise ValueError("Claude visibility signed marker is malformed") from exc
+    if payload != {
+        "bridge_id": identity.bridge_id,
+        "policy_generation": 1,
+        "source_session_id": candidate.source_session_id,
+        "target_provider": Provider.CLAUDE.value,
+    }:
+        raise ValueError("Claude visibility signed marker does not match candidate")
+
+
+def _validate_candidate(candidate: ClaudeVisibilityCandidate) -> None:
+    if not isinstance(candidate, ClaudeVisibilityCandidate):
+        raise ValueError("Claude visibility candidate is malformed")
+    if candidate.source_provider not in (Provider.CODEX, Provider.HERMES):
+        raise ValueError("Claude visibility source provider must be Codex or Hermes")
+    canonical = canonical_session_id(candidate.source_provider, candidate.source_session_id.removeprefix(f"{candidate.source_provider.value}:"))
+    if canonical != candidate.source_session_id:
+        raise ValueError("Claude visibility source identity is not canonical")
+    if not candidate.native_name.startswith(
+        "[Codex] " if candidate.source_provider is Provider.CODEX else "[Hermes] "
+    ) or len(candidate.native_name) > 120:
+        raise ValueError("Claude visibility native name is invalid")
+    _required_metadata(candidate.source_cwd, "source cwd")
+    for value, label in (
+        (candidate.git_root, "git root"),
+        (candidate.git_branch, "git branch"),
+        (candidate.git_head, "git head"),
+        (candidate.worktree_id, "worktree id"),
+    ):
+        _optional_metadata(value, label)
+    _finite_float(candidate.eligible_at, "eligible_at")
+
+
+def _required_metadata(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ValueError(f"{label} must be canonical nonempty text")
+    if len(value) > _MAX_METADATA_CHARS or any(char in value for char in "\r\n\x00"):
+        raise ValueError(f"{label} exceeds its safe bound")
+    return value
+
+
+def _optional_metadata(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _required_metadata(value, label)
+
+
+def _finite_float(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a finite number")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"{label} must be a finite number")
+    return normalized
+
+
+def decimal_cost(value: object, label: str) -> Decimal:
+    try:
+        normalized = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{label} must be a decimal amount") from exc
+    if not normalized.is_finite() or normalized < 0:
+        raise ValueError(f"{label} must be a non-negative decimal amount")
+    return normalized

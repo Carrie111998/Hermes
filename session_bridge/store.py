@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, tzinfo
+from decimal import Decimal
 import errno
 import hashlib
 import hmac
@@ -12,6 +14,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -39,6 +42,10 @@ from .models import (
 )
 
 if TYPE_CHECKING:
+    from .claude_visibility import (
+        ClaudeVisibilityCandidate,
+        ClaudeVisibilityIdentity,
+    )
     from .sidebar import SidebarCandidate
     from .worktree import WorktreeSnapshot
 
@@ -165,6 +172,15 @@ _SIDEBAR_LATENCY_SAMPLE_LIMIT = 512
 
 NativeProjectionCursor = tuple[float, str]
 SidebarCandidateCursor = tuple[float, str]
+
+
+def _claude_error_detail(value: object) -> str:
+    from .context_pack import _redact
+
+    if not isinstance(value, str):
+        return "Claude visibility operation failed"
+    compact = " ".join(_redact(value).split())
+    return (compact or "Claude visibility operation failed")[:512]
 
 
 def _canonical_snapshot_value(value: object) -> list[Any]:
@@ -319,6 +335,8 @@ class SessionBridgeStore:
         clock: Callable[[], float] = time.time,
         sidebar_token_factory: Callable[[], str] | None = None,
         sidebar_jitter: Callable[[float], float] | None = None,
+        local_timezone: tzinfo | None = None,
+        claude_lease_factory: Callable[[], str] | None = None,
         hermes_profile_db_paths: Callable[
             [], Sequence[tuple[str, Path]]
         ] | None = None,
@@ -331,9 +349,552 @@ class SessionBridgeStore:
         self._sidebar_jitter = sidebar_jitter or (
             lambda bound: random.uniform(0.0, bound)
         )
+        if local_timezone is not None and not isinstance(local_timezone, tzinfo):
+            raise TypeError("local_timezone must be a tzinfo or None")
+        self._local_timezone = local_timezone
+        self._claude_lease_factory = claude_lease_factory or (
+            lambda: secrets.token_urlsafe(32)
+        )
         self._hermes_profile_db_paths = (
             hermes_profile_db_paths or self._discover_hermes_profile_db_paths
         )
+
+    def enqueue_claude_visibility_job(
+        self,
+        candidate: ClaudeVisibilityCandidate,
+        identity: ClaudeVisibilityIdentity,
+    ) -> dict[str, Any]:
+        from .claude_visibility import (
+            ClaudeVisibilityCandidate,
+            ClaudeVisibilityIdentity,
+            validate_claude_visibility_identity_binding,
+        )
+
+        if not isinstance(candidate, ClaudeVisibilityCandidate):
+            raise TypeError("candidate must be a ClaudeVisibilityCandidate")
+        if not isinstance(identity, ClaudeVisibilityIdentity):
+            raise TypeError("identity must be a ClaudeVisibilityIdentity")
+        validate_claude_visibility_identity_binding(candidate, identity)
+        now = _finite_number(self._clock(), "clock")
+
+        def _write(conn):
+            collisions = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE source_session_id = ? OR bridge_id = ?
+                      OR idempotency_key = ? OR reserved_claude_uuid = ?
+                   ORDER BY id LIMIT 5""",
+                (
+                    candidate.source_session_id,
+                    identity.bridge_id,
+                    identity.idempotency_key,
+                    identity.claude_uuid,
+                ),
+            ).fetchall()
+            if collisions:
+                if len(collisions) == 1:
+                    existing = dict(collisions[0])
+                    immutable = {
+                        "id": identity.job_id,
+                        "source_session_id": candidate.source_session_id,
+                        "bridge_id": identity.bridge_id,
+                        "idempotency_key": identity.idempotency_key,
+                        "reserved_claude_uuid": identity.claude_uuid,
+                        "native_name": candidate.native_name,
+                        "source_provider": candidate.source_provider.value,
+                        "source_cwd": candidate.source_cwd,
+                        "git_root": candidate.git_root,
+                        "git_branch": candidate.git_branch,
+                        "git_head": candidate.git_head,
+                        "worktree_id": candidate.worktree_id,
+                        "signed_marker": identity.signed_marker,
+                        "eligible_at": candidate.eligible_at,
+                    }
+                    if all(existing[key] == value for key, value in immutable.items()):
+                        return existing
+                raise ValueError("Claude visibility identity collision")
+            try:
+                conn.execute(
+                    """INSERT INTO session_claude_visibility_jobs (
+                       id, source_session_id, bridge_id, idempotency_key,
+                       reserved_claude_uuid, native_name, source_provider,
+                       source_cwd, git_root, git_branch, git_head, worktree_id,
+                       signed_marker, state, attempts, next_attempt_at,
+                       eligible_at, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                 'claude_pending', 0, ?, ?, ?, ?)""",
+                    (
+                        identity.job_id,
+                        candidate.source_session_id,
+                        identity.bridge_id,
+                        identity.idempotency_key,
+                        identity.claude_uuid,
+                        candidate.native_name,
+                        candidate.source_provider.value,
+                        candidate.source_cwd,
+                        candidate.git_root,
+                        candidate.git_branch,
+                        candidate.git_head,
+                        candidate.worktree_id,
+                        identity.signed_marker,
+                        candidate.eligible_at,
+                        candidate.eligible_at,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Claude visibility identity collision") from exc
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                    (identity.job_id,),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
+    def inspect_due_claude_visibility_reconciliation(
+        self, now: float
+    ) -> ClaudeVisibilityClaim:
+        """Return immutable exact-ID lookup work without leasing or reserving cost."""
+
+        from .claude_visibility import ClaudeVisibilityClaim
+
+        inspection_time = _finite_number(now, "now")
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            due = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE (
+                       state IN ('claude_pending', 'claude_retry')
+                       AND next_attempt_at <= ?
+                   ) OR (
+                       state = 'claude_leased' AND lease_expires_at <= ?
+                   )
+                   ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
+                (inspection_time, inspection_time),
+            ).fetchone()
+        if due is None:
+            return ClaudeVisibilityClaim(status="no_due_job")
+        prior_error = (
+            "lease_expired"
+            if due["state"] == "claude_leased"
+            else due["error_code"]
+        )
+        return ClaudeVisibilityClaim(
+            status="reconciliation_required",
+            job_id=due["id"],
+            source_session_id=due["source_session_id"],
+            source_provider=Provider(due["source_provider"]),
+            reserved_claude_uuid=due["reserved_claude_uuid"],
+            native_name=due["native_name"],
+            source_cwd=due["source_cwd"],
+            git_root=due["git_root"],
+            git_branch=due["git_branch"],
+            git_head=due["git_head"],
+            worktree_id=due["worktree_id"],
+            signed_marker=due["signed_marker"],
+            attempt_ordinal=int(due["attempts"]),
+            prior_error_code=prior_error,
+            requires_exact_id_reconciliation=True,
+        )
+
+    def claim_claude_visibility_reconciliation(
+        self,
+        now: float,
+        lease_seconds: float,
+    ) -> ClaudeVisibilityClaim:
+        """Lease exact-ID reconciliation without reserving launch budget."""
+
+        from .claude_visibility import ClaudeVisibilityClaim
+
+        claim_time = _finite_number(now, "now")
+        lease_duration = _finite_number(lease_seconds, "lease_seconds")
+        if lease_duration <= 0:
+            raise ValueError("lease_seconds must be positive")
+
+        def _write(conn):
+            conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_retry', next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = 'lease_expired',
+                       error_detail = 'active lease expired before completion',
+                       updated_at = ?
+                   WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
+                (claim_time, claim_time, claim_time),
+            )
+            due = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE state IN ('claude_pending', 'claude_retry')
+                     AND next_attempt_at <= ?
+                   ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
+                (claim_time,),
+            ).fetchone()
+            if due is None:
+                return ClaudeVisibilityClaim(status="no_due_job")
+            lease_digest = hashlib.sha256(
+                self._claude_lease_factory().encode("utf-8")
+            ).hexdigest()
+            if conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs
+                   WHERE lease_digest = ? LIMIT 1""",
+                (lease_digest,),
+            ).fetchone() is not None:
+                raise ValueError("Claude visibility lease factory returned a duplicate")
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_leased', lease_digest = ?,
+                       lease_expires_at = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND attempts = ?""",
+                (
+                    lease_digest,
+                    claim_time + lease_duration,
+                    claim_time,
+                    due["id"],
+                    due["state"],
+                    due["attempts"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale Claude visibility reconciliation claim")
+            return ClaudeVisibilityClaim(
+                status="claimed",
+                job_id=due["id"],
+                source_session_id=due["source_session_id"],
+                source_provider=Provider(due["source_provider"]),
+                reserved_claude_uuid=due["reserved_claude_uuid"],
+                native_name=due["native_name"],
+                source_cwd=due["source_cwd"],
+                git_root=due["git_root"],
+                git_branch=due["git_branch"],
+                git_head=due["git_head"],
+                worktree_id=due["worktree_id"],
+                signed_marker=due["signed_marker"],
+                lease_digest=lease_digest,
+                attempt_ordinal=int(due["attempts"]),
+                prior_error_code=due["error_code"],
+                requires_exact_id_reconciliation=True,
+                registration_reserved=False,
+                launch_permitted=False,
+            )
+
+        return self.db._execute_write(_write)
+
+    def claim_claude_visibility_job(
+        self,
+        now: float,
+        lease_seconds: float,
+        daily_limit: int,
+        cost_limit: object,
+        reserved_cost: object,
+    ) -> ClaudeVisibilityClaim:
+        from .claude_visibility import ClaudeVisibilityClaim, decimal_cost
+
+        claim_time = _finite_number(now, "now")
+        lease_duration = _finite_number(lease_seconds, "lease_seconds")
+        if lease_duration <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if not isinstance(daily_limit, int) or isinstance(daily_limit, bool) or daily_limit < 1:
+            raise ValueError("daily_limit must be a positive integer")
+        if daily_limit > 25:
+            raise ValueError("daily_limit cannot exceed 25")
+        maximum_cost = decimal_cost(cost_limit, "cost_limit")
+        attempt_cost = decimal_cost(reserved_cost, "reserved_cost")
+        if attempt_cost <= 0:
+            raise ValueError("reserved_cost must be positive")
+        local_day = self._claude_visibility_local_day(claim_time)
+
+        def _write(conn):
+            conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_retry', next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = 'lease_expired',
+                       error_detail = 'active lease expired before completion',
+                       updated_at = ?
+                   WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
+                (claim_time, claim_time, claim_time),
+            )
+            due = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE state IN ('claude_pending', 'claude_retry')
+                     AND next_attempt_at <= ?
+                   ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
+                (claim_time,),
+            ).fetchone()
+            if due is None:
+                return ClaudeVisibilityClaim(status="no_due_job")
+            usage = conn.execute(
+                """SELECT reserved_estimated_cost_usd
+                   FROM session_claude_registration_usage
+                   WHERE local_day = ?""",
+                (local_day,),
+            ).fetchall()
+            if len(usage) >= daily_limit:
+                return ClaudeVisibilityClaim(status="daily_limit")
+            spent = sum(
+                (Decimal(row["reserved_estimated_cost_usd"]) for row in usage),
+                Decimal("0"),
+            )
+            if spent + attempt_cost > maximum_cost:
+                return ClaudeVisibilityClaim(status="cost_limit")
+
+            lease_digest = hashlib.sha256(
+                self._claude_lease_factory().encode("utf-8")
+            ).hexdigest()
+            if conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs
+                   WHERE lease_digest = ? LIMIT 1""",
+                (lease_digest,),
+            ).fetchone() is not None:
+                raise ValueError("Claude visibility lease factory returned a duplicate")
+            attempt = int(due["attempts"]) + 1
+            prior_error_code = due["error_code"]
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_leased', attempts = ?, lease_digest = ?,
+                       lease_expires_at = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND attempts = ?""",
+                (
+                    attempt,
+                    lease_digest,
+                    claim_time + lease_duration,
+                    claim_time,
+                    due["id"],
+                    due["state"],
+                    due["attempts"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale Claude visibility claim")
+            conn.execute(
+                """INSERT INTO session_claude_registration_usage (
+                   local_day, job_id, attempt_ordinal,
+                   reserved_estimated_cost_usd, reserved_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    local_day,
+                    due["id"],
+                    attempt,
+                    str(attempt_cost),
+                    claim_time,
+                ),
+            )
+            return ClaudeVisibilityClaim(
+                status="claimed",
+                job_id=due["id"],
+                source_session_id=due["source_session_id"],
+                source_provider=Provider(due["source_provider"]),
+                reserved_claude_uuid=due["reserved_claude_uuid"],
+                native_name=due["native_name"],
+                source_cwd=due["source_cwd"],
+                git_root=due["git_root"],
+                git_branch=due["git_branch"],
+                git_head=due["git_head"],
+                worktree_id=due["worktree_id"],
+                signed_marker=due["signed_marker"],
+                lease_digest=lease_digest,
+                attempt_ordinal=attempt,
+                prior_error_code=prior_error_code,
+                requires_exact_id_reconciliation=True,
+                registration_reserved=True,
+                launch_permitted=True,
+            )
+
+        return self.db._execute_write(_write)
+
+    def retry_claude_visibility_job(
+        self,
+        job_id: str,
+        lease_digest: str,
+        error_code: str,
+        next_attempt_at: float,
+        detail: str,
+    ) -> dict[str, Any]:
+        from .claude_visibility import normalized_claude_visibility_error
+
+        next_at = _finite_number(next_attempt_at, "next_attempt_at")
+        normalized_code, retryable = normalized_claude_visibility_error(error_code)
+        return self._finish_claude_visibility_lease(
+            job_id=job_id,
+            lease_digest=lease_digest,
+            state="claude_retry" if retryable else "claude_failed",
+            error_code=normalized_code,
+            error_detail=_claude_error_detail(detail),
+            next_attempt_at=next_at,
+        )
+
+    def fail_claude_visibility_job(
+        self,
+        job_id: str,
+        lease_digest: str,
+        error_code: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        from .claude_visibility import normalized_claude_visibility_error
+
+        normalized_code, _retryable = normalized_claude_visibility_error(error_code)
+        return self._finish_claude_visibility_lease(
+            job_id=job_id,
+            lease_digest=lease_digest,
+            state="claude_failed",
+            error_code=normalized_code,
+            error_detail=_claude_error_detail(detail),
+            next_attempt_at=None,
+        )
+
+    def commit_claude_visibility_job(
+        self,
+        job_id: str,
+        lease_digest: str,
+        transcript_digest: str,
+        visible_at: float,
+    ) -> dict[str, Any]:
+        normalized_job_id = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_lease = _exact_nonempty_text(
+            lease_digest, "Claude visibility lease digest"
+        )
+        completion = _exact_nonempty_text(transcript_digest, "transcript digest")
+        timestamp = _finite_number(visible_at, "visible_at")
+        operation_time = _finite_number(self._clock(), "clock")
+
+        def _write(conn):
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_visible', lease_digest = NULL,
+                       lease_expires_at = NULL, completion_digest = ?,
+                       error_code = NULL, error_detail = NULL,
+                       visible_at = ?, updated_at = ?
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ? AND lease_expires_at > ?""",
+                (
+                    completion,
+                    timestamp,
+                    operation_time,
+                    normalized_job_id,
+                    normalized_lease,
+                    operation_time,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("exact active Claude visibility lease required")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                    (normalized_job_id,),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
+    def _finish_claude_visibility_lease(
+        self,
+        *,
+        job_id: str,
+        lease_digest: str,
+        state: str,
+        error_code: str,
+        error_detail: str,
+        next_attempt_at: float | None,
+    ) -> dict[str, Any]:
+        normalized_job_id = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_lease = _exact_nonempty_text(
+            lease_digest, "Claude visibility lease digest"
+        )
+        updated_at = _finite_number(self._clock(), "clock")
+
+        def _write(conn):
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = ?, next_attempt_at = COALESCE(?, next_attempt_at),
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = ?, error_detail = ?, updated_at = ?
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ? AND lease_expires_at > ?""",
+                (
+                    state,
+                    next_attempt_at,
+                    error_code,
+                    error_detail,
+                    updated_at,
+                    normalized_job_id,
+                    normalized_lease,
+                    updated_at,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("exact active Claude visibility lease required")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                    (normalized_job_id,),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
+    def claude_visibility_status(self, now: float) -> dict[str, Any]:
+        status_time = _finite_number(now, "now")
+        local_day = self._claude_visibility_local_day(status_time)
+        states = (
+            "claude_pending",
+            "claude_leased",
+            "claude_retry",
+            "claude_visible",
+            "claude_failed",
+        )
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            count_rows = conn.execute(
+                """SELECT state, COUNT(*) AS count
+                   FROM session_claude_visibility_jobs GROUP BY state"""
+            ).fetchall()
+            code_rows = conn.execute(
+                """SELECT state, error_code, COUNT(*) AS count
+                   FROM session_claude_visibility_jobs
+                   WHERE error_code IS NOT NULL
+                   GROUP BY state, error_code"""
+            ).fetchall()
+            usage_rows = conn.execute(
+                """SELECT reserved_estimated_cost_usd
+                   FROM session_claude_registration_usage
+                   WHERE local_day = ?""",
+                (local_day,),
+            ).fetchall()
+        counts = {state: 0 for state in states}
+        for row in count_rows:
+            if row["state"] in counts:
+                counts[row["state"]] = int(row["count"])
+        retry_codes: dict[str, int] = {}
+        failed_codes: dict[str, int] = {}
+        for row in code_rows:
+            target = retry_codes if row["state"] == "claude_retry" else failed_codes
+            if row["state"] in ("claude_retry", "claude_failed"):
+                target[row["error_code"]] = int(row["count"])
+        total_cost = sum(
+            (Decimal(row["reserved_estimated_cost_usd"]) for row in usage_rows),
+            Decimal("0"),
+        )
+        return {
+            "counts": counts,
+            "retry_codes": retry_codes,
+            "failed_codes": failed_codes,
+            "usage": {
+                "local_day": local_day,
+                "attempts": len(usage_rows),
+                "reserved_cost_usd": str(total_cost),
+            },
+        }
+
+    def _claude_visibility_local_day(self, timestamp: float) -> str:
+        if self._local_timezone is None:
+            local = datetime.fromtimestamp(timestamp).astimezone()
+        else:
+            local = datetime.fromtimestamp(timestamp, tz=self._local_timezone)
+        return local.date().isoformat()
 
     def _discover_hermes_profile_db_paths(self) -> tuple[tuple[str, Path], ...]:
         profiles_root = self.db.db_path.parent / "profiles"
