@@ -5814,17 +5814,21 @@ def _builtin_setup_fn(key: str):
     from hermes_cli import setup as _s
 
     return {
-        # telegram moved into the plugin: setup_fn registered by
-        # plugins/platforms/telegram/adapter.py::register(). #41112.
         # discord moved into the plugin: setup_fn is registered by
         # plugins/platforms/discord/adapter.py::register() and dispatched
         # via the plugin path in _configure_platform().
-        # slack moved into the plugin: setup_fn is registered by
-        # plugins/platforms/slack/adapter.py::register() and dispatched
-        # via the plugin path in _configure_platform(). #41112.
-        # matrix moved into the plugin: setup_fn registered by
-        # plugins/platforms/matrix/adapter.py::register() and dispatched via
-        # the plugin path in _configure_platform(). #41112.
+        #
+        # telegram, slack, and matrix are built-in (not plugin-migrated —
+        # see the _PLATFORMS NOTE above). They keep their bespoke setup
+        # flows here because the generic _setup_standard_platform fallback
+        # treats the first `vars` entry (token_var) as mandatory and aborts
+        # the whole wizard if it's left empty. That breaks Matrix's
+        # documented "leave the access token empty for password login"
+        # path outright, and loses Telegram's token-format validation and
+        # Slack's manifest-regeneration prompt.
+        "telegram": _s._setup_telegram,
+        "slack": _s._setup_slack,
+        "matrix": _s._setup_matrix,
         # mattermost moved into the plugin: setup_fn is registered by
         # plugins/platforms/mattermost/adapter.py::register() and dispatched
         # via the plugin path in _configure_platform().
