@@ -31,7 +31,7 @@ Use a combined model: **platform-style descriptors and factories, context/memory
 
 ### 1. Establish a Terminal Backend Registry as the narrow waist
 
-Introduce a host-owned terminal backend registry. The registry stores only immutable backend definitions, never active environments.
+Introduce a host-owned terminal backend registry. The registry stores backend definitions and factories, never active environments.
 
 Each backend definition must describe at least:
 
