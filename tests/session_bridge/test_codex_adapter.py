@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,119 @@ def _read_with_items(*items: dict[str, Any]) -> dict[str, Any]:
 
 
 class TestInventory:
+    def test_inventory_accepts_equal_values_for_every_supported_cwd_alias(self) -> None:
+        row = {
+            "id": "equal-cwd-aliases",
+            "cwd": "C:/work/equal",
+            "workingDirectory": "C:/work/equal",
+            "working_directory": "C:/work/equal",
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+        client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
+
+        [summary] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_inventory(archived=False)
+
+        assert summary.cwd == "C:/work/equal"
+
+    def test_inventory_rejects_conflicting_cwd_and_working_directory(self) -> None:
+        row = {
+            "id": "conflicting-cwd-aliases",
+            "cwd": "C:/work/first",
+            "workingDirectory": "C:/work/second",
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+        client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_inventory(archived=False)
+
+    @pytest.mark.parametrize("malformed", [None, 7, "", "relative/path", "C:/bad\0cwd"])
+    def test_inventory_rejects_malformed_later_cwd_alias(
+        self, malformed: Any
+    ) -> None:
+        row = {
+            "id": "malformed-cwd-alias",
+            "cwd": "C:/work/valid",
+            "workingDirectory": malformed,
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+        client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_inventory(archived=False)
+
+    @pytest.mark.parametrize("alias", ["workingDirectory", "working_directory"])
+    def test_inventory_accepts_each_alternate_cwd_alias(self, alias: str) -> None:
+        row = {
+            "id": "alternate-cwd",
+            alias: "C:/work/alternate",
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+        client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
+
+        [summary] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_inventory(archived=False)
+
+        assert summary.cwd == "C:/work/alternate"
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path-equivalence policy")
+    def test_inventory_cwd_aliases_follow_windows_normalization_and_case_rules(
+        self,
+    ) -> None:
+        row = {
+            "id": "windows-cwd-aliases",
+            "cwd": "C:/Work/Repo/.",
+            "workingDirectory": r"c:\work\repo",
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+        client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
+
+        [summary] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_inventory(archived=False)
+
+        assert summary.cwd == "C:/Work/Repo/."
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path-equivalence policy")
+    def test_thread_read_equivalent_cwd_alias_becomes_reconciled_canonical_value(
+        self,
+    ) -> None:
+        row = {
+            "id": "windows-read-cwd",
+            "cwd": "C:/Work/Repo/.",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+        }
+        read_cwd = r"c:\work\repo"
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{"thread": {
+                "id": "windows-read-cwd",
+                "workingDirectory": read_cwd,
+                "source": "vscode",
+                "turns": [],
+            }}],
+        })
+
+        [candidate] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        assert candidate.projection.cwd == read_cwd
+
     def test_claude_visibility_inventory_is_complete_paginated_and_preserves_metadata(
         self,
     ) -> None:

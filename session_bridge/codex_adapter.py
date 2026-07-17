@@ -36,6 +36,7 @@ from .sidebar import VerifiedSidebarThread
 _PARSER_VERSION = 1
 _REQUEST_TIMEOUT = 30.0
 _TARGET_SOURCE_KINDS = ("vscode", "appServer")
+_CWD_ALIASES = ("cwd", "workingDirectory", "working_directory")
 _SUPPORTED_ITEM_TYPES = frozenset({
     "agentMessage",
     "commandExecution",
@@ -1742,9 +1743,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         raise ValueError("Codex inventory entry has no thread ID")
 
     title = _optional_string(_first(entry, "title", "name", "preview"))
-    cwd = _optional_string(
-        _first(entry, "cwd", "workingDirectory", "working_directory")
-    )
+    cwd = _cwd_alias_metadata(entry)
     started_at = _inventory_timestamp(
         entry,
         aliases=(
@@ -1928,14 +1927,36 @@ def _metadata_alias_values(
     return values
 
 
-def _read_summary_metadata(entry: dict[str, Any]) -> dict[str, str | None]:
-    cwd_values = _metadata_alias_values(
-        entry, ("cwd", "workingDirectory", "working_directory")
-    )
-    if len(set(cwd_values)) > 1:
+def _cwd_alias_metadata(entry: dict[str, Any]) -> str | None:
+    values: list[str] = []
+    for alias in _CWD_ALIASES:
+        if alias not in entry:
+            continue
+        value = entry[alias]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Codex inventory cwd must be a non-empty string")
+        normalized = value.strip()
+        try:
+            path = Path(normalized).expanduser()
+            if not path.is_absolute():
+                raise ValueError("Codex inventory cwd must be absolute")
+        except (OSError, TypeError, ValueError):
+            raise ValueError("Codex inventory cwd must be absolute") from None
+        values.append(normalized)
+    if not values:
+        return None
+    selected = values[0]
+    if any(
+        not _same_filesystem_location(selected, candidate)
+        for candidate in values[1:]
+    ):
         raise CodexInventoryProtocolError("metadata_conflict")
+    return selected
+
+
+def _read_summary_metadata(entry: dict[str, Any]) -> dict[str, str | None]:
     return {
-        "cwd": cwd_values[0] if cwd_values else None,
+        "cwd": _cwd_alias_metadata(entry),
         "git_root": _summary_metadata(
             entry,
             ("gitRoot", "git_root", "repositoryRoot", "repository_root"),
@@ -1974,6 +1995,14 @@ def _reconcile_summary_metadata(
     source_kind = reconcile(
         summary.source_kind, read_source_kind, field="source kind"
     )
+    read_cwd = read_metadata["cwd"]
+    if (
+        summary.cwd is not None
+        and read_cwd is not None
+        and not _same_filesystem_location(summary.cwd, read_cwd)
+    ):
+        raise CodexInventoryProtocolError("metadata_conflict")
+    cwd = read_cwd if read_cwd is not None else summary.cwd
     if read_source_kind is not None:
         automation_only = read_automation
         subagent_only = read_subagent
@@ -1982,7 +2011,7 @@ def _reconcile_summary_metadata(
         subagent_only = summary.subagent_only
     return replace(
         summary,
-        cwd=reconcile(summary.cwd, read_metadata["cwd"]),
+        cwd=cwd,
         git_root=reconcile(summary.git_root, read_metadata["git_root"]),
         git_branch=reconcile(summary.git_branch, read_metadata["git_branch"]),
         git_head=reconcile(summary.git_head, read_metadata["git_head"]),
