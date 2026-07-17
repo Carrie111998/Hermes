@@ -13921,9 +13921,14 @@ Examples:
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command. Handlers that return an int are signalling an exit
+    # code (plugin CLI commands use 1 for user errors, 2 for usage errors) —
+    # propagate it so scripted/cron callers can branch on failure instead of
+    # every error exiting 0.
     if hasattr(args, "func"):
-        args.func(args)
+        rc = args.func(args)
+        if isinstance(rc, int) and rc != 0:
+            sys.exit(rc)
     else:
         parser.print_help()
 

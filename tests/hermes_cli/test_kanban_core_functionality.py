@@ -1955,10 +1955,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
         kb.claim_task(conn, a); kb.claim_task(conn, b)
     finally:
         conn.close()
-    # Bulk + summary is refused (stderr message, no mutation).
-    # Note: hermes_cli.main doesn't propagate sub-command exit codes
-    # (args.func(args) discards the return value), so we check the side
-    # effects instead.
+    # Bulk + summary is refused (stderr message, exit code, no mutation).
     from subprocess import run as _run
     import os, sys
     env = os.environ.copy()
@@ -1968,6 +1965,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
         capture_output=True, text=True, env=env,
     )
     assert "per-task" in r.stderr, r.stderr
+    assert r.returncode == 2, r.stderr
     # The tasks must still be running (no partial apply).
     conn = kb.connect()
     try:
