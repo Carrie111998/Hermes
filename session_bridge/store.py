@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, tzinfo
 from decimal import Decimal
 import errno
@@ -1913,6 +1913,13 @@ class SessionBridgeStore:
         identities = [source.source_session_id for source in sources]
         if len(identities) != len(set(identities)):
             raise ValueError("duplicate native Hermes session identity across profiles")
+        snapshots = self._recorded_worktree_snapshots(identities)
+        sources = [
+            self._with_recorded_worktree_snapshot(
+                source, snapshots.get(source.source_session_id)
+            )
+            for source in sources
+        ]
         sources.sort(
             key=lambda source: (
                 -source.projection.last_active,
@@ -1920,6 +1927,103 @@ class SessionBridgeStore:
             )
         )
         return tuple(sources if limit is None else sources[:limit])
+
+    def _recorded_worktree_snapshots(
+        self, source_session_ids: Sequence[str]
+    ) -> dict[str, WorktreeSnapshot]:
+        from .worktree import WorktreeSnapshot
+
+        key_to_source = {
+            _worktree_snapshot_state_key(source_id): source_id
+            for source_id in source_session_ids
+        }
+        delivery_key_to_source = {
+            _sidebar_delivery_state_key(source_id): source_id
+            for source_id in source_session_ids
+        }
+        snapshots: dict[str, WorktreeSnapshot] = {}
+        keys = list(key_to_source)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            delivery_keys = list(delivery_key_to_source)
+            for start in range(0, len(delivery_keys), _MESSAGE_KEY_QUERY_CHUNK):
+                batch = delivery_keys[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT key, value_json FROM session_bridge_state
+                         WHERE key IN ({placeholders})""",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    source_id = delivery_key_to_source[row["key"]]
+                    candidate = _decode_sidebar_delivery_candidate(row["value_json"])
+                    if candidate.source_session_id != source_id:
+                        raise ValueError("invalid sidebar delivery candidate identity")
+                    if candidate.git_root is None or candidate.worktree_id is None:
+                        continue
+                    payload = json.dumps(
+                        {
+                            "version": 1,
+                            "source_session_id": source_id,
+                            "cwd": candidate.cwd,
+                            "git_root": candidate.git_root,
+                            "branch": candidate.git_branch,
+                            "head": candidate.git_head,
+                            "worktree_id": candidate.worktree_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    snapshots[source_id] = _decode_worktree_snapshot(
+                        payload, source_id
+                    )
+            for start in range(0, len(keys), _MESSAGE_KEY_QUERY_CHUNK):
+                batch = keys[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT key, value_json FROM session_bridge_state
+                         WHERE key IN ({placeholders})""",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    source_id = key_to_source[row["key"]]
+                    snapshot = _decode_worktree_snapshot(
+                        row["value_json"], source_id
+                    )
+                    prior = snapshots.get(source_id)
+                    if prior is not None and prior != snapshot:
+                        raise ValueError(
+                            "conflicting native Hermes worktree snapshot identity"
+                        )
+                    snapshots[source_id] = snapshot
+        return snapshots
+
+    @staticmethod
+    def _with_recorded_worktree_snapshot(
+        source: SidebarSource, snapshot: WorktreeSnapshot | None
+    ) -> SidebarSource:
+        if snapshot is None or snapshot.git_root is None:
+            return source
+        projection = source.projection
+        if (
+            projection.cwd != snapshot.cwd
+            or (source.git_root is not None and source.git_root != snapshot.git_root)
+            or (
+                projection.git_branch is not None
+                and projection.git_branch != snapshot.branch
+            )
+        ):
+            raise ValueError("conflicting native Hermes worktree snapshot identity")
+        return replace(
+            source,
+            projection=replace(
+                projection, cwd=snapshot.cwd, git_branch=snapshot.branch
+            ),
+            git_root=snapshot.git_root,
+            git_head=snapshot.head,
+            worktree_id=snapshot.worktree_id,
+        )
 
     @staticmethod
     def _list_claude_visibility_hermes_sources_from_db(

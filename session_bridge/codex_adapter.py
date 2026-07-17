@@ -73,6 +73,9 @@ class CodexThreadSummary:
     git_branch: str | None = None
     git_head: str | None = None
     worktree_id: str | None = None
+    source_kind: str | None = None
+    automation_only: bool = False
+    subagent_only: bool = False
 
 
 class SidebarVerificationError(RuntimeError):
@@ -450,12 +453,30 @@ class CodexSourceAdapter:
     def read_sidebar_thread(
         self, summary: CodexThreadSummary, *, deadline: float | None
     ) -> SessionProjection:
+        projection, _source_kind = self._read_sidebar_thread_details(
+            summary, deadline=deadline
+        )
+        return projection
+
+    def _read_sidebar_thread_details(
+        self, summary: CodexThreadSummary, *, deadline: float | None
+    ) -> tuple[SessionProjection, str | None]:
         response = self._bounded_sidebar_request(
             "thread/read",
             {"threadId": summary.native_id, "includeTurns": True},
             deadline=deadline,
         )
-        return self.project_thread(summary, response=response)
+        thread = _thread_from_response(response)
+        read_source_kind, _automation, _subagent = _source_kind_metadata(
+            thread, required=False
+        )
+        if (
+            summary.source_kind is not None
+            and read_source_kind is not None
+            and summary.source_kind != read_source_kind
+        ):
+            raise ValueError("Codex thread source kind conflicts between list and read")
+        return self.project_thread(summary, response=response), read_source_kind
 
     def _bounded_sidebar_inventory_kind(
         self,
@@ -635,9 +656,9 @@ class CodexSourceAdapter:
                 if summary.last_active < cutoff:
                     continue
                 prior = combined.get(summary.native_id)
-                if prior is None or (
-                    summary.last_active, not summary.archived, summary.revision
-                ) > (prior.last_active, not prior.archived, prior.revision):
+                if prior is not None and prior != summary:
+                    raise ValueError("Codex thread/list contains conflicting inventory entries")
+                if prior is None:
                     combined[summary.native_id] = summary
         summaries = sorted(
             combined.values(), key=lambda item: (-item.last_active, item.native_id)
@@ -646,7 +667,13 @@ class CodexSourceAdapter:
 
         sources: list[SidebarSource] = []
         for summary in summaries:
-            projection = self.read_sidebar_thread(summary, deadline=None)
+            if summary.source_kind is None:
+                raise ValueError("Codex thread/list inventory source kind is missing")
+            projection, read_source_kind = self._read_sidebar_thread_details(
+                summary, deadline=None
+            )
+            if read_source_kind is None:
+                raise ValueError("Codex thread/read source kind is missing")
             sources.append(SidebarSource(
                 source_session_id=canonical_session_id(
                     Provider.CODEX, summary.native_id
@@ -655,8 +682,8 @@ class CodexSourceAdapter:
                 git_root=summary.git_root,
                 git_head=summary.git_head,
                 worktree_id=summary.worktree_id,
-                automation_only=False,
-                subagent_only=False,
+                automation_only=summary.automation_only,
+                subagent_only=summary.subagent_only,
             ))
         return tuple(sources)
 
@@ -880,7 +907,6 @@ class CodexSourceAdapter:
         cursor: Any = None
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
-        conflicts: set[str] = set()
         raw_entry_count = 0
         while True:
             params: dict[str, Any] = {"archived": archived}
@@ -901,17 +927,20 @@ class CodexSourceAdapter:
             raw_entry_count += len(entries)
             for entry in entries:
                 if not isinstance(entry, dict):
-                    continue
+                    raise ValueError("Codex thread/list inventory entry must be an object")
                 try:
                     summary = _normalize_summary(entry, archived=archived)
                 except (TypeError, ValueError):
-                    continue
+                    raise ValueError(
+                        "Codex thread/list inventory entry is invalid"
+                    ) from None
                 prior = normalized.get(summary.native_id)
-                if prior is None and summary.native_id not in conflicts:
+                if prior is None:
                     normalized[summary.native_id] = summary
                 elif prior != summary:
-                    normalized.pop(summary.native_id, None)
-                    conflicts.add(summary.native_id)
+                    raise ValueError(
+                        "Codex thread/list contains conflicting inventory entries"
+                    )
 
             next_cursor = _first(response, "nextCursor", "next_cursor")
             if next_cursor in (None, ""):
@@ -1749,6 +1778,9 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
     archived_value = entry.get("archived", archived)
     if not isinstance(archived_value, bool):
         raise ValueError("Codex inventory archived state must be boolean")
+    source_kind, automation_only, subagent_only = _source_kind_metadata(
+        entry, required=False
+    )
     normalized: dict[str, Any] = {
         "native_id": native_id,
         "title": title,
@@ -1756,6 +1788,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         "started_at": started_at,
         "last_active": last_active,
         "archived": archived_value,
+        "source_kind": source_kind,
     }
     revision_value = _first(entry, "revision", "version", "updatedVersion")
     revision = _normalize_revision(revision_value)
@@ -1779,6 +1812,56 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         worktree_id=_summary_metadata(
             entry, "worktreeId", "worktree_id", "worktree"
         ),
+        source_kind=source_kind,
+        automation_only=automation_only,
+        subagent_only=subagent_only,
+    )
+
+
+def _source_kind_metadata(
+    entry: dict[str, Any], *, required: bool
+) -> tuple[str | None, bool, bool]:
+    if "source" not in entry or entry["source"] is None:
+        if required or "source" in entry:
+            raise ValueError("Codex inventory source kind is missing")
+        return None, False, False
+    source = entry["source"]
+    if isinstance(source, str):
+        if source in {"cli", "vscode", "appServer"}:
+            return source, False, False
+        if source == "exec":
+            return source, True, False
+        raise ValueError("Codex inventory source kind is unknown")
+    if not isinstance(source, dict) or len(source) != 1:
+        raise ValueError("Codex inventory source kind is malformed")
+    if source.get("custom") == "automation":
+        return _canonical_json(source), True, False
+    if "subAgent" in source and _valid_subagent_source(source["subAgent"]):
+        return _canonical_json(source), False, True
+    raise ValueError("Codex inventory source kind is unknown")
+
+
+def _valid_subagent_source(value: Any) -> bool:
+    if isinstance(value, str) and value in {
+        "review", "compact", "memory_consolidation"
+    }:
+        return True
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    other = value.get("other")
+    if isinstance(other, str) and bool(other.strip()):
+        return True
+    spawn = value.get("thread_spawn")
+    if not isinstance(spawn, dict) or set(spawn) != {"depth", "parent_thread_id"}:
+        return False
+    depth = spawn["depth"]
+    parent = spawn["parent_thread_id"]
+    return (
+        isinstance(depth, int)
+        and not isinstance(depth, bool)
+        and depth >= 0
+        and isinstance(parent, str)
+        and bool(parent.strip())
     )
 
 

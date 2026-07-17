@@ -254,9 +254,50 @@ def test_apply_does_not_count_or_enqueue_an_already_queued_source() -> None:
     result = coordinator.backfill(days=30, limit=10, apply=True)
 
     assert result.applied == 1
-    assert result.duplicates == 1
+    assert result.duplicates == 0
+    assert [(item.source_session_id, item.reason) for item in result.exclusions] == [
+        ("codex:existing", "duplicate_source")
+    ]
     assert [candidate.source_session_id for candidate, _identity in store.enqueued] == [
         "codex:new"
+    ]
+
+
+def test_manual_limit_is_applied_after_queued_sources_are_excluded() -> None:
+    store = FakeStore()
+    sources = [_source(f"source-{index:02d}", active=NOW - index) for index in range(20)]
+    store.open_sources.update(source.source_session_id for source in sources[:10])
+    coordinator, _calls = _coordinator(sources, store=store)
+
+    result = coordinator.backfill(days=30, limit=10, apply=False)
+
+    assert [item.candidate.source_session_id for item in result.candidates] == [
+        f"codex:source-{index:02d}" for index in range(10, 20)
+    ]
+    assert [(item.source_session_id, item.reason) for item in result.exclusions] == [
+        (f"codex:source-{index:02d}", "duplicate_source") for index in range(10)
+    ]
+
+
+def test_atomic_enqueue_rechecks_a_source_that_races_after_discovery() -> None:
+    class RacingStore(FakeStore):
+        def enqueue_claude_visibility_batch_if_idle(self, items, marker_secret):
+            batch = tuple(items)
+            self.open_sources.add(batch[0][0].source_session_id)
+            return super().enqueue_claude_visibility_batch_if_idle(batch, marker_secret)
+
+    store = RacingStore()
+    coordinator, _calls = _coordinator(
+        [_source("first", active=NOW), _source("second", active=NOW - 1)],
+        store=store,
+    )
+
+    result = coordinator.backfill(days=30, limit=10, apply=True)
+
+    assert result.applied == 1
+    assert result.duplicates == 1
+    assert [candidate.source_session_id for candidate, _identity in store.enqueued] == [
+        "codex:second"
     ]
 
 
@@ -272,6 +313,12 @@ def test_continuous_enqueues_only_first_new_candidate() -> None:
     result = coordinator.continuous_once()
 
     assert result.applied == 1
+    assert [item.candidate.source_session_id for item in result.candidates] == [
+        "codex:second"
+    ]
+    assert [(item.source_session_id, item.reason) for item in result.exclusions] == [
+        ("codex:first", "duplicate_source")
+    ]
     assert store.enqueued[0][0].source_session_id == "codex:second"
 
 

@@ -48,7 +48,7 @@ from session_bridge.store import (
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
 )
-from session_bridge.worktree import capture_worktree_snapshot
+from session_bridge.worktree import WorktreeSnapshot, capture_worktree_snapshot
 
 
 @pytest.fixture
@@ -3707,6 +3707,84 @@ def test_claude_visibility_hermes_inventory_is_independent_and_stable(db) -> Non
     assert by_id["hermes-bridge"].projection.origin_kind is OriginKind.BRIDGE_CONTINUATION
     assert by_id["hermes-bridge"].projection.origin_bridge_id == "bridge:visibility"
     assert len(by_id) == len(sources)
+
+
+def test_claude_visibility_hermes_inventory_uses_exact_recorded_worktree_identity(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    records = (
+        (
+            "hermes-git-one",
+            "C:/missing/worktree-one",
+            "C:/missing/repo-one",
+            "feature/one",
+            "a" * 40,
+            "worktree:v1:" + "1" * 64,
+        ),
+        (
+            "hermes-git-two",
+            "C:/missing/worktree-two",
+            "C:/missing/repo-two",
+            "feature/two",
+            "b" * 40,
+            "worktree:v1:" + "2" * 64,
+        ),
+    )
+    for index, (session_id, cwd, git_root, branch, head, worktree_id) in enumerate(
+        records
+    ):
+        db.create_session(session_id, "cli", cwd=cwd)
+        db.update_session_cwd(
+            session_id, cwd, git_branch=branch, git_repo_root=git_root
+        )
+        db.append_message(
+            session_id,
+            "user",
+            f"meaningful request {session_id}",
+            timestamp=100.0 + index,
+        )
+        candidate = SidebarCandidate(
+            source_session_id=session_id,
+            provider=Provider.HERMES,
+            bridge_id=sidebar_bridge_id(session_id),
+            title=f"[Hermes] {session_id}",
+            cwd=cwd,
+            git_root=git_root,
+            git_branch=branch,
+            git_head=head,
+            worktree_id=worktree_id,
+            eligible_at=100.0 + index,
+        )
+        snapshot = WorktreeSnapshot(
+            cwd=cwd,
+            git_root=git_root,
+            branch=branch,
+            head=head,
+            worktree_id=worktree_id,
+        )
+        store.enqueue_sidebar_job(
+            candidate,
+            worktree_snapshot=snapshot if index == 0 else None,
+        )
+
+    db.create_session("hermes-non-git", "cli", cwd="C:/missing/non-git")
+    db.append_message(
+        "hermes-non-git", "user", "meaningful non git request", timestamp=99.0
+    )
+
+    sources = store.list_claude_visibility_hermes_sources(after=0.0, limit=None)
+
+    by_id = {source.source_session_id: source for source in sources}
+    for session_id, cwd, git_root, branch, head, worktree_id in records:
+        source = by_id[session_id]
+        assert source.projection.cwd == cwd
+        assert source.git_root == git_root
+        assert source.projection.git_branch == branch
+        assert source.git_head == head
+        assert source.worktree_id == worktree_id
+    assert by_id["hermes-non-git"].git_head is None
+    assert by_id["hermes-non-git"].worktree_id is None
 
 
 def _sidebar_candidate(

@@ -114,6 +114,7 @@ class TestInventory:
                 "gitBranch": f"feature/{native_id}",
                 "gitHead": f"head-{native_id}",
                 "worktreeId": f"wt-{native_id}",
+                "source": "vscode",
             }
 
         client = FakeInitializingClient({
@@ -123,15 +124,15 @@ class TestInventory:
                 {"data": [entry("archived", 200, archived=True)]},
             ],
             "thread/read": [
-                {"thread": {"id": "linked-or-uncataloged", "turns": [{"items": [{
+                {"thread": {"id": "linked-or-uncataloged", "source": "vscode", "turns": [{"items": [{
                     "type": "userMessage", "id": "u1",
                     "content": [{"type": "text", "text": "Build API"}],
                 }]}]}},
-                {"thread": {"id": "archived", "turns": [{"items": [{
+                {"thread": {"id": "archived", "source": "vscode", "turns": [{"items": [{
                     "type": "userMessage", "id": "u3",
                     "content": [{"type": "text", "text": "Archived request"}],
                 }]}]}},
-                {"thread": {"id": "older", "turns": [{"items": [{
+                {"thread": {"id": "older", "source": "vscode", "turns": [{"items": [{
                     "type": "userMessage", "id": "u2",
                     "content": [{"type": "text", "text": "Older request"}],
                 }]}]}},
@@ -156,6 +157,132 @@ class TestInventory:
             "thread/list", "thread/list", "thread/list",
             "thread/read", "thread/read", "thread/read",
         ]
+
+    def test_claude_visibility_inventory_preserves_normal_automation_and_subagent_kinds(
+        self,
+    ) -> None:
+        def entry(native_id: str, updated: int, source: Any, *, archived=False):
+            return {
+                "id": native_id,
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": updated - 1,
+                "updatedAt": updated,
+                "archived": archived,
+                "source": source,
+            }
+
+        rows = [
+            entry("cli", 600, "cli"),
+            entry("vscode", 550, "vscode"),
+            entry("app-server", 500, "appServer"),
+            entry("exec", 450, "exec"),
+            entry("automation", 400, {"custom": "automation"}),
+        ]
+        subagent = entry("subagent", 350, {"subAgent": "review"}, archived=True)
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": rows},
+                {"data": [subagent]},
+            ],
+            "thread/read": [
+                {"thread": {"id": "cli", "source": "cli", "turns": []}},
+                {"thread": {"id": "vscode", "source": "vscode", "turns": []}},
+                {
+                    "thread": {
+                        "id": "app-server",
+                        "source": "appServer",
+                        "turns": [],
+                    }
+                },
+                {"thread": {"id": "exec", "source": "exec", "turns": []}},
+                {
+                    "thread": {
+                        "id": "automation",
+                        "source": {"custom": "automation"},
+                        "turns": [],
+                    }
+                },
+                {
+                    "thread": {
+                        "id": "subagent",
+                        "source": {"subAgent": "review"},
+                        "turns": [],
+                    }
+                },
+            ],
+        })
+
+        sources = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        by_id = {source.projection.native_id: source for source in sources}
+        for native_id in ("cli", "vscode", "app-server"):
+            assert by_id[native_id].automation_only is False
+            assert by_id[native_id].subagent_only is False
+        assert by_id["exec"].automation_only is True
+        assert by_id["exec"].subagent_only is False
+        assert by_id["automation"].automation_only is True
+        assert by_id["automation"].subagent_only is False
+        assert by_id["subagent"].automation_only is False
+        assert by_id["subagent"].subagent_only is True
+        assert by_id["subagent"].projection.native_status == "archived"
+
+    @pytest.mark.parametrize(
+        "source_kind",
+        ["unknown", {"custom": "future-source"}, None, {"subAgent": None}],
+    )
+    def test_claude_visibility_unknown_or_malformed_source_kind_fails_closed(
+        self, source_kind: Any
+    ) -> None:
+        row = {
+            "id": "bad-source-kind",
+            "cwd": "C:/work/bad-source-kind",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": source_kind,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{
+                "thread": {
+                    "id": "bad-source-kind",
+                    "source": source_kind,
+                    "turns": [],
+                }
+            }],
+        })
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_claude_visibility_sources(after=0)
+
+    def test_claude_visibility_source_kind_conflict_between_list_and_read_fails_closed(
+        self,
+    ) -> None:
+        row = {
+            "id": "conflict",
+            "cwd": "C:/work/conflict",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{
+                "thread": {
+                    "id": "conflict",
+                    "source": {"subAgent": "review"},
+                    "turns": [],
+                }
+            }],
+        })
+
+        with pytest.raises(ValueError, match="source kind"):
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_claude_visibility_sources(after=0)
 
     def test_find_sidebar_thread_reuses_scanner_cache_without_relisting(self) -> None:
         client = FakeInitializingClient({
@@ -510,7 +637,7 @@ class TestInventory:
             "one"
         ]
 
-    def test_invalid_entries_and_conflicting_duplicates_are_skipped(self) -> None:
+    def test_invalid_entries_and_conflicting_duplicates_fail_closed(self) -> None:
         valid = {
             "id": "valid",
             "createdAt": "2026-07-12T10:00:00Z",
@@ -533,11 +660,61 @@ class TestInventory:
             ]
         })
 
-        result = CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
-            archived=False
-        )
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
 
-        assert [row.native_id for row in result] == ["valid"]
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            "not-an-object",
+            {"id": 123, "createdAt": 1, "updatedAt": 2},
+            {"id": "bad-cwd", "cwd": 123, "createdAt": 1, "updatedAt": 2},
+            {"id": "bad-time", "createdAt": "not-a-date", "updatedAt": 2},
+            {
+                "id": "bad-source",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "source": {"custom": "future-source"},
+            },
+        ],
+    )
+    def test_single_malformed_inventory_row_fails_closed(self, invalid: Any) -> None:
+        client = FakeInitializingClient({"thread/list": [{"data": [invalid]}]})
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
+
+    def test_conflicting_duplicate_across_pages_fails_closed(self) -> None:
+        row = {"id": "duplicate", "createdAt": 1, "updatedAt": 2}
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [{**row, "title": "first"}], "nextCursor": "page-2"},
+                {"data": [{**row, "title": "second"}]},
+            ]
+        })
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
+
+    def test_later_page_malformed_row_discards_the_whole_inventory(self) -> None:
+        valid = {"id": "valid", "createdAt": 1, "updatedAt": 2}
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [valid], "nextCursor": "page-2"},
+                {"data": [{"id": "broken", "createdAt": True, "updatedAt": 3}]},
+            ]
+        })
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
 
     @pytest.mark.parametrize(
         "response",

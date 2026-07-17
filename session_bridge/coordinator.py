@@ -398,6 +398,10 @@ class ClaudeVisibilityCoordinator:
                         automation_only=source.automation_only,
                         subagent_only=source.subagent_only,
                     )
+                    if reason == "eligible" and self._store.has_claude_visibility_source(
+                        source.source_session_id
+                    ):
+                        reason = "duplicate_source"
                 seen.add(key)
                 if reason != "eligible":
                     if reason not in _CLAUDE_VISIBILITY_DISCOVERY_CODES:
@@ -432,7 +436,7 @@ class ClaudeVisibilityCoordinator:
             )
         return ClaudeVisibilityDiscoveryResult(
             enabled=True,
-            candidates=tuple(candidates[:bounded_limit] if manual else candidates),
+            candidates=tuple(candidates[:bounded_limit]),
             exclusions=tuple(exclusions),
         )
 
@@ -520,15 +524,7 @@ class ClaudeVisibilityCoordinator:
                 fatal_reasons=discovery.reasons,
             )
         try:
-            candidate = next(
-                (
-                    item for item in discovery.candidates
-                    if not self._store.has_claude_visibility_source(
-                        item.candidate.source_session_id
-                    )
-                ),
-                None,
-            )
+            candidate = next(iter(discovery.candidates), None)
             if candidate is None:
                 return ClaudeVisibilityApplyResult(
                     enabled=True, mode="continuous",
