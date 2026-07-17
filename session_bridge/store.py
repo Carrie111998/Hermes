@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import hashlib
@@ -13,6 +14,7 @@ import re
 import secrets
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 if sys.platform == "win32":
@@ -316,6 +318,9 @@ class SessionBridgeStore:
         clock: Callable[[], float] = time.time,
         sidebar_token_factory: Callable[[], str] | None = None,
         sidebar_jitter: Callable[[float], float] | None = None,
+        hermes_profile_db_paths: Callable[
+            [], Sequence[tuple[str, Path]]
+        ] | None = None,
     ) -> None:
         self.db = db
         self._clock = clock
@@ -325,6 +330,99 @@ class SessionBridgeStore:
         self._sidebar_jitter = sidebar_jitter or (
             lambda bound: random.uniform(0.0, bound)
         )
+        self._hermes_profile_db_paths = (
+            hermes_profile_db_paths or self._discover_hermes_profile_db_paths
+        )
+
+    def _discover_hermes_profile_db_paths(self) -> tuple[tuple[str, Path], ...]:
+        profiles_root = self.db.db_path.parent / "profiles"
+        if not profiles_root.is_dir():
+            return ()
+        return tuple(
+            (entry.name, entry / "state.db")
+            for entry in sorted(profiles_root.iterdir(), key=lambda path: path.name)
+            if entry.is_dir() and (entry / "state.db").is_file()
+        )
+
+    @contextmanager
+    def _native_hermes_databases(self):
+        databases: list[tuple[str, SessionDB, bool]] = [
+            ("default", self.db, False)
+        ]
+        seen = {str(self.db.db_path.resolve()).casefold()}
+        try:
+            for profile, raw_path in self._hermes_profile_db_paths():
+                if not isinstance(profile, str) or not profile.strip():
+                    raise ValueError("Hermes profile name must be nonempty")
+                path = Path(raw_path)
+                key = str(path.resolve()).casefold()
+                if key in seen or not path.is_file():
+                    continue
+                seen.add(key)
+                database = SessionDB(path, read_only=True)
+                self._install_profile_read_compatibility(database)
+                databases.append((profile.strip(), database, True))
+            yield databases
+        finally:
+            for _profile, database, owned in databases:
+                if owned:
+                    database.close()
+
+    @staticmethod
+    def _install_profile_read_compatibility(database: SessionDB) -> None:
+        """Supply empty TEMP bridge tables for pre-bridge profile databases."""
+
+        definitions = {
+            "external_sessions": """(
+                session_id TEXT, provider TEXT, native_id TEXT,
+                native_status TEXT, first_indexed_at REAL, last_indexed_at REAL,
+                origin_kind TEXT, origin_bridge_id TEXT, sync_error TEXT
+            )""",
+            "session_links": """(
+                id TEXT, from_session_id TEXT, to_session_id TEXT,
+                relation TEXT, bridge_id TEXT, created_at REAL,
+                hydrated_at REAL, diverged_at REAL
+            )""",
+            "session_mirror_jobs": """(
+                source_session_id TEXT, state TEXT
+            )""",
+            "session_sidebar_jobs": """(
+                source_session_id TEXT, state TEXT, lease_expires_at REAL,
+                codex_thread_id TEXT, error_code TEXT
+            )""",
+        }
+        with database._lock:
+            conn = database._conn
+            assert conn is not None
+            existing = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                ).fetchall()
+            }
+            for name, definition in definitions.items():
+                if name not in existing:
+                    conn.execute(f"CREATE TEMP TABLE {name} {definition}")
+
+    @staticmethod
+    def _database_columns(database: SessionDB, table: str) -> set[str]:
+        with database._lock:
+            conn = database._conn
+            assert conn is not None
+            return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    @classmethod
+    def _profile_catalog_compatible(cls, database: SessionDB) -> bool:
+        session_columns = cls._database_columns(database, "sessions")
+        message_columns = cls._database_columns(database, "messages")
+        return {
+            "id", "source", "model", "title", "started_at", "ended_at",
+            "message_count", "cwd", "git_branch", "git_repo_root",
+            "parent_session_id", "archived",
+        }.issubset(session_columns) and {
+            "id", "session_id", "role", "content", "tool_call_id",
+            "tool_calls", "tool_name", "timestamp", "active", "compacted",
+        }.issubset(message_columns)
 
     def try_acquire_mirror_worker_lock(self) -> _MirrorWorkerFileLock | None:
         """Try to serialize mirror processing and reconciliation across processes."""
@@ -990,9 +1088,6 @@ class SessionBridgeStore:
                     LIMIT :query_limit""",
                 params,
             ).fetchall()
-            if not rows:
-                return SidebarSourcePage()
-
             page_rows = rows[:limit]
             messages_by_session: dict[str, list[ProjectedMessage]] = {
                 row["session_id"]: [] for row in page_rows
@@ -1083,7 +1178,33 @@ class SessionBridgeStore:
                 )
             )
 
-        has_more = len(rows) > limit
+        profile_has_more = False
+        with self._native_hermes_databases() as databases:
+            for profile, profile_db, owned in databases:
+                if not owned:
+                    continue
+                profile_sources, more = self._list_profile_sidebar_sources(
+                    profile_db,
+                    profile=profile,
+                    after=cutoff,
+                    limit=limit,
+                    cursor=normalized_cursor,
+                )
+                sources.extend(profile_sources)
+                profile_has_more = profile_has_more or more
+
+        identities = [source.source_session_id for source in sources]
+        if len(identities) != len(set(identities)):
+            raise ValueError("duplicate native Hermes session identity across profiles")
+        sources.sort(
+            key=lambda source: (
+                -source.projection.last_active,
+                source.source_session_id,
+            )
+        )
+        combined_has_more = len(sources) > limit
+        sources = sources[:limit]
+        has_more = len(rows) > limit or profile_has_more or combined_has_more
         next_cursor = (
             (sources[-1].projection.last_active, sources[-1].source_session_id)
             if has_more and sources
@@ -1095,26 +1216,157 @@ class SessionBridgeStore:
             next_cursor=next_cursor,
         )
 
+    def _list_profile_sidebar_sources(
+        self,
+        profile_db: SessionDB,
+        *,
+        profile: str,
+        after: float,
+        limit: int,
+        cursor: SidebarCandidateCursor | None,
+    ) -> tuple[list[SidebarSource], bool]:
+        if not self._profile_catalog_compatible(profile_db):
+            return [], False
+        cursor_clause = ""
+        params: dict[str, Any] = {"after": after, "query_limit": limit + 1}
+        if cursor is not None:
+            cursor_clause = """AND (
+                candidate.last_active < :cursor_activity
+                OR (
+                    candidate.last_active = :cursor_activity
+                    AND candidate.session_id > :cursor_session_id
+                )
+            )"""
+            params.update(
+                cursor_activity=cursor[0], cursor_session_id=cursor[1]
+            )
+        with self.db._lock:
+            root_conn = self.db._conn
+            assert root_conn is not None
+            blocked = {
+                row[0]
+                for row in root_conn.execute(
+                    """SELECT source_session_id FROM session_sidebar_jobs
+                       UNION SELECT source_session_id FROM session_sidebar_exclusions"""
+                ).fetchall()
+            }
+        with profile_db._lock:
+            conn = profile_db._conn
+            assert conn is not None
+            rows = conn.execute(
+                f"""WITH candidate AS (
+                       SELECT s.id AS session_id, s.source, s.model_config,
+                              s.title, s.cwd, s.started_at, s.git_branch,
+                              s.git_repo_root,
+                              COALESCE(
+                                  (SELECT MAX(message.timestamp)
+                                     FROM messages AS message
+                                    WHERE message.session_id = s.id
+                                      AND (message.active = 1 OR message.compacted = 1)),
+                                  s.started_at
+                              ) AS last_active,
+                              CASE WHEN s.source = 'cron' THEN 1 ELSE 0 END
+                                  AS automation_only,
+                              CASE
+                                  WHEN s.source IN ('subagent', 'tool') THEN 1
+                                  WHEN json_extract(COALESCE(s.model_config, '{{}}'),
+                                                    '$._delegate_from') IS NOT NULL THEN 1
+                                  ELSE 0
+                              END AS subagent_only
+                         FROM sessions AS s
+                         LEFT JOIN external_sessions AS e ON e.session_id = s.id
+                        WHERE e.session_id IS NULL
+                          AND s.id NOT LIKE 'claude:%'
+                          AND s.id NOT LIKE 'codex:%'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM session_links AS incoming_link
+                               WHERE incoming_link.to_session_id = s.id
+                          )
+                   )
+                   SELECT * FROM candidate
+                    WHERE last_active IS NOT NULL AND last_active >= :after
+                      {cursor_clause}
+                    ORDER BY last_active DESC, session_id
+                    LIMIT :query_limit""",
+                params,
+            ).fetchall()
+            rows = [row for row in rows if row["session_id"] not in blocked]
+            page_rows = rows[:limit]
+            messages: dict[str, list[ProjectedMessage]] = {
+                row["session_id"]: [] for row in page_rows
+            }
+            for session_id in messages:
+                message_rows = conn.execute(
+                    """SELECT id, role, content, timestamp FROM messages
+                        WHERE session_id = ? AND role = 'user'
+                          AND (active = 1 OR compacted = 1)
+                        ORDER BY timestamp, id""",
+                    (session_id,),
+                ).fetchall()
+                for message in message_rows:
+                    message_id = int(message["id"])
+                    decoded = profile_db._decode_content(message["content"])
+                    messages[session_id].append(
+                        ProjectedMessage(
+                            native_event_id=f"hermes-message:{message_id}",
+                            ordinal=message_id,
+                            role=message["role"],
+                            content=decoded if isinstance(decoded, str) else None,
+                            timestamp=float(message["timestamp"]),
+                        )
+                    )
+        sources = [
+            SidebarSource(
+                source_session_id=row["session_id"],
+                projection=SessionProjection(
+                    provider=Provider.HERMES,
+                    native_id=row["session_id"],
+                    title=row["title"],
+                    cwd=row["cwd"],
+                    started_at=float(row["started_at"]),
+                    last_active=float(row["last_active"]),
+                    messages=tuple(messages[row["session_id"]]),
+                    native_status="active",
+                    origin_kind=OriginKind.NATIVE,
+                    git_branch=row["git_branch"],
+                ),
+                git_root=row["git_repo_root"],
+                git_head=None,
+                worktree_id=None,
+                automation_only=bool(row["automation_only"]),
+                subagent_only=bool(row["subagent_only"]),
+            )
+            for row in page_rows
+        ]
+        return sources, len(rows) > limit
+
     def get_session_launch_metadata(
         self, session_id: str
     ) -> dict[str, str | None] | None:
         normalized_session_id = _nonempty_text(session_id, "session ID")
-        with self.db._lock:
-            conn = self.db._conn
-            assert conn is not None
-            row = conn.execute(
-                "SELECT title, cwd FROM sessions WHERE id = ?",
-                (normalized_session_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        metadata = {"title": row["title"], "cwd": row["cwd"]}
-        if any(
-            value is not None and not isinstance(value, str)
-            for value in metadata.values()
-        ):
-            raise ValueError("invalid session launch metadata")
-        return metadata
+        with self._native_hermes_databases() as databases:
+            for profile, database, owned in databases:
+                if owned and not self._profile_catalog_compatible(database):
+                    continue
+                with database._lock:
+                    conn = database._conn
+                    assert conn is not None
+                    row = conn.execute(
+                        "SELECT title, cwd FROM sessions WHERE id = ?",
+                        (normalized_session_id,),
+                    ).fetchone()
+                if row is None:
+                    continue
+                metadata = {"title": row["title"], "cwd": row["cwd"]}
+                if owned:
+                    metadata["profile"] = profile
+                if any(
+                    value is not None and not isinstance(value, str)
+                    for value in metadata.values()
+                ):
+                    raise ValueError("invalid session launch metadata")
+                return metadata
+        return None
 
     def get_native_session_snapshot(
         self, session_id: str
@@ -1128,10 +1380,15 @@ class SessionBridgeStore:
         """
 
         normalized_session_id = _nonempty_text(session_id, "session ID")
-        with self.db._lock:
-            conn = self.db._conn
-            assert conn is not None
-            session_row = conn.execute(
+        with self._native_hermes_databases() as databases:
+            matches: list[tuple[str, SessionDB, Mapping[str, Any], list[Mapping[str, Any]]]] = []
+            for profile, database, _owned in databases:
+                if database is not self.db and not self._profile_catalog_compatible(database):
+                    continue
+                with database._lock:
+                    conn = database._conn
+                    assert conn is not None
+                    session_row = conn.execute(
                 """SELECT s.id, s.source, s.model, s.title, s.started_at,
                           s.ended_at, s.end_reason, s.message_count,
                           s.tool_call_count, s.cwd, s.git_branch,
@@ -1141,12 +1398,10 @@ class SessionBridgeStore:
                      LEFT JOIN external_sessions AS e ON e.session_id = s.id
                     WHERE s.id = ?""",
                 (normalized_session_id,),
-            ).fetchone()
-            if session_row is None:
-                raise KeyError(normalized_session_id)
-            if session_row["external_session_id"] is not None:
-                return None
-            message_rows = conn.execute(
+                    ).fetchone()
+                    if session_row is None:
+                        continue
+                    message_rows = conn.execute(
                 """SELECT id, role, content, tool_call_id, tool_calls,
                           tool_name, timestamp, finish_reason, reasoning,
                           reasoning_details, codex_reasoning_items,
@@ -1156,18 +1411,27 @@ class SessionBridgeStore:
                     WHERE session_id = ?
                     ORDER BY id""",
                 (normalized_session_id,),
-            ).fetchall()
+                    ).fetchall()
+                matches.append((profile, database, session_row, message_rows))
+            if not matches:
+                raise KeyError(normalized_session_id)
+            if len(matches) != 1:
+                raise ValueError("duplicate native Hermes session identity across profiles")
+            profile, database, session_row, message_rows = matches[0]
+            if session_row["external_session_id"] is not None:
+                return None
 
-        identity = _native_session_snapshot_identity(
-            dict(session_row),
-            [dict(row) for row in message_rows],
-            decode_content=self.db._decode_content,
-        )
-        return {
-            "session_id": normalized_session_id,
-            "provider": Provider.HERMES.value,
-            **identity,
-        }
+            identity = _native_session_snapshot_identity(
+                dict(session_row),
+                [dict(row) for row in message_rows],
+                decode_content=database._decode_content,
+            )
+            return {
+                "session_id": normalized_session_id,
+                "provider": Provider.HERMES.value,
+                "profile": profile,
+                **identity,
+            }
 
     def find_external_session_by_origin_bridge(
         self,

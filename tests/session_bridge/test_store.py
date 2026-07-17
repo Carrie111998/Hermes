@@ -16,6 +16,7 @@ from session_bridge.mirror import (
     MirrorPolicy,
     enqueue_mirror_job,
 )
+from session_bridge.catalog import UnifiedCatalog
 from session_bridge.models import (
     ContextPack,
     MirrorJobState,
@@ -2837,6 +2838,60 @@ def test_native_hermes_snapshot_identity_is_stable_and_tracks_messages(db):
     assert advanced is not None
     assert advanced["cursor"] != first["cursor"]
     assert advanced["source_hash"] != first["source_hash"]
+
+
+def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tmp_path):
+    profile_path = tmp_path / "profiles" / "main" / "state.db"
+    profile_path.parent.mkdir(parents=True)
+    profile_db = SessionDB(profile_path)
+    try:
+        profile_db.create_session(
+            "hermes-profile-native",
+            "tui",
+            cwd="C:/workspace/profile-project",
+        )
+        profile_db.append_message(
+            "hermes-profile-native",
+            "user",
+            "ship the cross-profile sidebar bridge",
+            timestamp=100.0,
+        )
+        profile_db._execute_write(
+            lambda conn: (
+                conn.execute("DROP TABLE external_sessions"),
+                conn.execute("DROP TABLE session_links"),
+            )
+        )
+    finally:
+        profile_db.close()
+
+    store = SessionBridgeStore(
+        db,
+        hermes_profile_db_paths=lambda: (("main", profile_path),),
+    )
+
+    page = store.list_sidebar_candidates(after=0.0, limit=10)
+    snapshot = store.get_native_session_snapshot("hermes-profile-native")
+    metadata = store.get_session_launch_metadata("hermes-profile-native")
+
+    assert [source.source_session_id for source in page] == ["hermes-profile-native"]
+    assert page[0].projection.messages[0].content == (
+        "ship the cross-profile sidebar bridge"
+    )
+    assert snapshot is not None
+    assert snapshot["session_id"] == "hermes-profile-native"
+    assert snapshot["profile"] == "main"
+    assert metadata == {
+        "title": None,
+        "cwd": "C:/workspace/profile-project",
+        "profile": "main",
+    }
+
+    read = UnifiedCatalog(db, store).get("hermes-profile-native")
+    assert read["session"]["profile"] == "main"
+    assert read["messages"][0]["content"] == (
+        "ship the cross-profile sidebar bridge"
+    )
 
 
 def test_native_hermes_snapshot_canonicalizes_binary_and_nonfinite_content(db):

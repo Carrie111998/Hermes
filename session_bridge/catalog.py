@@ -150,24 +150,128 @@ class UnifiedCatalog:
         )
 
         if normalized_session_id is not None and around_message_id is not None:
-            return self._scroll(
+            return self._profile_exact_read(
+                "scroll",
                 normalized_session_id,
-                around_message_id,
                 window=normalized_window,
+                around_message_id=around_message_id,
             )
         if normalized_session_id is not None:
-            return self._read(normalized_session_id, window=normalized_window)
+            return self._profile_exact_read(
+                "read", normalized_session_id, window=normalized_window
+            )
         if normalized_query:
-            return self._discover(
+            primary = self._discover(
                 normalized_query,
                 window=normalized_window,
                 limit=normalized_limit,
                 filters=filters,
             )
-        return self._browse(limit=normalized_limit, filters=filters)
+        else:
+            primary = self._browse(limit=normalized_limit, filters=filters)
+        return self._merge_profile_results(
+            primary,
+            query=normalized_query,
+            window=normalized_window,
+            limit=normalized_limit,
+            filters=filters,
+        )
 
     def get(self, session_id: str, *, window: int = 50) -> dict[str, Any]:
         return self.search(session_id=session_id, window=window)
+
+    def _profile_exact_read(
+        self,
+        mode: str,
+        session_id: str,
+        *,
+        window: int,
+        around_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        matches: list[tuple[str, dict[str, Any]]] = []
+        with self.store._native_hermes_databases() as databases:
+            for profile, database, owned in databases:
+                if owned and not self.store._profile_catalog_compatible(database):
+                    continue
+                catalog = self if not owned else UnifiedCatalog(
+                    database,
+                    SessionBridgeStore(
+                        database,
+                        hermes_profile_db_paths=lambda: (),
+                    ),
+                )
+                try:
+                    result = (
+                        catalog._scroll(
+                            session_id,
+                            around_message_id,
+                            window=window,
+                        )
+                        if mode == "scroll"
+                        else catalog._read(session_id, window=window)
+                    )
+                except KeyError:
+                    continue
+                if owned:
+                    result["session"]["profile"] = profile
+                    result["session_meta"]["profile"] = profile
+                matches.append((profile, result))
+        if not matches:
+            raise KeyError(session_id)
+        if len(matches) != 1:
+            raise ValueError("duplicate native Hermes session identity across profiles")
+        return matches[0][1]
+
+    def _merge_profile_results(
+        self,
+        primary: dict[str, Any],
+        *,
+        query: str,
+        window: int,
+        limit: int,
+        filters: _Filters,
+    ) -> dict[str, Any]:
+        results = list(primary["results"])
+        with self.store._native_hermes_databases() as databases:
+            for profile, database, owned in databases:
+                if not owned:
+                    continue
+                if not self.store._profile_catalog_compatible(database):
+                    continue
+                catalog = UnifiedCatalog(
+                    database,
+                    SessionBridgeStore(
+                        database,
+                        hermes_profile_db_paths=lambda: (),
+                    ),
+                )
+                page = (
+                    catalog._discover(
+                        query,
+                        window=window,
+                        limit=limit,
+                        filters=filters,
+                    )
+                    if query
+                    else catalog._browse(limit=limit, filters=filters)
+                )
+                for result in page["results"]:
+                    result["profile"] = profile
+                    results.append(result)
+        identities = [result["session_id"] for result in results]
+        if len(identities) != len(set(identities)):
+            raise ValueError("duplicate native Hermes session identity across profiles")
+        results.sort(
+            key=lambda result: (
+                -float(result.get("last_active") or 0.0),
+                result["session_id"],
+            )
+        )
+        primary["results"] = results[:limit]
+        primary["count"] = len(primary["results"])
+        if "sessions_searched" in primary:
+            primary["sessions_searched"] = len(primary["results"])
+        return primary
 
     def resolve_continuation(
         self,
