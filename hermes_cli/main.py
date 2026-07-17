@@ -2039,6 +2039,16 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             "--progress=false",
         ]
 
+        # CREATE_NO_WINDOW: this call is spawned from the windowless
+        # pythonw.exe dashboard/gateway backend (e.g. a Windows Scheduled
+        # Task), but without this flag a console-subsystem child (npm.cmd)
+        # gets its own new console — visibly, if the user's default
+        # terminal handler is Windows Terminal (Settings > For developers >
+        # Terminal delegation) — even though the parent has no window of
+        # its own. Same pattern as the wmic scan above; see
+        # windows_hide_flags()'s docstring.
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         def _run_tui_install() -> subprocess.CompletedProcess:
             return subprocess.run(
                 npm_install_cmd,
@@ -2049,6 +2059,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 encoding="utf-8",
                 errors="replace",
                 env={**os.environ, "CI": "1"},
+                creationflags=windows_hide_flags(),
             )
 
         result = _run_tui_install()
