@@ -638,7 +638,14 @@ def test_sidebar_provider_parser_failures_are_isolated_bidirectionally(
         assert scan.discovered == 1
         assert scan.failed == int(broken_provider is Provider.CLAUDE)
         assert scan.indexed == int(healthy_provider is Provider.CLAUDE)
-        assert summary.failed == int(broken_provider is Provider.HERMES)
+        # A native Hermes row with no cwd is an intentional, persisted sidebar
+        # exclusion.  It is not a parser failure: the provider remains usable and
+        # the healthy Claude candidate must still be delivered.
+        assert summary.failed == 0
+        assert summary.excluded == int(broken_provider is Provider.HERMES)
+        assert summary.excluded_by_reason["source_cwd_missing"] == int(
+            broken_provider is Provider.HERMES
+        )
         assert summary.queued == 1
         assert harness.store.get_sidebar_job_for_source(broken_id) is None
         assert harness.store.get_sidebar_job_for_source(healthy_id)["state"] == (
