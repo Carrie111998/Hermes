@@ -4032,6 +4032,10 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # Provider-free host execution is a real canonical session activity. Use
+    # the existing gateway-owned lazy-row primitive before the first durable
+    # append; this does not build an agent or invoke a provider.
+    _ensure_session_db_row(session)
     request_id = params.get("request_id")
     correlation_id = params.get("correlation_id")
     if not isinstance(request_id, str) or not isinstance(correlation_id, str):
