@@ -11,6 +11,26 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.run import GatewayRunner
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_eventbus_startup(monkeypatch):
+    """Keep ``GatewayRunner.start()`` off the canonical ~/.hermes event bus.
+
+    ``start()`` calls ``events.gateway_integration.startup()`` inline and
+    synchronously, doing real I/O against the **canonical** ~/.hermes event bus
+    (13 subscribers, tracker-intent-applier rehydrate, a jobops :4100 probe).
+    Notification state is cross-profile, so a tmp HERMES_HOME does not redirect
+    it, and patching ``write_runtime_status`` does not cover it either.
+
+    Only ``test_start_continues_after_platform_connect_timeout`` reaches that
+    call (it is the one test here that drives ``start()``), where it cost ~87s.
+    A no-op for every other test in this file, which exercise the watcher and
+    its helpers directly.
+    """
+    import events.gateway_integration as _ebi
+
+    monkeypatch.setattr(_ebi, "startup", lambda *a, **k: None)
+
+
 class StubAdapter(BasePlatformAdapter):
     """Adapter whose connect() result can be controlled."""
 
@@ -63,6 +83,11 @@ def _make_runner():
     runner._exit_cleanly = False
     runner._failed_platforms = {}
     runner.adapters = {}
+    # The real __init__ sets this (gateway/run.py); startup's fire-and-retry
+    # path registers each background connect task in it. object.__new__ skips
+    # __init__, so without it any test whose runner reaches that path dies with
+    # a bare AttributeError instead of exercising the behavior under test.
+    runner._background_tasks = set()
     runner.delivery_router = MagicMock()
     runner._running_agents = {}
     runner._pending_messages = {}
@@ -81,11 +106,21 @@ class TestStartupPlatformIsolation:
 
     @pytest.mark.asyncio
     async def test_start_continues_after_platform_connect_timeout(self, tmp_path):
-        """A timeout on Telegram should queue it and still connect Feishu."""
+        """A timeout on Discord should queue it and still connect Feishu.
+
+        Uses Discord specifically because it is NOT in
+        ``_BACKGROUND_CONNECT_PLATFORMS`` — this test is about the *inline*
+        connect path, where one platform's 30s timeout must not stop a later
+        platform from connecting. Telegram (the original subject here) was
+        backgrounded so a DNS flap couldn't block boot, which makes it useless
+        for asserting inline isolation: its connect no longer happens in the
+        startup loop at all. Telegram's own backgrounded behavior is covered by
+        test_telegram_background_connect.py.
+        """
         runner = _make_runner()
         runner.config = GatewayConfig(
             platforms={
-                Platform.TELEGRAM: PlatformConfig(enabled=True, token="test"),
+                Platform.DISCORD: PlatformConfig(enabled=True, token="test"),
                 Platform.FEISHU: PlatformConfig(enabled=True, token="test"),
             },
             sessions_dir=tmp_path,
@@ -101,7 +136,7 @@ class TestStartupPlatformIsolation:
         runner._send_restart_notification = AsyncMock()
 
         adapters = {
-            Platform.TELEGRAM: StubAdapter(platform=Platform.TELEGRAM),
+            Platform.DISCORD: StubAdapter(platform=Platform.DISCORD),
             Platform.FEISHU: StubAdapter(platform=Platform.FEISHU),
         }
         runner._create_adapter = MagicMock(
@@ -109,7 +144,7 @@ class TestStartupPlatformIsolation:
         )
         runner._connect_adapter_with_timeout = AsyncMock(
             side_effect=[
-                TimeoutError("telegram connect timed out after 30s"),
+                TimeoutError("discord connect timed out after 30s"),
                 True,
             ]
         )
@@ -133,9 +168,9 @@ class TestStartupPlatformIsolation:
                                 with patch("gateway.run.asyncio.create_task", side_effect=fake_create_task):
                                     assert await runner.start() is True
 
-        assert Platform.TELEGRAM in runner._failed_platforms
+        assert Platform.DISCORD in runner._failed_platforms
         assert Platform.FEISHU in runner.adapters
-        assert Platform.TELEGRAM not in runner.adapters
+        assert Platform.DISCORD not in runner.adapters
         assert runner._create_adapter.call_count == 2
 
     @pytest.mark.asyncio

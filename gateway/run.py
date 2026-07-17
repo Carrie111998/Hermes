@@ -3520,6 +3520,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             },
         )
 
+    async def _exit_if_nonretryable_leaves_nothing_running(
+        self, platform, adapter
+    ) -> None:
+        """Exit cleanly when a backgrounded non-retryable fatal leaves nothing up.
+
+        Mirrors the inline startup policy for the fire-and-retry path: a
+        non-retryable error with nothing else connected means EX_CONFIG (78), so
+        the s6 finish script translates it to 125 — a permanent failure that is
+        NOT restarted (#51228). Such an error will not fix itself (a bot token
+        held by another gateway, bad auth), so there is nothing for the reconnect
+        watcher to wait for. Left running, the process is dead weight at best and
+        at worst a duplicate racing another live gateway's cron.
+
+        Before ``_BACKGROUND_CONNECT_PLATFORMS`` grew Telegram this decision was
+        made inline; backgrounding the connect moved the fatal to *after*
+        ``start()`` returns and silently dropped it.
+
+        Two guards keep this from over-firing — it must be no more aggressive
+        than the inline path it replaces:
+
+        * Wait for the inline connect phase to finish (``_running``). This task
+          can lose the race to a platform that is merely *later* in the startup
+          loop (api_server binds after us), and exiting on that snapshot would
+          let one bad token kill an otherwise healthy boot.
+        * Stay alive if anything is connected or queued for retry — the inline
+          path only exits when ``connected_count == 0``, and a half-working
+          gateway still runs cron and serves its other platforms.
+        """
+        while not self._running and not self._shutdown_event.is_set():
+            await asyncio.sleep(0.05)
+
+        # Already going down — don't relabel another path's exit reason/code.
+        if self._shutdown_event.is_set():
+            return
+
+        if self.adapters or self._failed_platforms:
+            return
+
+        reason = f"{platform.value}: {adapter.fatal_error_message}"
+        logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+        except Exception:
+            pass
+        self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+        self._request_clean_exit(reason)
+
     async def _connect_platform_in_background(
         self, adapter, platform, platform_config
     ) -> None:
@@ -3565,6 +3613,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # retry queue — same policy as the inline startup path.
                 if adapter.fatal_error_retryable:
                     self._queue_platform_for_retry(platform, platform_config)
+                else:
+                    await self._exit_if_nonretryable_leaves_nothing_running(
+                        platform, adapter
+                    )
             else:
                 self._update_platform_runtime_status(
                     platform.value,

@@ -10,6 +10,33 @@ from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_eventbus_startup(monkeypatch):
+    """Keep ``GatewayRunner.start()`` off the canonical ~/.hermes event bus.
+
+    ``start()`` calls ``events.gateway_integration.startup()`` inline — and
+    *synchronously*, so not even an outer ``wait_for`` can interrupt it. That
+    does real I/O against the **canonical** ~/.hermes event bus (13
+    subscribers, the tracker-intent-applier's idempotency rehydrate, a jobops
+    :4100 probe). Notification state is deliberately cross-profile, so a
+    ``tmp_path`` HERMES_HOME does *not* redirect it — these tests hit the live
+    bus of whatever machine runs them.
+
+    That cost is real: the first test here to reach that call paid ~107s on a
+    loaded box (later ones are cheap only because the module global ``_bus`` is
+    already initialized). None of these tests assert anything about the event
+    bus, so neutralize it — they stay fast, hermetic, and dependent only on the
+    startup behavior they actually describe.
+
+    ``emit_gateway_started`` later in ``start()`` needs no patch: it returns
+    early while ``_bus`` is None, which is exactly what skipping ``startup()``
+    leaves it as.
+    """
+    import events.gateway_integration as _ebi
+
+    monkeypatch.setattr(_ebi, "startup", lambda *a, **k: None)
+
+
 class _RetryableFailureAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)

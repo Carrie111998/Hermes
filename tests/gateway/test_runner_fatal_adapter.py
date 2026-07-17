@@ -5,7 +5,25 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
 from gateway.run import GatewayRunner
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_eventbus_startup(monkeypatch):
+    """Keep ``GatewayRunner.start()`` off the canonical ~/.hermes event bus.
+
+    ``start()`` calls ``events.gateway_integration.startup()`` inline and
+    synchronously, doing real I/O against the **canonical** ~/.hermes event bus
+    (13 subscribers, tracker-intent-applier rehydrate, a jobops :4100 probe).
+    Notification state is cross-profile, so a ``tmp_path`` HERMES_HOME does not
+    redirect it. ``test_runner_requests_clean_exit_for_nonretryable_startup_conflict``
+    reaches that call and paid ~134s on a loaded box for an assertion about
+    clean-exit bookkeeping that says nothing about the event bus.
+    """
+    import events.gateway_integration as _ebi
+
+    monkeypatch.setattr(_ebi, "startup", lambda *a, **k: None)
 
 
 class _FatalAdapter(BasePlatformAdapter):
@@ -49,6 +67,20 @@ class _RuntimeRetryableAdapter(BasePlatformAdapter):
 
 @pytest.mark.asyncio
 async def test_runner_requests_clean_exit_for_nonretryable_startup_conflict(monkeypatch, tmp_path):
+    """A non-retryable startup conflict must still exit the gateway cleanly.
+
+    Telegram now connects in the BACKGROUND (``_BACKGROUND_CONNECT_PLATFORMS``,
+    added so a DNS flap can't block boot), so the token-lock fatal lands *after*
+    ``start()`` returns instead of inline — wait for it before asserting.
+
+    The clean exit itself must survive that move. A token lock is not transient:
+    another gateway already holds this bot token, so this process is a duplicate
+    and must not linger running cron against the same config. It exits with
+    EX_CONFIG (78) so the s6 finish script translates it to 125 — a permanent
+    failure that is NOT restarted (#51228). Telegram is the only platform here,
+    so nothing else is up to justify staying alive.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config = GatewayConfig(
         platforms={
             Platform.TELEGRAM: PlatformConfig(enabled=True, token="token")
@@ -62,8 +94,15 @@ async def test_runner_requests_clean_exit_for_nonretryable_startup_conflict(monk
     ok = await runner.start()
 
     assert ok is True
+
+    for _ in range(300):  # ~3s ceiling
+        if runner.should_exit_cleanly:
+            break
+        await asyncio.sleep(0.01)
+
     assert runner.should_exit_cleanly is True
     assert "already using this Telegram bot token" in runner.exit_reason
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
 @pytest.mark.asyncio
