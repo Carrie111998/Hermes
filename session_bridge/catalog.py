@@ -217,6 +217,7 @@ class UnifiedCatalog:
                 if owned:
                     result["session"]["profile"] = profile
                     result["session_meta"]["profile"] = profile
+                    self._overlay_root_relationships([result["session"]])
                 matches.append((profile, result))
         if not matches:
             raise KeyError(session_id)
@@ -259,6 +260,7 @@ class UnifiedCatalog:
                 )
                 for result in page["results"]:
                     result["profile"] = profile
+                    self._overlay_root_relationships([result])
                     results.append(result)
         identities = [result["session_id"] for result in results]
         if len(identities) != len(set(identities)):
@@ -856,6 +858,34 @@ class UnifiedCatalog:
             if row["to_session_id"] in known and row["to_session_id"] != row["from_session_id"]:
                 links[row["to_session_id"]].append(summary)
         return links
+
+    def _overlay_root_relationships(
+        self,
+        sessions: Sequence[dict[str, Any]],
+    ) -> None:
+        """Merge authoritative root bridge links into profile-native rows."""
+
+        if not sessions:
+            return
+        session_ids = [str(session["session_id"]) for session in sessions]
+        links_by_session = self._links(session_ids)
+        for session in sessions:
+            links = links_by_session.get(str(session["session_id"]), [])
+            if not links:
+                continue
+            diverged = any(link["diverged_at"] is not None for link in links)
+            relations = {link["relation"] for link in links}
+            if diverged:
+                mirror_state = "diverged"
+            elif relations & {Relation.CONTINUES.value, Relation.FORKS.value}:
+                mirror_state = "continued"
+            elif Relation.MIRRORS.value in relations:
+                mirror_state = "mirrored"
+            else:
+                mirror_state = session.get("mirror_state")
+            session["links"] = links
+            session["diverged"] = diverged
+            session["mirror_state"] = mirror_state
 
 
 class _Filters:

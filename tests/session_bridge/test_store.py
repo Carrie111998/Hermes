@@ -2905,8 +2905,45 @@ def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tm
         "hermes-profile-native",
     )) == [{"source": "session_bridge_profile"}]
 
+    db._execute_write(
+        lambda conn: (
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                ("codex:profile-target", "codex", 101.0),
+            ),
+            conn.execute(
+                """INSERT INTO session_links (
+                       id, from_session_id, to_session_id, relation, bridge_id,
+                       created_at, hydrated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "profile-sidebar-link",
+                    "hermes-profile-native",
+                    "codex:profile-target",
+                    Relation.MIRRORS.value,
+                    candidate.bridge_id,
+                    101.0,
+                    None,
+                ),
+            ),
+        )
+    )
+
     read = UnifiedCatalog(db, store).get("hermes-profile-native")
     assert read["session"]["profile"] == "main"
+    assert read["session"]["mirror_state"] == "mirrored"
+    assert read["session"]["links"] == [
+        {
+            "id": "profile-sidebar-link",
+            "from_session_id": "hermes-profile-native",
+            "to_session_id": "codex:profile-target",
+            "relation": "mirrors",
+            "bridge_id": candidate.bridge_id,
+            "created_at": 101.0,
+            "hydrated_at": None,
+            "diverged_at": None,
+        }
+    ]
     assert read["messages"][0]["content"] == (
         "ship the cross-profile sidebar bridge"
     )
