@@ -14,7 +14,11 @@ import time
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
-from .claude_adapter import ClaudeParseResult, ClaudeReadableSource
+from .claude_adapter import (
+    ClaudeParseResult,
+    ClaudeReadableSource,
+    claude_project_directory_name,
+)
 from .claude_visibility import (
     ClaudeVisibilityCandidate,
     ClaudeVisibilityClaim,
@@ -27,6 +31,7 @@ from .models import OriginKind, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
+_RESPONSE_SETTLE_SECONDS = 0.1
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
@@ -76,6 +81,12 @@ class _TranscriptConflict(ValueError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class _ExactTranscript:
+    path: Path
+    projection: SessionProjection
+
+
 class WindowsConPtyFactory:
     """Production pywinpty factory; imports remain safe off Windows."""
 
@@ -103,38 +114,52 @@ class _WinPtyProcess:
         self._closed = False
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
-        result: queue.Queue[str | BaseException] = queue.Queue(maxsize=1)
+        del prompt
+        result: queue.Queue[str | BaseException | None] = queue.Queue()
 
         def _read() -> None:
-            chunks: list[str] = []
             try:
                 while True:
                     chunk = self._process.read(4096)  # type: ignore[attr-defined]
                     if not chunk:
+                        time.sleep(0.01)
                         continue
                     text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
-                    chunks.append(text)
-                    joined = "".join(chunks)
-                    exact_response = _exact_registered_suffix(joined)
-                    if len(joined) > _MAX_RESPONSE_CHARS:
-                        result.put(joined)
-                        return
-                    if exact_response is not None:
-                        result.put(exact_response)
-                        return
-            except EOFError:
-                result.put("".join(chunks))
+                    result.put(text)
+            except (EOFError, StopIteration):
+                result.put(None)
             except BaseException as exc:
                 result.put(exc)
 
         threading.Thread(target=_read, daemon=True).start()
-        try:
-            value = result.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise TimeoutError from exc
-        if isinstance(value, BaseException):
-            raise RuntimeError("PTY read unavailable") from value
-        return value
+        deadline = time.monotonic() + timeout
+        settle_deadline: float | None = None
+        chunks: list[str] = []
+        while True:
+            now = time.monotonic()
+            wake_at = deadline if settle_deadline is None else min(deadline, settle_deadline)
+            remaining = wake_at - now
+            if remaining <= 0:
+                joined = "".join(chunks)
+                exact_response = _exact_registered_suffix(joined)
+                if exact_response is not None and settle_deadline is not None:
+                    return exact_response
+                raise TimeoutError
+            try:
+                value = result.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if value is None:
+                joined = "".join(chunks)
+                return _exact_registered_suffix(joined) or joined
+            if isinstance(value, BaseException):
+                raise RuntimeError("PTY read unavailable") from value
+            chunks.append(value)
+            joined = "".join(chunks)
+            if len(joined) > _MAX_RESPONSE_CHARS:
+                return joined
+            if _exact_registered_suffix(joined) is not None:
+                settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
 
     def write(self, data: str) -> None:
         self._process.write(data)  # type: ignore[attr-defined]
@@ -201,9 +226,16 @@ class ClaudeNativeRegistrar:
         if not claim.claimed:
             return ClaudeRegistrarOutcome(claim.status, claim.job_id, claim.reserved_claude_uuid)
         try:
+            self._validate_claim_authority(claim)
+        except ValueError:
+            return ClaudeRegistrarOutcome(
+                "failed", claim.job_id, claim.reserved_claude_uuid,
+                "bridge_conflict", "claim authority conflict",
+            )
+        try:
             candidate, identity = self._materialize_claim(claim)
         except ValueError:
-            return self._fail(claim, "bridge_conflict", "claim authority conflict")
+            return self._fail(claim, "bridge_conflict", "claim identity conflict")
 
         if claim.lease_kind == "reconciliation":
             return self._reconcile(claim, candidate, identity)
@@ -212,18 +244,7 @@ class ClaudeNativeRegistrar:
     def _materialize_claim(
         self, claim: ClaudeVisibilityClaim
     ) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
-        launch = claim.lease_kind == "launch"
-        reconciliation = claim.lease_kind == "reconciliation"
-        if not (launch or reconciliation):
-            raise ValueError("missing lease authority")
-        if launch != bool(claim.launch_permitted and claim.registration_reserved):
-            raise ValueError("inconsistent launch authority")
-        if reconciliation != bool(
-            claim.requires_exact_id_reconciliation
-            and not claim.launch_permitted
-            and not claim.registration_reserved
-        ):
-            raise ValueError("inconsistent reconciliation authority")
+        self._validate_claim_authority(claim)
         required_text = (
             claim.job_id,
             claim.source_session_id,
@@ -271,6 +292,20 @@ class ClaudeNativeRegistrar:
         validate_claude_visibility_identity_binding(candidate, identity, self._secret)
         return candidate, identity
 
+    @staticmethod
+    def _validate_claim_authority(claim: ClaudeVisibilityClaim) -> None:
+        authority = (
+            claim.lease_kind,
+            claim.launch_permitted,
+            claim.registration_reserved,
+            claim.requires_exact_id_reconciliation,
+        )
+        if any(type(flag) is not bool for flag in authority[1:]) or authority not in {
+            ("launch", True, True, False),
+            ("reconciliation", False, False, True),
+        }:
+            raise ValueError("inconsistent reconciliation authority")
+
     def _reconcile(
         self, claim: ClaudeVisibilityClaim, candidate: ClaudeVisibilityCandidate,
         identity: ClaudeVisibilityIdentity,
@@ -303,8 +338,8 @@ class ClaudeNativeRegistrar:
         try:
             existing = self._read_exact(identity.claude_uuid)
         except ValueError:
-            return self._retry(
-                claim, "creation_ambiguous", "exact transcript requires reconciliation"
+            return self._fail(
+                claim, "bridge_conflict", "exact transcript identity conflict"
             )
         except (OSError, RuntimeError):
             return self._retry(
@@ -359,7 +394,11 @@ class ClaudeNativeRegistrar:
         while True:
             try:
                 found = self._read_exact(identity.claude_uuid)
-            except (OSError, RuntimeError, ValueError):
+            except ValueError:
+                return self._fail(
+                    claim, "bridge_conflict", "exact transcript identity conflict"
+                )
+            except (OSError, RuntimeError):
                 found = None
             if found is not None:
                 return self._validate_and_commit(claim, candidate, identity, found)
@@ -367,21 +406,23 @@ class ClaudeNativeRegistrar:
                 return self._retry(claim, "native_transcript_not_indexed", "native transcript not indexed")
             self._sleep(self._poll_interval)
 
-    def _read_exact(self, native_id: str) -> SessionProjection | None:
+    def _read_exact(self, native_id: str) -> _ExactTranscript | None:
         path = self._source.find_native_session(native_id)
         if path is None:
             return None
-        parsed: ClaudeParseResult = self._source.parse(Path(path))
-        return parsed.projection
+        exact_path = Path(path)
+        parsed: ClaudeParseResult = self._source.parse(exact_path)
+        return _ExactTranscript(path=exact_path, projection=parsed.projection)
 
     def _validate_and_commit(
         self, claim: ClaudeVisibilityClaim, candidate: ClaudeVisibilityCandidate,
-        identity: ClaudeVisibilityIdentity, projection: SessionProjection,
+        identity: ClaudeVisibilityIdentity, transcript: _ExactTranscript,
     ) -> ClaudeRegistrarOutcome:
         try:
-            _validate_projection(projection, candidate, identity, self._secret)
+            _validate_projection(transcript, candidate, identity, self._secret)
         except _TranscriptConflict as exc:
             return self._fail(claim, exc.code, "exact transcript conflict")
+        projection = transcript.projection
         digest = projection.native_hash
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             digest = hashlib.sha256(json.dumps({
@@ -418,11 +459,14 @@ class ClaudeNativeRegistrar:
 
 
 def _validate_projection(
-    projection: SessionProjection, candidate: ClaudeVisibilityCandidate,
+    transcript: _ExactTranscript, candidate: ClaudeVisibilityCandidate,
     identity: ClaudeVisibilityIdentity, marker_secret: bytes,
 ) -> None:
+    projection = transcript.projection
     if projection.provider is not Provider.CLAUDE or projection.native_id != identity.claude_uuid:
         raise _TranscriptConflict("uuid_conflict")
+    if transcript.path.parent.name != claude_project_directory_name(candidate.source_cwd):
+        raise _TranscriptConflict("cwd_conflict")
     if projection.cwd != candidate.source_cwd:
         raise _TranscriptConflict("cwd_conflict")
     if projection.title != candidate.native_name:
@@ -430,12 +474,26 @@ def _validate_projection(
     if projection.origin_bridge_id != identity.bridge_id or projection.origin_kind is not OriginKind.BRIDGE_PLACEHOLDER:
         raise _TranscriptConflict("bridge_conflict")
     expected = build_claude_registration_prompt(candidate, identity, marker_secret)
-    user_contents = [m.content for m in projection.messages if m.role == "user"]
-    assistant_contents = [m.content for m in projection.messages if m.role == "assistant"]
-    if expected not in user_contents:
+    prompt_indexes = [
+        index
+        for index, message in enumerate(projection.messages)
+        if message.role == "user" and message.content == expected
+    ]
+    if len(prompt_indexes) != 1:
         raise _TranscriptConflict("marker_conflict")
-    if "REGISTERED" not in assistant_contents:
+    prompt_index = prompt_indexes[0]
+    if prompt_index + 1 >= len(projection.messages):
         raise _TranscriptConflict("bridge_conflict")
+    response = projection.messages[prompt_index + 1]
+    if response.role != "assistant" or not _is_exact_registered_text(response.content):
+        raise _TranscriptConflict("bridge_conflict")
+
+
+def _is_exact_registered_text(content: object) -> bool:
+    if not isinstance(content, str):
+        return False
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", content)).replace("\r", "")
+    return cleaned.strip() == "REGISTERED"
 
 
 def _is_authentication_failure(output: str) -> bool:

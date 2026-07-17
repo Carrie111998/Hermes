@@ -3,16 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import timezone
 import json
+from itertools import product
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 from typing import Any
 
 import pytest
 
 from hermes_state import SessionDB
 
+from session_bridge.claude_adapter import claude_project_directory_name
 from session_bridge.claude_registrar import ClaudeNativeRegistrar, _WinPtyProcess
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
@@ -72,17 +76,32 @@ class FakeParse:
 
 
 class FakeSource:
-    def __init__(self, projections: list[SessionProjection | None] | None = None):
+    def __init__(
+        self,
+        projections: list[SessionProjection | None] | None = None,
+        *,
+        parse_error: Exception | None = None,
+        project_name: str | None = None,
+    ):
         self.projections = list(projections or [None])
         self.lookups: list[str] = []
+        self.parse_error = parse_error
+        self.project_name = project_name
 
     def find_native_session(self, native_id: str) -> Path | None:
         self.lookups.append(native_id)
         item = self.projections.pop(0) if len(self.projections) > 1 else self.projections[0]
         self.current = item
-        return None if item is None else Path(f"/{native_id}.jsonl")
+        if item is None:
+            return None
+        project_name = self.project_name or claude_project_directory_name(
+            item.cwd or ""
+        )
+        return Path("C:/Users/test/.claude/projects") / project_name / f"{native_id}.jsonl"
 
     def parse(self, path: Path) -> FakeParse:
+        if self.parse_error is not None:
+            raise self.parse_error
         assert self.current is not None
         return FakeParse(self.current)
 
@@ -168,7 +187,11 @@ def projection_for(item: ClaudeVisibilityClaim, *, response: str = "REGISTERED",
             ProjectedMessage("u1", 0, "user", prompt, 10.0),
             ProjectedMessage("a1", 0, "assistant", response, 11.0),
         ],
-        native_path=f"/{item.reserved_claude_uuid}.jsonl",
+        native_path=str(
+            Path("C:/Users/test/.claude/projects")
+            / claude_project_directory_name(item.source_cwd or "")
+            / f"{item.reserved_claude_uuid}.jsonl"
+        ),
         native_hash="b" * 64,
         origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
         origin_bridge_id=identity.bridge_id,
@@ -234,19 +257,40 @@ def test_registration_response_requires_exact_bounded_token(output: str) -> None
     assert process.closed and process.terminated
 
 
-@pytest.mark.parametrize(
-    ("changes", "code"),
-    [
-        ({"lease_kind": "reconciliation", "registration_reserved": True}, "bridge_conflict"),
-        ({"lease_kind": "launch", "launch_permitted": False}, "bridge_conflict"),
-        ({"lease_kind": None}, "bridge_conflict"),
-    ],
-)
-def test_inconsistent_claim_authority_is_rejected_before_spawn(changes: dict[str, Any], code: str) -> None:
+_VALID_AUTHORITIES = {
+    ("launch", True, True, False),
+    ("reconciliation", False, False, True),
+}
+_INVALID_AUTHORITIES = [
+    authority
+    for authority in product(
+        ("launch", "reconciliation"),
+        (False, True),
+        (False, True),
+        (False, True),
+    )
+    if authority not in _VALID_AUTHORITIES
+] + [(None, True, True, False), ("launch", 1, True, False)]
+
+
+@pytest.mark.parametrize("authority", _INVALID_AUTHORITIES)
+def test_inconsistent_claim_authority_is_rejected_before_lookup_spawn_or_store(
+    authority: tuple[Any, Any, Any, Any],
+) -> None:
+    lease_kind, launch_permitted, registration_reserved, requires_reconciliation = authority
+    source = FakeSource()
+    store = FakeStore()
     factory = FakeFactory()
-    result = registrar(FakeSource(), factory).process(claim(**changes))
-    assert result.status == "failed" and result.error_code == code
+    result = registrar(source, factory, store).process(claim(
+        lease_kind=lease_kind,
+        launch_permitted=launch_permitted,
+        registration_reserved=registration_reserved,
+        requires_exact_id_reconciliation=requires_reconciliation,
+    ))
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
     assert factory.spawns == []
+    assert source.lookups == []
+    assert store.calls == []
 
 
 def test_reconciliation_exact_match_commits_without_spawn() -> None:
@@ -306,6 +350,58 @@ def test_reconciliation_fails_an_exact_uuid_with_wrong_authenticated_marker() ->
     assert result.status == "failed" and result.error_code == "marker_conflict"
 
 
+def test_registration_prompt_must_pair_with_immediate_exact_assistant_reply() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(item)
+    prompt_message = projection.messages[0]
+    messages = [
+        prompt_message,
+        replace(projection.messages[1], content="WRONG"),
+        replace(prompt_message, native_event_id="u2", content="unrelated user turn"),
+        replace(projection.messages[1], native_event_id="a2", content="REGISTERED"),
+    ]
+    result = registrar(
+        FakeSource([replace(projection, messages=messages)]), FakeFactory()
+    ).process(item)
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
+
+
+def test_exact_transcript_must_use_windows_encoded_source_project_directory() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    expected = claude_project_directory_name(item.source_cwd or "")
+    assert expected == "C--exact-project-subdir"
+    assert registrar(FakeSource([projection_for(item)]), FakeFactory()).process(item).status == "visible"
+
+    wrong = registrar(
+        FakeSource([projection_for(item)], project_name="C--wrong-project"), FakeFactory()
+    ).process(replace(item, lease_digest="c" * 64))
+    assert wrong.status == "failed" and wrong.error_code == "cwd_conflict"
+
+
+def test_paid_exact_path_parse_failure_is_terminal_and_never_spawns() -> None:
+    item = claim()
+    store = FakeStore()
+    factory = FakeFactory()
+    result = registrar(
+        FakeSource([projection_for(item)], parse_error=ValueError("identity changed")),
+        factory,
+        store,
+    ).process(item)
+    assert result.status == "failed" and result.error_code == "bridge_conflict"
+    assert factory.spawns == []
+    assert store.calls[0][0] == "fail"
+
+
 def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     item = claim()
     source = FakeSource([None, projection_for(item)])
@@ -347,11 +443,13 @@ def test_winpty_wrapper_uses_real_read_signature_without_unbounded_keyword() -> 
 
         def read(self, size: int = 1024) -> str:
             self.calls += 1
+            if self.calls > 1:
+                raise EOFError
             return "REGISTERED\r\n"
 
     process = Process()
     assert _WinPtyProcess(process).read_until(0.2).strip() == "REGISTERED"
-    assert process.calls == 1
+    assert process.calls == 2
 
 
 def test_winpty_reader_does_not_stop_on_registered_text_inside_prompt_echo() -> None:
@@ -367,12 +465,14 @@ def test_winpty_reader_does_not_stop_on_registered_text_inside_prompt_echo() -> 
 
         def read(self, size: int = 1024) -> str:
             self.calls += 1
+            if self.calls == 2:
+                time.sleep(0.01)
             return next(self.chunks)
 
     process = Process()
     output = _WinPtyProcess(process).read_until(0.2, prompt=prompt)
     assert output.strip() == "REGISTERED"
-    assert process.calls == 2
+    assert process.calls == 3
 
 
 def test_winpty_reader_ignores_startup_chrome_and_wrapped_prompt_fragments() -> None:
@@ -397,7 +497,7 @@ def test_winpty_reader_ignores_startup_chrome_and_wrapped_prompt_fragments() -> 
     process = Process()
     output = _WinPtyProcess(process).read_until(0.2, prompt=prompt)
     assert output.strip() == "REGISTERED"
-    assert process.calls == 3
+    assert process.calls == 4
 
 
 def test_winpty_reader_never_treats_authentication_words_in_echo_as_failure() -> None:
@@ -418,7 +518,51 @@ def test_winpty_reader_never_treats_authentication_words_in_echo_as_failure() ->
         0.2, prompt="Bounded metadata: authentication required"
     )
     assert output.strip() == "REGISTERED"
-    assert process.calls == 2
+    assert process.calls == 3
+
+
+def test_winpty_reader_drains_extra_output_after_registered_before_acceptance() -> None:
+    class Process:
+        def __init__(self):
+            self.chunks = iter(["REGISTERED\r\n", "extra\r\n"])
+            self.calls = 0
+
+        def read(self, size: int = 1024) -> str:
+            self.calls += 1
+            if self.calls == 2:
+                time.sleep(0.08)
+            return next(self.chunks)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until(0.2)
+    assert output.strip().splitlines() == ["REGISTERED", "extra"]
+    assert process.calls >= 2
+
+
+def test_winpty_reader_accepts_registered_split_across_chunks() -> None:
+    class Process:
+        def __init__(self):
+            self.chunks = iter(["REGIS", "TERED\r\n"])
+
+        def read(self, size: int = 1024) -> str:
+            return next(self.chunks)
+
+    assert _WinPtyProcess(Process()).read_until(0.2).strip() == "REGISTERED"
+
+
+def test_winpty_reader_timeout_is_bounded_when_underlying_read_blocks() -> None:
+    release = threading.Event()
+
+    class Process:
+        def read(self, size: int = 1024) -> str:
+            release.wait(2)
+            raise EOFError
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _WinPtyProcess(Process()).read_until(0.05)
+    assert time.monotonic() - started < 0.5
+    release.set()
 
 
 def test_paid_launch_exact_reconciles_existing_uuid_before_any_spawn() -> None:
@@ -533,3 +677,46 @@ def test_offline_interactive_fixture_records_frames_exit_and_delayed_index(tmp_p
     assert [event["event"] for event in events] == [
         "spawn", "stdin", "native_created", "index_ready", "stdin", "exit"
     ]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_code", "expected_output"),
+    [
+        ("authentication_failure", 1, b"Authentication required"),
+        ("malformed_response", 0, b"NOT REGISTERED"),
+        ("nonzero", 9, b"REGISTERED"),
+    ],
+)
+def test_offline_fixture_named_terminating_scenarios_record_exit(
+    tmp_path: Path, scenario: str, expected_code: int, expected_output: bytes
+) -> None:
+    record = tmp_path / f"{scenario}.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    process = subprocess.Popen(
+        [sys.executable, str(fixture), "--session-id", "offline-uuid"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "FAKE_CLAUDE_RECORD": str(record),
+            "FAKE_CLAUDE_SCENARIO": scenario,
+        },
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    if scenario != "authentication_failure":
+        process.stdin.write(b"\x1b[200~offline prompt\x1b[201~\r")
+        process.stdin.flush()
+    output = process.stdout.readline()
+    assert expected_output in output
+    if scenario != "authentication_failure":
+        process.stdin.write(b"/exit\n")
+        process.stdin.flush()
+    assert process.wait(timeout=2) == expected_code
+    events = json.loads(record.read_text(encoding="utf-8"))
+    assert events[-1] == {
+        "event": "exit",
+        "scenario": scenario,
+        "sequence": expected_code,
+    }

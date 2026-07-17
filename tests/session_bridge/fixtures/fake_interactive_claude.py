@@ -33,7 +33,7 @@ def main() -> int:
     if scenario == "authentication_failure":
         sys.stdout.write("Authentication required\r\n")
         sys.stdout.flush()
-        return 1
+        return _exit(scenario, 1)
     frame = _read_frame()
     _record(event="stdin", frame=frame)
     _record(event="native_created", session_id=_session_id())
@@ -52,8 +52,12 @@ def main() -> int:
     exit_frame = sys.stdin.buffer.readline().decode("utf-8", errors="replace")
     _record(event="stdin", frame=exit_frame)
     if exit_frame.strip() != "/exit":
-        return 7
-    sequence = int(os.environ.get("FAKE_CLAUDE_EXIT", "0"))
+        return _exit(scenario, 7)
+    sequence = 9 if scenario == "nonzero" else int(os.environ.get("FAKE_CLAUDE_EXIT", "0"))
+    return _exit(scenario, sequence)
+
+
+def _exit(scenario: str, sequence: int) -> int:
     _record(event="exit", sequence=sequence, scenario=scenario)
     return sequence
 

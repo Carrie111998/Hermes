@@ -54,6 +54,14 @@ _DESCRIPTOR_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._/+;-]+")
 CLAUDE_PLACEHOLDER_MAX_BUDGET_USD = "0.50"
 
 
+def claude_project_directory_name(cwd: str) -> str:
+    """Return Claude Code's project-directory encoding for an exact cwd."""
+
+    if not isinstance(cwd, str) or not cwd:
+        raise ValueError("Claude project cwd must be nonempty text")
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
 @dataclass(frozen=True)
 class ClaudeCursor:
     offset: int
@@ -245,8 +253,8 @@ class ClaudeSourceAdapter:
             ):
                 for message in _project_record(line):
                     identity = (message.native_event_id, message.ordinal)
-                    previous = projected_by_identity.get(identity)
-                    if previous == message:
+                    existing_message = projected_by_identity.get(identity)
+                    if existing_message == message:
                         continue
                     projected_by_identity[identity] = message
                     messages.append(message)
