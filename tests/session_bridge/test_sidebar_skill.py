@@ -159,6 +159,7 @@ def test_sidebar_skill_encodes_the_bounded_parallel_native_delivery_protocol() -
     assert "registration_prompt" in skill
     assert "exactly one native local task" in skill
     assert "rename" in skill.casefold()
+    assert "session_sidebar_bind" in skill
     assert "session_sidebar_commit" in skill
     assert "session_sidebar_fail" in skill
     assert "error_code=<fixed code>" in skill
@@ -198,9 +199,10 @@ def test_sidebar_skill_unconditionally_renames_every_task_before_commit() -> Non
     rename_step = skill.split("\n7. ", 1)[1].split("\n8. ", 1)[0]
 
     assert rename_step.startswith(
-        "Rename every reconciled task and every newly created task to the returned "
-        "`[Claude]` or `[Hermes]` title before commit."
+        "Before any rename, durably bind every reconciled task and every newly "
+        "created task to its exact native thread ID"
     )
+    assert "Rename every bound task" in rename_step
     assert "whenever" not in rename_step
     assert "flag" not in rename_step.casefold()
     assert (
@@ -214,12 +216,18 @@ def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
     create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
 
     assert "returned `threadId`" in create_step
+    assert "session_sidebar_bind" in create_step
     assert "`read_thread`" in create_step
     assert "same thread ID" in create_step
     assert "status is `idle`" in create_step
     assert "60 seconds" in create_step
     assert "`native_task_not_indexed`" in create_step
-    assert create_step.index("`read_thread`") > create_step.index("returned `threadId`")
+    assert create_step.index("session_sidebar_bind") > create_step.index(
+        "returned `threadId`"
+    )
+    assert create_step.index("`read_thread`") > create_step.index(
+        "session_sidebar_bind"
+    )
 
 
 def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
@@ -248,6 +256,10 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     ) in skill
     assert "Only the returned `threadId` is a successful create result" in skill
     assert "`worktreeId`" in skill and "`clientThreadId`" in skill
+    assert (
+        "`session_sidebar_bind(lease_token=<exact token>, "
+        "codex_thread_id=<threadId>)`" in skill
+    )
     assert (
         '`set_thread_title({"threadId":"<threadId>","title":"<exact title>"})`'
         in skill
@@ -401,6 +413,7 @@ def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
     assert named == {
         "session_status",
         "session_sidebar_pending",
+        "session_sidebar_bind",
         "session_sidebar_commit",
         "session_sidebar_fail",
         "session_continue",

@@ -48,6 +48,7 @@ EXPECTED_TOOLS = {
     "session_mirror",
     "session_status",
     "session_sidebar_pending",
+    "session_sidebar_bind",
     "session_sidebar_commit",
     "session_sidebar_fail",
 }
@@ -55,6 +56,7 @@ _TOKEN_ENV = "HERMES_SESSION_BRIDGE_TOKEN"
 _MIN_TOKEN_BYTES = 32
 _MIN_MARKER_KEY_BYTES = 32
 _MAX_MARKER_KEY_BYTES = 4096
+_WINDOWS_ACL_TIMEOUT_SECONDS = 15
 _MAX_CONTEXT_BUDGET = 100_000
 _DEFAULT_CONTEXT_BUDGET = 24_000
 _FIXED_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -433,6 +435,38 @@ def create_app(
             raise ValueError("sidebar_pending_failed") from None
 
     @mcp.tool()
+    async def session_sidebar_bind(
+        lease_token: Any,
+        codex_thread_id: Any,
+    ) -> dict[str, Any]:
+        """Durably bind one native Codex task ID before rename or commit."""
+
+        token_text = _exact_sidebar_text(lease_token, "lease token")
+        thread_id = _exact_sidebar_text(codex_thread_id, "Codex thread ID")
+        bind_method = getattr(coordinator, "bind_sidebar_thread", None)
+        if not callable(bind_method):
+            raise RuntimeError("sidebar_bind_unavailable")
+        try:
+            result = await bind_method(
+                lease_token=token_text,
+                codex_thread_id=thread_id,
+            )
+            if (
+                not isinstance(result, Mapping)
+                or result.get("state") != "sidebar_leased"
+                or result.get("codex_thread_id") != thread_id
+            ):
+                raise ValueError("invalid sidebar bind")
+            return {
+                "state": "sidebar_leased",
+                "codex_thread_id": thread_id,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_bind_failed") from None
+
+    @mcp.tool()
     async def session_sidebar_commit(
         lease_token: Any,
         codex_thread_id: Any,
@@ -639,7 +673,7 @@ $rules = @($acl.GetAccessRules(
             capture_output=True,
             env={**os.environ, "HERMES_SESSION_BRIDGE_ACL_PATH": str(path)},
             text=True,
-            timeout=5,
+            timeout=_WINDOWS_ACL_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise PermissionError("session bridge token file ACL could not be verified") from exc
@@ -1005,9 +1039,14 @@ def _build_sidebar_broker_job(
         marker_key,
     )
     recovered = getattr(claim, "recovered_thread", None)
-    recovered_thread_id = None
+    reserved_thread_id = getattr(claim, "reserved_thread_id", None)
+    recovered_thread_id = (
+        None
+        if reserved_thread_id is None
+        else _exact_sidebar_text(reserved_thread_id, "reserved thread ID")
+    )
     if recovered is not None:
-        recovered_thread_id = _exact_sidebar_text(
+        verified_thread_id = _exact_sidebar_text(
             getattr(recovered, "thread_id", None), "recovered thread ID"
         )
         if (
@@ -1015,6 +1054,9 @@ def _build_sidebar_broker_job(
             or getattr(recovered, "bridge_id", None) != bridge_id
         ):
             raise ValueError("recovered sidebar identity is malformed")
+        if recovered_thread_id is not None and recovered_thread_id != verified_thread_id:
+            raise ValueError("recovered sidebar thread identity is malformed")
+        recovered_thread_id = verified_thread_id
     return {
         "lease_token": lease_token,
         "registration_prompt": build_registration_prompt(candidate, marker),

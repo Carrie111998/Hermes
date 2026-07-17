@@ -310,6 +310,7 @@ class _FakeCoordinator:
         self.continue_requests: list[Any] = []
         self.sidebar_claims: tuple[SidebarDeliveryClaim, ...] = ()
         self.sidebar_claim_limits: list[int] = []
+        self.sidebar_binds: list[tuple[str, str]] = []
         self.sidebar_commits: list[tuple[str, str]] = []
 
     async def start(self) -> None:
@@ -366,6 +367,18 @@ class _FakeCoordinator:
         self.sidebar_commits.append((lease_token, codex_thread_id))
         return {
             "state": "sidebar_visible",
+            "codex_thread_id": codex_thread_id,
+        }
+
+    async def bind_sidebar_thread(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+    ) -> dict[str, Any]:
+        self.sidebar_binds.append((lease_token, codex_thread_id))
+        return {
+            "state": "sidebar_leased",
             "codex_thread_id": codex_thread_id,
         }
 
@@ -723,7 +736,7 @@ def test_health_is_minimal_and_mcp_auth_is_constant_surface(db: SessionDB) -> No
     assert coordinator.stopped == 1
 
 
-def test_tools_list_exposes_exactly_the_eight_approved_tools(db: SessionDB) -> None:
+def test_tools_list_exposes_exactly_the_nine_approved_tools(db: SessionDB) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
     coordinator = _FakeCoordinator(
         bridge_id=bridge_id, source_id=source_id, target_id=target_id
@@ -740,6 +753,7 @@ def test_tools_list_exposes_exactly_the_eight_approved_tools(db: SessionDB) -> N
         "session_mirror",
         "session_status",
         "session_sidebar_pending",
+        "session_sidebar_bind",
         "session_sidebar_commit",
         "session_sidebar_fail",
     }
@@ -873,6 +887,39 @@ def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
         candidate.source_session_id,
         Provider.CODEX,
         1,
+    )
+
+
+def test_session_sidebar_pending_returns_durable_reserved_thread_id(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token="reserved-opaque-lease",
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=True,
+            recovered_thread=None,
+            reserved_thread_id="44444444-4444-4444-8444-444444444444",
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(
+            client,
+            "session_sidebar_pending",
+            {"limit": 1},
+        )
+
+    assert response["jobs"][0]["recovered_thread_id"] == (
+        "44444444-4444-4444-8444-444444444444"
     )
 
 
@@ -1236,6 +1283,52 @@ def test_session_sidebar_commit_has_two_argument_schema_and_is_idempotent(
         "codex_thread_id": thread_id,
     }
     assert coordinator.sidebar_commits == [
+        ("plaintext-opaque-lease", thread_id),
+        ("plaintext-opaque-lease", thread_id),
+    ]
+
+
+def test_session_sidebar_bind_has_two_argument_schema_and_is_idempotent(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    thread_id = "33333333-3333-4333-8333-333333333333"
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        tools = _rpc(client, "tools/list")["result"]["tools"]
+        schema = next(
+            tool["inputSchema"]
+            for tool in tools
+            if tool["name"] == "session_sidebar_bind"
+        )
+        first = _call_tool(
+            client,
+            "session_sidebar_bind",
+            {
+                "lease_token": "plaintext-opaque-lease",
+                "codex_thread_id": thread_id,
+            },
+        )
+        replay = _call_tool(
+            client,
+            "session_sidebar_bind",
+            {
+                "lease_token": "plaintext-opaque-lease",
+                "codex_thread_id": thread_id,
+            },
+        )
+
+    assert set(schema["properties"]) == {"lease_token", "codex_thread_id"}
+    assert replay == first == {
+        "state": "sidebar_leased",
+        "codex_thread_id": thread_id,
+    }
+    assert coordinator.sidebar_binds == [
         ("plaintext-opaque-lease", thread_id),
         ("plaintext-opaque-lease", thread_id),
     ]

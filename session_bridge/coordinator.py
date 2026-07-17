@@ -106,6 +106,7 @@ class SidebarDeliveryClaim:
     reconcile_required: bool
     rename_required: bool
     recovered_thread: VerifiedSidebarThread | None
+    reserved_thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -567,35 +568,46 @@ class SessionBridgeCoordinator:
                     target_provider=Provider.CODEX,
                     policy_generation=1,
                 )
-                try:
-                    recovered = await asyncio.to_thread(
-                        verifier.find_by_marker,
-                        expected,
+                raw_reserved_thread_id = raw_claim.get("codex_thread_id")
+                reserved_thread_id = (
+                    None
+                    if raw_reserved_thread_id is None
+                    else _exact_sidebar_claim_text(
+                        raw_reserved_thread_id,
+                        "reserved Codex thread ID",
                     )
-                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                    raise
-                except SidebarVerificationError as exc:
-                    if exc.code == "native_task_not_indexed":
-                        recovered = None
-                    else:
-                        code = (
-                            exc.code
-                            if exc.code
-                            in {
-                                "marker_conflict",
-                                "source_identity_mismatch",
-                                "provider_mismatch",
-                            }
-                            else "bridge_temporarily_unavailable"
+                )
+                recovered = None
+                if reserved_thread_id is None:
+                    try:
+                        recovered = await asyncio.to_thread(
+                            verifier.find_by_marker,
+                            expected,
                         )
-                        await self._fail_sidebar_delivery_claim(lease_token, code)
+                    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                        raise
+                    except SidebarVerificationError as exc:
+                        if exc.code == "native_task_not_indexed":
+                            recovered = None
+                        else:
+                            code = (
+                                exc.code
+                                if exc.code
+                                in {
+                                    "marker_conflict",
+                                    "source_identity_mismatch",
+                                    "provider_mismatch",
+                                }
+                                else "bridge_temporarily_unavailable"
+                            )
+                            await self._fail_sidebar_delivery_claim(lease_token, code)
+                            continue
+                    except Exception:
+                        await self._fail_sidebar_delivery_claim(
+                            lease_token,
+                            "bridge_temporarily_unavailable",
+                        )
                         continue
-                except Exception:
-                    await self._fail_sidebar_delivery_claim(
-                        lease_token,
-                        "bridge_temporarily_unavailable",
-                    )
-                    continue
                 if recovered is not None and (
                     recovered.source_session_id != source_session_id
                     or recovered.bridge_id != bridge_id
@@ -605,14 +617,34 @@ class SessionBridgeCoordinator:
                         "source_identity_mismatch",
                     )
                     continue
+                if recovered is not None:
+                    reserved_thread_id = recovered.thread_id
+                    try:
+                        await asyncio.to_thread(
+                            _call,
+                            self._store,
+                            "bind_sidebar_thread",
+                            lease_token=lease_token,
+                            codex_thread_id=reserved_thread_id,
+                            now=claim_time,
+                        )
+                    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        await self._fail_sidebar_delivery_claim(
+                            lease_token,
+                            "bridge_temporarily_unavailable",
+                        )
+                        continue
                 delivery.append(
                     SidebarDeliveryClaim(
                         lease_token=lease_token,
                         source_session_id=source_session_id,
                         bridge_id=bridge_id,
                         reconcile_required=True,
-                        rename_required=recovered is not None,
+                        rename_required=reserved_thread_id is not None,
                         recovered_thread=recovered,
+                        reserved_thread_id=reserved_thread_id,
                     )
                 )
             heartbeat = getattr(
@@ -782,6 +814,30 @@ class SessionBridgeCoordinator:
         if cancelled is not None:
             _raise_detached_cancelled(cancelled)
 
+    async def bind_sidebar_thread(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+    ) -> Mapping[str, Any]:
+        token = _exact_sidebar_claim_text(lease_token, "lease token")
+        thread_id = _exact_sidebar_claim_text(codex_thread_id, "Codex thread ID")
+        result = await asyncio.to_thread(
+            _call,
+            self._store,
+            "bind_sidebar_thread",
+            lease_token=token,
+            codex_thread_id=thread_id,
+            now=_finite_number(self._clock(), "now"),
+        )
+        if (
+            not isinstance(result, Mapping)
+            or result.get("state") != "sidebar_leased"
+            or result.get("codex_thread_id") != thread_id
+        ):
+            raise ValueError("sidebar bind result is malformed")
+        return result
+
     async def commit_sidebar_job(
         self,
         *,
@@ -816,6 +872,15 @@ class SessionBridgeCoordinator:
             target_provider=Provider.CODEX,
             policy_generation=1,
         )
+        if raw_identity.get("state") != "sidebar_visible":
+            await asyncio.to_thread(
+                _call,
+                self._store,
+                "bind_sidebar_thread",
+                lease_token=token,
+                codex_thread_id=thread_id,
+                now=_finite_number(self._clock(), "now"),
+            )
         verified = await asyncio.to_thread(
             verifier.verify_thread,
             thread_id=thread_id,

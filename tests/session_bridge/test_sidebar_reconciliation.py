@@ -34,9 +34,16 @@ def _leased_job(*, expires_at: float = 400.0) -> dict[str, Any]:
 
 
 class FakeSidebarStore:
-    def __init__(self, *, claim_after: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        claim_after: float = 0.0,
+        reserved_thread_id: str | None = None,
+    ) -> None:
         self.claim_after = claim_after
+        self.reserved_thread_id = reserved_thread_id
         self.failures: list[tuple[str, str, float]] = []
+        self.binds: list[tuple[str, str, float]] = []
         self.commits: list[tuple[str, str, float]] = []
 
     def claim_sidebar_jobs(
@@ -45,7 +52,22 @@ class FakeSidebarStore:
         assert lease_seconds == 300
         if now < self.claim_after:
             return []
-        return [_leased_job(expires_at=now + lease_seconds)][:limit]
+        return [
+            {
+                **_leased_job(expires_at=now + lease_seconds),
+                "codex_thread_id": self.reserved_thread_id,
+            }
+        ][:limit]
+
+    def bind_sidebar_thread(
+        self, *, lease_token: str, codex_thread_id: str, now: float
+    ) -> dict[str, Any]:
+        self.binds.append((lease_token, codex_thread_id, now))
+        self.reserved_thread_id = codex_thread_id
+        return {
+            **_leased_job(),
+            "codex_thread_id": codex_thread_id,
+        }
 
     def fail_sidebar_job(
         self, *, lease_token: str, error_code: str, now: float
@@ -165,6 +187,25 @@ async def test_lost_commit_recovers_one_authenticated_thread_without_creation() 
     assert verifier.find_calls == [
         BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1)
     ]
+    assert store.binds == [("opaque-lease-token", THREAD, 100.0)]
+    assert store.failures == []
+
+
+@pytest.mark.asyncio
+async def test_reserved_thread_id_forces_exact_recovery_without_marker_search() -> None:
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert len(claims) == 1
+    assert claims[0].reserved_thread_id == THREAD
+    assert claims[0].recovered_thread is None
+    assert claims[0].reconcile_required is True
+    assert claims[0].rename_required is True
+    assert verifier.find_calls == []
+    assert store.binds == []
     assert store.failures == []
 
 
@@ -272,6 +313,25 @@ async def test_recovered_rename_failure_renames_same_thread_before_verified_comm
         (THREAD, BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1))
     ]
     assert store.commits == [("opaque-lease-token", THREAD, 101.0)]
+
+
+@pytest.mark.asyncio
+async def test_commit_binds_native_id_before_transient_verification_failure() -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(
+        SidebarVerificationError("bridge_temporarily_unavailable")
+    )
+    coordinator = _coordinator(store, verifier, clock=lambda: 101.0)
+
+    with pytest.raises(SidebarVerificationError) as failure:
+        await coordinator.commit_sidebar_job(
+            lease_token="opaque-lease-token",
+            codex_thread_id=THREAD,
+        )
+
+    assert failure.value.code == "bridge_temporarily_unavailable"
+    assert store.binds == [("opaque-lease-token", THREAD, 101.0)]
+    assert store.commits == []
 
 
 @pytest.mark.asyncio

@@ -3428,6 +3428,49 @@ def test_sidebar_commit_requires_exact_unexpired_token_and_is_idempotent(db) -> 
     ).hexdigest()
 
 
+def test_sidebar_bind_persists_exact_thread_across_retry_and_rejects_rebind(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("bind-token", "retry-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="bind-retry")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    bound = store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id="codex-bound-thread",
+        now=150.0,
+    )
+    replay = store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id="codex-bound-thread",
+        now=151.0,
+    )
+    with pytest.raises(ValueError, match="conflicting Codex thread identity"):
+        store.bind_sidebar_thread(
+            lease_token=lease["lease_token"],
+            codex_thread_id="codex-replacement-thread",
+            now=152.0,
+        )
+
+    assert replay == bound
+    assert bound["state"] == SidebarJobState.LEASED.value
+    assert bound["codex_thread_id"] == "codex-bound-thread"
+
+    retried = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="bridge_temporarily_unavailable",
+        now=160.0,
+    )
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["codex_thread_id"] == "codex-bound-thread"
+    reclaimed = store.claim_sidebar_jobs(now=1_000.0, limit=1)[0]
+    assert reclaimed["lease_token"] == "retry-token"
+    assert reclaimed["codex_thread_id"] == "codex-bound-thread"
+
+
 def test_sidebar_atomic_lineage_commit_and_exact_replay_are_idempotent(db) -> None:
     store = SessionBridgeStore(
         db,

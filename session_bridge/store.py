@@ -1535,6 +1535,70 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def bind_sidebar_thread(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """Durably reserve one native task identity before rename or commit."""
+
+        token_digest = _sidebar_lease_digest(lease_token)
+        thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
+        bind_time = _finite_number(now, "now")
+
+        def _write(conn):
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if float(job["lease_expires_at"]) <= bind_time:
+                _recover_one_expired_sidebar_lease(conn, job, now=bind_time)
+                return dict(job), True
+            existing = job["codex_thread_id"]
+            if existing is not None:
+                if existing == thread_id:
+                    return dict(job), False
+                raise ValueError("conflicting Codex thread identity")
+            conflict = conn.execute(
+                """SELECT id FROM session_sidebar_jobs
+                   WHERE codex_thread_id = ? AND id != ?""",
+                (thread_id, job["id"]),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("conflicting Codex thread identity")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET codex_thread_id = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND codex_thread_id IS NULL""",
+                (
+                    thread_id,
+                    bind_time,
+                    job["id"],
+                    SidebarJobState.LEASED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar thread binding")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        return result
+
     def commit_sidebar_job(
         self,
         *,
