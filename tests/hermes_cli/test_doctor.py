@@ -1336,3 +1336,52 @@ class TestCoreModuleImportsCheck:
         assert "Broken module" in out
         assert len(issues) == 1
         assert "tests.hermes_cli._does_not_exist_module" in issues[0]
+
+
+class TestSlackChannelExposureCheck:
+    """DAN-2043: nudge when Slack has no allowed_channels allowlist. This is
+    a hygiene warning only — it never sets or decides the channel list,
+    since that's the user's call, not doctor's."""
+
+    def _run(self, monkeypatch, *, bot_token="xoxb-test", config_channels=None, env_channels=None):
+        import hermes_cli.config as config_mod
+
+        if bot_token is None:
+            monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        else:
+            monkeypatch.setenv("SLACK_BOT_TOKEN", bot_token)
+
+        if env_channels is None:
+            monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+        else:
+            monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", env_channels)
+
+        fake_cfg = {"slack": {"allowed_channels": config_channels}} if config_channels is not None else {"slack": {}}
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: fake_cfg)
+
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod._check_slack_channel_exposure(issues)
+        return buf.getvalue(), issues
+
+    def test_silent_when_slack_not_configured(self, monkeypatch):
+        out, issues = self._run(monkeypatch, bot_token=None)
+        assert out == ""
+        assert issues == []
+
+    def test_warns_when_no_allowlist_set(self, monkeypatch):
+        out, issues = self._run(monkeypatch, config_channels="")
+        assert "No channel allowlist set" in out
+        assert len(issues) == 1
+        assert "allowed_channels" in issues[0]
+
+    def test_ok_when_config_allowlist_set(self, monkeypatch):
+        out, issues = self._run(monkeypatch, config_channels="C0123,C0456")
+        assert "Channel allowlist configured (2 channel(s))" in out
+        assert issues == []
+
+    def test_ok_when_env_allowlist_set(self, monkeypatch):
+        out, issues = self._run(monkeypatch, config_channels=None, env_channels="C0123")
+        assert "Channel allowlist configured (1 channel(s))" in out
+        assert issues == []

@@ -274,6 +274,44 @@ def _check_core_module_imports(issues: list[str]) -> None:
             )
 
 
+def _check_slack_channel_exposure(issues: list[str]) -> None:
+    """Warn when Slack is configured with no channel allowlist.
+
+    Empty ``slack.allowed_channels`` is the documented, backward-compatible
+    default (the bot responds in every channel it's a member of) — not a
+    bug. This is a hygiene nudge for deployments where the bot has since
+    been invited to privileged channels, not a judgment on which channels
+    belong on an allowlist; that decision is the user's to make.
+    """
+    from hermes_cli.config import get_env_value, load_config_readonly
+
+    if not get_env_value("SLACK_BOT_TOKEN"):
+        return  # Slack isn't configured; nothing to warn about.
+
+    _section("Slack Configuration")
+    cfg = load_config_readonly()
+    raw = (cfg.get("slack") or {}).get("allowed_channels")
+    if raw is None:
+        raw = os.environ.get("SLACK_ALLOWED_CHANNELS", "")
+    if isinstance(raw, list):
+        channels = [str(c).strip() for c in raw if str(c).strip()]
+    else:
+        channels = [c.strip() for c in str(raw or "").split(",") if c.strip()]
+
+    if channels:
+        check_ok(f"Channel allowlist configured ({len(channels)} channel(s))")
+    else:
+        check_warn(
+            "No channel allowlist set",
+            "(bot responds in every channel it's a member of, including any privileged ones)",
+        )
+        check_info("Set slack.allowed_channels in config.yaml (or SLACK_ALLOWED_CHANNELS) to restrict it")
+        issues.append(
+            "Slack has no allowed_channels set — review which channels the bot should "
+            "respond in and set slack.allowed_channels (or SLACK_ALLOWED_CHANNELS) if any are privileged."
+        )
+
+
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
@@ -1022,6 +1060,7 @@ def run_doctor(args):
             pass
 
     _check_gateway_service_linger(issues)
+    _check_slack_channel_exposure(issues)
 
     if sys.platform != "win32":
         _section("Command Installation")
