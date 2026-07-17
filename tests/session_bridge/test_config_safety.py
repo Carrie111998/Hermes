@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import FrozenInstanceError, asdict
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from hermes_cli.config import DEFAULT_CONFIG
-from session_bridge.config import BridgeConfig, SidebarConfig, _ENV_NAMES
+from session_bridge.config import (
+    BridgeConfig,
+    ClaudeVisibilityConfig,
+    SidebarConfig,
+    _ENV_NAMES,
+)
 
 
 def _load(
@@ -219,4 +225,104 @@ def test_sidebar_config_rejects_unsafe_values(
         _load_with_sidebar(
             monkeypatch,
             {**_SIDEBAR_DEFAULTS, field: value},
+        )
+
+
+_CLAUDE_VISIBILITY_DEFAULTS = {
+    "enabled": False,
+    "continuous": False,
+    "backfill_days": 30,
+    "continuous_batch_limit": 1,
+    "manual_batch_limit": 10,
+    "lease_seconds": 300,
+    "max_attempts": 5,
+    "daily_registration_limit": 25,
+    "reserved_cost_per_attempt_usd": Decimal("0.02"),
+    "emergency_daily_cost_usd": Decimal("0.50"),
+    "process_timeout_seconds": 120,
+    "discovery_timeout_seconds": 30,
+}
+
+
+def _load_with_claude_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    claude_visibility: object,
+) -> BridgeConfig:
+    document: dict[str, Any] = {
+        "session_bridge": {"claude_visibility": claude_visibility}
+    }
+    snapshot = deepcopy(document)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: document)
+
+    config = BridgeConfig.load(environ={})
+
+    assert document == snapshot
+    return config
+
+
+def test_claude_visibility_defaults_are_exact_disabled_and_environment_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert not any("CLAUDE_VISIBILITY" in name for name in _ENV_NAMES)
+
+    config = _load_with_claude_visibility(monkeypatch, {})
+
+    assert asdict(config.claude_visibility) == _CLAUDE_VISIBILITY_DEFAULTS
+    assert config.claude_visibility.enabled is False
+    assert config.claude_visibility.continuous is False
+    with pytest.raises(FrozenInstanceError):
+        config.claude_visibility.enabled = True
+    assert isinstance(config.claude_visibility, ClaudeVisibilityConfig)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("backfill_days", -1, "backfill_days must be at least 0"),
+        ("continuous_batch_limit", 0, "continuous_batch_limit must be at least 1"),
+        ("continuous_batch_limit", -1, "continuous_batch_limit must be at least 1"),
+        ("manual_batch_limit", 0, "manual_batch_limit must be at least 1"),
+        ("manual_batch_limit", -1, "manual_batch_limit must be at least 1"),
+        ("lease_seconds", 0, "lease_seconds must be at least 1"),
+        ("lease_seconds", -1, "lease_seconds must be at least 1"),
+        ("max_attempts", 0, "max_attempts must be at least 1"),
+        ("max_attempts", -1, "max_attempts must be at least 1"),
+        ("daily_registration_limit", 0, "daily_registration_limit must be at least 1"),
+        ("daily_registration_limit", -1, "daily_registration_limit must be at least 1"),
+        ("process_timeout_seconds", 0, "process_timeout_seconds must be at least 1"),
+        ("process_timeout_seconds", -1, "process_timeout_seconds must be at least 1"),
+        ("discovery_timeout_seconds", 0, "discovery_timeout_seconds must be at least 1"),
+        ("discovery_timeout_seconds", -1, "discovery_timeout_seconds must be at least 1"),
+        (
+            "reserved_cost_per_attempt_usd",
+            "0",
+            "reserved_cost_per_attempt_usd must be greater than 0",
+        ),
+        (
+            "reserved_cost_per_attempt_usd",
+            "-0.01",
+            "reserved_cost_per_attempt_usd must be greater than 0",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "0",
+            "emergency_daily_cost_usd must be greater than 0",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "-0.01",
+            "emergency_daily_cost_usd must be greater than 0",
+        ),
+    ),
+)
+def test_claude_visibility_config_rejects_unsafe_values(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        _load_with_claude_visibility(
+            monkeypatch,
+            {**_CLAUDE_VISIBILITY_DEFAULTS, field: value},
         )

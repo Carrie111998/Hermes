@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier, Event
@@ -58,6 +59,121 @@ def test_fresh_schema_has_current_version_and_sidebar_exclusions_table(db) -> No
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
         ("session_sidebar_exclusions",),
     ) == [{"name": "session_sidebar_exclusions"}]
+
+
+_CLAUDE_VISIBILITY_JOB_COLUMNS = [
+    "id",
+    "source_session_id",
+    "bridge_id",
+    "idempotency_key",
+    "reserved_claude_uuid",
+    "native_name",
+    "source_provider",
+    "source_cwd",
+    "git_root",
+    "git_branch",
+    "git_head",
+    "worktree_id",
+    "signed_marker",
+    "state",
+    "attempts",
+    "next_attempt_at",
+    "lease_digest",
+    "lease_expires_at",
+    "error_code",
+    "error_detail",
+    "completion_digest",
+    "eligible_at",
+    "created_at",
+    "updated_at",
+    "visible_at",
+]
+_CLAUDE_REGISTRATION_USAGE_COLUMNS = [
+    "local_day",
+    "job_id",
+    "attempt_ordinal",
+    "reserved_estimated_cost_usd",
+    "reserved_at",
+]
+
+
+def _unique_column_sets(db: SessionDB, table: str) -> set[tuple[str, ...]]:
+    unique_sets: set[tuple[str, ...]] = set()
+    for index in _rows(db, f'PRAGMA index_list("{table}")'):
+        if index["unique"]:
+            columns = _rows(db, f'PRAGMA index_info("{index["name"]}")')
+            unique_sets.add(tuple(column["name"] for column in columns))
+    return unique_sets
+
+
+def test_fresh_claude_visibility_schema_has_exact_columns_states_and_uniques(
+    db,
+) -> None:
+    assert [
+        row["name"]
+        for row in _rows(db, 'PRAGMA table_info("session_claude_visibility_jobs")')
+    ] == _CLAUDE_VISIBILITY_JOB_COLUMNS
+    table_sql = _rows(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_claude_visibility_jobs",),
+    )[0]["sql"]
+    normalized = " ".join(table_sql.split())
+    assert (
+        "state IN ( 'claude_pending', 'claude_leased', 'claude_retry', "
+        "'claude_visible', 'claude_failed' )"
+    ) in normalized
+    unique_sets = _unique_column_sets(db, "session_claude_visibility_jobs")
+    assert {
+        ("source_session_id",),
+        ("bridge_id",),
+        ("idempotency_key",),
+        ("reserved_claude_uuid",),
+    } <= unique_sets
+
+
+def test_claude_registration_usage_migrates_existing_database_idempotently(
+    tmp_path,
+) -> None:
+    path = tmp_path / "existing-state.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE preexisting_sentinel (value TEXT NOT NULL);
+        INSERT INTO preexisting_sentinel (value) VALUES ('preserved');
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (21);
+        """
+    )
+    connection.close()
+
+    first = SessionDB(path)
+    first.close()
+    migrated = SessionDB(path)
+    try:
+        assert _rows(migrated, "SELECT * FROM preexisting_sentinel") == [
+            {"value": "preserved"}
+        ]
+        assert [
+            row["name"]
+            for row in _rows(
+                migrated,
+                'PRAGMA table_info("session_claude_visibility_jobs")',
+            )
+        ] == _CLAUDE_VISIBILITY_JOB_COLUMNS
+        assert [
+            row["name"]
+            for row in _rows(
+                migrated,
+                'PRAGMA table_info("session_claude_registration_usage")',
+            )
+        ] == _CLAUDE_REGISTRATION_USAGE_COLUMNS
+        assert (
+            "job_id",
+            "attempt_ordinal",
+        ) in _unique_column_sets(migrated, "session_claude_registration_usage")
+    finally:
+        migrated.close()
 
 
 def test_mirror_worker_lock_serializes_independent_store_instances(db) -> None:

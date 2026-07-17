@@ -6,6 +6,7 @@ import re
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import ipaddress
 from pathlib import Path
 from typing import Any, TypeVar
@@ -75,11 +76,28 @@ class SidebarConfig:
 
 
 @dataclass(frozen=True)
+class ClaudeVisibilityConfig:
+    enabled: bool = False
+    continuous: bool = False
+    backfill_days: int = 30
+    continuous_batch_limit: int = 1
+    manual_batch_limit: int = 10
+    lease_seconds: int = 300
+    max_attempts: int = 5
+    daily_registration_limit: int = 25
+    reserved_cost_per_attempt_usd: Decimal = Decimal("0.02")
+    emergency_daily_cost_usd: Decimal = Decimal("0.50")
+    process_timeout_seconds: int = 120
+    discovery_timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     service: ServiceConfig = ServiceConfig()
     catalog: CatalogConfig = CatalogConfig()
     mirrors: MirrorsConfig = MirrorsConfig()
     sidebar: SidebarConfig = SidebarConfig()
+    claude_visibility: ClaudeVisibilityConfig = ClaudeVisibilityConfig()
 
     @classmethod
     def load(
@@ -109,6 +127,7 @@ class BridgeConfig:
             raise ValueError("config.yaml root must be a mapping")
         session_bridge = _mapping_section(yaml_document, "session_bridge")
         sidebar = _mapping_section(session_bridge, "sidebar")
+        claude_visibility = _mapping_section(session_bridge, "claude_visibility")
         _reject_unknown_keys(
             sidebar,
             allowed=frozenset({
@@ -122,6 +141,24 @@ class BridgeConfig:
                 "heartbeat_grace_seconds",
             }),
             scope="session_bridge.sidebar",
+        )
+        _reject_unknown_keys(
+            claude_visibility,
+            allowed=frozenset({
+                "enabled",
+                "continuous",
+                "backfill_days",
+                "continuous_batch_limit",
+                "manual_batch_limit",
+                "lease_seconds",
+                "max_attempts",
+                "daily_registration_limit",
+                "reserved_cost_per_attempt_usd",
+                "emergency_daily_cost_usd",
+                "process_timeout_seconds",
+                "discovery_timeout_seconds",
+            }),
+            scope="session_bridge.claude_visibility",
         )
 
         _reject_unknown_keys(
@@ -361,11 +398,100 @@ class BridgeConfig:
                 minimum=0,
             ),
         )
+        claude_visibility_defaults = cls().claude_visibility
+        claude_visibility_config = ClaudeVisibilityConfig(
+            enabled=_toml_bool(
+                claude_visibility.get("enabled", claude_visibility_defaults.enabled),
+                "session_bridge.claude_visibility.enabled",
+            ),
+            continuous=_toml_bool(
+                claude_visibility.get(
+                    "continuous", claude_visibility_defaults.continuous
+                ),
+                "session_bridge.claude_visibility.continuous",
+            ),
+            backfill_days=_toml_int(
+                claude_visibility.get(
+                    "backfill_days", claude_visibility_defaults.backfill_days
+                ),
+                "session_bridge.claude_visibility.backfill_days",
+                minimum=0,
+            ),
+            continuous_batch_limit=_toml_int(
+                claude_visibility.get(
+                    "continuous_batch_limit",
+                    claude_visibility_defaults.continuous_batch_limit,
+                ),
+                "session_bridge.claude_visibility.continuous_batch_limit",
+                minimum=1,
+            ),
+            manual_batch_limit=_toml_int(
+                claude_visibility.get(
+                    "manual_batch_limit",
+                    claude_visibility_defaults.manual_batch_limit,
+                ),
+                "session_bridge.claude_visibility.manual_batch_limit",
+                minimum=1,
+            ),
+            lease_seconds=_toml_int(
+                claude_visibility.get(
+                    "lease_seconds", claude_visibility_defaults.lease_seconds
+                ),
+                "session_bridge.claude_visibility.lease_seconds",
+                minimum=1,
+            ),
+            max_attempts=_toml_int(
+                claude_visibility.get(
+                    "max_attempts", claude_visibility_defaults.max_attempts
+                ),
+                "session_bridge.claude_visibility.max_attempts",
+                minimum=1,
+            ),
+            daily_registration_limit=_toml_int(
+                claude_visibility.get(
+                    "daily_registration_limit",
+                    claude_visibility_defaults.daily_registration_limit,
+                ),
+                "session_bridge.claude_visibility.daily_registration_limit",
+                minimum=1,
+            ),
+            reserved_cost_per_attempt_usd=_positive_decimal(
+                claude_visibility.get(
+                    "reserved_cost_per_attempt_usd",
+                    claude_visibility_defaults.reserved_cost_per_attempt_usd,
+                ),
+                "session_bridge.claude_visibility.reserved_cost_per_attempt_usd",
+            ),
+            emergency_daily_cost_usd=_positive_decimal(
+                claude_visibility.get(
+                    "emergency_daily_cost_usd",
+                    claude_visibility_defaults.emergency_daily_cost_usd,
+                ),
+                "session_bridge.claude_visibility.emergency_daily_cost_usd",
+            ),
+            process_timeout_seconds=_toml_int(
+                claude_visibility.get(
+                    "process_timeout_seconds",
+                    claude_visibility_defaults.process_timeout_seconds,
+                ),
+                "session_bridge.claude_visibility.process_timeout_seconds",
+                minimum=1,
+            ),
+            discovery_timeout_seconds=_toml_int(
+                claude_visibility.get(
+                    "discovery_timeout_seconds",
+                    claude_visibility_defaults.discovery_timeout_seconds,
+                ),
+                "session_bridge.claude_visibility.discovery_timeout_seconds",
+                minimum=1,
+            ),
+        )
         return cls(
             service=service_config,
             catalog=catalog_config,
             mirrors=mirrors_config,
             sidebar=sidebar_config,
+            claude_visibility=claude_visibility_config,
         )
 
 
@@ -454,6 +580,20 @@ def _toml_int(
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{name} must be an integer")
     return _validate_int(value, name, minimum=minimum, maximum=maximum)
+
+
+def _positive_decimal(value: object, name: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (Decimal, int, float, str)):
+        raise ValueError(f"{name} must be a decimal number")
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"{name} must be a decimal number") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"{name} must be finite")
+    if parsed <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return parsed
 
 
 def _env_int(

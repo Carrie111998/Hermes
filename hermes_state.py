@@ -139,7 +139,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -943,6 +943,56 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
+    id TEXT PRIMARY KEY,
+    source_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+    bridge_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    reserved_claude_uuid TEXT NOT NULL UNIQUE,
+    native_name TEXT NOT NULL,
+    source_provider TEXT NOT NULL CHECK (source_provider IN ('codex', 'hermes')),
+    source_cwd TEXT NOT NULL,
+    git_root TEXT,
+    git_branch TEXT,
+    git_head TEXT,
+    worktree_id TEXT,
+    signed_marker TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'claude_pending', 'claude_leased', 'claude_retry',
+            'claude_visible', 'claude_failed'
+        )
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT,
+    lease_expires_at REAL,
+    error_code TEXT,
+    error_detail TEXT,
+    completion_digest TEXT,
+    eligible_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    visible_at REAL,
+    CHECK (
+        (state = 'claude_leased' AND lease_digest IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state != 'claude_leased' AND lease_digest IS NULL AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        state != 'claude_visible'
+        OR (completion_digest IS NOT NULL AND visible_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS session_claude_registration_usage (
+    local_day TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES session_claude_visibility_jobs(id),
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+    reserved_estimated_cost_usd TEXT NOT NULL,
+    reserved_at REAL NOT NULL,
+    UNIQUE(job_id, attempt_ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS session_context_packs (
     id TEXT PRIMARY KEY,
     bridge_id TEXT NOT NULL,
@@ -987,6 +1037,13 @@ CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_completion_digest
 CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_visible_at
     ON session_sidebar_jobs(state, visible_at DESC, id DESC)
     WHERE visible_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_state_next_attempt_at
+    ON session_claude_visibility_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_lease_digest
+    ON session_claude_visibility_jobs(lease_digest)
+    WHERE lease_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_claude_registration_usage_local_day
+    ON session_claude_registration_usage(local_day, reserved_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
