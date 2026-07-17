@@ -188,6 +188,7 @@ _SIDEBAR_REGISTRATION_CURSOR_VERSION = 1
 _SIDEBAR_REGISTRATION_QUERY_BUDGET = 4
 _SIDEBAR_REGISTRATION_EXAMINED_BUDGET = 40
 _SIDEBAR_REGISTRATION_PAGE_SIZE = 10
+_SIDEBAR_NEWEST_PROBE_SIZE = 30
 _SIDEBAR_BACKFILL_QUERY_BUDGET = 100
 _SIDEBAR_BACKFILL_EXAMINED_BUDGET = 1000
 # Foreground cancellation recovery is intentionally short. Unfinished ownership
@@ -966,21 +967,25 @@ class SessionBridgeCoordinator:
             and query_count < query_budget
             and examined < examined_budget
         ):
-            remaining_queue_capacity = (
-                _SIDEBAR_REGISTRATION_PAGE_SIZE
-                if persist_cursor and newest_probe
-                else limit - queued
-                if persist_cursor
-                else _SIDEBAR_REGISTRATION_PAGE_SIZE
-            )
-            page_size = max(
-                1,
-                min(
-                    remaining_queue_capacity,
-                    _SIDEBAR_REGISTRATION_PAGE_SIZE,
+            if persist_cursor and newest_probe:
+                page_size = min(
+                    _SIDEBAR_NEWEST_PROBE_SIZE,
                     examined_budget - examined,
-                ),
-            )
+                )
+            else:
+                remaining_queue_capacity = (
+                    limit - queued
+                    if persist_cursor
+                    else _SIDEBAR_REGISTRATION_PAGE_SIZE
+                )
+                page_size = max(
+                    1,
+                    min(
+                        remaining_queue_capacity,
+                        _SIDEBAR_REGISTRATION_PAGE_SIZE,
+                        examined_budget - examined,
+                    ),
+                )
             raw_page = await asyncio.to_thread(
                 _call,
                 self._store,
