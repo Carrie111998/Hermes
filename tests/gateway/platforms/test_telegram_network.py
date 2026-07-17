@@ -1,7 +1,7 @@
 """Test that sticky IP resets after repeated failures."""
 from unittest.mock import MagicMock
 
-from gateway.platforms.telegram_network import TelegramFallbackTransport
+from plugins.platforms.telegram.telegram_network import TelegramFallbackTransport
 
 
 def test_sticky_ip_resets_after_5_consecutive_failures():
