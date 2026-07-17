@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -89,6 +91,16 @@ async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_
     # Gateway stays alive in degraded mode; reconnect watcher takes over.
     assert ok is True
     assert runner.should_exit_cleanly is False
+
+    # Telegram now connects in the BACKGROUND (see _BACKGROUND_CONNECT_PLATFORMS),
+    # so its retryable failure is recorded by the background task shortly after
+    # start() returns rather than inline. Wait for it to land in the retry queue
+    # before asserting — same async semantics as WhatsApp's background connect.
+    for _ in range(300):  # ~3s ceiling
+        if Platform.TELEGRAM in runner._failed_platforms:
+            break
+        await asyncio.sleep(0.01)
+
     state = read_runtime_status()
     assert state["gateway_state"] in {"degraded", "running"}
     # Telegram was queued for retry, not given up on.

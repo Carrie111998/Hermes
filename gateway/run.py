@@ -2845,7 +2845,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # that 30s (boot forensics 2026-07-10). Firing it as a background task lets
     # the loop bind api_server immediately; failures fall into the existing
     # reconnect watcher, which keeps retrying at its 60-300s backoff.
-    _BACKGROUND_CONNECT_PLATFORMS: frozenset = frozenset({Platform.WHATSAPP})
+    #
+    # Telegram is backgrounded for the same reason (death forensics 2026-07-16):
+    # a NordVPN/DNS flap made all name resolution fail (``getaddrinfo failed``),
+    # so Telegram's inline boot connect blocked on its reconnect ladder and the
+    # gateway could not reach a running state until DNS recovered — a ~10-minute
+    # blip became a ~27-minute restart storm. Backgrounding lets the gateway boot
+    # (api_server bound, cron + event bus up) during the outage; Telegram wires
+    # itself in via the reconnect watcher once the network returns.
+    _BACKGROUND_CONNECT_PLATFORMS: frozenset = frozenset(
+        {Platform.WHATSAPP, Platform.TELEGRAM}
+    )
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
