@@ -42,9 +42,7 @@ def _aux_response(payload: dict):
     response = MagicMock()
     response.choices = [MagicMock()]
     response.choices[0].message.content = json.dumps(payload)
-    client = MagicMock()
-    client.chat.completions.create.return_value = response
-    return client
+    return response
 
 
 def test_board_allowed_profiles_round_trip_and_normalize(kanban_home):
@@ -247,13 +245,12 @@ def test_decomposer_filters_roster_and_uses_allowed_fallbacks(kanban_home, monke
             {"title": "security", "body": "audit", "assignee": "kitt", "parents": []},
         ],
     }
-    client = _aux_response(payload)
+    call_llm = MagicMock(return_value=_aux_response(payload))
     with patch("hermes_cli.profiles.list_profiles", return_value=_profiles(["alex", "kitt", "goggins", "chef"])), \
          patch("hermes_cli.profiles.profile_exists", return_value=True), \
          patch("hermes_cli.profiles.get_active_profile_name", return_value="goggins"), \
          patch("hermes_cli.kanban_decompose._load_config", return_value={"kanban": {}}), \
-         patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(client, "test-model")), \
-         patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={}):
+         patch("agent.auxiliary_client.call_llm", call_llm):
         outcome = decomp.decompose_task(task_id, author="test")
 
     assert outcome.ok, outcome.reason
@@ -263,7 +260,7 @@ def test_decomposer_filters_roster_and_uses_allowed_fallbacks(kanban_home, monke
 
     assert root.assignee == "alex"
     assert [child.assignee for child in children] == ["alex", "kitt"]
-    prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    prompt = call_llm.call_args.kwargs["messages"][1]["content"]
     assert "alex" in prompt and "kitt" in prompt
     assert "goggins" not in prompt and "chef" not in prompt
 
@@ -274,9 +271,9 @@ def test_decomposer_does_not_call_llm_when_allowlist_is_empty(kanban_home, monke
     with kb.connect(board="frozen") as conn:
         task_id = kb.create_task(conn, title="rough", triage=True, board="frozen")
 
-    with patch("agent.auxiliary_client.get_text_auxiliary_client") as get_client:
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
         outcome = decomp.decompose_task(task_id, author="test")
 
     assert outcome.ok is False
     assert "allowlist is empty" in outcome.reason
-    get_client.assert_not_called()
+    call_llm.assert_not_called()
