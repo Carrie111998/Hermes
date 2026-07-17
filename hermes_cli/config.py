@@ -2677,6 +2677,7 @@ DEFAULT_CONFIG = {
             "limit": 100,                 # Global cap on messages scanned per reconnect
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
         },
+        "history_full_thread": False,     # If True, walk the entire thread instead of stopping at the bot's most recent self-message (default: False — preserves existing partition behaviour)
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         # Discord Gateway transport health. These settings inspect the active
         # WebSocket's ready/open/heartbeat state; they never use Discord REST as
