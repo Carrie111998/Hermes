@@ -1,96 +1,87 @@
-# Missing Platform Plugin Shims — Known Issue (undocumented until now)
+# Missing Platform Plugin Shims — Resolved
 
-**Status:** Open — documented but not yet fixed, per explicit decision during a
-2026-07-09 cleanup pass (`claude/hermes-errors-xh2x9x`).
+**Status:** Closed. Resolved in two passes:
 
-## Problem
+1. PR #89 (`fix(gateway): restore built-in platforms dropped from setup
+   picker`) restored **telegram, slack, matrix, whatsapp, email, sms** as
+   inline `_PLATFORMS` entries.
+2. This pass restored the remaining four: **dingtalk, feishu, wecom, and
+   wecom_callback** (the last two weren't in the original inventory below —
+   found while re-auditing `_PLATFORMS` against its pre-refactor history).
+   Feishu additionally needed its bespoke `_setup_feishu()` interactive
+   function restored (QR-code onboarding), not just picker metadata — see
+   below.
+
+Option 3 from the original options list ("revert to inline `_PLATFORMS`
+definitions") is what was chosen for all ten platforms, for both passes:
+lowest risk, and consistent with the fact that every one of these adapters
+(`gateway/platforms/*.py`) was never actually migrated to the plugin-registry
+pattern the removed comments claimed.
+
+## Original problem
 
 `hermes_cli/gateway.py::_PLATFORMS` used to carry inline setup-wizard metadata
 (setup instructions, `vars` schemas, token env vars) for every messaging
 platform. Commit `e39b468` ("fix(gateway): source environment env and
-auto-wrap dispatch tool args") removed the inline entries for **telegram,
-slack, matrix, whatsapp, email, sms, wecom, and feishu**, replacing each with
-a comment claiming it "moved to `plugins/platforms/<name>/` — setup metadata
-discovered dynamically via the platform registry entry registered by
-`plugins/platforms/<name>/adapter.py::register()`."
+auto-wrap dispatch tool args") removed the inline entries for telegram,
+slack, matrix, whatsapp, email, sms, dingtalk, feishu, wecom, and
+wecom_callback, replacing each with a comment claiming it "moved to
+`plugins/platforms/<name>/`". Those plugin directories were never created —
+`git log --all` showed zero history for any of them. The directories that
+*do* exist under `plugins/platforms/` are: `discord`, `google_chat`, `irc`,
+`line`, `ntfy`, `simplex`, `teams` (all genuinely plugin-registered).
 
-Those 8 plugin directories were never created. `git log --all` shows zero
-history for any of `plugins/platforms/{telegram,slack,matrix,whatsapp,email,
-sms,wecom,feishu}/`. The directories that *do* exist under `plugins/platforms/`
-are: `discord`, `google_chat`, `irc`, `line`, `ntfy`, `simplex`, `teams` — all
-successfully discovered via `platform_registry`.
+Feishu was a deeper cut: the `_setup_feishu()` interactive function itself
+(QR-code bot registration via `gateway/platforms/feishu.qr_register()`) was
+deleted from `gateway.py`, not just its `_PLATFORMS` entry — a comment
+claimed it moved to `plugins/platforms/feishu/adapter.py::interactive_setup`,
+which never existed either.
 
-## Impact
+## What was NOT restored
 
-- **Gateway message routing is NOT affected.** The real adapter
-  implementations (`gateway/platforms/telegram.py`, `slack.py`, `matrix.py`,
-  `whatsapp.py`, `email.py`, `sms.py`, `wecom.py`, `feishu.py`) are all still
-  present and presumably functional — existing users with env vars already
-  configured should be unaffected.
-- **`hermes setup gateway`'s interactive picker no longer lists these 8
-  platforms at all** — new users cannot configure Telegram (or any of the
-  other 7) through the setup wizard; they'd have to hand-edit env vars with
-  no guided setup_instructions.
-- **`_platform_status()` / `_all_platforms()`-driven status displays** (setup
-  wizard, possibly other menus) silently omit these 8 platforms rather than
-  showing "not configured".
+`_setup_telegram`/`_setup_slack`/`_setup_matrix`/`_setup_whatsapp`/
+`_setup_dingtalk`/`_setup_wecom` bespoke interactive functions were **not**
+recreated — PR #89 established the precedent of using the generic
+vars-schema-driven `_setup_standard_platform()` flow for these instead
+(simpler prompt-per-env-var UX vs. the original's mix of QR/OAuth flows).
+This pass followed the same precedent for dingtalk, wecom, and
+wecom_callback. Only Feishu got its bespoke function back, because
+`tests/gateway/test_setup_feishu.py` (pre-existing, not written as part of
+either fix) explicitly exercises the QR-registration UX and specific
+`save_env_value` call sequence — the generic flow can't reproduce that.
 
-## Evidence / repro
+## Verification
 
-```
-python3 -c "
-from hermes_cli.plugins import discover_plugins
-discover_plugins()
-from gateway.platform_registry import platform_registry
-print(sorted(e.name for e in platform_registry.all_entries()))
-"
-# -> ['discord', 'google_chat', 'irc', 'line', 'ntfy', 'simplex', 'teams']
-# telegram/slack/matrix/whatsapp/email/sms/wecom/feishu are absent
-```
+- `tests/hermes_cli/test_gateway_platform_gating.py`,
+  `tests/hermes_cli/test_setup.py`,
+  `tests/hermes_cli/test_setup_openclaw_migration.py`,
+  `tests/gateway/test_setup_feishu.py` — all pass.
+- `hermes_cli.gateway._all_platforms()` now returns all 23 platforms
+  (10 restored/newly-added built-ins + mattermost/signal/weixin/bluebubbles/
+  qqbot/yuanbao + the 7 genuine plugin-registry entries), confirmed via:
+  ```
+  python3 -c "
+  import hermes_cli.gateway as gw
+  print([p['key'] for p in gw._all_platforms()])
+  "
+  ```
+- `ruff check hermes_cli/gateway.py` — clean.
 
-Test files currently failing because of this (all pre-existing failures,
-not caused by this cleanup pass):
+## CodeQL alert on restored `_setup_feishu()`
 
-- `tests/hermes_cli/test_gateway_platform_gating.py` —
-  `TestMatrixHiddenOnWindows::test_matrix_present_on_linux`,
-  `test_matrix_present_on_macos`, `test_other_platforms_unaffected_on_windows`
-  (asserts telegram/matrix are in the picker; they aren't, on any platform)
-- `tests/hermes_cli/test_setup.py` —
-  `test_setup_gateway_skips_service_install_when_systemctl_missing`,
-  `test_setup_gateway_in_container_shows_docker_guidance` (both rely on
-  Matrix showing as "configured" in the picker so `setup_gateway()` reaches
-  its "Messaging platforms configured!" branch)
-- `tests/hermes_cli/test_setup_openclaw_migration.py::TestGetSectionConfigSummary` —
-  `test_gateway_lists_platforms` (expects "Telegram" in the openclaw-migration
-  config summary; only "Discord" shows), `test_gateway_recognises_whatsapp_enabled`
-  (WhatsApp isn't recognized at all, summary is `None`)
-- `tests/gateway/test_setup_feishu.py` — all 14 tests fail with
-  `ImportError: cannot import name '_setup_feishu' from 'hermes_cli.gateway'`.
-  This one's slightly different: the function itself (not just the picker
-  metadata) was removed from `gateway.py` with a comment claiming it "moved to
-  plugins/platforms/feishu/adapter.py::interactive_setup" — that function
-  doesn't exist anywhere either. Whichever option below is chosen for Feishu
-  needs to restore an `interactive_setup`-equivalent entry point, not just a
-  `register()` metadata shim.
+Restoring `_setup_feishu()` reintroduced `save_env_value("FEISHU_APP_SECRET",
+app_secret)` (gateway.py:5740), which CodeQL flags as a new high-severity
+"clear-text storage of sensitive information" alert — it's new code in this
+diff's eyes, even though it's byte-for-byte the same pattern already used,
+unflagged, for every other credential in this file (e.g.
+`save_env_value("WEIXIN_TOKEN", token)` at gateway.py:5540,
+`save_env_value("QQ_CLIENT_SECRET", ...)` at gateway.py:5878).
+`save_env_value()` (`hermes_cli/config.py:5107`) writes every credential in
+the app to a plaintext `~/.hermes/.env` file protected by restrictive file
+permissions (`_secure_file()`, 0600), never encryption — this is the CLI's
+established, deliberate credential-storage design (same model as `aws`, `gh`,
+git-credential-store), not a new vulnerability class introduced here.
 
-## Options considered (not yet decided)
-
-1. **Restore Telegram only** as a proof of concept, matching
-   `plugins/platforms/discord/adapter.py`'s registration pattern, and follow
-   up on the other 7 separately.
-2. **Restore all 8** plugin adapter shims — larger effort, 8 new files, each
-   needs to correctly reproduce the removed `vars`/`setup_instructions`/
-   `install_hint`/`is_connected`/`check_fn` contract without introducing
-   drift from the real `gateway/platforms/*.py` adapters.
-3. **Revert to inline `_PLATFORMS` definitions** for these 8 — lowest risk,
-   but reverses whatever the plugin-registry refactor was meant to
-   accomplish (see `e39b468`'s commit message/diff for the rest of the
-   intended architecture).
-4. Something else — worth checking with whoever authored `e39b468` whether
-   the plugin shims exist in an unpushed branch/local checkout, since the
-   commit message describes them as already done.
-
-## Next step
-
-Needs an explicit decision on which option above before someone picks this
-up — flagged here per user request rather than acted on unilaterally.
+Decision: dismiss the alert on GitHub's Security tab as a false positive
+rather than change the storage architecture or add an unverified suppression
+comment.

@@ -134,9 +134,23 @@ class TestSetupFeishuConnectionMode:
         env = _run_setup_feishu(
             qr_result=None,
             prompt_choice_responses=[1, 0, 1, 0, 0],  # method=manual, domain=feishu, connection=webhook, dm=pairing, group=open
-            prompt_responses=["cli_manual", "secret_manual", ""],  # app_id, app_secret, home_channel
+            prompt_responses=["cli_manual", "secret_manual", "verify_token_test", "", ""],  # app_id, app_secret, verification_token, encrypt_key, home_channel
         )
         assert env["FEISHU_CONNECTION_MODE"] == "webhook"
+        assert env["FEISHU_VERIFICATION_TOKEN"] == "verify_token_test"
+        assert "FEISHU_ENCRYPT_KEY" not in env
+
+    @patch("gateway.platforms.feishu.probe_bot", return_value=None)
+    def test_manual_path_webhook_without_verification_falls_back_to_websocket(self, _mock_probe):
+        """Refusing to enable an unauthenticated public webhook endpoint (security)."""
+        env = _run_setup_feishu(
+            qr_result=None,
+            prompt_choice_responses=[1, 0, 1, 0, 0],  # method=manual, domain=feishu, connection=webhook, dm=pairing, group=open
+            prompt_responses=["cli_manual", "secret_manual", "", "", ""],  # app_id, app_secret, verification_token=blank, encrypt_key=blank, home_channel
+        )
+        assert env["FEISHU_CONNECTION_MODE"] == "websocket"
+        assert "FEISHU_VERIFICATION_TOKEN" not in env
+        assert "FEISHU_ENCRYPT_KEY" not in env
 
 
 # ---------------------------------------------------------------------------
