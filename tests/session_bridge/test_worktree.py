@@ -203,7 +203,7 @@ def test_worktree_git_probes_share_one_total_deadline(
     def run(command: list[str], **kwargs: object) -> SimpleNamespace:
         timeout = float(kwargs["timeout"])
         timeouts.append(timeout)
-        clock[0] += 2.0
+        clock[0] += 6.0
         args = command[3:]
         if args == ["rev-parse", "--show-toplevel"]:
             output = str(source)
@@ -222,7 +222,7 @@ def test_worktree_git_probes_share_one_total_deadline(
         capture_worktree_snapshot(str(source))
 
     assert raised.value.code == "source_identity_mismatch"
-    assert timeouts == [5.0, 3.0, 1.0]
+    assert timeouts == [15.0, 9.0, 3.0]
 
 
 def test_worktree_validation_allows_branch_and_head_drift_with_truthful_warnings(
