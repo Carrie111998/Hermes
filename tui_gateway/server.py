@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from hashlib import sha256
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -3985,6 +3986,119 @@ def _(rid, params: dict) -> dict:
             "messages": _history_to_messages(history),
         },
     )
+
+
+_HOST_RESULT_TYPE = "hermes.host.execution.result.v1"
+_HOST_RESULT_MARKER = "HOST_EXECUTION_RESULT_V1"
+_HOST_RESULT_FIELDS = (
+    "receipt_version", "status", "code", "request_id", "correlation", "workspace_id",
+    "cwd", "tool", "stdout", "stderr", "exit_code", "signal", "timed_out",
+    "cancelled", "artifacts", "started_at", "finished_at", "request_sha256",
+)
+_HOST_RESULT_CAPABILITY_TTL_S = 300
+
+
+def _host_result_canonical(value: Any) -> str:
+    if isinstance(value, list):
+        return "[" + ",".join(_host_result_canonical(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            json.dumps(key, separators=(",", ":")) + ":" + _host_result_canonical(value[key])
+            for key in sorted(value)
+        ) + "}"
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def _restricted_host_receipt(receipt: Any) -> dict:
+    if not isinstance(receipt, dict) or isinstance(receipt, list):
+        raise ValueError("INVALID_HOST_RECEIPT")
+    safe = {field: receipt[field] for field in _HOST_RESULT_FIELDS if field in receipt}
+    if safe.get("receipt_version") != 1 or not isinstance(safe.get("request_id"), str):
+        raise ValueError("INVALID_HOST_RECEIPT")
+    correlation = safe.get("correlation")
+    if not isinstance(correlation, dict) or not isinstance(correlation.get("canonical_session_id"), str):
+        raise ValueError("INVALID_HOST_CORRELATION")
+    if not isinstance(safe.get("artifacts"), list):
+        raise ValueError("INVALID_HOST_ARTIFACTS")
+    return safe
+
+
+def _host_result_hash(receipt: dict) -> str:
+    return sha256(_host_result_canonical(receipt).encode("utf-8")).hexdigest()
+
+
+@method("session.host_result.prepare")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    request_id = params.get("request_id")
+    correlation_id = params.get("correlation_id")
+    if not isinstance(request_id, str) or not isinstance(correlation_id, str):
+        return _err(rid, 4002, "request_id and correlation_id are required")
+    if len(request_id) > 128 or len(correlation_id) > 128:
+        return _err(rid, 4002, "request_id and correlation_id are too long")
+    with session["history_lock"]:
+        pending = session.setdefault("host_result_pending", {})
+        prior = pending.get(request_id)
+        if prior and prior["correlation_id"] != correlation_id:
+            return _err(rid, 4090, "host result request id is already bound")
+        if not prior:
+            prior = {"correlation_id": correlation_id, "capability": uuid.uuid4().hex + uuid.uuid4().hex, "expires_at": time.time() + _HOST_RESULT_CAPABILITY_TTL_S}
+            pending[request_id] = prior
+    return _ok(rid, {"session_id": session["session_key"], "request_id": request_id, "correlation_id": correlation_id, "capability": prior["capability"], "result_type": _HOST_RESULT_TYPE})
+
+
+@method("session.host_result.append")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    request_id = params.get("request_id")
+    correlation_id = params.get("correlation_id")
+    capability = params.get("capability")
+    try:
+        receipt = _restricted_host_receipt(params.get("receipt"))
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    if params.get("result_type") != _HOST_RESULT_TYPE:
+        return _err(rid, 4002, "unsupported host result type")
+    if receipt["request_id"] != request_id or receipt["correlation"].get("canonical_session_id") != session["session_key"]:
+        return _err(rid, 4003, "host result correlation mismatch")
+    if not isinstance(correlation_id, str) or not isinstance(capability, str):
+        return _err(rid, 4002, "correlation_id and capability are required")
+    expected_hash = _host_result_hash(receipt)
+    if params.get("receipt_hash") != expected_hash:
+        return _err(rid, 4003, "host receipt hash mismatch")
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5008)
+    with session["history_lock"]:
+        pending = session.setdefault("host_result_pending", {})
+        prior = pending.get(request_id)
+        if not prior:
+            for message in db.get_messages(session["session_key"]):
+                if message.get("message_id") != request_id:
+                    continue
+                content = str(message.get("content") or "")
+                if _HOST_RESULT_MARKER not in content or expected_hash not in content:
+                    return _err(rid, 4090, "host result request id is already bound")
+                return _ok(rid, {"status": "attached", "replayed": True, "message_id": message.get("id"), "receipt_hash": expected_hash})
+        if not prior or prior["correlation_id"] != correlation_id or prior["capability"] != capability:
+            return _err(rid, 4010, "host result capability rejected")
+        if prior.get("expires_at", 0) <= time.time():
+            return _err(rid, 4010, "host result capability expired")
+        if prior.get("receipt_hash"):
+            if prior["receipt_hash"] != expected_hash:
+                return _err(rid, 4090, "host result request id is already bound")
+            return _ok(rid, {"status": "attached", "replayed": True, "message_id": prior["message_id"], "receipt_hash": expected_hash})
+        content = f"{_HOST_RESULT_MARKER}\n" + json.dumps({"result_type": _HOST_RESULT_TYPE, "request_id": request_id, "correlation_id": correlation_id, "receipt_hash": expected_hash, "receipt": receipt}, ensure_ascii=False, separators=(",", ":"))
+        message_id = db.append_message(session_id=session["session_key"], role="assistant", content=content, tool_name="hermes_host_execution", platform_message_id=request_id, observed=True)
+        session["history"].append({"role": "assistant", "content": content, "tool_name": "hermes_host_execution", "message_id": request_id, "observed": True})
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        prior.update({"receipt_hash": expected_hash, "message_id": message_id})
+    _emit("message.complete", params.get("session_id", ""), {"text": content, "host_result": True, "request_id": request_id, "receipt_hash": expected_hash})
+    return _ok(rid, {"status": "attached", "replayed": False, "message_id": message_id, "receipt_hash": expected_hash})
 
 
 @method("session.undo")
