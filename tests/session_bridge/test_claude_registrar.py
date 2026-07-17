@@ -968,6 +968,39 @@ def test_offline_interactive_fixture_records_frames_exit_and_delayed_index(tmp_p
     ]
 
 
+def test_offline_fixture_reads_complete_multiline_bracketed_paste_frame(
+    tmp_path: Path,
+) -> None:
+    record = tmp_path / "multiline-record.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    process = subprocess.Popen(
+        [sys.executable, str(fixture), "--session-id", "offline-multiline"],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "FAKE_CLAUDE_RECORD": str(record),
+            "FAKE_CLAUDE_SCENARIO": "registered",
+        },
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    frame = b"\x1b[200~first line\r\nsecond line\nthird line\x1b[201~\r"
+    process.stdin.write(frame)
+    process.stdin.flush()
+    assert b"REGISTERED" in process.stdout.readline()
+    process.stdin.write(b"/exit\r\n")
+    process.stdin.flush()
+    assert process.wait(timeout=2) == 0
+    events = json.loads(record.read_text(encoding="utf-8"))
+    assert events[1] == {
+        "event": "stdin",
+        "frame": frame.decode("utf-8"),
+    }
+    assert events[3] == {"event": "stdin", "frame": "/exit\r\n"}
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_code", "expected_output"),
     [
@@ -1043,8 +1076,15 @@ def test_real_windows_conpty_fixture_exit_and_cleanup(
         [sys.executable, str(fixture), "--session-id", "real-conpty-uuid"],
         cwd=str(tmp_path),
     )
-    process.write("\x1b[200~registration prompt\x1b[201~\r")
-    output = process.read_until(10.0, prompt="registration prompt")
+    registration_prompt = (
+        build_claude_registration_prompt(
+            candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
+        )
+        if scenario == "registered"
+        else "registration prompt"
+    )
+    process.write(f"\x1b[200~{registration_prompt}\x1b[201~\r")
+    output = process.read_until(10.0, prompt=registration_prompt)
     process.write("/exit\r")
     assert output.strip().splitlines() == expected_lines
     assert process.wait(10.0) == expected_exit
@@ -1054,7 +1094,8 @@ def test_real_windows_conpty_fixture_exit_and_cleanup(
     events = json.loads(record.read_text(encoding="utf-8"))
     assert events[0]["cwd"] == str(tmp_path)
     assert events[0]["argv"] == ["--session-id", "real-conpty-uuid"]
-    assert "registration prompt" in events[1]["frame"]
+    assert events[1]["frame"].rstrip("\r\n") == registration_prompt.replace("\n", "")
+    assert events[-2]["frame"].strip() == "/exit"
 
 
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")

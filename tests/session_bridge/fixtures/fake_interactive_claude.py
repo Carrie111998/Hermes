@@ -9,6 +9,11 @@ import sys
 import time
 
 
+_BRACKETED_PASTE_OPEN = b"\x1b[200~"
+_BRACKETED_PASTE_CLOSE = b"\x1b[201~"
+_MAX_FRAME_BYTES = 65_536
+
+
 def _record(**values: object) -> None:
     path = Path(os.environ["FAKE_CLAUDE_RECORD"])
     current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
@@ -18,7 +23,27 @@ def _record(**values: object) -> None:
 
 def _read_frame() -> str:
     data = bytearray()
-    while True:
+    while len(data) < len(_BRACKETED_PASTE_OPEN):
+        byte = sys.stdin.buffer.read(1)
+        if not byte:
+            break
+        data.extend(byte)
+        if byte in (b"\r", b"\n"):
+            return bytes(data).decode("utf-8", errors="replace")
+    if data == _BRACKETED_PASTE_OPEN:
+        while len(data) < _MAX_FRAME_BYTES and not data.endswith(
+            _BRACKETED_PASTE_CLOSE
+        ):
+            byte = sys.stdin.buffer.read(1)
+            if not byte:
+                break
+            data.extend(byte)
+        if data.endswith(_BRACKETED_PASTE_CLOSE):
+            terminator = sys.stdin.buffer.read(1)
+            if terminator in (b"\r", b"\n"):
+                data.extend(terminator)
+        return bytes(data).decode("utf-8", errors="replace")
+    while len(data) < _MAX_FRAME_BYTES:
         byte = sys.stdin.buffer.read(1)
         if not byte:
             break
@@ -35,6 +60,8 @@ def main() -> int:
         sys.stdout.write("Authentication required\r\n")
         sys.stdout.flush()
         return _exit(scenario, 1)
+    sys.stdout.write("\x1b[?2004h")
+    sys.stdout.flush()
     frame = _read_frame()
     _record(event="stdin", frame=frame)
     _record(event="native_created", session_id=_session_id())

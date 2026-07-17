@@ -783,6 +783,10 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
     """Remove only recognized terminal echo/UI framing, preserving other output."""
 
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    if prompt is not None:
+        for exact_echo in (prompt, prompt.replace("\n", "")):
+            if exact_echo in cleaned:
+                cleaned = cleaned.replace(exact_echo, "", 1)
     prompt_lines = (
         {line.strip() for line in prompt.splitlines()} if prompt is not None else set()
     )
