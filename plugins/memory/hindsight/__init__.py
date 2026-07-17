@@ -559,16 +559,51 @@ def _embedded_profile_env_path(config: dict[str, Any]):
     return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
-def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
+def _materialize_embedded_profile_env(
+    config: dict[str, Any], *, llm_api_key: str | None = None
+):
     """Write the profile-scoped env file that standalone hindsight-embed uses."""
+    import tempfile
+
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
-    profile_env.write_text(
-        "".join(f"{key}={value}\n" for key, value in env_values.items()),
-        encoding="utf-8",
+    content = "".join(f"{key}={value}\n" for key, value in env_values.items())
+
+    # This file contains the embedded daemon's plaintext LLM API key. Create
+    # the replacement at 0600 before writing any bytes so a normal 022 umask
+    # never exposes credentials, even briefly between write and chmod.
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(profile_env.parent),
+        prefix=f".{profile_env.stem}_",
+        suffix=".tmp",
     )
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        from utils import atomic_replace
+
+        real_path = atomic_replace(tmp_path, profile_env)
+        try:
+            os.chmod(real_path, 0o600)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return profile_env
+
 
 def _sanitize_bank_segment(value: str) -> str:
     """Sanitize a bank_id_template placeholder value.

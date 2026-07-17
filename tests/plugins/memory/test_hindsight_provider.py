@@ -25,6 +25,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
+    _materialize_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -398,6 +399,12 @@ class TestPostSetup:
         monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-local-test")
         saved_configs = []
         monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved_configs.append(cfg.copy()))
+        monkeypatch.setattr(
+            "tools.lazy_deps.install_specs",
+            lambda *args, **kwargs: SimpleNamespace(
+                ok=True, blocked=False, reason="", stderr=""
+            ),
+        )
 
         provider = HindsightMemoryProvider()
         provider.post_setup(str(hermes_home), {"memory": {}})
@@ -410,6 +417,8 @@ class TestPostSetup:
 
         profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
         assert profile_env.exists()
+        if os.name != "nt":
+            assert stat.S_IMODE(profile_env.stat().st_mode) == 0o600
         assert profile_env.read_text() == (
             "HINDSIGHT_API_LLM_PROVIDER=openai\n"
             "HINDSIGHT_API_LLM_API_KEY=sk-local-test\n"
@@ -417,6 +426,60 @@ class TestPostSetup:
             "HINDSIGHT_API_LOG_LEVEL=info\n"
             "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT=300\n"
         )
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not enforced on Windows")
+    def test_embedded_profile_env_rewrite_tightens_existing_permissions(
+        self, tmp_path, monkeypatch
+    ):
+        user_home = tmp_path / "user-home"
+        profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True)
+        profile_env.write_text("HINDSIGHT_API_LLM_API_KEY=stale\n", encoding="utf-8")
+        os.chmod(profile_env, 0o644)
+        monkeypatch.setenv("HOME", str(user_home))
+
+        _materialize_embedded_profile_env(
+            {
+                "profile": "hermes",
+                "llm_provider": "openai",
+                "llm_model": "gpt-4o-mini",
+            },
+            llm_api_key="sk-current",
+        )
+
+        assert stat.S_IMODE(profile_env.stat().st_mode) == 0o600
+        assert "HINDSIGHT_API_LLM_API_KEY=sk-current\n" in profile_env.read_text(
+            encoding="utf-8"
+        )
+
+    def test_embedded_profile_env_replace_failure_preserves_existing_file(
+        self, tmp_path, monkeypatch
+    ):
+        user_home = tmp_path / "user-home"
+        profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True)
+        profile_env.write_text("HINDSIGHT_API_LLM_API_KEY=stale\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(user_home))
+
+        def fail_replace(*args, **kwargs):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr("utils.atomic_replace", fail_replace)
+
+        with pytest.raises(OSError, match="simulated replace failure"):
+            _materialize_embedded_profile_env(
+                {
+                    "profile": "hermes",
+                    "llm_provider": "openai",
+                    "llm_model": "gpt-4o-mini",
+                },
+                llm_api_key="sk-current",
+            )
+
+        assert profile_env.read_text(encoding="utf-8") == (
+            "HINDSIGHT_API_LLM_API_KEY=stale\n"
+        )
+        assert list(profile_env.parent.glob(".hermes_*.tmp")) == []
 
 
 # ---------------------------------------------------------------------------
