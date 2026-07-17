@@ -2887,6 +2887,24 @@ def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tm
         "profile": "main",
     }
 
+    candidate = SidebarCandidate(
+        source_session_id="hermes-profile-native",
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id("hermes-profile-native"),
+        title="[Hermes] ship the cross-profile sidebar bridge",
+        cwd="C:/workspace/profile-project",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    queued = store.enqueue_sidebar_job(candidate)
+    assert queued["created"] is True
+    assert _rows(db, "SELECT source FROM sessions WHERE id = ?", (
+        "hermes-profile-native",
+    )) == [{"source": "session_bridge_profile"}]
+
     read = UnifiedCatalog(db, store).get("hermes-profile-native")
     assert read["session"]["profile"] == "main"
     assert read["messages"][0]["content"] == (

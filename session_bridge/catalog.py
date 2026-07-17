@@ -16,7 +16,7 @@ from .store import SessionBridgeStore
 
 _MAX_LIMIT = 100
 _MAX_WINDOW = 200
-_HIDDEN_SOURCES = ("subagent", "tool")
+_HIDDEN_SOURCES = ("subagent", "tool", "session_bridge_profile")
 _MESSAGE_COLUMNS = (
     "id, session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp"
 )
@@ -211,6 +211,8 @@ class UnifiedCatalog:
                         else catalog._read(session_id, window=window)
                     )
                 except KeyError:
+                    continue
+                if not owned and result["session"].get("source") == "session_bridge_profile":
                     continue
                 if owned:
                     result["session"]["profile"] = profile

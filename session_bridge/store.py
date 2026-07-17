@@ -53,6 +53,7 @@ _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
+_PROFILE_SHADOW_SOURCE = "session_bridge_profile"
 _WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
 _WORKTREE_SNAPSHOT_FIELDS = frozenset({
     "version",
@@ -694,6 +695,7 @@ class SessionBridgeStore:
         cursor_clause = ""
         query_params: dict[str, Any] = {
             "activity_prefix": "session-bridge:external-activity:",
+            "profile_shadow_source": _PROFILE_SHADOW_SOURCE,
             "origin_kind": OriginKind.NATIVE.value,
             "after": cutoff,
             "queued": MirrorJobState.QUEUED.value,
@@ -992,6 +994,7 @@ class SessionBridgeStore:
             "claude": Provider.CLAUDE.value,
             "native": OriginKind.NATIVE.value,
             "activity_prefix": "session-bridge:external-activity:",
+            "profile_shadow_source": _PROFILE_SHADOW_SOURCE,
             "query_limit": limit + 1,
         }
         if normalized_cursor is not None:
@@ -1066,6 +1069,7 @@ class SessionBridgeStore:
                                 )
                             )
                         )
+                          AND s.source != :profile_shadow_source
                           AND NOT EXISTS (
                               SELECT 1
                                 FROM session_sidebar_jobs AS sidebar_job
@@ -1352,10 +1356,12 @@ class SessionBridgeStore:
                     conn = database._conn
                     assert conn is not None
                     row = conn.execute(
-                        "SELECT title, cwd FROM sessions WHERE id = ?",
+                        "SELECT source, title, cwd FROM sessions WHERE id = ?",
                         (normalized_session_id,),
                     ).fetchone()
                 if row is None:
+                    continue
+                if row["source"] == _PROFILE_SHADOW_SOURCE:
                     continue
                 metadata = {"title": row["title"], "cwd": row["cwd"]}
                 if owned:
@@ -1400,6 +1406,8 @@ class SessionBridgeStore:
                 (normalized_session_id,),
                     ).fetchone()
                     if session_row is None:
+                        continue
+                    if session_row["source"] == _PROFILE_SHADOW_SOURCE:
                         continue
                     message_rows = conn.execute(
                 """SELECT id, role, content, tool_call_id, tool_calls,
@@ -1626,8 +1634,46 @@ class SessionBridgeStore:
         eligible_at = _finite_number(candidate.eligible_at, "sidebar eligible_at")
         now = _finite_number(self._clock(), "store clock")
         job_id = f"sidebar-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+        launch_metadata = self.get_session_launch_metadata(candidate.source_session_id)
+        profile = (
+            launch_metadata.get("profile")
+            if isinstance(launch_metadata, Mapping)
+            else None
+        )
 
         def _write(conn):
+            source_row = conn.execute(
+                "SELECT source, model_config FROM sessions WHERE id = ?",
+                (candidate.source_session_id,),
+            ).fetchone()
+            if source_row is None:
+                if not isinstance(profile, str) or not profile.strip():
+                    raise KeyError(candidate.source_session_id)
+                model_config = json.dumps(
+                    {"_session_bridge_profile": profile.strip()},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    """INSERT INTO sessions (
+                           id, source, model_config, started_at, title, cwd
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        candidate.source_session_id,
+                        _PROFILE_SHADOW_SOURCE,
+                        model_config,
+                        eligible_at,
+                        launch_metadata.get("title") if launch_metadata else None,
+                        candidate.cwd,
+                    ),
+                )
+            elif source_row["source"] == _PROFILE_SHADOW_SOURCE:
+                try:
+                    shadow_config = json.loads(source_row["model_config"] or "{}")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid profile shadow identity") from exc
+                if shadow_config.get("_session_bridge_profile") != profile:
+                    raise ValueError("conflicting profile shadow identity")
             insert = conn.execute(
                 """INSERT OR IGNORE INTO session_sidebar_jobs (
                    id, idempotency_key, source_session_id, bridge_id, state,
