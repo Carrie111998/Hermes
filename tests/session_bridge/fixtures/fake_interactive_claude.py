@@ -1,4 +1,9 @@
-"""Deterministic, offline interactive-Claude stand-in used by registrar tests."""
+"""Deterministic, offline interactive-Claude stand-in used by registrar tests.
+
+ConPTY may collapse multiline bracketed-paste input before this fixture records it.
+That transport normalization is fixture-only: production registration still verifies
+the exact canonical prompt parsed from Claude's native JSONL transcript.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import BinaryIO
 
 
 _BRACKETED_PASTE_OPEN = b"\x1b[200~"
@@ -21,10 +27,11 @@ def _record(**values: object) -> None:
     path.write_text(json.dumps(current, sort_keys=True), encoding="utf-8")
 
 
-def _read_frame() -> str:
+def _read_frame(stream: BinaryIO | None = None) -> str:
+    input_stream = stream or sys.stdin.buffer
     data = bytearray()
     while len(data) < len(_BRACKETED_PASTE_OPEN):
-        byte = sys.stdin.buffer.read(1)
+        byte = input_stream.read(1)
         if not byte:
             break
         data.extend(byte)
@@ -34,17 +41,17 @@ def _read_frame() -> str:
         while len(data) < _MAX_FRAME_BYTES and not data.endswith(
             _BRACKETED_PASTE_CLOSE
         ):
-            byte = sys.stdin.buffer.read(1)
+            byte = input_stream.read(1)
             if not byte:
                 break
             data.extend(byte)
         if data.endswith(_BRACKETED_PASTE_CLOSE):
-            terminator = sys.stdin.buffer.read(1)
+            terminator = input_stream.read(1)
             if terminator in (b"\r", b"\n"):
                 data.extend(terminator)
         return bytes(data).decode("utf-8", errors="replace")
     while len(data) < _MAX_FRAME_BYTES:
-        byte = sys.stdin.buffer.read(1)
+        byte = input_stream.read(1)
         if not byte:
             break
         data.extend(byte)

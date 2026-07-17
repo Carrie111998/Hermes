@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib.metadata
+import inspect
 import json
 import os
 import queue
@@ -14,7 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from .claude_adapter import (
     ClaudeParseResult,
@@ -33,8 +35,7 @@ from .models import OriginKind, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
-_RESPONSE_SETTLE_SECONDS = 0.1
-_WINPTY_SPAWN_LOCK = threading.Lock()
+_RESPONSE_SETTLE_SECONDS = 0.25
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
@@ -117,46 +118,130 @@ class WindowsConPtyFactory:
         if not sys.platform.startswith("win"):
             raise RuntimeError("pty unavailable")
         try:
-            from winpty import PtyProcess
-            from winpty import ptyprocess as winpty_module
-        except ImportError as exc:
-            raise RuntimeError("pty unavailable") from exc
-        try:
-            with _WINPTY_SPAWN_LOCK:
-                previous_blocking = os.environ.get("PYWINPTY_BLOCK")
-                original_reader = getattr(winpty_module, "_read_in_thread")
-                os.environ["PYWINPTY_BLOCK"] = "0"
-                setattr(winpty_module, "_read_in_thread", _winpty_nonblocking_reader)
-                try:
-                    process = PtyProcess.spawn(
-                        list(argv), cwd=cwd, env=os.environ.copy(), dimensions=(24, 120)
-                    )
-                finally:
-                    setattr(winpty_module, "_read_in_thread", original_reader)
-                    if previous_blocking is None:
-                        os.environ.pop("PYWINPTY_BLOCK", None)
-                    else:
-                        os.environ["PYWINPTY_BLOCK"] = previous_blocking
+            process = self._spawn_process(list(argv), cwd=cwd)
         except FileNotFoundError:
             raise
         except Exception as exc:
             raise RuntimeError("pty unavailable") from exc
+        try:
+            return self._adapt_process(process)
+        except Exception as exc:
+            _reclaim_unadapted_process(process, timeout=2.0)
+            raise RuntimeError("pty unavailable") from exc
+
+    def _spawn_process(self, argv: list[str], *, cwd: str) -> object:
+        process_type = _registrar_pywinpty_process_type()
+        return process_type.spawn(
+            argv, cwd=cwd, env=os.environ.copy(), dimensions=(24, 120)
+        )
+
+    def _adapt_process(self, spawned: object) -> _WinPtyProcess:
         return _WinPtyProcess(
-            process, require_supported_layout=True, direct_native_pty=True
+            spawned, require_supported_layout=True, direct_native_pty=True
         )
 
 
-def _winpty_nonblocking_reader(address: object, pty: object, blocking: bool) -> None:
-    """Disable pywinpty 2.x's unjoinable reader; the wrapper reads the PTY directly."""
-
-    del pty, blocking
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _registrar_pywinpty_process_type() -> Any:
     try:
-        client.connect(address)  # type: ignore[arg-type]
+        from winpty import PTY, PtyProcess
+    except ImportError as exc:
+        raise RuntimeError("pywinpty import unavailable") from exc
+    try:
+        version = importlib.metadata.version("pywinpty")
+        major = int(version.split(".", 1)[0])
+    except (importlib.metadata.PackageNotFoundError, ValueError) as exc:
+        raise RuntimeError("pywinpty version unavailable") from exc
+    if major != 2:
+        raise RuntimeError(f"unsupported pywinpty major version: {version}")
+    spawn_parameters = tuple(inspect.signature(PtyProcess.spawn).parameters)
+    if spawn_parameters != ("argv", "cwd", "env", "dimensions", "backend"):
+        raise RuntimeError("unsupported pywinpty spawn signature")
+    if not all(
+        callable(getattr(PtyProcess, name, None))
+        for name in ("spawn", "isalive", "terminate")
+    ):
+        raise RuntimeError("unsupported pywinpty process API")
+    if not all(
+        callable(getattr(PTY, name, None))
+        for name in ("read", "write", "iseof", "isalive", "get_exitstatus")
+    ):
+        raise RuntimeError("unsupported pywinpty PTY API")
+
+    class _RegistrarPtyProcess(PtyProcess):
+        """Registrar-only transport; avoids pywinpty's process-global reader hook."""
+
+        def __init__(self, pty: object) -> None:
+            self.pty = pty
+            self.pid = pty.pid  # type: ignore[attr-defined]
+            self.read_blocking = False
+            self.closed = False
+            self.flag_eof = False
+            self.delayafterterminate = 0.1
+            self.delayafterclose = 0.1
+            self.fileobj, self._server = socket.socketpair()
+            self.fd = self.fileobj.fileno()
+            self._thread = threading.Thread(
+                target=lambda: None,
+                daemon=True,
+                name="session-bridge-winpty-transport",
+            )
+            self._thread.start()
+
+    return _RegistrarPtyProcess
+
+
+def _reclaim_unadapted_process(process: object, *, timeout: float) -> None:
+    try:
+        alive = bool(process.isalive())  # type: ignore[attr-defined]
     except Exception:
-        return
-    finally:
-        client.close()
+        alive = True
+    if alive:
+        try:
+            process.terminate(force=True)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    deadline = time.monotonic() + timeout
+    while alive and time.monotonic() < deadline:
+        try:
+            alive = bool(process.isalive())  # type: ignore[attr-defined]
+        except Exception:
+            break
+        if alive:
+            time.sleep(0.01)
+    if alive:
+        pid = getattr(process, "pid", None)
+        if type(pid) is int:
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+    for name in ("fileobj", "_server"):
+        resource = getattr(process, name, None)
+        try:
+            shutdown = getattr(resource, "shutdown", None)
+            if callable(shutdown):
+                shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+    try:
+        setattr(process, "fd", -1)
+        setattr(process, "closed", True)
+    except Exception:
+        pass
+    reader = getattr(process, "_thread", None)
+    if isinstance(reader, threading.Thread):
+        reader.join(timeout)
 
 
 class _WinPtyProcess:

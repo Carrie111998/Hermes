@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import timezone
+import io
 import json
 from itertools import product
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import threading
@@ -854,6 +856,51 @@ def test_winpty_unknown_private_resource_layout_fails_closed() -> None:
         _WinPtyProcess(object(), require_supported_layout=True)
 
 
+def test_factory_validation_failure_reclaims_spawned_child_and_descriptors() -> None:
+    class Resource:
+        def __init__(self, descriptor: int):
+            self.descriptor = descriptor
+
+        def close(self) -> None:
+            self.descriptor = -1
+
+        def fileno(self) -> int:
+            return self.descriptor
+
+    class Process:
+        def __init__(self):
+            self.fileobj = Resource(10)
+            self._server = Resource(11)
+            self.fd = 10
+            self.dead = False
+            self._thread = threading.Thread(target=lambda: None)
+            self._thread.start()
+
+        def isalive(self) -> bool:
+            return not self.dead
+
+        def terminate(self, force: bool = False) -> bool:
+            assert force
+            self.dead = True
+            return True
+
+    process = Process()
+
+    class Factory(WindowsConPtyFactory):
+        def _spawn_process(self, argv: list[str], *, cwd: str) -> object:
+            return process
+
+        def _adapt_process(self, spawned: object) -> _WinPtyProcess:
+            assert spawned is process
+            raise RuntimeError("unsupported pywinpty resource layout")
+
+    with pytest.raises(RuntimeError, match="pty unavailable"):
+        Factory().spawn(["ignored"], cwd="C:/ignored")
+    assert process.dead
+    assert process.fileobj.fileno() == process._server.fileno() == -1
+    assert process.fd == -1
+
+
 def test_paid_launch_exact_reconciles_existing_uuid_before_any_spawn() -> None:
     item = claim()
     store = FakeStore()
@@ -1001,6 +1048,36 @@ def test_offline_fixture_reads_complete_multiline_bracketed_paste_frame(
     assert events[3] == {"event": "stdin", "frame": "/exit\r\n"}
 
 
+def _fixture_read_frame(data: bytes) -> str:
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    namespace = runpy.run_path(str(fixture))
+    return namespace["_read_frame"](io.BytesIO(data))
+
+
+def test_fixture_accepts_close_marker_at_exact_frame_boundary() -> None:
+    opening = b"\x1b[200~"
+    closing = b"\x1b[201~"
+    content = b"x" * (65_536 - len(opening) - len(closing))
+    frame = opening + content + closing
+    assert _fixture_read_frame(frame + b"\r") == (frame + b"\r").decode()
+
+
+def test_fixture_returns_bounded_partial_frame_when_close_marker_is_missing_at_eof() -> None:
+    frame = b"\x1b[200~line one\r\nline two"
+    assert _fixture_read_frame(frame) == frame.decode()
+
+
+@pytest.mark.parametrize(
+    ("terminator", "consumed"),
+    [(b"\r", b"\r"), (b"\n", b"\n"), (b"\r\n", b"\r")],
+)
+def test_fixture_consumes_one_terminal_normalized_trailing_terminator(
+    terminator: bytes, consumed: bytes
+) -> None:
+    frame = b"\x1b[200~line one\nline two\x1b[201~"
+    assert _fixture_read_frame(frame + terminator) == (frame + consumed).decode()
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_code", "expected_output"),
     [
@@ -1057,8 +1134,9 @@ def _real_conpty_available() -> bool:
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
 @pytest.mark.parametrize(
     ("scenario", "expected_exit", "expected_lines"),
-    [("registered", 0, ["REGISTERED"]), ("nonzero", 9, ["REGISTERED"]),
-     ("delayed_extra", 0, ["REGISTERED", "extra"])],
+    [("registered", 0, ["REGISTERED"]), ("nonzero", 9, ["REGISTERED"]), *(
+        ("delayed_extra", 0, ["REGISTERED", "extra"]) for _ in range(5)
+    )],
 )
 def test_real_windows_conpty_fixture_exit_and_cleanup(
     tmp_path: Path,
@@ -1116,3 +1194,66 @@ def test_real_windows_conpty_timeout_terminates_and_releases_resources(
     assert process.terminate(5.0)
     cleanup = process.close(5.0)
     assert cleanup.process_dead and cleanup.reader_stopped and cleanup.descriptors_closed
+
+
+@pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
+def test_registrar_spawn_does_not_mutate_standard_pywinpty_reader_during_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+    from winpty import PtyProcess
+    from winpty import ptyprocess as winpty_module
+
+    original_reader = winpty_module._read_in_thread
+    changed: list[object] = []
+
+    def observing_reader(address: object, pty: object, blocking: bool) -> None:
+        del blocking
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            client.connect(address)  # type: ignore[arg-type]
+            while True:
+                if winpty_module._read_in_thread is not observing_reader:
+                    changed.append(winpty_module._read_in_thread)
+                try:
+                    data = pty.read(4096, blocking=False)  # type: ignore[attr-defined]
+                except Exception:
+                    return
+                if data:
+                    client.sendall(data.encode() if isinstance(data, str) else data)
+                if pty.iseof():  # type: ignore[attr-defined]
+                    return
+                time.sleep(0.001)
+        finally:
+            client.close()
+
+    monkeypatch.setattr(winpty_module, "_read_in_thread", observing_reader)
+    standard = PtyProcess.spawn(
+        [sys.executable, "-c", "import time; time.sleep(1); print('STANDARD_OK')"]
+    )
+    record = tmp_path / "concurrent.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "registered")
+    registrar_process = WindowsConPtyFactory().spawn(
+        [sys.executable, str(fixture), "--session-id", "concurrent-uuid"],
+        cwd=str(tmp_path),
+    )
+    assert winpty_module._read_in_thread is observing_reader
+    registrar_process.write("\x1b[200~registration prompt\x1b[201~\r")
+    assert "REGISTERED" in registrar_process.read_until(
+        10.0, prompt="registration prompt"
+    )
+    registrar_process.write("/exit\r")
+    assert registrar_process.wait(10.0) == 0
+    assert registrar_process.close(5.0).succeeded
+    assert "STANDARD_OK" in standard.read(4096)
+    deadline = time.monotonic() + 5
+    while standard.isalive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    standard.fileobj.close()
+    standard._server.close()
+    standard._thread.join(5)
+    assert not changed
+    monkeypatch.setattr(winpty_module, "_read_in_thread", original_reader)
+    assert winpty_module._read_in_thread is original_reader
