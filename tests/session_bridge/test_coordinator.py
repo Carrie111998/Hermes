@@ -3188,7 +3188,7 @@ async def test_sidebar_backfill_confirms_transient_identity_capture_failure(
     def _capture_with_one_transient_failure(cwd: str) -> WorktreeSnapshot:
         nonlocal calls
         calls += 1
-        if calls == 1:
+        if calls <= 2:
             raise WorktreeSnapshotError("source_identity_mismatch")
         return real_capture(cwd)
 
@@ -3211,7 +3211,7 @@ async def test_sidebar_backfill_confirms_transient_identity_capture_failure(
         apply=False,
     )
 
-    assert calls == 2
+    assert calls == 3
     assert preview.queued == 1
     assert preview.failed == 0
     assert preview.excluded == 0
