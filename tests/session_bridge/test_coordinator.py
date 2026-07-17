@@ -1262,7 +1262,7 @@ def _directory_alias(alias: Path, target: Path) -> str:
 
 
 @pytest.mark.asyncio
-async def test_start_reconciles_before_background_scans_and_stop_is_idempotent(
+async def test_start_returns_while_initial_reconcile_gates_background_scans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = BridgeConfig()
@@ -1290,7 +1290,7 @@ async def test_start_reconciles_before_background_scans_and_stop_is_idempotent(
         return ReconcileSummary(examined=0, recovered=0, retried=0, failed=0)
 
     monkeypatch.setattr(coordinator, "reconcile_once", reconcile_once)
-    start_task = asyncio.create_task(coordinator.start())
+    await asyncio.wait_for(coordinator.start(), timeout=1)
     await asyncio.wait_for(reconcile_started.wait(), timeout=1)
     await asyncio.sleep(0.03)
 
@@ -1298,7 +1298,6 @@ async def test_start_reconciles_before_background_scans_and_stop_is_idempotent(
     assert codex.inventory_calls == 0
 
     allow_reconcile.set()
-    await asyncio.wait_for(start_task, timeout=1)
     await asyncio.wait_for(claude.scan_started.wait(), timeout=1)
     await coordinator.stop()
     calls_after_stop = (claude.discover_calls, codex.inventory_calls)

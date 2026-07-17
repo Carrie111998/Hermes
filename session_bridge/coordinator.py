@@ -277,6 +277,7 @@ class SessionBridgeCoordinator:
         self._sidebar_registration_lock = asyncio.Lock()
         self._continuation_locks: dict[str, asyncio.Lock] = {}
         self._running = False
+        self._initial_reconcile_done = asyncio.Event()
         self._background_tasks: list[asyncio.Task[None]] = []
         self._provider_tasks: set[asyncio.Task[Any]] = set()
         self._sidebar_recovery_tasks: set[asyncio.Task[Any]] = set()
@@ -338,11 +339,11 @@ class SessionBridgeCoordinator:
                     *tuple(self._provider_tasks),
                     return_exceptions=True,
                 )
-            await self.reconcile_once()
+            self._initial_reconcile_done = asyncio.Event()
             self._running = True
             self._background_tasks = [
-                asyncio.create_task(self._scan_loop()),
                 asyncio.create_task(self._reconcile_loop()),
+                asyncio.create_task(self._scan_loop()),
             ]
             if self._claude_projects_root is not None:
                 self._watch_stop_event = asyncio.Event()
@@ -3241,6 +3242,7 @@ class SessionBridgeCoordinator:
         self._backfill_progress[provider] = dict(progress)
 
     async def _scan_loop(self) -> None:
+        await self._initial_reconcile_done.wait()
         while self._running:
             try:
                 await self.scan_once()
@@ -3255,6 +3257,7 @@ class SessionBridgeCoordinator:
         stop_event = self._watch_stop_event
         if root is None or stop_event is None:
             return
+        await self._initial_reconcile_done.wait()
         pending_scan: asyncio.Task[None] | None = None
         iterator: Any = None
         try:
@@ -3296,6 +3299,14 @@ class SessionBridgeCoordinator:
             await self.scan_once(Provider.CLAUDE)
 
     async def _reconcile_loop(self) -> None:
+        try:
+            await self.reconcile_once()
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._record_error_code("mirror_reconcile_failed")
+        finally:
+            self._initial_reconcile_done.set()
         while self._running:
             await self._sleep(self._config.service.reconcile_seconds)
             if self._running:
