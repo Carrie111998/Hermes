@@ -35,13 +35,10 @@ def server():
 
         mod = importlib.import_module("tui_gateway.server")
 
+    methods = dict(mod._methods)
     yield mod
-    # Reset module-level session state without re-importing. importlib.reload
-    # would re-register the module's atexit hooks (ThreadPoolExecutor
-    # shutdown, _shutdown_sessions); the duplicates race the stderr
-    # buffer at interpreter shutdown and surface as Fatal Python error:
-    # _enter_buffered_busy. Clearing the per-session dicts gives the
-    # next test a clean slate.
+    mod._methods.clear()
+    mod._methods.update(methods)
     mod._sessions.clear()
     mod._pending.clear()
     mod._answers.clear()
