@@ -128,6 +128,16 @@ def _make_runner(monkeypatch, tmp_path, wa_adapter):
         return None
 
     monkeypatch.setattr(runner, "_create_adapter", _make)
+
+    # ``start()`` awaits ``events.gateway_integration.startup`` inline. That does
+    # real I/O against the *canonical* ~/.hermes event bus (13 subscribers, the
+    # tracker-intent-applier's idempotency rehydrate + jobops :4100 probe) and
+    # can block for minutes on a loaded box — wholly unrelated to platform-connect
+    # backgrounding. Neutralize it so this test stays hermetic and fast and
+    # asserts only the startup-ordering behavior it is about.
+    import events.gateway_integration as _ebi
+
+    monkeypatch.setattr(_ebi, "startup", lambda *a, **k: None)
     return runner
 
 
@@ -140,7 +150,11 @@ async def test_whatsapp_connect_does_not_block_api_server_bind(monkeypatch, tmp_
     try:
         # If WhatsApp were still awaited inline, start() would block on the
         # never-released event and blow this timeout — that's the regression.
-        ok = await asyncio.wait_for(runner.start(), timeout=10)
+        # 30s (matching the companion Telegram test) leaves headroom for the
+        # rest of start()'s post-connect housekeeping — the first-invocation
+        # lazy imports, channel-directory build, and restart-notification
+        # checks — on a memory-pressured box.
+        ok = await asyncio.wait_for(runner.start(), timeout=30)
 
         assert ok is True
         # api_server came up without waiting for WhatsApp.
@@ -167,7 +181,7 @@ async def test_whatsapp_background_connect_failure_queues_for_retry(monkeypatch,
     runner = _make_runner(monkeypatch, tmp_path, wa_adapter)
 
     try:
-        ok = await asyncio.wait_for(runner.start(), timeout=10)
+        ok = await asyncio.wait_for(runner.start(), timeout=30)
 
         assert ok is True
         # api_server still connected despite WhatsApp failing.
