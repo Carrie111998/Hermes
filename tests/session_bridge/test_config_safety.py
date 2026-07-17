@@ -260,6 +260,21 @@ def _load_with_claude_visibility(
     return config
 
 
+def test_omitted_claude_visibility_section_is_exact_safe_disabled_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document: dict[str, Any] = {"session_bridge": {}}
+    snapshot = deepcopy(document)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: document)
+
+    config = BridgeConfig.load(environ={})
+
+    assert document == snapshot
+    assert asdict(config.claude_visibility) == _CLAUDE_VISIBILITY_DEFAULTS
+    assert config.claude_visibility.enabled is False
+    assert config.claude_visibility.continuous is False
+
+
 def test_claude_visibility_defaults_are_exact_disabled_and_environment_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

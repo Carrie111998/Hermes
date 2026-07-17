@@ -130,6 +130,17 @@ def test_fresh_claude_visibility_schema_has_exact_columns_states_and_uniques(
         ("idempotency_key",),
         ("reserved_claude_uuid",),
     } <= unique_sets
+    assert [
+        row["name"]
+        for row in _rows(
+            db,
+            'PRAGMA table_info("session_claude_registration_usage")',
+        )
+    ] == _CLAUDE_REGISTRATION_USAGE_COLUMNS
+    assert (
+        "job_id",
+        "attempt_ordinal",
+    ) in _unique_column_sets(db, "session_claude_registration_usage")
 
 
 def test_claude_registration_usage_migrates_existing_database_idempotently(
