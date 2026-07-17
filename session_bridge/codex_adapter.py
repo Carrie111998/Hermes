@@ -263,6 +263,8 @@ class SidebarThreadVerifier:
             ) from None
         matches: dict[str, VerifiedSidebarThread] = {}
         for projection in projections:
+            if projection.native_status == "archived":
+                continue
             verified = _verified_sidebar_projection(
                 projection,
                 expected=expected,

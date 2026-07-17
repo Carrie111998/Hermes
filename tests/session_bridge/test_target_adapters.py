@@ -893,7 +893,7 @@ def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> N
     assert all(params["searchTerm"] == valid.rsplit(".", 1)[0] for params in search_calls)
 
 
-def test_sidebar_marker_lookup_rejects_multiple_authenticated_threads() -> None:
+def test_sidebar_marker_lookup_ignores_archived_duplicate() -> None:
     other_id = "33333333-3333-4333-8333-333333333333"
     client = FakeRequestClient({
         "thread/list": [
@@ -911,11 +911,38 @@ def test_sidebar_marker_lookup_rejects_multiple_authenticated_threads() -> None:
         reconciliation_interval=0,
     )
 
+    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+
+
+def test_sidebar_marker_lookup_rejects_multiple_active_authenticated_threads() -> None:
+    other_id = "33333333-3333-4333-8333-333333333333"
+    first = _codex_inventory()["data"][0]
+    second = _codex_inventory(native_id=other_id)["data"][0]
+    client = FakeRequestClient({
+        "thread/list": [
+            {"data": [first, second]},
+            {"data": []},
+        ],
+        "thread/read": [
+            _codex_signed_read(),
+            _codex_signed_read(native_id=other_id),
+        ],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
     with pytest.raises(SidebarVerificationError) as raised:
         verifier.find_by_marker(_sidebar_expected())
 
     assert raised.value.code == "marker_conflict"
-    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
 
 
 @pytest.mark.parametrize(
