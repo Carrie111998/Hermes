@@ -6063,7 +6063,12 @@ class DispatchResult:
     """Task ids sent back to ``triage`` for decomposition instead of
     being auto-blocked, because they kept timing out and
     ``kanban.retriage_on_timeout`` is enabled. The auto-decomposer picks
-    them up on its next tick and splits them into smaller children."""
+    them up on its next tick and splits them into smaller children.
+
+    NOTE: these ids also appear in ``timed_out`` (the timeout really
+    happened; retriage is what the dispatcher did about it). Consumers
+    counting hard failures should treat ``timed_out`` minus ``retriaged``
+    as the unrecovered set."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
@@ -7093,7 +7098,7 @@ def _retriage_task(
     limit_source: str,
     error: str,
     event_payload_extra: Optional[dict] = None,
-) -> None:
+) -> bool:
     """Send a repeatedly-timed-out task back to ``triage`` for decomposition.
 
     Appends a failure-context block to the body (the decomposer LLM sees
@@ -7102,6 +7107,15 @@ def _retriage_task(
     ``retriaged`` event — which is also the once-only guard
     ``_was_retriaged`` checks. Must be called inside the caller's
     ``write_txn`` (this helper does NOT open its own).
+
+    Returns True when the task was actually retriaged. The UPDATE matches
+    ``status = 'ready'`` ONLY: the timeout path parked the task there in
+    its own txn, and if another dispatcher claimed it back to ``running``
+    in the window between that txn and this one, retriaging would yank a
+    freshly-spawned live worker off the task. Losing the race returns
+    False (no event, no body change) and the caller falls through to the
+    plain block semantics, which is exactly the pre-existing behavior for
+    that window.
     """
     if max_runtime_seconds:
         budget_clause = (
@@ -7114,13 +7128,15 @@ def _retriage_task(
         error=error,
         budget_clause=budget_clause,
     )
-    conn.execute(
+    cur = conn.execute(
         "UPDATE tasks SET status = 'triage', body = ?, "
         "consecutive_failures = 0, last_failure_error = ?, "
         "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-        "WHERE id = ? AND status IN ('ready', 'running')",
+        "WHERE id = ? AND status = 'ready'",
         (new_body, error, task_id),
     )
+    if cur.rowcount != 1:
+        return False
     payload = {
         "failures": failures,
         "effective_limit": effective_limit,
@@ -7131,6 +7147,7 @@ def _retriage_task(
     if event_payload_extra:
         payload.update(event_payload_extra)
     _append_event(conn, task_id, "retriaged", payload)
+    return True
 
 
 def _record_task_failure(
@@ -7241,7 +7258,7 @@ def _record_task_failure(
                 and outcome == "timed_out"
                 and not _was_retriaged(conn, task_id)
             ):
-                _retriage_task(
+                if _retriage_task(
                     conn, task_id,
                     body=row["body"],
                     max_runtime_seconds=(
@@ -7253,8 +7270,10 @@ def _record_task_failure(
                     limit_source=limit_source,
                     error=error[:500],
                     event_payload_extra=event_payload_extra,
-                )
-                return False
+                ):
+                    return False
+                # Lost the ready→running race to a concurrent claimer —
+                # fall through to the plain block semantics below.
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.

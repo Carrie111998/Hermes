@@ -245,6 +245,41 @@ def test_force_trip_never_retriages(kanban_home):
         conn.close()
 
 
+def test_retriage_lost_claim_race_falls_back_to_block(kanban_home):
+    """If a concurrent dispatcher re-claimed the task (ready → running)
+    between the timeout txn and the failure-recording txn, retriage must
+    NOT yank the live worker — it loses the race and the plain block
+    semantics apply (the pre-existing behavior for that window)."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="long job", assignee="worker",
+            body="original body",
+            max_runtime_seconds=1,
+        )
+        # Simulate the race: task is back in 'running' hands by the time
+        # the failure is recorded, with the counter one below the limit.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', "
+                "consecutive_failures = 1 WHERE id = ?", (tid,),
+            )
+        tripped = kb._record_task_failure(
+            conn, tid, "elapsed 30s > limit 1s",
+            outcome="timed_out",
+            retriage_on_timeout=True,
+        )
+        assert tripped is True, "race loser must fall back to the breaker"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.body == "original body", "no failure block on race loss"
+        events = kb.list_events(conn, tid)
+        assert not any(e.kind == "retriaged" for e in events)
+        assert any(e.kind == "gave_up" for e in events)
+    finally:
+        conn.close()
+
+
 def test_per_task_max_retries_retriages_on_first_timeout(
     kanban_home, fast_pid_dead,
 ):

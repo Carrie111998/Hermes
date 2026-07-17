@@ -164,7 +164,11 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
+        # "retriaged" (kanban.retriage_on_timeout) is delivered so a
+        # subscriber who just saw the task's `timed_out` event also sees
+        # that the dispatcher recovered it into Triage for decomposition
+        # rather than giving up.
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "retriaged", "status", "archived", "unblocked")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -880,6 +884,16 @@ class GatewayKanbanWatchersMixin:
         retriage_on_timeout = bool(kanban_cfg.get("retriage_on_timeout", False))
         if retriage_on_timeout:
             logger.info("kanban dispatcher: retriage_on_timeout enabled")
+            _ad_enabled, _ = _resolve_auto_decompose_settings(_load_config)
+            if not _ad_enabled:
+                # Not fatal — manual `hermes kanban decompose` still works —
+                # but without auto-decompose a retriaged task sits in Triage
+                # until someone acts, which is easy to miss.
+                logger.warning(
+                    "kanban dispatcher: retriage_on_timeout is enabled but "
+                    "auto_decompose is disabled — retriaged tasks will wait "
+                    "in Triage for a manual decompose"
+                )
 
         # Read stale_timeout_seconds — 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
