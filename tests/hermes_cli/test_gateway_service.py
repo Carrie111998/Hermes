@@ -67,6 +67,8 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        # This test isn't about D-Bus reachability; skip that preflight check.
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
 
@@ -90,6 +92,8 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
         monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+        # This test isn't about D-Bus reachability; skip that preflight check.
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -382,6 +386,13 @@ class TestGeneratedSystemdUnits:
             "_get_restart_drain_timeout",
             lambda: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
         )
+        # _system_service_identity() refuses an auto-detected root user (by
+        # design); stub a normal identity since this test isn't about that.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
         unit = gateway_cli.generate_systemd_unit(system=True)
 
         assert "ExecStart=" in unit
@@ -406,6 +417,11 @@ class TestGatewayStopCleanup:
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        # Importing gateway.run (e.g. via `monkeypatch.setattr("gateway.run....")`
+        # elsewhere) sets this in real os.environ as a module-level side
+        # effect that outlives monkeypatch's per-test rollback; make sure
+        # this test isn't accidentally "inside the gateway process".
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
 
         service_calls = []
         kill_calls = []
@@ -432,6 +448,11 @@ class TestGatewayStopCleanup:
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        # Importing gateway.run (e.g. via `monkeypatch.setattr("gateway.run....")`
+        # elsewhere) sets this in real os.environ as a module-level side
+        # effect that outlives monkeypatch's per-test rollback; make sure
+        # this test isn't accidentally "inside the gateway process".
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
 
         service_calls = []
         kill_calls = []
@@ -480,6 +501,18 @@ class TestLaunchdServiceRecovery:
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
 
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        # Sandbox HERMES_HOME can legitimately live under a temp dir, which
+        # would otherwise trip the temp-HERMES_HOME write guard this test
+        # isn't exercising.
+        monkeypatch.setattr(gateway_cli, "_refuse_temp_home_service_write", lambda *a, **k: False)
+        # This test isn't exercising the self-preservation path (refresh
+        # running inside the gateway's own process tree), which would add an
+        # extra `launchctl print` PID lookup before bootout/bootstrap.
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        # Nor the domain-resolution probe (also a `launchctl print` call) --
+        # fix it to a known value so it doesn't show up as an extra call.
+        domain = "gui/0"
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: domain)
 
         calls = []
 
@@ -492,7 +525,6 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_install()
 
         label = gateway_cli.get_launchd_label()
-        domain = gateway_cli._launchd_domain()
         assert "--replace" in plist_path.read_text(encoding="utf-8")
         assert calls[:2] == [
             ["launchctl", "bootout", f"{domain}/{label}"],
@@ -741,6 +773,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
@@ -786,6 +819,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
@@ -845,6 +879,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -875,6 +910,7 @@ class TestGatewaySystemServiceRouting:
 
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr(
@@ -1308,6 +1344,11 @@ class TestGeneratedUnitIncludesLocalBin:
     def test_system_unit_includes_local_bin_in_path(self, monkeypatch):
         monkeypatch.setattr(
             gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
@@ -1618,7 +1659,9 @@ class TestProfileArg:
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
         unit = gateway_cli.generate_systemd_unit(system=False)
         assert "--profile mybot" in unit
-        assert "gateway run --replace" in unit
+        # systemd's Restart=always already replaces the process on exit;
+        # --replace is only used by the launchd/manual-restart paths.
+        assert "gateway run" in unit
 
     def test_launchd_plist_includes_profile(self, tmp_path, monkeypatch):
         """generate_launchd_plist should include --profile in ProgramArguments for named profiles."""
@@ -1706,7 +1749,11 @@ class TestSystemUnitPathRemapping:
         assert str(root_home) not in unit
         # Target user paths should be present
         assert "/home/alice" in unit
-        assert "WorkingDirectory=/home/alice/.hermes/hermes-agent" in unit
+        # WorkingDirectory anchors to the target user's HERMES_HOME (stable,
+        # always exists), not a source-checkout path that can rot -- see
+        # _stable_service_working_dir()'s docstring for the incident this
+        # guards against.
+        assert "WorkingDirectory=/home/alice/.hermes" in unit
 
 
 class TestDockerAwareGateway:

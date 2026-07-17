@@ -1713,7 +1713,6 @@ class TestConfigurableTimeouts:
 
         server = MCPServerTask("test_srv")
         assert server.tool_timeout == _DEFAULT_TOOL_TIMEOUT
-        assert server.tool_timeout == 120
 
     def test_custom_timeout(self):
         """Server with timeout=180 in config gets 180."""

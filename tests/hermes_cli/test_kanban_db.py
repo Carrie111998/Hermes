@@ -1979,6 +1979,23 @@ def test_connect_falls_back_to_delete_on_locking_protocol(kanban_home, caplog):
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
 
+    # The kanban_home fixture already called kb.init_db(), which persisted
+    # journal_mode=wal onto the DB file on disk (a SQLite header property,
+    # not just per-connection state). apply_wal_with_fallback()'s read-only
+    # probe would see "wal" already set and return early -- never attempting
+    # (and therefore never failing) the PRAGMA journal_mode=WAL this test
+    # mocks. Delete the file so the mocked connect() creates a fresh one.
+    db_path = kb.kanban_db_path()
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(db_path) + suffix).unlink(missing_ok=True)
+
+    # Also clear the (db_label -> already warned) dedup cache -- keyed only
+    # on the filename, not the full path, so an earlier test's identical
+    # "kanban.db" fallback would otherwise suppress this test's warning too.
+    import hermes_state
+    with hermes_state._wal_fallback_warned_lock:
+        hermes_state._wal_fallback_warned_paths.clear()
+
     real_connect = _sqlite3.connect
 
     class _WalBlockingConnection(_sqlite3.Connection):

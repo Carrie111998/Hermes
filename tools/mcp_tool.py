@@ -3155,7 +3155,14 @@ def _interpolate_env_vars(value):
     profile's), falling back to ``os.environ`` otherwise. Unset vars keep the
     literal ``${VAR}`` placeholder, as before.
     """
-    from agent.secret_scope import get_secret as _get_secret
+    try:
+        from agent.secret_scope import get_secret as _get_secret
+    except ImportError:
+        # agent.secret_scope isn't available on this build -- fall back to
+        # the process-global environment rather than erroring on every MCP
+        # config load.
+        def _get_secret(name: str, placeholder: str) -> Optional[str]:
+            return os.environ.get(name)
 
     if isinstance(value, str):
         def _replace(m):

@@ -679,6 +679,7 @@ def test_auth_list_does_not_call_mutating_select(monkeypatch, capsys):
         last_status = None
         last_error_code = None
         last_status_at = None
+        extra = {}
 
     class _Pool:
         def entries(self):

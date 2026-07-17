@@ -211,7 +211,9 @@ class TestListAndCleanup:
 
         db = manager._get_db()
         messages = db.get_messages_as_conversation(state.session_id)
-        assert messages == [{"role": "user", "content": "original"}]
+        assert len(messages) == 1
+        first = {k: v for k, v in messages[0].items() if k != "timestamp"}
+        assert first == {"role": "user", "content": "original"}
 
     def test_cleanup_clears_all(self, manager):
         s1 = manager.create_session()
@@ -501,7 +503,9 @@ class TestPersistence:
 
         restored = manager.get_session(state.session_id)
         assert restored is not None
-        assert restored.history == [{
+        assert len(restored.history) == 1
+        first = {k: v for k, v in restored.history[0].items() if k != "timestamp"}
+        assert first == {
             "role": "assistant",
             "content": "hello",
             "reasoning": "step-by-step",
@@ -511,7 +515,7 @@ class TestPersistence:
             "codex_reasoning_items": [
                 {"type": "reasoning", "id": "rs_123", "encrypted_content": "enc_blob"},
             ],
-        }]
+        }
 
     def test_restore_preserves_persisted_provider_snapshot(self, tmp_path, monkeypatch):
         """Restored ACP sessions should keep their original runtime provider."""

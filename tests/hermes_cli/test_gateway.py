@@ -9,6 +9,18 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
+class _TTY:
+    """Minimal stdin stand-in for tests that need an interactive session.
+
+    ``gateway_command()`` decides whether to prompt based on
+    ``sys.stdin.isatty()``; pytest's real stdin isn't a TTY, so tests that
+    exercise the interactive prompt path swap it in via monkeypatch.
+    """
+
+    def isatty(self):
+        return True
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
@@ -235,13 +247,16 @@ def test_gateway_install_in_container_with_operational_systemd_uses_systemd(monk
     monkeypatch.setattr(gateway, "is_wsl", lambda: False)
     monkeypatch.setattr(gateway, "is_macos", lambda: False)
     monkeypatch.setattr(gateway, "is_managed", lambda: False)
+    # gateway_command() only prompts when stdin is a TTY; pytest's stdin
+    # isn't one, so simulate an interactive session to exercise the prompts.
+    monkeypatch.setattr(gateway.sys, "stdin", _TTY())
 
     calls = []
     monkeypatch.setattr(gateway, "prompt_yes_no", lambda question, default=True: calls.append(("prompt", question, default)) or True)
     monkeypatch.setattr(
         gateway,
         "systemd_install",
-        lambda force=False, system=False, run_as_user=None, enable_on_startup=True: calls.append(("install", force, system, run_as_user, enable_on_startup)),
+        lambda force=False, system=False, run_as_user=None, enable_on_startup=True, non_interactive=False: calls.append(("install", force, system, run_as_user, enable_on_startup)),
     )
     monkeypatch.setattr(gateway, "systemd_start", lambda system=False: calls.append(("start", system)))
 
@@ -380,6 +395,10 @@ def test_systemd_install_checks_linger_status(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
     monkeypatch.setattr(gateway, "_ensure_linger_enabled", lambda: helper_calls.append(True))
+    # This test doesn't exercise the temp-HERMES_HOME guard; the sandbox's
+    # own HERMES_HOME can legitimately resolve under a temp dir, which would
+    # otherwise make generate_systemd_unit()'s real output trip the guard.
+    monkeypatch.setattr(gateway, "_refuse_temp_home_service_write", lambda *a, **k: False)
 
     gateway.systemd_install(force=False)
 
@@ -408,6 +427,10 @@ def test_systemd_install_can_skip_enable_on_startup(monkeypatch, tmp_path, capsy
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
     monkeypatch.setattr(gateway, "_ensure_user_systemd_env", lambda: None)
     monkeypatch.setattr(gateway, "_ensure_linger_enabled", lambda: helper_calls.append(True))
+    # See test_systemd_install_checks_linger_status: sandbox HERMES_HOME can
+    # legitimately live under a temp dir, which would otherwise trip the
+    # temp-HERMES_HOME write guard this test isn't exercising.
+    monkeypatch.setattr(gateway, "_refuse_temp_home_service_write", lambda *a, **k: False)
 
     gateway.systemd_install(force=False, enable_on_startup=False)
 
@@ -479,6 +502,9 @@ def test_conflicting_systemd_units_warning(monkeypatch, tmp_path, capsys):
 
 
 def test_install_linux_gateway_from_setup_system_choice_without_root_prints_followup(monkeypatch, capsys):
+    """Non-root system-scope install refuses without printing a self-elevation
+    (``sudo ...``) recipe -- deliberately, per the guard's own comment: this
+    path shouldn't hand back a copy-pasteable elevation command."""
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
     monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
@@ -488,8 +514,9 @@ def test_install_linux_gateway_from_setup_system_choice_without_root_prints_foll
 
     out = capsys.readouterr().out
     assert (scope, did_install) == ("system", False)
-    assert "sudo hermes gateway install --system --run-as-user alice" in out
-    assert "sudo hermes gateway start --system" in out
+    assert "System service install requires root" in out
+    assert "hermes gateway install" in out
+    assert "sudo" not in out
 
 
 def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeypatch):
@@ -531,6 +558,9 @@ def test_gateway_install_can_decline_start_now_and_startup(monkeypatch):
     monkeypatch.setattr(gateway, "is_wsl", lambda: False)
     monkeypatch.setattr(gateway, "is_macos", lambda: False)
     monkeypatch.setattr(gateway, "is_managed", lambda: False)
+    # See test_gateway_install_in_container_with_operational_systemd_uses_systemd:
+    # prompting only happens when stdin looks like a TTY.
+    monkeypatch.setattr(gateway.sys, "stdin", _TTY())
 
     answers = iter([False, False])
     calls = []
@@ -538,7 +568,7 @@ def test_gateway_install_can_decline_start_now_and_startup(monkeypatch):
     monkeypatch.setattr(
         gateway,
         "systemd_install",
-        lambda force=False, system=False, run_as_user=None, enable_on_startup=True: calls.append(("install", force, system, run_as_user, enable_on_startup)),
+        lambda force=False, system=False, run_as_user=None, enable_on_startup=True, non_interactive=False: calls.append(("install", force, system, run_as_user, enable_on_startup)),
     )
     monkeypatch.setattr(gateway, "systemd_start", lambda system=False: calls.append(("start", system)))
 

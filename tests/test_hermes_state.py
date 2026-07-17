@@ -176,7 +176,8 @@ class TestMessageStorage:
         assert messages[1]["observed"] == 0
 
         conversation = db.get_messages_as_conversation("s1")
-        assert conversation[0] == {
+        first = {k: v for k, v in conversation[0].items() if k != "timestamp"}
+        assert first == {
             "role": "user",
             "content": "[Alice|111]\nside chatter",
             "observed": True,
@@ -264,7 +265,8 @@ class TestMessageStorage:
         # get_messages_as_conversation decodes back to the original list
         conv = db.get_messages_as_conversation("s1")
         assert len(conv) == 1
-        assert conv[0] == {"role": "user", "content": content}
+        first = {k: v for k, v in conv[0].items() if k != "timestamp"}
+        assert first == {"role": "user", "content": content}
 
     def test_dict_content_round_trip(self, db):
         """Dict-shaped content (e.g. provider wrappers) also round-trips."""
@@ -335,8 +337,10 @@ class TestMessageStorage:
 
         conv = db.get_messages_as_conversation("s1")
         assert len(conv) == 2
-        assert conv[0] == {"role": "user", "content": "Hello"}
-        assert conv[1] == {"role": "assistant", "content": "Hi!"}
+        first = {k: v for k, v in conv[0].items() if k != "timestamp"}
+        second = {k: v for k, v in conv[1].items() if k != "timestamp"}
+        assert first == {"role": "user", "content": "Hello"}
+        assert second == {"role": "assistant", "content": "Hi!"}
 
     def test_platform_message_id_round_trips(self, db):
         """Platform-side message ids (yuanbao msg_id, telegram update_id, …)
@@ -426,7 +430,9 @@ class TestMessageStorage:
         )
 
         conv = db.get_messages_as_conversation("s1")
-        assert conv == [{"role": "assistant", "content": "Visible answer"}]
+        assert len(conv) == 1
+        first = {k: v for k, v in conv[0].items() if k != "timestamp"}
+        assert first == {"role": "assistant", "content": "Visible answer"}
 
     def test_reasoning_persisted_and_restored(self, db):
         """Reasoning text is stored for assistant messages and restored by
@@ -1531,11 +1537,15 @@ class TestSchemaInit:
         columns = {row[1] for row in cursor.fetchall()}
         assert "title" in columns
 
-    def test_topic_mode_schema_is_not_auto_migrated_on_open(self, tmp_path):
-        """Opening an old DB should not add topic-mode columns until /topic opts in.
+    def test_old_db_schema_is_reconciled_on_open(self, tmp_path):
+        """Opening an old DB declaratively reconciles it to the current schema.
 
-        The gateway must remain rollback-safe: simply upgrading Hermes and starting
-        the old bot should not eagerly mutate the state DB for this feature.
+        _reconcile_columns() (Beets/sqlite-utils pattern) diffs live columns
+        against SCHEMA_SQL and ADDs whatever is missing on every startup --
+        including session-routing columns like chat_id/chat_type/thread_id/
+        session_key -- rather than gating additions behind version-numbered
+        migration blocks. This is safe for rollback: the columns are
+        nullable additions that an older Hermes binary simply ignores.
         """
         old_db = tmp_path / "old.db"
         import sqlite3
@@ -1599,7 +1609,7 @@ class TestSchemaInit:
         db = SessionDB(db_path=old_db)
         cursor = db._conn.execute("PRAGMA table_info(sessions)")
         columns = {row[1] for row in cursor.fetchall()}
-        assert {"chat_id", "chat_type", "thread_id", "session_key"}.isdisjoint(columns)
+        assert {"chat_id", "chat_type", "thread_id", "session_key"}.issubset(columns)
         db.close()
 
     def test_apply_telegram_topic_migration_creates_topic_tables_explicitly(self, tmp_path):
