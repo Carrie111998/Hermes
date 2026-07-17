@@ -14,6 +14,17 @@ from typing import Any, NoReturn, Protocol, cast
 import uuid
 
 from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
+from .claude_visibility import (
+    CLAUDE_VISIBILITY_EXCLUSION_CODES,
+    CLAUDE_VISIBILITY_FATAL_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
+    ClaudeVisibilityCandidate,
+    ClaudeVisibilityClaim,
+    ClaudeVisibilityIdentity,
+    build_claude_visibility_candidate,
+    derive_claude_visibility_identity,
+    evaluate_claude_visibility,
+)
 from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig
 from .context_pack import ContextPackRequest
@@ -132,6 +143,481 @@ class ContinueResult:
     link: SessionLink
     warnings: Sequence[str]
     exact_cwd: str | None = None
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityCandidateResult:
+    candidate: ClaudeVisibilityCandidate
+    identity: ClaudeVisibilityIdentity
+    activity: float
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityExclusion:
+    source_session_id: str
+    source_provider: str
+    activity: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityDiscoveryResult:
+    enabled: bool
+    candidates: tuple[ClaudeVisibilityCandidateResult, ...] = ()
+    exclusions: tuple[ClaudeVisibilityExclusion, ...] = ()
+    degraded: bool = False
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityApplyResult:
+    enabled: bool
+    mode: str
+    candidates: tuple[ClaudeVisibilityCandidateResult, ...] = ()
+    exclusions: tuple[ClaudeVisibilityExclusion, ...] = ()
+    applied: int = 0
+    degraded: bool = False
+    open_reasons: tuple[str, ...] = ()
+    fatal_reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClaudeVisibilityRunResult:
+    enabled: bool
+    status: str
+    job_id: str | None = None
+    error_code: str | None = None
+    degraded: bool = False
+    fatal: bool = False
+    discovery: ClaudeVisibilityApplyResult | None = None
+
+
+class _ClaudeVisibilityInventory(Protocol):
+    def __call__(self, after: float) -> Sequence[SidebarSource]: ...
+
+
+class _ClaudeVisibilityRegistrar(Protocol):
+    def process(self, claim: ClaudeVisibilityClaim) -> object: ...
+
+
+class _ClaudeVisibilityStore(Protocol):
+    def claude_visibility_status(self, now: float) -> Mapping[str, Any]: ...
+    def has_claude_visibility_source(self, source_session_id: str) -> bool: ...
+    def enqueue_claude_visibility_job(
+        self,
+        candidate: ClaudeVisibilityCandidate,
+        identity: ClaudeVisibilityIdentity,
+        marker_secret: bytes,
+    ) -> object: ...
+    def claim_claude_visibility_job(
+        self,
+        now: float,
+        lease_seconds: float,
+        daily_limit: int,
+        cost_limit: object,
+        reserved_cost: object,
+    ) -> ClaudeVisibilityClaim: ...
+
+
+_CLAUDE_VISIBILITY_DISCOVERY_CODES = CLAUDE_VISIBILITY_EXCLUSION_CODES | {
+    "outside_activity_window",
+    "duplicate_source",
+}
+_CLAUDE_VISIBILITY_MANUAL_LIMIT = 10
+_CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT = 1_000
+_CLAUDE_VISIBILITY_OPEN_STATES = (
+    "claude_pending",
+    "claude_leased",
+    "claude_retry",
+    "claude_failed",
+)
+_CLAUDE_VISIBILITY_IDLE_CLAIM_STATUSES = frozenset({
+    "no_due_job",
+    "daily_limit",
+    "cost_limit",
+})
+_CLAUDE_VISIBILITY_REGISTRAR_STATUSES = frozenset({
+    "absent",
+    "failed",
+    "retry",
+    "visible",
+})
+
+
+def _claude_visibility_enqueue_gates(
+    status: object,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return fixed open/fatal reasons without exposing mutable store rows."""
+
+    if not isinstance(status, Mapping):
+        return (), ("invalid_visibility_status",)
+    status_mapping = cast(Mapping[object, object], status)
+    counts = status_mapping.get("counts")
+    retry_codes = status_mapping.get("retry_codes")
+    failed_codes = status_mapping.get("failed_codes")
+    if not isinstance(counts, Mapping):
+        return (), ("invalid_visibility_status",)
+    if not isinstance(retry_codes, Mapping):
+        return (), ("invalid_visibility_status",)
+    if not isinstance(failed_codes, Mapping):
+        return (), ("invalid_visibility_status",)
+
+    def _validated_counts(values: Mapping[object, object]) -> dict[str, int] | None:
+        result: dict[str, int] = {}
+        for key, value in values.items():
+            if type(key) is not str or type(value) is not int or value < 0:
+                return None
+            result[key] = value
+        return result
+
+    count_values = _validated_counts(cast(Mapping[object, object], counts))
+    retry_values = _validated_counts(cast(Mapping[object, object], retry_codes))
+    failed_values = _validated_counts(cast(Mapping[object, object], failed_codes))
+    if count_values is None or retry_values is None or failed_values is None:
+        return (), ("invalid_visibility_status",)
+
+    open_reasons = (
+        ("open_visibility_work",)
+        if any(count_values.get(state, 0) > 0 for state in _CLAUDE_VISIBILITY_OPEN_STATES)
+        else ()
+    )
+    fatal: set[str] = set()
+    for code, count in retry_values.items():
+        if count > 0 and code not in CLAUDE_VISIBILITY_RETRY_CODES:
+            fatal.add("unknown_retry_code")
+    for code, count in failed_values.items():
+        if count <= 0:
+            continue
+        fatal.add(code if code in CLAUDE_VISIBILITY_FATAL_CODES else "unknown_failed_code")
+    return open_reasons, tuple(sorted(fatal))
+
+
+class ClaudeVisibilityCoordinator:
+    """Discovery and single-claim delivery orchestration for Claude visibility."""
+
+    def __init__(
+        self,
+        *,
+        config: BridgeConfig,
+        store: _ClaudeVisibilityStore,
+        inventory: _ClaudeVisibilityInventory,
+        registrar: _ClaudeVisibilityRegistrar,
+        marker_secret: bytes,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if not isinstance(config, BridgeConfig):
+            raise TypeError("config must be a BridgeConfig")
+        if not isinstance(marker_secret, bytes) or not marker_secret:
+            raise ValueError("marker_secret must be nonempty bytes")
+        self._config = config
+        self._store = store
+        self._inventory = inventory
+        self._registrar = registrar
+        self._marker_secret = marker_secret
+        self._clock = clock
+
+    def discover(self, *, days: int, limit: int) -> ClaudeVisibilityDiscoveryResult:
+        return self._discover(days=days, limit=limit, manual=True)
+
+    def _discover(
+        self, *, days: int, limit: int, manual: bool
+    ) -> ClaudeVisibilityDiscoveryResult:
+        if not self._config.claude_visibility.enabled:
+            return ClaudeVisibilityDiscoveryResult(enabled=False, reasons=("disabled",))
+        if type(days) is not int or days <= 0:
+            raise ValueError("days must be a positive integer")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        bounded_limit = (
+            min(
+                limit,
+                _CLAUDE_VISIBILITY_MANUAL_LIMIT,
+                self._config.claude_visibility.manual_batch_limit,
+            )
+            if manual
+            else min(limit, _CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT)
+        )
+        now = float(self._clock())
+        after = now - days * 86400
+        try:
+            sources = tuple(self._inventory(after))
+        except Exception:
+            return ClaudeVisibilityDiscoveryResult(
+                enabled=True, degraded=True, reasons=("source_discovery_failed",)
+            )
+        ordered = sorted(
+            sources,
+            key=lambda item: (
+                -float(item.projection.last_active),
+                item.source_session_id,
+                item.projection.provider.value,
+            ),
+        )
+        candidates: list[ClaudeVisibilityCandidateResult] = []
+        exclusions: list[ClaudeVisibilityExclusion] = []
+        seen: set[tuple[str, Provider]] = set()
+        for source in ordered[:_CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT]:
+            projection = source.projection
+            activity = float(projection.last_active)
+            key = (source.source_session_id, projection.provider)
+            if key in seen:
+                reason = "duplicate_source"
+            elif activity < after:
+                reason = "outside_activity_window"
+            else:
+                reason = evaluate_claude_visibility(
+                    projection,
+                    automation_only=source.automation_only,
+                    subagent_only=source.subagent_only,
+                )
+            seen.add(key)
+            if reason != "eligible":
+                if reason not in _CLAUDE_VISIBILITY_DISCOVERY_CODES:
+                    return ClaudeVisibilityDiscoveryResult(
+                        enabled=True,
+                        candidates=tuple(candidates),
+                        exclusions=tuple(exclusions),
+                        degraded=True,
+                        reasons=("unknown_exclusion",),
+                    )
+                exclusions.append(
+                    ClaudeVisibilityExclusion(
+                        source_session_id=source.source_session_id,
+                        source_provider=projection.provider.value,
+                        activity=activity,
+                        reason=reason,
+                    )
+                )
+                continue
+            try:
+                candidate = build_claude_visibility_candidate(
+                    projection,
+                    eligible_at=activity,
+                    git_root=source.git_root,
+                    git_head=source.git_head,
+                    worktree_id=source.worktree_id,
+                    automation_only=source.automation_only,
+                    subagent_only=source.subagent_only,
+                )
+                identity = derive_claude_visibility_identity(
+                    candidate, self._marker_secret
+                )
+            except Exception:
+                return ClaudeVisibilityDiscoveryResult(
+                    enabled=True,
+                    candidates=tuple(candidates),
+                    exclusions=tuple(exclusions),
+                    degraded=True,
+                    reasons=("candidate_construction_failed",),
+                )
+            candidates.append(
+                ClaudeVisibilityCandidateResult(candidate, identity, activity)
+            )
+        return ClaudeVisibilityDiscoveryResult(
+            enabled=True,
+            candidates=tuple(candidates[:bounded_limit]),
+            exclusions=tuple(exclusions),
+        )
+
+    def backfill(
+        self, *, days: int, limit: int, apply: bool
+    ) -> ClaudeVisibilityApplyResult:
+        if not self._config.claude_visibility.enabled:
+            return ClaudeVisibilityApplyResult(enabled=False, mode="disabled")
+        discovery = self.discover(days=days, limit=limit)
+        mode = "apply" if apply else "dry_run"
+        if discovery.degraded:
+            return ClaudeVisibilityApplyResult(
+                enabled=True,
+                mode=mode,
+                candidates=discovery.candidates,
+                exclusions=discovery.exclusions,
+                degraded=True,
+                fatal_reasons=discovery.reasons,
+            )
+        if not apply:
+            return ClaudeVisibilityApplyResult(
+                enabled=True,
+                mode=mode,
+                candidates=discovery.candidates,
+                exclusions=discovery.exclusions,
+            )
+        try:
+            status = self._store.claude_visibility_status(float(self._clock()))
+            open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(status)
+            if open_reasons or fatal_reasons:
+                return ClaudeVisibilityApplyResult(
+                    enabled=True,
+                    mode=mode,
+                    candidates=discovery.candidates,
+                    exclusions=discovery.exclusions,
+                    degraded=bool(fatal_reasons),
+                    open_reasons=open_reasons,
+                    fatal_reasons=fatal_reasons,
+                )
+            applied = 0
+            for item in discovery.candidates[:10]:
+                if self._store.has_claude_visibility_source(
+                    item.candidate.source_session_id
+                ):
+                    continue
+                self._store.enqueue_claude_visibility_job(
+                    item.candidate, item.identity, self._marker_secret
+                )
+                applied += 1
+        except Exception:
+            return ClaudeVisibilityApplyResult(
+                enabled=True,
+                mode=mode,
+                candidates=discovery.candidates,
+                exclusions=discovery.exclusions,
+                degraded=True,
+                fatal_reasons=("enqueue_failed",),
+            )
+        return ClaudeVisibilityApplyResult(
+            enabled=True,
+            mode=mode,
+            candidates=discovery.candidates,
+            exclusions=discovery.exclusions,
+            applied=applied,
+        )
+
+    def continuous_once(self) -> ClaudeVisibilityApplyResult:
+        if not self._config.claude_visibility.enabled:
+            return ClaudeVisibilityApplyResult(enabled=False, mode="disabled")
+        if not self._config.claude_visibility.continuous:
+            return ClaudeVisibilityApplyResult(enabled=True, mode="continuous_disabled")
+        discovery = self._discover(
+            days=self._config.claude_visibility.backfill_days,
+            limit=_CLAUDE_VISIBILITY_CONTINUOUS_SCAN_LIMIT,
+            manual=False,
+        )
+        if discovery.degraded:
+            return ClaudeVisibilityApplyResult(
+                enabled=True, mode="continuous", degraded=True,
+                candidates=discovery.candidates, exclusions=discovery.exclusions,
+                fatal_reasons=discovery.reasons,
+            )
+        try:
+            status = self._store.claude_visibility_status(float(self._clock()))
+            open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(status)
+            if open_reasons or fatal_reasons:
+                return ClaudeVisibilityApplyResult(
+                    enabled=True, mode="continuous",
+                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                    degraded=bool(fatal_reasons),
+                    open_reasons=open_reasons,
+                    fatal_reasons=fatal_reasons,
+                )
+            candidate = next(
+                (
+                    item for item in discovery.candidates
+                    if not self._store.has_claude_visibility_source(
+                        item.candidate.source_session_id
+                    )
+                ),
+                None,
+            )
+            if candidate is None:
+                return ClaudeVisibilityApplyResult(
+                    enabled=True, mode="continuous",
+                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                )
+            self._store.enqueue_claude_visibility_job(
+                candidate.candidate, candidate.identity, self._marker_secret
+            )
+        except Exception:
+            return ClaudeVisibilityApplyResult(
+                enabled=True, mode="continuous", degraded=True,
+                candidates=discovery.candidates, exclusions=discovery.exclusions,
+                fatal_reasons=("enqueue_failed",),
+            )
+        return ClaudeVisibilityApplyResult(
+            enabled=True, mode="continuous", candidates=discovery.candidates,
+            exclusions=discovery.exclusions, applied=1,
+        )
+
+    def run_once(self, *, discover_continuous: bool = False) -> ClaudeVisibilityRunResult:
+        if not self._config.claude_visibility.enabled:
+            return ClaudeVisibilityRunResult(enabled=False, status="disabled")
+        discovery = self.continuous_once() if discover_continuous else None
+        if discovery is not None and discovery.degraded:
+            return ClaudeVisibilityRunResult(
+                enabled=True, status="degraded", degraded=True, discovery=discovery
+            )
+        policy = self._config.claude_visibility
+        try:
+            claim = self._store.claim_claude_visibility_job(
+                float(self._clock()),
+                policy.lease_seconds,
+                policy.daily_registration_limit,
+                policy.emergency_daily_cost_usd,
+                policy.reserved_cost_per_attempt_usd,
+            )
+        except Exception:
+            return ClaudeVisibilityRunResult(
+                enabled=True, status="degraded", degraded=True,
+                error_code="claim_failed", discovery=discovery,
+            )
+        if not claim.claimed:
+            if claim.status not in _CLAUDE_VISIBILITY_IDLE_CLAIM_STATUSES:
+                return ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status="degraded",
+                    job_id=claim.job_id,
+                    error_code="unknown_claim_status",
+                    degraded=True,
+                    fatal=True,
+                    discovery=discovery,
+                )
+            return ClaudeVisibilityRunResult(
+                enabled=True, status=claim.status, job_id=claim.job_id,
+                discovery=discovery,
+            )
+        try:
+            outcome = self._registrar.process(claim)
+            status = str(getattr(outcome, "status"))
+            error_code = getattr(outcome, "error_code", None)
+            if status not in _CLAUDE_VISIBILITY_REGISTRAR_STATUSES:
+                return ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status="degraded",
+                    job_id=claim.job_id,
+                    error_code="unknown_registrar_status",
+                    degraded=True,
+                    fatal=True,
+                    discovery=discovery,
+                )
+            if (
+                status == "retry"
+                and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
+            ) or (
+                status == "failed"
+                and error_code not in CLAUDE_VISIBILITY_FATAL_CODES
+            ):
+                return ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status="degraded",
+                    job_id=claim.job_id,
+                    error_code="unknown_registrar_error_code",
+                    degraded=True,
+                    fatal=True,
+                    discovery=discovery,
+                )
+            return ClaudeVisibilityRunResult(
+                enabled=True,
+                status=status,
+                job_id=claim.job_id,
+                error_code=error_code if isinstance(error_code, str) else None,
+                degraded=status in {"retry", "failed"},
+                fatal=status == "failed",
+                discovery=discovery,
+            )
+        except Exception:
+            return ClaudeVisibilityRunResult(
+                enabled=True, status="degraded", job_id=claim.job_id,
+                error_code="registrar_failed", degraded=True, discovery=discovery,
+            )
 
 
 class ContinuationBlockedError(RuntimeError):

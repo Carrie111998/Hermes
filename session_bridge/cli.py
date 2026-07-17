@@ -26,10 +26,20 @@ from .characterize import (
     run_live_characterization,
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
+from .claude_registrar import ClaudeNativeRegistrar
+from .claude_visibility import (
+    CLAUDE_VISIBILITY_FATAL_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
+    ClaudeVisibilityClaim,
+)
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter, SidebarThreadVerifier
 from .config import BridgeConfig
 from .context_pack import ContextPackBuilder
-from .coordinator import SessionBridgeCoordinator
+from .coordinator import (
+    ClaudeVisibilityCoordinator,
+    ClaudeVisibilityRunResult,
+    SessionBridgeCoordinator,
+)
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
 from .mirror import (
     BatchProgress,
@@ -40,12 +50,13 @@ from .mirror import (
     enqueue_mirror_job,
     should_halt_batch,
 )
-from .models import MirrorJobState, Provider, SidebarJobState
+from .models import MirrorJobState, Provider, SidebarJobState, canonical_session_id
 from .sidebar_skill import install_sidebar_skill
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
+    SidebarSource,
     redact_codex_thread_id,
 )
 
@@ -110,6 +121,14 @@ class _Backend(Protocol):
         self, *, days: int, limit: int, apply: bool
     ) -> Mapping[str, Any]: ...
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]: ...
+    def claude_visibility_status(self) -> Mapping[str, Any]: ...
+    def claude_visibility_backfill(
+        self, *, days: int, limit: int, apply: bool
+    ) -> Mapping[str, Any]: ...
+    def set_claude_visibility_continuous(
+        self, *, enabled: bool
+    ) -> Mapping[str, Any]: ...
+    def claude_visibility_run_once(self) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
     def backfill_candidates(self, *, days: int) -> list[dict[str, Any]]: ...
@@ -118,6 +137,14 @@ class _Backend(Protocol):
     ) -> Mapping[str, Any]: ...
     def mirror_preview(self, *, session_id: str, target: str) -> Mapping[str, Any]: ...
     def apply_mirror(self, *, session_id: str, target: str) -> Mapping[str, Any]: ...
+
+
+class _ReadOnlyClaudeVisibilityRegistrar:
+    def process(self, _claim: ClaudeVisibilityClaim) -> object:
+        raise RuntimeError("read_only_claude_visibility_coordinator")
+
+
+_READ_ONLY_CLAUDE_VISIBILITY_REGISTRAR: Any = _ReadOnlyClaudeVisibilityRegistrar()
 
 
 class ConfigurationFailure(RuntimeError):
@@ -147,6 +174,7 @@ class ProductionBackend:
         self._store: SessionBridgeStore | None = None
         self._catalog: UnifiedCatalog | None = None
         self._coordinator: SessionBridgeCoordinator | None = None
+        self._claude_visibility_coordinator: ClaudeVisibilityCoordinator | None = None
         self._codex_client: CodexAppServerClient | None = None
 
     def close(self) -> None:
@@ -157,6 +185,7 @@ class ProductionBackend:
         self._store = None
         self._catalog = None
         self._coordinator = None
+        self._claude_visibility_coordinator = None
         if db is not None:
             db.close()
 
@@ -386,6 +415,176 @@ class ProductionBackend:
             "enabled": self.config.sidebar.enabled,
             "continuous": persisted_continuous,
         }
+
+    def claude_visibility_status(self) -> Mapping[str, Any]:
+        config = self.config.claude_visibility
+        if not config.enabled:
+            return _disabled_claude_visibility_payload(config.continuous)
+        store = self._require_store()
+        coordinator = ClaudeVisibilityCoordinator(
+            config=self.config,
+            store=store,
+            inventory=self._claude_visibility_inventory,
+            registrar=_READ_ONLY_CLAUDE_VISIBILITY_REGISTRAR,
+            marker_secret=resolve_marker_key(),
+            clock=time.time,
+        )
+        discovery = coordinator.discover(
+            days=config.backfill_days,
+            limit=config.manual_batch_limit,
+        )
+        raw = store.claude_visibility_status(time.time())
+        status_fatal = _claude_visibility_fatal_reasons(raw)
+        return {
+            "enabled": True,
+            "continuous": config.continuous,
+            "counts": dict(raw["counts"]),
+            "retry_codes": dict(raw["retry_codes"]),
+            "failed_codes": dict(raw["failed_codes"]),
+            "usage": dict(raw["usage"]),
+            "candidates": [_public_claude_candidate(item) for item in discovery.candidates],
+            "exclusions": [asdict(item) for item in discovery.exclusions],
+            "open_reasons": _claude_visibility_open_reasons(raw),
+            "fatal_reasons": [
+                *status_fatal,
+                *(list(discovery.reasons) if discovery.degraded else []),
+            ],
+            "degraded_reasons": list(discovery.reasons) if discovery.degraded else [],
+            "last_empty_cycle": None,
+            "last_registrar_result": None,
+        }
+
+    def claude_visibility_backfill(
+        self, *, days: int, limit: int, apply: bool
+    ) -> Mapping[str, Any]:
+        if not self.config.claude_visibility.enabled:
+            return {
+                **_disabled_claude_visibility_payload(
+                    self.config.claude_visibility.continuous
+                ),
+                "mode": "disabled",
+                "dry_run": not apply,
+                "applied": False,
+                "enqueued": 0,
+            }
+        result = self._claude_visibility_runtime().backfill(
+            days=days, limit=limit, apply=apply
+        )
+        return _public_claude_apply(result, continuous=self.config.claude_visibility.continuous)
+
+    def set_claude_visibility_continuous(
+        self, *, enabled: bool
+    ) -> Mapping[str, Any]:
+        if type(enabled) is not bool:
+            raise ConfigurationFailure("invalid_claude_visibility_continuous_mode")
+        from hermes_cli.config import ConfigPersistenceRejected, mutate_config
+
+        def _mutate(document: dict[str, Any]) -> None:
+            session_bridge = document.get("session_bridge")
+            if session_bridge is None:
+                session_bridge = {}
+                document["session_bridge"] = session_bridge
+            if not isinstance(session_bridge, dict):
+                raise ConfigurationFailure("invalid_session_bridge_config")
+            visibility = session_bridge.get("claude_visibility")
+            if visibility is None:
+                visibility = {}
+                session_bridge["claude_visibility"] = visibility
+            if not isinstance(visibility, dict):
+                raise ConfigurationFailure("invalid_claude_visibility_config")
+            visibility["continuous"] = enabled
+
+        try:
+            persisted = mutate_config(
+                _mutate,
+                preserve_keys={("session_bridge", "claude_visibility", "continuous")},
+            )
+        except ConfigPersistenceRejected as exc:
+            raise ConfigurationFailure("config_persistence_rejected") from exc
+        bridge = persisted.get("session_bridge")
+        visibility = bridge.get("claude_visibility") if isinstance(bridge, dict) else None
+        value = visibility.get("continuous") if isinstance(visibility, dict) else None
+        if type(value) is not bool:
+            raise ConfigurationFailure("invalid_persisted_claude_visibility_config")
+        if value is not enabled:
+            raise ConfigurationFailure("claude_visibility_continuous_not_persisted")
+        self.config = replace(
+            self.config,
+            claude_visibility=replace(self.config.claude_visibility, continuous=value),
+        )
+        return {"enabled": self.config.claude_visibility.enabled, "continuous": value}
+
+    def claude_visibility_run_once(self) -> Mapping[str, Any]:
+        if not self.config.claude_visibility.enabled:
+            return {
+                "enabled": False,
+                "continuous": self.config.claude_visibility.continuous,
+                "status": "disabled",
+                "degraded": False,
+                "fatal": False,
+            }
+        result = self._claude_visibility_runtime().run_once(discover_continuous=True)
+        return _public_claude_run(
+            result, continuous=self.config.claude_visibility.continuous
+        )
+
+    def _claude_visibility_runtime(self) -> ClaudeVisibilityCoordinator:
+        if self._claude_visibility_coordinator is not None:
+            return self._claude_visibility_coordinator
+        try:
+            marker_secret = resolve_marker_key()
+            claude_command = resolve_cli_executable("claude")
+            source = ClaudeSourceAdapter(
+                _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+            )
+            store = self._require_store()
+            registrar = ClaudeNativeRegistrar(
+                store,
+                source,
+                marker_secret=marker_secret,
+                claude_command=claude_command,
+                process_timeout=self.config.claude_visibility.process_timeout_seconds,
+                discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
+            )
+
+            self._claude_visibility_coordinator = ClaudeVisibilityCoordinator(
+                config=self.config,
+                store=store,
+                inventory=self._claude_visibility_inventory,
+                registrar=registrar,
+                marker_secret=marker_secret,
+                clock=time.time,
+            )
+            return self._claude_visibility_coordinator
+        except ConfigurationFailure:
+            raise
+        except Exception as exc:
+            raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
+
+    def _claude_visibility_inventory(self, after: float) -> Sequence[SidebarSource]:
+        store = self._require_store()
+        sources = list(store.list_claude_visibility_hermes_sources(after, 1000))
+        page = store.list_native_projections(after, 1000)
+        existing = {
+            (item.projection.provider, item.source_session_id) for item in sources
+        }
+        for projection in page:
+            if projection.provider is not Provider.CODEX:
+                continue
+            source_id = canonical_session_id(projection.provider, projection.native_id)
+            if (projection.provider, source_id) in existing:
+                continue
+            sources.append(SidebarSource(
+                source_session_id=source_id,
+                projection=projection,
+                git_root=None,
+                git_head=None,
+                worktree_id=None,
+                automation_only=False,
+                subagent_only=False,
+            ))
+            existing.add((projection.provider, source_id))
+        return tuple(sources)
 
     def characterize(self, *, provider: str) -> Mapping[str, Any]:
         if provider != "all":
@@ -811,6 +1010,41 @@ def build_parser() -> argparse.ArgumentParser:
     sidebar_continuous_mode.add_argument("--enable", action="store_true")
     sidebar_continuous_mode.add_argument("--disable", action="store_true")
 
+    claude_visibility_status = commands.add_parser(
+        "claude-visibility-status",
+        help="show sanitized Claude native visibility status",
+    )
+    claude_visibility_status.add_argument("--json", action="store_true")
+
+    claude_visibility_backfill = commands.add_parser(
+        "claude-visibility-backfill",
+        help="preview or enqueue a reviewed Claude visibility batch",
+    )
+    claude_visibility_backfill.add_argument(
+        "--days", type=_positive_int, default=30
+    )
+    claude_visibility_backfill.add_argument(
+        "--limit", type=_bounded_claude_visibility_limit, default=10
+    )
+    claude_visibility_mode = claude_visibility_backfill.add_mutually_exclusive_group()
+    claude_visibility_mode.add_argument("--dry-run", action="store_true")
+    claude_visibility_mode.add_argument("--apply", action="store_true")
+
+    claude_visibility_continuous = commands.add_parser(
+        "claude-visibility-continuous",
+        help="persist the Claude visibility continuous discovery preference",
+    )
+    claude_continuous_mode = claude_visibility_continuous.add_mutually_exclusive_group(
+        required=True
+    )
+    claude_continuous_mode.add_argument("--enable", action="store_true")
+    claude_continuous_mode.add_argument("--disable", action="store_true")
+
+    commands.add_parser(
+        "claude-visibility-run-once",
+        help="process at most one reviewed Claude visibility job",
+    )
+
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
     )
@@ -901,6 +1135,42 @@ def main(
             )
             _emit(payload)
             return EXIT_OK
+        if args.command == "claude-visibility-status":
+            payload = dict(backend.claude_visibility_status())
+            _emit(payload)
+            return (
+                EXIT_DEGRADED
+                if payload.get("degraded_reasons") or payload.get("fatal_reasons")
+                else EXIT_OK
+            )
+        if args.command == "claude-visibility-backfill":
+            payload = dict(backend.claude_visibility_backfill(
+                days=args.days,
+                limit=args.limit,
+                apply=bool(args.apply),
+            ))
+            _emit(payload)
+            blocked = any(
+                payload.get(key)
+                for key in ("open_reasons", "fatal_reasons", "degraded_reasons")
+            ) or payload.get("degraded") is True
+            return EXIT_ROLLOUT_GATE if args.apply and blocked else (
+                EXIT_DEGRADED if blocked else EXIT_OK
+            )
+        if args.command == "claude-visibility-continuous":
+            payload = dict(backend.set_claude_visibility_continuous(
+                enabled=bool(args.enable)
+            ))
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "claude-visibility-run-once":
+            payload = dict(backend.claude_visibility_run_once())
+            _emit(payload)
+            return (
+                EXIT_DEGRADED
+                if payload.get("degraded") is True or payload.get("fatal") is True
+                else EXIT_OK
+            )
         if args.command == "characterize":
             _emit(dict(backend.characterize(provider=args.provider)))
             return EXIT_OK
@@ -1050,6 +1320,113 @@ def _public_preview(preview: Mapping[str, Any]) -> dict[str, Any]:
             "job_state",
         )
         if key in preview
+    }
+
+
+def _public_claude_candidate(item: Any) -> dict[str, Any]:
+    candidate = item.candidate
+    return {
+        "source_session_id": candidate.source_session_id,
+        "source_provider": candidate.source_provider.value,
+        "native_name": candidate.native_name,
+        "source_cwd": candidate.source_cwd,
+        "git_root": candidate.git_root,
+        "git_branch": candidate.git_branch,
+        "git_head": candidate.git_head,
+        "worktree_id": candidate.worktree_id,
+        "activity": item.activity,
+        "job_id": item.identity.job_id,
+    }
+
+
+def _public_claude_apply(result: Any, *, continuous: bool) -> dict[str, Any]:
+    return {
+        "enabled": result.enabled,
+        "continuous": continuous,
+        "mode": result.mode,
+        "dry_run": result.mode == "dry_run",
+        "applied": result.mode == "apply",
+        "enqueued": result.applied,
+        "candidates": [_public_claude_candidate(item) for item in result.candidates],
+        "exclusions": [asdict(item) for item in result.exclusions],
+        "open_reasons": list(result.open_reasons),
+        "fatal_reasons": list(result.fatal_reasons),
+        "degraded_reasons": list(result.fatal_reasons) if result.degraded else [],
+        "degraded": result.degraded,
+    }
+
+
+def _public_claude_run(
+    result: ClaudeVisibilityRunResult, *, continuous: bool
+) -> dict[str, Any]:
+    return {
+        "enabled": result.enabled,
+        "status": result.status,
+        "job_id": result.job_id,
+        "error_code": result.error_code,
+        "degraded": result.degraded,
+        "fatal": result.fatal,
+        "discovery": (
+            _public_claude_apply(result.discovery, continuous=continuous)
+            if result.discovery is not None
+            else None
+        ),
+    }
+
+
+def _claude_visibility_open_reasons(raw: Mapping[str, Any]) -> list[str]:
+    counts = raw.get("counts")
+    if not isinstance(counts, Mapping):
+        return ["invalid_status"]
+    if any(
+        int(counts.get(state, 0)) > 0
+        for state in (
+            "claude_pending", "claude_leased", "claude_retry", "claude_failed"
+        )
+    ):
+        return ["open_visibility_work"]
+    return []
+
+
+def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:
+    retry_codes = raw.get("retry_codes")
+    failed_codes = raw.get("failed_codes")
+    if not isinstance(retry_codes, Mapping) or not isinstance(failed_codes, Mapping):
+        return ["invalid_status"]
+    reasons: list[str] = []
+    for code, count in retry_codes.items():
+        if code not in CLAUDE_VISIBILITY_RETRY_CODES and int(count) > 0:
+            reasons.append("unknown_retry_code")
+    for code, count in failed_codes.items():
+        if int(count) <= 0:
+            continue
+        reasons.append(
+            str(code) if code in CLAUDE_VISIBILITY_FATAL_CODES else "unknown_failed_code"
+        )
+    return sorted(set(reasons))
+
+
+def _disabled_claude_visibility_payload(continuous: bool) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "continuous": continuous,
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_visible": 0,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "usage": {"local_day": None, "attempts": 0, "reserved_cost_usd": "0"},
+        "candidates": [],
+        "exclusions": [],
+        "open_reasons": [],
+        "fatal_reasons": [],
+        "degraded_reasons": [],
+        "last_empty_cycle": None,
+        "last_registrar_result": None,
     }
 
 
@@ -1218,6 +1595,13 @@ def _bounded_sidebar_days(value: str) -> int:
 
 
 def _bounded_sidebar_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 10:
+        raise argparse.ArgumentTypeError("value must be at most 10")
+    return parsed
+
+
+def _bounded_claude_visibility_limit(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > 10:
         raise argparse.ArgumentTypeError("value must be at most 10")

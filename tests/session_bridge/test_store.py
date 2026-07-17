@@ -3640,6 +3640,75 @@ def test_native_hermes_snapshot_rejects_external_sessions(db):
     assert store.get_native_session_snapshot("claude:native-1") is None
 
 
+def test_claude_visibility_hermes_inventory_is_independent_and_stable(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    for session_id, source, timestamp in (
+        ("hermes-pending", "cli", 105.0),
+        ("hermes-visible", "cli", 104.0),
+        ("hermes-excluded", "cli", 103.0),
+        ("hermes-automation", "cron", 102.0),
+        ("hermes-bridge", "cli", 101.0),
+        ("hermes-origin", "cli", 100.0),
+    ):
+        db.create_session(session_id, source, cwd="C:/workspace/project")
+        db.append_message(session_id, "user", f"meaningful {session_id}", timestamp=timestamp)
+
+    def sidebar_candidate(session_id: str) -> SidebarCandidate:
+        return SidebarCandidate(
+            source_session_id=session_id,
+            provider=Provider.HERMES,
+            bridge_id=sidebar_bridge_id(session_id),
+            title=f"[Hermes] {session_id}",
+            cwd="C:/workspace/project",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=100.0,
+        )
+
+    pending = sidebar_candidate("hermes-pending")
+    visible = sidebar_candidate("hermes-visible")
+    store.enqueue_sidebar_job(pending)
+    store.enqueue_sidebar_job(visible)
+    db._execute_write(lambda conn: conn.execute(
+        """UPDATE session_sidebar_jobs
+              SET state = 'sidebar_visible', codex_thread_id = ?, visible_at = ?,
+                  completion_digest = ?
+            WHERE source_session_id = ?""",
+        ("visible-thread", 200.0, "a" * 64, visible.source_session_id),
+    ))
+    store.record_sidebar_exclusion(
+        "hermes-excluded", Provider.HERMES, "source_cwd_missing", now=200.0
+    )
+    db._execute_write(lambda conn: conn.execute(
+        """INSERT INTO session_links (
+               id, from_session_id, to_session_id, relation, bridge_id,
+               created_at, hydrated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("visibility-bridge-link", "hermes-origin", "hermes-bridge",
+         Relation.CONTINUES.value, "bridge:visibility", 101.0, 101.0),
+    ))
+    store.upsert_projection(_projection(
+        _message("native-claude", "must not pollute Hermes inventory"),
+        provider=Provider.CLAUDE,
+        native_id="native-claude",
+        last_active=106.0,
+    ))
+
+    sources = store.list_claude_visibility_hermes_sources(after=0.0, limit=20)
+
+    assert [source.source_session_id for source in sources] == [
+        "hermes-pending", "hermes-visible", "hermes-excluded",
+        "hermes-automation", "hermes-bridge", "hermes-origin",
+    ]
+    by_id = {source.source_session_id: source for source in sources}
+    assert by_id["hermes-automation"].automation_only is True
+    assert by_id["hermes-bridge"].projection.origin_kind is OriginKind.BRIDGE_CONTINUATION
+    assert by_id["hermes-bridge"].projection.origin_bridge_id == "bridge:visibility"
+    assert len(by_id) == len(sources)
+
+
 def _sidebar_candidate(
     db: SessionDB,
     *,
@@ -5487,6 +5556,20 @@ def test_claude_visibility_retry_fatal_or_unknown_code_terminalizes(
 
     assert result["state"] == "claude_failed"
     assert result["error_code"] == persisted_code
+
+
+def test_claude_visibility_source_lookup_is_read_only_and_covers_all_states(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+
+    assert store.has_claude_visibility_source(candidate.source_session_id) is False
+
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    assert store.has_claude_visibility_source(candidate.source_session_id) is True
+    assert store.claude_visibility_status(100.0)["counts"]["claude_pending"] == 1
 
 
 def test_claude_visibility_claims_at_most_one_due_job_and_status_is_exact(

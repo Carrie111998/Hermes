@@ -1097,6 +1097,20 @@ class SessionBridgeStore:
             },
         }
 
+    def has_claude_visibility_source(self, source_session_id: str) -> bool:
+        normalized = _exact_nonempty_text(
+            source_session_id, "Claude visibility source session ID"
+        )
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs
+                   WHERE source_session_id = ? LIMIT 1""",
+                (normalized,),
+            ).fetchone()
+        return row is not None
+
     def _claude_visibility_local_day(self, timestamp: float) -> str:
         if self._local_timezone is None:
             local = datetime.fromtimestamp(timestamp).astimezone()
@@ -1741,6 +1755,147 @@ class SessionBridgeStore:
             if row["reason_code"] in by_reason:
                 by_reason[row["reason_code"]] = row["count"]
         return {"total": total, "by_reason": by_reason}
+
+    def list_claude_visibility_hermes_sources(
+        self, after: float, limit: int
+    ) -> tuple[SidebarSource, ...]:
+        """Read native Hermes sources independently of all delivery queues."""
+
+        cutoff = _finite_number(after, "Claude visibility candidate cutoff")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("Claude visibility candidate limit must be between 1 and 1000")
+        sources: list[SidebarSource] = []
+        with self._native_hermes_databases() as databases:
+            for _profile, database, _owned in databases:
+                if not self._profile_catalog_compatible(database):
+                    continue
+                sources.extend(
+                    self._list_claude_visibility_hermes_sources_from_db(
+                        database, after=cutoff, limit=limit
+                    )
+                )
+        identities = [source.source_session_id for source in sources]
+        if len(identities) != len(set(identities)):
+            raise ValueError("duplicate native Hermes session identity across profiles")
+        sources.sort(
+            key=lambda source: (
+                -source.projection.last_active,
+                source.source_session_id,
+            )
+        )
+        return tuple(sources[:limit])
+
+    @staticmethod
+    def _list_claude_visibility_hermes_sources_from_db(
+        database: SessionDB, *, after: float, limit: int
+    ) -> list[SidebarSource]:
+        with database._lock:
+            conn = database._conn
+            assert conn is not None
+            rows = conn.execute(
+                """WITH candidate AS (
+                       SELECT s.id AS session_id, s.source, s.model_config,
+                              s.title, s.cwd, s.started_at, s.git_branch,
+                              s.git_repo_root,
+                              COALESCE(
+                                  (SELECT MAX(message.timestamp)
+                                     FROM messages AS message
+                                    WHERE message.session_id = s.id
+                                      AND (message.active = 1 OR message.compacted = 1)),
+                                  s.started_at
+                              ) AS last_active,
+                              CASE WHEN s.source = 'cron' THEN 1 ELSE 0 END
+                                  AS automation_only,
+                              CASE
+                                  WHEN s.source IN ('subagent', 'tool') THEN 1
+                                  WHEN json_extract(COALESCE(s.model_config, '{}'),
+                                                    '$._delegate_from') IS NOT NULL THEN 1
+                                  ELSE 0
+                              END AS subagent_only,
+                              (SELECT incoming.relation
+                                 FROM session_links AS incoming
+                                WHERE incoming.to_session_id = s.id
+                                ORDER BY incoming.created_at, incoming.id LIMIT 1)
+                                  AS incoming_relation,
+                              (SELECT incoming.bridge_id
+                                 FROM session_links AS incoming
+                                WHERE incoming.to_session_id = s.id
+                                ORDER BY incoming.created_at, incoming.id LIMIT 1)
+                                  AS incoming_bridge_id
+                         FROM sessions AS s
+                         LEFT JOIN external_sessions AS e ON e.session_id = s.id
+                        WHERE e.session_id IS NULL
+                          AND s.id NOT LIKE 'claude:%'
+                          AND s.id NOT LIKE 'codex:%'
+                          AND s.source != ?
+                   )
+                   SELECT * FROM candidate
+                    WHERE last_active IS NOT NULL AND last_active >= ?
+                    ORDER BY last_active DESC, session_id
+                    LIMIT ?""",
+                (_PROFILE_SHADOW_SOURCE, after, limit),
+            ).fetchall()
+            messages: dict[str, list[ProjectedMessage]] = {
+                row["session_id"]: [] for row in rows
+            }
+            session_ids = list(messages)
+            for start in range(0, len(session_ids), _MESSAGE_KEY_QUERY_CHUNK):
+                batch = session_ids[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+                placeholders = ",".join("?" for _ in batch)
+                message_rows = conn.execute(
+                    f"""SELECT id, session_id, role, content, timestamp
+                           FROM messages
+                          WHERE session_id IN ({placeholders}) AND role = 'user'
+                            AND (active = 1 OR compacted = 1)
+                          ORDER BY session_id, timestamp, id""",
+                    batch,
+                ).fetchall()
+                for message in message_rows:
+                    message_id = int(message["id"])
+                    decoded = database._decode_content(message["content"])
+                    messages[message["session_id"]].append(ProjectedMessage(
+                        native_event_id=f"hermes-message:{message_id}",
+                        ordinal=message_id,
+                        role=message["role"],
+                        content=decoded if isinstance(decoded, str) else None,
+                        timestamp=float(message["timestamp"]),
+                    ))
+        sources: list[SidebarSource] = []
+        for row in rows:
+            incoming_relation = row["incoming_relation"]
+            if incoming_relation == Relation.MIRRORS.value:
+                origin_kind = OriginKind.BRIDGE_PLACEHOLDER
+            elif incoming_relation is not None:
+                origin_kind = OriginKind.BRIDGE_CONTINUATION
+            else:
+                origin_kind = OriginKind.NATIVE
+            source_session_id = row["session_id"]
+            sources.append(SidebarSource(
+                source_session_id=source_session_id,
+                projection=SessionProjection(
+                    provider=Provider.HERMES,
+                    native_id=source_session_id,
+                    title=row["title"],
+                    cwd=row["cwd"],
+                    started_at=float(row["started_at"]),
+                    last_active=float(row["last_active"]),
+                    messages=tuple(messages[source_session_id]),
+                    native_status="active",
+                    origin_kind=origin_kind,
+                    origin_bridge_id=row["incoming_bridge_id"],
+                    git_branch=row["git_branch"],
+                ),
+                git_root=row["git_repo_root"],
+                git_head=None,
+                worktree_id=None,
+                automation_only=bool(row["automation_only"]),
+                subagent_only=bool(row["subagent_only"]),
+            ))
+        return sources
 
     def list_sidebar_candidates(
         self,
