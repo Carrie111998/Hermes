@@ -290,9 +290,38 @@ def test_claude_visibility_defaults_are_exact_disabled_and_environment_free(
     assert isinstance(config.claude_visibility, ClaudeVisibilityConfig)
 
 
+def test_claude_visibility_config_parses_every_valid_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = {
+        "enabled": True,
+        "continuous": True,
+        "backfill_days": 14,
+        "continuous_batch_limit": 2,
+        "manual_batch_limit": 8,
+        "lease_seconds": 600,
+        "max_attempts": 7,
+        "daily_registration_limit": 40,
+        "reserved_cost_per_attempt_usd": "0.03",
+        "emergency_daily_cost_usd": "0.75",
+        "process_timeout_seconds": 180,
+        "discovery_timeout_seconds": 45,
+    }
+
+    config = _load_with_claude_visibility(monkeypatch, configured)
+
+    assert asdict(config.claude_visibility) == {
+        **configured,
+        "reserved_cost_per_attempt_usd": Decimal("0.03"),
+        "emergency_daily_cost_usd": Decimal("0.75"),
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
+        ("enabled", 1, "enabled must be a boolean"),
+        ("continuous", "false", "continuous must be a boolean"),
         ("backfill_days", -1, "backfill_days must be at least 0"),
         ("continuous_batch_limit", 0, "continuous_batch_limit must be at least 1"),
         ("continuous_batch_limit", -1, "continuous_batch_limit must be at least 1"),
@@ -327,6 +356,36 @@ def test_claude_visibility_defaults_are_exact_disabled_and_environment_free(
             "emergency_daily_cost_usd",
             "-0.01",
             "emergency_daily_cost_usd must be greater than 0",
+        ),
+        (
+            "reserved_cost_per_attempt_usd",
+            "NaN",
+            "reserved_cost_per_attempt_usd must be finite",
+        ),
+        (
+            "reserved_cost_per_attempt_usd",
+            "Infinity",
+            "reserved_cost_per_attempt_usd must be finite",
+        ),
+        (
+            "reserved_cost_per_attempt_usd",
+            "not-money",
+            "reserved_cost_per_attempt_usd must be a decimal number",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "NaN",
+            "emergency_daily_cost_usd must be finite",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "Infinity",
+            "emergency_daily_cost_usd must be finite",
+        ),
+        (
+            "emergency_daily_cost_usd",
+            "not-money",
+            "emergency_daily_cost_usd must be a decimal number",
         ),
     ),
 )

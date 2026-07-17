@@ -106,6 +106,50 @@ def _unique_column_sets(db: SessionDB, table: str) -> set[tuple[str, ...]]:
     return unique_sets
 
 
+def _insert_claude_visibility_job(
+    db: SessionDB,
+    *,
+    job_id: str,
+    source_session_id: str,
+    state: str = "claude_pending",
+    bridge_id: str | None = None,
+    idempotency_key: str | None = None,
+    reserved_claude_uuid: str | None = None,
+) -> None:
+    visible = state == "claude_visible"
+    db._conn.execute(
+        """INSERT INTO session_claude_visibility_jobs (
+           id, source_session_id, bridge_id, idempotency_key,
+           reserved_claude_uuid, native_name, source_provider, source_cwd,
+           signed_marker, state, next_attempt_at, completion_digest,
+           eligible_at, created_at, updated_at, visible_at
+           ) VALUES (?, ?, ?, ?, ?, ?, 'hermes', ?, ?, ?, 1, ?, 1, 1, 1, ?)""",
+        (
+            job_id,
+            source_session_id,
+            bridge_id or f"bridge:{job_id}",
+            idempotency_key or f"idempotency:{job_id}",
+            reserved_claude_uuid or f"00000000-0000-4000-8000-{job_id[-12:]:0>12}",
+            f"Native {job_id}",
+            "C:/source",
+            f"signed:{job_id}",
+            state,
+            f"completion:{job_id}" if visible else None,
+            2 if visible else None,
+        ),
+    )
+
+
+def _insert_claude_registration_usage(db: SessionDB, job_id: str) -> None:
+    db._conn.execute(
+        """INSERT INTO session_claude_registration_usage (
+           local_day, job_id, attempt_ordinal, reserved_estimated_cost_usd,
+           reserved_at
+           ) VALUES ('2026-07-17', ?, 1, '0.02', 1)""",
+        (job_id,),
+    )
+
+
 def test_fresh_claude_visibility_schema_has_exact_columns_states_and_uniques(
     db,
 ) -> None:
@@ -141,6 +185,10 @@ def test_fresh_claude_visibility_schema_has_exact_columns_states_and_uniques(
         "job_id",
         "attempt_ordinal",
     ) in _unique_column_sets(db, "session_claude_registration_usage")
+    assert _rows(
+        db,
+        'PRAGMA foreign_key_list("session_claude_visibility_jobs")',
+    ) == []
 
 
 def test_claude_registration_usage_migrates_existing_database_idempotently(
@@ -183,8 +231,145 @@ def test_claude_registration_usage_migrates_existing_database_idempotently(
             "job_id",
             "attempt_ordinal",
         ) in _unique_column_sets(migrated, "session_claude_registration_usage")
+        assert _rows(
+            migrated,
+            'PRAGMA foreign_key_list("session_claude_visibility_jobs")',
+        ) == []
     finally:
         migrated.close()
+
+
+@pytest.mark.parametrize("state", ["claude_pending", "claude_visible"])
+def test_delete_session_preserves_claude_visibility_job_and_usage_audit(
+    db: SessionDB,
+    state: str,
+) -> None:
+    source_session_id = f"hermes:delete-{state}"
+    job_id = f"job-delete-{state}"
+    db.create_session(source_session_id, source="cli")
+    _insert_claude_visibility_job(
+        db,
+        job_id=job_id,
+        source_session_id=source_session_id,
+        state=state,
+    )
+    _insert_claude_registration_usage(db, job_id)
+    assert _rows(db, "PRAGMA foreign_keys") == [{"foreign_keys": 1}]
+
+    assert db.delete_session(source_session_id) is True
+
+    assert db.get_session(source_session_id) is None
+    assert _rows(
+        db,
+        "SELECT id, source_session_id, state FROM session_claude_visibility_jobs",
+    ) == [{
+        "id": job_id,
+        "source_session_id": source_session_id,
+        "state": state,
+    }]
+    assert _rows(
+        db,
+        "SELECT job_id, attempt_ordinal FROM session_claude_registration_usage",
+    ) == [{"job_id": job_id, "attempt_ordinal": 1}]
+
+
+@pytest.mark.parametrize("state", ["claude_pending", "claude_visible"])
+def test_prune_sessions_preserves_claude_visibility_job_and_usage_audit(
+    db: SessionDB,
+    state: str,
+) -> None:
+    source_session_id = f"hermes:prune-{state}"
+    job_id = f"job-prune-{state}"
+    db.create_session(source_session_id, source="cli")
+    db.end_session(source_session_id, "completed")
+    _insert_claude_visibility_job(
+        db,
+        job_id=job_id,
+        source_session_id=source_session_id,
+        state=state,
+    )
+    _insert_claude_registration_usage(db, job_id)
+    assert _rows(db, "PRAGMA foreign_keys") == [{"foreign_keys": 1}]
+
+    assert db.prune_sessions(
+        older_than_days=None,
+        started_before=10**12,
+    ) == 1
+
+    assert db.get_session(source_session_id) is None
+    assert _rows(
+        db,
+        "SELECT id, source_session_id, state FROM session_claude_visibility_jobs",
+    ) == [{
+        "id": job_id,
+        "source_session_id": source_session_id,
+        "state": state,
+    }]
+    assert _rows(
+        db,
+        "SELECT job_id, attempt_ordinal FROM session_claude_registration_usage",
+    ) == [{"job_id": job_id, "attempt_ordinal": 1}]
+
+
+def test_claude_visibility_job_rejects_invalid_state(db: SessionDB) -> None:
+    db.create_session("hermes:invalid-state", source="cli")
+
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        _insert_claude_visibility_job(
+            db,
+            job_id="job-invalid-state",
+            source_session_id="hermes:invalid-state",
+            state="invalid-state",
+        )
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "source_session_id",
+        "bridge_id",
+        "idempotency_key",
+        "reserved_claude_uuid",
+    ],
+)
+def test_claude_visibility_job_rejects_each_duplicate_identity(
+    db: SessionDB,
+    column: str,
+) -> None:
+    db.create_session("hermes:unique-one", source="cli")
+    db.create_session("hermes:unique-two", source="cli")
+    first = {
+        "source_session_id": "hermes:unique-one",
+        "bridge_id": "bridge:shared",
+        "idempotency_key": "idempotency:shared",
+        "reserved_claude_uuid": "00000000-0000-4000-8000-000000000001",
+    }
+    second = {
+        "source_session_id": "hermes:unique-two",
+        "bridge_id": "bridge:different",
+        "idempotency_key": "idempotency:different",
+        "reserved_claude_uuid": "00000000-0000-4000-8000-000000000002",
+    }
+    second[column] = first[column]
+    _insert_claude_visibility_job(db, job_id="job-unique-one", **first)
+
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        _insert_claude_visibility_job(db, job_id="job-unique-two", **second)
+
+
+def test_claude_registration_usage_rejects_duplicate_job_attempt(
+    db: SessionDB,
+) -> None:
+    db.create_session("hermes:usage-unique", source="cli")
+    _insert_claude_visibility_job(
+        db,
+        job_id="job-usage-unique",
+        source_session_id="hermes:usage-unique",
+    )
+    _insert_claude_registration_usage(db, "job-usage-unique")
+
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        _insert_claude_registration_usage(db, "job-usage-unique")
 
 
 def test_mirror_worker_lock_serializes_independent_store_instances(db) -> None:

@@ -945,7 +945,7 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
 
 CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     id TEXT PRIMARY KEY,
-    source_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+    source_session_id TEXT NOT NULL UNIQUE,
     bridge_id TEXT NOT NULL UNIQUE,
     idempotency_key TEXT NOT NULL UNIQUE,
     reserved_claude_uuid TEXT NOT NULL UNIQUE,
