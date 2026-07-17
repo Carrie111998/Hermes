@@ -4608,18 +4608,155 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 # Per-platform config: each entry defines the env vars, setup instructions,
 # and prompts needed to configure a messaging platform.
 _PLATFORMS = [
-    # Telegram moved to plugins/platforms/telegram/ — setup metadata discovered
-    # dynamically via the platform registry entry registered by
-    # plugins/platforms/telegram/adapter.py::register(). #41112.
-    # Discord moved to plugins/platforms/discord/ — its setup metadata is
-    # discovered dynamically via _all_platforms() from the platform registry
-    # entry registered by plugins/platforms/discord/adapter.py::register().
-    # Slack moved to plugins/platforms/slack/ for the same reason — its setup
-    # metadata is discovered dynamically via the platform registry entry
-    # registered by plugins/platforms/slack/adapter.py::register(). #41112.
-    # Matrix moved to plugins/platforms/matrix/ — setup metadata discovered
-    # dynamically via the platform registry entry registered by
-    # plugins/platforms/matrix/adapter.py::register(). #41112.
+    # NOTE: telegram, slack, matrix, whatsapp, email and sms are **built-in**
+    # adapters that still live in gateway/platforms/. An incomplete
+    # plugin-migration refactor removed their setup entries from this list on
+    # the assumption they had moved to plugins/platforms/<name>/, but those
+    # plugin dirs were never created — so they silently vanished from
+    # `hermes setup gateway` and _all_platforms(). Their entries are restored
+    # below, alongside the other still-built-in adapters (mattermost, signal,
+    # weixin, …). Discord DID migrate to plugins/platforms/discord/ and is
+    # discovered dynamically via _all_platforms() from the platform registry.
+    {
+        "key": "telegram",
+        "label": "Telegram",
+        "emoji": "📱",
+        "token_var": "TELEGRAM_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Open Telegram and message @BotFather",
+            "2. Send /newbot and follow the prompts to create your bot",
+            "3. Copy the bot token BotFather gives you",
+            "4. To find your user ID: message @userinfobot — it replies with your numeric ID",
+        ],
+        "vars": [
+            {"name": "TELEGRAM_BOT_TOKEN", "prompt": "Bot token", "password": True,
+             "help": "Paste the token from @BotFather (step 3 above)."},
+            {"name": "TELEGRAM_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Paste your user ID from step 4 above."},
+            {"name": "TELEGRAM_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)", "password": False,
+             "help": "For DMs, this is your user ID. You can set it later by typing /set-home in chat."},
+        ],
+    },
+    {
+        "key": "slack",
+        "label": "Slack",
+        "emoji": "💼",
+        "token_var": "SLACK_BOT_TOKEN",
+        "setup_instructions": [
+            "1. Go to https://api.slack.com/apps → Create New App → From Scratch",
+            "2. Enable Socket Mode: Settings → Socket Mode → Enable",
+            "   Create an App-Level Token with scope: connections:write → copy xapp-... token",
+            "3. Add Bot Token Scopes: Features → OAuth & Permissions → Scopes",
+            "   Required: chat:write, app_mentions:read, channels:history, channels:read,",
+            "   groups:history, im:history, im:read, im:write, users:read, files:read, files:write",
+            "4. Subscribe to Events: Features → Event Subscriptions → Enable",
+            "   Required events: message.im, message.channels, app_mention",
+            "   Optional: message.groups (for private channels)",
+            "   ⚠ Without message.channels the bot will ONLY work in DMs!",
+            "5. Install to Workspace: Settings → Install App → copy xoxb-... token",
+            "6. Reinstall the app after any scope or event changes",
+            "7. Find your user ID: click your profile → three dots → Copy member ID",
+            "8. Invite the bot to channels: /invite @YourBot",
+        ],
+        "vars": [
+            {"name": "SLACK_BOT_TOKEN", "prompt": "Bot Token (xoxb-...)", "password": True,
+             "help": "Paste the bot token from step 3 above."},
+            {"name": "SLACK_APP_TOKEN", "prompt": "App Token (xapp-...)", "password": True,
+             "help": "Paste the app-level token from step 4 above."},
+            {"name": "SLACK_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Paste your member ID from step 7 above."},
+        ],
+    },
+    {
+        "key": "matrix",
+        "label": "Matrix",
+        "emoji": "🔐",
+        "token_var": "MATRIX_ACCESS_TOKEN",
+        "setup_instructions": [
+            "1. Works with any Matrix homeserver (self-hosted Synapse/Conduit/Dendrite or matrix.org)",
+            "2. Create a bot user on your homeserver, or use your own account",
+            "3. Get an access token: Element → Settings → Help & About → Access Token",
+            "   Or via API: curl -X POST https://your-server/_matrix/client/v3/login \\",
+            "     -d '{\"type\":\"m.login.password\",\"user\":\"@bot:server\",\"password\":\"...\"}'",
+            "4. Alternatively, provide user ID + password and Hermes will log in directly",
+            "5. For E2EE: set MATRIX_ENCRYPTION=true (requires pip install 'mautrix[encryption]')",
+            "6. To find your user ID: it's @username:your-server (shown in Element profile)",
+        ],
+        "vars": [
+            {"name": "MATRIX_HOMESERVER", "prompt": "Homeserver URL (e.g. https://matrix.example.org)", "password": False,
+             "help": "Your Matrix homeserver URL. Works with any self-hosted instance."},
+            {"name": "MATRIX_ACCESS_TOKEN", "prompt": "Access token (leave empty to use password login instead)", "password": True,
+             "help": "Paste your access token, or leave empty and provide user ID + password below."},
+            {"name": "MATRIX_USER_ID", "prompt": "User ID (@bot:server — required for password login)", "password": False,
+             "help": "Full Matrix user ID, e.g. @hermes:matrix.example.org"},
+            {"name": "MATRIX_ALLOWED_USERS", "prompt": "Allowed user IDs (comma-separated, e.g. @you:server)", "password": False,
+             "is_allowlist": True,
+             "help": "Matrix user IDs who can interact with the bot."},
+            {"name": "MATRIX_HOME_ROOM", "prompt": "Home room ID (for cron/notification delivery, or empty to set later with /set-home)", "password": False,
+             "help": "Room ID (e.g. !abc123:server) for delivering cron results and notifications."},
+        ],
+    },
+    {
+        "key": "whatsapp",
+        "label": "WhatsApp",
+        "emoji": "📲",
+        "token_var": "WHATSAPP_ENABLED",
+    },
+    {
+        "key": "email",
+        "label": "Email",
+        "emoji": "📧",
+        "token_var": "EMAIL_ADDRESS",
+        "setup_instructions": [
+            "1. Use a dedicated email account for your Hermes agent",
+            "2. For Gmail: enable 2FA, then create an App Password at",
+            "   https://myaccount.google.com/apppasswords",
+            "3. For other providers: use your email password or app-specific password",
+            "4. IMAP must be enabled on your email account",
+        ],
+        "vars": [
+            {"name": "EMAIL_ADDRESS", "prompt": "Email address", "password": False,
+             "help": "The email address Hermes will use (e.g., hermes@gmail.com)."},
+            {"name": "EMAIL_PASSWORD", "prompt": "Email password (or app password)", "password": True,
+             "help": "For Gmail, use an App Password (not your regular password)."},
+            {"name": "EMAIL_IMAP_HOST", "prompt": "IMAP host", "password": False,
+             "help": "e.g., imap.gmail.com for Gmail, outlook.office365.com for Outlook."},
+            {"name": "EMAIL_SMTP_HOST", "prompt": "SMTP host", "password": False,
+             "help": "e.g., smtp.gmail.com for Gmail, smtp.office365.com for Outlook."},
+            {"name": "EMAIL_ALLOWED_USERS", "prompt": "Allowed sender emails (comma-separated)", "password": False,
+             "is_allowlist": True,
+             "help": "Only emails from these addresses will be processed."},
+        ],
+    },
+    {
+        "key": "sms",
+        "label": "SMS (Twilio)",
+        "emoji": "📱",
+        "token_var": "TWILIO_ACCOUNT_SID",
+        "setup_instructions": [
+            "1. Create a Twilio account at https://www.twilio.com/",
+            "2. Get your Account SID and Auth Token from the Twilio Console dashboard",
+            "3. Buy or configure a phone number capable of sending SMS",
+            "4. Set up your webhook URL for inbound SMS:",
+            "   Twilio Console → Phone Numbers → Active Numbers → your number",
+            "   → Messaging → A MESSAGE COMES IN → Webhook → https://your-server:8080/webhooks/twilio",
+        ],
+        "vars": [
+            {"name": "TWILIO_ACCOUNT_SID", "prompt": "Twilio Account SID", "password": False,
+             "help": "Found on the Twilio Console dashboard."},
+            {"name": "TWILIO_AUTH_TOKEN", "prompt": "Twilio Auth Token", "password": True,
+             "help": "Found on the Twilio Console dashboard (click to reveal)."},
+            {"name": "TWILIO_PHONE_NUMBER", "prompt": "Twilio phone number (E.164 format, e.g. +15551234567)", "password": False,
+             "help": "The Twilio phone number to send SMS from."},
+            {"name": "SMS_ALLOWED_USERS", "prompt": "Allowed phone numbers (comma-separated, E.164 format)", "password": False,
+             "is_allowlist": True,
+             "help": "Only messages from these phone numbers will be processed."},
+            {"name": "SMS_HOME_CHANNEL", "prompt": "Home channel phone number (for cron/notification delivery, or empty)", "password": False,
+             "help": "Phone number to deliver cron job results and notifications to."},
+        ],
+    },
     {
         "key": "mattermost",
         "label": "Mattermost",
@@ -4669,18 +4806,12 @@ _PLATFORMS = [
             },
         ],
     },
-    # WhatsApp moved to plugins/platforms/whatsapp/ — setup metadata discovered
-    # dynamically via the platform registry entry registered by
-    # plugins/platforms/whatsapp/adapter.py::register(). #41112.
     {
         "key": "signal",
         "label": "Signal",
         "emoji": "📡",
         "token_var": "SIGNAL_HTTP_URL",
     },
-    # Email and SMS moved to plugins/platforms/{email,sms}/ — setup metadata
-    # discovered dynamically via the platform registry entries registered by
-    # plugins/platforms/{email,sms}/adapter.py::register(). #41112.
     {
         "key": "weixin",
         "label": "Weixin / WeChat",
