@@ -96,6 +96,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
+import { useTranscriptSync } from '../session/hooks/use-transcript-sync'
 import { newSessionOpensTab, startWorkspaceSession } from '../session/workspace-session-target'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
@@ -390,6 +391,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshHermesConfig,
     refreshSessions,
     sessionStateByRuntimeIdRef,
+    updateSessionState
+  })
+
+  // Cross-window transcript refresh when another window advances the same chat
+  // (#65047). Soft sync only; submit still has a hard stale guard.
+  useTranscriptSync({
+    activeSessionIdRef,
+    selectedStoredSessionIdRef,
     updateSessionState
   })
 
