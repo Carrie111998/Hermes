@@ -59,8 +59,14 @@ CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
     "duplicate_identity",
     "unknown_error_code",
 })
+CLAUDE_VISIBILITY_INTERNAL_CODES = frozenset({
+    "exact_id_reconciliation_in_progress",
+    "exact_id_absent_reconciled",
+})
 CLAUDE_VISIBILITY_ERROR_CODES = (
-    CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
+    CLAUDE_VISIBILITY_RETRY_CODES
+    | CLAUDE_VISIBILITY_FATAL_CODES
+    | CLAUDE_VISIBILITY_INTERNAL_CODES
 )
 
 _ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready"})

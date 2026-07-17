@@ -4926,7 +4926,7 @@ def test_claude_visibility_enqueue_claim_commit_and_idempotency(db: SessionDB) -
     assert claim.job_id == identity.job_id
     assert claim.reserved_claude_uuid == identity.claude_uuid
     assert claim.lease_digest and len(claim.lease_digest) == 64
-    assert claim.requires_exact_id_reconciliation is True
+    assert claim.requires_exact_id_reconciliation is False
     visible = store.commit_claude_visibility_job(
         identity.job_id, claim.lease_digest, "transcript-digest", 120.0
     )
@@ -4991,6 +4991,10 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     store.enqueue_claude_visibility_job(candidate, identity)
     first = store.claim_claude_visibility_job(100.0, 10, 25, "0.50", "0.02")
+    with pytest.raises(ValueError, match="reconciliation lease"):
+        store.record_claude_visibility_exact_id_absent(
+            identity.job_id, first.lease_digest, "a" * 64
+        )
     retried = store.retry_claude_visibility_job(
         identity.job_id,
         first.lease_digest,
@@ -5002,17 +5006,58 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     assert retried["reserved_claude_uuid"] == identity.claude_uuid
 
     restarted = SessionBridgeStore(db, clock=lambda: 120.0, local_timezone=timezone.utc)
-    second = restarted.claim_claude_visibility_job(120.0, 10, 25, "0.50", "0.02")
+    reconciliation = restarted.claim_claude_visibility_job(
+        120.0, 10, 25, "0.50", "0.02"
+    )
+    assert reconciliation.reserved_claude_uuid == identity.claude_uuid
+    assert reconciliation.attempt_ordinal == 1
+    assert reconciliation.prior_error_code == "creation_ambiguous"
+    assert reconciliation.registration_reserved is False
+    assert reconciliation.launch_permitted is False
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+    with pytest.raises(ValueError, match="reconciliation lease"):
+        restarted.record_claude_visibility_exact_id_absent(
+            identity.job_id, "wrong", "b" * 64
+        )
+    with pytest.raises(ValueError, match="reconciliation lease"):
+        restarted.record_claude_visibility_exact_id_absent(
+            "forged-job-id", reconciliation.lease_digest, "b" * 64
+        )
+    absent = restarted.record_claude_visibility_exact_id_absent(
+        identity.job_id, reconciliation.lease_digest, "b" * 64
+    )
+    assert absent["state"] == "claude_retry"
+    assert absent["error_code"] == "exact_id_absent_reconciled"
+    assert absent["reserved_claude_uuid"] == identity.claude_uuid
+
+    after_restart = SessionBridgeStore(
+        db, clock=lambda: 120.0, local_timezone=timezone.utc
+    )
+    second = after_restart.claim_claude_visibility_job(
+        120.0, 10, 25, "0.50", "0.02"
+    )
     assert second.reserved_claude_uuid == identity.claude_uuid
     assert second.attempt_ordinal == 2
-    assert second.prior_error_code == "creation_ambiguous"
-    assert second.requires_exact_id_reconciliation is True
+    assert second.prior_error_code == "exact_id_absent_reconciled"
+    assert second.registration_reserved is True
+    assert second.launch_permitted is True
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2
 
-    stale = restarted.claim_claude_visibility_job(131.0, 10, 25, "0.50", "0.02")
+    stale = after_restart.claim_claude_visibility_job(
+        131.0, 10, 25, "0.50", "0.02"
+    )
     assert stale.status == "claimed"
     assert stale.reserved_claude_uuid == identity.claude_uuid
-    assert stale.attempt_ordinal == 3
+    assert stale.attempt_ordinal == 2
     assert stale.prior_error_code == "lease_expired"
+    assert stale.registration_reserved is False
+    assert stale.launch_permitted is False
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2
+    expired = SessionBridgeStore(db, clock=lambda: 142.0, local_timezone=timezone.utc)
+    with pytest.raises(ValueError, match="reconciliation lease"):
+        expired.record_claude_visibility_exact_id_absent(
+            identity.job_id, stale.lease_digest, "e" * 64
+        )
 
 
 def test_claude_visibility_transitions_require_exact_active_lease(db: SessionDB) -> None:
@@ -5224,6 +5269,62 @@ def test_claude_visibility_read_only_reconciliation_consumes_no_slot(
     ) == [{"state": "claude_retry", "attempts": 1, "lease_digest": None}]
 
 
+def test_claude_visibility_reconciliation_api_does_not_divert_fresh_pending(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    store.enqueue_claude_visibility_job(candidate, identity)
+
+    inspected = store.inspect_due_claude_visibility_reconciliation(100.0)
+    reconciliation = store.claim_claude_visibility_reconciliation(100.0, 60)
+
+    assert inspected.status == "no_due_job"
+    assert reconciliation.status == "no_due_job"
+    paid = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    assert paid.job_id == identity.job_id
+    assert paid.registration_reserved is True
+    assert paid.launch_permitted is True
+
+
+def test_claude_visibility_retry_with_no_usage_requires_absence_before_one_launch(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    store.enqueue_claude_visibility_job(candidate, identity)
+    db._conn.execute(
+        """UPDATE session_claude_visibility_jobs
+           SET state = 'claude_retry', error_code = 'creation_ambiguous'
+           WHERE id = ?""",
+        (identity.job_id,),
+    )
+
+    reconciliation = store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02"
+    )
+    assert reconciliation.registration_reserved is False
+    assert reconciliation.launch_permitted is False
+    assert _rows(db, "SELECT * FROM session_claude_registration_usage") == []
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id, reconciliation.lease_digest, "d" * 64
+    )
+
+    assert store.inspect_due_claude_visibility_reconciliation(100.0).status == (
+        "no_due_job"
+    )
+    assert store.claim_claude_visibility_reconciliation(100.0, 60).status == (
+        "no_due_job"
+    )
+    paid = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    assert paid.registration_reserved is True
+    assert paid.launch_permitted is True
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+    assert store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02"
+    ).status == "no_due_job"
+
+
 def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
     db: SessionDB,
 ) -> None:
@@ -5260,3 +5361,89 @@ def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
     )
     assert visible["state"] == "claude_visible"
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+
+
+def test_claude_visibility_transient_reconciliation_retries_never_launch_or_spend(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    store.enqueue_claude_visibility_job(candidate, identity)
+    paid = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.retry_claude_visibility_job(
+        identity.job_id, paid.lease_digest, "creation_ambiguous", 110.0, "unknown"
+    )
+
+    for due_at in (110.0, 120.0):
+        reconciliation = store.claim_claude_visibility_job(
+            due_at, 60, 25, "0.50", "0.02"
+        )
+        assert reconciliation.registration_reserved is False
+        assert reconciliation.launch_permitted is False
+        assert reconciliation.attempt_ordinal == 1
+        store.retry_claude_visibility_job(
+            identity.job_id,
+            reconciliation.lease_digest,
+            "native_transcript_not_indexed",
+            due_at + 10,
+            "lookup transient",
+        )
+
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+
+
+def test_claude_visibility_reconciliation_lease_can_fail_conflict_without_slot(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    store.enqueue_claude_visibility_job(candidate, identity)
+    paid = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.retry_claude_visibility_job(
+        identity.job_id, paid.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+    reconciliation = store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02"
+    )
+
+    failed = store.fail_claude_visibility_job(
+        identity.job_id,
+        reconciliation.lease_digest,
+        "uuid_conflict",
+        "exact reserved UUID belongs to another source",
+    )
+
+    assert failed["state"] == "claude_failed"
+    assert failed["error_code"] == "uuid_conflict"
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+
+
+def test_claude_visibility_new_ambiguity_invalidates_prior_absence(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity()
+    store.enqueue_claude_visibility_job(candidate, identity)
+    first = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.retry_claude_visibility_job(
+        identity.job_id, first.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+    reconciliation = store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02"
+    )
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id, reconciliation.lease_digest, "c" * 64
+    )
+    second = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    assert second.launch_permitted is True
+    store.retry_claude_visibility_job(
+        identity.job_id, second.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+
+    required_again = store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02"
+    )
+    assert required_again.registration_reserved is False
+    assert required_again.launch_permitted is False
+    assert required_again.attempt_ordinal == 2
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2

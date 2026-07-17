@@ -467,7 +467,8 @@ class SessionBridgeStore:
             due = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
                    WHERE (
-                       state IN ('claude_pending', 'claude_retry')
+                       state = 'claude_retry'
+                       AND error_code <> 'exact_id_absent_reconciled'
                        AND next_attempt_at <= ?
                    ) OR (
                        state = 'claude_leased' AND lease_expires_at <= ?
@@ -527,57 +528,70 @@ class SessionBridgeStore:
             )
             due = conn.execute(
                 """SELECT * FROM session_claude_visibility_jobs
-                   WHERE state IN ('claude_pending', 'claude_retry')
+                   WHERE state = 'claude_retry'
+                     AND error_code <> 'exact_id_absent_reconciled'
                      AND next_attempt_at <= ?
                    ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
                 (claim_time,),
             ).fetchone()
             if due is None:
                 return ClaudeVisibilityClaim(status="no_due_job")
-            lease_digest = hashlib.sha256(
-                self._claude_lease_factory().encode("utf-8")
-            ).hexdigest()
-            if conn.execute(
-                """SELECT 1 FROM session_claude_visibility_jobs
-                   WHERE lease_digest = ? LIMIT 1""",
-                (lease_digest,),
-            ).fetchone() is not None:
-                raise ValueError("Claude visibility lease factory returned a duplicate")
+            return self._lease_claude_visibility_reconciliation(
+                conn,
+                due,
+                claim_time=claim_time,
+                lease_duration=lease_duration,
+            )
+
+        return self.db._execute_write(_write)
+
+    def record_claude_visibility_exact_id_absent(
+        self,
+        job_id: str,
+        lease_digest: str,
+        evidence_digest: str,
+    ) -> dict[str, Any]:
+        """Persist exact reserved-UUID absence under a reconciliation lease."""
+
+        normalized_job_id = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_lease = _exact_nonempty_text(
+            lease_digest, "Claude visibility lease digest"
+        )
+        evidence = _exact_nonempty_text(
+            evidence_digest, "Claude reconciliation evidence digest"
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", evidence) is None:
+            raise ValueError(
+                "Claude reconciliation evidence digest must be lowercase SHA-256"
+            )
+        reconciled_at = _finite_number(self._clock(), "clock")
+
+        def _write(conn):
             cursor = conn.execute(
                 """UPDATE session_claude_visibility_jobs
-                   SET state = 'claude_leased', lease_digest = ?,
-                       lease_expires_at = ?, updated_at = ?
-                   WHERE id = ? AND state = ? AND attempts = ?""",
+                   SET state = 'claude_retry', next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = 'exact_id_absent_reconciled',
+                       error_detail = ?, updated_at = ?
+                   WHERE id = ? AND state = 'claude_leased'
+                     AND lease_digest = ? AND lease_expires_at > ?
+                     AND error_code = 'exact_id_reconciliation_in_progress'""",
                 (
-                    lease_digest,
-                    claim_time + lease_duration,
-                    claim_time,
-                    due["id"],
-                    due["state"],
-                    due["attempts"],
+                    reconciled_at,
+                    f"absence-evidence:{evidence}",
+                    reconciled_at,
+                    normalized_job_id,
+                    normalized_lease,
+                    reconciled_at,
                 ),
             )
             if cursor.rowcount != 1:
-                raise ValueError("stale Claude visibility reconciliation claim")
-            return ClaudeVisibilityClaim(
-                status="claimed",
-                job_id=due["id"],
-                source_session_id=due["source_session_id"],
-                source_provider=Provider(due["source_provider"]),
-                reserved_claude_uuid=due["reserved_claude_uuid"],
-                native_name=due["native_name"],
-                source_cwd=due["source_cwd"],
-                git_root=due["git_root"],
-                git_branch=due["git_branch"],
-                git_head=due["git_head"],
-                worktree_id=due["worktree_id"],
-                signed_marker=due["signed_marker"],
-                lease_digest=lease_digest,
-                attempt_ordinal=int(due["attempts"]),
-                prior_error_code=due["error_code"],
-                requires_exact_id_reconciliation=True,
-                registration_reserved=False,
-                launch_permitted=False,
+                raise ValueError("exact active Claude reconciliation lease required")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                    (normalized_job_id,),
+                ).fetchone()
             )
 
         return self.db._execute_write(_write)
@@ -626,6 +640,19 @@ class SessionBridgeStore:
             ).fetchone()
             if due is None:
                 return ClaudeVisibilityClaim(status="no_due_job")
+            launch_permitted = (
+                due["state"] == "claude_pending" and int(due["attempts"]) == 0
+            ) or (
+                due["state"] == "claude_retry"
+                and due["error_code"] == "exact_id_absent_reconciled"
+            )
+            if not launch_permitted:
+                return self._lease_claude_visibility_reconciliation(
+                    conn,
+                    due,
+                    claim_time=claim_time,
+                    lease_duration=lease_duration,
+                )
             usage = conn.execute(
                 """SELECT reserved_estimated_cost_usd
                    FROM session_claude_registration_usage
@@ -655,7 +682,8 @@ class SessionBridgeStore:
             cursor = conn.execute(
                 """UPDATE session_claude_visibility_jobs
                    SET state = 'claude_leased', attempts = ?, lease_digest = ?,
-                       lease_expires_at = ?, updated_at = ?
+                       lease_expires_at = ?, error_code = NULL,
+                       error_detail = NULL, updated_at = ?
                    WHERE id = ? AND state = ? AND attempts = ?""",
                 (
                     attempt,
@@ -698,12 +726,71 @@ class SessionBridgeStore:
                 lease_digest=lease_digest,
                 attempt_ordinal=attempt,
                 prior_error_code=prior_error_code,
-                requires_exact_id_reconciliation=True,
+                requires_exact_id_reconciliation=False,
                 registration_reserved=True,
                 launch_permitted=True,
             )
 
         return self.db._execute_write(_write)
+
+    def _lease_claude_visibility_reconciliation(
+        self,
+        conn: Any,
+        due: Any,
+        *,
+        claim_time: float,
+        lease_duration: float,
+    ) -> ClaudeVisibilityClaim:
+        from .claude_visibility import ClaudeVisibilityClaim
+
+        prior_error_code = due["error_code"]
+        lease_digest = hashlib.sha256(
+            self._claude_lease_factory().encode("utf-8")
+        ).hexdigest()
+        if conn.execute(
+            """SELECT 1 FROM session_claude_visibility_jobs
+               WHERE lease_digest = ? LIMIT 1""",
+            (lease_digest,),
+        ).fetchone() is not None:
+            raise ValueError("Claude visibility lease factory returned a duplicate")
+        cursor = conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_leased', lease_digest = ?,
+                   lease_expires_at = ?,
+                   error_code = 'exact_id_reconciliation_in_progress',
+                   error_detail = NULL, updated_at = ?
+               WHERE id = ? AND state = ? AND attempts = ?""",
+            (
+                lease_digest,
+                claim_time + lease_duration,
+                claim_time,
+                due["id"],
+                due["state"],
+                due["attempts"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("stale Claude visibility reconciliation claim")
+        return ClaudeVisibilityClaim(
+            status="claimed",
+            job_id=due["id"],
+            source_session_id=due["source_session_id"],
+            source_provider=Provider(due["source_provider"]),
+            reserved_claude_uuid=due["reserved_claude_uuid"],
+            native_name=due["native_name"],
+            source_cwd=due["source_cwd"],
+            git_root=due["git_root"],
+            git_branch=due["git_branch"],
+            git_head=due["git_head"],
+            worktree_id=due["worktree_id"],
+            signed_marker=due["signed_marker"],
+            lease_digest=lease_digest,
+            attempt_ordinal=int(due["attempts"]),
+            prior_error_code=prior_error_code,
+            requires_exact_id_reconciliation=True,
+            registration_reserved=False,
+            launch_permitted=False,
+        )
 
     def retry_claude_visibility_job(
         self,
