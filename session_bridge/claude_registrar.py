@@ -207,9 +207,16 @@ def _registrar_pywinpty_process_type() -> Any:
         def read_with_timeout(self, size: int, timeout: float) -> str | None:
             if self._transport_stop.is_set():
                 raise EOFError("Pty is closed")
-            data = self.pty.read(size, blocking=False)
+            try:
+                data = self.pty.read(size, blocking=False)
+            except Exception as exc:
+                if self._native_process_alive() is False:
+                    raise EOFError("Pty process exited") from exc
+                raise
             if data:
                 return data if isinstance(data, str) else bytes(data).decode("utf-8", "replace")
+            if self._native_process_alive() is False:
+                raise EOFError("Pty process exited")
             ready, _, _ = select.select(
                 [self.fileobj], [], [], min(max(0.0, timeout), 0.01)
             )
@@ -221,6 +228,12 @@ def _registrar_pywinpty_process_type() -> Any:
                 if self._transport_stop.is_set():
                     raise EOFError("Pty is closed")
             return None
+
+        def _native_process_alive(self) -> bool | None:
+            try:
+                return bool(self.pty.isalive())
+            except Exception:
+                return None
 
         def stop_transport(self) -> None:
             self._transport_stop.set()

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -24,6 +24,7 @@ from session_bridge.claude_registrar import (
     PtyCleanupResult,
     WindowsConPtyFactory,
     _WinPtyProcess,
+    _registrar_pywinpty_process_type,
 )
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
@@ -765,6 +766,76 @@ def test_winpty_reader_accepts_registered_split_across_chunks() -> None:
     assert _WinPtyProcess(Process()).read_until(0.2).strip() == "REGISTERED"
 
 
+def _close_raw_registrar_process(process: Any) -> None:
+    process.stop_transport()
+    process.fileobj.close()
+    process._server.close()
+    process.release_native_pty()
+
+
+def test_raw_winpty_read_exception_after_exit_preserves_accumulated_output() -> None:
+    class Pty:
+        pid = 123
+
+        def __init__(self) -> None:
+            self.reads = iter(["Authentication required\r\n", OSError("closed")])
+
+        def read(self, size: int, *, blocking: bool) -> str:
+            del size, blocking
+            value = next(self.reads)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        def isalive(self) -> bool:
+            return False
+
+    process = _registrar_pywinpty_process_type()(Pty())
+    try:
+        output = _WinPtyProcess(process).read_until(0.2)
+        assert output.strip() == "Authentication required"
+    finally:
+        _close_raw_registrar_process(process)
+
+
+def test_raw_winpty_read_exception_while_alive_remains_an_error() -> None:
+    class Pty:
+        pid = 123
+
+        def read(self, size: int, *, blocking: bool) -> str:
+            del size, blocking
+            raise OSError("real read failure")
+
+        def isalive(self) -> bool:
+            return True
+
+    process = _registrar_pywinpty_process_type()(Pty())
+    try:
+        with pytest.raises(OSError, match="real read failure"):
+            process.read_with_timeout(4096, 0.01)
+    finally:
+        _close_raw_registrar_process(process)
+
+
+def test_raw_winpty_empty_read_after_exit_is_eof() -> None:
+    class Pty:
+        pid = 123
+
+        def read(self, size: int, *, blocking: bool) -> str:
+            del size, blocking
+            return ""
+
+        def isalive(self) -> bool:
+            return False
+
+    process = _registrar_pywinpty_process_type()(Pty())
+    try:
+        with pytest.raises(EOFError):
+            process.read_with_timeout(4096, 0.01)
+    finally:
+        _close_raw_registrar_process(process)
+
+
 def test_winpty_reader_timeout_is_bounded_when_underlying_read_blocks() -> None:
     release = threading.Event()
 
@@ -1234,6 +1305,61 @@ def test_real_windows_conpty_timeout_terminates_and_releases_resources(
     assert cleanup.registrar_reader_stopped is True
     assert cleanup.transport_reader_stopped is True
     assert process._reader_thread is None
+
+
+@pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
+def test_real_windows_authentication_failure_is_fixed_retry_with_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = replace(candidate(), source_cwd=str(tmp_path), git_root=str(tmp_path))
+    identity = derive_claude_visibility_identity(value, SECRET)
+    item = replace(
+        claim(),
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        signed_marker=identity.signed_marker,
+        source_cwd=value.source_cwd,
+        git_root=value.git_root,
+    )
+    record = tmp_path / "authentication_failure.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "authentication_failure")
+
+    class CapturingFactory(WindowsConPtyFactory):
+        process: _WinPtyProcess | None = None
+
+        def spawn(self, argv: list[str], *, cwd: str) -> _WinPtyProcess:
+            spawned = super().spawn(argv, cwd=cwd)
+            assert isinstance(spawned, _WinPtyProcess)
+            self.process = spawned
+            return spawned
+
+    factory = CapturingFactory()
+    result = ClaudeNativeRegistrar(
+        cast(Any, FakeStore()),
+        cast(Any, FakeSource()),
+        marker_secret=SECRET,
+        pty_factory=factory,
+        claude_command=(sys.executable, str(fixture)),
+        clock=lambda: 100.0,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+        process_timeout=10.0,
+        exit_timeout=5.0,
+        discovery_timeout=0.0,
+        retry_delay=5.0,
+    ).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "claude_authentication_unavailable"
+    assert result.reserved_claude_uuid == item.reserved_claude_uuid
+    assert factory.process is not None
+    cleanup = factory.process.close(5.0)
+    assert cleanup.succeeded
+    assert cleanup.registrar_reader_stopped is True
+    assert cleanup.transport_reader_stopped is True
+    assert factory.process._reader_thread is None
 
 
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
