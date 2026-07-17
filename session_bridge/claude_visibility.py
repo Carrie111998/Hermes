@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import uuid
+from typing import Literal
 
 from .models import (
     BridgeMarkerPayload,
@@ -103,6 +104,7 @@ class ClaudeVisibilityIdentity:
 @dataclass(frozen=True)
 class ClaudeVisibilityClaim:
     status: str
+    lease_kind: Literal["launch", "reconciliation"] | None = None
     job_id: str | None = None
     source_session_id: str | None = None
     source_provider: Provider | None = None

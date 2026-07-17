@@ -783,6 +783,7 @@ class SessionBridgeStore:
             )
             return ClaudeVisibilityClaim(
                 status="claimed",
+                lease_kind="launch",
                 job_id=due["id"],
                 source_session_id=due["source_session_id"],
                 source_provider=Provider(due["source_provider"]),
@@ -843,6 +844,7 @@ class SessionBridgeStore:
             raise ValueError("stale Claude visibility reconciliation claim")
         return ClaudeVisibilityClaim(
             status="claimed",
+            lease_kind="reconciliation",
             job_id=due["id"],
             source_session_id=due["source_session_id"],
             source_provider=Provider(due["source_provider"]),
