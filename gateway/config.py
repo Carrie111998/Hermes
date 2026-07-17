@@ -777,7 +777,11 @@ def load_gateway_config() -> GatewayConfig:
                         existing = {}
                     # Deep-merge extra dicts so gateway.json defaults survive
                     merged_extra = {**existing.get("extra", {}), **plat_block.get("extra", {})}
-                    if plat_name == Platform.SLACK.value and "enabled" in plat_block:
+                    if "enabled" in plat_block:
+                        # Mark the enabled flag as an explicit user choice so
+                        # later auto-enable passes (env token detection, plugin
+                        # env-enablement) don't silently override a deliberate
+                        # ``enabled: false``.
                         merged_extra["_enabled_explicit"] = True
                     merged = {**existing, **plat_block}
                     if merged_extra:
@@ -874,7 +878,9 @@ def load_gateway_config() -> GatewayConfig:
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
                     plat_data["enabled"] = platform_cfg["enabled"]
-                if plat == Platform.SLACK and enabled_was_explicit:
+                    # Explicit user choice — later auto-enable passes (env
+                    # token detection, plugin env-enablement) must not
+                    # silently override a deliberate ``enabled: false``.
                     extra["_enabled_explicit"] = True
                 extra.update(bridged)
 
@@ -1221,7 +1227,16 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
-    
+    # Snapshot platforms the user explicitly disabled in config.yaml before
+    # any env pass runs: every token-detection block below sets
+    # ``enabled = True`` unconditionally, and a deliberate ``enabled: false``
+    # must survive all of them (DAN-2140), not just the plugin pass.
+    _explicitly_disabled = {
+        plat
+        for plat, plat_cfg in config.platforms.items()
+        if not plat_cfg.enabled and plat_cfg.extra.get("_enabled_explicit")
+    }
+
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
     if telegram_token:
@@ -1825,7 +1840,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             platform = Platform(entry.name)
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()
-            config.platforms[platform].enabled = True
+            plat_cfg = config.platforms[platform]
+            if not plat_cfg.enabled and plat_cfg.extra.get("_enabled_explicit"):
+                # check_fn only proves the platform's dependencies import —
+                # not that the user wants it. A deliberate ``enabled: false``
+                # in config.yaml must win, otherwise a disabled platform with
+                # no token retries forever (observed with Discord, DAN-2140).
+                continue
+            plat_cfg.enabled = True
             # Seed extras from env if the plugin opted in.
             if entry.env_enablement_fn is not None:
                 try:
@@ -1854,3 +1876,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                         )
     except Exception as e:
         logger.debug("Plugin platform enable pass failed: %s", e)
+
+    # Re-assert explicit user disables: env passes may have set tokens or
+    # extras (harmless for a disabled platform), but the enabled flag itself
+    # stays false when config.yaml said so.
+    for plat in _explicitly_disabled:
+        if plat in config.platforms:
+            config.platforms[plat].enabled = False

@@ -703,3 +703,94 @@ class TestHomeChannelEnvOverrides:
             home = config.platforms[platform].home_channel
             assert home is not None, f"{platform.value}: home_channel should not be None"
             assert (home.chat_id, home.name) == expected, platform.value
+
+
+class TestExplicitPlatformDisable:
+    """A deliberate ``enabled: false`` in config.yaml must survive the plugin
+    env-enablement pass, whose check_fn only proves dependencies import — not
+    that the user wants the platform. Regression for the Discord retry loop
+    (adapter instantiated with no token, retried forever; DAN-2140)."""
+
+    class _FakeEntry:
+        name = "discord"
+
+        @staticmethod
+        def check_fn():
+            return True
+
+        env_enablement_fn = None
+
+    def _load(self, tmp_path, monkeypatch, yaml_text, env=None):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(yaml_text, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        for key, value in (env or {}).items():
+            monkeypatch.setenv(key, value)
+
+        from gateway.platform_registry import platform_registry
+
+        monkeypatch.setattr(
+            platform_registry, "plugin_entries", lambda: [self._FakeEntry()]
+        )
+        return load_gateway_config()
+
+    def test_top_level_enabled_false_wins(self, tmp_path, monkeypatch):
+        config = self._load(
+            tmp_path, monkeypatch, "discord:\n  enabled: false\n  voice_fx:\n    speech_gain: 1\n"
+        )
+        assert config.platforms[Platform.DISCORD].enabled is False
+
+    def test_platforms_section_enabled_false_wins(self, tmp_path, monkeypatch):
+        config = self._load(
+            tmp_path, monkeypatch, "platforms:\n  discord:\n    enabled: false\n"
+        )
+        assert config.platforms[Platform.DISCORD].enabled is False
+
+    def test_no_explicit_flag_still_auto_enables(self, tmp_path, monkeypatch):
+        # Without an explicit user choice, dependency-based auto-enable keeps
+        # its existing behavior.
+        config = self._load(tmp_path, monkeypatch, "timezone: America/New_York\n")
+        assert config.platforms[Platform.DISCORD].enabled is True
+
+    def test_enabled_false_survives_env_token(self, tmp_path, monkeypatch):
+        # The direct token-detection pass in _apply_env_overrides sets
+        # enabled = True whenever DISCORD_BOT_TOKEN is present; an explicit
+        # disable must survive that pass too, not just plugin env-enablement.
+        config = self._load(
+            tmp_path,
+            monkeypatch,
+            "platforms:\n  discord:\n    enabled: false\n",
+            env={"DISCORD_BOT_TOKEN": "xoxb-fake-token"},
+        )
+        assert config.platforms[Platform.DISCORD].enabled is False
+
+    def test_env_token_still_enables_without_explicit_flag(
+        self, tmp_path, monkeypatch
+    ):
+        config = self._load(
+            tmp_path,
+            monkeypatch,
+            "timezone: America/New_York\n",
+            env={"DISCORD_BOT_TOKEN": "xoxb-fake-token"},
+        )
+        assert config.platforms[Platform.DISCORD].enabled is True
+        assert config.platforms[Platform.DISCORD].token == "xoxb-fake-token"
+
+
+class TestSlackInSetupMenus:
+    """Slack is a built-in adapter that never migrated to a plugin; the
+    #41112-era cleanup removed its _PLATFORMS entry on the false assumption
+    the registry would provide it, dropping Slack from setup menus entirely."""
+
+    def test_slack_listed_in_all_platforms(self):
+        from hermes_cli.gateway import _all_platforms
+
+        assert "slack" in [p["key"] for p in _all_platforms()]
+
+    def test_slack_builtin_setup_fn_resolves(self):
+        from hermes_cli import setup as _s
+        from hermes_cli.gateway import _builtin_setup_fn
+
+        assert _builtin_setup_fn("slack") is _s._setup_slack
