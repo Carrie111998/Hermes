@@ -1032,6 +1032,11 @@ def _redact(value: str) -> str:
     return _redact_assignments(redacted)
 
 
+def redact_sensitive_text(value: str) -> str:
+    """Redact supported credential forms from arbitrary bridge text."""
+    return _redact(value)
+
+
 def _redact_assignments(value: str) -> str:
     output: list[str] = []
     cursor = 0

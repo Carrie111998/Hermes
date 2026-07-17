@@ -16,7 +16,7 @@ from .models import (
     decode_bridge_marker,
     encode_bridge_marker,
 )
-from .context_pack import _redact
+from .context_pack import redact_sensitive_text
 from .sidebar import is_meaningful_user_text, normalize_meaningful_user_text, sidebar_title
 
 
@@ -256,7 +256,7 @@ def build_claude_registration_prompt(
     marker_secret: bytes,
 ) -> str:
     validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
-    if _redact(candidate.source_session_id) != candidate.source_session_id:
+    if redact_sensitive_text(candidate.source_session_id) != candidate.source_session_id:
         raise ValueError("source session ID cannot be represented safely")
     metadata = {
         "bridge_id": identity.bridge_id,
@@ -329,7 +329,7 @@ def validate_claude_visibility_identity_binding(
 def _safe_prompt_metadata(value: str | None) -> str | None:
     """Redact untrusted metadata before ASCII-only canonical JSON serialization."""
 
-    return None if value is None else _redact(value)
+    return None if value is None else redact_sensitive_text(value)
 
 
 def _validate_candidate(candidate: ClaudeVisibilityCandidate) -> None:

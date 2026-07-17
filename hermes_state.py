@@ -24,6 +24,7 @@ import sqlite3
 import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -1036,6 +1037,11 @@ CREATE TABLE IF NOT EXISTS session_bridge_state (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_bridge_migrations (
+    migration_name TEXT PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_external_sessions_last_indexed_at
     ON external_sessions(last_indexed_at);
 CREATE INDEX IF NOT EXISTS idx_external_sessions_origin_bridge_id
@@ -1087,26 +1093,42 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+DROP TRIGGER IF EXISTS trg_claude_visibility_lease_kind_insert;
+DROP TRIGGER IF EXISTS trg_claude_visibility_lease_kind_update;
 CREATE TRIGGER IF NOT EXISTS trg_claude_visibility_lease_kind_insert
 BEFORE INSERT ON session_claude_visibility_jobs
-WHEN NOT (
-    (NEW.state = 'claude_leased' AND NEW.lease_digest IS NOT NULL
-     AND NEW.lease_expires_at IS NOT NULL AND NEW.lease_kind IS NOT NULL)
-    OR
-    (NEW.state != 'claude_leased' AND NEW.lease_digest IS NULL
-     AND NEW.lease_expires_at IS NULL AND NEW.lease_kind IS NULL)
+WHEN (
+    NEW.state = 'claude_leased'
+    AND (
+        NEW.lease_digest IS NULL OR NEW.lease_expires_at IS NULL
+        OR NEW.lease_kind IS NULL
+        OR NEW.lease_kind NOT IN ('launch', 'reconciliation')
+    )
+) OR (
+    NEW.state != 'claude_leased'
+    AND (
+        NEW.lease_digest IS NOT NULL OR NEW.lease_expires_at IS NOT NULL
+        OR NEW.lease_kind IS NOT NULL
+    )
 )
 BEGIN
     SELECT RAISE(ABORT, 'invalid Claude visibility lease fields');
 END;
 CREATE TRIGGER IF NOT EXISTS trg_claude_visibility_lease_kind_update
 BEFORE UPDATE ON session_claude_visibility_jobs
-WHEN NOT (
-    (NEW.state = 'claude_leased' AND NEW.lease_digest IS NOT NULL
-     AND NEW.lease_expires_at IS NOT NULL AND NEW.lease_kind IS NOT NULL)
-    OR
-    (NEW.state != 'claude_leased' AND NEW.lease_digest IS NULL
-     AND NEW.lease_expires_at IS NULL AND NEW.lease_kind IS NULL)
+WHEN (
+    NEW.state = 'claude_leased'
+    AND (
+        NEW.lease_digest IS NULL OR NEW.lease_expires_at IS NULL
+        OR NEW.lease_kind IS NULL
+        OR NEW.lease_kind NOT IN ('launch', 'reconciliation')
+    )
+) OR (
+    NEW.state != 'claude_leased'
+    AND (
+        NEW.lease_digest IS NOT NULL OR NEW.lease_expires_at IS NOT NULL
+        OR NEW.lease_kind IS NOT NULL
+    )
 )
 BEGIN
     SELECT RAISE(ABORT, 'invalid Claude visibility lease fields');
@@ -1638,7 +1660,9 @@ class SessionDB:
         finally:
             ref.close()
 
-    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+    def _reconcile_columns_from_sql(
+        self, cursor: sqlite3.Cursor, schema_sql: str
+    ) -> None:
         """Ensure live tables have every column declared in SCHEMA_SQL.
 
         Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
@@ -1651,7 +1675,7 @@ class SessionDB:
         the column to SCHEMA_SQL and it appears on the next startup.
         Version-gated migration blocks are no longer needed for ADD COLUMN.
         """
-        expected = self._parse_schema_columns(SCHEMA_SQL)
+        expected = self._parse_schema_columns(schema_sql)
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
             try:
@@ -1681,6 +1705,104 @@ class SessionDB:
                         logger.debug(
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
+
+    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Ensure live core and bridge tables have every declared column."""
+        self._reconcile_columns_from_sql(cursor, SCHEMA_SQL)
+        self._reconcile_columns_from_sql(cursor, BRIDGE_SCHEMA_SQL)
+
+    @staticmethod
+    def _canonicalize_legacy_claude_cost(raw: object, rowid: int) -> str:
+        """Return exact six-decimal legacy cost text or fail closed."""
+        try:
+            value = Decimal(str(raw))
+            quantum = Decimal("0.000001")
+            canonical = value.quantize(quantum)
+        except (InvalidOperation, ValueError):
+            canonical = None
+        if (
+            canonical is None
+            or not value.is_finite()
+            or value < 0
+            or value > Decimal("1000000")
+            or value != canonical
+        ):
+            raise RuntimeError(
+                "unsafe session_claude_registration_usage row "
+                f"{rowid} reserved_estimated_cost_usd={raw!r}"
+            )
+        return format(canonical, ".6f")
+
+    def _apply_bridge_migrations(self, cursor: sqlite3.Cursor) -> None:
+        """Apply bridge-only data migrations independently of core/FTS."""
+        migration_name = "claude_visibility_security_v24"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                connection.commit()
+                return
+
+            for row in cursor.execute(
+                """SELECT rowid, reserved_estimated_cost_usd
+                   FROM session_claude_registration_usage"""
+            ).fetchall():
+                rowid = row["rowid"] if isinstance(row, sqlite3.Row) else row[0]
+                raw = (
+                    row["reserved_estimated_cost_usd"]
+                    if isinstance(row, sqlite3.Row)
+                    else row[1]
+                )
+                canonical = self._canonicalize_legacy_claude_cost(raw, rowid)
+                if raw != canonical:
+                    cursor.execute(
+                        """UPDATE session_claude_registration_usage
+                           SET reserved_estimated_cost_usd = ? WHERE rowid = ?""",
+                        (canonical, rowid),
+                    )
+
+            # v23 lease/error sentinels were not authenticated authorization.
+            cursor.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_retry', next_attempt_at = updated_at,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       lease_kind = NULL, error_code = 'lease_expired',
+                       error_detail = substr(
+                           'v23 active lease invalidated during v24 migration; '
+                           || COALESCE(error_code, 'no prior diagnostic') || '; '
+                           || COALESCE(error_detail, ''), 1, 512
+                       )
+                   WHERE state = 'claude_leased'"""
+            )
+            cursor.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET error_code = 'creation_ambiguous',
+                       error_detail = substr(
+                           'v23 authorization sentinel invalidated during v24 migration; '
+                           || error_code || '; ' || COALESCE(error_detail, ''), 1, 512
+                       )
+                   WHERE state = 'claude_retry'
+                     AND error_code IN (
+                         'exact_id_absent_reconciled',
+                         'exact_id_reconciliation_in_progress'
+                     )"""
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
@@ -1718,6 +1840,10 @@ class SessionDB:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Bridge security migrations have their own durable ledger. They must
+        # run after bridge-column reconciliation and must not wait for FTS.
+        self._apply_bridge_migrations(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -1906,39 +2032,6 @@ class SessionDB:
                     # means consumers fall back to sessions.json for those
                     # rows until the gateway rewrites them.
                     logger.debug("v18 gateway metadata backfill skipped: %s", exc)
-            if current_version < 24:
-                # v24: legacy v23 Claude visibility lease/error sentinels were
-                # not authenticated authorization. Never promote them into the
-                # reconciliation audit table. Invalidate every active legacy
-                # lease and force an exact-ID reconciliation while retaining
-                # the old sentinel in bounded diagnostic detail.
-                cursor.execute(
-                    """UPDATE session_claude_visibility_jobs
-                       SET state = 'claude_retry',
-                           next_attempt_at = updated_at,
-                           lease_digest = NULL, lease_expires_at = NULL,
-                           lease_kind = NULL,
-                           error_code = 'lease_expired',
-                           error_detail = substr(
-                               'v23 active lease invalidated during v24 migration; '
-                               || COALESCE(error_code, 'no prior diagnostic') || '; '
-                               || COALESCE(error_detail, ''), 1, 512
-                           )
-                       WHERE state = 'claude_leased'"""
-                )
-                cursor.execute(
-                    """UPDATE session_claude_visibility_jobs
-                       SET error_code = 'creation_ambiguous',
-                           error_detail = substr(
-                               'v23 authorization sentinel invalidated during v24 migration; '
-                               || error_code || '; ' || COALESCE(error_detail, ''), 1, 512
-                           )
-                       WHERE state = 'claude_retry'
-                         AND error_code IN (
-                             'exact_id_absent_reconciled',
-                             'exact_id_reconciliation_in_progress'
-                         )"""
-                )
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",

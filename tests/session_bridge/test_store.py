@@ -200,6 +200,105 @@ def _insert_claude_registration_usage(db: SessionDB, job_id: str) -> None:
     )
 
 
+def _create_exact_v23_claude_db(path) -> sqlite3.Connection:
+    """Create the Claude tables exactly as shipped by schema v23."""
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (23);
+        CREATE TABLE session_claude_visibility_jobs (
+            id TEXT PRIMARY KEY,
+            source_session_id TEXT NOT NULL UNIQUE,
+            bridge_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            reserved_claude_uuid TEXT NOT NULL UNIQUE,
+            native_name TEXT NOT NULL,
+            source_provider TEXT NOT NULL CHECK (source_provider IN ('codex', 'hermes')),
+            source_cwd TEXT NOT NULL,
+            git_root TEXT,
+            git_branch TEXT,
+            git_head TEXT,
+            worktree_id TEXT,
+            signed_marker TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (
+                state IN (
+                    'claude_pending', 'claude_leased', 'claude_retry',
+                    'claude_visible', 'claude_failed'
+                )
+            ),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            next_attempt_at REAL NOT NULL,
+            lease_digest TEXT,
+            lease_expires_at REAL,
+            error_code TEXT,
+            error_detail TEXT,
+            completion_digest TEXT,
+            eligible_at REAL NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            visible_at REAL,
+            CHECK (
+                (state = 'claude_leased' AND lease_digest IS NOT NULL
+                 AND lease_expires_at IS NOT NULL)
+                OR (state != 'claude_leased' AND lease_digest IS NULL
+                    AND lease_expires_at IS NULL)
+            ),
+            CHECK (
+                state != 'claude_visible'
+                OR (completion_digest IS NOT NULL AND visible_at IS NOT NULL)
+            )
+        );
+        CREATE TABLE session_claude_registration_usage (
+            local_day TEXT NOT NULL,
+            job_id TEXT NOT NULL REFERENCES session_claude_visibility_jobs(id),
+            attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+            reserved_estimated_cost_usd TEXT NOT NULL,
+            reserved_at REAL NOT NULL,
+            UNIQUE(job_id, attempt_ordinal)
+        );
+        """
+    )
+    return connection
+
+
+def _insert_v23_claude_job(
+    connection: sqlite3.Connection,
+    *,
+    suffix: str,
+    state: str,
+    error_code: str | None = None,
+    error_detail: str | None = None,
+) -> str:
+    job_id = f"v23-{suffix}"
+    leased = state == "claude_leased"
+    connection.execute(
+        """INSERT INTO session_claude_visibility_jobs (
+           id, source_session_id, bridge_id, idempotency_key,
+           reserved_claude_uuid, native_name, source_provider, source_cwd,
+           signed_marker, state, attempts, next_attempt_at, lease_digest,
+           lease_expires_at, error_code, error_detail, eligible_at, created_at,
+           updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, 'hermes', 'C:/source', ?, ?, 1, 100,
+                     ?, ?, ?, ?, 1, 1, 100)""",
+        (
+            job_id,
+            f"hermes:{job_id}",
+            f"bridge:{job_id}",
+            f"idempotency:{job_id}",
+            f"00000000-0000-4000-8000-{suffix[-12:]:0>12}",
+            f"Native {job_id}",
+            f"signed:{job_id}",
+            state,
+            "legacy-lease" if leased else None,
+            999 if leased else None,
+            error_code,
+            error_detail,
+        ),
+    )
+    return job_id
+
+
 def test_fresh_claude_visibility_schema_has_exact_columns_states_and_uniques(
     db,
 ) -> None:
@@ -299,33 +398,16 @@ def test_v24_migration_invalidates_legacy_authorization_and_ambiguous_lease(
     tmp_path,
 ) -> None:
     path = tmp_path / "legacy-v23.db"
-    original = SessionDB(path)
-    first_candidate, first_identity = _claude_visibility_identity("legacy-absence")
-    second_candidate, second_identity = _claude_visibility_identity("legacy-lease")
-    store = SessionBridgeStore(original, clock=lambda: 100.0)
-    _enqueue_claude_visibility_job(store, first_candidate, first_identity)
-    _enqueue_claude_visibility_job(store, second_candidate, second_identity)
-    original._conn.execute("DROP TRIGGER trg_claude_visibility_lease_kind_insert")
-    original._conn.execute("DROP TRIGGER trg_claude_visibility_lease_kind_update")
-    original._conn.execute("PRAGMA ignore_check_constraints = ON")
-    original._conn.execute(
-        """UPDATE session_claude_visibility_jobs
-           SET state = 'claude_retry', attempts = 1,
-               error_code = 'exact_id_absent_reconciled',
-               error_detail = 'absence-evidence:' || ?
-           WHERE id = ?""",
-        ("a" * 64, first_identity.job_id),
+    original = _create_exact_v23_claude_db(path)
+    _insert_v23_claude_job(
+        original,
+        suffix="absence",
+        state="claude_retry",
+        error_code="exact_id_absent_reconciled",
+        error_detail="absence-evidence:" + "a" * 64,
     )
-    original._conn.execute(
-        """UPDATE session_claude_visibility_jobs
-           SET state = 'claude_leased', attempts = 1,
-               lease_digest = ?, lease_expires_at = 999,
-               lease_kind = NULL, error_code = NULL
-           WHERE id = ?""",
-        ("legacy-lease", second_identity.job_id),
-    )
-    original._conn.execute("UPDATE schema_version SET version = 23")
-    original._conn.commit()
+    _insert_v23_claude_job(original, suffix="lease", state="claude_leased")
+    original.commit()
     original.close()
 
     migrated = SessionDB(path)
@@ -342,8 +424,104 @@ def test_v24_migration_invalidates_legacy_authorization_and_ambiguous_lease(
         assert _rows(
             migrated, "SELECT * FROM session_claude_visibility_reconciliations"
         ) == []
+        with pytest.raises(sqlite3.IntegrityError, match="lease fields"):
+            migrated._conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_leased', lease_digest = 'digest',
+                       lease_expires_at = 200, lease_kind = 'bogus'
+                   WHERE id = 'v23-absence'"""
+            )
     finally:
         migrated.close()
+
+
+def test_v24_bridge_migration_is_independent_of_fts_schema_version(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "legacy-v23-no-fts.db"
+    original = _create_exact_v23_claude_db(path)
+    job_id = _insert_v23_claude_job(original, suffix="nofts", state="claude_leased")
+    # Simulate an independently stale core/FTS migration counter. The bridge
+    # tables themselves retain the exact v23 shape under test.
+    original.execute("UPDATE schema_version SET version = 10")
+    original.commit()
+    original.close()
+    monkeypatch.setattr(SessionDB, "_sqlite_supports_fts5", lambda self, cursor: False)
+
+    first = SessionDB(path)
+    assert _rows(first, "SELECT version FROM schema_version") == [{"version": 10}]
+    assert _rows(
+        first,
+        "SELECT migration_name FROM session_bridge_migrations",
+    ) == [{"migration_name": "claude_visibility_security_v24"}]
+    first._conn.execute(
+        """UPDATE session_claude_visibility_jobs
+           SET state = 'claude_leased', lease_digest = 'valid-digest',
+               lease_expires_at = 999, lease_kind = 'launch'
+           WHERE id = ?""",
+        (job_id,),
+    )
+    first._conn.commit()
+    first.close()
+
+    reopened = SessionDB(path)
+    try:
+        assert _rows(reopened, "SELECT version FROM schema_version") == [{"version": 10}]
+        assert _rows(
+            reopened,
+            """SELECT state, lease_digest, lease_kind
+               FROM session_claude_visibility_jobs WHERE id = ?""",
+            (job_id,),
+        ) == [{
+            "state": "claude_leased",
+            "lease_digest": "valid-digest",
+            "lease_kind": "launch",
+        }]
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("legacy_value", ["0.02", "0.0200000", "1000000.000000"])
+def test_v24_migration_canonicalizes_safe_legacy_money(tmp_path, legacy_value) -> None:
+    path = tmp_path / f"legacy-money-{legacy_value}.db"
+    original = _create_exact_v23_claude_db(path)
+    job_id = _insert_v23_claude_job(original, suffix="money", state="claude_pending")
+    original.execute(
+        """INSERT INTO session_claude_registration_usage
+           VALUES ('2026-07-17', ?, 1, ?, 1)""",
+        (job_id, legacy_value),
+    )
+    original.commit()
+    original.close()
+
+    migrated = SessionDB(path)
+    try:
+        assert _rows(
+            migrated,
+            "SELECT reserved_estimated_cost_usd FROM session_claude_registration_usage",
+        ) == [{"reserved_estimated_cost_usd": f"{Decimal(legacy_value):.6f}"}]
+    finally:
+        migrated.close()
+
+
+@pytest.mark.parametrize("legacy_value", ["0.0000001", "1000000.000001", "NaN"])
+def test_v24_migration_rejects_unsafe_legacy_money(tmp_path, legacy_value) -> None:
+    path = tmp_path / f"unsafe-money-{legacy_value}.db"
+    original = _create_exact_v23_claude_db(path)
+    job_id = _insert_v23_claude_job(original, suffix="unsafe", state="claude_pending")
+    original.execute(
+        """INSERT INTO session_claude_registration_usage
+           VALUES ('2026-07-17', ?, 1, ?, 1)""",
+        (job_id, legacy_value),
+    )
+    original.commit()
+    original.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"unsafe session_claude_registration_usage row 1.*reserved_estimated_cost_usd",
+    ):
+        SessionDB(path)
 
 
 def test_claude_reconciliation_table_enforces_outcome_and_evidence_checks(
@@ -444,6 +622,16 @@ def test_prune_sessions_preserves_claude_visibility_job_and_usage_audit(
         state=state,
     )
     _insert_claude_registration_usage(db, job_id)
+    reserved_uuid = _rows(
+        db,
+        "SELECT reserved_claude_uuid FROM session_claude_visibility_jobs WHERE id = ?",
+        (job_id,),
+    )[0]["reserved_claude_uuid"]
+    db._conn.execute(
+        """INSERT INTO session_claude_visibility_reconciliations
+           VALUES (?, ?, 0, 'exact_match', ?, 1, NULL)""",
+        (job_id, reserved_uuid, "a" * 64),
+    )
     assert _rows(db, "PRAGMA foreign_keys") == [{"foreign_keys": 1}]
 
     assert db.prune_sessions(
@@ -464,6 +652,10 @@ def test_prune_sessions_preserves_claude_visibility_job_and_usage_audit(
         db,
         "SELECT job_id, attempt_ordinal FROM session_claude_registration_usage",
     ) == [{"job_id": job_id, "attempt_ordinal": 1}]
+    assert _rows(
+        db,
+        "SELECT job_id, outcome FROM session_claude_visibility_reconciliations",
+    ) == [{"job_id": job_id, "outcome": "exact_match"}]
 
 
 def test_claude_visibility_job_rejects_invalid_state(db: SessionDB) -> None:
