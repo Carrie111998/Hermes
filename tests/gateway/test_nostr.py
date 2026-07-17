@@ -137,7 +137,7 @@ class TestNostrConnect:
         adapter = NostrAdapter(_config())
         result = await adapter.connect()
         assert result is False
-        assert adapter.nsec is None
+        assert not adapter.nsec
 
     async def test_connect_fails_on_exception(self):
         with patch.object(_mod, "Keys") as mock_keys_cls:
