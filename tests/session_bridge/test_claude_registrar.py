@@ -901,6 +901,40 @@ def test_factory_validation_failure_reclaims_spawned_child_and_descriptors() -> 
     assert process.fd == -1
 
 
+def test_factory_surfaces_unconfirmed_post_spawn_process_death() -> None:
+    class Resource:
+        def close(self) -> None:
+            pass
+
+        def fileno(self) -> int:
+            return -1
+
+    class Process:
+        fileobj = Resource()
+        _server = Resource()
+        fd = -1
+        pid = None
+        _thread = threading.Thread(target=lambda: None)
+
+        def isalive(self) -> bool:
+            return True
+
+        def terminate(self, force: bool = False) -> bool:
+            return False
+
+    Process._thread.start()
+
+    class Factory(WindowsConPtyFactory):
+        def _spawn_process(self, argv: list[str], *, cwd: str) -> object:
+            return Process()
+
+        def _adapt_process(self, spawned: object) -> _WinPtyProcess:
+            raise RuntimeError("unsupported pywinpty resource layout")
+
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        Factory().spawn(["ignored"], cwd="C:/ignored")
+
+
 def test_paid_launch_exact_reconciles_existing_uuid_before_any_spawn() -> None:
     item = claim()
     store = FakeStore()
@@ -1135,7 +1169,7 @@ def _real_conpty_available() -> bool:
 @pytest.mark.parametrize(
     ("scenario", "expected_exit", "expected_lines"),
     [("registered", 0, ["REGISTERED"]), ("nonzero", 9, ["REGISTERED"]), *(
-        ("delayed_extra", 0, ["REGISTERED", "extra"]) for _ in range(5)
+        ("delayed_extra", 0, ["REGISTERED", "extra"]) for _ in range(20)
     )],
 )
 def test_real_windows_conpty_fixture_exit_and_cleanup(
@@ -1168,6 +1202,9 @@ def test_real_windows_conpty_fixture_exit_and_cleanup(
     assert process.wait(10.0) == expected_exit
     cleanup = process.close(5.0)
     assert cleanup == PtyCleanupResult(True, True, True, expected_exit)
+    assert cleanup.registrar_reader_stopped is True
+    assert cleanup.transport_reader_stopped is True
+    assert process._reader_thread is None
     assert process.close(5.0) == cleanup
     events = json.loads(record.read_text(encoding="utf-8"))
     assert events[0]["cwd"] == str(tmp_path)
@@ -1194,6 +1231,9 @@ def test_real_windows_conpty_timeout_terminates_and_releases_resources(
     assert process.terminate(5.0)
     cleanup = process.close(5.0)
     assert cleanup.process_dead and cleanup.reader_stopped and cleanup.descriptors_closed
+    assert cleanup.registrar_reader_stopped is True
+    assert cleanup.transport_reader_stopped is True
+    assert process._reader_thread is None
 
 
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
@@ -1247,7 +1287,11 @@ def test_registrar_spawn_does_not_mutate_standard_pywinpty_reader_during_overlap
     registrar_process.write("/exit\r")
     assert registrar_process.wait(10.0) == 0
     assert registrar_process.close(5.0).succeeded
-    assert "STANDARD_OK" in standard.read(4096)
+    standard_output = ""
+    output_deadline = time.monotonic() + 5
+    while "STANDARD_OK" not in standard_output and time.monotonic() < output_deadline:
+        standard_output += standard.read(4096)
+    assert "STANDARD_OK" in standard_output
     deadline = time.monotonic() + 5
     while standard.isalive() and time.monotonic() < deadline:
         time.sleep(0.01)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import importlib.metadata
 import inspect
@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from .models import OriginKind, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
-_RESPONSE_SETTLE_SECONDS = 0.25
+_RESPONSE_SETTLE_SECONDS = 0.5
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
@@ -85,12 +86,26 @@ class PtyCleanupResult:
     reader_stopped: bool
     descriptors_closed: bool
     exit_code: int | None
+    registrar_reader_stopped: bool | None = field(default=None, compare=False)
+    transport_reader_stopped: bool | None = field(default=None, compare=False)
 
     @property
     def succeeded(self) -> bool:
+        registrar_stopped = (
+            self.reader_stopped
+            if self.registrar_reader_stopped is None
+            else self.registrar_reader_stopped
+        )
+        transport_stopped = (
+            self.reader_stopped
+            if self.transport_reader_stopped is None
+            else self.transport_reader_stopped
+        )
         return (
             self.process_dead
             and self.reader_stopped
+            and registrar_stopped
+            and transport_stopped
             and self.descriptors_closed
         )
 
@@ -126,7 +141,8 @@ class WindowsConPtyFactory:
         try:
             return self._adapt_process(process)
         except Exception as exc:
-            _reclaim_unadapted_process(process, timeout=2.0)
+            if not _reclaim_unadapted_process(process, timeout=2.0):
+                raise RuntimeError("pty cleanup unconfirmed") from exc
             raise RuntimeError("pty unavailable") from exc
 
     def _spawn_process(self, argv: list[str], *, cwd: str) -> object:
@@ -171,7 +187,7 @@ def _registrar_pywinpty_process_type() -> Any:
         """Registrar-only transport; avoids pywinpty's process-global reader hook."""
 
         def __init__(self, pty: object) -> None:
-            self.pty = pty
+            self.pty: Any = pty
             self.pid = pty.pid  # type: ignore[attr-defined]
             self.read_blocking = False
             self.closed = False
@@ -180,17 +196,47 @@ def _registrar_pywinpty_process_type() -> Any:
             self.delayafterclose = 0.1
             self.fileobj, self._server = socket.socketpair()
             self.fd = self.fileobj.fileno()
+            self._transport_stop = threading.Event()
             self._thread = threading.Thread(
                 target=lambda: None,
-                daemon=True,
+                daemon=False,
                 name="session-bridge-winpty-transport",
             )
             self._thread.start()
 
+        def read_with_timeout(self, size: int, timeout: float) -> str | None:
+            if self._transport_stop.is_set():
+                raise EOFError("Pty is closed")
+            data = self.pty.read(size, blocking=False)
+            if data:
+                return data if isinstance(data, str) else bytes(data).decode("utf-8", "replace")
+            ready, _, _ = select.select(
+                [self.fileobj], [], [], min(max(0.0, timeout), 0.01)
+            )
+            if ready:
+                try:
+                    self.fileobj.recv(1)
+                except OSError:
+                    pass
+                if self._transport_stop.is_set():
+                    raise EOFError("Pty is closed")
+            return None
+
+        def stop_transport(self) -> None:
+            self._transport_stop.set()
+            try:
+                self._server.send(b"\0")
+            except OSError:
+                pass
+
+        def release_native_pty(self) -> None:
+            """Drop the last owned pseudoconsole handle after synchronous reads stop."""
+            self.pty = None
+
     return _RegistrarPtyProcess
 
 
-def _reclaim_unadapted_process(process: object, *, timeout: float) -> None:
+def _reclaim_unadapted_process(process: object, *, timeout: float) -> bool:
     try:
         alive = bool(process.isalive())  # type: ignore[attr-defined]
     except Exception:
@@ -220,6 +266,21 @@ def _reclaim_unadapted_process(process: object, *, timeout: float) -> None:
                 )
             except (OSError, subprocess.SubprocessError):
                 pass
+        final_deadline = time.monotonic() + timeout
+        while time.monotonic() < final_deadline:
+            try:
+                if not process.isalive():  # type: ignore[attr-defined]
+                    alive = False
+                    break
+            except Exception:
+                break
+            time.sleep(0.01)
+    stop_transport = getattr(process, "stop_transport", None)
+    if callable(stop_transport):
+        try:
+            stop_transport()
+        except Exception:
+            pass
     for name in ("fileobj", "_server"):
         resource = getattr(process, name, None)
         try:
@@ -242,6 +303,26 @@ def _reclaim_unadapted_process(process: object, *, timeout: float) -> None:
     reader = getattr(process, "_thread", None)
     if isinstance(reader, threading.Thread):
         reader.join(timeout)
+    try:
+        process_dead = not bool(process.isalive())  # type: ignore[attr-defined]
+    except Exception:
+        process_dead = False
+    descriptors_closed = all(
+        _fileno_closed(getattr(process, name, None))
+        for name in ("fileobj", "_server")
+    ) and getattr(process, "fd", None) == -1
+    reader_stopped = not isinstance(reader, threading.Thread) or not reader.is_alive()
+    if process_dead and reader_stopped:
+        release_native_pty = getattr(process, "release_native_pty", None)
+        if callable(release_native_pty):
+            try:
+                release_native_pty()
+            except Exception:
+                return False
+    native_pty_released = not hasattr(process, "release_native_pty") or (
+        getattr(process, "pty", object()) is None
+    )
+    return process_dead and descriptors_closed and reader_stopped and native_pty_released
 
 
 class _WinPtyProcess:
@@ -287,6 +368,9 @@ class _WinPtyProcess:
         return fileobj, server, reader
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
+        timed_read = getattr(self._process, "read_with_timeout", None)
+        if callable(timed_read):
+            return self._read_until_cancellable(timeout, prompt, timed_read)
         if self._reader_thread is not None:
             raise RuntimeError("PTY reader already started")
         result: queue.Queue[str | BaseException | None] = queue.Queue()
@@ -350,6 +434,48 @@ class _WinPtyProcess:
             joined = "".join(chunks)
             if len(joined) > _MAX_RESPONSE_CHARS:
                 return self._finish_read(joined)
+            if not candidate_seen and _exact_registered_suffix(joined) is not None:
+                candidate_seen = True
+            if candidate_seen:
+                settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
+
+    def _read_until_cancellable(
+        self,
+        timeout: float,
+        prompt: str | None,
+        timed_read: Callable[[int, float], str | bytes | None],
+    ) -> str:
+        deadline = time.monotonic() + timeout
+        settle_deadline: float | None = None
+        candidate_seen = False
+        chunks: list[str] = []
+        while True:
+            now = time.monotonic()
+            wake_at = deadline if settle_deadline is None else min(deadline, settle_deadline)
+            remaining = wake_at - now
+            if remaining <= 0:
+                joined = "".join(chunks)
+                if candidate_seen:
+                    return _normalized_terminal_output(joined, prompt)
+                raise TimeoutError
+            try:
+                value = timed_read(4096, remaining)
+            except EOFError:
+                joined = "".join(chunks)
+                return _normalized_terminal_output(joined, prompt)
+            except Exception as exc:
+                raise RuntimeError("PTY read unavailable") from exc
+            if value is None:
+                continue
+            text = (
+                value.decode("utf-8", "replace")
+                if isinstance(value, bytes)
+                else str(value)
+            )
+            chunks.append(text)
+            joined = "".join(chunks)
+            if len(joined) > _MAX_RESPONSE_CHARS:
+                return joined
             if not candidate_seen and _exact_registered_suffix(joined) is not None:
                 candidate_seen = True
             if candidate_seen:
@@ -428,6 +554,12 @@ class _WinPtyProcess:
             process_dead = self._is_dead()
             if not process_dead:
                 process_dead = self.terminate(timeout)
+            stop_transport = getattr(self._process, "stop_transport", None)
+            if callable(stop_transport):
+                try:
+                    stop_transport()
+                except Exception:
+                    pass
             for resource in (fileobj, server):
                 try:
                     shutdown = getattr(resource, "shutdown", None)
@@ -448,18 +580,34 @@ class _WinPtyProcess:
             for reader in (self._reader_thread, native_reader):
                 if reader is not None and reader is not threading.current_thread():
                     reader.join(max(0.0, deadline - time.monotonic()))
-            reader_stopped = all(
-                reader is None or not reader.is_alive()
-                for reader in (self._reader_thread, native_reader)
+            registrar_reader_stopped = (
+                self._reader_thread is None or not self._reader_thread.is_alive()
             )
+            transport_reader_stopped = not native_reader.is_alive()
+            reader_stopped = registrar_reader_stopped and transport_reader_stopped
+            exit_code = self._exit_code()
+            release_native_pty = getattr(self._process, "release_native_pty", None)
+            native_pty_released = not callable(release_native_pty)
+            if process_dead and transport_reader_stopped and callable(release_native_pty):
+                try:
+                    release_native_pty()
+                    native_pty_released = True
+                except Exception:
+                    native_pty_released = False
             descriptors_closed = (
                 _fileno_closed(fileobj)
                 and _fileno_closed(server)
                 and getattr(self._process, "fd", None) == -1
+                and native_pty_released
             )
             self._closed = True
             result = PtyCleanupResult(
-                process_dead, reader_stopped, descriptors_closed, self._exit_code()
+                process_dead,
+                reader_stopped,
+                descriptors_closed,
+                exit_code,
+                registrar_reader_stopped=registrar_reader_stopped,
+                transport_reader_stopped=transport_reader_stopped,
             )
             self._cleanup_result = result
             return result
