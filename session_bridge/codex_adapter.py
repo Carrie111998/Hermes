@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -76,6 +76,19 @@ class CodexThreadSummary:
     source_kind: str | None = None
     automation_only: bool = False
     subagent_only: bool = False
+
+
+class CodexInventoryProtocolError(ValueError):
+    """A fixed-code failure while reconciling Codex inventory metadata."""
+
+    def __init__(self, code: str, *, field: str | None = None) -> None:
+        if code not in {"metadata_conflict"}:
+            raise ValueError("Codex inventory protocol error code is not fixed")
+        if field not in {None, "source kind"}:
+            raise ValueError("Codex inventory protocol error field is not fixed")
+        self.code = code
+        message = code if field is None else f"{code}: {field}"
+        super().__init__(message)
 
 
 class SidebarVerificationError(RuntimeError):
@@ -453,30 +466,22 @@ class CodexSourceAdapter:
     def read_sidebar_thread(
         self, summary: CodexThreadSummary, *, deadline: float | None
     ) -> SessionProjection:
-        projection, _source_kind = self._read_sidebar_thread_details(
+        projection, _reconciled_summary = self._read_sidebar_thread_details(
             summary, deadline=deadline
         )
         return projection
 
     def _read_sidebar_thread_details(
         self, summary: CodexThreadSummary, *, deadline: float | None
-    ) -> tuple[SessionProjection, str | None]:
+    ) -> tuple[SessionProjection, CodexThreadSummary]:
         response = self._bounded_sidebar_request(
             "thread/read",
             {"threadId": summary.native_id, "includeTurns": True},
             deadline=deadline,
         )
         thread = _thread_from_response(response)
-        read_source_kind, _automation, _subagent = _source_kind_metadata(
-            thread, required=False
-        )
-        if (
-            summary.source_kind is not None
-            and read_source_kind is not None
-            and summary.source_kind != read_source_kind
-        ):
-            raise ValueError("Codex thread source kind conflicts between list and read")
-        return self.project_thread(summary, response=response), read_source_kind
+        reconciled = _reconcile_summary_metadata(summary, thread)
+        return self.project_thread(reconciled, response=response), reconciled
 
     def _bounded_sidebar_inventory_kind(
         self,
@@ -667,23 +672,21 @@ class CodexSourceAdapter:
 
         sources: list[SidebarSource] = []
         for summary in summaries:
-            if summary.source_kind is None:
-                raise ValueError("Codex thread/list inventory source kind is missing")
-            projection, read_source_kind = self._read_sidebar_thread_details(
+            projection, reconciled = self._read_sidebar_thread_details(
                 summary, deadline=None
             )
-            if read_source_kind is None:
-                raise ValueError("Codex thread/read source kind is missing")
+            if reconciled.source_kind is None:
+                raise ValueError("Codex thread source kind is missing")
             sources.append(SidebarSource(
                 source_session_id=canonical_session_id(
-                    Provider.CODEX, summary.native_id
+                    Provider.CODEX, reconciled.native_id
                 ),
                 projection=projection,
-                git_root=summary.git_root,
-                git_head=summary.git_head,
-                worktree_id=summary.worktree_id,
-                automation_only=summary.automation_only,
-                subagent_only=summary.subagent_only,
+                git_root=reconciled.git_root,
+                git_head=reconciled.git_head,
+                worktree_id=reconciled.worktree_id,
+                automation_only=reconciled.automation_only,
+                subagent_only=reconciled.subagent_only,
             ))
         return tuple(sources)
 
@@ -1805,12 +1808,21 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         archived=archived_value,
         revision=revision,
         git_root=_summary_metadata(
-            entry, "gitRoot", "git_root", "repositoryRoot", "repository_root"
+            entry,
+            ("gitRoot", "git_root", "repositoryRoot", "repository_root"),
         ),
-        git_branch=_summary_metadata(entry, "gitBranch", "git_branch", "branch"),
-        git_head=_summary_metadata(entry, "gitHead", "git_head", "head"),
+        git_branch=_summary_metadata(
+            entry,
+            ("gitBranch", "git_branch", "branch"),
+            git_aliases=("branch", "gitBranch", "git_branch"),
+        ),
+        git_head=_summary_metadata(
+            entry,
+            ("gitHead", "git_head", "head"),
+            git_aliases=("sha", "gitHead", "git_head", "head"),
+        ),
         worktree_id=_summary_metadata(
-            entry, "worktreeId", "worktree_id", "worktree"
+            entry, ("worktreeId", "worktree_id", "worktree")
         ),
         source_kind=source_kind,
         automation_only=automation_only,
@@ -1852,7 +1864,13 @@ def _valid_subagent_source(value: Any) -> bool:
     if isinstance(other, str) and bool(other.strip()):
         return True
     spawn = value.get("thread_spawn")
-    if not isinstance(spawn, dict) or set(spawn) != {"depth", "parent_thread_id"}:
+    required_keys = {"depth", "parent_thread_id"}
+    optional_keys = {"agent_nickname", "agent_path", "agent_role"}
+    if (
+        not isinstance(spawn, dict)
+        or not required_keys.issubset(spawn)
+        or not set(spawn).issubset(required_keys | optional_keys)
+    ):
         return False
     depth = spawn["depth"]
     parent = spawn["parent_thread_id"]
@@ -1862,16 +1880,117 @@ def _valid_subagent_source(value: Any) -> bool:
         and depth >= 0
         and isinstance(parent, str)
         and bool(parent.strip())
+        and all(
+            spawn[key] is None or isinstance(spawn[key], str)
+            for key in optional_keys & set(spawn)
+        )
     )
 
 
-def _summary_metadata(entry: dict[str, Any], *aliases: str) -> str | None:
-    value = _first(entry, *aliases)
-    if value is None:
-        git = entry.get("gitInfo", entry.get("git_info"))
-        if isinstance(git, dict):
-            value = _first(git, *aliases)
-    return _optional_string(value)
+def _summary_metadata(
+    entry: dict[str, Any],
+    aliases: tuple[str, ...],
+    *,
+    git_aliases: tuple[str, ...] | None = None,
+) -> str | None:
+    values: list[str] = []
+    nested_aliases = aliases if git_aliases is None else git_aliases
+
+    # gitInfo.sha is the canonical Codex commit field. Legacy aliases remain
+    # accepted only when they agree with it exactly.
+    for git_key in ("gitInfo", "git_info"):
+        if git_key not in entry or entry[git_key] is None:
+            continue
+        git = entry[git_key]
+        if not isinstance(git, dict):
+            raise ValueError("Codex inventory git metadata must be an object")
+        values.extend(_metadata_alias_values(git, nested_aliases))
+    values.extend(_metadata_alias_values(entry, aliases))
+
+    if not values:
+        return None
+    selected = values[0]
+    if any(value != selected for value in values[1:]):
+        raise CodexInventoryProtocolError("metadata_conflict")
+    return selected
+
+
+def _metadata_alias_values(
+    entry: dict[str, Any], aliases: tuple[str, ...]
+) -> list[str]:
+    values: list[str] = []
+    for alias in aliases:
+        if alias not in entry or entry[alias] is None:
+            continue
+        value = _optional_string(entry[alias])
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _read_summary_metadata(entry: dict[str, Any]) -> dict[str, str | None]:
+    cwd_values = _metadata_alias_values(
+        entry, ("cwd", "workingDirectory", "working_directory")
+    )
+    if len(set(cwd_values)) > 1:
+        raise CodexInventoryProtocolError("metadata_conflict")
+    return {
+        "cwd": cwd_values[0] if cwd_values else None,
+        "git_root": _summary_metadata(
+            entry,
+            ("gitRoot", "git_root", "repositoryRoot", "repository_root"),
+        ),
+        "git_branch": _summary_metadata(
+            entry,
+            ("gitBranch", "git_branch", "branch"),
+            git_aliases=("branch", "gitBranch", "git_branch"),
+        ),
+        "git_head": _summary_metadata(
+            entry,
+            ("gitHead", "git_head", "head"),
+            git_aliases=("sha", "gitHead", "git_head", "head"),
+        ),
+        "worktree_id": _summary_metadata(
+            entry, ("worktreeId", "worktree_id", "worktree")
+        ),
+    }
+
+
+def _reconcile_summary_metadata(
+    summary: CodexThreadSummary, thread: dict[str, Any]
+) -> CodexThreadSummary:
+    read_source_kind, read_automation, read_subagent = _source_kind_metadata(
+        thread, required=False
+    )
+    read_metadata = _read_summary_metadata(thread)
+
+    def reconcile(
+        left: str | None, right: str | None, *, field: str | None = None
+    ) -> str | None:
+        if left is not None and right is not None and left != right:
+            raise CodexInventoryProtocolError("metadata_conflict", field=field)
+        return right if right is not None else left
+
+    source_kind = reconcile(
+        summary.source_kind, read_source_kind, field="source kind"
+    )
+    if read_source_kind is not None:
+        automation_only = read_automation
+        subagent_only = read_subagent
+    else:
+        automation_only = summary.automation_only
+        subagent_only = summary.subagent_only
+    return replace(
+        summary,
+        cwd=reconcile(summary.cwd, read_metadata["cwd"]),
+        git_root=reconcile(summary.git_root, read_metadata["git_root"]),
+        git_branch=reconcile(summary.git_branch, read_metadata["git_branch"]),
+        git_head=reconcile(summary.git_head, read_metadata["git_head"]),
+        worktree_id=reconcile(summary.worktree_id, read_metadata["worktree_id"]),
+        source_kind=source_kind,
+        automation_only=automation_only,
+        subagent_only=subagent_only,
+    )
 
 
 def _normalize_revision(value: Any) -> str | None:

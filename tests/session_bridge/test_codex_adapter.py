@@ -229,6 +229,234 @@ class TestInventory:
         assert by_id["subagent"].projection.native_status == "archived"
 
     @pytest.mark.parametrize(
+        "optional_fields",
+        [
+            {"agent_nickname": "scout"},
+            {"agent_path": "reviewer/worker"},
+            {"agent_role": "reviewer"},
+            {
+                "agent_nickname": "scout",
+                "agent_path": "reviewer/worker",
+                "agent_role": "reviewer",
+            },
+            {
+                "agent_nickname": None,
+                "agent_path": None,
+                "agent_role": None,
+            },
+        ],
+    )
+    def test_claude_visibility_accepts_protocol_thread_spawn_optional_fields(
+        self, optional_fields: dict[str, str | None]
+    ) -> None:
+        spawn = {
+            "depth": 1,
+            "parent_thread_id": "parent-thread",
+            **optional_fields,
+        }
+        source = {"subAgent": {"thread_spawn": spawn}}
+        row = {
+            "id": "spawned",
+            "cwd": "C:/work/spawned",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": source,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{
+                "thread": {"id": "spawned", "source": source, "turns": []}
+            }],
+        })
+
+        [candidate] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        assert candidate.subagent_only is True
+        assert candidate.automation_only is False
+
+    @pytest.mark.parametrize(
+        "invalid_fields",
+        [
+            {"agent_nickname": 7},
+            {"agent_path": ["reviewer", "worker"]},
+            {"agent_role": False},
+            {"future_field": "unsupported"},
+        ],
+    )
+    def test_claude_visibility_rejects_malformed_thread_spawn_optional_fields(
+        self, invalid_fields: dict[str, Any]
+    ) -> None:
+        source = {"subAgent": {"thread_spawn": {
+            "depth": 1,
+            "parent_thread_id": "parent-thread",
+            **invalid_fields,
+        }}}
+        row = {
+            "id": "bad-spawn",
+            "cwd": "C:/work/bad-spawn",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": source,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{
+                "thread": {"id": "bad-spawn", "source": source, "turns": []}
+            }],
+        })
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_claude_visibility_sources(after=0)
+
+    def test_claude_visibility_maps_git_info_sha_to_git_head(self) -> None:
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        row = {
+            "id": "native-git",
+            "cwd": "C:/work/native-git",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+            "gitInfo": {"branch": "feature/native", "sha": sha},
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{"thread": {**row, "turns": []}}],
+        })
+
+        [candidate] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        assert candidate.git_head == sha
+        assert candidate.projection.git_branch == "feature/native"
+
+    def test_claude_visibility_rejects_conflicting_native_and_legacy_git_heads(
+        self,
+    ) -> None:
+        row = {
+            "id": "conflicting-head",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+            "gitInfo": {"sha": "a" * 40},
+            "gitHead": "b" * 40,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}],
+        })
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_claude_visibility_sources(after=0)
+
+    @pytest.mark.parametrize(
+        ("list_metadata", "read_metadata"),
+        [
+            ({"cwd": "C:/work/list"}, {"cwd": "C:/work/read"}),
+            ({"gitRoot": "C:/repo/list"}, {"gitRoot": "C:/repo/read"}),
+            ({"gitBranch": "feature/list"}, {"gitBranch": "feature/read"}),
+            ({"gitHead": "a" * 40}, {"gitInfo": {"sha": "b" * 40}}),
+            ({"worktreeId": "wt-list"}, {"worktreeId": "wt-read"}),
+        ],
+    )
+    def test_claude_visibility_metadata_conflicts_fail_closed(
+        self,
+        list_metadata: dict[str, Any],
+        read_metadata: dict[str, Any],
+    ) -> None:
+        row = {
+            "id": "metadata-conflict",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+            **list_metadata,
+        }
+        read = {
+            "id": "metadata-conflict",
+            "source": "vscode",
+            "turns": [],
+            **read_metadata,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{"thread": read}],
+        })
+
+        with pytest.raises(ValueError, match="metadata_conflict") as error:
+            CodexSourceAdapter(
+                client, marker_secret=SECRET
+            ).list_claude_visibility_sources(after=0)
+
+        assert getattr(error.value, "code", None) == "metadata_conflict"
+
+    def test_claude_visibility_fills_metadata_present_only_in_thread_read(self) -> None:
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        row = {
+            "id": "read-fill",
+            "createdAt": 1,
+            "updatedAt": 2,
+        }
+        read = {
+            "id": "read-fill",
+            "cwd": "C:/work/read-fill",
+            "source": "vscode",
+            "gitRoot": "C:/work",
+            "gitInfo": {"branch": "feature/read-fill", "sha": sha},
+            "worktreeId": "wt-read-fill",
+            "turns": [],
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{"thread": read}],
+        })
+
+        [candidate] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        assert candidate.projection.cwd == "C:/work/read-fill"
+        assert candidate.projection.git_branch == "feature/read-fill"
+        assert candidate.git_root == "C:/work"
+        assert candidate.git_head == sha
+        assert candidate.worktree_id == "wt-read-fill"
+        assert candidate.automation_only is False
+        assert candidate.subagent_only is False
+
+    def test_claude_visibility_accepts_exact_list_and_read_metadata_match(self) -> None:
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        metadata = {
+            "cwd": "C:/work/exact",
+            "source": {"subAgent": "review"},
+            "gitRoot": "C:/work",
+            "gitInfo": {"branch": "feature/exact", "sha": sha},
+            "worktreeId": "wt-exact",
+        }
+        row = {
+            "id": "exact",
+            "createdAt": 1,
+            "updatedAt": 2,
+            **metadata,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [{
+                "thread": {"id": "exact", "turns": [], **metadata}
+            }],
+        })
+
+        [candidate] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        assert candidate.git_head == sha
+        assert candidate.subagent_only is True
+
+    @pytest.mark.parametrize(
         "source_kind",
         ["unknown", {"custom": "future-source"}, None, {"subAgent": None}],
     )
