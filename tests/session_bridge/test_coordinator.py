@@ -56,7 +56,11 @@ from session_bridge.sidebar import (
     sidebar_bridge_id,
 )
 from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
-from session_bridge.worktree import WorktreeSnapshotError, capture_worktree_snapshot
+from session_bridge.worktree import (
+    WorktreeSnapshot,
+    WorktreeSnapshotError,
+    capture_worktree_snapshot,
+)
 
 
 _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
@@ -3160,6 +3164,57 @@ async def test_sidebar_backfill_nonmissing_preflight_error_is_not_excluded(
     assert preview.excluded == 0
     assert preview.excluded_by_reason == {"source_cwd_missing": 0}
     assert store.sidebar_exclusion_counts()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sidebar_backfill_confirms_transient_identity_capture_failure(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 3_000_000.0
+    source = _exact_cwd_repo(tmp_path / "source")
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="transient-identity-capture",
+        content="Confirm a transient Git capture timeout",
+        last_active=now,
+        cwd=str(source),
+    ))
+    real_capture = capture_worktree_snapshot
+    calls = 0
+
+    def _capture_with_one_transient_failure(cwd: str) -> WorktreeSnapshot:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise WorktreeSnapshotError("source_identity_mismatch")
+        return real_capture(cwd)
+
+    monkeypatch.setattr(
+        "session_bridge.coordinator.capture_worktree_snapshot",
+        _capture_with_one_transient_failure,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=10,
+        apply=False,
+    )
+
+    assert calls == 2
+    assert preview.queued == 1
+    assert preview.failed == 0
+    assert preview.excluded == 0
 
 
 @pytest.mark.asyncio

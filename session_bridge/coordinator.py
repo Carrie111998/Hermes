@@ -1074,10 +1074,18 @@ class SessionBridgeCoordinator:
                                 or candidate.git_head is not None
                                 or candidate.git_branch not in (None, "HEAD")
                             )
-                            worktree_snapshot = await asyncio.to_thread(
-                                capture_worktree_snapshot,
-                                candidate.cwd,
-                            )
+                            try:
+                                worktree_snapshot = await asyncio.to_thread(
+                                    capture_worktree_snapshot,
+                                    candidate.cwd,
+                                )
+                            except WorktreeSnapshotError as exc:
+                                if exc.code != "source_identity_mismatch":
+                                    raise
+                                worktree_snapshot = await asyncio.to_thread(
+                                    capture_worktree_snapshot,
+                                    candidate.cwd,
+                                )
                             if (
                                 indexed_git_metadata
                                 and worktree_snapshot.git_root is None
