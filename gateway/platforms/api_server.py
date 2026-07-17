@@ -44,6 +44,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 try:
     from aiohttp import web
@@ -60,6 +62,21 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_OMNIO_DURABLE_APPROVALS_DISABLED_ENV = "OMNIO_TOOL_APPROVAL_DURABLE_DISABLED"
+_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+def _parse_omnio_connector_toolkit_approval_tools(payload: Any) -> list[str]:
+    """Validate and normalize Omnia's authoritative standing-grant response."""
+    if not isinstance(payload, dict):
+        raise ValueError("approval payload must be an object")
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        raise ValueError("approval payload tools must be an array")
+    if not all(isinstance(item, str) for item in tools):
+        raise ValueError("approval payload tools must contain strings")
+    return [item.strip() for item in tools if item.strip()]
 
 
 def _hermes_version() -> str:
@@ -2421,6 +2438,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         parsed = json.loads(function_result or "{}")
                     except Exception:
                         parsed = {}
+                    # A resolved decision (once/session/always/deny) rides the
+                    # gated call's completed event as `interaction.answered` —
+                    # mirroring request_user_input's answered echo — so the
+                    # persisted turn rehydrates the approval card in its
+                    # granted/denied state instead of "not answered".
+                    try:
+                        from tools.tool_approval import consume_tool_approval_decision
+
+                        decision = consume_tool_approval_decision(session_id, tool_call_id)
+                    except Exception:
+                        decision = None
+                    if decision is not None:
+                        completed.setdefault("interaction", {})["answered"] = decision
                     if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
                         try:
                             from tools.tool_approval import (
@@ -4959,7 +4989,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     status=400,
                 )
-            recorded = resolve_tool_approval(session_key, tool, scope, tool_call_id)
+            raw_tools = body.get("tools")
+            tools: list[str] | None = None
+            if raw_tools is not None:
+                if not isinstance(raw_tools, list):
+                    return web.json_response(
+                        _openai_error("'tools' must be an array", code="invalid_approval_tools"),
+                        status=400,
+                    )
+                tools = []
+                for item in raw_tools:
+                    if not isinstance(item, str):
+                        return web.json_response(
+                            _openai_error(
+                                "'tools' must contain only strings",
+                                code="invalid_approval_tools",
+                            ),
+                            status=400,
+                        )
+                    stripped = item.strip()
+                    if stripped:
+                        tools.append(stripped)
+            recorded = resolve_tool_approval(session_key, tool, scope, tool_call_id, tools)
         except Exception as exc:
             logger.exception("[api_server] tool approval resolution failed")
             return web.json_response(_openai_error(str(exc)), status=500)
@@ -5049,6 +5100,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # discover_mcp_tools() and corrupt _servers or stop the MCP loop
             # mid-rebuild.
             async with self._mcp_reload_lock:
+                await self._refresh_omnio_connector_toolkit_approvals()
                 with _lock:
                     old_servers = set(_servers.keys())
                 await loop.run_in_executor(None, shutdown_mcp_servers)
@@ -5341,6 +5393,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._site = web.TCPSite(self._runner, self._host, self._port)
             await self._site.start()
 
+            await self._refresh_omnio_connector_toolkit_approvals()
             self._mark_connected()
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
@@ -5351,6 +5404,117 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
+
+    async def _refresh_omnio_connector_toolkit_approvals(self) -> None:
+        try:
+            from tools.tool_approval import (
+                register_always_approval_authority,
+                replace_injected_always_approvals,
+            )
+            from utils import env_var_enabled
+        except Exception:
+            logger.warning("[api_server] Omnio approval injection unavailable", exc_info=True)
+            return
+
+        # The snapshots loaded here are only candidate indexes. Register the
+        # uncached exact-tool check that must confirm every later skip.
+        register_always_approval_authority(
+            self._is_omnio_connector_toolkit_approval_granted
+        )
+
+        if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
+            replace_injected_always_approvals([])
+            return
+
+        base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
+        api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
+        brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
+        if not base_url or not api_token or not brand_id:
+            replace_injected_always_approvals([])
+            return
+
+        try:
+            tools = await self._fetch_omnio_connector_toolkit_approvals(
+                base_url=base_url,
+                api_token=api_token,
+                brand_id=brand_id,
+            )
+        except Exception as exc:
+            logger.warning("[api_server] Omnio approval injection failed: %s", exc)
+            replace_injected_always_approvals([])
+            return
+
+        replace_injected_always_approvals(tools)
+
+    def _is_omnio_connector_toolkit_approval_granted(
+        self,
+        function_name: str,
+    ) -> bool:
+        """Check one standing grant against Omnia without caching a positive.
+
+        Tool execution calls this from its worker thread. Any missing authority,
+        timeout, non-2xx response or malformed body raises; the approval gate
+        catches that and prompts instead of executing the write.
+        """
+        from utils import env_var_enabled
+
+        if env_var_enabled(_OMNIO_DURABLE_APPROVALS_DISABLED_ENV):
+            raise RuntimeError("durable approval authority is disabled")
+
+        base_url = os.environ.get("OMNIA_BASE_URL", "").strip().rstrip("/")
+        api_token = os.environ.get("OMNIA_API_TOKEN", "").strip()
+        brand_id = os.environ.get("OMNIO_BRAND_ID", "").strip()
+        if not base_url or not api_token or not brand_id:
+            raise RuntimeError("durable approval authority is unavailable")
+
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_token}",
+        }
+        bypass = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "").strip()
+        if bypass:
+            headers["x-vercel-protection-bypass"] = bypass
+        url = (
+            f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
+            f"{urlencode({'brand': brand_id})}"
+        )
+        request = Request(url, headers=headers, method="GET")
+        with urlopen(
+            request,
+            timeout=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS,
+        ) as response:
+            status = response.status
+            if not isinstance(status, int) or not 200 <= status < 300:
+                raise RuntimeError(f"omnia_status={status}")
+            payload = json.loads(response.read())
+
+        tools = _parse_omnio_connector_toolkit_approval_tools(payload)
+        return function_name in tools
+
+    async def _fetch_omnio_connector_toolkit_approvals(
+        self, *, base_url: str, api_token: str, brand_id: str
+    ) -> list[str]:
+        import aiohttp
+
+        headers = {"Authorization": f"Bearer {api_token}"}
+        bypass = os.environ.get("VERCEL_AUTOMATION_BYPASS_SECRET", "").strip()
+        if bypass:
+            headers["x-vercel-protection-bypass"] = bypass
+        url = (
+            f"{base_url}/api/agents/omnio/connector-toolkit-approvals?"
+            f"{urlencode({'brand': brand_id})}"
+        )
+        timeout = aiohttp.ClientTimeout(total=_OMNIO_APPROVALS_FETCH_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    return []
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"omnia_status={response.status} body={text[:160]}")
+                payload = await response.json(content_type=None)
+
+        return _parse_omnio_connector_toolkit_approval_tools(payload)
 
     async def disconnect(self) -> None:
         """Stop the aiohttp web server and release all owned resources.
