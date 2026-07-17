@@ -378,17 +378,21 @@ See [Subagent Delegation](/user-guide/features/delegation) for full configuratio
 
 ## Cron Job Providers
 
-Cron jobs inherit your configured `fallback_providers` chain (or legacy `fallback_model`) when they create an agent. To use a different primary provider for a cron job, configure `provider` and `model` overrides on the cron job itself:
+Agent-backed cron jobs inherit your configured `fallback_providers` chain (or legacy `fallback_model`) when they create an agent. A per-job model route changes the primary only; it does not disable that recovery chain. Use the `cronjob` tool's `model={provider, model}` object to pin a different primary route:
 
 ```python
 cronjob(
     action="create",
     schedule="every 2h",
     prompt="Check server status",
-    provider="openrouter",
-    model="google/gemini-3-flash-preview"
+    model={
+        "provider": "openrouter",
+        "model": "google/gemini-3-flash-preview",
+    },
 )
 ```
+
+If the object contains `model` but omits `provider`, the tool materializes the current main provider into the stored job at creation time. That is an implicit provider pin, not dynamic inheritance. Omit the entire `model` object when the job should continue to follow runtime agent/default routing. Script-only jobs with `no_agent=True` short-circuit before agent creation, so their effective model/provider and fallback chain are N/A.
 
 See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration details.
 
@@ -409,5 +413,5 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 | Approval classification | Layered (see above) | `auxiliary.approval` |
 | Title generation | Layered (see above) | `auxiliary.title_generation` |
 | Triage specifier | Layered (see above) | `auxiliary.triage_specifier` |
-| Delegation | Provider override only (no automatic fallback) | `delegation.provider` / `delegation.model` |
-| Cron jobs | Per-job provider override only (no automatic fallback) | Per-job `provider` / `model` |
+| Delegation | Subagents inherit the parent's primary fallback chain; delegation settings may override the primary route | `delegation.provider` / `delegation.model` + top-level `fallback_providers` |
+| Cron jobs | Agent-backed jobs inherit the configured fallback chain after resolving their primary route; `no_agent` jobs are N/A | Per-job `model={provider, model}` + top-level `fallback_providers` |

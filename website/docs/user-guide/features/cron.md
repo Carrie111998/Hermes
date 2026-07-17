@@ -22,7 +22,7 @@ Cron jobs can:
 All of this is available to Hermes itself through the `cronjob` tool, so you can create, pause, edit, and remove jobs by asking in plain language — no CLI required.
 
 :::tip
-Cron jobs use whatever provider `hermes model` selected. `hermes setup --portal` is the lowest-friction option for unattended runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal).
+Agent-backed cron jobs resolve their model route at execution time unless the job stores an explicit override. `hermes setup --portal` is the lowest-friction option for unattended runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal).
 :::
 
 :::warning
@@ -92,6 +92,41 @@ cronjob(
 ```
 
 This is useful when you want a scheduled agent to inherit reusable workflows without stuffing the full skill text into the cron prompt itself.
+
+## Model and provider routing
+
+For an agent-backed job, Hermes reloads the active profile's configuration on every run and resolves the primary model in this order:
+
+1. An explicit `job.model` override.
+2. An explicit agent identity (`agent_id`, `agent`, or `agentId`), looked up in `agents.models`.
+3. If there is no explicit identity, the first attached skill whose normalized name matches a key in `agents.models`. Skills are checked in stored order.
+4. The profile's `model.default`.
+
+In shorthand: **`job.model` → explicit agent identity → `agents.models` → first matching skill → `model.default`**. A complete `agents.models.<identity>` entry supplies that agent's model and provider together; a partial entry falls back to the profile defaults for missing values. An explicit per-job provider remains independent: when `job.model` is set, `job.provider` wins if present, otherwise Hermes uses the provider stored or resolved for that job.
+
+The `cronjob` tool schema accepts the model route as one object:
+
+```python
+cronjob(
+    action="create",
+    schedule="every 2h",
+    prompt="Check server status",
+    model={
+        "provider": "openrouter",
+        "model": "google/gemini-3-flash-preview",
+    },
+)
+```
+
+The persisted job record stores `model` and `provider` as separate fields. To keep dynamic inheritance, omit the `model` object entirely. If you create a job through the `cronjob` tool with a model name but no provider, the tool **materializes the profile's current main provider at creation time**:
+
+```python
+model={"model": "google/gemini-3-flash-preview"}
+```
+
+That is an implicit pin, not dynamic provider inheritance: changing `model.provider` later does not reroute that job's primary provider. To pin a deliberate route, supply both keys; to inherit dynamically, supply neither. This materialization is performed by the tool boundary—raw job records that already contain `model` with `provider: null` fall back to runtime/config resolution instead.
+
+The primary route does not replace recovery policy. Agent-backed cron jobs still inherit the profile's configured `fallback_providers` chain (or legacy `fallback_model`) and credential-pool rotation.
 
 ## Running a job inside a project directory
 
@@ -370,7 +405,7 @@ Semantics:
 - **Empty stdout → silent tick**, no delivery. This is the watchdog pattern: "only say something when something is wrong".
 - Non-zero exit or timeout → an error alert is delivered, so a broken watchdog can't fail silently.
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
-- No tokens, no model, no provider fallback — the job never touches the inference layer.
+- The scheduler short-circuits before model resolution and before creating `AIAgent`. Effective model/provider are **N/A**: no tokens, provider, credential rotation, or fallback chain is used, even if stale model/provider fields exist in the stored job.
 
 `.sh` / `.bash` files run under `/bin/bash`; anything else under the current Python interpreter (`sys.executable`). Scripts must live in `~/.hermes/scripts/` (same sandboxing rule as the pre-run script gate).
 
@@ -671,7 +706,7 @@ The referenced jobs' most recent completed outputs are injected above the prompt
 
 Jobs are stored in `~/.hermes/cron/jobs.json`. Output from job runs is saved to `~/.hermes/cron/output/{job_id}/{timestamp}.md`.
 
-Jobs may store `model` and `provider` as `null`. When those fields are omitted, Hermes resolves them at execution time from the global configuration. They only appear in the job record when a per-job override is set.
+Jobs may store `model` and `provider` as `null`. For agent-backed jobs with no stored override, Hermes resolves them at execution time using the routing precedence above, including `agents.models` before `model.default`. A model-only override created through the `cronjob` tool is different: the current main provider is materialized into the job record at creation time, so it is pinned rather than dynamically inherited. For `no_agent` jobs both fields are operationally irrelevant and the effective route is N/A.
 
 The storage uses atomic file writes so interrupted writes do not leave a partially written job file behind.
 
