@@ -875,6 +875,7 @@ class ClaudeNativeRegistrar:
         if existing is not None:
             return self._validate_and_commit(claim, candidate, identity, existing)
 
+        prompt = build_claude_registration_prompt(candidate, identity, self._secret)
         argv = [
             *self._command,
             "--session-id",
@@ -887,6 +888,8 @@ class ClaudeNativeRegistrar:
             "",
             "--permission-mode",
             "dontAsk",
+            "--print",
+            prompt,
         ]
         process: InteractivePty | None = None
         launched = False
@@ -895,8 +898,6 @@ class ClaudeNativeRegistrar:
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
-            prompt = build_claude_registration_prompt(candidate, identity, self._secret)
-            process.write(f"\x1b[200~{prompt}\x1b[201~\r")
             output = process.read_until(self._process_timeout, prompt=prompt)
             if _is_authentication_failure(output):
                 pending = (
@@ -907,7 +908,6 @@ class ClaudeNativeRegistrar:
             elif not _has_exact_registered_response(output, prompt):
                 pending = ("fail", "bridge_conflict", "registration response malformed")
             else:
-                process.write("/exit\r")
                 exit_code = process.wait(self._exit_timeout)
                 if type(exit_code) is not int or exit_code != 0:
                     pending = (

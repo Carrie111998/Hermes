@@ -277,12 +277,15 @@ def registrar(
     )
 
 
-def test_launch_uses_exact_interactive_argv_cwd_and_one_redacted_prompt() -> None:
+def test_launch_uses_persistent_print_mode_and_never_writes_exit_command() -> None:
     item = claim()
     process = FakePty(output="\x1b[?2004hClaude>\x1b[0m REGISTERED\r\n")
     factory = FakeFactory(process)
     source = FakeSource([None, projection_for(item)])
     result = registrar(source, factory).process(item)
+    expected = build_claude_registration_prompt(
+        candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
+    )
 
     assert result.status == "visible"
     assert factory.spawns == [
@@ -299,19 +302,16 @@ def test_launch_uses_exact_interactive_argv_cwd_and_one_redacted_prompt() -> Non
                 "",
                 "--permission-mode",
                 "dontAsk",
+                "--print",
+                expected,
             ],
             item.source_cwd,
         )
     ]
     argv = factory.spawns[0][0]
-    assert "--print" not in argv and "-p" not in argv
-    assert len(process.writes) == 2
-    expected = build_claude_registration_prompt(
-        candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
-    )
-    assert process.writes[0] == f"\x1b[200~{expected}\x1b[201~\r"
-    assert process.writes[1] == "/exit\r"
-    assert "tool_calls" not in process.writes[0]
+    assert "--no-session-persistence" not in argv
+    assert process.writes == []
+    assert "tool_calls" not in factory.spawns[0][0][-1]
     assert process.closed and process.waits == [1.0]
 
 
