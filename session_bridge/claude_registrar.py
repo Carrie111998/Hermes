@@ -1038,6 +1038,7 @@ class ClaudeNativeRegistrar:
         process: InteractivePty | None = None
         launched = False
         clean_exit = False
+        provider_limit_observed = False
         pending: tuple[str, str, str] | None = None
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
@@ -1050,6 +1051,7 @@ class ClaudeNativeRegistrar:
                     "Claude authentication unavailable",
                 )
             elif _is_provider_limit_failure(output):
+                provider_limit_observed = True
                 pending = (
                     "retry",
                     "creation_ambiguous",
@@ -1089,6 +1091,7 @@ class ClaudeNativeRegistrar:
                     except Exception:
                         terminated = False
                     if not terminated:
+                        provider_limit_observed = False
                         pending = (
                             "retry",
                             "creation_ambiguous",
@@ -1099,13 +1102,14 @@ class ClaudeNativeRegistrar:
                 except Exception:
                     cleanup = PtyCleanupResult(False, False, False, None)
                 if not cleanup.succeeded:
+                    provider_limit_observed = False
                     pending = (
                         "retry",
                         "creation_ambiguous",
                         "PTY cleanup postconditions failed",
                     )
 
-        if pending is not None:
+        if pending is not None and not provider_limit_observed:
             transition, code, detail = pending
             if transition == "fail":
                 return self._fail(claim, code, detail)
@@ -1126,6 +1130,12 @@ class ClaudeNativeRegistrar:
             if found is not None:
                 return self._validate_and_commit(claim, candidate, identity, found)
             if self._monotonic() >= deadline:
+                if provider_limit_observed:
+                    return self._retry(
+                        claim,
+                        "creation_ambiguous",
+                        "Claude provider limit interrupted registration",
+                    )
                 return self._retry(
                     claim,
                     "native_transcript_not_indexed",

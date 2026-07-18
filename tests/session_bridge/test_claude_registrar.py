@@ -753,6 +753,20 @@ def test_exact_uuid_provider_limit_transcript_reconciles_without_replacement() -
     assert factory.spawns == []
 
 
+def test_launch_provider_limit_reconciles_created_exact_uuid_in_same_cycle() -> None:
+    item = claim()
+    limited = "You've hit your limit · resets Jul 20, 4am " \
+        "(America/New_York)\nAPI Error: 429 rate_limit"
+    source = FakeSource([None, projection_for(item, response=limited)])
+    factory = FakeFactory(FakePty(output=limited))
+
+    result = registrar(source, factory).process(item)
+
+    assert result.status == "visible"
+    assert len(factory.spawns) == 1
+    assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
+
+
 @pytest.mark.parametrize(
     "messages",
     [
