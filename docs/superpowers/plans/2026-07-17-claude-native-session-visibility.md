@@ -470,6 +470,23 @@ uv run pytest -q
 
 Expected: all tests pass. Record duration and counts for the rollout log.
 
+If the repository-wide suite exposes failures in files outside the cumulative
+Session Bridge change set, Task 7 may use a bounded baseline non-regression
+waiver instead of expanding this rollout into unrelated platform cleanup. The
+waiver requires all of the following evidence:
+
+1. the exact focused Session Bridge suite and all static gates pass;
+2. collection succeeds after installing the repository's locked test extras;
+3. every observed waived failure is in a path outside the cumulative feature
+   diff and no Session Bridge failure is present;
+4. failure counts, paths, platform cause, and incomplete-run limits are recorded
+   explicitly rather than described as a green full-suite run; and
+5. all diagnostic edits outside the Session Bridge scope are restored before
+   deployment.
+
+This waiver is a non-regression gate, not a claim that the repository-wide
+baseline is green.
+
 - [ ] **Step 4: Install and validate the personal skill**
 
 Run the implemented installer, then verify:
