@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import ntpath
 import os
 import random
 import re
@@ -37,6 +38,30 @@ _LOCAL_PERSISTED_CWD_SOURCES = frozenset({"cli", "tui"})
 _MAX_PERSISTED_CWD_CHARS = 4096
 
 
+def _is_fully_qualified_path(value: str) -> bool:
+    if os.name != "nt":
+        return os.path.isabs(value)
+    if value.startswith(("\\\\", "//")):
+        if len(value) < 3 or value[2] in "\\/":
+            return False
+        components = re.split(r"[\\/]", value[2:])
+        return (
+            len(components) >= 2
+            and bool(components[0])
+            and bool(components[1])
+            and components[0] not in {"?", "."}
+        )
+    if value.startswith(("\\", "/")):
+        return False
+    drive, tail = ntpath.splitdrive(value)
+    return (
+        len(drive) == 2
+        and drive[0].isalpha()
+        and drive[1] == ":"
+        and tail.startswith(("\\", "/"))
+    )
+
+
 def _is_canonical_absolute_cwd(value: object) -> bool:
     if (
         not isinstance(value, str)
@@ -44,7 +69,7 @@ def _is_canonical_absolute_cwd(value: object) -> bool:
         or value != value.strip()
         or len(value) > _MAX_PERSISTED_CWD_CHARS
         or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
-        or not os.path.isabs(value)
+        or not _is_fully_qualified_path(value)
     ):
         return False
     separator_tail = value[2:] if value.startswith(("\\\\", "//")) else value

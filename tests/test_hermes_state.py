@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import os
 import sqlite3
 import time
 import json
@@ -151,6 +152,8 @@ class TestSessionLifecycle:
             ("cli", "cli", "C:/work/pro\x1fject"),
             ("cli", "cli", "C:\\work\\.\\project"),
             ("cli", "cli", "C:\\work\\\\project"),
+            ("cli", "cli", "\\\\\\server\\share\\project"),
+            ("cli", "cli", "///server/share/project"),
         ],
     )
     def test_local_child_cwd_rejects_non_authoritative_parent_metadata(
@@ -172,6 +175,22 @@ class TestSessionLifecycle:
             lambda _session_id: {"id": "different", "source": "cli", "cwd": cwd},
         )
         assert db.get_inheritable_local_child_cwd("parent", "cli") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path qualification")
+    @pytest.mark.parametrize("cwd", ["\\work\\project", "/work/project"])
+    def test_local_child_cwd_rejects_windows_root_relative_paths(self, db, cwd):
+        db.create_session("parent", source="cli", cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", "cli") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path qualification")
+    @pytest.mark.parametrize(
+        "cwd", ["C:\\work\\project", "C:/work/project", "\\\\server\\share\\project"]
+    )
+    def test_local_child_cwd_accepts_windows_fully_qualified_paths(self, db, cwd):
+        db.create_session("parent", source="cli", cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", "cli") == cwd
 
     def test_update_session_cwd_persists_git_branch(self, db):
         db.create_session(session_id="s1", source="cli")
