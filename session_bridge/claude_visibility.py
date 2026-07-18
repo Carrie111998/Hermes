@@ -135,13 +135,15 @@ def evaluate_claude_visibility(
         canonical_session_id(projection.provider, projection.native_id)
     except ValueError:
         return "unstable_identity"
+    user_contents = tuple(
+        message.content for message in projection.messages if message.role == "user"
+    )
     normalized_user_texts = tuple(
         normalized
-        for message in projection.messages
-        if message.role == "user"
-        if (normalized := normalize_meaningful_user_text(message.content)) is not None
+        for content in user_contents
+        if (normalized := normalize_meaningful_user_text(content)) is not None
     )
-    if any(is_meaningful_user_text(value) for value in normalized_user_texts):
+    if any(is_meaningful_user_text(content) for content in user_contents):
         try:
             _required_metadata(projection.cwd, "source cwd")
         except ValueError:

@@ -159,6 +159,28 @@ def test_injected_internal_events_plus_context_only_retry_are_not_eligible() -> 
     assert evaluate_claude_visibility(projection) == "no_meaningful_request"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            " [System: The active model for this chat has changed to model-x via "
+            "provider provider-y.]"
+        ),
+        (
+            "［System: The active model for this chat has changed to model-x via "
+            "provider provider-y.]"
+        ),
+    ],
+)
+def test_internal_event_lookalikes_remain_meaningful_through_visibility(
+    content: str,
+) -> None:
+    assert (
+        evaluate_claude_visibility(_projection(Provider.HERMES, content=content))
+        == "eligible"
+    )
+
+
 def test_identity_name_and_marker_are_stable_across_restart_and_frozen() -> None:
     projection = _projection(
         Provider.CODEX,
