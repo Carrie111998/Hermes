@@ -80,6 +80,22 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
     if not is_schema:
         return repaired
 
+    # Rule 3: every object schema must carry an explicit ``required`` array,
+    # even if it is empty.  Moonshot rejects top-level tool parameters that
+    # are typed as object but omit ``required`` (``required`` should be an
+    # array).  Applying this recursively keeps nested object schemas valid too.
+    if repaired.get("type") == "object":
+        if "properties" not in repaired:
+            repaired["properties"] = {}
+        if not isinstance(repaired.get("required"), list):
+            repaired["required"] = []
+        else:
+            props = repaired.get("properties") or {}
+            repaired["required"] = [
+                r for r in repaired["required"]
+                if isinstance(r, str) and r in props
+            ]
+
     # Rule 2: when anyOf is present, type belongs only on the children.
     # Additionally, Moonshot rejects null-type branches inside anyOf
     # (enum value (<nil>) does not match any type in [string]).
@@ -174,17 +190,19 @@ def sanitize_moonshot_tool_parameters(parameters: Any) -> Dict[str, Any]:
     applied.  Input is not mutated.
     """
     if not isinstance(parameters, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
     repaired = _repair_schema(copy.deepcopy(parameters), is_schema=True)
     if not isinstance(repaired, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
     # Top-level must be an object schema
     if repaired.get("type") != "object":
         repaired["type"] = "object"
     if "properties" not in repaired:
         repaired["properties"] = {}
+    if "required" not in repaired:
+        repaired["required"] = []
 
     return repaired
 

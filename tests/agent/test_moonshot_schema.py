@@ -184,15 +184,86 @@ class TestTopLevelGuarantees:
     """The returned top-level schema is always a well-formed object."""
 
     def test_non_dict_input_returns_empty_object(self):
-        assert sanitize_moonshot_tool_parameters(None) == {"type": "object", "properties": {}}
-        assert sanitize_moonshot_tool_parameters("garbage") == {"type": "object", "properties": {}}
-        assert sanitize_moonshot_tool_parameters([]) == {"type": "object", "properties": {}}
+        assert sanitize_moonshot_tool_parameters(None) == {"type": "object", "properties": {}, "required": []}
+        assert sanitize_moonshot_tool_parameters("garbage") == {"type": "object", "properties": {}, "required": []}
+        assert sanitize_moonshot_tool_parameters([]) == {"type": "object", "properties": {}, "required": []}
 
     def test_non_object_top_level_coerced(self):
         params = {"type": "string"}
         out = sanitize_moonshot_tool_parameters(params)
         assert out["type"] == "object"
         assert "properties" in out
+        assert out["required"] == []
+
+
+class TestObjectRequiredInjected:
+    """Rule 3: every object schema must have an explicit required array."""
+
+    def test_top_level_required_empty_is_injected(self):
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        assert out["required"] == []
+
+    def test_top_level_required_is_preserved(self):
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q"],
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        assert out["required"] == ["q"]
+
+    def test_required_unknown_names_are_dropped(self):
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q", "missing"],
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        assert out["required"] == ["q"]
+
+    def test_required_non_string_entries_are_dropped(self):
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+            "required": ["q", None, 123],
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        assert out["required"] == ["q"]
+
+    def test_nested_object_gets_required(self):
+        params = {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {"field": {"type": "string"}},
+                },
+            },
+        }
+        out = sanitize_moonshot_tool_parameters(params)
+        assert out["required"] == []
+        assert out["properties"]["filter"]["required"] == []
+
+    def test_tool_list_sanitizer_injects_required(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                    },
+                },
+            },
+        ]
+        out = sanitize_moonshot_tools(tools)
+        assert out[0]["function"]["parameters"]["required"] == []
 
     def test_does_not_mutate_input(self):
         params = {
@@ -235,8 +306,9 @@ class TestToolListSanitizer:
         ]
         out = sanitize_moonshot_tools(tools)
         assert out[0]["function"]["parameters"]["properties"]["q"]["type"] == "string"
-        # Second tool already clean — should be structurally equivalent
-        assert out[1]["function"]["parameters"] == {"type": "object", "properties": {}}
+        assert out[0]["function"]["parameters"]["required"] == []
+        # Second tool already clean — sanitized shape is structurally equivalent
+        assert out[1]["function"]["parameters"] == {"type": "object", "properties": {}, "required": []}
 
     def test_empty_list_is_passthrough(self):
         assert sanitize_moonshot_tools([]) == []
