@@ -1082,6 +1082,208 @@ class TestGitDestructiveOps:
         assert dangerous is False
 
 
+class TestGitPushEmptyRefspec:
+    """git push with empty refspec destination (`:branch`) deletes the remote
+    branch. This is equivalent to `git push --delete` but spelled as a refspec.
+    """
+
+    def test_git_push_colon_branch_detected(self):
+        """`:my-branch` deletes the remote branch named my-branch."""
+        cmd = "git push origin :my-branch"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "empty refspec" in desc.lower() or "delete" in desc.lower()
+
+    def test_git_push_colon_refs_heads_detected(self):
+        """`:refs/heads/main` deletes the remote main branch via full ref."""
+        cmd = "git push origin :refs/heads/main"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "empty refspec" in desc.lower()
+
+    def test_git_push_colon_refs_tags_detected(self):
+        """`:refs/tags/v1.0` deletes the remote tag."""
+        cmd = "git push origin :refs/tags/v1.0"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_push_normal_branch_not_flagged(self):
+        """Normal `git push origin my-branch` must not be flagged."""
+        cmd = "git push origin my-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_push_refspec_with_source_not_flagged(self):
+        """A full refspec `local:remote` is a normal push, not a deletion."""
+        cmd = "git push origin main:main"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+class TestGitCheckoutPathspec:
+    """git checkout with `--` pathspec separator discards uncommitted changes.
+
+    `git checkout -- .` and `git checkout HEAD -- src/` overwrite local
+    modifications. Branch switches like `git checkout main` (no `--`) are safe.
+    """
+
+    def test_git_checkout_double_dash_dot_detected(self):
+        """`git checkout -- .` discards ALL uncommitted changes."""
+        cmd = "git checkout -- ."
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "checkout" in desc.lower() or "discard" in desc.lower()
+
+    def test_git_checkout_double_dash_file_detected(self):
+        """`git checkout -- file.txt` discards changes to that file."""
+        cmd = "git checkout -- file.txt"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_checkout_head_double_dash_path_detected(self):
+        """`git checkout HEAD -- src/` discards changes in that directory."""
+        cmd = "git checkout HEAD -- src/"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_checkout_commit_double_dash_detected(self):
+        """`git checkout abc123 -- .` restores from a commit, discarding changes."""
+        cmd = "git checkout abc123 -- ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_checkout_branch_not_flagged(self):
+        """Normal branch switch `git checkout main` must not be flagged."""
+        cmd = "git checkout main"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_checkout_b_new_branch_not_flagged(self):
+        """`git checkout -b new-feature` creates a branch, no discard."""
+        cmd = "git checkout -b new-feature"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_checkout_track_not_flagged(self):
+        """`git checkout --track origin/feature` is a branch operation."""
+        cmd = "git checkout --track origin/feature"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+
+class TestGitRestoreWorktree:
+    """git restore --worktree / -W discards uncommitted worktree changes.
+
+    Also gate bare `git restore .` (implicit worktree restore). Do NOT gate
+    `git restore --staged .` which only unstages without discarding changes.
+    """
+
+    def test_git_restore_worktree_flag_detected(self):
+        """`git restore --worktree .` discards uncommitted changes."""
+        cmd = "git restore --worktree ."
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "restore" in desc.lower() or "discard" in desc.lower()
+
+    def test_git_restore_W_short_flag_detected(self):
+        """`git restore -W file.txt` discards changes to that file."""
+        cmd = "git restore -W file.txt"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_worktree_with_source_detected(self):
+        """`git restore --worktree --source=HEAD~1 .` still discards."""
+        cmd = "git restore --worktree --source=HEAD~1 ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_bare_path_detected(self):
+        """Bare `git restore .` implicitly restores worktree, discarding changes."""
+        cmd = "git restore ."
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "restore" in desc.lower()
+
+    def test_git_restore_bare_file_detected(self):
+        """`git restore file.txt` discards changes to that file."""
+        cmd = "git restore file.txt"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_staged_not_flagged(self):
+        """`git restore --staged .` only unstages, does not discard changes."""
+        cmd = "git restore --staged ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_restore_S_short_staged_not_flagged(self):
+        """`git restore -S file.txt` only unstages that file."""
+        cmd = "git restore -S file.txt"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_restore_source_only_detected(self):
+        """`git restore --source=HEAD~1 file.txt` overwrites the worktree."""
+        cmd = "git restore --source=HEAD~1 file.txt"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_help_not_flagged(self):
+        """`git restore --help` is informational and must not need approval."""
+        dangerous, _, _ = detect_dangerous_command("git restore --help")
+        assert dangerous is False
+
+
+class TestGitStashDestructive:
+    """git stash clear / drop destroy stashed work.
+
+    `stash clear` removes ALL stashes; `stash drop` removes a specific one.
+    """
+
+    def test_git_stash_clear_detected(self):
+        """`git stash clear` destroys all stashed changes."""
+        cmd = "git stash clear"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "stash" in desc.lower()
+
+    def test_git_stash_drop_detected(self):
+        """`git stash drop` destroys the top stash entry."""
+        cmd = "git stash drop"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "stash" in desc.lower()
+
+    def test_git_stash_drop_with_index_detected(self):
+        """`git stash drop stash@{2}` destroys a specific stash."""
+        cmd = "git stash drop stash@{2}"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_stash_push_not_flagged(self):
+        """`git stash push` saves work, doesn't destroy it."""
+        cmd = "git stash push -m 'work in progress'"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_stash_pop_not_flagged(self):
+        """`git stash pop` restores work (may remove stash, but recoverable)."""
+        cmd = "git stash pop"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_stash_list_not_flagged(self):
+        """`git stash list` is read-only."""
+        cmd = "git stash list"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_stash_show_not_flagged(self):
+        """`git stash show` is read-only."""
+        cmd = "git stash show -p"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+
 class TestChmodExecuteCombo:
     """chmod +x && ./ is the two-step social engineering pattern where a
     script is first made executable then immediately run. The script

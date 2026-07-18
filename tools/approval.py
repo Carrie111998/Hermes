@@ -937,6 +937,27 @@ DANGEROUS_PATTERNS = [
     # later command in the same script.
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-d\b|--delete\b)[^;|&\n]*?(?:-f\b|--force\b)', "git branch force delete (long flags)"),
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
+    # git push with empty refspec destination (`:branch`) deletes the remote
+    # branch. The leading colon in a refspec means "push nothing to this ref",
+    # which is a destructive remote operation. Match `:ref` where ref starts
+    # with a word char or refs/ — excludes normal `git push origin branch`.
+    (r'\bgit\s+push\b[^;|&\n]*\s:(?:\w|refs/)', "git push empty refspec (deletes remote branch)"),
+    # git checkout with `--` pathspec separator followed by a path discards
+    # uncommitted worktree changes. `git checkout -- .` and `git checkout HEAD
+    # -- src/` both overwrite local modifications. Does NOT flag branch
+    # switches like `git checkout main` (no `--` separator).
+    (r'\bgit\s+checkout\b[^;|&\n]*\s--\s+\S', "git checkout -- <path> (discards uncommitted changes)"),
+    # git restore --worktree / -W discards uncommitted worktree changes.
+    # `git restore --worktree .` and `git restore -W file.txt` both overwrite.
+    # Also gate bare `git restore .` (implicit worktree restore), including a
+    # `--source` form which writes the named source into the worktree. Do NOT
+    # gate `git restore --staged .` which only unstages.
+    (r'\bgit\s+restore\b[^;|&\n]*(?:--worktree\b|-W\b)', "git restore --worktree (discards uncommitted changes)"),
+    (r'\bgit\s+restore\b(?![^;|&\n]*(?:--staged\b|-S\b))(?=[^;|&\n]*\s+(?!-)\S)', "git restore <path> (discards uncommitted changes)"),
+    # git stash clear / drop destroy stashed work. `stash clear` removes ALL
+    # stashes; `stash drop` removes a specific one (or the top if no index).
+    (r'\bgit\s+stash\s+clear\b', "git stash clear (destroys all stashes)"),
+    (r'\bgit\s+stash\s+drop\b', "git stash drop (destroys stashed work)"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
