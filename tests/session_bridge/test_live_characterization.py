@@ -134,6 +134,43 @@ def test_claude_visibility_live_characterization_uses_existing_gate(
         backend.characterize_claude_visibility()
 
 
+def test_claude_visibility_cleanup_bypasses_auth_idle_store_and_registrar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    token = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "capability": "x" * 43,
+    }
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cleanup must not authenticate")
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.cleanup_characterized_claude_visibility",
+        lambda **kwargs: (
+            calls.append(kwargs) or {"cleanup": "removed_exact_characterization"}
+        ),
+    )
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("cleanup must not inspect idle state")
+        ),
+    )
+
+    result = backend.characterize_claude_visibility(token)
+
+    assert result["cleanup"] == "removed_exact_characterization"
+    assert calls[0]["cleanup_token"] == token
+
+
 def test_characterization_gate_latest_failure_blocks_older_pass(tmp_path: Path) -> None:
     versions = {"claude": "1.2.3", "codex": "4.5.6"}
     _write_report(

@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
 from session_bridge.characterize import (
+    _read_characterization_record,
+    _write_characterization_record,
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
 )
@@ -92,6 +94,7 @@ def _claim_for(projection: SessionProjection) -> tuple[ClaudeVisibilityClaim, st
 
 def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit_second_phase(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_root = tmp_path / "sources"
     projects_root = tmp_path / "projects"
@@ -136,6 +139,7 @@ def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit
         reserve=reserve,
         registrar=registrar,
         restarted_source=restarted_source,
+        marker_secret=SECRET,
         now=lambda: 10.0,
     )
 
@@ -151,18 +155,50 @@ def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit
         "Press Ctrl+A in /resume to verify the exact session across all projects.",
         f"Resume the exact ID with: claude --resume {registrar.claims[0].reserved_claude_uuid}",
     ]
-    assert result["cleanup_token"] in result["operator_checks"][3]
+    assert "--cleanup-token" in result["operator_checks"][3]
     assert result["verification"] == "pending_operator_checks"
     assert result["cleanup"] == "pending_explicit_confirmation"
-    assert isinstance(result["cleanup_token"], str)
+    assert set(result["cleanup_token"]) == {"id", "capability"}
     assert state["transcript"].exists()
     assert Path(reserved[0].cwd or "").exists()
 
+    failed_checkpoint = False
+
+    def fail_after_disposable_checkpoint(
+        path: Path, payload: dict[str, Any], secret: bytes
+    ) -> None:
+        nonlocal failed_checkpoint
+        _write_characterization_record(path, payload, secret)
+        if payload.get("phase") == "disposable_removed" and not failed_checkpoint:
+            failed_checkpoint = True
+            raise OSError("synthetic cleanup checkpoint interruption")
+
+    monkeypatch.setattr(
+        "session_bridge.characterize._write_characterization_record",
+        fail_after_disposable_checkpoint,
+    )
+    with pytest.raises(OSError, match="checkpoint interruption"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=result["cleanup_token"],
+            source_root=source_root,
+            projects_root=projects_root,
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )
+    monkeypatch.setattr(
+        "session_bridge.characterize._write_characterization_record",
+        _write_characterization_record,
+    )
     cleaned = cleanup_characterized_claude_visibility(
         cleanup_token=result["cleanup_token"],
         source_root=source_root,
         projects_root=projects_root,
-        restarted_source=restarted_source,
+        restarted_source=lambda: (_ for _ in ()).throw(
+            AssertionError("resumed cleanup must not require provider rediscovery")
+        ),
+        marker_secret=SECRET,
+        now=lambda: 12.0,
     )
 
     assert cleaned["verification"] == "operator_confirmed"
@@ -237,6 +273,10 @@ def test_characterize_claude_visibility_json_dispatches_once(
                 "restart_exact_id_verified": True,
                 "verification": "pending_operator_checks",
                 "cleanup": "pending_explicit_confirmation",
+                "cleanup_token": {
+                    "id": "11111111-1111-4111-8111-111111111111",
+                    "capability": "opaque-cleanup-capability",
+                },
             }
 
         def close(self) -> None:
@@ -253,6 +293,10 @@ def test_characterize_claude_visibility_json_dispatches_once(
     assert calls == ["characterize", "close"]
     assert json.loads(capsys.readouterr().out) == {
         "cleanup": "pending_explicit_confirmation",
+        "cleanup_token": {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "capability": "opaque-cleanup-capability",
+        },
         "passed": True,
         "restart_exact_id_verified": True,
         "verification": "pending_operator_checks",
@@ -262,12 +306,15 @@ def test_characterize_claude_visibility_json_dispatches_once(
 def test_characterize_cli_explicit_cleanup_dispatches_token_without_registration(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    token = "11111111-1111-4111-8111-111111111111"
-    calls: list[str | None] = []
+    token = {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "capability": "opaque-cleanup-capability",
+    }
+    calls: list[Mapping[str, Any] | None] = []
 
     class Backend:
         def characterize_claude_visibility(
-            self, cleanup_token: str | None = None
+            self, cleanup_token: Mapping[str, Any] | None = None
         ) -> dict[str, Any]:
             calls.append(cleanup_token)
             return {
@@ -280,7 +327,12 @@ def test_characterize_cli_explicit_cleanup_dispatches_token_without_registration
 
     assert (
         main(
-            ["characterize-claude-visibility", "--json", "--cleanup-token", token],
+            [
+                "characterize-claude-visibility",
+                "--json",
+                "--cleanup-token",
+                json.dumps(token),
+            ],
             config_loader=BridgeConfig,
             backend_factory=lambda _config: Backend(),  # type: ignore[arg-type]
         )
@@ -348,6 +400,7 @@ def test_characterization_cleanup_aborts_on_identity_mismatch(
             reserve=reserve,
             registrar=_Registrar(),
             restarted_source=restarted_source,
+            marker_secret=SECRET,
             now=lambda: 10.0,
         )
     assert state["transcript"].exists()
@@ -391,6 +444,7 @@ def test_explicit_cleanup_revalidates_identity_and_aborts_after_operator_phase(
         reserve=reserve,
         registrar=_Registrar(),
         restarted_source=restarted_source,
+        marker_secret=SECRET,
         now=lambda: 10.0,
     )
     state["claim"] = state["claim"].__class__(**{
@@ -404,5 +458,255 @@ def test_explicit_cleanup_revalidates_identity_and_aborts_after_operator_phase(
             source_root=source_root,
             projects_root=projects_root,
             restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 11.0,
         )
     assert state["transcript"].exists()
+
+
+@pytest.mark.parametrize("failure_point", ["after_transcript", "after_commit"])
+def test_characterization_rerun_reconciles_same_operation_without_second_launch(
+    tmp_path: Path, failure_point: str
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    claims: list[ClaudeVisibilityClaim] = []
+    launches: list[str] = []
+    state: dict[str, Any] = {}
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        claims.append(claim)
+        state.update(claim=claim, marker=marker)
+        return claim
+
+    class FailingAfterLaunchRegistrar:
+        def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+            launches.append(claim.reserved_claude_uuid or "")
+            transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+            transcript.parent.mkdir(exist_ok=True)
+            transcript.write_text("native", encoding="utf-8")
+            state["transcript"] = transcript
+            raise RuntimeError(failure_point)
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    with pytest.raises(RuntimeError, match=failure_point):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=FailingAfterLaunchRegistrar(),
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 10.0,
+        )
+
+    recovered = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=FailingAfterLaunchRegistrar(),
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+
+    assert len(launches) == 1
+    assert len(claims) == 1
+    assert recovered["reserved_claude_uuid"] == launches[0]
+
+
+def test_characterization_recovers_same_cleanup_capability_after_ready_write_error(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+    launches = 0
+    failed_ready_write = False
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        state.update(claim=claim, marker=marker)
+        return claim
+
+    class Registrar:
+        def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+            nonlocal launches
+            launches += 1
+            transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+            transcript.parent.mkdir(exist_ok=True)
+            transcript.write_text("native", encoding="utf-8")
+            state["transcript"] = transcript
+            return ClaudeRegistrarOutcome(
+                "visible", claim.job_id, claim.reserved_claude_uuid
+            )
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    def writer(path: Path, payload: dict[str, Any], secret: bytes) -> None:
+        nonlocal failed_ready_write
+        _write_characterization_record(path, payload, secret)
+        if payload.get("phase") == "ready" and not failed_ready_write:
+            failed_ready_write = True
+            raise OSError("synthetic post-token-write failure")
+
+    with pytest.raises(OSError, match="post-token-write"):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=Registrar(),
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            record_writer=writer,
+            now=lambda: 10.0,
+        )
+    recovered = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=Registrar(),
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+    assert launches == 1
+    assert recovered["cleanup_token"]["id"]
+    assert recovered["cleanup_token"]["capability"]
+
+
+def test_cleanup_rejects_forged_capability_and_leaves_exact_artifacts(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("native", encoding="utf-8")
+        state.update(claim=claim, marker=marker, transcript=transcript)
+        return claim
+
+    pending = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=_Registrar(),
+        restarted_source=lambda: _RestartedSource(
+            state["transcript"],
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=state["claim"].reserved_claude_uuid,
+                title=state["claim"].native_name,
+                cwd=state["claim"].source_cwd,
+                started_at=10.0,
+                last_active=11.0,
+                messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+                native_path=str(state["transcript"]),
+                native_hash="b" * 64,
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            ),
+            state["marker"],
+        ),
+        marker_secret=SECRET,
+        now=lambda: 10.0,
+    )
+    forged = {**pending["cleanup_token"], "capability": "forged"}
+    with pytest.raises(RuntimeError, match="cleanup_token_invalid"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=forged,
+            source_root=source_root,
+            projects_root=projects_root,
+            restarted_source=lambda: _RestartedSource(
+                state["transcript"],
+                SessionProjection(
+                    provider=Provider.CLAUDE,
+                    native_id=state["claim"].reserved_claude_uuid,
+                    title=state["claim"].native_name,
+                    cwd=state["claim"].source_cwd,
+                    started_at=10.0,
+                    last_active=11.0,
+                    messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+                    native_path=str(state["transcript"]),
+                    native_hash="b" * 64,
+                    origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                ),
+                state["marker"],
+            ),
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )
+    assert state["transcript"].exists()
+    assert Path(state["claim"].source_cwd).exists()
+
+    # Even a correctly re-signed durable record cannot turn a malformed bridge
+    # marker or a non-child directory into cleanup authority.
+    active = source_root / ".claude-visibility-operation.json"
+    durable = _read_characterization_record(active, SECRET)
+    original_marker = durable["signed_marker"]
+    durable["signed_marker"] = original_marker[:-1] + (
+        "A" if original_marker[-1] != "A" else "B"
+    )
+    _write_characterization_record(active, durable, SECRET)
+    with pytest.raises(RuntimeError, match="identity_mismatch:marker"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=pending["cleanup_token"],
+            source_root=source_root,
+            projects_root=projects_root,
+            restarted_source=lambda: (_ for _ in ()).throw(
+                AssertionError("malformed marker must fail before adapter trust")
+            ),
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )
+
+    claimed = source_root / ".cleanup-claims" / f"{pending['cleanup_token']['id']}.json"
+    durable = _read_characterization_record(claimed, SECRET)
+    durable["signed_marker"] = original_marker
+    durable["source_cwd"] = str(projects_root)
+    _write_characterization_record(claimed, durable, SECRET)
+    with pytest.raises(RuntimeError, match="identity_mismatch:disposable"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=pending["cleanup_token"],
+            source_root=source_root,
+            projects_root=projects_root,
+            restarted_source=lambda: (_ for _ in ()).throw(AssertionError),
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )

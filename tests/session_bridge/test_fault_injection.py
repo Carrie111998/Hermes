@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 import sqlite3
 from pathlib import Path
@@ -924,14 +925,11 @@ def test_claude_visibility_delayed_indexing_polls_after_one_real_registrar_launc
     assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
 
 
-@pytest.mark.parametrize(
-    "restart_kind", ["service_restart_while_leased", "stale_lease"]
-)
-def test_claude_visibility_restart_and_stale_lease_reconcile_reserved_uuid_without_launch(
-    tmp_path: Path, restart_kind: str
+def test_claude_visibility_restart_before_expiry_waits_then_stale_lease_reconciles(
+    tmp_path: Path,
 ) -> None:
     now = [1_700_000_000.0]
-    database = SessionDB(tmp_path / f"{restart_kind}.db")
+    database = SessionDB(tmp_path / "restart-timing.db")
     try:
         store = SessionBridgeStore(database, clock=lambda: now[0])
         candidate = _registrar_candidate()
@@ -940,8 +938,15 @@ def test_claude_visibility_restart_and_stale_lease_reconcile_reserved_uuid_witho
         leased = store.claim_claude_visibility_job(now[0], 10.0, 25, "0.50", "0.02", 5)
         assert leased.lease_kind == "launch"
 
-        # Reconstructing the store models a real service restart; advancing past
-        # the lease models both restart recovery and an independently stale lease.
+        # A restart while the launch lease is still live must not claim or launch.
+        now[0] += 5.0
+        before_expiry = SessionBridgeStore(database, clock=lambda: now[0])
+        waiting = before_expiry.claim_claude_visibility_job(
+            now[0], 10.0, 25, "0.50", "0.02", 5
+        )
+        assert waiting.status == "no_due_job"
+
+        # The same process identity becomes reconciliation-only after expiry.
         now[0] += 11.0
         restarted = SessionBridgeStore(database, clock=lambda: now[0])
         reconciliation = restarted.claim_claude_visibility_job(
@@ -1003,10 +1008,12 @@ def test_claude_visibility_unknown_retry_code_in_durable_state_fails_closed(
 def test_claude_visibility_duplicate_idempotency_and_cost_rollover_fail_closed(
     tmp_path: Path,
 ) -> None:
-    base = 1_700_000_000.0
+    base = datetime(2026, 7, 16, 23, 59, tzinfo=timezone.utc).timestamp()
     current = [base]
     database = SessionDB(tmp_path / "duplicate-cost.db")
-    store = SessionBridgeStore(database, clock=lambda: current[0])
+    store = SessionBridgeStore(
+        database, clock=lambda: current[0], local_timezone=timezone.utc
+    )
     try:
         projection = SessionProjection(
             provider=Provider.CODEX,
@@ -1077,6 +1084,13 @@ def test_claude_visibility_duplicate_idempotency_and_cost_rollover_fail_closed(
         )
         assert gated.status == "cost_limit"
         assert gated.reserved_claude_uuid is None
+        current[0] = datetime(2026, 7, 17, 0, 1, tzinfo=timezone.utc).timestamp()
+        next_local_day = store.claim_claude_visibility_job(
+            current[0], 10.0, 25, "0.02", "0.02", 5
+        )
+        assert next_local_day.status == "claimed"
+        assert next_local_day.lease_kind == "launch"
+        assert next_local_day.reserved_claude_uuid == second_identity.claude_uuid
     finally:
         database.close()
 

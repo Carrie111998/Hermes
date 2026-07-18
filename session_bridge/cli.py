@@ -185,7 +185,7 @@ class _Backend(Protocol):
     ) -> Mapping[str, Any]: ...
     def claude_visibility_run_once(self) -> Mapping[str, Any]: ...
     def characterize_claude_visibility(
-        self, cleanup_token: str | None = None
+        self, cleanup_token: Mapping[str, Any] | None = None
     ) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
@@ -574,10 +574,27 @@ class ProductionBackend:
         )
 
     def characterize_claude_visibility(
-        self, cleanup_token: str | None = None
+        self, cleanup_token: Mapping[str, Any] | None = None
     ) -> Mapping[str, Any]:
         if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
             raise ConfigurationFailure("live_characterization_not_enabled")
+        marker_secret = resolve_marker_key()
+        source_root = (
+            Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+            / "session-bridge"
+            / "characterization"
+            / "claude-visibility-sources"
+        )
+        if cleanup_token is not None:
+            return cleanup_characterized_claude_visibility(
+                cleanup_token=cleanup_token,
+                source_root=source_root,
+                projects_root=_CLAUDE_PROJECTS_ROOT,
+                restarted_source=lambda: ClaudeSourceAdapter(
+                    _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+                ),
+                marker_secret=marker_secret,
+            )
         claude_command = resolve_cli_executable("claude")
         if _claude_visibility_preflight(claude_command) is None:
             raise ProviderDegraded("claude_visibility_preflight_failed")
@@ -593,7 +610,6 @@ class ProductionBackend:
             )
         ):
             raise RolloutGateBlocked("claude_visibility_not_idle")
-        marker_secret = resolve_marker_key()
         source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
         registrar = ClaudeNativeRegistrar(
             store,
@@ -623,21 +639,6 @@ class ProductionBackend:
                 raise RolloutGateBlocked("characterization_claim_mismatch")
             return claim
 
-        source_root = (
-            Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-            / "session-bridge"
-            / "characterization"
-            / "claude-visibility-sources"
-        )
-        if cleanup_token is not None:
-            return cleanup_characterized_claude_visibility(
-                cleanup_token=cleanup_token,
-                source_root=source_root,
-                projects_root=_CLAUDE_PROJECTS_ROOT,
-                restarted_source=lambda: ClaudeSourceAdapter(
-                    _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
-                ),
-            )
         return characterize_claude_visibility(
             source_root=source_root,
             projects_root=_CLAUDE_PROJECTS_ROOT,
@@ -646,6 +647,7 @@ class ProductionBackend:
             restarted_source=lambda: ClaudeSourceAdapter(
                 _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
             ),
+            marker_secret=marker_secret,
         )
 
     def _claude_visibility_runtime(self) -> ClaudeVisibilityCoordinator:
@@ -1324,7 +1326,13 @@ def main(
             if args.cleanup_token is None:
                 payload = backend.characterize_claude_visibility()
             else:
-                payload = backend.characterize_claude_visibility(args.cleanup_token)
+                try:
+                    cleanup_token = json.loads(args.cleanup_token)
+                except json.JSONDecodeError as exc:
+                    raise ConfigurationFailure(
+                        "characterization_cleanup_token_invalid"
+                    ) from exc
+                payload = backend.characterize_claude_visibility(cleanup_token)
             _emit(dict(payload))
             return EXIT_OK
         if args.command == "characterize":
@@ -1713,6 +1721,14 @@ def _optional_status_number(value: object) -> float | None:
 
 
 def _sanitize(value: Any, *, key: str | None = None) -> Any:
+    if key is not None and key.casefold() == "cleanup_token":
+        if (
+            isinstance(value, Mapping)
+            and set(value) == {"id", "capability"}
+            and all(isinstance(item, str) for item in value.values())
+        ):
+            return {"id": value["id"], "capability": value["capability"]}
+        return None
     if key is not None and any(
         fragment in key.casefold() for fragment in _SENSITIVE_KEY_FRAGMENTS
     ):

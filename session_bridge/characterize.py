@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -31,7 +34,14 @@ from .claude_adapter import (
     resolve_claude_command,
 )
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter
-from .models import BridgeMarkerPayload, OriginKind, Provider, SessionProjection
+from .models import (
+    BridgeMarkerPayload,
+    InvalidBridgeMarker,
+    OriginKind,
+    Provider,
+    SessionProjection,
+    decode_bridge_marker,
+)
 from .claude_visibility import ClaudeVisibilityClaim
 
 
@@ -48,6 +58,9 @@ _SENSITIVE_REPORT_KEYS = frozenset({
 })
 _MARKER_PREFIX = "HERMES_SESSION_BRIDGE_V1:"
 _MAX_CLI_VERSION_BYTES = 4096
+_CHARACTERIZATION_RECORD = ".claude-visibility-operation.json"
+_CHARACTERIZATION_SENTINEL = ".session-bridge-characterization.json"
+_CLEANUP_TTL_SECONDS = 7 * 24 * 60 * 60
 _PROVIDER_REQUIRED_FIELDS = frozenset({
     "create",
     "discover",
@@ -91,6 +104,8 @@ def characterize_claude_visibility(
     reserve: Callable[[SessionProjection], ClaudeVisibilityClaim],
     registrar: Any,
     restarted_source: Callable[[], ClaudeReadableSource],
+    marker_secret: bytes,
+    record_writer: Callable[[Path, dict[str, Any], bytes], None] | None = None,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     """Register and safely remove one disposable native Claude mirror.
@@ -101,161 +116,257 @@ def characterize_claude_visibility(
     only the transcript whose complete identity has been verified.
     """
 
-    root = Path(source_root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    project_root = Path(projects_root).resolve(strict=True)
-    if root.is_symlink() or project_root.is_symlink():
-        raise RuntimeError("unsafe_characterization_root")
-    disposable = Path(
-        tempfile.mkdtemp(prefix="claude-visibility-", dir=str(root))
-    ).resolve(strict=True)
-    characterization_id = str(uuid.uuid4())
+    _require_secret(marker_secret)
+    writer = record_writer or _write_characterization_record
+    root = _prepare_safe_root(source_root, create=True)
+    project_root = _prepare_safe_root(projects_root, create=False)
+    active_path = root / _CHARACTERIZATION_RECORD
     timestamp = float(now())
-    projection = SessionProjection(
-        provider=Provider.CODEX,
-        native_id=characterization_id,
-        title="Claude native visibility characterization",
-        cwd=str(disposable),
-        started_at=timestamp,
-        last_active=timestamp,
-        messages=[
-            # A real meaningful request keeps the disposable source on the
-            # exact same eligibility path as production mirrors.
-            # IDs are local characterization metadata, never provider state.
-            _characterization_message(timestamp)
-        ],
-        native_path=str(disposable / "source.json"),
-        native_hash="0" * 64,
-        origin_kind=OriginKind.NATIVE,
+    if active_path.exists():
+        state = _read_characterization_record(active_path, marker_secret)
+        _validate_operation_state(state, root=root, now=timestamp)
+        if state["phase"] == "prepared":
+            raise RuntimeError("characterization_reservation_incomplete")
+        disposable = _validate_disposable(state, root)
+    else:
+        operation_id = str(uuid.uuid4())
+        disposable = root / f"claude-visibility-{operation_id}"
+        os.mkdir(disposable)
+        sentinel_nonce = secrets.token_urlsafe(32)
+        _write_identity_sentinel(disposable, operation_id, sentinel_nonce)
+        state = {
+            "schema_version": 2,
+            "operation_id": operation_id,
+            "phase": "prepared",
+            "created_at": timestamp,
+            "expires_at": timestamp + _CLEANUP_TTL_SECONDS,
+            "source_provider": Provider.CODEX.value,
+            "source_session_id": None,
+            "bridge_id": None,
+            "job_id": None,
+            "reserved_claude_uuid": None,
+            "native_name": None,
+            "source_cwd": str(disposable),
+            "signed_marker": None,
+            "transcript_path": None,
+            "transcript_identity": None,
+            "sentinel_nonce": sentinel_nonce,
+            "cleanup_capability_hash": _cleanup_capability_hash(
+                marker_secret, operation_id
+            ),
+        }
+        writer(active_path, state, marker_secret)
+        projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id=operation_id,
+            title="Claude native visibility characterization",
+            cwd=str(disposable),
+            started_at=timestamp,
+            last_active=timestamp,
+            messages=[_characterization_message(timestamp)],
+            native_path=str(disposable / "source.json"),
+            native_hash="0" * 64,
+            origin_kind=OriginKind.NATIVE,
+        )
+        claim = reserve(projection)
+        if (
+            not isinstance(claim, ClaudeVisibilityClaim)
+            or not claim.claimed
+            or claim.lease_kind != "launch"
+            or claim.source_cwd != str(disposable)
+            or claim.source_provider is not Provider.CODEX
+            or not claim.reserved_claude_uuid
+            or not claim.signed_marker
+            or not claim.native_name
+            or not claim.job_id
+        ):
+            raise RuntimeError("characterization_reservation_invalid")
+        marker_payload = _validated_characterization_marker(
+            claim.signed_marker,
+            marker_secret,
+            source_session_id=claim.source_session_id,
+        )
+        state.update({
+            "phase": "reserved",
+            "source_session_id": claim.source_session_id,
+            "bridge_id": marker_payload.bridge_id,
+            "job_id": claim.job_id,
+            "reserved_claude_uuid": claim.reserved_claude_uuid,
+            "native_name": claim.native_name,
+            "signed_marker": claim.signed_marker,
+        })
+        writer(active_path, state, marker_secret)
+        # This durable transition is the no-relaunch boundary.  Any failure
+        # after it can only reconcile the exact reserved UUID.
+        state["phase"] = "launching"
+        writer(active_path, state, marker_secret)
+        outcome = registrar.process(claim)
+        if (
+            getattr(outcome, "status", None) != "visible"
+            or getattr(outcome, "reserved_claude_uuid", None)
+            != claim.reserved_claude_uuid
+        ):
+            raise RuntimeError("characterization_registration_failed")
+        state["phase"] = "launched"
+        writer(active_path, state, marker_secret)
+
+    reserved_uuid = _required_state_text(state, "reserved_claude_uuid")
+    native_name = _required_state_text(state, "native_name")
+    source_cwd = _required_state_text(state, "source_cwd")
+    signed_marker = _required_state_text(state, "signed_marker")
+    _validated_characterization_marker(
+        signed_marker,
+        marker_secret,
+        source_session_id=_required_state_text(state, "source_session_id"),
+        bridge_id=_required_state_text(state, "bridge_id"),
     )
-    claim = reserve(projection)
-    if (
-        not isinstance(claim, ClaudeVisibilityClaim)
-        or not claim.claimed
-        or claim.lease_kind != "launch"
-        or claim.source_cwd != str(disposable)
-        or claim.source_provider is not Provider.CODEX
-        or not claim.reserved_claude_uuid
-        or not claim.signed_marker
-        or not claim.native_name
-    ):
-        raise RuntimeError("characterization_reservation_invalid")
-    outcome = registrar.process(claim)
-    if (
-        getattr(outcome, "status", None) != "visible"
-        or getattr(outcome, "reserved_claude_uuid", None) != claim.reserved_claude_uuid
-    ):
-        raise RuntimeError("characterization_registration_failed")
-    assert claim.reserved_claude_uuid is not None
-    assert claim.native_name is not None
-    assert claim.source_cwd is not None
-    assert claim.signed_marker is not None
 
     restarted = restarted_source()
     resolved_transcript = _validate_characterization_transcript(
         restarted=restarted,
         projects_root=project_root,
-        reserved_uuid=claim.reserved_claude_uuid,
-        native_name=claim.native_name,
-        source_cwd=claim.source_cwd,
-        signed_marker=claim.signed_marker,
+        reserved_uuid=reserved_uuid,
+        native_name=native_name,
+        source_cwd=source_cwd,
+        signed_marker=signed_marker,
+        marker_secret=marker_secret,
     )
-    cleanup_token = str(uuid.uuid4())
-    token_root = root / ".cleanup-tokens"
-    token_root.mkdir(parents=True, exist_ok=True)
-    token_path = token_root / f"{cleanup_token}.json"
-    token_payload = {
-        "schema_version": 1,
-        "reserved_claude_uuid": claim.reserved_claude_uuid,
-        "native_name": claim.native_name,
-        "source_cwd": claim.source_cwd,
-        "signed_marker": claim.signed_marker,
-        "transcript_path": str(resolved_transcript),
-        "disposable_path": str(disposable),
-    }
-    temporary = token_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(token_payload, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, token_path)
+    if state["transcript_path"] not in (None, str(resolved_transcript)):
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
+    state["transcript_path"] = str(resolved_transcript)
+    state["phase"] = "ready"
+    writer(active_path, state, marker_secret)
+    operation_id = _required_state_text(state, "operation_id")
+    cleanup_token = _cleanup_capability(marker_secret, operation_id)
     return {
         "passed": True,
         "source_provider": Provider.CODEX.value,
         "source_cwd": str(disposable),
-        "reserved_claude_uuid": claim.reserved_claude_uuid,
-        "native_name": claim.native_name,
+        "reserved_claude_uuid": reserved_uuid,
+        "native_name": native_name,
         "restart_exact_id_verified": True,
         "operator_checks": [
             "Run /resume in Claude Code and select the deterministic characterization name.",
             "Press Ctrl+A in /resume to verify the exact session across all projects.",
-            f"Resume the exact ID with: claude --resume {claim.reserved_claude_uuid}",
-            f"After all checks pass, rerun with --cleanup-token {cleanup_token}",
+            f"Resume the exact ID with: claude --resume {reserved_uuid}",
+            "After all checks pass, rerun with --cleanup-token '<the returned JSON object>'.",
         ],
         "verification": "pending_operator_checks",
         "cleanup": "pending_explicit_confirmation",
-        "cleanup_token": cleanup_token,
+        "cleanup_token": {
+            "id": operation_id,
+            "capability": cleanup_token,
+        },
     }
 
 
 def cleanup_characterized_claude_visibility(
     *,
-    cleanup_token: str,
+    cleanup_token: Mapping[str, Any],
     source_root: Path,
     projects_root: Path,
     restarted_source: Callable[[], ClaudeReadableSource],
+    marker_secret: bytes,
+    now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     """Explicit second phase after the operator completes native picker checks."""
 
-    try:
-        canonical_token = str(uuid.UUID(cleanup_token))
-    except (TypeError, ValueError, AttributeError):
-        raise RuntimeError("characterization_cleanup_token_invalid") from None
-    root = Path(source_root).resolve(strict=True)
-    project_root = Path(projects_root).resolve(strict=True)
-    token_path = root / ".cleanup-tokens" / f"{canonical_token}.json"
-    try:
-        if token_path.is_symlink():
+    _require_secret(marker_secret)
+    operation_id, capability = _parse_cleanup_token(cleanup_token)
+    root = _prepare_safe_root(source_root, create=False)
+    project_root = _prepare_safe_root(projects_root, create=False)
+    claims = root / ".cleanup-claims"
+    completed = root / ".cleanup-completed"
+    claims.mkdir(exist_ok=True)
+    completed.mkdir(exist_ok=True)
+    _require_plain_directory(claims)
+    _require_plain_directory(completed)
+    active = root / _CHARACTERIZATION_RECORD
+    claimed = claims / f"{operation_id}.json"
+    done = completed / f"{operation_id}.json"
+    if done.exists():
+        state = _read_characterization_record(done, marker_secret)
+        _validate_cleanup_authority(
+            state, operation_id, capability, marker_secret, now()
+        )
+        return _cleanup_result(state)
+    if not claimed.exists():
+        if not active.exists():
             raise RuntimeError("characterization_cleanup_token_invalid")
-        resolved_token = token_path.resolve(strict=True)
-        resolved_token.relative_to(root)
-        state = json.loads(resolved_token.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        raise RuntimeError("characterization_cleanup_token_invalid") from None
-    expected = {
-        "schema_version",
-        "reserved_claude_uuid",
-        "native_name",
-        "source_cwd",
-        "signed_marker",
-        "transcript_path",
-        "disposable_path",
-    }
-    if (
-        not isinstance(state, dict)
-        or set(state) != expected
-        or state["schema_version"] != 1
-    ):
-        raise RuntimeError("characterization_cleanup_token_invalid")
-    transcript = _validate_characterization_transcript(
-        restarted=restarted_source(),
-        projects_root=project_root,
-        reserved_uuid=state["reserved_claude_uuid"],
-        native_name=state["native_name"],
-        source_cwd=state["source_cwd"],
-        signed_marker=state["signed_marker"],
+        state = _read_characterization_record(active, marker_secret)
+        _validate_cleanup_authority(
+            state, operation_id, capability, marker_secret, now()
+        )
+        os.replace(active, claimed)
+    state = _read_characterization_record(claimed, marker_secret)
+    _validate_cleanup_authority(state, operation_id, capability, marker_secret, now())
+    disposable = _bound_disposable_path(state, root)
+    if state["phase"] not in {"disposable_removed", "completed"}:
+        _validate_disposable(state, root)
+    _validated_characterization_marker(
+        _required_state_text(state, "signed_marker"),
+        marker_secret,
+        source_session_id=_required_state_text(state, "source_session_id"),
+        bridge_id=_required_state_text(state, "bridge_id"),
     )
-    expected_transcript = Path(state["transcript_path"]).resolve(strict=True)
-    disposable = Path(state["disposable_path"]).resolve(strict=True)
-    if transcript != expected_transcript or disposable != Path(
-        state["source_cwd"]
-    ).resolve(strict=True):
-        raise RuntimeError("characterization_identity_mismatch:path_changed")
-    if (
-        transcript.is_symlink()
-        or transcript.resolve(strict=True) != expected_transcript
-    ):
-        raise RuntimeError("characterization_identity_mismatch:path_changed")
-    transcript.unlink()
-    shutil.rmtree(disposable)
-    resolved_token.unlink()
+    if state["phase"] == "ready":
+        transcript = _validate_characterization_transcript(
+            restarted=restarted_source(),
+            projects_root=project_root,
+            reserved_uuid=_required_state_text(state, "reserved_claude_uuid"),
+            native_name=_required_state_text(state, "native_name"),
+            source_cwd=_required_state_text(state, "source_cwd"),
+            signed_marker=_required_state_text(state, "signed_marker"),
+            marker_secret=marker_secret,
+        )
+        if transcript != _safe_contained_file(
+            project_root, _required_state_text(state, "transcript_path")
+        ):
+            raise RuntimeError("characterization_identity_mismatch:path_changed")
+        state["transcript_identity"] = list(_path_identity(transcript))
+        state["phase"] = "transcript_removing"
+        _write_characterization_record(claimed, state, marker_secret)
+    if state["phase"] == "transcript_removing":
+        transcript = _absolute_without_resolving(
+            _required_state_text(state, "transcript_path")
+        )
+        try:
+            transcript.relative_to(project_root)
+        except ValueError:
+            raise RuntimeError(
+                "characterization_identity_mismatch:path_changed"
+            ) from None
+        quarantine = transcript.with_name(f".{transcript.name}.{operation_id}.cleanup")
+        expected_identity = tuple(state.get("transcript_identity") or ())
+        if transcript.exists():
+            _safe_contained_file(project_root, transcript)
+            if _path_identity(transcript) != expected_identity:
+                raise RuntimeError("characterization_identity_mismatch:path_changed")
+            if quarantine.exists() or _path_is_redirect(quarantine):
+                raise RuntimeError("characterization_identity_mismatch:path_changed")
+            os.replace(transcript, quarantine)
+        if quarantine.exists():
+            _safe_contained_file(project_root, quarantine)
+            if _path_identity(quarantine) != expected_identity:
+                raise RuntimeError("characterization_identity_mismatch:path_changed")
+            quarantine.unlink()
+        state["phase"] = "transcript_removed"
+        _write_characterization_record(claimed, state, marker_secret)
+    elif state["phase"] not in {"transcript_removed", "disposable_removed"}:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    if state["phase"] == "transcript_removed":
+        if disposable.exists():
+            _validate_disposable(state, root)
+            _safe_remove_disposable(disposable, state)
+        state["phase"] = "disposable_removed"
+        _write_characterization_record(claimed, state, marker_secret)
+    state["phase"] = "completed"
+    _write_characterization_record(done, state, marker_secret)
+    claimed.unlink()
+    return _cleanup_result(state)
+
+
+def _cleanup_result(state: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "passed": True,
         "reserved_claude_uuid": state["reserved_claude_uuid"],
@@ -273,6 +384,7 @@ def _validate_characterization_transcript(
     native_name: str,
     source_cwd: str,
     signed_marker: str,
+    marker_secret: bytes,
 ) -> Path:
     finder = getattr(restarted, "find_native_sessions", None)
     paths = (
@@ -286,37 +398,374 @@ def _validate_characterization_transcript(
     )
     if len(paths) != 1:
         raise RuntimeError("characterization_identity_mismatch:exact_uuid")
-    transcript = Path(paths[0])
-    try:
-        resolved_transcript = transcript.resolve(strict=True)
-        relative = resolved_transcript.relative_to(projects_root)
-    except (OSError, ValueError):
-        raise RuntimeError("characterization_identity_mismatch:path") from None
-    if (
-        transcript.is_symlink()
-        or not resolved_transcript.is_file()
-        or relative.name != f"{reserved_uuid}.jsonl"
-    ):
+    transcript = _safe_contained_file(projects_root, paths[0])
+    if transcript.name != f"{reserved_uuid}.jsonl":
         raise RuntimeError("characterization_identity_mismatch:path")
+    before = _path_identity(transcript)
     parsed = restarted.parse(transcript)
     native = parsed.projection
     try:
-        projected_path = Path(native.native_path or "").resolve(strict=True)
-    except OSError:
+        projected_path = _safe_contained_file(projects_root, native.native_path or "")
+    except (OSError, RuntimeError):
         raise RuntimeError("characterization_identity_mismatch:path") from None
     marker_check = getattr(restarted, "projection_has_exact_marker", None)
     exact_marker = callable(marker_check) and marker_check(native, signed_marker)
+    marker_payload = _validated_characterization_marker(
+        signed_marker, marker_secret, source_session_id=None
+    )
     if (
         native.provider is not Provider.CLAUDE
         or native.native_id != reserved_uuid
         or native.title != native_name
         or native.cwd != source_cwd
-        or projected_path != resolved_transcript
+        or projected_path != transcript
         or not exact_marker
+        or marker_payload.target_provider is not Provider.CLAUDE
     ):
         raise RuntimeError("characterization_identity_mismatch:metadata")
+    if _path_identity(transcript) != before:
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
+    return transcript
 
-    return resolved_transcript
+
+def _require_secret(secret: bytes) -> None:
+    if not isinstance(secret, bytes) or not secret:
+        raise ValueError("marker_secret must be nonempty bytes")
+
+
+def _canonical_json(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _record_signature(payload: Mapping[str, Any], secret: bytes) -> str:
+    return (
+        base64
+        .urlsafe_b64encode(
+            hmac.new(secret, _canonical_json(payload), hashlib.sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+
+def _write_characterization_record(
+    path: Path, payload: dict[str, Any], secret: bytes
+) -> None:
+    _require_secret(secret)
+    parent = Path(path).parent
+    _require_plain_directory(parent)
+    if path.exists() and _path_is_redirect(path):
+        raise RuntimeError("unsafe_characterization_record")
+    envelope = {"payload": payload, "signature": _record_signature(payload, secret)}
+    data = _canonical_json(envelope)
+    temporary = parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_characterization_record(path: Path, secret: bytes) -> dict[str, Any]:
+    try:
+        if _path_is_redirect(path):
+            raise RuntimeError("characterization_cleanup_token_invalid")
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 65_536:
+            raise RuntimeError("characterization_cleanup_token_invalid")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            data = os.read(descriptor, opened.st_size + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = os.lstat(path)
+        if (
+            len(data) != opened.st_size
+            or _identity_tuple(before) != _identity_tuple(opened)
+            or _identity_tuple(after) != _identity_tuple(opened)
+            or _identity_tuple(current) != _identity_tuple(opened)
+        ):
+            raise RuntimeError("characterization_cleanup_token_invalid")
+        envelope = json.loads(
+            data.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, _DuplicateJsonKey):
+        raise RuntimeError("characterization_cleanup_token_invalid") from None
+    if not isinstance(envelope, dict) or set(envelope) != {"payload", "signature"}:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    payload = envelope["payload"]
+    signature = envelope["signature"]
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(signature, str)
+        or not hmac.compare_digest(signature, _record_signature(payload, secret))
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    return payload
+
+
+def _cleanup_capability(secret: bytes, operation_id: str) -> str:
+    digest = hmac.new(
+        secret,
+        f"claude-characterization-cleanup:{operation_id}".encode(),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _cleanup_capability_hash(secret: bytes, operation_id: str) -> str:
+    return hashlib.sha256(
+        _cleanup_capability(secret, operation_id).encode()
+    ).hexdigest()
+
+
+def _parse_cleanup_token(token: Mapping[str, Any]) -> tuple[str, str]:
+    if not isinstance(token, Mapping) or set(token) != {"id", "capability"}:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    try:
+        operation_id = str(uuid.UUID(token["id"]))
+    except (TypeError, ValueError, AttributeError):
+        raise RuntimeError("characterization_cleanup_token_invalid") from None
+    capability = token["capability"]
+    if not isinstance(capability, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{43}", capability
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    return operation_id, capability
+
+
+def _validate_cleanup_authority(
+    state: Mapping[str, Any],
+    operation_id: str,
+    capability: str,
+    secret: bytes,
+    now: float,
+) -> None:
+    if state.get("operation_id") != operation_id:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    expected = _cleanup_capability(secret, operation_id)
+    if (
+        not hmac.compare_digest(capability, expected)
+        or state.get("cleanup_capability_hash")
+        != hashlib.sha256(capability.encode()).hexdigest()
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    expiry = state.get("expires_at")
+    if (
+        not isinstance(expiry, (int, float))
+        or not math.isfinite(expiry)
+        or now > expiry
+    ):
+        raise RuntimeError("characterization_cleanup_token_expired")
+
+
+def _validate_operation_state(
+    state: Mapping[str, Any], *, root: Path, now: float
+) -> None:
+    required = {
+        "schema_version",
+        "operation_id",
+        "phase",
+        "created_at",
+        "expires_at",
+        "source_provider",
+        "source_session_id",
+        "bridge_id",
+        "job_id",
+        "reserved_claude_uuid",
+        "native_name",
+        "source_cwd",
+        "signed_marker",
+        "transcript_path",
+        "transcript_identity",
+        "sentinel_nonce",
+        "cleanup_capability_hash",
+    }
+    if set(state) != required or state.get("schema_version") != 2:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    try:
+        if str(uuid.UUID(state["operation_id"])) != state["operation_id"]:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        raise RuntimeError("characterization_cleanup_token_invalid") from None
+    if state.get("source_provider") != Provider.CODEX.value:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    if state.get("phase") not in {
+        "prepared",
+        "reserved",
+        "launching",
+        "launched",
+        "ready",
+        "transcript_removing",
+        "transcript_removed",
+        "disposable_removed",
+        "completed",
+    }:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    _validate_disposable(state, root)
+
+
+def _validated_characterization_marker(
+    marker: str,
+    secret: bytes,
+    *,
+    source_session_id: str | None,
+    bridge_id: str | None = None,
+) -> BridgeMarkerPayload:
+    try:
+        payload = decode_bridge_marker(marker, secret)
+    except InvalidBridgeMarker:
+        raise RuntimeError("characterization_identity_mismatch:marker") from None
+    if (
+        payload.target_provider is not Provider.CLAUDE
+        or (
+            source_session_id is not None
+            and payload.source_session_id != source_session_id
+        )
+        or (bridge_id is not None and payload.bridge_id != bridge_id)
+    ):
+        raise RuntimeError("characterization_identity_mismatch:marker")
+    return payload
+
+
+def _required_state_text(state: Mapping[str, Any], key: str) -> str:
+    value = state.get(key)
+    if not isinstance(value, str) or not value:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    return value
+
+
+def _absolute_without_resolving(path: Path | str) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _prepare_safe_root(path: Path, *, create: bool) -> Path:
+    root = _absolute_without_resolving(path)
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    _require_plain_directory(root)
+    return root
+
+
+def _require_plain_directory(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise RuntimeError("unsafe_characterization_root") from None
+    if not stat.S_ISDIR(metadata.st_mode) or _metadata_is_redirect(metadata):
+        raise RuntimeError("unsafe_characterization_root")
+
+
+def _metadata_is_redirect(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _write_identity_sentinel(directory: Path, operation_id: str, nonce: str) -> None:
+    sentinel = directory / _CHARACTERIZATION_SENTINEL
+    data = _canonical_json({"operation_id": operation_id, "nonce": nonce})
+    descriptor = os.open(sentinel, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_disposable(state: Mapping[str, Any], root: Path) -> Path:
+    disposable = _bound_disposable_path(state, root)
+    _require_plain_directory(disposable)
+    sentinel = disposable / _CHARACTERIZATION_SENTINEL
+    if _path_is_redirect(sentinel):
+        raise RuntimeError("characterization_identity_mismatch:sentinel")
+    try:
+        value = json.loads(sentinel.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise RuntimeError("characterization_identity_mismatch:sentinel") from None
+    if value != {
+        "operation_id": state.get("operation_id"),
+        "nonce": state.get("sentinel_nonce"),
+    }:
+        raise RuntimeError("characterization_identity_mismatch:sentinel")
+    return disposable
+
+
+def _bound_disposable_path(state: Mapping[str, Any], root: Path) -> Path:
+    disposable = _absolute_without_resolving(_required_state_text(state, "source_cwd"))
+    if disposable.parent != root or not disposable.name.startswith(
+        "claude-visibility-"
+    ):
+        raise RuntimeError("characterization_identity_mismatch:disposable")
+    return disposable
+
+
+def _safe_contained_file(root: Path, path: Path | str) -> Path:
+    candidate = _absolute_without_resolving(path)
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        raise RuntimeError("characterization_identity_mismatch:path") from None
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            metadata = os.lstat(current)
+        except OSError:
+            raise RuntimeError("characterization_identity_mismatch:path") from None
+        if _metadata_is_redirect(metadata):
+            raise RuntimeError("characterization_identity_mismatch:path")
+    if not stat.S_ISREG(os.lstat(candidate).st_mode):
+        raise RuntimeError("characterization_identity_mismatch:path")
+    return candidate
+
+
+def _identity_tuple(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+
+def _path_identity(path: Path) -> tuple[int, int, int, int]:
+    return _identity_tuple(os.lstat(path))
+
+
+def _safe_remove_disposable(disposable: Path, state: Mapping[str, Any]) -> None:
+    _validate_disposable(state, disposable.parent)
+    # Delete bottom-up, never following a redirect. A swapped directory causes
+    # rmdir to fail rather than traversing an attacker-controlled target.
+    for current_root, dirs, files in os.walk(
+        disposable, topdown=False, followlinks=False
+    ):
+        current = Path(current_root)
+        if _path_is_redirect(current):
+            raise RuntimeError("characterization_identity_mismatch:disposable")
+        for name in files:
+            item = current / name
+            metadata = os.lstat(item)
+            if _metadata_is_redirect(metadata) or not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("characterization_identity_mismatch:disposable")
+            item.unlink()
+        for name in dirs:
+            item = current / name
+            metadata = os.lstat(item)
+            if _metadata_is_redirect(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError("characterization_identity_mismatch:disposable")
+            item.rmdir()
+    disposable.rmdir()
 
 
 def _characterization_message(timestamp: float) -> Any:
