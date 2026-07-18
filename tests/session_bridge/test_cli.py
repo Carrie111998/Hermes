@@ -963,7 +963,7 @@ def test_claude_visibility_status_reports_durable_open_work_while_disabled(
         ({"claude_retry": 1}, True, True),
         ({"claude_retry": 1}, False, False),
         ({"claude_retry": 2}, True, False),
-        ({"claude_leased": 1}, True, False),
+        ({"claude_leased": 1}, True, True),
         ({"claude_failed": 1}, True, False),
         ({"claude_pending": 1}, True, False),
     ],

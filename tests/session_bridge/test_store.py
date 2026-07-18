@@ -5628,13 +5628,34 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
         )
 
 
-def test_claude_visibility_expected_job_claim_never_leases_an_unrelated_job(
-    db: SessionDB,
+@pytest.mark.parametrize(
+    "other_state",
+    ["claude_pending", "claude_leased", "claude_retry", "claude_failed"],
+)
+def test_claude_visibility_expected_job_claim_refuses_when_another_job_is_open(
+    db: SessionDB, other_state: str
 ) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     first_candidate, first_identity = _claude_visibility_identity("first-due")
     second_candidate, second_identity = _claude_visibility_identity("second-due")
     _enqueue_claude_visibility_job(store, first_candidate, first_identity)
+    if other_state == "claude_leased":
+        leased = store.claim_claude_visibility_job(
+            100.0,
+            60,
+            25,
+            "1.00",
+            "0.02",
+            expected_job_id=first_identity.job_id,
+        )
+        assert leased.lease_kind == "launch"
+    else:
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_claude_visibility_jobs SET state = ? WHERE id = ?",
+                (other_state, first_identity.job_id),
+            )
+        )
     _enqueue_claude_visibility_job(store, second_candidate, second_identity)
 
     claim = store.claim_claude_visibility_job(
@@ -5646,15 +5667,49 @@ def test_claude_visibility_expected_job_claim_never_leases_an_unrelated_job(
         expected_job_id=second_identity.job_id,
     )
 
+    assert claim.status == "not_sole_open_job"
     assert claim.job_id == second_identity.job_id
     rows = {
         row["id"]: row["state"]
         for row in _rows(db, "SELECT id, state FROM session_claude_visibility_jobs")
     }
     assert rows == {
-        first_identity.job_id: "claude_pending",
-        second_identity.job_id: "claude_leased",
+        first_identity.job_id: other_state,
+        second_identity.job_id: "claude_pending",
     }
+
+
+def test_claude_visibility_expected_job_claim_reaps_its_expired_lease(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("expired-characterization")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    first = store.claim_claude_visibility_job(
+        100.0,
+        10,
+        25,
+        "1.00",
+        "0.02",
+        expected_job_id=identity.job_id,
+    )
+    assert first.lease_kind == "launch"
+
+    clock[0] = 111.0
+    recovered = store.claim_claude_visibility_job(
+        111.0,
+        10,
+        25,
+        "1.00",
+        "0.02",
+        expected_job_id=identity.job_id,
+    )
+
+    assert recovered.lease_kind == "reconciliation"
+    assert recovered.prior_error_code == "lease_expired"
+    assert recovered.reserved_claude_uuid == first.reserved_claude_uuid
+    assert recovered.attempt_ordinal == first.attempt_ordinal == 1
 
 
 def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(

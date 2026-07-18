@@ -814,17 +814,43 @@ class SessionBridgeStore:
         def _write(conn):
             operation_time = _finite_number(self._clock(), "clock")
             local_day = self._claude_visibility_local_day(operation_time)
-            conn.execute(
-                """UPDATE session_claude_visibility_jobs
-                   SET state = 'claude_retry', next_attempt_at = ?,
-                       lease_digest = NULL, lease_expires_at = NULL,
-                       lease_kind = NULL,
-                       error_code = 'lease_expired',
-                       error_detail = 'active lease expired before completion',
-                       updated_at = ?
-                   WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
-                (claim_time, operation_time, operation_time),
-            )
+            if expected_id is None:
+                conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_retry', next_attempt_at = ?,
+                           lease_digest = NULL, lease_expires_at = NULL,
+                           lease_kind = NULL,
+                           error_code = 'lease_expired',
+                           error_detail = 'active lease expired before completion',
+                           updated_at = ?
+                       WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
+                    (claim_time, operation_time, operation_time),
+                )
+            else:
+                conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_retry', next_attempt_at = ?,
+                           lease_digest = NULL, lease_expires_at = NULL,
+                           lease_kind = NULL,
+                           error_code = 'lease_expired',
+                           error_detail = 'active lease expired before completion',
+                           updated_at = ?
+                       WHERE id = ? AND state = 'claude_leased'
+                         AND lease_expires_at <= ?""",
+                    (claim_time, operation_time, expected_id, operation_time),
+                )
+                other_open = conn.execute(
+                    """SELECT 1 FROM session_claude_visibility_jobs
+                       WHERE id != ? AND state IN (
+                           'claude_pending', 'claude_leased',
+                           'claude_retry', 'claude_failed'
+                       ) LIMIT 1""",
+                    (expected_id,),
+                ).fetchone()
+                if other_open is not None:
+                    return ClaudeVisibilityClaim(
+                        status="not_sole_open_job", job_id=expected_id
+                    )
             if expected_id is None:
                 due = conn.execute(
                     """SELECT * FROM session_claude_visibility_jobs

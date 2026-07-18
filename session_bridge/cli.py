@@ -1583,12 +1583,20 @@ def _claude_characterization_open_work_allowed(
         }
     except (TypeError, ValueError):
         return False
-    return open_counts == {
-        "claude_pending": 0,
-        "claude_leased": 0,
-        "claude_retry": 1,
-        "claude_failed": 0,
-    }
+    return open_counts in (
+        {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 1,
+            "claude_failed": 0,
+        },
+        {
+            "claude_pending": 0,
+            "claude_leased": 1,
+            "claude_retry": 0,
+            "claude_failed": 0,
+        },
+    )
 
 
 def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:
