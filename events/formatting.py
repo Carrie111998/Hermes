@@ -291,7 +291,7 @@ _TIER_RANK = {"critical": 0, "important": 1, "optional": 2}
 
 
 def format_duration(seconds) -> str:
-    """Render a second count as '45s' / '8m 29s' / '2h 5m'."""
+    """Render a second count as '45s' / '8m 29s' / '2h 5m' / '2d 19h'."""
     try:
         s = int(float(seconds))
     except (TypeError, ValueError):
@@ -303,7 +303,10 @@ def format_duration(seconds) -> str:
     if m < 60:
         return f"{m}m {sec}s" if sec else f"{m}m"
     h, m = divmod(m, 60)
-    return f"{h}h {m}m" if m else f"{h}h"
+    if h < 24:
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h" if h else f"{d}d"
 
 
 def humanize_health_detail(detail: str) -> str:
@@ -479,3 +482,50 @@ def failure_cluster_body(payload: dict) -> str:
     when = f" at {_short_time(last_ts)}" if last_ts else ""
     return (f"{source} has failed {size} times in a row "
             f"(latest: {last_type}{when}). Something is stuck — needs a look.")
+
+
+def partial_backlog_body(payload: dict, *, max_ids: int = 10) -> str:
+    """Plain-language summary of a TRACKER_PARTIAL_BACKLOG alert.
+
+    A "partial" is a tracker approve/reject/archive intent whose pipeline.json
+    write (the canonical store) succeeded but whose Postgres mirror (:4100)
+    did not — so the dashboard and Postgres lag the real pipeline until the
+    intent is re-driven. The idempotency key stays unburned, so every partial
+    is safe to re-drive. See events/producers/partial_backlog_monitor.py.
+
+    Before this (2026-07-18 operator feedback: "these are cryptic and don't
+    really mean anything"), TRACKER_PARTIAL_BACKLOG hit TelegramNotifier's
+    generic fallback, which splatted count/threshold/oldest_age_seconds/
+    capped_count/sample_job_ids as raw key:value lines — a wall of numbers and
+    full UUIDs that said nothing about what was wrong or what to do.
+    """
+    p = payload or {}
+    count = p.get("count", "?")
+    threshold = p.get("threshold")
+    oldest = p.get("oldest_age_seconds")
+    ids = [str(j) for j in (p.get("sample_job_ids") or [])]
+
+    try:
+        verb = "update is" if int(count) == 1 else "updates are"
+    except (TypeError, ValueError):
+        verb = "updates are"
+
+    lines = [
+        f"{count} tracker {verb} stuck half-applied — each was saved to the "
+        f"pipeline but never mirrored to Postgres (:4100), so the dashboard "
+        f"and Postgres are out of sync with the real pipeline. They're safe "
+        f"to re-drive: the idempotency keys are unburned."
+    ]
+    if oldest is not None:
+        lines.append(f"Oldest has been waiting {format_duration(oldest)}.")
+    if threshold is not None:
+        lines.append(f"(Alert fires above {threshold} stuck updates.)")
+    if ids:
+        shown = [j[:8] for j in ids[:max_ids]]
+        try:
+            total = int(count)
+            scope = f"{len(shown)} of {total}" if total > len(shown) else str(len(shown))
+        except (TypeError, ValueError):
+            scope = str(len(shown))
+        lines.append(f"Sample jobs ({scope}): {', '.join(shown)}")
+    return "\n".join(lines)

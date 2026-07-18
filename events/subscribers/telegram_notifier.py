@@ -700,6 +700,13 @@ class TelegramNotifier(BaseSubscriber):
                 f"C: free: {p.get('disk_c_free_gb', '?')} GB"
             )
 
+        if et == EventType.TRACKER_PARTIAL_BACKLOG:
+            # 2026-07-18 operator feedback: the generic fallback splatted
+            # count/threshold/oldest_age_seconds/capped_count/sample_job_ids as
+            # raw key:value lines — cryptic. Render the plain-language triage.
+            from events.formatting import partial_backlog_body
+            return partial_backlog_body(p)
+
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
 

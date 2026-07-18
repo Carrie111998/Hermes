@@ -160,6 +160,10 @@ class TestPlainLanguageBodies:
         assert format_duration(300) == "5m"
         assert format_duration(7500) == "2h 5m"
         assert format_duration(None) == "None"  # graceful, not crashing
+        # Day tier (2026-07-18): multi-day ages (e.g. a partial-backlog oldest
+        # of ~2.8d) read as "2d 19h", not an unbounded hour count.
+        assert format_duration(86400) == "1d"
+        assert format_duration(244601) == "2d 19h"
 
     def test_humanize_health_detail_connection_refused(self):
         from events.formatting import humanize_health_detail
@@ -345,6 +349,58 @@ class TestPlainLanguageBodies:
         assert "mailbox:tailor" in body
         assert "4 times in a row" in body
         assert "cron_failed" in body
+
+    def test_partial_backlog_body_explains_and_advises(self):
+        from events.formatting import partial_backlog_body
+        body = partial_backlog_body({
+            "count": 10,
+            "threshold": 3,
+            "oldest_age_seconds": 244601.4,
+            "capped_count": 10,
+            "sample_job_ids": [
+                "1764098e-1101-4c04-aba0-909c96d977bd",
+                "39806922-3dc2-4573-8602-8f1de837954e",
+                "0425ac22-09d8-4c0d-9df2-44238764200e",
+            ],
+        })
+        # Says what's wrong, in plain language — not raw payload keys.
+        assert "10" in body
+        assert "Postgres" in body            # where the sync failed
+        assert "re-drive" in body            # what's safe to do
+        assert "2d 19h" in body              # humanized oldest age, not seconds
+        assert "1764098e" in body            # a triage id survives
+        # Zero raw-payload leakage: none of the cryptic field names appear.
+        assert "oldest_age_seconds" not in body
+        assert "capped_count" not in body
+        assert "sample_job_ids" not in body
+        assert "244601" not in body          # seconds humanized away
+        assert "{" not in body
+
+    def test_partial_backlog_body_singular(self):
+        from events.formatting import partial_backlog_body
+        body = partial_backlog_body({
+            "count": 1, "threshold": 3, "oldest_age_seconds": 90.0,
+            "capped_count": 1, "sample_job_ids": ["abcd1234-0000"],
+        })
+        assert "1 tracker update is" in body   # singular grammar
+        assert "1m 30s" in body
+
+    def test_partial_backlog_body_notes_when_sample_is_truncated(self):
+        from events.formatting import partial_backlog_body
+        body = partial_backlog_body({
+            "count": 42, "threshold": 3, "oldest_age_seconds": 5.0,
+            "capped_count": 2,
+            "sample_job_ids": ["aaaa1111-x", "bbbb2222-y"],
+        })
+        # When count exceeds the shown sample, say so.
+        assert "of 42" in body
+
+    def test_partial_backlog_body_survives_missing_fields(self):
+        from events.formatting import partial_backlog_body
+        # Never crash on a degraded payload.
+        body = partial_backlog_body({})
+        assert body
+        assert "{" not in body
 
     def test_whatsapp_header_uses_plain_title_for_watchdog_burst(self):
         from events.formatting import format_whatsapp_header
