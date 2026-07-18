@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import threading
+import time
 from typing import Any, Mapping
 
 import pytest
 
 from session_bridge.characterize import (
+    _prepare_safe_root,
     _read_characterization_record,
     _write_characterization_record,
     characterize_claude_visibility,
@@ -90,6 +94,54 @@ def _claim_for(projection: SessionProjection) -> tuple[ClaudeVisibilityClaim, st
         registration_reserved=True,
         launch_permitted=True,
     ), identity.signed_marker
+
+
+def _pending_characterization(
+    tmp_path: Path,
+    *,
+    now: float = 10.0,
+) -> tuple[dict[str, Any], dict[str, Any], _Registrar, Any]:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+    registrar = _Registrar()
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("native", encoding="utf-8")
+        state.update(claim=claim, marker=marker, transcript=transcript)
+        return claim
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    pending = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=registrar,
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: now,
+    )
+    state.update(source_root=source_root, projects_root=projects_root)
+    return pending, state, registrar, restarted_source
 
 
 def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit_second_phase(
@@ -605,6 +657,167 @@ def test_characterization_recovers_same_cleanup_capability_after_ready_write_err
     assert launches == 1
     assert recovered["cleanup_token"]["id"]
     assert recovered["cleanup_token"]["capability"]
+
+
+def test_expired_ready_operation_revalidates_identity_and_renews_same_operation(
+    tmp_path: Path,
+) -> None:
+    pending, state, registrar, restarted_source = _pending_characterization(tmp_path)
+    first_record = _read_characterization_record(
+        state["source_root"] / ".claude-visibility-operation.json", SECRET
+    )
+
+    renewed = characterize_claude_visibility(
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        reserve=lambda _projection: (_ for _ in ()).throw(
+            AssertionError("renewal must not reserve a second operation")
+        ),
+        registrar=_Registrar(),
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: float(first_record["expires_at"]) + 1.0,
+    )
+
+    renewed_record = _read_characterization_record(
+        state["source_root"] / ".claude-visibility-operation.json", SECRET
+    )
+    assert renewed["cleanup_token"]["id"] == pending["cleanup_token"]["id"]
+    assert renewed["reserved_claude_uuid"] == pending["reserved_claude_uuid"]
+    assert renewed["cleanup_token"]["capability"] != pending["cleanup_token"]["capability"]
+    assert renewed["cleanup_expires_at"] == renewed_record["expires_at"]
+    assert renewed_record["expires_at"] > first_record["expires_at"]
+    assert len(registrar.claims) == 1
+
+
+def test_claimed_cleanup_remains_authorized_across_expiry_after_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending, state, registrar, restarted_source = _pending_characterization(tmp_path)
+    active = state["source_root"] / ".claude-visibility-operation.json"
+    expiry = float(_read_characterization_record(active, SECRET)["expires_at"])
+    interrupted = False
+
+    def interrupt_after_authorized_checkpoint(
+        path: Path, payload: dict[str, Any], secret: bytes
+    ) -> None:
+        nonlocal interrupted
+        _write_characterization_record(path, payload, secret)
+        if payload.get("phase") == "transcript_removing" and not interrupted:
+            interrupted = True
+            raise OSError("synthetic claimed cleanup interruption")
+
+    monkeypatch.setattr(
+        "session_bridge.characterize._write_characterization_record",
+        interrupt_after_authorized_checkpoint,
+    )
+    with pytest.raises(OSError, match="claimed cleanup interruption"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=pending["cleanup_token"],
+            source_root=state["source_root"],
+            projects_root=state["projects_root"],
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: expiry - 1.0,
+        )
+    monkeypatch.setattr(
+        "session_bridge.characterize._write_characterization_record",
+        _write_characterization_record,
+    )
+
+    cleaned = cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=lambda: (_ for _ in ()).throw(
+            AssertionError("claimed cleanup must resume from its durable checkpoint")
+        ),
+        marker_secret=SECRET,
+        now=lambda: expiry + 1_000.0,
+    )
+
+    assert cleaned["reserved_claude_uuid"] == pending["reserved_claude_uuid"]
+    assert len(registrar.claims) == 1
+
+
+def test_concurrent_cleanup_callers_serialize_without_replaying_checkpoints(
+    tmp_path: Path,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    first_inside_restart = threading.Event()
+    release_restart = threading.Event()
+    restart_calls = 0
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def blocking_restarted_source() -> _RestartedSource:
+        nonlocal restart_calls
+        restart_calls += 1
+        first_inside_restart.set()
+        assert release_restart.wait(timeout=5)
+        return restarted_source()
+
+    def cleanup() -> None:
+        try:
+            results.append(
+                cleanup_characterized_claude_visibility(
+                    cleanup_token=pending["cleanup_token"],
+                    source_root=state["source_root"],
+                    projects_root=state["projects_root"],
+                    restarted_source=blocking_restarted_source,
+                    marker_secret=SECRET,
+                    now=lambda: 11.0,
+                )
+            )
+        except BaseException as exc:  # asserted below with both threads joined
+            errors.append(exc)
+
+    first = threading.Thread(target=cleanup)
+    second = threading.Thread(target=cleanup)
+    first.start()
+    assert first_inside_restart.wait(timeout=5)
+    second.start()
+    time.sleep(0.1)
+    release_restart.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(results) == 2
+    assert restart_calls == 1
+    assert {result["reserved_claude_uuid"] for result in results} == {
+        pending["reserved_claude_uuid"]
+    }
+
+
+def test_prepare_safe_root_rejects_reparse_point_in_existing_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    root = ancestor / "safe" / "root"
+    root.mkdir(parents=True)
+    real_lstat = os.lstat
+
+    class _ReparseMetadata:
+        def __init__(self, metadata: os.stat_result) -> None:
+            self._metadata = metadata
+            self.st_file_attributes = 0x400
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._metadata, name)
+
+    def injected_lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        metadata = real_lstat(path, *args, **kwargs)
+        if Path(path) == ancestor:
+            return _ReparseMetadata(metadata)
+        return metadata
+
+    monkeypatch.setattr(os, "lstat", injected_lstat)
+    with pytest.raises(RuntimeError, match="unsafe_characterization_root"):
+        _prepare_safe_root(root, create=False)
 
 
 def test_cleanup_rejects_forged_capability_and_leaves_exact_artifacts(

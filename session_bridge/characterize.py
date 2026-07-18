@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import base64
@@ -122,24 +123,30 @@ def characterize_claude_visibility(
     project_root = _prepare_safe_root(projects_root, create=False)
     active_path = root / _CHARACTERIZATION_RECORD
     timestamp = float(now())
+    renew_ready_authority = False
+    state: dict[str, Any]
     if active_path.exists():
         state = _read_characterization_record(active_path, marker_secret)
         _validate_operation_state(state, root=root, now=timestamp)
         if state["phase"] == "prepared":
             raise RuntimeError("characterization_reservation_incomplete")
         disposable = _validate_disposable(state, root)
+        renew_ready_authority = (
+            state["phase"] == "ready" and timestamp > float(state["expires_at"])
+        )
     else:
         operation_id = str(uuid.uuid4())
         disposable = root / f"claude-visibility-{operation_id}"
         os.mkdir(disposable)
         sentinel_nonce = secrets.token_urlsafe(32)
         _write_identity_sentinel(disposable, operation_id, sentinel_nonce)
+        expiry = timestamp + _CLEANUP_TTL_SECONDS
         state = {
             "schema_version": 2,
             "operation_id": operation_id,
             "phase": "prepared",
             "created_at": timestamp,
-            "expires_at": timestamp + _CLEANUP_TTL_SECONDS,
+            "expires_at": expiry,
             "source_provider": Provider.CODEX.value,
             "source_session_id": None,
             "bridge_id": None,
@@ -151,8 +158,9 @@ def characterize_claude_visibility(
             "transcript_path": None,
             "transcript_identity": None,
             "sentinel_nonce": sentinel_nonce,
+            "cleanup_authorized_at": None,
             "cleanup_capability_hash": _cleanup_capability_hash(
-                marker_secret, operation_id
+                marker_secret, operation_id, expiry
             ),
         }
         writer(active_path, state, marker_secret)
@@ -233,11 +241,23 @@ def characterize_claude_visibility(
     )
     if state["transcript_path"] not in (None, str(resolved_transcript)):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
+    transcript_identity = list(_path_identity(resolved_transcript))
+    if state["transcript_identity"] not in (None, transcript_identity):
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
     state["transcript_path"] = str(resolved_transcript)
+    state["transcript_identity"] = transcript_identity
+    if renew_ready_authority:
+        renewed_expiry = timestamp + _CLEANUP_TTL_SECONDS
+        state["expires_at"] = renewed_expiry
+        state["cleanup_capability_hash"] = _cleanup_capability_hash(
+            marker_secret, _required_state_text(state, "operation_id"), renewed_expiry
+        )
     state["phase"] = "ready"
     writer(active_path, state, marker_secret)
     operation_id = _required_state_text(state, "operation_id")
-    cleanup_token = _cleanup_capability(marker_secret, operation_id)
+    cleanup_token = _cleanup_capability(
+        marker_secret, operation_id, float(state["expires_at"])
+    )
     return {
         "passed": True,
         "source_provider": Provider.CODEX.value,
@@ -253,6 +273,7 @@ def characterize_claude_visibility(
         ],
         "verification": "pending_operator_checks",
         "cleanup": "pending_explicit_confirmation",
+        "cleanup_expires_at": state["expires_at"],
         "cleanup_token": {
             "id": operation_id,
             "capability": cleanup_token,
@@ -275,6 +296,28 @@ def cleanup_characterized_claude_visibility(
     operation_id, capability = _parse_cleanup_token(cleanup_token)
     root = _prepare_safe_root(source_root, create=False)
     project_root = _prepare_safe_root(projects_root, create=False)
+    with _exclusive_cleanup_lock(root, operation_id):
+        return _cleanup_characterized_claude_visibility_locked(
+            operation_id=operation_id,
+            capability=capability,
+            root=root,
+            project_root=project_root,
+            restarted_source=restarted_source,
+            marker_secret=marker_secret,
+            timestamp=float(now()),
+        )
+
+
+def _cleanup_characterized_claude_visibility_locked(
+    *,
+    operation_id: str,
+    capability: str,
+    root: Path,
+    project_root: Path,
+    restarted_source: Callable[[], ClaudeReadableSource],
+    marker_secret: bytes,
+    timestamp: float,
+) -> dict[str, Any]:
     claims = root / ".cleanup-claims"
     completed = root / ".cleanup-completed"
     claims.mkdir(exist_ok=True)
@@ -287,7 +330,12 @@ def cleanup_characterized_claude_visibility(
     if done.exists():
         state = _read_characterization_record(done, marker_secret)
         _validate_cleanup_authority(
-            state, operation_id, capability, marker_secret, now()
+            state,
+            operation_id,
+            capability,
+            marker_secret,
+            timestamp,
+            allow_expired_claim=True,
         )
         return _cleanup_result(state)
     if not claimed.exists():
@@ -295,11 +343,20 @@ def cleanup_characterized_claude_visibility(
             raise RuntimeError("characterization_cleanup_token_invalid")
         state = _read_characterization_record(active, marker_secret)
         _validate_cleanup_authority(
-            state, operation_id, capability, marker_secret, now()
+            state, operation_id, capability, marker_secret, timestamp
         )
+        state["cleanup_authorized_at"] = timestamp
+        _write_characterization_record(active, state, marker_secret)
         os.replace(active, claimed)
     state = _read_characterization_record(claimed, marker_secret)
-    _validate_cleanup_authority(state, operation_id, capability, marker_secret, now())
+    _validate_cleanup_authority(
+        state,
+        operation_id,
+        capability,
+        marker_secret,
+        timestamp,
+        allow_expired_claim=True,
+    )
     disposable = _bound_disposable_path(state, root)
     if state["phase"] not in {"disposable_removed", "completed"}:
         _validate_disposable(state, root)
@@ -374,6 +431,60 @@ def _cleanup_result(state: Mapping[str, Any]) -> dict[str, Any]:
         "verification": "operator_confirmed",
         "cleanup": "removed_exact_characterization",
     }
+
+
+@contextmanager
+def _exclusive_cleanup_lock(root: Path, operation_id: str) -> Any:
+    """Serialize one cleanup operation with an OS-released crash-safe lock."""
+
+    locks = root / ".cleanup-locks"
+    locks.mkdir(exist_ok=True)
+    _require_plain_directory(locks)
+    lock_path = locks / f"{operation_id}.lock"
+    if _path_is_redirect(lock_path):
+        raise RuntimeError("unsafe_characterization_root")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        current = os.lstat(lock_path)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or _metadata_is_redirect(current)
+            or _identity_tuple(metadata) != _identity_tuple(current)
+        ):
+            raise RuntimeError("unsafe_characterization_root")
+        if metadata.st_size == 0:
+            os.write(descriptor, b"0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_characterization_transcript(
@@ -518,18 +629,20 @@ def _read_characterization_record(path: Path, secret: bytes) -> dict[str, Any]:
     return payload
 
 
-def _cleanup_capability(secret: bytes, operation_id: str) -> str:
+def _cleanup_capability(secret: bytes, operation_id: str, expires_at: float) -> str:
     digest = hmac.new(
         secret,
-        f"claude-characterization-cleanup:{operation_id}".encode(),
+        f"claude-characterization-cleanup:{operation_id}:{expires_at:.6f}".encode(),
         hashlib.sha256,
     ).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _cleanup_capability_hash(secret: bytes, operation_id: str) -> str:
+def _cleanup_capability_hash(
+    secret: bytes, operation_id: str, expires_at: float
+) -> str:
     return hashlib.sha256(
-        _cleanup_capability(secret, operation_id).encode()
+        _cleanup_capability(secret, operation_id, expires_at).encode()
     ).hexdigest()
 
 
@@ -554,22 +667,34 @@ def _validate_cleanup_authority(
     capability: str,
     secret: bytes,
     now: float,
+    *,
+    allow_expired_claim: bool = False,
 ) -> None:
     if state.get("operation_id") != operation_id:
         raise RuntimeError("characterization_cleanup_token_invalid")
-    expected = _cleanup_capability(secret, operation_id)
+    expiry = state.get("expires_at")
+    if (
+        not isinstance(expiry, (int, float))
+        or isinstance(expiry, bool)
+        or not math.isfinite(expiry)
+    ):
+        raise RuntimeError("characterization_cleanup_token_expired")
+    expected = _cleanup_capability(secret, operation_id, float(expiry))
     if (
         not hmac.compare_digest(capability, expected)
         or state.get("cleanup_capability_hash")
         != hashlib.sha256(capability.encode()).hexdigest()
     ):
         raise RuntimeError("characterization_cleanup_token_invalid")
-    expiry = state.get("expires_at")
-    if (
-        not isinstance(expiry, (int, float))
-        or not math.isfinite(expiry)
-        or now > expiry
-    ):
+    authorized_at = state.get("cleanup_authorized_at")
+    durable_claim = (
+        allow_expired_claim
+        and isinstance(authorized_at, (int, float))
+        and not isinstance(authorized_at, bool)
+        and math.isfinite(authorized_at)
+        and authorized_at <= expiry
+    )
+    if now > expiry and not durable_claim:
         raise RuntimeError("characterization_cleanup_token_expired")
 
 
@@ -593,6 +718,7 @@ def _validate_operation_state(
         "transcript_path",
         "transcript_identity",
         "sentinel_nonce",
+        "cleanup_authorized_at",
         "cleanup_capability_hash",
     }
     if set(state) != required or state.get("schema_version") != 2:
@@ -603,6 +729,18 @@ def _validate_operation_state(
     except (TypeError, ValueError, AttributeError):
         raise RuntimeError("characterization_cleanup_token_invalid") from None
     if state.get("source_provider") != Provider.CODEX.value:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    created_at = _required_state_number(state, "created_at")
+    expires_at = _required_state_number(state, "expires_at")
+    if expires_at <= created_at:
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    authorized_at = state.get("cleanup_authorized_at")
+    if authorized_at is not None and (
+        not isinstance(authorized_at, (int, float))
+        or isinstance(authorized_at, bool)
+        or not math.isfinite(authorized_at)
+        or float(authorized_at) > expires_at
+    ):
         raise RuntimeError("characterization_cleanup_token_invalid")
     if state.get("phase") not in {
         "prepared",
@@ -649,16 +787,46 @@ def _required_state_text(state: Mapping[str, Any], key: str) -> str:
     return value
 
 
+def _required_state_number(state: Mapping[str, Any], key: str) -> float:
+    value = state.get(key)
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    return float(value)
+
+
 def _absolute_without_resolving(path: Path | str) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
 
 def _prepare_safe_root(path: Path, *, create: bool) -> Path:
     root = _absolute_without_resolving(path)
+    _require_plain_existing_ancestry(root)
     if create:
         root.mkdir(parents=True, exist_ok=True)
+    _require_plain_existing_ancestry(root)
     _require_plain_directory(root)
     return root
+
+
+def _require_plain_existing_ancestry(path: Path) -> None:
+    parts = path.parts
+    if not parts:
+        raise RuntimeError("unsafe_characterization_root")
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current /= part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise RuntimeError("unsafe_characterization_root") from None
+        if not stat.S_ISDIR(metadata.st_mode) or _metadata_is_redirect(metadata):
+            raise RuntimeError("unsafe_characterization_root")
 
 
 def _require_plain_directory(path: Path) -> None:
