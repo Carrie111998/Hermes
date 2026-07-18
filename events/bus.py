@@ -231,6 +231,28 @@ class EventBus:
         else:
             head = conn.execute("SELECT MAX(rowid) FROM events").fetchone()
             last_rowid = head[0] if head and head[0] is not None else 0
+            # Persist the head-default so this subscriber bootstraps a stable
+            # cursor on its first poll — mirroring BaseSubscriber's
+            # seed-at-construction (events/subscribers/base.py). Without this,
+            # a consumer that drives subscribe() DIRECTLY (not via
+            # BaseSubscriber — e.g. the standalone devflow-bridge cron) never
+            # gets a cursor row until it acks, so every poll recomputes
+            # MAX(rowid) and re-jumps to head. Any event emitted between two
+            # such polls falls into the gap: it's never returned, so the caller
+            # can never ack it, so the cursor is never persisted — a silent
+            # drop / deadlock on a fresh bus (2026-07-18 devflow-bridge).
+            #
+            # We seed at HEAD, not zero: the ADR-0018 flood mitigation stays
+            # intact (pre-first-poll history is still skipped, never replayed).
+            # INSERT OR IGNORE so a cursor concurrently seeded/acked by another
+            # path (AuditLogger's startup 0-seed, a persisted restart cursor)
+            # always wins — we never clobber it back to head.
+            self._execute(
+                "INSERT OR IGNORE INTO subscriber_cursors "
+                "(subscriber_id, last_rowid, updated_at) "
+                "VALUES (?, ?, datetime('now'))",
+                (subscriber_id, last_rowid),
+            )
 
         # Build query with optional filters
         conditions = ["rowid > ?"]
