@@ -84,6 +84,33 @@ def applier(tmp_path, mailbox, pipeline_path):
     ), jobops, mgr
 
 
+def _make_applier(tmp_path, mailbox, pipeline_path, *, job_state_reader=None, jobops=None, **kwargs):
+    """Build an IntentApplier with optional pre-flight reader / config overrides.
+
+    Returns (applier, jobops, mgr) mirroring the ``applier`` fixture shape when
+    the caller wants the jobops mock; callers that ignore it can just take [0].
+    """
+    mgr = PipelineManager(path=pipeline_path)
+    if jobops is None:
+        jobops = MagicMock()
+        jobops.post_legacy_stage.return_value = {"success": True}
+    tracker = IdempotencyTracker(tmp_path / "applier_state.db")
+    a = IntentApplier(
+        inbox_dir=mailbox["inbox"],
+        processed_dir=mailbox["processed"],
+        partial_dir=mailbox["partial"],
+        dead_letter_dir=mailbox["dead_letter"],
+        pipeline_manager=mgr,
+        jobops_client=jobops,
+        idempotency=tracker,
+        job_state_reader=job_state_reader,
+        **kwargs,
+    )
+    a._jobops_mock = jobops
+    a._mgr = mgr
+    return a
+
+
 class TestApplierHappyPath:
     def test_dual_write_success_moves_to_processed(self, mailbox, applier, pipeline_path):
         a, jobops, _mgr = applier
@@ -460,15 +487,35 @@ class TestRedrivePartials:
                        VALID_INTENT_PAYLOAD, age_seconds=200)
         assert a.redrive_partials() == {"x_APPROVAL_INTENT_main.rd1.json": "waiting"}
 
-    def test_capped_partial_is_left_in_place(self, mailbox, applier):
-        a, _j, _m = applier
-        # N=5 == max_redrive_attempts -> capped, even if ancient.
+    def test_capped_partial_is_left_in_place_when_give_up_configured(self, tmp_path, mailbox, pipeline_path):
+        # Fix B: capping is now opt-in via redrive_give_up_attempts. With it set
+        # to 5, N=5 -> terminal "capped" (old default behaviour), even if ancient.
+        a = _make_applier(tmp_path, mailbox, pipeline_path, redrive_give_up_attempts=5)
         _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
                        VALID_INTENT_PAYLOAD, age_seconds=99999)
         result = a.redrive_partials()
         assert result == {"x_APPROVAL_INTENT_main.rd5.json": "capped"}
         assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
         assert list(mailbox["inbox"].glob("*")) == []
+
+    def test_default_never_caps_slow_lane_redrives_past_max_attempts(self, mailbox, applier):
+        # Fix B: default redrive_give_up_attempts=0 => never surrender. An
+        # ancient rd5 partial (old code: "capped") now re-drives on the slow lane.
+        a, _j, _m = applier
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=99999)
+        result = a.redrive_partials()
+        assert result == {"x_APPROVAL_INTENT_main.rd5.json": "redriven"}
+        assert (mailbox["inbox"] / "x_APPROVAL_INTENT_main.rd6.json").exists()
+
+    def test_slow_lane_still_honours_max_backoff_cadence(self, mailbox, applier):
+        # Past max_redrive_attempts the backoff is pinned at redrive_max_backoff
+        # (1800s). An rd8 partial only 1000s old is still "waiting", proving the
+        # slow lane retries at the capped cadence rather than hot-looping.
+        a, _j, _m = applier
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd8.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1000)
+        assert a.redrive_partials() == {"x_APPROVAL_INTENT_main.rd8.json": "waiting"}
 
     def test_move_to_partial_resets_mtime(self, mailbox, applier):
         a, jobops, _m = applier
@@ -504,3 +551,83 @@ class TestRedrivePartials:
         outcomes = a.scan_inbox()
         assert outcomes == {"20260713T4_APPROVAL_INTENT_main.rd1.json": "applied"}
         assert a.idempotency.is_applied(key)
+
+
+def _stage_payload(stage: str, key_suffix: str = "") -> dict:
+    """A VALID_INTENT_PAYLOAD variant requesting a specific stage."""
+    p = json.loads(json.dumps(VALID_INTENT_PAYLOAD))
+    p["payload"]["requested_stage"] = stage
+    p["idempotency_key"] = f"tracker-intent:it:linkedin-1:{stage}{key_suffix}"
+    return p
+
+
+class TestPreflightSatisfied:
+    """Fix A — suppress redundant no-op intents whose job is already at/past target."""
+
+    def test_past_target_skips_dual_write(self, tmp_path, mailbox, pipeline_path):
+        # Job sits at materials_ready, which is PAST the requested 'approved'.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "materials_ready")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "satisfied"
+        # No :4100 POST, no mirror, no legacy-projection regression.
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+        assert _pipeline_updates(mailbox["inbox"]) == []
+        data = json.loads(pipeline_path.read_text())
+        job = next(j for j in data["jobs"] if j["job_id"] == "linkedin-1")
+        assert job["stage"] == "review"  # unchanged — step 3 skipped
+        # Moved to processed + key burned so the redundant intent can't recur.
+        assert (mailbox["processed"] / "intent.json").exists()
+        assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_at_exact_target_is_satisfied(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "approved_for_tailor")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "satisfied"
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+
+    def test_archived_target_satisfied_only_by_archived(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "archived")
+        f = write_intent(mailbox["inbox"], "arch.json", _stage_payload("archived"))
+        assert a.apply_one(f) == "satisfied"
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+
+    def test_before_target_takes_normal_dual_write(self, tmp_path, mailbox, pipeline_path):
+        # 'scored' is BEFORE 'approved' -> not satisfied -> normal apply.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "scored")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+    def test_reader_none_result_takes_normal_path(self, tmp_path, mailbox, pipeline_path):
+        # Unknown job (reader returns None) must not short-circuit.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: None)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+    def test_reader_exception_fails_open(self, tmp_path, mailbox, pipeline_path):
+        def boom(jid):
+            raise RuntimeError("pg down")
+        a = _make_applier(tmp_path, mailbox, pipeline_path, job_state_reader=boom)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"  # never blocks on a reader error
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+    def test_no_reader_takes_normal_path(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, job_state_reader=None)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+
+    def test_unlisted_stage_never_shortcircuits(self, tmp_path, mailbox, pipeline_path):
+        # 'scored' is deliberately absent from _STAGE_SATISFIED_BY: even a reader
+        # claiming a downstream state must NOT short-circuit an unlisted stage.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "materials_ready")
+        f = write_intent(mailbox["inbox"], "intent.json", _stage_payload("scored"))
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()

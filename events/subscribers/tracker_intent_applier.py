@@ -30,7 +30,12 @@ from events.bus import EventBus
 from events.schema import Event
 from events.subscribers.base import BaseSubscriber
 
-from intent_applier import IdempotencyTracker, IntentApplier, JobOpsClient
+from intent_applier import (
+    IdempotencyTracker,
+    IntentApplier,
+    JobOpsClient,
+    build_default_reader,
+)
 from pipeline_state import PipelineManager
 
 logger = logging.getLogger(__name__)
@@ -70,6 +75,9 @@ def _redrive_config_from_env() -> dict:
         "redrive_multiplier": _f("TRACKER_APPLIER_REDRIVE_MULTIPLIER", 2.0),
         "redrive_max_backoff": _f("TRACKER_APPLIER_REDRIVE_MAX_BACKOFF_SECONDS", 1800.0),
         "max_redrive_attempts": _i("TRACKER_APPLIER_REDRIVE_MAX_ATTEMPTS", 5),
+        # Fix B: 0 => never give up (slow-lane retry at max_backoff forever).
+        # Set >0 only to restore a terminal "capped" after N attempts.
+        "redrive_give_up_attempts": _i("TRACKER_APPLIER_REDRIVE_GIVE_UP_ATTEMPTS", 0),
     }
 
 
@@ -139,6 +147,10 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
                 "thread-resume disabled"
             )
 
+        # Fix A: native-Postgres pre-flight reader (None on minimal installs
+        # without a psycopg driver — pre-flight simply stays off).
+        job_state_reader = build_default_reader()
+
         self._applier = IntentApplier(
             inbox_dir=self._mailbox["inbox"],
             processed_dir=self._mailbox["processed"],
@@ -148,13 +160,17 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             jobops_client=JobOpsClient(base_url=self._jobops_url),
             idempotency=idempotency,
             resume_full=_resume_full,
+            job_state_reader=job_state_reader,
             **self._redrive_config,
         )
         logger.info(
-            "tracker-intent-applier: ready (inbox=%s, jobops=%s, redrive_enabled=%s)",
+            "tracker-intent-applier: ready (inbox=%s, jobops=%s, redrive_enabled=%s, "
+            "preflight=%s, give_up_attempts=%s)",
             self._mailbox["inbox"],
             self._jobops_url,
             self._redrive_enabled,
+            job_state_reader is not None,
+            self._redrive_config.get("redrive_give_up_attempts"),
         )
 
     def handle(self, event: Event) -> None:
@@ -188,10 +204,11 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             skipped = sum(
                 1 for v in outcomes.values() if v == "skipped_idempotent"
             )
+            satisfied = sum(1 for v in outcomes.values() if v == "satisfied")
             logger.info(
                 "tracker-intent-applier: tick processed=%d "
-                "(applied=%d partial=%d dead=%d skipped=%d)",
-                len(outcomes), applied, partial, dead, skipped,
+                "(applied=%d partial=%d dead=%d skipped=%d satisfied=%d)",
+                len(outcomes), applied, partial, dead, skipped, satisfied,
             )
         return len(outcomes)
 
