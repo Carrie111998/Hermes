@@ -118,3 +118,29 @@ def propagate_context_to_thread(target: Callable) -> Callable:
         return ctx.run(_inner)
 
     return _runner
+
+
+def propagate_context_only(target: Callable) -> Callable:
+    """Wrap *target* to run on a worker thread with the *current* thread's
+    ContextVars propagated, **without** touching thread-local
+    approval/sudo callbacks.
+
+    Unlike :func:`propagate_context_to_thread`, this helper does NOT capture,
+    install, or clear TLS callbacks.  This is required when the worker thread's
+    TLS callbacks are managed by a ``ThreadPoolExecutor`` ``initializer``
+    (e.g. ``delegate_task``'s ``DaemonThreadPoolExecutor`` which installs a
+    delegation-specific subagent approval callback).  Using
+    ``propagate_context_to_thread`` in that context would overwrite the
+    initializer's callback with the parent's (or ``None`` on teardown),
+    breaking ``delegation.subagent_auto_approve`` semantics.
+
+    Usage::
+
+        executor.submit(propagate_context_only(worker_fn), *args)
+    """
+    ctx = contextvars.copy_context()
+
+    def _runner(*args, **kwargs):
+        return ctx.run(target, *args, **kwargs)
+
+    return _runner

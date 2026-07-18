@@ -133,6 +133,7 @@ class ACPClientSession:
         approval_callback: Optional[Callable[..., str]] = None,
         auto_approve_permissions: bool = False,
         client_factory: Optional[Callable[..., ACPClient]] = None,
+        session_start_timeout: float = 30.0,
     ) -> None:
         """
         Args:
@@ -158,6 +159,10 @@ class ACPClientSession:
                 the caller do not alter the value sent on the wire.  Default
                 ``None`` → no ``_meta`` key is included (the server's own
                 defaults apply).
+            session_start_timeout: Timeout in seconds for the initialize +
+                session/new handshake.  Default 30s (was 15s hardcoded).
+                Covers npx startup, npm cache checks, and network latency
+                to the ACP agent's API endpoint.
             on_delta: Optional callback invoked with each text delta during streaming.
                       Bridges to Hermes' ``_fire_stream_delta`` for live output.
             approval_callback: Optional callback ``(command_label: str,
@@ -200,6 +205,7 @@ class ACPClientSession:
         self._approval_callback = approval_callback
         self._auto_approve_permissions = auto_approve_permissions
         self._client_factory = client_factory or ACPClient
+        self._session_start_timeout = session_start_timeout
 
         self._client: Optional[ACPClient] = None
         self._session_id: Optional[str] = None
@@ -222,6 +228,7 @@ class ACPClientSession:
         self._client.initialize(
             client_name="hermes",
             client_version=_get_hermes_version(),
+            timeout=self._session_start_timeout,
         )
         # Build session/new params.  ``_meta`` is an opaque vendor passthrough
         # — the core does not construct any vendor-specific structures.  When
@@ -237,7 +244,7 @@ class ACPClientSession:
         result = self._client.request(
             _METHOD_SESSION_NEW,
             session_new_params,
-            timeout=15,
+            timeout=self._session_start_timeout,
         )
         session_id = result.get("sessionId") or result.get("session_id") or ""
         if not session_id:

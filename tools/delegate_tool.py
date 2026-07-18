@@ -39,6 +39,7 @@ from toolsets import TOOLSETS
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.thread_context import propagate_context_only
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -1846,6 +1847,19 @@ def _run_single_child(
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _stale_count = [0]
+    # Signalled by the heartbeat thread once the stale threshold is reached so
+    # the parent thread (running ``_run_single_child``) can flag the result as
+    # ``exit_reason='stale'``.  Set BEFORE the heartbeat attempts
+    # ``child.interrupt()`` so it also acts as the one-shot guard that
+    # suppresses the redundant cleanup interrupt in the hard-timeout /
+    # exception branch — even when the heartbeat's own interrupt call raises
+    # (in which case ``_stale_interrupt_attempted`` stays False but the event
+    # is already set and the child has been declared stale).
+    # ``_stale_interrupt_attempted`` is retained as an observability hint
+    # (did the heartbeat actually reach ``child.interrupt()``?) but is no
+    # longer the guard for the cleanup path.
+    _stale_event = threading.Event()
+    _stale_interrupt_attempted = [False]
 
     def _heartbeat_loop():
         while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
@@ -1890,12 +1904,43 @@ def _run_single_child(
                 if _stale_count[0] >= stale_limit:
                     logger.warning(
                         "Subagent %d appears stale (no progress for %d "
-                        "heartbeat cycles, tool=%s) — stopping heartbeat",
+                        "heartbeat cycles, tool=%s) — interrupting child",
                         task_index,
                         _stale_count[0],
                         child_tool or "<none>",
                     )
-                    break  # stop touching parent, let gateway timeout fire
+                    # Signal the parent thread so it can mark the result
+                    # ``exit_reason='stale'`` once ``run_conversation`` returns.
+                    # Set before the interrupt so a fast worker unwind still
+                    # observes the flag from ``_run_single_child``.
+                    _stale_event.set()
+                    # Explicitly cancel the child instead of relying on the
+                    # gateway inactivity timeout — a wedged ACP subprocess can
+                    # out-wait the gateway and leak. ``interrupt`` is the
+                    # documented cross-thread cancellation API; fall back to
+                    # the private flag for stripped-down test doubles.
+                    try:
+                        if hasattr(child, "interrupt"):
+                            try:
+                                child.interrupt(
+                                    "delegate_task: cancelled due to inactivity "
+                                    "(stale heartbeat)"
+                                )
+                            except TypeError:
+                                # interrupt() on some stubs does not accept a
+                                # positional message argument.
+                                child.interrupt()
+                            _stale_interrupt_attempted[0] = True
+                        elif hasattr(child, "_interrupt_requested"):
+                            child._interrupt_requested = True
+                            _stale_interrupt_attempted[0] = True
+                    except Exception:
+                        logger.debug(
+                            "Stale-heartbeat interrupt of subagent %d raised",
+                            task_index,
+                            exc_info=True,
+                        )
+                    break  # stop touching parent activity
 
                 if child_tool:
                     desc = (
@@ -2022,18 +2067,32 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                 )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        _child_future = _timeout_executor.submit(
+            propagate_context_only(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
-            try:
-                if hasattr(child, "interrupt"):
-                    child.interrupt()
-                elif hasattr(child, "_interrupt_requested"):
-                    child._interrupt_requested = True
-            except Exception:
-                pass
+            # Skip the redundant cancel on a child that the heartbeat already
+            # interrupted (or flagged) via the stale path — it has been told
+            # to stop once and a second interrupt() would just re-fire on a
+            # thread that's already unwinding. Real hard timeouts and genuine
+            # child exceptions still take the cancel path below.
+            #
+            # Guard on ``_stale_event`` (not ``_stale_interrupt_attempted``):
+            # the event is set BEFORE the heartbeat attempts ``interrupt()``,
+            # so even if that call itself raises (leaving the attempted flag
+            # False) we still suppress the redundant cleanup interrupt. The
+            # heartbeat has already declared the child stale; a second
+            # interrupt from the exception path would be noise.
+            if not _stale_event.is_set():
+                try:
+                    if hasattr(child, "interrupt"):
+                        child.interrupt()
+                    elif hasattr(child, "_interrupt_requested"):
+                        child._interrupt_requested = True
+                except Exception:
+                    pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             duration = round(time.monotonic() - child_start, 2)
@@ -2072,22 +2131,19 @@ def _run_single_child(
                         diagnostic_path,
                     )
 
-            if child_progress_cb:
-                try:
-                    child_progress_cb(
-                        "subagent.complete",
-                        preview=(
-                            f"Timed out after {duration}s"
-                            if is_timeout
-                            else str(_timeout_exc)
-                        ),
-                        status="timeout" if is_timeout else "error",
-                        duration_seconds=duration,
-                        summary="",
-                    )
-                except Exception:
-                    pass
-
+            # Compute the final status/error before emitting the
+            # ``subagent.complete`` callback. The gateway/TUI surfaces this
+            # callback in real time as a completion event, so its ``status``
+            # must match the eventual return entry — otherwise consumers see
+            # ``status='timeout'`` / ``'error'`` arrive live and then a final
+            # ``interrupted`` / ``stale`` entry, a visible inconsistency.
+            #
+            # The stale-heartbeat override (when ``_stale_event`` is set)
+            # downgrades ``status`` to ``'interrupted'`` and appends a stale
+            # diagnostic to the error text. Compute that first so the
+            # callback reflects the post-override state. The preview keeps the
+            # original timeout/exception diagnostic for debuggability — only
+            # the reported ``status`` must not advertise the error.
             if is_timeout:
                 if child_api_calls == 0:
                     _err = (
@@ -2107,17 +2163,62 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
-            return {
+            _status = "timeout" if is_timeout else "error"
+            _exit_reason = "timeout" if is_timeout else "error"
+            _entry: Dict[str, Any] = {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "status": _status,
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": _exit_reason,
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+
+            # Stale-heartbeat override (exception path): if the heartbeat
+            # already declared the child stale and fired its interrupt, the
+            # fact that ``run_conversation`` subsequently raised (or tripped a
+            # hard timeout while unwinding) does NOT change the semantic
+            # outcome — we killed the child for inactivity. Report
+            # ``status='interrupted'`` / ``exit_reason='stale'`` so the parent
+            # aggregator and the model see a consistent signal regardless of
+            # whether the child returned cleanly or raised. The original
+            # timeout/error text is preserved as an appended diagnostic so the
+            # underlying failure mode is still visible for debugging.
+            #
+            # Applied BEFORE the ``child_progress_cb`` callback below so the
+            # live completion event carries the post-override status.
+            if _stale_event.is_set():
+                _stale_err = (
+                    "Subagent interrupted due to inactivity (stale heartbeat: "
+                    "no API-call progress for the configured stale threshold)."
+                )
+                _entry["status"] = "interrupted"
+                _entry["exit_reason"] = "stale"
+                if _entry.get("error"):
+                    _entry["error"] = f"{_entry['error']} | {_stale_err}"
+                else:
+                    _entry["error"] = _stale_err
+
+            if child_progress_cb:
+                try:
+                    child_progress_cb(
+                        "subagent.complete",
+                        preview=(
+                            f"Timed out after {duration}s"
+                            if is_timeout
+                            else str(_timeout_exc)
+                        ),
+                        status=_entry["status"],
+                        duration_seconds=duration,
+                        summary="",
+                    )
+                except Exception:
+                    pass
+
+            return _entry
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -2240,6 +2341,30 @@ def _run_single_child(
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
+
+        # Stale-heartbeat override: if the heartbeat thread already fired the
+        # stale interrupt while ``run_conversation`` was still finishing (or
+        # had just finished), the entry's real status may be "completed" /
+        # "interrupted" / "max_iterations" — none of those reflect that we
+        # killed the child for inactivity. Only override when the stale event
+        # is actually set; a normal completion (heartbeat never reached the
+        # threshold) leaves the original status / exit_reason intact. The
+        # child's summary, tokens, and trace are preserved so the parent
+        # still sees whatever the child produced before it went stale.
+        if _stale_event.is_set():
+            entry["status"] = "interrupted"
+            entry["exit_reason"] = "stale"
+            # Surface the reason as an error so the parent aggregator treats
+            # this as a non-success and the model gets a concrete signal
+            # instead of a silently-completed summary.
+            _stale_err = (
+                "Subagent interrupted due to inactivity (stale heartbeat: "
+                "no API-call progress for the configured stale threshold)."
+            )
+            if entry.get("error"):
+                entry["error"] = f"{entry['error']} | {_stale_err}"
+            else:
+                entry["error"] = _stale_err
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -2679,7 +2804,7 @@ def delegate_task(
                 futures = {}
                 for i, t, child in children:
                     future = executor.submit(
-                        _run_single_child,
+                        propagate_context_only(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,
