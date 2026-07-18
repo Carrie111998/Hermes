@@ -5495,6 +5495,13 @@ def _is_service_running() -> bool:
     return len(find_gateway_pids()) > 0
 
 
+def _setup_whatsapp():
+    """Delegate to the existing WhatsApp setup flow."""
+    from hermes_cli.main import cmd_whatsapp
+    import argparse
+    cmd_whatsapp(argparse.Namespace())
+
+
 def _setup_weixin():
     """Interactive setup for Weixin / WeChat personal accounts."""
     print()
@@ -6127,10 +6134,16 @@ def _builtin_setup_fn(key: str):
         "slack": _s._setup_slack,
         "matrix": _s._setup_matrix,
         #
-        # mattermost, whatsapp, email, sms, dingtalk, and wecom/wecom_callback
-        # are built-in adapters (gateway/platforms/*.py) that use the generic
+        # mattermost, email, sms, dingtalk, and wecom/wecom_callback are
+        # built-in adapters (gateway/platforms/*.py) that use the generic
         # vars-schema-driven _setup_standard_platform() flow via their
         # _PLATFORMS entries above -- no bespoke function needed for these.
+        #
+        # whatsapp can't use the vars flow: it has no env-var credentials
+        # (auth is QR pairing that writes session creds), so its _PLATFORMS
+        # entry has no `vars` schema and without a bespoke function it falls
+        # through to the unusable "configure in config.yaml" hint.
+        "whatsapp": _setup_whatsapp,
         "bluebubbles": _s._setup_bluebubbles,
         "webhooks": _s._setup_webhooks,
         "signal": _setup_signal,
