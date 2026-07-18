@@ -146,59 +146,36 @@ def characterize_claude_visibility(
         or getattr(outcome, "reserved_claude_uuid", None) != claim.reserved_claude_uuid
     ):
         raise RuntimeError("characterization_registration_failed")
+    assert claim.reserved_claude_uuid is not None
+    assert claim.native_name is not None
+    assert claim.source_cwd is not None
+    assert claim.signed_marker is not None
 
     restarted = restarted_source()
-    finder = getattr(restarted, "find_native_sessions", None)
-    paths = (
-        list(finder(claim.reserved_claude_uuid))
-        if callable(finder)
-        else [
-            found
-            for found in [restarted.find_native_session(claim.reserved_claude_uuid)]
-            if found is not None
-        ]
+    resolved_transcript = _validate_characterization_transcript(
+        restarted=restarted,
+        projects_root=project_root,
+        reserved_uuid=claim.reserved_claude_uuid,
+        native_name=claim.native_name,
+        source_cwd=claim.source_cwd,
+        signed_marker=claim.signed_marker,
     )
-    if len(paths) != 1:
-        raise RuntimeError("characterization_identity_mismatch:exact_uuid")
-    transcript = Path(paths[0])
-    try:
-        resolved_transcript = transcript.resolve(strict=True)
-        relative = resolved_transcript.relative_to(project_root)
-    except (OSError, ValueError):
-        raise RuntimeError("characterization_identity_mismatch:path") from None
-    if (
-        transcript.is_symlink()
-        or not resolved_transcript.is_file()
-        or relative.name != f"{claim.reserved_claude_uuid}.jsonl"
-    ):
-        raise RuntimeError("characterization_identity_mismatch:path")
-    parsed = restarted.parse(transcript)
-    native = parsed.projection
-    try:
-        projected_path = Path(native.native_path or "").resolve(strict=True)
-    except OSError:
-        raise RuntimeError("characterization_identity_mismatch:path") from None
-    marker_check = getattr(restarted, "projection_has_exact_marker", None)
-    exact_marker = callable(marker_check) and marker_check(native, claim.signed_marker)
-    if (
-        native.provider is not Provider.CLAUDE
-        or native.native_id != claim.reserved_claude_uuid
-        or native.title != claim.native_name
-        or native.cwd != claim.source_cwd
-        or projected_path != resolved_transcript
-        or not exact_marker
-    ):
-        raise RuntimeError("characterization_identity_mismatch:metadata")
-
-    # Recheck the directory entry immediately before unlinking.  Identity
-    # changes fail closed and leave provider state untouched for diagnosis.
-    if (
-        transcript.resolve(strict=True) != resolved_transcript
-        or transcript.is_symlink()
-    ):
-        raise RuntimeError("characterization_identity_mismatch:path_changed")
-    transcript.unlink()
-    shutil.rmtree(disposable)
+    cleanup_token = str(uuid.uuid4())
+    token_root = root / ".cleanup-tokens"
+    token_root.mkdir(parents=True, exist_ok=True)
+    token_path = token_root / f"{cleanup_token}.json"
+    token_payload = {
+        "schema_version": 1,
+        "reserved_claude_uuid": claim.reserved_claude_uuid,
+        "native_name": claim.native_name,
+        "source_cwd": claim.source_cwd,
+        "signed_marker": claim.signed_marker,
+        "transcript_path": str(resolved_transcript),
+        "disposable_path": str(disposable),
+    }
+    temporary = token_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(token_payload, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, token_path)
     return {
         "passed": True,
         "source_provider": Provider.CODEX.value,
@@ -210,9 +187,136 @@ def characterize_claude_visibility(
             "Run /resume in Claude Code and select the deterministic characterization name.",
             "Press Ctrl+A in /resume to verify the exact session across all projects.",
             f"Resume the exact ID with: claude --resume {claim.reserved_claude_uuid}",
+            f"After all checks pass, rerun with --cleanup-token {cleanup_token}",
         ],
+        "verification": "pending_operator_checks",
+        "cleanup": "pending_explicit_confirmation",
+        "cleanup_token": cleanup_token,
+    }
+
+
+def cleanup_characterized_claude_visibility(
+    *,
+    cleanup_token: str,
+    source_root: Path,
+    projects_root: Path,
+    restarted_source: Callable[[], ClaudeReadableSource],
+) -> dict[str, Any]:
+    """Explicit second phase after the operator completes native picker checks."""
+
+    try:
+        canonical_token = str(uuid.UUID(cleanup_token))
+    except (TypeError, ValueError, AttributeError):
+        raise RuntimeError("characterization_cleanup_token_invalid") from None
+    root = Path(source_root).resolve(strict=True)
+    project_root = Path(projects_root).resolve(strict=True)
+    token_path = root / ".cleanup-tokens" / f"{canonical_token}.json"
+    try:
+        if token_path.is_symlink():
+            raise RuntimeError("characterization_cleanup_token_invalid")
+        resolved_token = token_path.resolve(strict=True)
+        resolved_token.relative_to(root)
+        state = json.loads(resolved_token.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raise RuntimeError("characterization_cleanup_token_invalid") from None
+    expected = {
+        "schema_version",
+        "reserved_claude_uuid",
+        "native_name",
+        "source_cwd",
+        "signed_marker",
+        "transcript_path",
+        "disposable_path",
+    }
+    if (
+        not isinstance(state, dict)
+        or set(state) != expected
+        or state["schema_version"] != 1
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    transcript = _validate_characterization_transcript(
+        restarted=restarted_source(),
+        projects_root=project_root,
+        reserved_uuid=state["reserved_claude_uuid"],
+        native_name=state["native_name"],
+        source_cwd=state["source_cwd"],
+        signed_marker=state["signed_marker"],
+    )
+    expected_transcript = Path(state["transcript_path"]).resolve(strict=True)
+    disposable = Path(state["disposable_path"]).resolve(strict=True)
+    if transcript != expected_transcript or disposable != Path(
+        state["source_cwd"]
+    ).resolve(strict=True):
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
+    if (
+        transcript.is_symlink()
+        or transcript.resolve(strict=True) != expected_transcript
+    ):
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
+    transcript.unlink()
+    shutil.rmtree(disposable)
+    resolved_token.unlink()
+    return {
+        "passed": True,
+        "reserved_claude_uuid": state["reserved_claude_uuid"],
+        "restart_exact_id_verified": True,
+        "verification": "operator_confirmed",
         "cleanup": "removed_exact_characterization",
     }
+
+
+def _validate_characterization_transcript(
+    *,
+    restarted: ClaudeReadableSource,
+    projects_root: Path,
+    reserved_uuid: str,
+    native_name: str,
+    source_cwd: str,
+    signed_marker: str,
+) -> Path:
+    finder = getattr(restarted, "find_native_sessions", None)
+    paths = (
+        list(finder(reserved_uuid))
+        if callable(finder)
+        else [
+            found
+            for found in [restarted.find_native_session(reserved_uuid)]
+            if found is not None
+        ]
+    )
+    if len(paths) != 1:
+        raise RuntimeError("characterization_identity_mismatch:exact_uuid")
+    transcript = Path(paths[0])
+    try:
+        resolved_transcript = transcript.resolve(strict=True)
+        relative = resolved_transcript.relative_to(projects_root)
+    except (OSError, ValueError):
+        raise RuntimeError("characterization_identity_mismatch:path") from None
+    if (
+        transcript.is_symlink()
+        or not resolved_transcript.is_file()
+        or relative.name != f"{reserved_uuid}.jsonl"
+    ):
+        raise RuntimeError("characterization_identity_mismatch:path")
+    parsed = restarted.parse(transcript)
+    native = parsed.projection
+    try:
+        projected_path = Path(native.native_path or "").resolve(strict=True)
+    except OSError:
+        raise RuntimeError("characterization_identity_mismatch:path") from None
+    marker_check = getattr(restarted, "projection_has_exact_marker", None)
+    exact_marker = callable(marker_check) and marker_check(native, signed_marker)
+    if (
+        native.provider is not Provider.CLAUDE
+        or native.native_id != reserved_uuid
+        or native.title != native_name
+        or native.cwd != source_cwd
+        or projected_path != resolved_transcript
+        or not exact_marker
+    ):
+        raise RuntimeError("characterization_identity_mismatch:metadata")
+
+    return resolved_transcript
 
 
 def _characterization_message(timestamp: float) -> Any:

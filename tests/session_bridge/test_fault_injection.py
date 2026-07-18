@@ -12,13 +12,17 @@ import pytest
 
 from hermes_state import SessionDB
 from session_bridge.claude_adapter import ClaudeSourceAdapter
+from session_bridge.claude_registrar import ClaudeNativeRegistrar
 from session_bridge.claude_visibility import (
     build_claude_visibility_candidate,
     derive_claude_visibility_identity,
 )
 from session_bridge.codex_adapter import CodexSourceAdapter, CodexTargetAdapter
 from session_bridge.config import BridgeConfig
-from session_bridge.coordinator import SessionBridgeCoordinator
+from session_bridge.coordinator import (
+    SessionBridgeCoordinator,
+    _claude_visibility_enqueue_gates,
+)
 from session_bridge.mcp_server import resolve_bearer_token
 from session_bridge.mirror import (
     MirrorPolicy,
@@ -35,6 +39,16 @@ from session_bridge.models import (
 )
 from session_bridge.store import SessionBridgeStore
 from tests.session_bridge.test_end_to_end import _SidebarEndToEndHarness
+from tests.session_bridge.test_claude_registrar import (
+    FakeFactory as _ClaudeFactory,
+    FakePty as _ClaudePty,
+    FakeSource as _ClaudeSource,
+    FakeStore as _ClaudeStore,
+    SECRET as _REGISTRAR_SECRET,
+    candidate as _registrar_candidate,
+    claim as _registrar_claim,
+    projection_for as _registrar_projection,
+)
 
 
 NOW = 100.0
@@ -745,67 +759,105 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
 
 
 @pytest.mark.parametrize(
-    ("fault", "error_code"),
+    ("fault", "factory", "error_code", "transcript_after_failure"),
     [
-        ("process_crash_before_transcript", "clean_exit_not_observed"),
-        ("timeout_after_transcript", "creation_ambiguous"),
-        ("delayed_indexing", "native_transcript_not_indexed"),
-        ("restart_while_leased", "lease_expired"),
-        ("stale_lease", "lease_expired"),
-        ("authentication_loss", "claude_authentication_unavailable"),
-        ("missing_executable", "claude_executable_unavailable"),
-        ("pty_failure", "pty_unavailable"),
+        (
+            "process_crash_before_transcript",
+            lambda: _ClaudeFactory(_ClaudePty(exit_code=7)),
+            "clean_exit_not_observed",
+            False,
+        ),
+        (
+            "timeout_after_transcript",
+            lambda: _ClaudeFactory(_ClaudePty(read_error=TimeoutError())),
+            "creation_ambiguous",
+            True,
+        ),
+        (
+            "authentication_loss",
+            lambda: _ClaudeFactory(_ClaudePty(output="Authentication required")),
+            "claude_authentication_unavailable",
+            False,
+        ),
+        (
+            "missing_executable",
+            lambda: _ClaudeFactory(error=FileNotFoundError()),
+            "claude_executable_unavailable",
+            False,
+        ),
+        (
+            "pty_failure",
+            lambda: _ClaudeFactory(error=RuntimeError("pty unavailable")),
+            "pty_unavailable",
+            False,
+        ),
     ],
 )
-def test_claude_visibility_ambiguous_failure_matrix_never_replaces_uuid_or_relaunches(
-    tmp_path: Path, fault: str, error_code: str
+def test_claude_visibility_registrar_faults_reconcile_same_uuid_without_relaunch(
+    tmp_path: Path,
+    fault: str,
+    factory: Any,
+    error_code: str,
+    transcript_after_failure: bool,
 ) -> None:
     base = 1_700_000_000.0
     current = [base]
     database = SessionDB(tmp_path / f"{fault}.db")
     store = SessionBridgeStore(database, clock=lambda: current[0])
     try:
-        projection = SessionProjection(
-            provider=Provider.CODEX,
-            native_id=f"fault-{fault}",
-            title=fault,
-            cwd=str(tmp_path / "exact-cwd"),
-            started_at=10.0,
-            last_active=20.0,
-            messages=(_message(f"event-{fault}", "Perform a meaningful fault test"),),
-            origin_kind=OriginKind.NATIVE,
-        )
-        candidate = build_claude_visibility_candidate(projection, eligible_at=20.0)
-        identity = derive_claude_visibility_identity(candidate, MARKER_SECRET)
-        store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        candidate = _registrar_candidate()
+        identity = derive_claude_visibility_identity(candidate, _REGISTRAR_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, _REGISTRAR_SECRET)
         launch = store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
         assert launch.lease_kind == "launch"
         assert launch.reserved_claude_uuid == identity.claude_uuid
 
-        # A service restart or expired lease is represented by the same durable
-        # retry transition; every other injected ambiguity is recorded directly.
-        if error_code == "lease_expired":
-            current[0] = base + 11.0
-            retry_claim = store.claim_claude_visibility_job(
-                base + 11.0, 10.0, 25, "0.50", "0.02", 5
-            )
-        else:
-            store.retry_claude_visibility_job(
-                identity.job_id,
-                launch.lease_digest or "",
-                error_code,
-                base + 1.0,
-                fault,
-            )
-            current[0] = base + 1.0
-            retry_claim = store.claim_claude_visibility_job(
-                base + 1.0, 10.0, 25, "0.50", "0.02", 5
-            )
+        launch_factory = factory()
+        registrar = ClaudeNativeRegistrar(
+            store,
+            _ClaudeSource([None]),
+            marker_secret=_REGISTRAR_SECRET,
+            pty_factory=launch_factory,
+            clock=lambda: current[0],
+            monotonic=lambda: 1.0,
+            sleep=lambda _seconds: None,
+            process_timeout=1.0,
+            exit_timeout=0.1,
+            discovery_timeout=0.0,
+            retry_delay=1.0,
+        )
+        outcome = registrar.process(launch)
+        assert outcome.error_code == error_code
+        assert len(launch_factory.spawns) == 1
+
+        current[0] = base + 1.0
+        retry_claim = store.claim_claude_visibility_job(
+            base + 1.0, 10.0, 25, "0.50", "0.02", 5
+        )
 
         assert retry_claim.lease_kind == "reconciliation"
         assert retry_claim.launch_permitted is False
         assert retry_claim.registration_reserved is False
         assert retry_claim.reserved_claude_uuid == identity.claude_uuid
+        reconciliation_factory = _ClaudeFactory()
+        recovered = (
+            _registrar_projection(retry_claim) if transcript_after_failure else None
+        )
+        reconciliation = ClaudeNativeRegistrar(
+            store,
+            _ClaudeSource([recovered]),
+            marker_secret=_REGISTRAR_SECRET,
+            pty_factory=reconciliation_factory,
+            clock=lambda: current[0],
+            monotonic=lambda: 1.0,
+            sleep=lambda _seconds: None,
+            discovery_timeout=0.0,
+        ).process(retry_claim)
+        assert reconciliation.status == (
+            "visible" if transcript_after_failure else "absent"
+        )
+        assert reconciliation.reserved_claude_uuid == identity.claude_uuid
+        assert reconciliation_factory.spawns == []
         status = store.claude_visibility_status(current[0])
         assert status["usage"]["attempts"] == 1  # launch_count remains one
     finally:
@@ -813,43 +865,137 @@ def test_claude_visibility_ambiguous_failure_matrix_never_replaces_uuid_or_relau
 
 
 @pytest.mark.parametrize(
-    ("fault", "error_code"),
-    [
-        ("malformed_marker", "marker_conflict"),
-        ("wrong_cwd", "cwd_conflict"),
-        ("wrong_name", "name_conflict"),
-        ("duplicate_uuid", "duplicate_uuid"),
-        ("unknown_retry", "invented_future_retry"),
-    ],
+    "fault", ["malformed_marker", "wrong_cwd", "wrong_name", "duplicate_uuid"]
 )
-def test_claude_visibility_fatal_failure_matrix_is_terminal_without_new_identity(
-    tmp_path: Path, fault: str, error_code: str
+def test_claude_visibility_identity_faults_are_detected_by_registrar_before_spawn(
+    fault: str,
 ) -> None:
-    database = SessionDB(tmp_path / f"fatal-{fault}.db")
+    item = _registrar_claim()
+    changes: dict[str, Any] = {}
+    source_kwargs: dict[str, Any] = {}
+    expected = {
+        "malformed_marker": "marker_conflict",
+        "wrong_cwd": "cwd_conflict",
+        "wrong_name": "name_conflict",
+        "duplicate_uuid": "duplicate_uuid",
+    }[fault]
+    if fault == "malformed_marker":
+        changes["messages"] = (_message("bad", "wrong marker"),)
+    elif fault == "wrong_cwd":
+        changes["cwd"] = "C:/wrong"
+    elif fault == "wrong_name":
+        changes["title"] = "wrong"
+    elif fault == "duplicate_uuid":
+        source_kwargs["duplicate_paths"] = [Path("C:/one.jsonl"), Path("C:/two.jsonl")]
+    projection = _registrar_projection(item, **changes)
+    factory = _ClaudeFactory()
+    store = _ClaudeStore()
+    result = ClaudeNativeRegistrar(
+        store,
+        _ClaudeSource([projection], **source_kwargs),
+        marker_secret=_REGISTRAR_SECRET,
+        pty_factory=factory,
+    ).process(item)
+    assert result.status == "failed"
+    assert result.error_code == expected
+    assert result.reserved_claude_uuid == item.reserved_claude_uuid
+    assert factory.spawns == []
+
+
+def test_claude_visibility_delayed_indexing_polls_after_one_real_registrar_launch() -> (
+    None
+):
+    item = _registrar_claim()
+    factory = _ClaudeFactory()
+    source = _ClaudeSource([None, _registrar_projection(item)])
+    ticks = iter([0.0, 0.0, 0.1])
+    result = ClaudeNativeRegistrar(
+        _ClaudeStore(),
+        source,
+        marker_secret=_REGISTRAR_SECRET,
+        pty_factory=factory,
+        clock=lambda: 100.0,
+        monotonic=lambda: next(ticks),
+        sleep=lambda _seconds: None,
+        discovery_timeout=1.0,
+    ).process(item)
+    assert result.status == "visible"
+    assert len(factory.spawns) == 1
+    assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
+
+
+@pytest.mark.parametrize(
+    "restart_kind", ["service_restart_while_leased", "stale_lease"]
+)
+def test_claude_visibility_restart_and_stale_lease_reconcile_reserved_uuid_without_launch(
+    tmp_path: Path, restart_kind: str
+) -> None:
+    now = [1_700_000_000.0]
+    database = SessionDB(tmp_path / f"{restart_kind}.db")
+    try:
+        store = SessionBridgeStore(database, clock=lambda: now[0])
+        candidate = _registrar_candidate()
+        identity = derive_claude_visibility_identity(candidate, _REGISTRAR_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, _REGISTRAR_SECRET)
+        leased = store.claim_claude_visibility_job(now[0], 10.0, 25, "0.50", "0.02", 5)
+        assert leased.lease_kind == "launch"
+
+        # Reconstructing the store models a real service restart; advancing past
+        # the lease models both restart recovery and an independently stale lease.
+        now[0] += 11.0
+        restarted = SessionBridgeStore(database, clock=lambda: now[0])
+        reconciliation = restarted.claim_claude_visibility_job(
+            now[0], 10.0, 25, "0.50", "0.02", 5
+        )
+        factory = _ClaudeFactory()
+        outcome = ClaudeNativeRegistrar(
+            restarted,
+            _ClaudeSource([None]),
+            marker_secret=_REGISTRAR_SECRET,
+            pty_factory=factory,
+            clock=lambda: now[0],
+        ).process(reconciliation)
+        assert reconciliation.lease_kind == "reconciliation"
+        assert (
+            reconciliation.reserved_claude_uuid
+            == leased.reserved_claude_uuid
+            == identity.claude_uuid
+        )
+        assert outcome.status == "absent"
+        assert factory.spawns == []
+        assert restarted.claude_visibility_status(now[0])["usage"]["attempts"] == 1
+    finally:
+        database.close()
+
+
+def test_claude_visibility_unknown_retry_code_in_durable_state_fails_closed(
+    tmp_path: Path,
+) -> None:
     base = 1_700_000_000.0
+    database = SessionDB(tmp_path / "unknown-retry.db")
     store = SessionBridgeStore(database, clock=lambda: base)
     try:
-        projection = SessionProjection(
-            provider=Provider.HERMES,
-            native_id=f"fatal-{fault}",
-            title=fault,
-            cwd=str(tmp_path),
-            started_at=10.0,
-            last_active=20.0,
-            messages=(_message(f"event-{fault}", "Exercise a fatal identity fault"),),
-            origin_kind=OriginKind.NATIVE,
-        )
-        candidate = build_claude_visibility_candidate(projection, eligible_at=20.0)
-        identity = derive_claude_visibility_identity(candidate, MARKER_SECRET)
-        store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        candidate = _registrar_candidate()
+        identity = derive_claude_visibility_identity(candidate, _REGISTRAR_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, _REGISTRAR_SECRET)
         claim = store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
-        failed = store.fail_claude_visibility_job(
-            identity.job_id, claim.lease_digest or "", error_code, fault
+        store.retry_claude_visibility_job(
+            identity.job_id,
+            claim.lease_digest or "",
+            "creation_ambiguous",
+            base + 1.0,
+            "seed valid durable retry",
         )
-
-        assert failed["state"] == "claude_failed"
-        assert failed["reserved_claude_uuid"] == identity.claude_uuid
-        assert store.claude_visibility_status(base)["usage"]["attempts"] == 1
+        # Durable restart corruption/forward-version state cannot be produced by
+        # the current API, so inject it at the persistence boundary deliberately.
+        database._conn.execute(
+            "UPDATE session_claude_visibility_jobs SET error_code = ? WHERE id = ?",
+            ("invented_future_retry", claim.job_id),
+        )
+        status = store.claude_visibility_status(base + 1.0)
+        _open, fatal = _claude_visibility_enqueue_gates(status)
+        assert "unknown_retry_code" in fatal
+        assert status["counts"]["claude_retry"] == 1
     finally:
         database.close()
 

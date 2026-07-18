@@ -25,6 +25,7 @@ from .characterize import (
     resolve_characterization_gate,
     resolve_cli_executable,
     characterize_claude_visibility,
+    cleanup_characterized_claude_visibility,
     run_live_characterization,
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
@@ -122,6 +123,16 @@ def _claude_visibility_preflight(
     version_text = version.stdout.strip() if version.returncode == 0 else ""
     if not version_text or authentication.returncode != 0:
         return None
+    try:
+        auth_status = json.loads(authentication.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(auth_status, dict):
+        return None
+    logged_in = auth_status.get("loggedIn")
+    authenticated = auth_status.get("authenticated")
+    if logged_in is not True and authenticated is not True:
+        return None
     return {"version": version_text, "authentication": "available"}
 
 
@@ -173,7 +184,9 @@ class _Backend(Protocol):
         self, *, enabled: bool
     ) -> Mapping[str, Any]: ...
     def claude_visibility_run_once(self) -> Mapping[str, Any]: ...
-    def characterize_claude_visibility(self) -> Mapping[str, Any]: ...
+    def characterize_claude_visibility(
+        self, cleanup_token: str | None = None
+    ) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
     def backfill_candidates(self, *, days: int) -> list[dict[str, Any]]: ...
@@ -560,7 +573,9 @@ class ProductionBackend:
             result, continuous=self.config.claude_visibility.continuous
         )
 
-    def characterize_claude_visibility(self) -> Mapping[str, Any]:
+    def characterize_claude_visibility(
+        self, cleanup_token: str | None = None
+    ) -> Mapping[str, Any]:
         if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
             raise ConfigurationFailure("live_characterization_not_enabled")
         claude_command = resolve_cli_executable("claude")
@@ -614,6 +629,15 @@ class ProductionBackend:
             / "characterization"
             / "claude-visibility-sources"
         )
+        if cleanup_token is not None:
+            return cleanup_characterized_claude_visibility(
+                cleanup_token=cleanup_token,
+                source_root=source_root,
+                projects_root=_CLAUDE_PROJECTS_ROOT,
+                restarted_source=lambda: ClaudeSourceAdapter(
+                    _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+                ),
+            )
         return characterize_claude_visibility(
             source_root=source_root,
             projects_root=_CLAUDE_PROJECTS_ROOT,
@@ -1155,6 +1179,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="register and verify one disposable native Claude mirror",
     )
     characterize_claude_visibility_parser.add_argument("--json", action="store_true")
+    characterize_claude_visibility_parser.add_argument("--cleanup-token")
 
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
@@ -1296,7 +1321,11 @@ def main(
                 else EXIT_OK
             )
         if args.command == "characterize-claude-visibility":
-            _emit(dict(backend.characterize_claude_visibility()))
+            if args.cleanup_token is None:
+                payload = backend.characterize_claude_visibility()
+            else:
+                payload = backend.characterize_claude_visibility(args.cleanup_token)
+            _emit(dict(payload))
             return EXIT_OK
         if args.command == "characterize":
             _emit(dict(backend.characterize(provider=args.provider)))

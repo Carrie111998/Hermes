@@ -7,7 +7,10 @@ from typing import Any
 
 import pytest
 
-from session_bridge.characterize import characterize_claude_visibility
+from session_bridge.characterize import (
+    characterize_claude_visibility,
+    cleanup_characterized_claude_visibility,
+)
 from session_bridge.cli import _claude_visibility_preflight
 from session_bridge.cli import main
 from session_bridge.config import BridgeConfig
@@ -87,7 +90,7 @@ def _claim_for(projection: SessionProjection) -> tuple[ClaudeVisibilityClaim, st
     ), identity.signed_marker
 
 
-def test_characterization_reserves_once_registers_once_restarts_and_cleans_exact_transcript(
+def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit_second_phase(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "sources"
@@ -143,36 +146,81 @@ def test_characterization_reserves_once_registers_once_restarts_and_cleans_exact
     assert Path(reserved[0].cwd or "").parent == source_root.resolve()
     assert result["reserved_claude_uuid"] == registrar.claims[0].reserved_claude_uuid
     assert result["restart_exact_id_verified"] is True
-    assert result["operator_checks"] == [
+    assert result["operator_checks"][:3] == [
         "Run /resume in Claude Code and select the deterministic characterization name.",
         "Press Ctrl+A in /resume to verify the exact session across all projects.",
         f"Resume the exact ID with: claude --resume {registrar.claims[0].reserved_claude_uuid}",
     ]
-    assert result["cleanup"] == "removed_exact_characterization"
+    assert result["cleanup_token"] in result["operator_checks"][3]
+    assert result["verification"] == "pending_operator_checks"
+    assert result["cleanup"] == "pending_explicit_confirmation"
+    assert isinstance(result["cleanup_token"], str)
+    assert state["transcript"].exists()
+    assert Path(reserved[0].cwd or "").exists()
+
+    cleaned = cleanup_characterized_claude_visibility(
+        cleanup_token=result["cleanup_token"],
+        source_root=source_root,
+        projects_root=projects_root,
+        restarted_source=restarted_source,
+    )
+
+    assert cleaned["verification"] == "operator_confirmed"
+    assert cleaned["cleanup"] == "removed_exact_characterization"
     assert not state["transcript"].exists()
     assert not Path(reserved[0].cwd or "").exists()
 
 
-def test_claude_preflight_reads_only_version_and_auth_without_registration() -> None:
+@pytest.mark.parametrize(
+    ("auth_payload", "expected"),
+    [
+        ('{"loggedIn": true}', {"version": "2.1.110", "authentication": "available"}),
+        (
+            '{"authenticated": true}',
+            {"version": "2.1.110", "authentication": "available"},
+        ),
+        ('{"loggedIn": false}', None),
+        ('{"authenticated": false}', None),
+        ('{"loggedIn": "true"}', None),
+        ("not-json", None),
+    ],
+)
+def test_claude_preflight_requires_explicit_true_auth_without_registration(
+    auth_payload: str, expected: dict[str, str] | None
+) -> None:
     calls: list[list[str]] = []
 
-    class Result:
-        returncode = 0
-        stdout = "2.1.110"
-        stderr = ""
-
-    def runner(argv: list[str], **_kwargs: Any) -> Result:
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
         calls.append(argv)
-        return Result()
+        stdout = "2.1.110" if argv[-1] == "--version" else auth_payload
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
 
-    assert _claude_visibility_preflight(("claude",), runner=runner) == {
-        "version": "2.1.110",
-        "authentication": "available",
-    }
+    assert _claude_visibility_preflight(("claude",), runner=runner) == expected
     assert calls == [
         ["claude", "--version"],
         ["claude", "auth", "status", "--json"],
     ]
+    assert all("--session-id" not in call and "--print" not in call for call in calls)
+
+
+@pytest.mark.parametrize("failed_call", ["version", "auth"])
+def test_claude_preflight_command_failure_fails_before_spending_slot(
+    failed_call: str,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
+        calls.append(argv)
+        is_version = argv[-1] == "--version"
+        failed = failed_call == ("version" if is_version else "auth")
+        stdout = "2.1.110" if is_version else '{"loggedIn": true}'
+        return type(
+            "Result",
+            (),
+            {"returncode": 1 if failed else 0, "stdout": stdout, "stderr": ""},
+        )()
+
+    assert _claude_visibility_preflight(("claude",), runner=runner) is None
     assert all("--session-id" not in call and "--print" not in call for call in calls)
 
 
@@ -187,7 +235,8 @@ def test_characterize_claude_visibility_json_dispatches_once(
             return {
                 "passed": True,
                 "restart_exact_id_verified": True,
-                "cleanup": "removed_exact_characterization",
+                "verification": "pending_operator_checks",
+                "cleanup": "pending_explicit_confirmation",
             }
 
         def close(self) -> None:
@@ -203,10 +252,45 @@ def test_characterize_claude_visibility_json_dispatches_once(
     )
     assert calls == ["characterize", "close"]
     assert json.loads(capsys.readouterr().out) == {
-        "cleanup": "removed_exact_characterization",
+        "cleanup": "pending_explicit_confirmation",
         "passed": True,
         "restart_exact_id_verified": True,
+        "verification": "pending_operator_checks",
     }
+
+
+def test_characterize_cli_explicit_cleanup_dispatches_token_without_registration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = "11111111-1111-4111-8111-111111111111"
+    calls: list[str | None] = []
+
+    class Backend:
+        def characterize_claude_visibility(
+            self, cleanup_token: str | None = None
+        ) -> dict[str, Any]:
+            calls.append(cleanup_token)
+            return {
+                "verification": "operator_confirmed",
+                "cleanup": "removed_exact_characterization",
+            }
+
+        def close(self) -> None:
+            pass
+
+    assert (
+        main(
+            ["characterize-claude-visibility", "--json", "--cleanup-token", token],
+            config_loader=BridgeConfig,
+            backend_factory=lambda _config: Backend(),  # type: ignore[arg-type]
+        )
+        == 0
+    )
+    assert calls == [token]
+    assert (
+        json.loads(capsys.readouterr().out)["cleanup"]
+        == "removed_exact_characterization"
+    )
 
 
 @pytest.mark.parametrize("mismatch", ["uuid", "marker", "path", "cwd", "name"])
@@ -265,5 +349,60 @@ def test_characterization_cleanup_aborts_on_identity_mismatch(
             registrar=_Registrar(),
             restarted_source=restarted_source,
             now=lambda: 10.0,
+        )
+    assert state["transcript"].exists()
+
+
+def test_explicit_cleanup_revalidates_identity_and_aborts_after_operator_phase(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("native", encoding="utf-8")
+        state.update(claim=claim, marker=marker, transcript=transcript)
+        return claim
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    pending = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=_Registrar(),
+        restarted_source=restarted_source,
+        now=lambda: 10.0,
+    )
+    state["claim"] = state["claim"].__class__(**{
+        **state["claim"].__dict__,
+        "native_name": "changed-after-verification",
+    })
+
+    with pytest.raises(RuntimeError, match="characterization_identity_mismatch"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=pending["cleanup_token"],
+            source_root=source_root,
+            projects_root=projects_root,
+            restarted_source=restarted_source,
         )
     assert state["transcript"].exists()
