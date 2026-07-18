@@ -871,6 +871,48 @@ class TestHeredocScriptExecution:
             assert dangerous is False, cmd
 
 
+class TestNodeEvalPrintLongFlags:
+    """Node.js --eval and --print long flags bypass the -e/-c short flag pattern.
+
+    `node --eval "code"` and `node --print "code"` execute arbitrary JS just
+    like `node -e`, but the existing pattern only catches the short forms.
+    """
+
+    def test_node_eval_inline_js_dangerous(self):
+        """node --eval with inline JS is dangerous."""
+        cmd = "node --eval \"console.log('pwned')\""
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "node --eval/--print long flag" in desc
+
+    def test_node_print_inline_js_dangerous(self):
+        """node --print with inline JS is dangerous."""
+        cmd = "node --print \"process.env.SECRET\""
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "node --eval/--print long flag" in desc
+
+    def test_node_no_warnings_eval_dangerous(self):
+        """node --no-warnings --eval with inline JS is dangerous."""
+        cmd = "node --no-warnings --eval \"require('fs').readFileSync('/etc/passwd')\""
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "node --eval/--print long flag" in desc
+
+    def test_node_short_e_remains_dangerous(self):
+        """node -e inline JS remains dangerous (regression check for short flag)."""
+        cmd = "node -e \"console.log('test')\""
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "script execution via -e/-c flag" in desc
+
+    def test_node_index_js_evaluate_not_dangerous(self):
+        """node index.js --evaluate is not dangerous (user-defined flag)."""
+        cmd = "node index.js --evaluate"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+
 class TestPgrepKillExpansion:
     """kill -9 $(pgrep hermes) bypasses the pkill/killall name-matching
     pattern because the command substitution is opaque to regex.
