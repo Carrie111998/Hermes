@@ -19,7 +19,8 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { useAtomicMultiFileAuthState } from './atomic_auth_state.js';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -484,7 +485,7 @@ function scheduleReconnect(delayMs) {
 }
 
 async function startSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+  const { state, saveCreds } = await useAtomicMultiFileAuthState(SESSION_DIR);
   const version = await resolveWaVersion();
 
   sock = makeWASocket({
