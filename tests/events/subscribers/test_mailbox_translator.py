@@ -231,6 +231,28 @@ def test_pipeline_update_enriches_title_company_from_pipeline_state(bus, tmp_pat
     assert t["company"] == "Acme"
 
 
+def test_pipeline_update_enriches_from_dict_keyed_pipeline_state(bus, tmp_path, monkeypatch):
+    """Regression: on this host Tracker projects `jobs` as a dict keyed by
+    job_id, not a list. The backfill iterated `jobs` as a list, so `for j in
+    <dict>` yielded keys (strings), every `j.get()` raised, and the broad
+    except returned {} — title/company never populated and the Telegram head
+    stayed a bare UUID. This fixture mirrors the real dict shape.
+    """
+    import events.subscribers.mailbox_translator as mt
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text(json.dumps({"jobs": {
+        "e0752a61": {"job_id": "e0752a61", "title": "Director Finance", "company": "Acme"},
+    }}), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {"job_key": "e0752a61", "new_stage": "archived"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["title"] == "Director Finance"
+    assert t["company"] == "Acme"
+
+
 def test_pipeline_update_enrichment_does_not_override_message_fields(bus, tmp_path, monkeypatch):
     """Title/company already in the message win over pipeline-state values."""
     import events.subscribers.mailbox_translator as mt

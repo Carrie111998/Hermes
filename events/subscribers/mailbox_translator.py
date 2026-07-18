@@ -128,8 +128,18 @@ class MailboxTranslator(BaseSubscriber):
                 if raw.startswith(b"\xef\xbb\xbf"):  # strip BOM (Windows-authored)
                     raw = raw[3:]
                 data = json.loads(raw.decode("utf-8"))
+                jobs = data.get("jobs", [])
+                # On this host Tracker projects `jobs` as a dict keyed by
+                # job_id; older/other producers use a list. Support both —
+                # iterating a dict yields keys (strings), which silently
+                # emptied this index before (every j.get() raised and the
+                # broad except returned {}), so title/company backfill never
+                # populated the Telegram STAGE_TRANSITION head.
+                job_records = jobs.values() if isinstance(jobs, dict) else jobs
                 index: Dict[str, Dict[str, str]] = {}
-                for j in data.get("jobs", []):
+                for j in job_records:
+                    if not isinstance(j, dict):
+                        continue
                     jid = j.get("job_id") or j.get("id")
                     if not jid:
                         continue
