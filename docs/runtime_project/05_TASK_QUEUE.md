@@ -1,50 +1,47 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-18 (Task 7 completed by Cursor)
+**Last updated:** 2026-07-18 (Task 8 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect acceptance for Task 7.
+None — awaiting Architect acceptance for Task 8.
 
 ---
 
 ## Completed
 
-### Task 7 — Manual Run Review API
+### Task 8 — Review-Gated Follow-up Planning API
 
 **Status:** ✅ Completed  
-**Tests:** `python3 -m pytest tests/htr/ -v` → **265 passed**
+**Tests:** `python3 -m pytest tests/htr/ -v` → **331 passed**
 
 Changes:
 
-- `run_review_record` contract + schema validation
-- `make_run_review_record`, `run_review_fingerprint`
-- `review_run_manually()` — requires run `completed` + `run_completion_record.json`
-- Writes `run_review_record.json`, appends `manual_run_reviewed` event
-- Does **not** update `run_manifest` by default
-- Replay-only when `run_review_record.json` already exists
-- Run-level events use shared `task_events.jsonl` (no `task_id` field)
+- `run_followup_plan_record` contract + schema validation
+- `make_run_followup_plan_record`, `run_followup_plan_fingerprint`
+- `plan_run_followup()` — requires completed run + completion record + review record
+- `source_review_decision` must match `run_review_record.json`
+- Writes `run_followup_plan_record.json`, appends `manual_run_followup_planned` event
+- Plan may be authored by human, assistant, tool, or mixed process (`planner` field)
+- **Records and audits only** — does not execute, schedule, delegate, or mutate lifecycle status
+- `followup_items` are planning notes, not tasks
+- Does **not** update `run_manifest`, `task_status`, or `attempt_status`
 
-### Task 6 — Manual Run Completion API
-
-**Status:** ✅ Accepted  
-**Tests:** 228 passed (regression verified in 265-test suite)
-
-### Task 5 — Manual Task Completion API
+### Task 7 — Manual Run Review API
 
 **Status:** ✅ Accepted
 
-### Task 4 / Task 3 / Task 2 / Task 1 / Task 0
+### Task 6 / Task 5 / Task 4 / Task 0–3
 
-**Status:** ✅ Accepted (regression verified in 265-test suite)
+**Status:** ✅ Accepted (regression verified in 331-test suite)
 
 ---
 
 ## Next Task (Architect)
 
-Task 8 — not started. Await scope assignment.
+Task 9 — not started. Await scope assignment.
 
 ---
 

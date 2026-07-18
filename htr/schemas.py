@@ -18,6 +18,7 @@ SchemaName = Literal[
     "task_completion_record",
     "run_completion_record",
     "run_review_record",
+    "run_followup_plan_record",
 ]
 
 
@@ -124,6 +125,19 @@ class RunReviewRecord(TypedDict):
     created_at: str
 
 
+class RunFollowupPlanRecord(TypedDict):
+    schema_version: int
+    run_id: str
+    source_review_decision: str
+    planner: str
+    plan_status: str
+    summary: str
+    followup_items: list[dict[str, Any]]
+    notes: str | None
+    metadata: dict[str, Any]
+    created_at: str
+
+
 class AttemptResult(TypedDict):
     schema_version: str
     run_id: str
@@ -216,6 +230,18 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_followup_plan_record": (
+        "schema_version",
+        "run_id",
+        "source_review_decision",
+        "planner",
+        "plan_status",
+        "summary",
+        "followup_items",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -259,6 +285,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_completion_record(data)
     elif schema_name == "run_review_record":
         _validate_run_review_record(data)
+    elif schema_name == "run_followup_plan_record":
+        _validate_run_followup_plan_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -468,3 +496,74 @@ def _validate_run_review_record(data: dict[str, Any]) -> None:
         raise ValueError("run_review_record: notes must be a string or null")
     if not isinstance(data["metadata"], dict):
         raise ValueError("run_review_record: metadata must be a dict")
+
+
+def _validate_run_followup_plan_record(data: dict[str, Any]) -> None:
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError("run_followup_plan_record: schema_version must be an int")
+    _require_str(data, "run_id", "run_followup_plan_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError("run_followup_plan_record: run_id must be a valid run id")
+    _require_str(data, "source_review_decision", "run_followup_plan_record")
+    if data["source_review_decision"] not in {
+        "accepted",
+        "rejected",
+        "needs_followup",
+    }:
+        raise ValueError(
+            "run_followup_plan_record: source_review_decision must be one of "
+            "accepted, rejected, needs_followup"
+        )
+    _require_str(data, "planner", "run_followup_plan_record")
+    _require_str(data, "plan_status", "run_followup_plan_record")
+    if data["plan_status"] not in {"open", "cancelled"}:
+        raise ValueError(
+            "run_followup_plan_record: plan_status must be one of open, cancelled"
+        )
+    _require_str(data, "summary", "run_followup_plan_record")
+    _require_str(data, "created_at", "run_followup_plan_record")
+    if "notes" not in data:
+        raise ValueError("run_followup_plan_record: missing fields: notes")
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError("run_followup_plan_record: notes must be a string or null")
+    followup_items = data.get("followup_items")
+    if not isinstance(followup_items, list):
+        raise ValueError("run_followup_plan_record: followup_items must be a list")
+    for item in followup_items:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_followup_plan_record: each followup item must be a dict"
+            )
+        for field in ("item_id", "title", "kind", "proposed_action"):
+            if field not in item or not isinstance(item[field], str) or not item[field]:
+                raise ValueError(
+                    f"run_followup_plan_record: followup item {field} must be a "
+                    "non-empty string"
+                )
+        if item["kind"] not in {
+            "manual_check",
+            "rerun_recommended",
+            "documentation_update",
+            "external_action",
+            "other",
+        }:
+            raise ValueError("run_followup_plan_record: followup item kind is invalid")
+        if "rationale" not in item:
+            raise ValueError(
+                "run_followup_plan_record: followup item missing fields: rationale"
+            )
+        rationale = item["rationale"]
+        if rationale is not None and not isinstance(rationale, str):
+            raise ValueError(
+                "run_followup_plan_record: followup item rationale must be a string or null"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_followup_plan_record: followup item metadata must be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_followup_plan_record: metadata must be a dict")

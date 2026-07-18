@@ -23,6 +23,8 @@ from htr.contracts import (
     result_fingerprint,
     run_completion_fingerprint,
     run_completion_record_json_path,
+    run_followup_plan_fingerprint,
+    run_followup_plan_record_json_path,
     run_review_fingerprint,
     run_review_record_json_path,
     task_completion_fingerprint,
@@ -54,6 +56,7 @@ EVENT_TYPE_MANUAL_VERIFICATION_SUBMITTED = "manual_verification_submitted"
 EVENT_TYPE_MANUAL_TASK_COMPLETED = "manual_task_completed"
 EVENT_TYPE_MANUAL_RUN_COMPLETED = "manual_run_completed"
 EVENT_TYPE_MANUAL_RUN_REVIEWED = "manual_run_reviewed"
+EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED = "manual_run_followup_planned"
 
 EVENT_TYPES = frozenset(
     {
@@ -65,6 +68,7 @@ EVENT_TYPES = frozenset(
         EVENT_TYPE_MANUAL_TASK_COMPLETED,
         EVENT_TYPE_MANUAL_RUN_COMPLETED,
         EVENT_TYPE_MANUAL_RUN_REVIEWED,
+        EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED,
     }
 )
 
@@ -1065,3 +1069,124 @@ def review_run_manually(
     atomic_write_json(review_record_path, review_record)
     append_run_event(run_id, candidate, base_dir)
     return candidate
+
+
+def _matches_manual_run_followup_planned_replay(
+    existing: dict[str, Any],
+    *,
+    run_id: str,
+    actor: str,
+    followup_plan_record: dict[str, Any],
+) -> bool:
+    """Return True when *existing* matches a successful follow-up plan replay."""
+    payload = existing.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        existing.get("event_type") == EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED
+        and existing.get("run_id") == run_id
+        and existing.get("actor") == actor
+        and payload.get("run_id") == run_id
+        and payload.get("source_review_decision")
+        == followup_plan_record["source_review_decision"]
+        and payload.get("plan_status") == followup_plan_record["plan_status"]
+        and payload.get("planner") == followup_plan_record["planner"]
+        and payload.get("run_followup_plan_fingerprint")
+        == run_followup_plan_fingerprint(followup_plan_record)
+    )
+
+
+def plan_run_followup(
+    run_id: str,
+    followup_plan_record: dict[str, Any],
+    *,
+    actor: str = "human",
+    event_id: str | None = None,
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Record a review-gated follow-up plan for a reviewed completed run.
+
+    The plan may be authored by a human, assistant, tool, or mixed process.
+    This API only validates, stores, and audits the plan; it does not execute it.
+    """
+    validate_id(run_id, "run")
+    validate_schema(followup_plan_record, "run_followup_plan_record")
+    if followup_plan_record["run_id"] != run_id:
+        raise ValueError(
+            "followup_plan_record run_id does not match submission target"
+        )
+
+    submitted_fingerprint = run_followup_plan_fingerprint(followup_plan_record)
+    followup_plan_record_path = run_followup_plan_record_json_path(run_id, base_dir)
+    completion_record_path = run_completion_record_json_path(run_id, base_dir)
+    review_record_path = run_review_record_json_path(run_id, base_dir)
+    manifest_path = paths.run_manifest_path(run_id, base_dir)
+
+    if not manifest_path.exists():
+        raise InvalidTransition(f"run {run_id!r} is not completed")
+
+    current_run_manifest = read_json(manifest_path)
+    if current_run_manifest["status"] != RUN_COMPLETED:
+        raise InvalidTransition(
+            f"run {run_id!r} is not completed; "
+            f"status is {current_run_manifest['status']!r}"
+        )
+
+    if not completion_record_path.exists():
+        raise InvalidTransition("run_completion_record.json is missing")
+
+    if not review_record_path.exists():
+        raise InvalidTransition("run_review_record.json is missing")
+
+    stored_review_record = read_json(review_record_path)
+    if (
+        followup_plan_record["source_review_decision"]
+        != stored_review_record["decision"]
+    ):
+        raise InvalidTransition(
+            "source_review_decision does not match run_review_record decision"
+        )
+
+    if followup_plan_record_path.exists():
+        existing_followup_plan_record = read_json(followup_plan_record_path)
+        validate_schema(existing_followup_plan_record, "run_followup_plan_record")
+        if event_id is None:
+            raise InvalidTransition("run_followup_plan_record.json already exists")
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise InvalidTransition("run_followup_plan_record.json already exists")
+        if _matches_manual_run_followup_planned_replay(
+            existing_event,
+            run_id=run_id,
+            actor=actor,
+            followup_plan_record=followup_plan_record,
+        ):
+            return existing_followup_plan_record
+        if existing_event.get("event_type") == EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED:
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise InvalidTransition("run_followup_plan_record.json already exists")
+
+    candidate = make_run_event(
+        event_type=EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED,
+        run_id=run_id,
+        actor=actor,
+        payload={
+            "run_id": run_id,
+            "source_review_decision": followup_plan_record["source_review_decision"],
+            "plan_status": followup_plan_record["plan_status"],
+            "planner": followup_plan_record["planner"],
+            "run_followup_plan_fingerprint": submitted_fingerprint,
+            "run_followup_plan_record_path": str(followup_plan_record_path),
+        },
+        event_id=event_id,
+    )
+    existing = _resolve_idempotent_event(run_id, candidate, base_dir)
+    if existing is not None:
+        return followup_plan_record
+
+    ensure_dir(followup_plan_record_path.parent)
+    atomic_write_json(followup_plan_record_path, followup_plan_record)
+    append_run_event(run_id, candidate, base_dir)
+    return followup_plan_record

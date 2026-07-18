@@ -321,3 +321,91 @@ def run_review_fingerprint(review_record: dict[str, Any]) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+FOLLOWUP_PLAN_OPEN = "open"
+FOLLOWUP_PLAN_CANCELLED = "cancelled"
+
+FOLLOWUP_PLAN_STATUSES: frozenset[str] = frozenset(
+    {
+        FOLLOWUP_PLAN_OPEN,
+        FOLLOWUP_PLAN_CANCELLED,
+    }
+)
+
+FOLLOWUP_ITEM_KINDS: frozenset[str] = frozenset(
+    {
+        "manual_check",
+        "rerun_recommended",
+        "documentation_update",
+        "external_action",
+        "other",
+    }
+)
+
+
+def run_followup_plan_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run follow-up plan record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_followup_plan_record.json"
+
+
+def _normalize_followup_items(
+    followup_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in followup_items:
+        normalized.append(
+            {
+                "item_id": item["item_id"],
+                "title": item["title"],
+                "kind": item["kind"],
+                "rationale": item.get("rationale"),
+                "proposed_action": item["proposed_action"],
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def make_run_followup_plan_record(
+    *,
+    run_id: str,
+    source_review_decision: str,
+    summary: str,
+    followup_items: list[dict[str, Any]],
+    planner: str = "human",
+    plan_status: str = FOLLOWUP_PLAN_OPEN,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated review-gated run follow-up plan record envelope."""
+    followup_plan_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_review_decision": source_review_decision,
+        "planner": planner,
+        "plan_status": plan_status,
+        "summary": summary,
+        "followup_items": _normalize_followup_items(followup_items),
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(followup_plan_record, "run_followup_plan_record")
+    return followup_plan_record
+
+
+def run_followup_plan_fingerprint(followup_plan_record: dict[str, Any]) -> str:
+    """Return a stable semantic fingerprint for a run follow-up plan record."""
+    validate_schema(followup_plan_record, "run_followup_plan_record")
+    return json.dumps(
+        followup_plan_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

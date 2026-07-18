@@ -628,3 +628,35 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 - No SQLite, scheduler, event replay from log
 
 **Awaiting:** Architect acceptance before Task 8.
+
+---
+
+## Task 8 — Review-Gated Follow-up Planning API (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance  
+**Tests:** 331 passed (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_followup_plan_record` schema + `make_run_followup_plan_record()`
+- `run_followup_plan_fingerprint()` — stable canonical JSON
+- `plan_run_followup()` — review-gated planning after completion + review records exist
+- `manual_run_followup_planned` event + replay-only when follow-up plan record exists
+- Plan status constants: `open`, `cancelled`
+- `planner` may be human, assistant, tool, or mixed process
+- `followup_items` are planning notes only — not tasks
+
+### Design principle
+
+Automate safe bookkeeping (schema, fingerprint, idempotency, replay, audit events).
+Do not automate execution, scheduling, delegation, or lifecycle mutation.
+
+### Non-goals confirmed
+
+- No task/attempt creation from follow-up items
+- No Runtime/delegate_task/DECO/HEAL/scheduler/queue/database
+- No artifact/result/verification content inspection
+- No run_manifest/task_status/attempt_status updates
+
+**Awaiting:** Architect acceptance before Task 9.
