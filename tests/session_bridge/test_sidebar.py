@@ -284,6 +284,29 @@ def test_meaningful_text_requires_three_unicode_alphanumerics(
     assert is_meaningful_user_text(content) is expected
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (
+            "[System: The active model for this chat has changed to model-x via "
+            "provider provider-y.]",
+            False,
+        ),
+        (
+            "[IMPORTANT: Background process proc_123 completed normally "
+            "(exit code 0). Command: test Output: done]",
+            False,
+        ),
+        ("try again", False),
+        ("Explain the [IMPORTANT: Background process] event format", True),
+    ],
+)
+def test_internal_user_role_events_and_context_only_retry_are_not_requests(
+    content: str, expected: bool
+) -> None:
+    assert is_meaningful_user_text(content) is expected
+
+
 def test_acknowledgement_control_vocabulary_is_frozen() -> None:
     assert ACK_OR_CONTROL_ONLY == frozenset({
         "ok",
@@ -291,6 +314,7 @@ def test_acknowledgement_control_vocabulary_is_frozen() -> None:
         "yes",
         "y",
         "ready",
+        "try again",
         "resume",
         "/resume",
         "clear",

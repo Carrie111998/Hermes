@@ -128,6 +128,37 @@ def test_fixed_reverse_loop_and_nonmeaningful_exclusions(
     assert evaluate_claude_visibility(projection, **flags) == reason
 
 
+def test_injected_internal_events_plus_context_only_retry_are_not_eligible() -> None:
+    projection = replace(
+        _projection(Provider.HERMES),
+        messages=(
+            ProjectedMessage(
+                "model-switch",
+                0,
+                "user",
+                (
+                    "[System: The active model for this chat has changed to model-x "
+                    "via provider provider-y.]"
+                ),
+                11.0,
+            ),
+            ProjectedMessage(
+                "process-complete",
+                1,
+                "user",
+                (
+                    "[IMPORTANT: Background process proc_123 completed normally "
+                    "(exit code 0). Command: test Output: done]"
+                ),
+                12.0,
+            ),
+            ProjectedMessage("retry", 2, "user", "try again", 13.0),
+        ),
+    )
+
+    assert evaluate_claude_visibility(projection) == "no_meaningful_request"
+
+
 def test_identity_name_and_marker_are_stable_across_restart_and_frozen() -> None:
     projection = _projection(
         Provider.CODEX,

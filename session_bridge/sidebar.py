@@ -19,6 +19,7 @@ ACK_OR_CONTROL_ONLY = frozenset({
     "yes",
     "y",
     "ready",
+    "try again",
     "resume",
     "/resume",
     "clear",
@@ -28,6 +29,10 @@ ACK_OR_CONTROL_ONLY = frozenset({
     "quit",
     "/quit",
 })
+_INTERNAL_USER_EVENT_PREFIXES = (
+    "[System: The active model for this chat has changed to ",
+    "[IMPORTANT: Background process ",
+)
 
 _TITLE_PREFIXES = {
     Provider.CLAUDE: "[Claude] ",
@@ -82,7 +87,11 @@ def normalize_meaningful_user_text(value: object) -> str | None:
 
 def is_meaningful_user_text(value: object) -> bool:
     normalized = normalize_meaningful_user_text(value)
-    if normalized is None or normalized.casefold() in ACK_OR_CONTROL_ONLY:
+    if (
+        normalized is None
+        or normalized.casefold() in ACK_OR_CONTROL_ONLY
+        or normalized.startswith(_INTERNAL_USER_EVENT_PREFIXES)
+    ):
         return False
     return sum(character.isalnum() for character in normalized) >= 3
 

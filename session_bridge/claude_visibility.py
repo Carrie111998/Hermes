@@ -47,7 +47,7 @@ CLAUDE_VISIBILITY_EXCLUSION_CODES = frozenset({
     "unstable_identity",
     "source_cwd_missing",
 })
-_ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready"})
+_ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready", "try again"})
 _CONTROLS = frozenset({
     "resume",
     "/resume",
