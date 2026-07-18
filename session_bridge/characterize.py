@@ -333,6 +333,7 @@ def characterize_claude_visibility(
         signed_marker=signed_marker,
         marker_secret=marker_secret,
         allow_recovered=True,
+        allow_post_ready_continuations=state["phase"] == "ready",
     )
     if state["transcript_path"] not in (None, str(resolved_transcript)):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
@@ -533,6 +534,7 @@ def _cleanup_characterized_claude_visibility_locked(
             signed_marker=_required_state_text(state, "signed_marker"),
             marker_secret=marker_secret,
             allow_recovered=True,
+            allow_post_ready_continuations=True,
         )
         if transcript != _safe_contained_file(
             project_root, _required_state_text(state, "transcript_path")
@@ -659,6 +661,7 @@ def _validate_characterization_transcript(
     signed_marker: str,
     marker_secret: bytes,
     allow_recovered: bool = False,
+    allow_post_ready_continuations: bool = False,
 ) -> Path:
     finder = getattr(restarted, "find_native_sessions", None)
     paths = (
@@ -741,6 +744,14 @@ def _validate_characterization_transcript(
     )
     auth_failure = recovery_kind == "auth_pending"
     recovered = recovery_kind == "recovered"
+    post_ready_continuation = (
+        allow_post_ready_continuations
+        and allow_recovered
+        and exact_structure
+        and _has_exact_post_ready_continuations(
+            messages, expected_prompt, recovery_prompt
+        )
+    )
     if auth_failure:
         first_response = messages[1]
         assert isinstance(first_response.content, str)
@@ -749,7 +760,7 @@ def _validate_characterization_transcript(
         raise CharacterizationAuthenticationFailure(
             hashlib.sha256(first_response.content.encode("utf-8")).hexdigest()
         )
-    if not normal and not recovered:
+    if not normal and not recovered and not post_ready_continuation:
         raise RuntimeError("characterization_identity_mismatch:response")
     if _path_identity(transcript) != before:
         raise RuntimeError("characterization_identity_mismatch:path_changed")
@@ -765,6 +776,46 @@ def _validate_characterization_transcript(
             transcript_digest,
         )
     return transcript
+
+
+def _has_exact_post_ready_continuations(
+    messages: Sequence[Any], expected_prompt: str, recovery_prompt: str
+) -> bool:
+    """Accept complete strict operator turns only after a valid ready prefix."""
+
+    for prefix_length in range(2, len(messages), 1):
+        prefix = list(messages[:prefix_length])
+        normal_prefix = (
+            len(prefix) == 2
+            and prefix[0].role == "user"
+            and prefix[0].content == expected_prompt
+            and prefix[1].role == "assistant"
+            and _is_exact_registered_text(prefix[1].content)
+        )
+        recovered_prefix = (
+            _classify_exact_auth_recovery_messages(
+                prefix, expected_prompt, recovery_prompt
+            )
+            == "recovered"
+        )
+        suffix = list(messages[prefix_length:])
+        if (
+            not (normal_prefix or recovered_prefix)
+            or len(suffix) < 2
+            or len(suffix) % 2 != 0
+        ):
+            continue
+        if all(
+            suffix[index].role == "user"
+            and isinstance(suffix[index].content, str)
+            and bool(suffix[index].content)
+            and suffix[index + 1].role == "assistant"
+            and isinstance(suffix[index + 1].content, str)
+            and bool(suffix[index + 1].content)
+            for index in range(0, len(suffix), 2)
+        ):
+            return True
+    return False
 
 
 def _sha256_file(path: Path) -> str:

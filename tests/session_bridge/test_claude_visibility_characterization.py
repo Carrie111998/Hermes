@@ -578,6 +578,97 @@ def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit
     assert not Path(reserved[0].cwd or "").exists()
 
 
+def test_ready_cleanup_accepts_complete_strict_operator_continuation_pair(
+    tmp_path: Path,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    state["messages"].extend([
+        ProjectedMessage(
+            "operator-user", 0, "user", "verify this exact resumed session", 12.0
+        ),
+        ProjectedMessage(
+            "operator-assistant", 0, "assistant", "verification complete", 13.0
+        ),
+    ])
+
+    with pytest.raises(
+        RuntimeError, match="characterization_identity_mismatch:response"
+    ):
+        _validate_characterization_transcript(
+            restarted=restarted_source(),
+            projects_root=state["projects_root"],
+            reserved_uuid=state["claim"].reserved_claude_uuid or "",
+            native_name=state["claim"].native_name or "",
+            source_cwd=state["claim"].source_cwd or "",
+            signed_marker=state["marker"],
+            marker_secret=SECRET,
+            allow_recovered=True,
+        )
+
+    cleaned = cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+
+    assert cleaned["cleanup"] == "removed_exact_characterization"
+    assert not state["transcript"].exists()
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        [ProjectedMessage("operator-user", 0, "user", "request", 12.0)],
+        [
+            ProjectedMessage("operator-user", 0, "user", "", 12.0),
+            ProjectedMessage("operator-assistant", 0, "assistant", "done", 13.0),
+        ],
+        [
+            ProjectedMessage("operator-user", 1, "user", "request", 12.0),
+            ProjectedMessage("operator-assistant", 0, "assistant", "done", 13.0),
+        ],
+        [
+            ProjectedMessage("u", 0, "user", "request", 12.0),
+            ProjectedMessage("operator-assistant", 0, "assistant", "done", 13.0),
+        ],
+        [
+            ProjectedMessage("operator-user", 0, "user", "request", 12.0),
+            ProjectedMessage(
+                "operator-assistant",
+                0,
+                "assistant",
+                "done",
+                13.0,
+                tool_name="tool",
+            ),
+        ],
+    ],
+)
+def test_ready_continuation_rejects_incomplete_or_unstructured_suffix(
+    tmp_path: Path, suffix: list[ProjectedMessage]
+) -> None:
+    _pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    state["messages"].extend(suffix)
+
+    with pytest.raises(
+        RuntimeError, match="characterization_identity_mismatch:response"
+    ):
+        _validate_characterization_transcript(
+            restarted=restarted_source(),
+            projects_root=state["projects_root"],
+            reserved_uuid=state["claim"].reserved_claude_uuid or "",
+            native_name=state["claim"].native_name or "",
+            source_cwd=state["claim"].source_cwd or "",
+            signed_marker=state["marker"],
+            marker_secret=SECRET,
+            allow_recovered=True,
+            allow_post_ready_continuations=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("auth_payload", "expected"),
     [
