@@ -983,6 +983,18 @@ class TestSessionConfiguration:
             "hermes_cli.models.detect_provider_for_model",
             lambda model, current: None,
         )
+        # Also freeze the module-level globals directly so mutations by a
+        # concurrent xdist worker cannot affect this test's execution path
+        # even through code paths that bypass parse_model_input.
+        from hermes_cli import models as _models_mod
+        monkeypatch.setattr(
+            _models_mod, "_PROVIDER_ALIASES",
+            dict(_models_mod._PROVIDER_ALIASES),
+        )
+        monkeypatch.setattr(
+            _models_mod, "_KNOWN_PROVIDER_NAMES",
+            set(_models_mod._KNOWN_PROVIDER_NAMES),
+        )
         manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
 
         with patch("run_agent.AIAgent", side_effect=fake_agent):
@@ -1568,6 +1580,18 @@ class TestSlashCommands:
         monkeypatch.setattr(
             "hermes_cli.models.detect_provider_for_model",
             lambda model, current: None,
+        )
+        # Also freeze the module-level globals directly so mutations by a
+        # concurrent xdist worker cannot affect this test's execution path
+        # even through code paths that bypass parse_model_input.
+        from hermes_cli import models as _models_mod
+        monkeypatch.setattr(
+            _models_mod, "_PROVIDER_ALIASES",
+            dict(_models_mod._PROVIDER_ALIASES),
+        )
+        monkeypatch.setattr(
+            _models_mod, "_KNOWN_PROVIDER_NAMES",
+            set(_models_mod._KNOWN_PROVIDER_NAMES),
         )
         manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
 

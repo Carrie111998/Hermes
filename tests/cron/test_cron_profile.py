@@ -223,13 +223,16 @@ class TestRunJobProfileContext:
         monkeypatch.setattr(sched, "_hermes_home", None)
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
 
-        import dotenv
+        import hermes_cli.env_loader as _env_loader
 
-        def fake_load_dotenv(path, *_a, **_kw):
-            observed.setdefault("dotenv_paths", []).append(str(path))
-            return True
+        def fake_load_hermes_dotenv(*, hermes_home=None, **_kw):
+            if hermes_home is not None:
+                observed.setdefault("dotenv_paths", []).append(
+                    str(Path(hermes_home) / ".env")
+                )
+            return []
 
-        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
+        monkeypatch.setattr(_env_loader, "load_hermes_dotenv", fake_load_hermes_dotenv)
 
     def test_run_job_sets_and_restores_profile_home(
         self, isolated_cron_profile_home, monkeypatch
@@ -264,8 +267,8 @@ class TestRunJobProfileContext:
     def test_profile_dotenv_environment_is_restored(
         self, isolated_cron_profile_home, monkeypatch
     ):
-        import dotenv
         import cron.scheduler as sched
+        import hermes_cli.env_loader as _env_loader
 
         root, profile_home = isolated_cron_profile_home
         observed: dict = {}
@@ -273,14 +276,17 @@ class TestRunJobProfileContext:
         monkeypatch.setenv("HERMES_PROFILE_TEST_SHARED", "outer")
         monkeypatch.delenv("HERMES_PROFILE_TEST_ONLY", raising=False)
 
-        def fake_load_dotenv(path, *_a, **_kw):
-            observed.setdefault("dotenv_paths", []).append(str(path))
+        def fake_load_hermes_dotenv(*, hermes_home=None, **_kw):
+            if hermes_home is not None:
+                observed.setdefault("dotenv_paths", []).append(
+                    str(Path(hermes_home) / ".env")
+                )
             os.environ["HERMES_PROFILE_TEST_SHARED"] = "profile-value"
             os.environ["HERMES_PROFILE_TEST_ONLY"] = "profile-only"
             os.environ["HERMES_CRON_TIMEOUT"] = "123"
-            return True
+            return []
 
-        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
+        monkeypatch.setattr(_env_loader, "load_hermes_dotenv", fake_load_hermes_dotenv)
 
         job = {
             "id": "env-profile",
