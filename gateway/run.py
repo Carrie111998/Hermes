@@ -1977,6 +1977,28 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
     return message
 
 
+def _append_ephemeral_user_context(message: Any, user_context: Optional[str]) -> Any:
+    """Append volatile context to the API-only current user turn."""
+
+    context = (user_context or "").strip()
+    if not context:
+        return message
+
+    suffix = f"\n\n{context}"
+    if isinstance(message, str):
+        return f"{message}{suffix}"
+
+    if isinstance(message, list):
+        wrapped = [dict(part) if isinstance(part, dict) else part for part in message]
+        for part in wrapped:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = f"{part.get('text', '')}{suffix}"
+                return wrapped
+        return wrapped + [{"type": "text", "text": context}]
+
+    return message
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -6793,6 +6815,8 @@ class TurnRunner:
         # message so stale guidance never replays as user-authored text.
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
+        if ctx.ephemeral_user_context and _persist_user_message_override is None:
+            _persist_user_message_override = ctx.message
 
         # Prepend pending model switch note so the model knows about the switch
         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
@@ -6965,8 +6989,12 @@ class TurnRunner:
             else:
                 _run_message = ctx.message
 
-            _api_run_message = _wrap_current_message_with_observed_context(
+            _api_run_message = _append_ephemeral_user_context(
                 _run_message,
+                ctx.ephemeral_user_context,
+            )
+            _api_run_message = _wrap_current_message_with_observed_context(
+                _api_run_message,
                 observed_group_context,
             )
             _conversation_kwargs = {
@@ -18143,6 +18171,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
+                ephemeral_user_context=event.ephemeral_user_context,
                 internal=event.internal,
                 timestamp=event.timestamp,
             )
@@ -18174,6 +18203,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
+                    ephemeral_user_context=event.ephemeral_user_context,
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
@@ -18197,6 +18227,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
+                ephemeral_user_context=event.ephemeral_user_context,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
@@ -22626,6 +22657,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     str(event.message_id) if event.message_id else None
                 ),
                 channel_prompt=event.channel_prompt,
+                ephemeral_user_context=event.ephemeral_user_context,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -30456,6 +30488,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        ephemeral_user_context: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
@@ -30478,6 +30511,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
+                ephemeral_user_context=ephemeral_user_context,
+                moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
@@ -30492,6 +30527,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
+                ephemeral_user_context=ephemeral_user_context,
+                moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
@@ -30635,6 +30672,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        ephemeral_user_context: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
@@ -30940,6 +30978,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             history=history,
             context_prompt=context_prompt,
             channel_prompt=channel_prompt,
+            ephemeral_user_context=ephemeral_user_context,
             session_id=session_id,
             session_key=session_key,
             run_generation=run_generation,
@@ -32110,6 +32149,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_ephemeral_user_context = None
                 next_session_key = session_key
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
@@ -32146,6 +32186,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_ephemeral_user_context = getattr(
+                        pending_event, "ephemeral_user_context", None
+                    )
                     next_message_type = getattr(pending_event, "message_type", None)
 
                 # Clear the completed streaming marker from the prior logical
@@ -32201,6 +32244,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    ephemeral_user_context=next_ephemeral_user_context,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
