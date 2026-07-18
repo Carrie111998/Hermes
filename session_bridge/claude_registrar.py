@@ -33,13 +33,28 @@ from .claude_visibility import (
     derive_claude_visibility_identity,
     validate_claude_visibility_identity_binding,
 )
-from .models import OriginKind, Provider, SessionProjection
+from .models import OriginKind, ProjectedMessage, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
 _RESPONSE_SETTLE_SECONDS = 0.5
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_CLAUDE_2110_RESUME_SCAFFOLD = "No response requested."
+_MAX_AUTH_RECOVERY_ATTEMPTS = 24
+
+
+def build_characterization_auth_recovery_prompt(
+    reserved_uuid: str, signed_marker: str
+) -> str:
+    marker_digest = hashlib.sha256(signed_marker.encode("utf-8")).hexdigest()
+    return (
+        "Hermes Session Bridge authentication recovery for the existing Claude "
+        f"session {reserved_uuid}.\n"
+        "Do not perform project work or use tools. Do not create a new session.\n"
+        f"Bound marker digest: {marker_digest}.\n"
+        "Reply with exactly REGISTERED and nothing else."
+    )
 
 
 class InteractivePty(Protocol):
@@ -1225,6 +1240,15 @@ def _validate_projection(
         raise _TranscriptConflict("bridge_conflict")
     expected = build_claude_registration_prompt(candidate, identity, marker_secret)
     messages = list(projection.messages)
+    recovery_kind = _classify_exact_auth_recovery_messages(
+        messages,
+        expected,
+        build_characterization_auth_recovery_prompt(
+            identity.claude_uuid, identity.signed_marker
+        ),
+    )
+    if recovery_kind == "recovered":
+        return
     prompt_indexes = [
         index
         for index, message in enumerate(messages)
@@ -1276,6 +1300,74 @@ def _is_exact_registered_text(content: object) -> bool:
         return False
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", content)).replace("\r", "")
     return cleaned.strip() == "REGISTERED"
+
+
+def _classify_exact_auth_recovery_messages(
+    messages: Sequence[ProjectedMessage],
+    expected_prompt: str,
+    recovery_prompt: str,
+) -> str | None:
+    """Recognize only bounded same-UUID auth recovery transcript shapes."""
+
+    original = list(messages)
+    if any(
+        message.ordinal != 0
+        or not isinstance(message.native_event_id, str)
+        or not message.native_event_id
+        or message.tool_name is not None
+        or message.tool_calls is not None
+        or message.tool_call_id is not None
+        or message.reasoning is not None
+        for message in original
+    ) or len({message.native_event_id for message in original}) != len(original):
+        return None
+    scaffolded = (
+        len(original) >= 5
+        and original[2].role == "assistant"
+        and original[2].content == _CLAUDE_2110_RESUME_SCAFFOLD
+    )
+    normalized = [*original[:2], *original[3:]] if scaffolded else original
+    if (
+        len(normalized) < 2
+        or len(normalized) % 2 != 0
+        or len(normalized) > 2 + 2 * _MAX_AUTH_RECOVERY_ATTEMPTS
+        or normalized[0].role != "user"
+        or normalized[0].content != expected_prompt
+        or normalized[1].role != "assistant"
+        or not _is_bounded_authentication_failure(normalized[1].content)
+    ):
+        return None
+    for index in range(2, len(normalized), 2):
+        recovery_user = normalized[index]
+        recovery_response = normalized[index + 1]
+        is_last = index + 1 == len(normalized) - 1
+        if (
+            recovery_user.role != "user"
+            or recovery_user.content != recovery_prompt
+            or recovery_response.role != "assistant"
+            or (
+                not _is_bounded_authentication_failure(recovery_response.content)
+                and not (
+                    is_last and _is_exact_registered_text(recovery_response.content)
+                )
+            )
+        ):
+            return None
+    last = normalized[-1]
+    if _is_bounded_authentication_failure(last.content):
+        return "auth_pending"
+    if len(normalized) >= 4 and _is_exact_registered_text(last.content):
+        return "recovered"
+    return None
+
+
+def _is_bounded_authentication_failure(content: object) -> bool:
+    return (
+        isinstance(content, str)
+        and 1 <= len(content) <= 2048
+        and "invalid authentication credentials" in content.casefold()
+        and _is_authentication_failure(content)
+    )
 
 
 def _is_authentication_failure(output: str) -> bool:

@@ -20,6 +20,7 @@ import pytest
 from hermes_state import SessionDB
 
 from session_bridge.claude_adapter import claude_project_directory_name
+from session_bridge.characterize import build_characterization_auth_recovery_prompt
 from session_bridge.claude_registrar import (
     ClaudeNativeRegistrar,
     PtyCleanupResult,
@@ -422,6 +423,36 @@ def test_auth_recovery_malformed_response_terminalizes_when_store_marks_fatal() 
 
     assert outcome.status == "failed"
     assert outcome.error_code == "bridge_conflict"
+
+
+def test_strict_projection_accepts_exact_2110_resume_scaffold() -> None:
+    item = claim()
+    value = candidate()
+    identity = derive_claude_visibility_identity(value, SECRET)
+    original_prompt = build_claude_registration_prompt(value, identity, SECRET)
+    recovery_prompt = build_characterization_auth_recovery_prompt(
+        item.reserved_claude_uuid or "", item.signed_marker or ""
+    )
+    messages = [
+        ProjectedMessage("original", 0, "user", original_prompt, 10.0),
+        ProjectedMessage(
+            "auth",
+            0,
+            "assistant",
+            "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+            11.0,
+        ),
+        ProjectedMessage("scaffold", 0, "assistant", "No response requested.", 12.0),
+        ProjectedMessage("recovery-user", 0, "user", recovery_prompt, 13.0),
+        ProjectedMessage("recovery-assistant", 0, "assistant", "REGISTERED", 14.0),
+    ]
+    projection = projection_for(item, messages=messages, last_active=14.0)
+    store = FakeStore()
+
+    result = registrar(FakeSource([projection]), FakeFactory(), store).process(item)
+
+    assert result.status == "visible"
+    assert store.calls[0][0] == "commit"
 
 
 def test_terminal_echo_and_ansi_are_removed_before_exact_response_check() -> None:

@@ -251,6 +251,79 @@ def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
         )
 
 
+def test_characterization_accepts_only_exact_2110_resume_scaffold(
+    tmp_path: Path,
+) -> None:
+    projects_root = tmp_path / "projects"
+    source_projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id="operation-scaffold",
+        title="Claude native visibility characterization",
+        cwd=str(tmp_path / "source"),
+        started_at=10.0,
+        last_active=10.0,
+        messages=[ProjectedMessage("source", 0, "user", "request", 10.0)],
+        native_path=str(tmp_path / "source" / "source.json"),
+        native_hash="0" * 64,
+        origin_kind=OriginKind.NATIVE,
+    )
+    claim, marker = _claim_for(source_projection)
+    transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("native", encoding="utf-8")
+    prompt = _successful_characterization_messages(claim, marker)[0]
+    recovery_prompt = build_characterization_auth_recovery_prompt(
+        claim.reserved_claude_uuid or "", marker
+    )
+    messages = [
+        prompt,
+        ProjectedMessage(
+            "auth",
+            0,
+            "assistant",
+            "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+            11.0,
+        ),
+        ProjectedMessage("scaffold", 0, "assistant", "No response requested.", 12.0),
+        ProjectedMessage("recovery-user", 0, "user", recovery_prompt, 13.0),
+        ProjectedMessage("recovery-assistant", 0, "assistant", "REGISTERED", 14.0),
+    ]
+
+    def validate(projected_messages: list[ProjectedMessage]) -> Path:
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=14.0,
+            messages=projected_messages,
+            native_path=str(transcript),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _validate_characterization_transcript(
+            restarted=_RestartedSource(transcript, projection, marker),
+            projects_root=projects_root,
+            reserved_uuid=claim.reserved_claude_uuid or "",
+            native_name=claim.native_name or "",
+            source_cwd=claim.source_cwd or "",
+            signed_marker=marker,
+            marker_secret=SECRET,
+        )
+
+    with pytest.raises(RuntimeError, match="recovery_authority_required"):
+        validate(messages)
+    with pytest.raises(
+        RuntimeError, match="characterization_identity_mismatch:response"
+    ):
+        validate([
+            *messages[:2],
+            replace(messages[2], content="arbitrary"),
+            *messages[3:],
+        ])
+
+
 @pytest.mark.parametrize(
     "messages",
     [
