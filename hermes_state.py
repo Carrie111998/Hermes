@@ -1036,6 +1036,38 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_reconciliations (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS session_claude_auth_recoveries (
+    job_id TEXT PRIMARY KEY,
+    reserved_claude_uuid TEXT NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    prompt_digest TEXT NOT NULL CHECK (
+        length(prompt_digest) = 64
+        AND prompt_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK (state IN ('leased', 'retry', 'completed')),
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT UNIQUE,
+    lease_expires_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    CHECK (
+        (state = 'leased' AND lease_digest IS NOT NULL
+         AND lease_expires_at IS NOT NULL)
+        OR (state != 'leased' AND lease_digest IS NULL
+            AND lease_expires_at IS NULL)
+    ),
+    CHECK ((state = 'completed') = (completed_at IS NOT NULL)),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS session_context_packs (
     id TEXT PRIMARY KEY,
     bridge_id TEXT NOT NULL,

@@ -11,8 +11,11 @@ from typing import Any, Mapping
 import pytest
 
 from session_bridge.characterize import (
+    CharacterizationAuthenticationFailure,
+    build_characterization_auth_recovery_prompt,
     _prepare_safe_root,
     _read_characterization_record,
+    _validate_characterization_transcript,
     _write_characterization_record,
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
@@ -22,7 +25,9 @@ from session_bridge.cli import main
 from session_bridge.config import BridgeConfig
 from session_bridge.claude_registrar import ClaudeRegistrarOutcome
 from session_bridge.claude_visibility import (
+    ClaudeVisibilityCandidate,
     ClaudeVisibilityClaim,
+    build_claude_registration_prompt,
     derive_claude_visibility_identity,
 )
 from session_bridge.models import (
@@ -34,6 +39,34 @@ from session_bridge.models import (
 
 
 SECRET = b"characterization-marker-secret"
+
+
+def _successful_characterization_messages(
+    claim: ClaudeVisibilityClaim, marker: str, timestamp: float = 10.0
+) -> list[ProjectedMessage]:
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=claim.source_session_id or "",
+        source_provider=Provider.CODEX,
+        native_name=claim.native_name or "",
+        source_cwd=claim.source_cwd or "",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=0.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, SECRET)
+    assert identity.signed_marker == marker
+    return [
+        ProjectedMessage(
+            "u",
+            0,
+            "user",
+            build_claude_registration_prompt(candidate, identity, SECRET),
+            timestamp,
+        ),
+        ProjectedMessage("a", 1, "assistant", "REGISTERED", timestamp + 1.0),
+    ]
 
 
 @dataclass
@@ -70,6 +103,88 @@ class _Registrar:
         return ClaudeRegistrarOutcome(
             "visible", claim.job_id, claim.reserved_claude_uuid
         )
+
+
+def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
+    tmp_path: Path,
+) -> None:
+    projects_root = tmp_path / "projects"
+    transcript = projects_root / "exact" / "reserved.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("native", encoding="utf-8")
+    source_projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id="operation",
+        title="Claude native visibility characterization",
+        cwd=str(tmp_path / "source"),
+        started_at=10.0,
+        last_active=10.0,
+        messages=[ProjectedMessage("source", 0, "user", "request", 10.0)],
+        native_path=str(tmp_path / "source" / "source.json"),
+        native_hash="0" * 64,
+        origin_kind=OriginKind.NATIVE,
+    )
+    claim, marker = _claim_for(source_projection)
+    transcript = transcript.with_name(f"{claim.reserved_claude_uuid}.jsonl")
+    transcript.write_text("native", encoding="utf-8")
+    projection = SessionProjection(
+        provider=Provider.CLAUDE,
+        native_id=claim.reserved_claude_uuid,
+        title=claim.native_name,
+        cwd=claim.source_cwd,
+        started_at=10.0,
+        last_active=11.0,
+        messages=[
+            _successful_characterization_messages(claim, marker)[0],
+            ProjectedMessage(
+                "a",
+                1,
+                "assistant",
+                "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+                11.0,
+            ),
+        ],
+        native_path=str(transcript),
+        native_hash="b" * 64,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+    )
+
+    with pytest.raises(CharacterizationAuthenticationFailure) as raised:
+        _validate_characterization_transcript(
+            restarted=_RestartedSource(transcript, projection, marker),
+            projects_root=projects_root,
+            reserved_uuid=claim.reserved_claude_uuid or "",
+            native_name=claim.native_name or "",
+            source_cwd=claim.source_cwd or "",
+            signed_marker=marker,
+            marker_secret=SECRET,
+        )
+    assert len(raised.value.evidence_digest) == 64
+
+    projection.messages.extend([
+        ProjectedMessage(
+            "recovery-user",
+            2,
+            "user",
+            build_characterization_auth_recovery_prompt(
+                claim.reserved_claude_uuid or "", marker
+            ),
+            12.0,
+        ),
+        ProjectedMessage("recovery-assistant", 3, "assistant", "REGISTERED", 13.0),
+    ])
+    assert (
+        _validate_characterization_transcript(
+            restarted=_RestartedSource(transcript, projection, marker),
+            projects_root=projects_root,
+            reserved_uuid=claim.reserved_claude_uuid or "",
+            native_name=claim.native_name or "",
+            source_cwd=claim.source_cwd or "",
+            signed_marker=marker,
+            marker_secret=SECRET,
+        )
+        == transcript
+    )
 
 
 def _claim_for(projection: SessionProjection) -> tuple[ClaudeVisibilityClaim, str]:
@@ -112,7 +227,12 @@ def _pending_characterization(
         transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
         transcript.parent.mkdir()
         transcript.write_text("native", encoding="utf-8")
-        state.update(claim=claim, marker=marker, transcript=transcript)
+        state.update(
+            claim=claim,
+            marker=marker,
+            transcript=transcript,
+            messages=_successful_characterization_messages(claim, marker),
+        )
         return claim
 
     def restarted_source() -> _RestartedSource:
@@ -124,7 +244,7 @@ def _pending_characterization(
             cwd=claim.source_cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=state["messages"],
             native_path=str(state["transcript"]),
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -178,7 +298,7 @@ def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit
             cwd=claim.source_cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=_successful_characterization_messages(claim, state["marker"]),
             native_path=str(state["transcript"]),
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -437,7 +557,7 @@ def test_characterization_cleanup_aborts_on_identity_mismatch(
             cwd=cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=_successful_characterization_messages(claim, state["marker"]),
             native_path=native_path,
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -471,7 +591,12 @@ def test_explicit_cleanup_revalidates_identity_and_aborts_after_operator_phase(
         transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
         transcript.parent.mkdir()
         transcript.write_text("native", encoding="utf-8")
-        state.update(claim=claim, marker=marker, transcript=transcript)
+        state.update(
+            claim=claim,
+            marker=marker,
+            transcript=transcript,
+            messages=_successful_characterization_messages(claim, marker),
+        )
         return claim
 
     def restarted_source() -> _RestartedSource:
@@ -483,7 +608,7 @@ def test_explicit_cleanup_revalidates_identity_and_aborts_after_operator_phase(
             cwd=claim.source_cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=state["messages"],
             native_path=str(state["transcript"]),
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -551,7 +676,7 @@ def test_characterization_rerun_reconciles_same_operation_without_second_launch(
             cwd=claim.source_cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=_successful_characterization_messages(claim, state["marker"]),
             native_path=str(state["transcript"]),
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -651,7 +776,7 @@ def test_characterization_rerun_reconciles_absence_then_relaunches_reserved_uuid
             cwd=claim.source_cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=_successful_characterization_messages(claim, state["marker"]),
             native_path=str(transcript),
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -691,6 +816,102 @@ def test_characterization_rerun_reconciles_absence_then_relaunches_reserved_uuid
     assert claims[2].attempt_ordinal == 2
 
 
+def test_characterization_salvages_bounded_auth_failure_by_resuming_same_uuid(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {"messages": []}
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("native", encoding="utf-8")
+        state.update(claim=claim, marker=marker, transcript=transcript)
+        state["messages"] = [
+            _successful_characterization_messages(claim, marker)[0],
+            ProjectedMessage(
+                "a",
+                1,
+                "assistant",
+                "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+                11.0,
+            ),
+        ]
+        return claim
+
+    class FailedRegistrar:
+        def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+            return ClaudeRegistrarOutcome(
+                "failed", claim.job_id, claim.reserved_claude_uuid, "bridge_conflict"
+            )
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=13.0,
+            messages=list(state["messages"]),
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    with pytest.raises(RuntimeError, match="characterization_registration_failed"):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=FailedRegistrar(),
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 10.0,
+        )
+
+    completed: list[tuple[Mapping[str, Any], str]] = []
+
+    def recover(
+        operation: Mapping[str, Any], evidence_digest: str, prompt: str
+    ) -> Mapping[str, Any]:
+        assert operation["reserved_claude_uuid"] == state["claim"].reserved_claude_uuid
+        assert len(evidence_digest) == 64
+        state["messages"].extend([
+            ProjectedMessage("ru", 2, "user", prompt, 12.0),
+            ProjectedMessage("ra", 3, "assistant", "REGISTERED", 13.0),
+        ])
+        return {
+            "status": "recovered",
+            "job_id": operation["job_id"],
+            "reserved_claude_uuid": operation["reserved_claude_uuid"],
+            "lease_digest": "c" * 64,
+        }
+
+    result = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=FailedRegistrar(),
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        recover_auth_failure=recover,
+        complete_auth_recovery=lambda recovery, digest: completed.append((
+            recovery,
+            digest,
+        )),
+        now=lambda: 14.0,
+    )
+
+    assert result["reserved_claude_uuid"] == state["claim"].reserved_claude_uuid
+    assert len(completed) == 1 and len(completed[0][1]) == 64
+
+
 def test_characterization_recovers_same_cleanup_capability_after_ready_write_error(
     tmp_path: Path,
 ) -> None:
@@ -727,7 +948,7 @@ def test_characterization_recovers_same_cleanup_capability_after_ready_write_err
             cwd=claim.source_cwd,
             started_at=10.0,
             last_active=11.0,
-            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            messages=_successful_characterization_messages(claim, state["marker"]),
             native_path=str(state["transcript"]),
             native_hash="b" * 64,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -1100,7 +1321,9 @@ def test_cleanup_rejects_forged_capability_and_leaves_exact_artifacts(
                 cwd=state["claim"].source_cwd,
                 started_at=10.0,
                 last_active=11.0,
-                messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+                messages=_successful_characterization_messages(
+                    state["claim"], state["marker"]
+                ),
                 native_path=str(state["transcript"]),
                 native_hash="b" * 64,
                 origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
@@ -1125,7 +1348,9 @@ def test_cleanup_rejects_forged_capability_and_leaves_exact_artifacts(
                     cwd=state["claim"].source_cwd,
                     started_at=10.0,
                     last_active=11.0,
-                    messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+                    messages=_successful_characterization_messages(
+                        state["claim"], state["marker"]
+                    ),
                     native_path=str(state["transcript"]),
                     native_hash="b" * 64,
                     origin_kind=OriginKind.BRIDGE_PLACEHOLDER,

@@ -5712,6 +5712,104 @@ def test_claude_visibility_expected_job_claim_reaps_its_expired_lease(
     assert recovered.attempt_ordinal == first.attempt_ordinal == 1
 
 
+def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-recovery")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000001",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    assert recovery["status"] == "claimed"
+    assert recovery["reserved_claude_uuid"] == identity.claude_uuid
+    assert recovery["attempt_ordinal"] == 2
+    assert store.claude_visibility_status(100.0)["usage"]["attempts"] == 2
+
+    clock[0] = 111.0
+    resumed = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000001",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=111.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    assert resumed["status"] == "claimed"
+    assert resumed["attempt_ordinal"] == recovery["attempt_ordinal"]
+    assert resumed["reserved_claude_uuid"] == recovery["reserved_claude_uuid"]
+    assert store.claude_visibility_status(111.0)["usage"]["attempts"] == 2
+    committed = store.commit_claude_auth_recovery(
+        job_id=identity.job_id,
+        lease_digest=resumed["lease_digest"],
+        reserved_claude_uuid=identity.claude_uuid,
+        transcript_digest="c" * 64,
+        visible_at=111.0,
+    )
+    assert committed["state"] == "claude_visible"
+    recovery_row = _rows(
+        db,
+        "SELECT state, completed_at FROM session_claude_auth_recoveries WHERE job_id = ?",
+        (identity.job_id,),
+    )[0]
+    assert recovery_row == {"state": "completed", "completed_at": 111.0}
+
+
+def test_claude_auth_recovery_refuses_when_any_other_open_job_exists(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-recovery-blocked")
+    other_candidate, other_identity = _claude_visibility_identity("other-open")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+    _enqueue_claude_visibility_job(store, other_candidate, other_identity)
+
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000002",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    assert recovery == {"status": "not_sole_open_job", "job_id": identity.job_id}
+    rows = _rows(db, "SELECT id, state FROM session_claude_visibility_jobs")
+    assert {row["id"]: row["state"] for row in rows} == {
+        identity.job_id: "claude_failed",
+        other_identity.job_id: "claude_pending",
+    }
+
+
 def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(
     db: SessionDB,
 ) -> None:

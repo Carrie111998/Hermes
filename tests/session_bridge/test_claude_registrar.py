@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import timezone
 import io
+import hashlib
 import json
 from itertools import product
 import os
@@ -175,6 +176,10 @@ class FakeStore:
         self.calls.append(("absent", *args))
         return {"state": "claude_retry"}
 
+    def retry_claude_auth_recovery(self, *args: Any) -> dict[str, Any]:
+        self.calls.append(("retry_auth_recovery", *args))
+        return {"state": "retry"}
+
 
 class FakePty:
     def __init__(
@@ -313,6 +318,51 @@ def test_launch_uses_persistent_print_mode_and_never_writes_exit_command() -> No
     assert process.writes == []
     assert "tool_calls" not in factory.spawns[0][0][-1]
     assert process.closed and process.waits == [1.0]
+
+
+def test_auth_recovery_resumes_exact_uuid_in_print_mode_without_create_or_exit() -> (
+    None
+):
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    process = FakePty(output="REGISTERED\r\n", exit_code=0)
+    factory = FakeFactory(process)
+
+    outcome = registrar(FakeSource(), factory).resume_auth_recovery(recovery, prompt)
+
+    assert outcome.status == "recovered"
+    assert outcome.reserved_claude_uuid == item.reserved_claude_uuid
+    assert factory.spawns == [
+        (
+            [
+                "claude",
+                "--resume",
+                item.reserved_claude_uuid,
+                "--model",
+                "haiku",
+                "--tools",
+                "",
+                "--permission-mode",
+                "dontAsk",
+                "--print",
+                prompt,
+            ],
+            item.source_cwd,
+        )
+    ]
+    assert "--session-id" not in factory.spawns[0][0]
+    assert "--no-session-persistence" not in factory.spawns[0][0]
+    assert process.writes == []
 
 
 def test_terminal_echo_and_ansi_are_removed_before_exact_response_check() -> None:
@@ -681,6 +731,13 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
         (
             None,
             FakePty(output="Authentication required"),
+            "claude_authentication_unavailable",
+        ),
+        (
+            None,
+            FakePty(
+                output="Failed to authenticate. API Error: 401 Invalid authentication credentials"
+            ),
             "claude_authentication_unavailable",
         ),
         (None, FakePty(exit_code=7), "clean_exit_not_observed"),

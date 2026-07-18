@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -644,6 +645,55 @@ class ProductionBackend:
                 raise RolloutGateBlocked("characterization_claim_mismatch")
             return claim
 
+        def _recover_auth_failure(
+            operation: Mapping[str, Any], evidence_digest: str, prompt: str
+        ) -> Mapping[str, Any]:
+            job_id = operation.get("job_id")
+            reserved_uuid = operation.get("reserved_claude_uuid")
+            operation_id = operation.get("operation_id")
+            if any(
+                not isinstance(value, str) or not value
+                for value in (job_id, reserved_uuid, operation_id)
+            ):
+                raise RolloutGateBlocked("characterization_recovery_identity_invalid")
+            recovery = store.claim_claude_auth_recovery(
+                job_id=str(job_id),
+                reserved_claude_uuid=str(reserved_uuid),
+                operation_id=str(operation_id),
+                evidence_digest=evidence_digest,
+                prompt_digest=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                now=time.time(),
+                lease_seconds=policy.lease_seconds,
+                daily_limit=policy.daily_registration_limit,
+                cost_limit=policy.emergency_daily_cost_usd,
+                reserved_cost=policy.reserved_cost_per_attempt_usd,
+                max_attempts=policy.max_attempts,
+            )
+            if recovery.get("status") != "claimed":
+                raise RolloutGateBlocked("characterization_recovery_not_available")
+            outcome = registrar.resume_auth_recovery(recovery, prompt)
+            if outcome.status != "recovered":
+                raise ProviderDegraded(
+                    outcome.error_code or "characterization_recovery_failed"
+                )
+            return {
+                **recovery,
+                "status": "recovered",
+                "job_id": outcome.job_id,
+                "reserved_claude_uuid": outcome.reserved_claude_uuid,
+            }
+
+        def _complete_auth_recovery(
+            recovery: Mapping[str, Any], transcript_digest: str
+        ) -> None:
+            store.commit_claude_auth_recovery(
+                job_id=str(recovery["job_id"]),
+                lease_digest=str(recovery["lease_digest"]),
+                reserved_claude_uuid=str(recovery["reserved_claude_uuid"]),
+                transcript_digest=transcript_digest,
+                visible_at=time.time(),
+            )
+
         return characterize_claude_visibility(
             source_root=source_root,
             projects_root=_CLAUDE_PROJECTS_ROOT,
@@ -653,6 +703,8 @@ class ProductionBackend:
                 _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
             ),
             marker_secret=marker_secret,
+            recover_auth_failure=_recover_auth_failure,
+            complete_auth_recovery=_complete_auth_recovery,
         )
 
     def _claude_visibility_runtime(self) -> ClaudeVisibilityCoordinator:
@@ -1595,6 +1647,12 @@ def _claude_characterization_open_work_allowed(
             "claude_leased": 1,
             "claude_retry": 0,
             "claude_failed": 0,
+        },
+        {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_failed": 1,
         },
     )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import importlib.metadata
 import inspect
 import json
@@ -17,7 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .claude_adapter import (
     ClaudeParseResult,
@@ -83,6 +84,13 @@ class ClaudeVisibilityStore(Protocol):
         reserved_claude_uuid: str,
         attempt_ordinal: int,
         evidence_digest: str,
+    ) -> dict[str, object]: ...
+    def retry_claude_auth_recovery(
+        self,
+        job_id: str,
+        lease_digest: str,
+        error_code: str,
+        next_attempt_at: float,
     ) -> dict[str, object]: ...
 
 
@@ -744,6 +752,111 @@ class ClaudeNativeRegistrar:
             return self._reconcile(claim, candidate, identity)
         return self._launch(claim, candidate, identity)
 
+    def resume_auth_recovery(
+        self, claim: Mapping[str, Any], prompt: str
+    ) -> ClaudeRegistrarOutcome:
+        """Resume one exact persisted UUID under a durable recovery lease."""
+
+        job_id = claim.get("job_id")
+        native_id = claim.get("reserved_claude_uuid")
+        lease_digest = claim.get("lease_digest")
+        source_cwd = claim.get("source_cwd")
+        prompt_digest = claim.get("prompt_digest")
+        if (
+            claim.get("status") != "claimed"
+            or any(
+                not isinstance(value, str) or not value
+                for value in (
+                    job_id,
+                    native_id,
+                    lease_digest,
+                    source_cwd,
+                    prompt_digest,
+                )
+            )
+            or not isinstance(prompt, str)
+            or not prompt
+            or not hmac.compare_digest(
+                str(prompt_digest), hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            )
+        ):
+            raise ValueError("invalid Claude authentication recovery authority")
+        argv = [
+            *self._command,
+            "--resume",
+            str(native_id),
+            "--model",
+            "haiku",
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--print",
+            prompt,
+        ]
+        process: InteractivePty | None = None
+        clean_exit = False
+        pending: tuple[str, str] | None = None
+        try:
+            process = self._factory.spawn(argv, cwd=str(source_cwd))
+            output = process.read_until(self._process_timeout, prompt=prompt)
+            if _is_authentication_failure(output):
+                pending = (
+                    "claude_authentication_unavailable",
+                    "Claude authentication unavailable",
+                )
+            elif not _has_exact_registered_response(output, prompt):
+                pending = ("bridge_conflict", "recovery response malformed")
+            else:
+                exit_code = process.wait(self._exit_timeout)
+                if type(exit_code) is not int or exit_code != 0:
+                    pending = (
+                        "clean_exit_not_observed",
+                        "Claude did not exit cleanly",
+                    )
+                else:
+                    clean_exit = True
+        except FileNotFoundError:
+            pending = (
+                "claude_executable_unavailable",
+                "Claude executable unavailable",
+            )
+        except Exception:
+            pending = ("creation_ambiguous", "recovery result ambiguous")
+        finally:
+            if process is not None:
+                if not clean_exit:
+                    try:
+                        terminated = process.terminate(self._exit_timeout)
+                    except Exception:
+                        terminated = False
+                    if not terminated:
+                        pending = ("creation_ambiguous", "recovery cleanup unconfirmed")
+                try:
+                    cleanup = process.close(self._exit_timeout)
+                except Exception:
+                    cleanup = PtyCleanupResult(False, False, False, None)
+                if not cleanup.succeeded:
+                    pending = ("creation_ambiguous", "recovery cleanup unconfirmed")
+        if pending is not None:
+            code, detail = pending
+            try:
+                self._store.retry_claude_auth_recovery(
+                    str(job_id),
+                    str(lease_digest),
+                    code,
+                    self._clock() + self._retry_delay,
+                )
+            except Exception:
+                code, detail = (
+                    "session_bridge_unavailable",
+                    "store transition unavailable",
+                )
+            return ClaudeRegistrarOutcome(
+                "retry", str(job_id), str(native_id), code, detail
+            )
+        return ClaudeRegistrarOutcome("recovered", str(job_id), str(native_id))
+
     def _materialize_claim(
         self, claim: ClaudeVisibilityClaim
     ) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
@@ -1150,11 +1263,18 @@ def _is_exact_registered_text(content: object) -> bool:
 
 
 def _is_authentication_failure(output: str) -> bool:
+    if not isinstance(output, str) or not (1 <= len(output) <= _MAX_RESPONSE_CHARS):
+        return False
     folded = output.casefold()
     return (
         "authentication required" in folded
         or "not authenticated" in folded
         or "please log in" in folded
+        or (
+            "invalid authentication credentials" in folded
+            and ("401" in folded or "authentication_error" in folded)
+            and ("authenticate" in folded or "authentication" in folded)
+        )
     )
 
 

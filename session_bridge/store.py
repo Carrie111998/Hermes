@@ -1082,6 +1082,345 @@ class SessionBridgeStore:
             next_attempt_at=next_at,
         )
 
+    def claim_claude_auth_recovery(
+        self,
+        *,
+        job_id: str,
+        reserved_claude_uuid: str,
+        operation_id: str,
+        evidence_digest: str,
+        prompt_digest: str,
+        now: float,
+        lease_seconds: float,
+        daily_limit: int,
+        cost_limit: object,
+        reserved_cost: object,
+        max_attempts: int,
+    ) -> dict[str, Any]:
+        """Lease one paid, same-UUID authentication recovery attempt."""
+
+        from .claude_visibility import canonical_usd, usd_microdollars
+
+        normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_uuid = _exact_nonempty_text(
+            reserved_claude_uuid, "reserved Claude UUID"
+        )
+        normalized_operation = _exact_nonempty_text(
+            operation_id, "characterization operation ID"
+        )
+        evidence = _sha256_text(evidence_digest, "authentication evidence digest")
+        prompt = _sha256_text(prompt_digest, "authentication recovery prompt digest")
+        claim_time = _finite_number(now, "now")
+        lease_duration = _finite_number(lease_seconds, "lease_seconds")
+        if lease_duration <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if (
+            not isinstance(daily_limit, int)
+            or isinstance(daily_limit, bool)
+            or not 1 <= daily_limit <= 25
+        ):
+            raise ValueError("daily_limit must be between 1 and 25")
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be positive")
+        maximum_cost = usd_microdollars(cost_limit, "cost_limit")
+        attempt_cost = usd_microdollars(reserved_cost, "reserved_cost")
+
+        def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            local_day = self._claude_visibility_local_day(operation_time)
+            job = conn.execute(
+                """SELECT * FROM session_claude_visibility_jobs
+                   WHERE id = ? AND reserved_claude_uuid = ?""",
+                (normalized_job, normalized_uuid),
+            ).fetchone()
+            if job is None:
+                raise ValueError("exact failed Claude visibility job required")
+            other_open = conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs
+                   WHERE id != ? AND state IN (
+                       'claude_pending', 'claude_leased',
+                       'claude_retry', 'claude_failed'
+                   ) LIMIT 1""",
+                (normalized_job,),
+            ).fetchone()
+            if other_open is not None:
+                return {"status": "not_sole_open_job", "job_id": normalized_job}
+            recovery = conn.execute(
+                "SELECT * FROM session_claude_auth_recoveries WHERE job_id = ?",
+                (normalized_job,),
+            ).fetchone()
+            if recovery is not None:
+                if (
+                    recovery["reserved_claude_uuid"] != normalized_uuid
+                    or recovery["operation_id"] != normalized_operation
+                    or recovery["evidence_digest"] != evidence
+                    or recovery["prompt_digest"] != prompt
+                ):
+                    raise ValueError("Claude authentication recovery identity conflict")
+                if (
+                    recovery["state"] == "leased"
+                    and recovery["lease_expires_at"] <= operation_time
+                ):
+                    conn.execute(
+                        """UPDATE session_claude_auth_recoveries
+                           SET state = 'retry', next_attempt_at = ?,
+                               lease_digest = NULL, lease_expires_at = NULL,
+                               updated_at = ? WHERE job_id = ? AND state = 'leased'
+                               AND lease_expires_at <= ?""",
+                        (
+                            claim_time,
+                            operation_time,
+                            normalized_job,
+                            operation_time,
+                        ),
+                    )
+                    recovery = conn.execute(
+                        "SELECT * FROM session_claude_auth_recoveries WHERE job_id = ?",
+                        (normalized_job,),
+                    ).fetchone()
+                if recovery["state"] == "completed":
+                    return {"status": "completed", "job_id": normalized_job}
+                if (
+                    recovery["state"] != "retry"
+                    or recovery["next_attempt_at"] > claim_time
+                ):
+                    return {"status": "no_due_job", "job_id": normalized_job}
+                lease_digest = self._new_claude_auth_recovery_lease(conn)
+                cursor = conn.execute(
+                    """UPDATE session_claude_auth_recoveries
+                       SET state = 'leased', lease_digest = ?,
+                           lease_expires_at = ?, updated_at = ?
+                       WHERE job_id = ? AND state = 'retry'""",
+                    (
+                        lease_digest,
+                        operation_time + lease_duration,
+                        operation_time,
+                        normalized_job,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("stale Claude authentication recovery")
+                return {
+                    "status": "claimed",
+                    "job_id": normalized_job,
+                    "reserved_claude_uuid": normalized_uuid,
+                    "lease_digest": lease_digest,
+                    "attempt_ordinal": int(recovery["attempt_ordinal"]),
+                    "operation_id": normalized_operation,
+                    "prompt_digest": prompt,
+                    "source_cwd": job["source_cwd"],
+                }
+            if (
+                job["state"] != "claude_failed"
+                or job["error_code"] != "bridge_conflict"
+            ):
+                raise ValueError("exact failed Claude visibility job required")
+            attempts = int(job["attempts"])
+            if attempts >= max_attempts:
+                return {"status": "max_attempts_exhausted", "job_id": normalized_job}
+            usage = conn.execute(
+                """SELECT reserved_estimated_cost_usd
+                   FROM session_claude_registration_usage WHERE local_day = ?""",
+                (local_day,),
+            ).fetchall()
+            spent = sum(
+                usd_microdollars(row[0], "persisted reserved cost") for row in usage
+            )
+            if len(usage) >= daily_limit:
+                return {"status": "daily_limit", "job_id": normalized_job}
+            if spent + attempt_cost > maximum_cost:
+                return {"status": "cost_limit", "job_id": normalized_job}
+            attempt = attempts + 1
+            lease_digest = self._new_claude_auth_recovery_lease(conn)
+            conn.execute(
+                """INSERT INTO session_claude_registration_usage (
+                       local_day, job_id, attempt_ordinal,
+                       reserved_estimated_cost_usd, reserved_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    local_day,
+                    normalized_job,
+                    attempt,
+                    canonical_usd(attempt_cost),
+                    operation_time,
+                ),
+            )
+            updated = conn.execute(
+                """UPDATE session_claude_visibility_jobs SET attempts = ?, updated_at = ?
+                   WHERE id = ? AND reserved_claude_uuid = ?
+                     AND state = 'claude_failed' AND error_code = 'bridge_conflict'
+                     AND attempts = ?""",
+                (
+                    attempt,
+                    operation_time,
+                    normalized_job,
+                    normalized_uuid,
+                    attempts,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("stale failed Claude visibility job")
+            conn.execute(
+                """INSERT INTO session_claude_auth_recoveries (
+                       job_id, reserved_claude_uuid, operation_id,
+                       evidence_digest, prompt_digest, state, attempt_ordinal,
+                       next_attempt_at, lease_digest, lease_expires_at,
+                       created_at, updated_at, completed_at
+                   ) VALUES (?, ?, ?, ?, ?, 'leased', ?, ?, ?, ?, ?, ?, NULL)""",
+                (
+                    normalized_job,
+                    normalized_uuid,
+                    normalized_operation,
+                    evidence,
+                    prompt,
+                    attempt,
+                    claim_time,
+                    lease_digest,
+                    operation_time + lease_duration,
+                    operation_time,
+                    operation_time,
+                ),
+            )
+            return {
+                "status": "claimed",
+                "job_id": normalized_job,
+                "reserved_claude_uuid": normalized_uuid,
+                "lease_digest": lease_digest,
+                "attempt_ordinal": attempt,
+                "operation_id": normalized_operation,
+                "prompt_digest": prompt,
+                "source_cwd": job["source_cwd"],
+            }
+
+        return self.db._execute_write(_write)
+
+    def _new_claude_auth_recovery_lease(self, conn: Any) -> str:
+        lease = hashlib.sha256(self._claude_lease_factory().encode("utf-8")).hexdigest()
+        if (
+            conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs WHERE lease_digest = ?
+               UNION ALL SELECT 1 FROM session_claude_auth_recoveries
+               WHERE lease_digest = ? LIMIT 1""",
+                (lease, lease),
+            ).fetchone()
+            is not None
+        ):
+            raise ValueError("Claude visibility lease factory returned a duplicate")
+        return lease
+
+    def retry_claude_auth_recovery(
+        self,
+        job_id: str,
+        lease_digest: str,
+        error_code: str,
+        next_attempt_at: float,
+    ) -> dict[str, Any]:
+        normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_lease = _exact_nonempty_text(
+            lease_digest, "Claude authentication recovery lease"
+        )
+        from .claude_visibility import normalized_claude_visibility_error
+
+        normalized_code, _retryable = normalized_claude_visibility_error(error_code)
+        next_at = _finite_number(next_attempt_at, "next_attempt_at")
+
+        def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            cursor = conn.execute(
+                """UPDATE session_claude_auth_recoveries
+                   SET state = 'retry', next_attempt_at = ?, lease_digest = NULL,
+                       lease_expires_at = NULL, updated_at = ?
+                   WHERE job_id = ? AND state = 'leased' AND lease_digest = ?
+                     AND lease_expires_at > ?""",
+                (
+                    next_at,
+                    operation_time,
+                    normalized_job,
+                    normalized_lease,
+                    operation_time,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("exact active Claude authentication recovery required")
+            return {"state": "retry", "error_code": normalized_code}
+
+        return self.db._execute_write(_write)
+
+    def commit_claude_auth_recovery(
+        self,
+        *,
+        job_id: str,
+        lease_digest: str,
+        reserved_claude_uuid: str,
+        transcript_digest: str,
+        visible_at: float,
+    ) -> dict[str, Any]:
+        normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_lease = _exact_nonempty_text(
+            lease_digest, "Claude authentication recovery lease"
+        )
+        normalized_uuid = _exact_nonempty_text(
+            reserved_claude_uuid, "reserved Claude UUID"
+        )
+        transcript = _sha256_text(transcript_digest, "recovered transcript digest")
+        timestamp = _finite_number(visible_at, "visible_at")
+
+        def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            recovery = conn.execute(
+                """SELECT * FROM session_claude_auth_recoveries
+                   WHERE job_id = ? AND reserved_claude_uuid = ?
+                     AND state = 'leased' AND lease_digest = ?
+                     AND lease_expires_at > ?""",
+                (
+                    normalized_job,
+                    normalized_uuid,
+                    normalized_lease,
+                    operation_time,
+                ),
+            ).fetchone()
+            if recovery is None:
+                raise ValueError("exact active Claude authentication recovery required")
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_visible', completion_digest = ?, visible_at = ?,
+                       error_code = NULL, error_detail = NULL, updated_at = ?
+                   WHERE id = ? AND reserved_claude_uuid = ?
+                     AND state = 'claude_failed' AND error_code = 'bridge_conflict'
+                     AND attempts = ?""",
+                (
+                    transcript,
+                    timestamp,
+                    operation_time,
+                    normalized_job,
+                    normalized_uuid,
+                    recovery["attempt_ordinal"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("exact failed Claude visibility job required")
+            completed = conn.execute(
+                """UPDATE session_claude_auth_recoveries
+                   SET state = 'completed', lease_digest = NULL,
+                       lease_expires_at = NULL, completed_at = ?, updated_at = ?
+                   WHERE job_id = ? AND state = 'leased' AND lease_digest = ?""",
+                (timestamp, operation_time, normalized_job, normalized_lease),
+            )
+            if completed.rowcount != 1:
+                raise ValueError("stale Claude authentication recovery completion")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                    (normalized_job,),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
     def fail_claude_visibility_job(
         self,
         job_id: str,
@@ -4977,6 +5316,13 @@ def _exact_nonempty_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{label} must be an exact nonempty string")
     return value
+
+
+def _sha256_text(value: object, label: str) -> str:
+    normalized = _exact_nonempty_text(value, label)
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise ValueError(f"{label} must be lowercase SHA-256")
+    return normalized
 
 
 def _sidebar_lease_digest(lease_token: object) -> str:

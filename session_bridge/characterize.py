@@ -43,7 +43,13 @@ from .models import (
     SessionProjection,
     decode_bridge_marker,
 )
-from .claude_visibility import ClaudeVisibilityClaim
+from .claude_visibility import (
+    ClaudeVisibilityCandidate,
+    ClaudeVisibilityClaim,
+    build_claude_registration_prompt,
+    derive_claude_visibility_identity,
+)
+from .claude_registrar import _is_authentication_failure, _is_exact_registered_text
 
 
 _CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
@@ -71,6 +77,27 @@ _PROVIDER_REQUIRED_FIELDS = frozenset({
     "cleanup",
     "error_code",
 })
+
+
+class CharacterizationAuthenticationFailure(RuntimeError):
+    def __init__(self, evidence_digest: str) -> None:
+        super().__init__("characterization_authentication_failure")
+        self.evidence_digest = evidence_digest
+
+
+def build_characterization_auth_recovery_prompt(
+    reserved_uuid: str, signed_marker: str
+) -> str:
+    marker_digest = hashlib.sha256(signed_marker.encode("utf-8")).hexdigest()
+    return (
+        "Hermes Session Bridge authentication recovery for the existing Claude "
+        f"session {reserved_uuid}.\n"
+        "Do not perform project work or use tools. Do not create a new session.\n"
+        f"Bound marker digest: {marker_digest}.\n"
+        "Reply with exactly REGISTERED and nothing else."
+    )
+
+
 _PROVIDER_ALLOWED_FIELDS = {
     "claude": _PROVIDER_REQUIRED_FIELDS
     | {
@@ -106,6 +133,9 @@ def characterize_claude_visibility(
     registrar: Any,
     restarted_source: Callable[[], ClaudeReadableSource],
     marker_secret: bytes,
+    recover_auth_failure: Callable[[Mapping[str, Any], str, str], Mapping[str, Any]]
+    | None = None,
+    complete_auth_recovery: Callable[[Mapping[str, Any], str], None] | None = None,
     record_writer: Callable[[Path, dict[str, Any], bytes], None] | None = None,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
@@ -145,6 +175,35 @@ def characterize_claude_visibility(
                     signed_marker=_required_state_text(state, "signed_marker"),
                     marker_secret=marker_secret,
                 )
+            except CharacterizationAuthenticationFailure as exc:
+                if recover_auth_failure is None or complete_auth_recovery is None:
+                    raise
+                recovery_prompt = build_characterization_auth_recovery_prompt(
+                    _required_state_text(state, "reserved_claude_uuid"),
+                    _required_state_text(state, "signed_marker"),
+                )
+                recovery = recover_auth_failure(
+                    state, exc.evidence_digest, recovery_prompt
+                )
+                if (
+                    recovery.get("status") != "recovered"
+                    or recovery.get("job_id") != state.get("job_id")
+                    or recovery.get("reserved_claude_uuid")
+                    != state.get("reserved_claude_uuid")
+                ):
+                    raise RuntimeError("characterization_registration_failed")
+                recovered_transcript = _validate_characterization_transcript(
+                    restarted=restarted_source(),
+                    projects_root=project_root,
+                    reserved_uuid=_required_state_text(state, "reserved_claude_uuid"),
+                    native_name=_required_state_text(state, "native_name"),
+                    source_cwd=_required_state_text(state, "source_cwd"),
+                    signed_marker=_required_state_text(state, "signed_marker"),
+                    marker_secret=marker_secret,
+                )
+                complete_auth_recovery(recovery, _sha256_file(recovered_transcript))
+                state["phase"] = "launched"
+                writer(active_path, state, marker_secret)
             except RuntimeError as exc:
                 if str(exc) != "characterization_identity_mismatch:exact_uuid":
                     raise
@@ -620,9 +679,80 @@ def _validate_characterization_transcript(
         or marker_payload.target_provider is not Provider.CLAUDE
     ):
         raise RuntimeError("characterization_identity_mismatch:metadata")
+    recovery_prompt = build_characterization_auth_recovery_prompt(
+        reserved_uuid, signed_marker
+    )
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=marker_payload.source_session_id,
+        source_provider=Provider.CODEX,
+        native_name=native_name,
+        source_cwd=source_cwd,
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=0.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, marker_secret)
+    if identity.signed_marker != signed_marker:
+        raise RuntimeError("characterization_identity_mismatch:marker")
+    expected_prompt = build_claude_registration_prompt(
+        candidate, identity, marker_secret
+    )
+    marker_indexes = [
+        index
+        for index, message in enumerate(native.messages)
+        if message.role == "user" and message.content == expected_prompt
+    ]
+    if len(marker_indexes) != 1:
+        raise RuntimeError("characterization_identity_mismatch:response")
+    tail = list(native.messages)[marker_indexes[0] + 1 :]
+    normal = (
+        len(tail) == 1
+        and tail[0].role == "assistant"
+        and _is_exact_registered_text(tail[0].content)
+    )
+    auth_failure = (
+        len(tail) == 1
+        and tail[0].role == "assistant"
+        and _is_bounded_authentication_failure(tail[0].content)
+    )
+    recovered = (
+        len(tail) == 3
+        and tail[0].role == "assistant"
+        and _is_bounded_authentication_failure(tail[0].content)
+        and tail[1].role == "user"
+        and tail[1].content == recovery_prompt
+        and tail[2].role == "assistant"
+        and _is_exact_registered_text(tail[2].content)
+    )
+    if auth_failure:
+        assert isinstance(tail[0].content, str)
+        raise CharacterizationAuthenticationFailure(
+            hashlib.sha256(tail[0].content.encode("utf-8")).hexdigest()
+        )
+    if not normal and not recovered:
+        raise RuntimeError("characterization_identity_mismatch:response")
     if _path_identity(transcript) != before:
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     return transcript
+
+
+def _is_bounded_authentication_failure(content: object) -> bool:
+    if not isinstance(content, str) or not (1 <= len(content) <= 2048):
+        return False
+    return (
+        "invalid authentication credentials" in content.casefold()
+        and _is_authentication_failure(content)
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _require_secret(secret: bytes) -> None:
