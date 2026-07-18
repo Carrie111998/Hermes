@@ -376,6 +376,30 @@ class ClaudeVisibilityCoordinator:
             return ClaudeVisibilityDiscoveryResult(
                 enabled=True, degraded=True, reasons=("inventory_invalid",)
             )
+        if not manual:
+            try:
+                status = self._store.claude_visibility_status(now)
+                cursor = status.get("last_empty_cycle")
+                if cursor is not None:
+                    if not isinstance(cursor, Mapping):
+                        raise ValueError("last empty cycle must be an object")
+                    tracked = cursor.get("tracked")
+                    value = cursor.get("value")
+                    if tracked is True:
+                        cycle_at = float(value)
+                        if not math.isfinite(cycle_at) or cycle_at > now:
+                            raise ValueError("last empty cycle must be finite and past")
+                        after = max(after, cycle_at - 120.0)
+                    elif tracked is not False or value is not None:
+                        raise ValueError("last empty cycle is malformed")
+            except (TypeError, ValueError):
+                return ClaudeVisibilityDiscoveryResult(
+                    enabled=True, degraded=True, reasons=("inventory_invalid",)
+                )
+            except Exception:
+                return ClaudeVisibilityDiscoveryResult(
+                    enabled=True, degraded=True, reasons=("provider_degraded",)
+                )
         try:
             sources = tuple(self._inventory(after))
         except Exception:

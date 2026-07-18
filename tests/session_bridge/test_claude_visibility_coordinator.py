@@ -386,6 +386,36 @@ def test_continuous_enqueues_only_first_new_candidate() -> None:
     assert store.enqueued[0][0].source_session_id == "codex:second"
 
 
+def test_continuous_inventory_resumes_from_last_empty_cycle_with_overlap() -> None:
+    store = FakeStore()
+    store.raw_status["last_empty_cycle"] = {
+        "tracked": True,
+        "value": NOW - 30,
+    }
+    coordinator, calls = _coordinator(
+        [], store=store, config=_config(continuous=True)
+    )
+
+    result = coordinator.continuous_once()
+
+    assert result.degraded is False
+    assert calls == [NOW - 150]
+
+
+def test_manual_discovery_ignores_continuous_empty_cycle_cursor() -> None:
+    store = FakeStore()
+    store.raw_status["last_empty_cycle"] = {
+        "tracked": True,
+        "value": NOW - 30,
+    }
+    coordinator, calls = _coordinator([], store=store)
+
+    result = coordinator.discover(days=30, limit=10)
+
+    assert result.degraded is False
+    assert calls == [NOW - 30 * 86400]
+
+
 def test_disabled_config_short_circuits_every_dependency() -> None:
     coordinator, calls = _coordinator([_source("one")], config=_config(enabled=False))
 
