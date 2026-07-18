@@ -225,6 +225,8 @@ class _ClaudeVisibilityStore(Protocol):
         cost_limit: object,
         reserved_cost: object,
         max_attempts: int,
+        *,
+        expected_job_id: str | None = None,
     ) -> ClaudeVisibilityClaim: ...
     def record_claude_visibility_cycle(
         self, *, status: str, error_code: str | None, registrar_result: bool

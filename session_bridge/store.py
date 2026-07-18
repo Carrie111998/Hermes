@@ -774,6 +774,8 @@ class SessionBridgeStore:
         cost_limit: object,
         reserved_cost: object,
         max_attempts: int = 5,
+        *,
+        expected_job_id: str | None = None,
     ) -> ClaudeVisibilityClaim:
         from .claude_visibility import (
             ClaudeVisibilityClaim,
@@ -801,6 +803,13 @@ class SessionBridgeStore:
             raise ValueError("max_attempts must be a positive integer")
         maximum_cost = usd_microdollars(cost_limit, "cost_limit")
         attempt_cost = usd_microdollars(reserved_cost, "reserved_cost")
+        expected_id = (
+            None
+            if expected_job_id is None
+            else _exact_nonempty_text(
+                expected_job_id, "expected Claude visibility job ID"
+            )
+        )
 
         def _write(conn):
             operation_time = _finite_number(self._clock(), "clock")
@@ -816,13 +825,22 @@ class SessionBridgeStore:
                    WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
                 (claim_time, operation_time, operation_time),
             )
-            due = conn.execute(
-                """SELECT * FROM session_claude_visibility_jobs
-                   WHERE state IN ('claude_pending', 'claude_retry')
-                     AND next_attempt_at <= ?
-                   ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
-                (claim_time,),
-            ).fetchone()
+            if expected_id is None:
+                due = conn.execute(
+                    """SELECT * FROM session_claude_visibility_jobs
+                       WHERE state IN ('claude_pending', 'claude_retry')
+                         AND next_attempt_at <= ?
+                       ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
+                    (claim_time,),
+                ).fetchone()
+            else:
+                due = conn.execute(
+                    """SELECT * FROM session_claude_visibility_jobs
+                       WHERE id = ?
+                         AND state IN ('claude_pending', 'claude_retry')
+                         AND next_attempt_at <= ? LIMIT 1""",
+                    (expected_id, claim_time),
+                ).fetchone()
             if due is None:
                 return ClaudeVisibilityClaim(status="no_due_job")
             fresh_pending = (

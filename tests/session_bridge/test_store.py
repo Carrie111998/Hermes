@@ -5628,6 +5628,35 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
         )
 
 
+def test_claude_visibility_expected_job_claim_never_leases_an_unrelated_job(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    first_candidate, first_identity = _claude_visibility_identity("first-due")
+    second_candidate, second_identity = _claude_visibility_identity("second-due")
+    _enqueue_claude_visibility_job(store, first_candidate, first_identity)
+    _enqueue_claude_visibility_job(store, second_candidate, second_identity)
+
+    claim = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "1.00",
+        "0.02",
+        expected_job_id=second_identity.job_id,
+    )
+
+    assert claim.job_id == second_identity.job_id
+    rows = {
+        row["id"]: row["state"]
+        for row in _rows(db, "SELECT id, state FROM session_claude_visibility_jobs")
+    }
+    assert rows == {
+        first_identity.job_id: "claude_pending",
+        second_identity.job_id: "claude_leased",
+    }
+
+
 def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(
     db: SessionDB,
 ) -> None:

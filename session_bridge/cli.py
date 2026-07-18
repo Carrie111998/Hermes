@@ -468,13 +468,11 @@ class ProductionBackend:
 
     def claude_visibility_status(self) -> Mapping[str, Any]:
         config = self.config.claude_visibility
-        if not config.enabled:
-            return _disabled_claude_visibility_payload(config.continuous)
         store = self._require_store()
         raw = store.claude_visibility_status(time.time())
         status_fatal = _claude_visibility_fatal_reasons(raw)
         return {
-            "enabled": True,
+            "enabled": config.enabled,
             "continuous": config.continuous,
             "counts": dict(raw["counts"]),
             "retry_codes": dict(raw["retry_codes"]),
@@ -600,7 +598,7 @@ class ProductionBackend:
             raise ProviderDegraded("claude_visibility_preflight_failed")
         store = self._require_store()
         raw = store.claude_visibility_status(time.time())
-        if any(
+        has_open_work = any(
             int(raw.get("counts", {}).get(state, 0))
             for state in (
                 "claude_pending",
@@ -608,6 +606,12 @@ class ProductionBackend:
                 "claude_retry",
                 "claude_failed",
             )
+        )
+        if has_open_work and not _claude_characterization_open_work_allowed(
+            raw,
+            active_operation=(
+                source_root / ".claude-visibility-operation.json"
+            ).exists(),
         ):
             raise RolloutGateBlocked("claude_visibility_not_idle")
         source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
@@ -634,6 +638,7 @@ class ProductionBackend:
                 policy.emergency_daily_cost_usd,
                 policy.reserved_cost_per_attempt_usd,
                 policy.max_attempts,
+                expected_job_id=identity.job_id,
             )
             if claim.job_id != identity.job_id:
                 raise RolloutGateBlocked("characterization_claim_mismatch")
@@ -1554,6 +1559,36 @@ def _claude_visibility_open_reasons(raw: Mapping[str, Any]) -> list[str]:
     ):
         return ["open_visibility_work"]
     return []
+
+
+def _claude_characterization_open_work_allowed(
+    raw: Mapping[str, Any], *, active_operation: bool
+) -> bool:
+    """Permit recovery only for the one durable characterization retry row."""
+
+    if type(active_operation) is not bool or not active_operation:
+        return False
+    counts = raw.get("counts")
+    if not isinstance(counts, Mapping):
+        return False
+    try:
+        open_counts = {
+            state: int(counts.get(state, 0))
+            for state in (
+                "claude_pending",
+                "claude_leased",
+                "claude_retry",
+                "claude_failed",
+            )
+        }
+    except (TypeError, ValueError):
+        return False
+    return open_counts == {
+        "claude_pending": 0,
+        "claude_leased": 0,
+        "claude_retry": 1,
+        "claude_failed": 0,
+    }
 
 
 def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -582,6 +582,113 @@ def test_characterization_rerun_reconciles_same_operation_without_second_launch(
     assert len(launches) == 1
     assert len(claims) == 1
     assert recovered["reserved_claude_uuid"] == launches[0]
+
+
+def test_characterization_rerun_reconciles_absence_then_relaunches_reserved_uuid(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+    claims: list[ClaudeVisibilityClaim] = []
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        if not claims:
+            claim, marker = _claim_for(projection)
+            state.update(claim=claim, marker=marker)
+        elif len(claims) == 1:
+            claim = replace(
+                state["claim"],
+                lease_kind="reconciliation",
+                lease_digest="b" * 64,
+                registration_reserved=False,
+                launch_permitted=False,
+                requires_exact_id_reconciliation=True,
+                prior_error_code="creation_ambiguous",
+            )
+        else:
+            claim = replace(
+                state["claim"],
+                lease_digest="c" * 64,
+                attempt_ordinal=2,
+                prior_error_code="creation_ambiguous",
+            )
+        claims.append(claim)
+        return claim
+
+    class AmbiguousThenRecoveredRegistrar:
+        def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+            if len(claims) == 1:
+                return ClaudeRegistrarOutcome(
+                    "retry",
+                    claim.job_id,
+                    claim.reserved_claude_uuid,
+                    "creation_ambiguous",
+                )
+            if claim.lease_kind == "reconciliation":
+                return ClaudeRegistrarOutcome(
+                    "absent", claim.job_id, claim.reserved_claude_uuid
+                )
+            transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+            transcript.parent.mkdir(exist_ok=True)
+            transcript.write_text("native", encoding="utf-8")
+            state["transcript"] = transcript
+            return ClaudeRegistrarOutcome(
+                "visible", claim.job_id, claim.reserved_claude_uuid
+            )
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        transcript = state.get(
+            "transcript",
+            projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl",
+        )
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=[ProjectedMessage("m", 0, "user", state["marker"], 10.0)],
+            native_path=str(transcript),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(transcript, projection, state["marker"])
+
+    registrar = AmbiguousThenRecoveredRegistrar()
+    with pytest.raises(RuntimeError, match="characterization_registration_failed"):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=registrar,
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 10.0,
+        )
+
+    recovered = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=registrar,
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+
+    assert [claim.lease_kind for claim in claims] == [
+        "launch",
+        "reconciliation",
+        "launch",
+    ]
+    assert {claim.reserved_claude_uuid for claim in claims} == {
+        recovered["reserved_claude_uuid"]
+    }
+    assert claims[2].attempt_ordinal == 2
 
 
 def test_characterization_recovers_same_cleanup_capability_after_ready_write_error(

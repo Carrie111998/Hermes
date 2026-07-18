@@ -25,6 +25,7 @@ from session_bridge.cli import (
     ProductionBackend,
     ProviderDegraded,
     RolloutGateBlocked,
+    _claude_characterization_open_work_allowed,
     main,
 )
 from session_bridge.codex_adapter import SidebarThreadVerifier
@@ -919,6 +920,73 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     assert result["last_cycle"] == {"tracked": False, "value": None}
     assert result["last_empty_cycle"] == {"tracked": False, "value": None}
     assert result["last_registrar_result"] == {"tracked": False, "value": None}
+
+
+def test_claude_visibility_status_reports_durable_open_work_while_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": 1,
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {"creation_ambiguous": 1},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": "2026-07-18",
+                    "attempts": 1,
+                    "reserved_cost_usd": "0.02",
+                },
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["enabled"] is False
+    assert result["counts"]["claude_retry"] == 1
+    assert result["retry_codes"] == {"creation_ambiguous": 1}
+    assert result["usage"]["attempts"] == 1
+    assert result["open_reasons"] == ["open_visibility_work"]
+
+
+@pytest.mark.parametrize(
+    ("counts", "active_operation", "allowed"),
+    [
+        ({"claude_retry": 1}, True, True),
+        ({"claude_retry": 1}, False, False),
+        ({"claude_retry": 2}, True, False),
+        ({"claude_leased": 1}, True, False),
+        ({"claude_failed": 1}, True, False),
+        ({"claude_pending": 1}, True, False),
+    ],
+)
+def test_characterization_recovery_allows_only_one_owned_open_job(
+    counts: dict[str, int], active_operation: bool, allowed: bool
+) -> None:
+    complete = {
+        state: counts.get(state, 0)
+        for state in (
+            "claude_pending",
+            "claude_leased",
+            "claude_retry",
+            "claude_failed",
+        )
+    }
+
+    assert (
+        _claude_characterization_open_work_allowed(
+            {"counts": complete}, active_operation=active_operation
+        )
+        is allowed
+    )
 
 
 def test_claude_visibility_status_exposes_durable_cycle_tracking(

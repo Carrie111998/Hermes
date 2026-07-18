@@ -134,6 +134,40 @@ def characterize_claude_visibility(
         renew_ready_authority = state["phase"] == "ready" and timestamp > float(
             state["expires_at"]
         )
+        if state["phase"] == "launching":
+            try:
+                _validate_characterization_transcript(
+                    restarted=restarted_source(),
+                    projects_root=project_root,
+                    reserved_uuid=_required_state_text(state, "reserved_claude_uuid"),
+                    native_name=_required_state_text(state, "native_name"),
+                    source_cwd=_required_state_text(state, "source_cwd"),
+                    signed_marker=_required_state_text(state, "signed_marker"),
+                    marker_secret=marker_secret,
+                )
+            except RuntimeError as exc:
+                if str(exc) != "characterization_identity_mismatch:exact_uuid":
+                    raise
+                projection = _characterization_projection(state)
+                claim = reserve(projection)
+                _validate_characterization_recovery_claim(claim, state)
+                outcome = registrar.process(claim)
+                _validate_characterization_outcome(outcome, state)
+                if getattr(outcome, "status", None) == "absent":
+                    # ``absent`` is returned only after the registrar durably
+                    # records exact-UUID absence and releases its reconciliation
+                    # lease.  Only the store's next paid launch lease authorizes
+                    # relaunch, and every persisted identity must remain exact.
+                    claim = reserve(projection)
+                    _validate_characterization_recovery_claim(
+                        claim, state, require_launch=True
+                    )
+                    outcome = registrar.process(claim)
+                    _validate_characterization_outcome(outcome, state)
+                if getattr(outcome, "status", None) != "visible":
+                    raise RuntimeError("characterization_registration_failed")
+                state["phase"] = "launched"
+                writer(active_path, state, marker_secret)
     else:
         operation_id = str(uuid.uuid4())
         disposable = root / f"claude-visibility-{operation_id}"
@@ -164,18 +198,7 @@ def characterize_claude_visibility(
             ),
         }
         writer(active_path, state, marker_secret)
-        projection = SessionProjection(
-            provider=Provider.CODEX,
-            native_id=operation_id,
-            title="Claude native visibility characterization",
-            cwd=str(disposable),
-            started_at=timestamp,
-            last_active=timestamp,
-            messages=[_characterization_message(timestamp)],
-            native_path=str(disposable / "source.json"),
-            native_hash="0" * 64,
-            origin_kind=OriginKind.NATIVE,
-        )
+        projection = _characterization_projection(state)
         claim = reserve(projection)
         if (
             not isinstance(claim, ClaudeVisibilityClaim)
@@ -209,11 +232,8 @@ def characterize_claude_visibility(
         state["phase"] = "launching"
         writer(active_path, state, marker_secret)
         outcome = registrar.process(claim)
-        if (
-            getattr(outcome, "status", None) != "visible"
-            or getattr(outcome, "reserved_claude_uuid", None)
-            != claim.reserved_claude_uuid
-        ):
+        _validate_characterization_outcome(outcome, state)
+        if getattr(outcome, "status", None) != "visible":
             raise RuntimeError("characterization_registration_failed")
         state["phase"] = "launched"
         writer(active_path, state, marker_secret)
@@ -282,6 +302,65 @@ def characterize_claude_visibility(
             "capability": cleanup_token,
         },
     }
+
+
+def _characterization_projection(state: Mapping[str, Any]) -> SessionProjection:
+    operation_id = _required_state_text(state, "operation_id")
+    source_cwd = _required_state_text(state, "source_cwd")
+    created_at = _required_state_number(state, "created_at")
+    return SessionProjection(
+        provider=Provider.CODEX,
+        native_id=operation_id,
+        title="Claude native visibility characterization",
+        cwd=source_cwd,
+        started_at=created_at,
+        last_active=created_at,
+        messages=[_characterization_message(created_at)],
+        native_path=str(Path(source_cwd) / "source.json"),
+        native_hash="0" * 64,
+        origin_kind=OriginKind.NATIVE,
+    )
+
+
+def _validate_characterization_recovery_claim(
+    claim: Any,
+    state: Mapping[str, Any],
+    *,
+    require_launch: bool = False,
+) -> None:
+    lease_kind = getattr(claim, "lease_kind", None)
+    valid_authority = (
+        lease_kind == "launch"
+        and getattr(claim, "launch_permitted", None) is True
+        and getattr(claim, "registration_reserved", None) is True
+        and getattr(claim, "requires_exact_id_reconciliation", None) is False
+    ) or (
+        not require_launch
+        and lease_kind == "reconciliation"
+        and getattr(claim, "launch_permitted", None) is False
+        and getattr(claim, "registration_reserved", None) is False
+        and getattr(claim, "requires_exact_id_reconciliation", None) is True
+    )
+    if (
+        not isinstance(claim, ClaudeVisibilityClaim)
+        or not claim.claimed
+        or not valid_authority
+        or claim.job_id != state.get("job_id")
+        or claim.source_session_id != state.get("source_session_id")
+        or claim.source_provider is not Provider.CODEX
+        or claim.source_cwd != state.get("source_cwd")
+        or claim.reserved_claude_uuid != state.get("reserved_claude_uuid")
+        or claim.native_name != state.get("native_name")
+        or claim.signed_marker != state.get("signed_marker")
+    ):
+        raise RuntimeError("characterization_reservation_invalid")
+
+
+def _validate_characterization_outcome(outcome: Any, state: Mapping[str, Any]) -> None:
+    if getattr(outcome, "job_id", None) != state.get("job_id") or getattr(
+        outcome, "reserved_claude_uuid", None
+    ) != state.get("reserved_claude_uuid"):
+        raise RuntimeError("characterization_registration_failed")
 
 
 def cleanup_characterized_claude_visibility(
