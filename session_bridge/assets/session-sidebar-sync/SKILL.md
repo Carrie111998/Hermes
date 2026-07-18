@@ -22,6 +22,18 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
 | A native create outcome is ambiguous | Do not create again; settle the lease for later reconciliation. |
 | A returned thread ID is not readable or still active | Poll the exact ID until it is indexed and idle before rename or commit. |
 
+## Authenticated Local Transport Fallback
+
+Use the native `session_bridge` MCP tools when they are callable in the current task. If, and only if, those MCP tools are absent from the task's tool schema, use this authenticated loopback command prefix for the corresponding bridge operation:
+
+```powershell
+uv run --project "C:\\Users\\diego\\.hermes\\worktrees\\session-bridge-ship" --no-sync python -m session_bridge.broker_client status|pending|bind|commit|fail
+```
+
+The subcommands map one-for-one to `session_status`, `session_sidebar_pending`, `session_sidebar_bind`, `session_sidebar_commit`, and `session_sidebar_fail`. Supply `pending --limit 5`, `bind --lease-token <exact token> --thread-id <threadId>`, `commit --lease-token <exact token> --thread-id <threadId>`, or `fail --lease-token <exact token> --error-code <fixed code>` as required. Parse the command's JSON stdout as the bridge tool result.
+
+Each fallback invocation counts as the exact single bridge call required by the procedure. Select one bridge transport for each step and never call both transports for the same bridge step. Do not retry a fallback invocation whose result is ambiguous, and do not mutate the bridge database directly. If neither transport is available, stop before leasing. Native Codex project and task operations still use the native app tools; this fallback applies only to the five bridge operations above.
+
 ## Procedure
 
 1. Call `session_status` exactly once before any native project call or lease. Require `health.running` and the watcher to be running, require every reported provider `degraded_reason` to be null, and read `sidebar.counts` without broadening the request. If status is unavailable or malformed, a health requirement fails, or both `sidebar_pending` and `sidebar_retry` are zero, end immediately with no user-facing message. Do not call `session_sidebar_pending`, and no job attempt is consumed.

@@ -202,6 +202,20 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
     assert "no job attempt is consumed" in skill
 
 
+def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missing() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Authenticated Local Transport Fallback" in skill
+    assert (
+        'uv run --project "C:\\\\Users\\\\diego\\\\.hermes\\\\worktrees\\\\'
+        'session-bridge-ship" --no-sync python -m session_bridge.broker_client'
+    ) in skill
+    assert "status|pending|bind|commit|fail" in skill
+    assert "never call both transports for the same bridge step" in skill
+    assert "counts as the exact single bridge call" in skill
+    assert "If neither transport is available, stop before leasing" in skill
+
+
 def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     folded = skill.casefold()
@@ -425,6 +439,7 @@ def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
 
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     named = set(re.findall(r"\bsession_[a-z_]+\b", skill))
+    named.discard("session_bridge")  # module/server name, not a callable tool
 
     assert named == {
         "session_status",
