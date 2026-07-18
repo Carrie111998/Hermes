@@ -918,9 +918,10 @@ class CLICommandsMixin:
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
         try:
+            child_source = os.environ.get("HERMES_SESSION_SOURCE", "cli")
             self._session_db.create_session(
                 session_id=new_session_id,
-                source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                source=child_source,
                 model=self.model,
                 model_config={
                     "max_iterations": self.max_turns,
@@ -928,6 +929,9 @@ class CLICommandsMixin:
                     "_branched_from": parent_session_id,
                 },
                 parent_session_id=parent_session_id,
+                cwd=self._session_db.get_inheritable_local_child_cwd(
+                    parent_session_id, child_source
+                ),
             )
         except Exception as e:
             _cprint(f"  Failed to create branch session: {e}")

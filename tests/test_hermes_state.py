@@ -129,6 +129,46 @@ class TestSessionLifecycle:
         assert session["model"] == "real-model"
         assert session["source"] == "cli"
 
+    @pytest.mark.parametrize("source", ["cli", "tui"])
+    def test_local_child_cwd_returns_exact_persisted_parent_cwd(
+        self, db, tmp_path, source
+    ):
+        cwd = str(tmp_path / "project")
+        db.create_session("parent", source=source, cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", source) == cwd
+
+    @pytest.mark.parametrize(
+        ("parent_source", "child_source", "cwd"),
+        [
+            ("cli", "cli", None),
+            ("telegram", "telegram", "C:/work/project"),
+            ("cli", "telegram", "C:/work/project"),
+            ("cli", "cli", "relative/project"),
+            ("cli", "cli", " C:/work/project"),
+            ("cli", "cli", "C:/work/project\n"),
+        ],
+    )
+    def test_local_child_cwd_rejects_non_authoritative_parent_metadata(
+        self, db, parent_source, child_source, cwd
+    ):
+        db.create_session("parent", source=parent_source, cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", child_source) is None
+
+    def test_local_child_cwd_rejects_missing_or_identity_mismatched_parent(
+        self, db, monkeypatch, tmp_path
+    ):
+        assert db.get_inheritable_local_child_cwd("missing", "cli") is None
+
+        cwd = str(tmp_path / "project")
+        monkeypatch.setattr(
+            db,
+            "get_session",
+            lambda _session_id: {"id": "different", "source": "cli", "cwd": cwd},
+        )
+        assert db.get_inheritable_local_child_cwd("parent", "cli") is None
+
     def test_update_session_cwd_persists_git_branch(self, db):
         db.create_session(session_id="s1", source="cli")
         db.update_session_cwd("s1", "/work/repo", git_branch="pets-feature")

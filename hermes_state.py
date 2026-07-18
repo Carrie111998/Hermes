@@ -33,6 +33,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+_LOCAL_PERSISTED_CWD_SOURCES = frozenset({"cli", "tui"})
+_MAX_PERSISTED_CWD_CHARS = 4096
+
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
@@ -3244,6 +3247,42 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def get_inheritable_local_child_cwd(
+        self, parent_session_id: str, child_source: str
+    ) -> Optional[str]:
+        """Return an exact persisted cwd safe to copy to a local child.
+
+        This is deliberately a narrow metadata copy, not cwd discovery. The
+        requested parent identity, returned row identity, and local source must
+        all agree. Missing, remote, relative, or malformed values stay absent.
+        """
+        if (
+            not isinstance(parent_session_id, str)
+            or not parent_session_id
+            or not isinstance(child_source, str)
+            or child_source not in _LOCAL_PERSISTED_CWD_SOURCES
+        ):
+            return None
+        parent = self.get_session(parent_session_id)
+        if (
+            not parent
+            or parent.get("id") != parent_session_id
+            or parent.get("source") != child_source
+        ):
+            return None
+        cwd = parent.get("cwd")
+        if (
+            not isinstance(cwd, str)
+            or not cwd
+            or cwd != cwd.strip()
+            or len(cwd) > _MAX_PERSISTED_CWD_CHARS
+            or any(char in cwd for char in "\r\n\x00")
+            or not os.path.isabs(cwd)
+            or ".." in Path(cwd).parts
+        ):
+            return None
+        return cwd
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
