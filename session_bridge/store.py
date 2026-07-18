@@ -2396,6 +2396,23 @@ class SessionBridgeStore:
                 ),
             )
 
+            if (
+                provider is Provider.CLAUDE
+                and origin_bridge_id is not None
+                and origin_kind
+                in {
+                    OriginKind.BRIDGE_PLACEHOLDER,
+                    OriginKind.BRIDGE_CONTINUATION,
+                }
+            ):
+                _ensure_claude_visibility_lineage_row_if_known(
+                    conn,
+                    target_session_id=session_id,
+                    target_native_id=native_id,
+                    bridge_id=origin_bridge_id,
+                    created_at=now,
+                )
+
             if rebuild:
                 conn.execute(
                     """DELETE FROM messages
@@ -5730,6 +5747,81 @@ def _ensure_sidebar_lineage_row(
     ).fetchone()
     if row is None or row["id"] != link_id:
         raise ValueError(f"link ID collision for {link_id!r}")
+    return dict(row)
+
+
+def _ensure_claude_visibility_lineage_row_if_known(
+    conn: Any,
+    *,
+    target_session_id: str,
+    target_native_id: str,
+    bridge_id: str,
+    created_at: float,
+) -> dict[str, Any] | None:
+    jobs = conn.execute(
+        """SELECT source_session_id FROM session_claude_visibility_jobs
+           WHERE bridge_id = ? AND reserved_claude_uuid = ?
+             AND state = 'claude_visible'
+           ORDER BY id LIMIT 2""",
+        (bridge_id, target_native_id),
+    ).fetchall()
+    if not jobs:
+        return None
+    if len(jobs) != 1:
+        raise ValueError("duplicate Claude visibility lineage identity")
+    source_session_id = str(jobs[0]["source_session_id"])
+    if (
+        conn.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (source_session_id,)
+        ).fetchone()
+        is None
+    ):
+        raise ValueError("Claude visibility source session is not indexed")
+    conflicting = conn.execute(
+        """SELECT 1 FROM session_links
+           WHERE bridge_id = ? AND (
+               from_session_id != ? OR to_session_id != ? OR relation != ?
+           ) LIMIT 1""",
+        (
+            bridge_id,
+            source_session_id,
+            target_session_id,
+            Relation.MIRRORS.value,
+        ),
+    ).fetchone()
+    if conflicting is not None:
+        raise ValueError("Claude visibility lineage identity conflict")
+    digest = hashlib.sha256(
+        f"{bridge_id}\0{source_session_id}\0{target_session_id}".encode()
+    ).hexdigest()
+    link_id = f"claude-visibility-link:{digest}"
+    conn.execute(
+        """INSERT OR IGNORE INTO session_links (
+               id, from_session_id, to_session_id, relation, bridge_id,
+               source_cursor, source_hash, created_at
+           ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)""",
+        (
+            link_id,
+            source_session_id,
+            target_session_id,
+            Relation.MIRRORS.value,
+            bridge_id,
+            created_at,
+        ),
+    )
+    row = conn.execute(
+        """SELECT * FROM session_links
+           WHERE bridge_id = ? AND from_session_id = ?
+             AND to_session_id = ? AND relation = ?""",
+        (
+            bridge_id,
+            source_session_id,
+            target_session_id,
+            Relation.MIRRORS.value,
+        ),
+    ).fetchone()
+    if row is None or row["id"] != link_id:
+        raise ValueError("Claude visibility lineage link collision")
     return dict(row)
 
 

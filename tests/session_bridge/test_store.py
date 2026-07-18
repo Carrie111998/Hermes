@@ -1606,6 +1606,57 @@ def test_projection_preserves_placeholder_on_replay_and_non_human_native_deltas(
     assert external["last_native_cursor"] == "native-non-human-cursor"
 
 
+def test_indexed_claude_visibility_target_creates_unified_catalog_lineage(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("lineage")
+    store.upsert_projection(
+        _projection(
+            _message("source-user", "meaningful request"),
+            provider=Provider.CODEX,
+            native_id="source-lineage",
+        )
+    )
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.commit_claude_visibility_job(
+        identity.job_id, claim.lease_digest, "a" * 64, 100.0
+    )
+
+    store.upsert_projection(
+        _projection(
+            _message("target-user", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+
+    links = _rows(
+        db,
+        """SELECT from_session_id, to_session_id, relation, bridge_id
+             FROM session_links WHERE bridge_id = ?""",
+        (identity.bridge_id,),
+    )
+    assert links == [
+        {
+            "from_session_id": candidate.source_session_id,
+            "to_session_id": f"claude:{identity.claude_uuid}",
+            "relation": "mirrors",
+            "bridge_id": identity.bridge_id,
+        }
+    ]
+    assert UnifiedCatalog(db, store).resolve_continuation(
+        session_id=candidate.source_session_id,
+        bridge_id=None,
+        target_provider="claude",
+    ) == {
+        "bridge_id": identity.bridge_id,
+        "source_session_id": candidate.source_session_id,
+        "target_session_id": f"claude:{identity.claude_uuid}",
+        "target_provider": "claude",
+    }
+
+
 def test_new_native_user_delta_promotes_placeholder(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     store.upsert_projection(
