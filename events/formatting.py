@@ -161,6 +161,22 @@ def priority_dot(priority: Priority) -> str:
     return PRIORITY_EMOJI.get(priority, "")
 
 
+def header_dot(event: Event) -> str:
+    """Header status dot, overriding the priority color where an event
+    semantically reads as a recovery rather than a problem.
+
+    GATEWAY_HEALTH carries a fixed HIGH priority (so a real outage escalates),
+    which means a 'down' AND a 'back-up' both inherited the amber 🟠 dot. An
+    operator scanning the feed asked (2026-07-18) for the recovery/'up' line to
+    read as green — visually distinct from an outage — without touching the
+    event's priority (routing/escalation stay as-is). Only the dot changes.
+    """
+    if event.event_type == EventType.GATEWAY_HEALTH:
+        if (event.payload or {}).get("status") == "up":
+            return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
+    return priority_dot(event.priority)
+
+
 def event_icon(event: Event) -> str:
     """Return the icon for an event.
 
@@ -187,7 +203,7 @@ def format_header(event: Event) -> str:
     For mailbox_message events, surfaces the inner message_type and includes
     sender -> recipient: '🟡 📊 SCORE_RESULT — matcher → main · 14:37 UTC'.
     """
-    dot = priority_dot(event.priority)
+    dot = header_dot(event)
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
 
@@ -243,7 +259,7 @@ def format_whatsapp_header(event: Event) -> str:
     title = WHATSAPP_TITLE_BY_EVENT.get(event.event_type)
     if title is None or event.event_type == EventType.MAILBOX_MESSAGE:
         return format_header(event)
-    dot = priority_dot(event.priority)
+    dot = header_dot(event)
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
     return f"{dot} {icon} {title} — {event.source} · {ts}"

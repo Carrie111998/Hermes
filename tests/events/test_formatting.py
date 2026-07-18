@@ -4,6 +4,7 @@ from events.formatting import (
     SEPARATOR,
     priority_dot, event_icon,
     format_header, format_event_message, format_whatsapp_message,
+    format_whatsapp_header,
 )
 from events.schema import Event, EventType, Priority
 
@@ -57,6 +58,31 @@ def test_event_icon_for_secret_detected_is_padlock():
 def test_format_header_for_agent_error():
     e = _make_event(EventType.AGENT_ERROR, source="mailbox:sentinel")
     assert format_header(e) == "🟠 ⚠️ AGENT_ERROR — mailbox:sentinel · 05:02 UTC"
+
+
+def test_format_header_gateway_health_up_is_green():
+    """A GATEWAY_HEALTH recovery ('up'/back-running) reads as green (🟢), not
+    the amber HIGH dot it shares with the 'down' outage. Operator request
+    2026-07-18: an 'X is back up' line must be visually distinct from an
+    outage at a glance."""
+    e = _make_event(EventType.GATEWAY_HEALTH, source="system",
+                    payload={"platform": "whatsapp", "status": "up", "detail": ""})
+    assert format_header(e) == "🟢 🛰️ GATEWAY_HEALTH — system · 05:02 UTC"
+
+
+def test_format_header_gateway_health_down_stays_amber():
+    """The 'down' side is unchanged — still the amber HIGH dot."""
+    e = _make_event(EventType.GATEWAY_HEALTH, source="system",
+                    payload={"platform": "whatsapp", "status": "down",
+                             "detail": "connection refused"})
+    assert format_header(e) == "🟠 🛰️ GATEWAY_HEALTH — system · 05:02 UTC"
+
+
+def test_format_whatsapp_header_gateway_health_up_is_green():
+    """The green-on-recovery override applies to the WhatsApp surface too."""
+    e = _make_event(EventType.GATEWAY_HEALTH, source="system",
+                    payload={"platform": "whatsapp", "status": "up", "detail": ""})
+    assert format_whatsapp_header(e) == "🟢 🛰️ GATEWAY HEALTH — system · 05:02 UTC"
 
 
 def test_format_header_for_interview_signal_is_critical():
