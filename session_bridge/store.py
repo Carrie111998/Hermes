@@ -67,6 +67,7 @@ _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
+_CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
 _PROFILE_SHADOW_SOURCE = "session_bridge_profile"
 _WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
 _WORKTREE_SNAPSHOT_FIELDS = frozenset({
@@ -1309,7 +1310,7 @@ class SessionBridgeStore:
                     for state_row in state_rows
                 )
             value: dict[str, Any] = {
-                "version": 1,
+                "version": _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION,
                 "sequence": sequence,
                 "last_cycle_at": recorded_at,
                 "last_result": {
@@ -6002,8 +6003,15 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
         value = json.loads(value_json)
     except (TypeError, ValueError):
         return {}
-    if not isinstance(value, dict) or value.get("version") != 1:
+    if not isinstance(value, dict):
         return {}
+    version = value.get("version")
+    if version is not None and (
+        type(version) is not int
+        or version not in (1, _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION)
+    ):
+        return {}
+    current_version = version == _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION
     sequence = value.get("sequence")
     last_cycle_at = value.get("last_cycle_at")
     last_result = value.get("last_result")
@@ -6019,7 +6027,9 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
         return {}
     status = _claude_status_token(last_result.get("status"))
     error_code = _claude_status_token(last_result.get("error_code"), optional=True)
-    empty_verified = last_result.get("empty_verified", False)
+    empty_verified = (
+        last_result.get("empty_verified") if current_version else False
+    )
     if (
         status in {None, "invalid", "redacted"}
         or error_code in {"invalid", "redacted"}
@@ -6027,7 +6037,9 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
     ):
         return {}
     decoded: dict[str, Any] = {
-        "version": 1,
+        "version": (
+            _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION if current_version else 1
+        ),
         "sequence": sequence,
         "last_cycle_at": float(last_cycle_at),
         "last_result": {
@@ -6036,7 +6048,7 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
             "empty_verified": empty_verified,
         },
     }
-    empty_at = value.get("last_empty_cycle_at")
+    empty_at = value.get("last_empty_cycle_at") if current_version else None
     if (
         isinstance(empty_at, (int, float))
         and not isinstance(empty_at, bool)

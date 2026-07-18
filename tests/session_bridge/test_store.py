@@ -5697,6 +5697,139 @@ def test_claude_visibility_cycle_status_is_durable_and_preserves_last_empty(
     assert second["last_registrar_result"] == {"tracked": False, "value": None}
 
 
+def test_legacy_v1_cycle_discards_unverified_empty_history_on_restart_and_write(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    seed = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    seed.set_state("session-bridge:claude-visibility:cycle", {
+        "version": 1,
+        "sequence": 7,
+        "last_cycle_at": 50.0,
+        "last_result": {"status": "no_due_job", "error_code": None},
+        "last_empty_cycle_at": 50.0,
+    })
+    restarted = SessionBridgeStore(
+        db, clock=lambda: clock[0], local_timezone=timezone.utc
+    )
+
+    legacy = restarted.claude_visibility_status(100.0)
+    restarted.record_claude_visibility_cycle(
+        status="daily_limit", error_code=None, registrar_result=False
+    )
+    nonempty = restarted.get_state("session-bridge:claude-visibility:cycle")
+    clock[0] = 200.0
+    restarted.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+    genuine_empty = restarted.get_state("session-bridge:claude-visibility:cycle")
+
+    assert legacy["last_cycle"] == {
+        "tracked": True,
+        "value": {
+            "at": 50.0, "sequence": 7, "status": "no_due_job",
+            "error_code": None, "empty_verified": False,
+        },
+    }
+    assert legacy["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert nonempty is not None
+    assert nonempty["version"] == 2
+    assert nonempty["sequence"] == 8
+    assert "last_empty_cycle_at" not in nonempty
+    assert genuine_empty is not None
+    assert genuine_empty["version"] == 2
+    assert genuine_empty["last_result"]["empty_verified"] is True
+    assert genuine_empty["last_empty_cycle_at"] == 200.0
+
+
+def test_unversioned_cycle_discards_unverified_empty_history_on_next_write(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    store.set_state("session-bridge:claude-visibility:cycle", {
+        "sequence": 3,
+        "last_cycle_at": 25.0,
+        "last_result": {"status": "no_due_job", "error_code": None},
+        "last_empty_cycle_at": 25.0,
+    })
+
+    legacy = store.claude_visibility_status(100.0)
+    store.record_claude_visibility_cycle(
+        status="cost_limit", error_code=None, registrar_result=False
+    )
+    rewritten = store.get_state("session-bridge:claude-visibility:cycle")
+
+    assert legacy["last_cycle"]["value"]["empty_verified"] is False
+    assert legacy["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert rewritten is not None
+    assert rewritten["version"] == 2
+    assert rewritten["sequence"] == 4
+    assert "last_empty_cycle_at" not in rewritten
+
+
+def test_current_v2_cycle_preserves_only_verified_empty_history(db: SessionDB) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+    candidate, identity = _claude_visibility_identity("v2-preserve")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    clock[0] = 200.0
+
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+
+    current = store.get_state("session-bridge:claude-visibility:cycle")
+    status = store.claude_visibility_status(200.0)
+    assert current is not None
+    assert current["version"] == 2
+    assert current["last_result"]["empty_verified"] is False
+    assert current["last_empty_cycle_at"] == 100.0
+    assert status["last_empty_cycle"] == {"tracked": True, "value": 100.0}
+
+
+@pytest.mark.parametrize("version", ("2", 2.0, True, 3))
+def test_malformed_or_future_cycle_version_is_untracked(
+    db: SessionDB,
+    version: object,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    store.set_state("session-bridge:claude-visibility:cycle", {
+        "version": version,
+        "sequence": 9,
+        "last_cycle_at": 90.0,
+        "last_result": {
+            "status": "no_due_job", "error_code": None,
+            "empty_verified": True,
+        },
+        "last_empty_cycle_at": 90.0,
+    })
+
+    status = store.claude_visibility_status(100.0)
+
+    assert status["last_cycle"] == {"tracked": False, "value": None}
+    assert status["last_empty_cycle"] == {"tracked": False, "value": None}
+
+
+def test_malformed_cycle_json_is_untracked_without_raw_error(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    with db._lock:
+        assert db._conn is not None
+        db._conn.execute(
+            """INSERT INTO session_bridge_state (key, value_json, updated_at)
+               VALUES ('session-bridge:claude-visibility:cycle', ?, 1)""",
+            ('{"secret":',),
+        )
+        db._conn.commit()
+
+    status = store.claude_visibility_status(100.0)
+
+    assert status["last_cycle"] == {"tracked": False, "value": None}
+    assert "secret" not in repr(status)
+
+
 @pytest.mark.parametrize(
     "job_state",
     ("claude_pending", "claude_retry", "claude_leased", "claude_failed", "unknown"),
