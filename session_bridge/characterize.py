@@ -242,7 +242,12 @@ def characterize_claude_visibility(
     if state["transcript_path"] not in (None, str(resolved_transcript)):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     transcript_identity = list(_path_identity(resolved_transcript))
-    if state["transcript_identity"] not in (None, transcript_identity):
+    previous_transcript_identity = state["transcript_identity"]
+    if (
+        previous_transcript_identity is not None
+        and _recorded_object_identity(previous_transcript_identity)
+        != _object_identity(resolved_transcript)
+    ):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     state["transcript_path"] = str(resolved_transcript)
     state["transcript_identity"] = transcript_identity
@@ -909,6 +914,21 @@ def _identity_tuple(metadata: os.stat_result) -> tuple[int, int, int, int]:
 
 def _path_identity(path: Path) -> tuple[int, int, int, int]:
     return _identity_tuple(os.lstat(path))
+
+
+def _object_identity(path: Path) -> tuple[int, int]:
+    metadata = os.lstat(path)
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _recorded_object_identity(value: Any) -> tuple[int, int]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 4
+        or any(not isinstance(item, int) or isinstance(item, bool) for item in value)
+    ):
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
+    return (value[0], value[1])
 
 
 def _safe_remove_disposable(disposable: Path, state: Mapping[str, Any]) -> None:

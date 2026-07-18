@@ -690,6 +690,80 @@ def test_expired_ready_operation_revalidates_identity_and_renews_same_operation(
     assert len(registrar.claims) == 1
 
 
+def test_expired_ready_operation_renews_after_native_resume_appends_transcript(
+    tmp_path: Path,
+) -> None:
+    pending, state, registrar, restarted_source = _pending_characterization(tmp_path)
+    active = state["source_root"] / ".claude-visibility-operation.json"
+    first_record = _read_characterization_record(active, SECRET)
+    transcript = state["transcript"]
+    before = transcript.stat()
+    resume_record = {
+        "type": "user",
+        "sessionId": pending["reserved_claude_uuid"],
+        "uuid": "12121212-1212-4212-8212-121212121212",
+        "timestamp": "2026-07-17T12:00:00Z",
+        "cwd": state["claim"].source_cwd,
+        "gitBranch": "",
+        "isSidechain": False,
+        "message": {"role": "user", "content": "resume verification"},
+    }
+    with transcript.open("a", encoding="utf-8") as stream:
+        stream.write("\n" + json.dumps(resume_record, separators=(",", ":")))
+    after = transcript.stat()
+    assert after.st_size > before.st_size
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+    renewal_registrar = _Registrar()
+    renewed = characterize_claude_visibility(
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        reserve=lambda _projection: (_ for _ in ()).throw(
+            AssertionError("renewal must not reserve a second operation")
+        ),
+        registrar=renewal_registrar,
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: float(first_record["expires_at"]) + 1.0,
+    )
+
+    assert renewed["cleanup_token"]["id"] == pending["cleanup_token"]["id"]
+    assert renewed["reserved_claude_uuid"] == pending["reserved_claude_uuid"]
+    assert renewed["cleanup_token"]["capability"] != pending["cleanup_token"]["capability"]
+    assert len(registrar.claims) == 1
+    assert renewal_registrar.claims == []
+
+
+def test_expired_ready_operation_rejects_replaced_transcript_with_same_content(
+    tmp_path: Path,
+) -> None:
+    _pending, state, registrar, restarted_source = _pending_characterization(tmp_path)
+    active = state["source_root"] / ".claude-visibility-operation.json"
+    first_record = _read_characterization_record(active, SECRET)
+    transcript = state["transcript"]
+    original = transcript.read_bytes()
+    replacement = transcript.with_name(f".{transcript.name}.replacement")
+    replacement.write_bytes(original)
+    os.replace(replacement, transcript)
+
+    renewal_registrar = _Registrar()
+    with pytest.raises(RuntimeError, match="identity_mismatch:path_changed"):
+        characterize_claude_visibility(
+            source_root=state["source_root"],
+            projects_root=state["projects_root"],
+            reserve=lambda _projection: (_ for _ in ()).throw(
+                AssertionError("renewal must not reserve a second operation")
+            ),
+            registrar=renewal_registrar,
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: float(first_record["expires_at"]) + 1.0,
+        )
+
+    assert len(registrar.claims) == 1
+    assert renewal_registrar.claims == []
+
+
 def test_claimed_cleanup_remains_authorized_across_expiry_after_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
