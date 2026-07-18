@@ -693,3 +693,37 @@ Execution requests prepare controlled automation; they do not execute work.
 - Task 10 not started
 
 **Awaiting:** Architect acceptance before Task 10.
+
+---
+
+## Task 10 — Controlled One-Shot Execution Adapter (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance  
+**Tests:** 488 passed (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_execution_result_record` schema + `make_run_execution_result_record()`
+- `run_execution_result_fingerprint()` — stable canonical JSON
+- `process_execution_items()` — controlled per-item processing without external side effects
+- `execute_run_execution_request()` — one-shot adapter after full review chain + pending execution request
+- `run_execution_completed` event + replay-only when result record exists
+- Result status constants: `completed`, `partial`, `failed`
+- Item status constants: `completed`, `skipped`, `failed`, `unsupported`
+
+### Execution behavior
+
+- Manually triggered only; no scheduler, queue, or daemon
+- Loads approved `run_execution_request_record.json` from disk
+- `command` dict is data, not executable instructions
+- No Runtime/delegate_task/subprocess/HTTP/browser/docs mutation
+
+### Non-goals confirmed
+
+- No task/attempt creation or lifecycle mutation
+- No artifact/result/verification content inspection
+- No HEAL/DECO/scheduler/queue/database integration
+- Task 11 not started
+
+**Awaiting:** Architect acceptance before Task 11.

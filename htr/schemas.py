@@ -20,6 +20,7 @@ SchemaName = Literal[
     "run_review_record",
     "run_followup_plan_record",
     "run_execution_request_record",
+    "run_execution_result_record",
 ]
 
 
@@ -266,6 +267,17 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_execution_result_record": (
+        "schema_version",
+        "run_id",
+        "source_execution_request_fingerprint",
+        "executor",
+        "result_status",
+        "item_results",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -313,6 +325,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_followup_plan_record(data)
     elif schema_name == "run_execution_request_record":
         _validate_run_execution_request_record(data)
+    elif schema_name == "run_execution_result_record":
+        _validate_run_execution_result_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -673,3 +687,83 @@ def _validate_run_execution_request_record(data: dict[str, Any]) -> None:
             )
     if not isinstance(data["metadata"], dict):
         raise ValueError("run_execution_request_record: metadata must be a dict")
+
+
+def _validate_run_execution_result_record(data: dict[str, Any]) -> None:
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError("run_execution_result_record: schema_version must be an int")
+    _require_str(data, "run_id", "run_execution_result_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError("run_execution_result_record: run_id must be a valid run id")
+    _require_str(
+        data, "source_execution_request_fingerprint", "run_execution_result_record"
+    )
+    _require_str(data, "executor", "run_execution_result_record")
+    _require_str(data, "result_status", "run_execution_result_record")
+    if data["result_status"] not in {"completed", "partial", "failed"}:
+        raise ValueError(
+            "run_execution_result_record: result_status must be one of "
+            "completed, partial, failed"
+        )
+    _require_str(data, "created_at", "run_execution_result_record")
+    if "notes" not in data:
+        raise ValueError("run_execution_result_record: missing fields: notes")
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError("run_execution_result_record: notes must be a string or null")
+    item_results = data.get("item_results")
+    if not isinstance(item_results, list):
+        raise ValueError("run_execution_result_record: item_results must be a list")
+    for item in item_results:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_execution_result_record: each item result must be a dict"
+            )
+        for field in (
+            "item_id",
+            "source_followup_item_id",
+            "execution_kind",
+            "item_status",
+        ):
+            if field not in item or not isinstance(item[field], str) or not item[field]:
+                raise ValueError(
+                    f"run_execution_result_record: item result {field} must be a "
+                    "non-empty string"
+                )
+        if item["execution_kind"] not in {
+            "manual_open_link",
+            "rerun_task",
+            "regenerate_output",
+            "update_documentation",
+            "external_action",
+            "other",
+        }:
+            raise ValueError(
+                "run_execution_result_record: item result execution_kind is invalid"
+            )
+        if item["item_status"] not in {"completed", "skipped", "failed", "unsupported"}:
+            raise ValueError(
+                "run_execution_result_record: item result item_status is invalid"
+            )
+        if "output" not in item or not isinstance(item["output"], dict):
+            raise ValueError(
+                "run_execution_result_record: item result output must be a dict"
+            )
+        if "error" not in item:
+            raise ValueError(
+                "run_execution_result_record: item result missing fields: error"
+            )
+        error = item["error"]
+        if error is not None and not isinstance(error, str):
+            raise ValueError(
+                "run_execution_result_record: item result error must be a string or null"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_execution_result_record: item result metadata must be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_execution_result_record: metadata must be a dict")

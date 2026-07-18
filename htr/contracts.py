@@ -497,3 +497,190 @@ def run_execution_request_fingerprint(execution_request_record: dict[str, Any]) 
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+EXECUTION_RESULT_COMPLETED = "completed"
+EXECUTION_RESULT_PARTIAL = "partial"
+EXECUTION_RESULT_FAILED = "failed"
+
+EXECUTION_RESULT_STATUSES: frozenset[str] = frozenset(
+    {
+        EXECUTION_RESULT_COMPLETED,
+        EXECUTION_RESULT_PARTIAL,
+        EXECUTION_RESULT_FAILED,
+    }
+)
+
+EXECUTION_ITEM_COMPLETED = "completed"
+EXECUTION_ITEM_SKIPPED = "skipped"
+EXECUTION_ITEM_FAILED = "failed"
+EXECUTION_ITEM_UNSUPPORTED = "unsupported"
+
+EXECUTION_ITEM_STATUSES: frozenset[str] = frozenset(
+    {
+        EXECUTION_ITEM_COMPLETED,
+        EXECUTION_ITEM_SKIPPED,
+        EXECUTION_ITEM_FAILED,
+        EXECUTION_ITEM_UNSUPPORTED,
+    }
+)
+
+
+def run_execution_result_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run execution result record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_execution_result_record.json"
+
+
+def _normalize_item_results(
+    item_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in item_results:
+        normalized.append(
+            {
+                "item_id": item["item_id"],
+                "source_followup_item_id": item["source_followup_item_id"],
+                "execution_kind": item["execution_kind"],
+                "item_status": item["item_status"],
+                "output": item["output"],
+                "error": item.get("error"),
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def process_execution_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Process one approved execution item without external side effects."""
+    kind = item["execution_kind"]
+    command = dict(item["command"])
+    base = {
+        "item_id": item["item_id"],
+        "source_followup_item_id": item["source_followup_item_id"],
+        "execution_kind": kind,
+        "metadata": item["metadata"] if item.get("metadata") is not None else {},
+    }
+
+    if kind == "manual_open_link":
+        return {
+            **base,
+            "item_status": EXECUTION_ITEM_SKIPPED,
+            "output": {
+                "human_action_required": True,
+                "command": command,
+            },
+            "error": None,
+        }
+
+    if kind == "update_documentation":
+        return {
+            **base,
+            "item_status": EXECUTION_ITEM_SKIPPED,
+            "output": {
+                "proposed_update": command,
+                "command": command,
+            },
+            "error": None,
+        }
+
+    if kind == "other":
+        if command.get("no_op") is True:
+            return {
+                **base,
+                "item_status": EXECUTION_ITEM_COMPLETED,
+                "output": {
+                    "no_op_completed": True,
+                    "command": command,
+                },
+                "error": None,
+            }
+        return {
+            **base,
+            "item_status": EXECUTION_ITEM_UNSUPPORTED,
+            "output": {"command": command},
+            "error": "unsupported execution kind handling for other",
+        }
+
+    if kind in {"rerun_task", "regenerate_output", "external_action"}:
+        return {
+            **base,
+            "item_status": EXECUTION_ITEM_UNSUPPORTED,
+            "output": {"command": command},
+            "error": f"{kind} is not supported in Task 10",
+        }
+
+    return {
+        **base,
+        "item_status": EXECUTION_ITEM_UNSUPPORTED,
+        "output": {"command": command},
+        "error": f"unsupported execution kind {kind!r}",
+    }
+
+
+def process_execution_items(
+    execution_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Process approved execution items and return per-item results."""
+    return [process_execution_item(item) for item in execution_items]
+
+
+def compute_execution_result_status(item_results: list[dict[str, Any]]) -> str:
+    """Derive aggregate execution result status from item results."""
+    if not item_results:
+        return EXECUTION_RESULT_FAILED
+    completed = sum(
+        1
+        for item in item_results
+        if item["item_status"] == EXECUTION_ITEM_COMPLETED
+    )
+    if completed == len(item_results):
+        return EXECUTION_RESULT_COMPLETED
+    if completed > 0:
+        return EXECUTION_RESULT_PARTIAL
+    return EXECUTION_RESULT_FAILED
+
+
+def make_run_execution_result_record(
+    *,
+    run_id: str,
+    source_execution_request_fingerprint: str,
+    item_results: list[dict[str, Any]],
+    executor: str = "human",
+    result_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated controlled run execution result record envelope."""
+    normalized_item_results = _normalize_item_results(item_results)
+    resolved_result_status = result_status or compute_execution_result_status(
+        normalized_item_results
+    )
+    execution_result_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_execution_request_fingerprint": source_execution_request_fingerprint,
+        "executor": executor,
+        "result_status": resolved_result_status,
+        "item_results": normalized_item_results,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(execution_result_record, "run_execution_result_record")
+    return execution_result_record
+
+
+def run_execution_result_fingerprint(execution_result_record: dict[str, Any]) -> str:
+    """Return a stable semantic fingerprint for a run execution result record."""
+    validate_schema(execution_result_record, "run_execution_result_record")
+    return json.dumps(
+        execution_result_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

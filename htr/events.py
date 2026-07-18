@@ -20,11 +20,16 @@ from htr.io import (
     read_jsonl,
 )
 from htr.contracts import (
+    EXECUTION_REQUEST_PENDING,
+    make_run_execution_result_record,
+    process_execution_items,
     result_fingerprint,
     run_completion_fingerprint,
     run_completion_record_json_path,
     run_execution_request_fingerprint,
     run_execution_request_record_json_path,
+    run_execution_result_fingerprint,
+    run_execution_result_record_json_path,
     run_followup_plan_fingerprint,
     run_followup_plan_record_json_path,
     run_review_fingerprint,
@@ -60,6 +65,7 @@ EVENT_TYPE_MANUAL_RUN_COMPLETED = "manual_run_completed"
 EVENT_TYPE_MANUAL_RUN_REVIEWED = "manual_run_reviewed"
 EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED = "manual_run_followup_planned"
 EVENT_TYPE_RUN_EXECUTION_REQUESTED = "run_execution_requested"
+EVENT_TYPE_RUN_EXECUTION_COMPLETED = "run_execution_completed"
 
 EVENT_TYPES = frozenset(
     {
@@ -73,6 +79,7 @@ EVENT_TYPES = frozenset(
         EVENT_TYPE_MANUAL_RUN_REVIEWED,
         EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED,
         EVENT_TYPE_RUN_EXECUTION_REQUESTED,
+        EVENT_TYPE_RUN_EXECUTION_COMPLETED,
     }
 )
 
@@ -1335,3 +1342,179 @@ def request_run_execution(
     atomic_write_json(execution_request_record_path, execution_request_record)
     append_run_event(run_id, candidate, base_dir)
     return execution_request_record
+
+
+def _matches_run_execution_completed_replay(
+    existing: dict[str, Any],
+    *,
+    run_id: str,
+    actor: str,
+    execution_result_record: dict[str, Any],
+) -> bool:
+    """Return True when *existing* matches a successful execution result replay."""
+    payload = existing.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        existing.get("event_type") == EVENT_TYPE_RUN_EXECUTION_COMPLETED
+        and existing.get("run_id") == run_id
+        and existing.get("actor") == actor
+        and payload.get("run_id") == run_id
+        and payload.get("executor") == execution_result_record["executor"]
+        and payload.get("result_status") == execution_result_record["result_status"]
+        and payload.get("source_execution_request_fingerprint")
+        == execution_result_record["source_execution_request_fingerprint"]
+        and payload.get("run_execution_result_fingerprint")
+        == run_execution_result_fingerprint(execution_result_record)
+    )
+
+
+def execute_run_execution_request(
+    project_dir: Path | str,
+    run_id: str,
+    executor: str,
+    *,
+    event_id: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Execute a controlled one-shot processing pass for a pending execution request.
+
+    Loads the approved execution request from disk, processes each execution item
+    without external side effects, stores the result record, and appends an audit
+    event. This adapter is manually triggered and does not mutate lifecycle state.
+    """
+    validate_id(run_id, "run")
+    if not isinstance(executor, str) or not executor:
+        raise ValueError("executor must be a non-empty string")
+
+    base_dir = Path(project_dir)
+    execution_result_record_path = run_execution_result_record_json_path(
+        run_id, base_dir
+    )
+    execution_request_record_path = run_execution_request_record_json_path(
+        run_id, base_dir
+    )
+    followup_plan_record_path = run_followup_plan_record_json_path(run_id, base_dir)
+    completion_record_path = run_completion_record_json_path(run_id, base_dir)
+    review_record_path = run_review_record_json_path(run_id, base_dir)
+    manifest_path = paths.run_manifest_path(run_id, base_dir)
+
+    if not manifest_path.exists():
+        raise InvalidTransition(f"run {run_id!r} is not completed")
+
+    current_run_manifest = read_json(manifest_path)
+    if current_run_manifest["status"] != RUN_COMPLETED:
+        raise InvalidTransition(
+            f"run {run_id!r} is not completed; "
+            f"status is {current_run_manifest['status']!r}"
+        )
+
+    if not completion_record_path.exists():
+        raise InvalidTransition("run_completion_record.json is missing")
+
+    if not review_record_path.exists():
+        raise InvalidTransition("run_review_record.json is missing")
+
+    if not followup_plan_record_path.exists():
+        raise InvalidTransition("run_followup_plan_record.json is missing")
+
+    if not execution_request_record_path.exists():
+        raise InvalidTransition("run_execution_request_record.json is missing")
+
+    stored_execution_request_record = read_json(execution_request_record_path)
+    validate_schema(stored_execution_request_record, "run_execution_request_record")
+    if stored_execution_request_record["run_id"] != run_id:
+        raise ValueError(
+            "execution_request_record run_id does not match submission target"
+        )
+
+    stored_followup_plan_record = read_json(followup_plan_record_path)
+    validate_schema(stored_followup_plan_record, "run_followup_plan_record")
+    expected_followup_fingerprint = run_followup_plan_fingerprint(
+        stored_followup_plan_record
+    )
+    if (
+        stored_execution_request_record["source_followup_plan_fingerprint"]
+        != expected_followup_fingerprint
+    ):
+        raise InvalidTransition(
+            "source_followup_plan_fingerprint does not match run_followup_plan_record"
+        )
+
+    expected_request_fingerprint = run_execution_request_fingerprint(
+        stored_execution_request_record
+    )
+    reloaded_execution_request_record = read_json(execution_request_record_path)
+    if (
+        run_execution_request_fingerprint(reloaded_execution_request_record)
+        != expected_request_fingerprint
+    ):
+        raise InvalidTransition(
+            "source_execution_request_fingerprint does not match "
+            "run_execution_request_record"
+        )
+
+    if stored_execution_request_record["request_status"] != EXECUTION_REQUEST_PENDING:
+        raise InvalidTransition(
+            f"execution request status is "
+            f"{stored_execution_request_record['request_status']!r}; "
+            "expected pending"
+        )
+
+    if execution_result_record_path.exists():
+        existing_execution_result_record = read_json(execution_result_record_path)
+        validate_schema(existing_execution_result_record, "run_execution_result_record")
+        if event_id is None:
+            raise InvalidTransition("run_execution_result_record.json already exists")
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise InvalidTransition("run_execution_result_record.json already exists")
+        if _matches_run_execution_completed_replay(
+            existing_event,
+            run_id=run_id,
+            actor=executor,
+            execution_result_record=existing_execution_result_record,
+        ):
+            return existing_execution_result_record
+        if existing_event.get("event_type") == EVENT_TYPE_RUN_EXECUTION_COMPLETED:
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise InvalidTransition("run_execution_result_record.json already exists")
+
+    item_results = process_execution_items(
+        stored_execution_request_record["execution_items"]
+    )
+    execution_result_record = make_run_execution_result_record(
+        run_id=run_id,
+        source_execution_request_fingerprint=expected_request_fingerprint,
+        item_results=item_results,
+        executor=executor,
+        notes=notes,
+        metadata=metadata,
+    )
+    submitted_fingerprint = run_execution_result_fingerprint(execution_result_record)
+
+    candidate = make_run_event(
+        event_type=EVENT_TYPE_RUN_EXECUTION_COMPLETED,
+        run_id=run_id,
+        actor=executor,
+        payload={
+            "run_id": run_id,
+            "executor": executor,
+            "result_status": execution_result_record["result_status"],
+            "source_execution_request_fingerprint": expected_request_fingerprint,
+            "run_execution_result_fingerprint": submitted_fingerprint,
+            "run_execution_result_record_path": str(execution_result_record_path),
+        },
+        event_id=event_id,
+    )
+    existing = _resolve_idempotent_event(run_id, candidate, base_dir)
+    if existing is not None:
+        return execution_result_record
+
+    ensure_dir(execution_result_record_path.parent)
+    atomic_write_json(execution_result_record_path, execution_result_record)
+    append_run_event(run_id, candidate, base_dir)
+    return execution_result_record
