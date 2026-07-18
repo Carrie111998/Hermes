@@ -1297,6 +1297,8 @@ def _validate_projection(
     aggregate = "".join(
         message.content for message in turn_messages if isinstance(message.content, str)
     )
+    if _is_provider_limit_failure(aggregate):
+        return
     if not _is_exact_registered_text(aggregate):
         raise _TranscriptConflict("bridge_conflict")
 

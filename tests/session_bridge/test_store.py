@@ -6653,8 +6653,11 @@ def test_claude_visibility_commit_cannot_backdate_an_expired_lease(
         )
 
 
+@pytest.mark.parametrize(
+    "detail", ["registration response malformed", "exact transcript conflict"]
+)
 def test_failed_malformed_registration_can_only_requeue_exact_uuid_reconciliation(
-    db: SessionDB,
+    db: SessionDB, detail: str
 ) -> None:
     clock = [100.0]
     store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
@@ -6665,7 +6668,7 @@ def test_failed_malformed_registration_can_only_requeue_exact_uuid_reconciliatio
         identity.job_id,
         launch.lease_digest,
         "bridge_conflict",
-        "registration response malformed",
+        detail,
     )
     assert failed["state"] == "claude_failed"
 

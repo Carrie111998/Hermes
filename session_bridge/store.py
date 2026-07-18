@@ -1740,7 +1740,10 @@ class SessionBridgeStore:
                    WHERE id = ? AND reserved_claude_uuid = ?
                      AND state = 'claude_failed'
                      AND error_code = 'bridge_conflict'
-                     AND error_detail = 'registration response malformed'
+                     AND error_detail IN (
+                         'registration response malformed',
+                         'exact transcript conflict'
+                     )
                      AND attempts > 0""",
                 (
                     operation_time,

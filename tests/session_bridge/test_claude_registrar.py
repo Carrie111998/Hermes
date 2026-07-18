@@ -734,6 +734,25 @@ def test_registration_transcript_rejects_any_unrelated_projected_message() -> No
     assert result.status == "failed" and result.error_code == "bridge_conflict"
 
 
+def test_exact_uuid_provider_limit_transcript_reconciles_without_replacement() -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    projection = projection_for(
+        item,
+        response="You've hit your limit · resets Jul 20, 4am "
+        "(America/New_York)\nAPI Error: 429 rate_limit",
+    )
+    factory = FakeFactory()
+    result = registrar(FakeSource([projection]), factory).process(item)
+
+    assert result.status == "visible"
+    assert factory.spawns == []
+
+
 @pytest.mark.parametrize(
     "messages",
     [
