@@ -673,15 +673,7 @@ def _claude_visibility_status_payload(
 
     counts: dict[str, int] = {}
     for state in states:
-        try:
-            count = int(counts_raw.get(state, 0))
-        except (TypeError, ValueError):
-            count = 0
-            degraded.add("invalid_status")
-        if count < 0:
-            count = 0
-            degraded.add("invalid_status")
-        counts[state] = count
+        counts[state] = _nonnegative_int(counts_raw.get(state, 0), degraded)
 
     retry_codes = _fixed_count_mapping(retry_raw, degraded)
     failed_codes = _fixed_count_mapping(failed_raw, degraded)
@@ -720,10 +712,28 @@ def _claude_visibility_status_payload(
 
     def tracked(name: str) -> dict[str, Any]:
         value = raw.get(name, {"tracked": False, "value": None})
-        if not isinstance(value, Mapping):
+        if not isinstance(value, Mapping) or set(value) != {"tracked", "value"}:
             degraded.add("invalid_status")
             return {"tracked": False, "value": None}
-        return dict(value)
+        selected = value.get("tracked")
+        nested = value.get("value")
+        if type(selected) is not bool or (not selected and nested is not None):
+            degraded.add("invalid_status")
+            return {"tracked": False, "value": None}
+        if not selected:
+            return {"tracked": False, "value": None}
+        if name == "last_empty_cycle":
+            timestamp = _finite_number(nested)
+            if timestamp is None:
+                degraded.add("invalid_status")
+                return {"tracked": False, "value": None}
+            return {"tracked": True, "value": timestamp}
+        include_empty = name == "last_cycle"
+        shaped = _tracked_result_value(nested, include_empty=include_empty)
+        if shaped is None:
+            degraded.add("invalid_status")
+            return {"tracked": False, "value": None}
+        return {"tracked": True, "value": shaped}
 
     payload = {
         "enabled": bool(getattr(config, "enabled")),
@@ -767,14 +777,66 @@ def _fixed_count_mapping(
 
 
 def _nonnegative_int(value: Any, degraded: set[str]) -> int:
-    try:
-        selected = int(value)
-    except (TypeError, ValueError):
+    if type(value) is not int:
         degraded.add("invalid_status")
         return 0
+    selected = value
     if selected < 0:
         degraded.add("invalid_status")
         return 0
+    return selected
+
+
+def _tracked_result_value(
+    value: Any, *, include_empty: bool
+) -> dict[str, Any] | None:
+    expected = {"at", "sequence", "status", "error_code"}
+    if include_empty:
+        expected.add("empty_verified")
+    if not isinstance(value, Mapping) or set(value) != expected:
+        return None
+    at = _finite_number(value.get("at"))
+    sequence = value.get("sequence")
+    status = value.get("status")
+    error_code = value.get("error_code")
+    if (
+        at is None
+        or type(sequence) is not int
+        or sequence < 1
+        or type(status) is not str
+        or not _FIXED_CODE.fullmatch(status)
+        or (
+            error_code is not None
+            and (
+                type(error_code) is not str
+                or not _FIXED_CODE.fullmatch(error_code)
+            )
+        )
+    ):
+        return None
+    result: dict[str, Any] = {
+        "at": at,
+        "sequence": sequence,
+        "status": status,
+        "error_code": error_code,
+    }
+    if include_empty:
+        empty_verified = value.get("empty_verified")
+        if type(empty_verified) is not bool:
+            return None
+        result["empty_verified"] = empty_verified
+    return result
+
+
+def _finite_number(value: Any) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    try:
+        selected = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(selected):
+        return None
     return selected
 
 

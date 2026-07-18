@@ -24,6 +24,7 @@ from session_bridge.coordinator import (
 )
 from session_bridge.mcp_server import (
     EXPECTED_TOOLS,
+    _claude_visibility_status_payload,
     _validate_windows_token_acl,
     create_app,
     resolve_bearer_token,
@@ -1465,6 +1466,93 @@ def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract
             "claude_fail",
         )
     )
+
+
+def test_claude_visibility_status_rejects_coercible_counts_and_shapes_heartbeats(
+) -> None:
+    config = ClaudeVisibilityConfig(
+        enabled=True,
+        continuous=True,
+        daily_registration_limit=25,
+        reserved_cost_per_attempt_usd="0.02",
+        emergency_daily_cost_usd="0.50",
+    )
+    raw = {
+        "counts": {
+            "claude_pending": True,
+            "claude_leased": 1.0,
+            "claude_retry": "2",
+            "claude_visible": 3,
+            "claude_failed": 0,
+        },
+        "retry_codes": {"native_transcript_not_indexed": "4"},
+        "failed_codes": {},
+        "usage": {
+            "local_day": "2026-07-17",
+            "attempts": "5",
+            "reserved_cost_usd": "0.10",
+        },
+        "fatal": [],
+        "last_cycle": {
+            "tracked": True,
+            "value": {
+                "at": 120.0,
+                "sequence": "9",
+                "status": "retry",
+                "error_code": "native_transcript_not_indexed",
+                "empty_verified": False,
+                "secret": "must-not-leak",
+            },
+            "outer_secret": "must-not-leak",
+        },
+        "last_empty_cycle": {"tracked": 1, "value": 100.0},
+        "last_registrar_result": {
+            "tracked": True,
+            "value": {
+                "at": 119.0,
+                "sequence": 8,
+                "status": "registered",
+                "error_code": None,
+                "secret": "must-not-leak",
+            },
+        },
+    }
+
+    payload = _claude_visibility_status_payload(raw, config)
+
+    assert payload["counts"] == {
+        "claude_pending": 0,
+        "claude_leased": 0,
+        "claude_retry": 0,
+        "claude_visible": 3,
+        "claude_failed": 0,
+    }
+    assert payload["retry_codes"] == {"native_transcript_not_indexed": 0}
+    assert payload["usage"]["attempts"] == 0
+    assert payload["last_cycle"] == {"tracked": False, "value": None}
+    assert payload["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert payload["last_registrar_result"] == {
+        "tracked": False,
+        "value": None,
+    }
+    assert payload["degraded_reasons"] == ["invalid_status"]
+
+
+def test_claude_visibility_status_degrades_oversized_heartbeat_timestamp() -> None:
+    config = ClaudeVisibilityConfig(enabled=True, continuous=True)
+    raw = {
+        "counts": {},
+        "retry_codes": {},
+        "failed_codes": {},
+        "usage": {"attempts": 0, "reserved_cost_usd": "0"},
+        "fatal": [],
+        "last_empty_cycle": {"tracked": True, "value": 10**1000},
+    }
+
+    payload = _claude_visibility_status_payload(raw, config)
+
+    assert payload["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert payload["degraded_reasons"] == ["invalid_status"]
 
 
 def test_session_sidebar_fail_has_fixed_schema_and_rejects_arbitrary_errors(

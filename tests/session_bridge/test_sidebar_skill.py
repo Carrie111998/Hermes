@@ -20,6 +20,31 @@ BASELINE = Path(__file__).parent / "fixtures" / "sidebar_skill_baseline.txt"
 LOCK_NAME = ".session-sidebar-sync.install.lock"
 
 
+@pytest.mark.parametrize("relative", ("a:b", "D:/escape.txt", "D:escape.txt"))
+def test_sidebar_installer_rejects_windows_drive_relative_manifest_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
+    from session_bridge import sidebar_skill
+    from session_bridge.asset_installer import AssetInstallSpec
+
+    monkeypatch.setattr(
+        sidebar_skill,
+        "_INSTALL_SPEC",
+        AssetInstallSpec(
+            asset_name="session-sidebar-sync",
+            destination_name="session-sidebar-sync",
+            files=(relative,),
+            staging_marker_content=b"test\n",
+            error_label="sidebar skill",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="asset file path"):
+        sidebar_skill.install_sidebar_skill(tmp_path / "codex")
+
+    assert not (tmp_path / "codex" / "skills").exists()
+
+
 def _installed_files(path: Path) -> dict[str, bytes]:
     return {
         str(file.relative_to(path)).replace("\\", "/"): file.read_bytes()

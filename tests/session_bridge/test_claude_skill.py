@@ -88,6 +88,47 @@ def test_shared_asset_installer_rejects_path_traversal(tmp_path: Path) -> None:
     assert not (tmp_path.parent / "escape").exists()
 
 
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "a:b",
+        "D:/escape.txt",
+        "D:escape.txt",
+        "CON",
+        "nested/NUL.txt",
+        "nested/trailing.",
+        "nested/trailing ",
+    ),
+)
+def test_shared_asset_installer_rejects_windows_ambiguous_manifest_paths(
+    tmp_path: Path, relative: str
+) -> None:
+    from session_bridge.asset_installer import AssetInstallSpec, install_packaged_asset
+
+    with pytest.raises(ValueError, match="asset file path"):
+        install_packaged_asset(
+            tmp_path,
+            AssetInstallSpec(
+                asset_name="claude-session-bridge",
+                destination_name="session-bridge",
+                files=(relative,),
+                staging_marker_content=b"test\n",
+            ),
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_shared_asset_join_requires_a_strict_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import asset_installer
+
+    monkeypatch.setattr(asset_installer, "_validate_asset_file_path", lambda _path: None)
+    with pytest.raises(ValueError, match="descendant"):
+        asset_installer._strict_descendant(tmp_path / "staging", "D:/escape.txt")
+
+
 def test_install_claude_skill_rejects_redirected_destination(tmp_path: Path) -> None:
     from session_bridge.claude_skill import install_claude_skill
 

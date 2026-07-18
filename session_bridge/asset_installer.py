@@ -12,8 +12,9 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import errno
 from importlib import resources
+from importlib.resources.abc import Traversable
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import stat
@@ -23,6 +24,12 @@ from typing import Final
 
 
 _SAFE_NAME: Final = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
+_WINDOWS_RESERVED_NAMES: Final = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"}
+    | {f"COM{suffix}" for suffix in "123456789¹²³"}
+    | {f"LPT{suffix}" for suffix in "123456789¹²³"}
+)
+_WINDOWS_FORBIDDEN_CHARACTERS: Final = frozenset('<>"|?*')
 
 
 @dataclass(frozen=True)
@@ -43,14 +50,7 @@ class AssetInstallSpec:
         if not self.files or len(set(self.files)) != len(self.files):
             raise ValueError("asset files must be non-empty and unique")
         for relative in self.files:
-            path = PurePosixPath(relative)
-            if (
-                not relative
-                or path.is_absolute()
-                or "\\" in relative
-                or any(part in {"", ".", ".."} for part in path.parts)
-            ):
-                raise ValueError("asset file path must be a safe relative path")
+            _validate_asset_file_path(relative)
         if not self.staging_marker_content:
             raise ValueError("staging marker content must be non-empty")
         return self
@@ -169,17 +169,18 @@ def _copy_packaged_asset(
 ) -> None:
     source = resources.files("session_bridge").joinpath("assets", spec.asset_name)
     for relative in spec.files:
-        target = destination.joinpath(*relative.split("/"))
+        target = _strict_descendant(destination, relative)
+        packaged_source = _packaged_descendant(source, relative)
         if identity is not None:
             identity.revalidate()
         target.parent.mkdir(parents=True, exist_ok=True)
         if identity is not None:
             identity.revalidate()
             _guarded_write_bytes(
-                target, source.joinpath(*relative.split("/")).read_bytes(), identity
+                target, packaged_source.read_bytes(), identity
             )
         else:
-            target.write_bytes(source.joinpath(*relative.split("/")).read_bytes())
+            target.write_bytes(packaged_source.read_bytes())
 
 
 def _tree_matches_packaged_asset(
@@ -208,8 +209,8 @@ def _tree_matches_packaged_asset(
         return False
     source = resources.files("session_bridge").joinpath("assets", spec.asset_name)
     return all(
-        directory.joinpath(*relative.split("/")).read_bytes()
-        == source.joinpath(*relative.split("/")).read_bytes()
+        _strict_descendant(directory, relative).read_bytes()
+        == _packaged_descendant(source, relative).read_bytes()
         for relative in spec.files
     )
 
@@ -373,12 +374,58 @@ def _is_verified_owned_staging(candidate: Path, spec: AssetInstallSpec) -> bool:
         source = resources.files("session_bridge").joinpath("assets", spec.asset_name)
         return all(
             relative == spec.staging_marker
-            or candidate.joinpath(*relative.split("/")).read_bytes()
-            == source.joinpath(*relative.split("/")).read_bytes()
+            or _strict_descendant(candidate, relative).read_bytes()
+            == _packaged_descendant(source, relative).read_bytes()
             for relative in actual
         )
     except (FileNotFoundError, OSError, PermissionError):
         return False
+
+
+def _validate_asset_file_path(relative: str) -> None:
+    path = PurePosixPath(relative)
+    windows_path = PureWindowsPath(relative)
+    if (
+        not relative
+        or path.is_absolute()
+        or "\\" in relative
+        or ":" in relative
+        or bool(windows_path.drive)
+        or bool(windows_path.root)
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(_is_ambiguous_windows_component(part) for part in path.parts)
+    ):
+        raise ValueError("asset file path must be a safe relative path")
+
+
+def _is_ambiguous_windows_component(component: str) -> bool:
+    basename = component.partition(".")[0].upper()
+    return (
+        component.rstrip(" .") != component
+        or any(ord(character) < 32 for character in component)
+        or any(character in _WINDOWS_FORBIDDEN_CHARACTERS for character in component)
+        or basename in _WINDOWS_RESERVED_NAMES
+    )
+
+
+def _strict_descendant(root: Path, relative: str) -> Path:
+    """Join a manifest path without allowing Windows drive/root resets."""
+
+    _validate_asset_file_path(relative)
+    absolute_root = root.absolute()
+    candidate = absolute_root.joinpath(*relative.split("/"))
+    if candidate == absolute_root or not candidate.is_relative_to(absolute_root):
+        raise ValueError("asset file path must resolve to a strict descendant")
+    return candidate
+
+
+def _packaged_descendant(root: Traversable, relative: str) -> Traversable:
+    """Join below a packaged asset, checking containment when it is filesystem-backed."""
+
+    _validate_asset_file_path(relative)
+    if isinstance(root, Path):
+        return _strict_descendant(root, relative)
+    return root.joinpath(*relative.split("/"))
 
 
 def _cleanup_current_staging(
