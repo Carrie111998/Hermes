@@ -30,7 +30,7 @@ Use the native `session_bridge` MCP tools when they are callable in the current 
 uv run --project "C:\\Users\\diego\\.hermes\\worktrees\\session-bridge-ship" --no-sync python -m session_bridge.broker_client status|pending|bind|commit|fail
 ```
 
-The subcommands map one-for-one to `session_status`, `session_sidebar_pending`, `session_sidebar_bind`, `session_sidebar_commit`, and `session_sidebar_fail`. Supply `pending --limit 5`, `bind --lease-token <exact token> --thread-id <threadId>`, `commit --lease-token <exact token> --thread-id <threadId>`, or `fail --lease-token <exact token> --error-code <fixed code>` as required. Parse the command's JSON stdout as the bridge tool result.
+The subcommands map one-for-one to `session_status`, `session_sidebar_pending`, `session_sidebar_bind`, `session_sidebar_commit`, and `session_sidebar_fail`. Supply `pending --limit 5`, `bind --lease-token=<exact token> --thread-id=<threadId>`, `commit --lease-token=<exact token> --thread-id=<threadId>`, or `fail --lease-token=<exact token> --error-code=<fixed code>` as required. The equals-sign form is mandatory because opaque tokens may begin with `-` and must remain one argument. Parse the command's JSON stdout as the bridge tool result.
 
 Each fallback invocation counts as the exact single bridge call required by the procedure. Select one bridge transport for each step and never call both transports for the same bridge step. Do not retry a fallback invocation whose result is ambiguous, and do not mutate the bridge database directly. If neither transport is available, stop before leasing. Native Codex project and task operations still use the native app tools; this fallback applies only to the five bridge operations above.
 

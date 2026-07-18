@@ -211,6 +211,8 @@ def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missin
         'session-bridge-ship" --no-sync python -m session_bridge.broker_client'
     ) in skill
     assert "status|pending|bind|commit|fail" in skill
+    assert "--lease-token=<exact token>" in skill
+    assert "--lease-token <exact token>" not in skill
     assert "never call both transports for the same bridge step" in skill
     assert "counts as the exact single bridge call" in skill
     assert "If neither transport is available, stop before leasing" in skill
