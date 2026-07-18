@@ -211,6 +211,57 @@ def test_pipeline_update_accepts_tailor_alias_fields(bus):
     assert transitions[0]["title"].startswith("LMS Deposit Strategy")
 
 
+def test_pipeline_update_enriches_title_company_from_pipeline_state(bus, tmp_path, monkeypatch):
+    """Matcher's batch PIPELINE_UPDATE messages carry only job_key + new_stage
+    (no title/company), so the Telegram head fell back to a bare UUID. The
+    translator best-effort backfills title/company from pipeline state.
+    """
+    import events.subscribers.mailbox_translator as mt
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text(json.dumps({"jobs": [
+        {"job_id": "e0752a61", "title": "Director Finance", "company": "Acme"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {"job_key": "e0752a61", "new_stage": "archived"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["title"] == "Director Finance"
+    assert t["company"] == "Acme"
+
+
+def test_pipeline_update_enrichment_does_not_override_message_fields(bus, tmp_path, monkeypatch):
+    """Title/company already in the message win over pipeline-state values."""
+    import events.subscribers.mailbox_translator as mt
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text(json.dumps({"jobs": [
+        {"job_id": "j9", "title": "Stale Title", "company": "StaleCo"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {
+        "job_key": "j9", "new_stage": "applied", "title": "Fresh Title", "company": "FreshCo"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["title"] == "Fresh Title"
+    assert t["company"] == "FreshCo"
+
+
+def test_pipeline_update_enrichment_best_effort_when_no_pipeline_file(bus, tmp_path, monkeypatch):
+    """Missing/unreadable pipeline state must never break emission."""
+    import events.subscribers.mailbox_translator as mt
+    monkeypatch.setattr(mt, "PIPELINE_PATH", tmp_path / "does_not_exist.json")
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {"job_key": "j1", "new_stage": "scored"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["new_stage"] == "scored"
+    assert "title" not in t and "company" not in t
+
+
 def test_error_message_emits_agent_error(bus):
     _mailbox_event(bus, "ERROR",
                    {"message": "scout failed", "source_agent": "scout"})

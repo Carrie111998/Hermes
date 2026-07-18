@@ -15,6 +15,7 @@ closes a gap from the cron-emitter wiring (events/producers/cron_emitter.py)
 which only saw failures that surfaced as cron exit codes.
 """
 
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +26,7 @@ from events.paths import failure_cluster_state_path
 from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
 from events.subscribers.base import BaseSubscriber
+from pipeline_state.manager import PIPELINE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,43 @@ class MailboxTranslator(BaseSubscriber):
         self._cluster_detector = FailureClusterDetector(
             state_path=failure_cluster_state_path(),
         )
+        # mtime-keyed cache for pipeline-state title/company enrichment so a
+        # burst of PIPELINE_UPDATE events (matcher scores/archives many jobs at
+        # once) rebuilds the index at most once per pipeline.json write.
+        self._pipeline_index_cache: Optional[Tuple[float, Dict[str, Dict[str, str]]]] = None
+
+    def _pipeline_metadata(self, job_ref: Optional[str]) -> Dict[str, str]:
+        """Best-effort {title, company} lookup by job id/key from pipeline
+        state. Returns {} on any miss or error — enrichment must never break
+        event emission. Cached and invalidated by pipeline.json mtime.
+        """
+        if not job_ref:
+            return {}
+        try:
+            path = PIPELINE_PATH
+            mtime = path.stat().st_mtime
+            cache = self._pipeline_index_cache
+            if cache is None or cache[0] != mtime:
+                raw = path.read_bytes()
+                if raw.startswith(b"\xef\xbb\xbf"):  # strip BOM (Windows-authored)
+                    raw = raw[3:]
+                data = json.loads(raw.decode("utf-8"))
+                index: Dict[str, Dict[str, str]] = {}
+                for j in data.get("jobs", []):
+                    jid = j.get("job_id") or j.get("id")
+                    if not jid:
+                        continue
+                    meta = {}
+                    if j.get("title"):
+                        meta["title"] = j["title"]
+                    if j.get("company"):
+                        meta["company"] = j["company"]
+                    index[jid] = meta
+                cache = (mtime, index)
+                self._pipeline_index_cache = cache
+            return dict(cache[1].get(job_ref, {}))
+        except Exception:
+            return {}
 
     def handle(self, event: Event) -> None:
         payload = event.payload or {}
@@ -235,6 +274,16 @@ class MailboxTranslator(BaseSubscriber):
             new = transition.get("new_stage")
             # Emit on any real transition — including first assignment where prev is None.
             if new and new != prev:
+                # Backfill title/company from pipeline state when the message
+                # omits them (matcher batch updates carry only job_key + stage),
+                # so the Telegram head is "<title> at <company>" not a bare UUID.
+                if not transition.get("title") or not transition.get("company"):
+                    meta = self._pipeline_metadata(
+                        transition.get("job_id") or transition.get("job_key")
+                    )
+                    for k in ("title", "company"):
+                        if not transition.get(k) and meta.get(k):
+                            transition[k] = meta[k]
                 results.append((EventType.STAGE_TRANSITION, transition, None))
 
         elif message_type == "FOLLOWUP_ALERT":
