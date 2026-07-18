@@ -3428,6 +3428,7 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        hermes_user_id = ""
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3435,6 +3436,7 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
+                    hermes_user_id = str(sess.get("hermes_user_id") or "")
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3443,6 +3445,7 @@ def _set_session_context(
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
+            user_id=hermes_user_id,
         )
     except Exception:
         return []
