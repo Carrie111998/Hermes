@@ -166,8 +166,8 @@ def test_sidebar_skill_metadata_matches_the_personal_codex_contract() -> None:
 def test_sidebar_skill_encodes_the_bounded_parallel_native_delivery_protocol() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "session_sidebar_pending(limit=5)" in skill
-    assert "at most five" in skill
+    assert "session_sidebar_pending(limit=3)" in skill
+    assert "at most three" in skill
     assert "concurrently across leases" in skill
     assert "preserve the procedure order within each lease" in skill
     assert "exactly once" in skill
@@ -196,7 +196,7 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
 
     assert skill.index("session_status") < skill.index("list_projects({})")
     assert skill.index("list_projects({})") < skill.index(
-        "session_sidebar_pending(limit=5)"
+        "session_sidebar_pending(limit=3)"
     )
     assert "do not call `session_sidebar_pending`" in skill
     assert "no job attempt is consumed" in skill
