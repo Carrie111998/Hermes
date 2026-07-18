@@ -5098,6 +5098,31 @@ def test_sidebar_retryable_error_allowlist_is_the_exact_fixed_contract() -> None
     })
 
 
+def test_sidebar_ambiguous_native_create_is_fatal_without_spending_retry_budget(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("ambiguous-create-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="ambiguous-native-create")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=150.0,
+    )
+
+    assert failed["state"] == SidebarJobState.FAILED.value
+    assert failed["attempts"] == 0
+    assert failed["error_code"] == "native_create_ambiguous"
+    assert failed["codex_thread_id"] is None
+    assert store.claim_sidebar_jobs(now=10_000.0, limit=1) == []
+
+
 @pytest.mark.parametrize(
     "error_code",
     sorted(SIDEBAR_RETRYABLE_ERRORS - {"broker_time_budget"}),
@@ -5216,6 +5241,7 @@ def test_sidebar_retry_backoff_counts_failures_and_fails_on_attempt_five(db) -> 
 @pytest.mark.parametrize(
     "error_code",
     [
+        "native_create_ambiguous",
         "marker_conflict",
         "source_identity_mismatch",
         "codex_thread_conflict",

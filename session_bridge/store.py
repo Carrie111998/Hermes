@@ -152,6 +152,7 @@ SIDEBAR_RETRYABLE_ERRORS = frozenset({
     "broker_time_budget",
 })
 SIDEBAR_FATAL_ERRORS = frozenset({
+    "native_create_ambiguous",
     "marker_conflict",
     "source_identity_mismatch",
     "codex_thread_conflict",

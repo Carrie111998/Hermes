@@ -162,7 +162,8 @@ class _SidebarSkillContract:
                 "Bridge temporarily unavailable": "bridge_temporarily_unavailable",
                 "Project listing or canonical lookup failed": "project_lookup_failed",
                 "Rename failed": "rename_failed",
-                "Create response lost or task not yet indexed": "native_task_not_indexed",
+                "Create response lost or otherwise ambiguous": "native_create_ambiguous",
+                "Bound task not yet indexed": "native_task_not_indexed",
                 "Authenticated marker conflict": "marker_conflict",
             }
             if any(

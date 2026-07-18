@@ -367,7 +367,8 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
     required_rules = (
         "Unavailable native tool -> `codex_tool_unavailable`",
         "Desktop explicitly offline -> `desktop_offline`",
-        "Definite or ambiguous create failure -> `native_task_not_indexed`",
+        "Definite create failure -> `native_task_not_indexed`",
+        "ambiguous create failure -> `native_create_ambiguous`",
         "Failed or ambiguous reconciliation -> `native_task_not_indexed`",
         "Failed rename -> `rename_failed`",
         "Definite or ambiguous commit failure -> `bridge_temporarily_unavailable`",
@@ -380,6 +381,16 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
     for rule in required_rules:
         assert rule in skill
     assert "Never retry create after any ambiguous create outcome" in skill
+
+
+def test_sidebar_skill_quarantines_ambiguous_create_without_retrying_creation() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "ambiguous create failure -> `native_create_ambiguous`" in skill
+    assert "`native_create_ambiguous`" in skill
+    assert (
+        "requires an operator audit before the failed job may be requeued" in skill
+    )
     assert "Never create a replacement after commit ambiguity" in skill
 
 
