@@ -7,18 +7,21 @@ import json
 import sys
 
 
-_INSTALL_COMMAND = ["install-sidebar-skill"]
+_INSTALL_COMMANDS = frozenset({"install-sidebar-skill", "install-claude-skill"})
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Install directly for the exact installer command; lazily load all else."""
 
     selected = list(sys.argv[1:] if argv is None else argv)
-    if selected == _INSTALL_COMMAND:
-        from .sidebar_skill import install_sidebar_skill
+    if len(selected) == 1 and selected[0] in _INSTALL_COMMANDS:
+        if selected[0] == "install-sidebar-skill":
+            from .sidebar_skill import install_sidebar_skill as installer
+        else:
+            from .claude_skill import install_claude_skill as installer
 
         try:
-            installed = install_sidebar_skill()
+            installed = installer()
         except Exception:
             _emit({"error": "configuration_error"})
             return 2

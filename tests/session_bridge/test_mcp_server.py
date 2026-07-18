@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
-from session_bridge.config import BridgeConfig, SidebarConfig
+from session_bridge.config import BridgeConfig, ClaudeVisibilityConfig, SidebarConfig
 from session_bridge.coordinator import (
     ContinuationBlockedError,
     ContinueResult,
@@ -736,7 +736,7 @@ def test_health_is_minimal_and_mcp_auth_is_constant_surface(db: SessionDB) -> No
     assert coordinator.stopped == 1
 
 
-def test_tools_list_exposes_exactly_the_nine_approved_tools(db: SessionDB) -> None:
+def test_tools_list_exposes_exactly_the_ten_approved_tools(db: SessionDB) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
     coordinator = _FakeCoordinator(
         bridge_id=bridge_id, source_id=source_id, target_id=target_id
@@ -752,6 +752,7 @@ def test_tools_list_exposes_exactly_the_nine_approved_tools(db: SessionDB) -> No
         "session_continue",
         "session_mirror",
         "session_status",
+        "session_claude_visibility_status",
         "session_sidebar_pending",
         "session_sidebar_bind",
         "session_sidebar_commit",
@@ -1332,6 +1333,66 @@ def test_session_sidebar_bind_has_two_argument_schema_and_is_idempotent(
         ("plaintext-opaque-lease", thread_id),
         ("plaintext-opaque-lease", thread_id),
     ]
+
+
+def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract(
+    db: SessionDB,
+) -> None:
+    store, bridge_id, source_id, target_id = _seed_linked_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=bridge_id, source_id=source_id, target_id=target_id
+    )
+    config = BridgeConfig(
+        claude_visibility=ClaudeVisibilityConfig(
+            enabled=True,
+            continuous=True,
+            daily_registration_limit=25,
+            reserved_cost_per_attempt_usd="0.02",
+            emergency_daily_cost_usd="0.50",
+        )
+    )
+    app = create_app(
+        catalog=UnifiedCatalog(db, store),
+        coordinator=coordinator,
+        store=store,
+        config=config,
+        token=TOKEN,
+        marker_key=MARKER_KEY,
+    )
+
+    with _test_client(app) as client:
+        payload = _call_tool(client, "session_claude_visibility_status", {})
+        listed = _rpc(client, "tools/list")
+
+    assert payload["enabled"] is True
+    assert payload["continuous"] is True
+    assert payload["counts"] == {
+        "claude_pending": 0,
+        "claude_leased": 0,
+        "claude_retry": 0,
+        "claude_visible": 0,
+        "claude_failed": 0,
+    }
+    assert payload["cost_gates"] == {
+        "daily_registration_limit": 25,
+        "attempts_remaining": 25,
+        "reserved_cost_per_attempt_usd": "0.02",
+        "emergency_daily_cost_usd": "0.50",
+        "reserved_cost_remaining_usd": "0.50",
+        "registration_limit_reached": False,
+        "emergency_cost_limit_reached": False,
+    }
+    assert payload["degraded_reasons"] == []
+    assert payload["last_cycle"] == {"tracked": False, "value": None}
+    assert payload["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert payload["last_registrar_result"] == {"tracked": False, "value": None}
+    names = {tool["name"] for tool in listed["result"]["tools"]}
+    assert not any(
+        fragment in name
+        for name in names
+        for fragment in ("claude_pending", "claude_claim", "claude_create",
+                         "claude_bind", "claude_commit", "claude_fail")
+    )
 
 
 def test_session_sidebar_fail_has_fixed_schema_and_rejects_arbitrary_errors(

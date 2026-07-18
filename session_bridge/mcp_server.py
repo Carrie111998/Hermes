@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from decimal import Decimal, InvalidOperation
 import ipaddress
 import json
 import math
@@ -20,6 +21,10 @@ from typing import Any, cast
 from hermes_constants import get_hermes_home
 
 from .catalog import UnifiedCatalog
+from .claude_visibility_codes import (
+    CLAUDE_VISIBILITY_FATAL_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
+)
 from .config import BridgeConfig
 from .coordinator import ContinueRequest, ContinueResult
 from .mirror import MirrorPolicy, enqueue_mirror_job
@@ -47,6 +52,7 @@ EXPECTED_TOOLS = {
     "session_continue",
     "session_mirror",
     "session_status",
+    "session_claude_visibility_status",
     "session_sidebar_pending",
     "session_sidebar_bind",
     "session_sidebar_commit",
@@ -378,6 +384,33 @@ def create_app(
         return _status_payload(health, catalog_status, sidebar_status)
 
     @mcp.tool()
+    async def session_claude_visibility_status() -> dict[str, Any]:
+        """Return read-only Claude native-visibility health and cost gates."""
+
+        visibility = config.claude_visibility
+        if not visibility.enabled:
+            raw: Mapping[str, Any] = {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": 0,
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": None,
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+            }
+        else:
+            raw = await asyncio.to_thread(store.claude_visibility_status, time.time())
+        return _claude_visibility_status_payload(raw, visibility)
+
+    @mcp.tool()
     async def session_sidebar_pending(limit: Any = 5) -> dict[str, Any]:
         """Lease up to five native sidebar registrations for the Codex broker."""
 
@@ -606,6 +639,155 @@ class _BearerMcpAuth:
             headers={"WWW-Authenticate": "Bearer"},
         )
         await response(scope, receive, send)
+
+
+def _claude_visibility_status_payload(
+    raw: Mapping[str, Any], config: object
+) -> dict[str, Any]:
+    """Shape the store's read-only status into a fixed public contract."""
+
+    states = (
+        "claude_pending",
+        "claude_leased",
+        "claude_retry",
+        "claude_visible",
+        "claude_failed",
+    )
+    counts_raw = raw.get("counts")
+    retry_raw = raw.get("retry_codes")
+    failed_raw = raw.get("failed_codes")
+    usage_raw = raw.get("usage")
+    degraded: set[str] = set()
+    if not isinstance(counts_raw, Mapping):
+        counts_raw = {}
+        degraded.add("invalid_status")
+    if not isinstance(retry_raw, Mapping):
+        retry_raw = {}
+        degraded.add("invalid_status")
+    if not isinstance(failed_raw, Mapping):
+        failed_raw = {}
+        degraded.add("invalid_status")
+    if not isinstance(usage_raw, Mapping):
+        usage_raw = {}
+        degraded.add("invalid_status")
+
+    counts: dict[str, int] = {}
+    for state in states:
+        try:
+            count = int(counts_raw.get(state, 0))
+        except (TypeError, ValueError):
+            count = 0
+            degraded.add("invalid_status")
+        if count < 0:
+            count = 0
+            degraded.add("invalid_status")
+        counts[state] = count
+
+    retry_codes = _fixed_count_mapping(retry_raw, degraded)
+    failed_codes = _fixed_count_mapping(failed_raw, degraded)
+    for code, count in retry_codes.items():
+        if count > 0 and code not in CLAUDE_VISIBILITY_RETRY_CODES:
+            degraded.add("unknown_retry_code")
+    for code, count in failed_codes.items():
+        if count <= 0:
+            continue
+        degraded.add(
+            code if code in CLAUDE_VISIBILITY_FATAL_CODES else "unknown_failed_code"
+        )
+    fatal = raw.get("fatal", [])
+    if not isinstance(fatal, list):
+        degraded.add("invalid_status")
+        fatal = []
+    else:
+        for item in fatal:
+            if not isinstance(item, Mapping) or item.get("code") not in {
+                "unknown_job_state",
+                "unknown_error_code",
+            }:
+                degraded.add("invalid_status")
+            else:
+                degraded.add(str(item["code"]))
+
+    attempts = _nonnegative_int(usage_raw.get("attempts"), degraded)
+    reserved_cost = _nonnegative_decimal(
+        usage_raw.get("reserved_cost_usd", "0"), degraded
+    )
+    daily_limit = int(getattr(config, "daily_registration_limit"))
+    attempt_cost = Decimal(str(getattr(config, "reserved_cost_per_attempt_usd")))
+    emergency_limit = Decimal(str(getattr(config, "emergency_daily_cost_usd")))
+    cost_remaining = max(Decimal("0"), emergency_limit - reserved_cost)
+    cost_blocked = reserved_cost + attempt_cost > emergency_limit
+
+    def tracked(name: str) -> dict[str, Any]:
+        value = raw.get(name, {"tracked": False, "value": None})
+        if not isinstance(value, Mapping):
+            degraded.add("invalid_status")
+            return {"tracked": False, "value": None}
+        return dict(value)
+
+    payload = {
+        "enabled": bool(getattr(config, "enabled")),
+        "continuous": bool(getattr(config, "continuous")),
+        "counts": counts,
+        "retry_codes": retry_codes,
+        "failed_codes": failed_codes,
+        "usage": {
+            "local_day": usage_raw.get("local_day"),
+            "attempts": attempts,
+            "reserved_cost_usd": str(reserved_cost),
+        },
+        "cost_gates": {
+            "daily_registration_limit": daily_limit,
+            "attempts_remaining": max(0, daily_limit - attempts),
+            "reserved_cost_per_attempt_usd": str(attempt_cost),
+            "emergency_daily_cost_usd": str(emergency_limit),
+            "reserved_cost_remaining_usd": str(cost_remaining),
+            "registration_limit_reached": attempts >= daily_limit,
+            "emergency_cost_limit_reached": cost_blocked,
+        },
+        "degraded_reasons": [],
+        "last_cycle": tracked("last_cycle"),
+        "last_empty_cycle": tracked("last_empty_cycle"),
+        "last_registrar_result": tracked("last_registrar_result"),
+    }
+    payload["degraded_reasons"] = sorted(degraded)
+    return payload
+
+
+def _fixed_count_mapping(
+    value: Mapping[Any, Any], degraded: set[str]
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for raw_code, raw_count in value.items():
+        if type(raw_code) is not str or not _FIXED_CODE.fullmatch(raw_code):
+            degraded.add("invalid_status")
+            continue
+        result[raw_code] = _nonnegative_int(raw_count, degraded)
+    return result
+
+
+def _nonnegative_int(value: Any, degraded: set[str]) -> int:
+    try:
+        selected = int(value)
+    except (TypeError, ValueError):
+        degraded.add("invalid_status")
+        return 0
+    if selected < 0:
+        degraded.add("invalid_status")
+        return 0
+    return selected
+
+
+def _nonnegative_decimal(value: Any, degraded: set[str]) -> Decimal:
+    try:
+        selected = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        degraded.add("invalid_status")
+        return Decimal("0")
+    if not selected.is_finite() or selected < 0:
+        degraded.add("invalid_status")
+        return Decimal("0")
+    return selected
 
 
 def _validated_token(value: str | bytes) -> bytes:

@@ -266,6 +266,29 @@ def test_sidebar_skill_cli_sanitizes_install_failure(
     assert "private destination" not in rendered
 
 
+def test_claude_skill_cli_installs_without_loading_bridge_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installed = tmp_path / "claude" / "skills" / "session-bridge"
+    calls: list[None] = []
+    monkeypatch.setattr(
+        "session_bridge.cli.install_claude_skill",
+        lambda: calls.append(None) or installed,
+    )
+
+    result = main(
+        ["install-claude-skill"],
+        config_loader=lambda: pytest.fail("installer must not load bridge config"),
+        backend_factory=lambda _config: pytest.fail("installer must not start backend"),
+    )
+
+    assert result == 0
+    assert calls == [None]
+    assert _json_output(capsys) == {"status": "installed", "path": str(installed)}
+
+
 def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -50,6 +50,7 @@ from .mirror import (
     should_halt_batch,
 )
 from .models import MirrorJobState, Provider, SidebarJobState
+from .claude_skill import install_claude_skill
 from .sidebar_skill import install_sidebar_skill
 from .store import (
     SIDEBAR_FATAL_ERRORS,
@@ -959,6 +960,10 @@ def build_parser() -> argparse.ArgumentParser:
         "install-sidebar-skill",
         help="install the personal Codex sidebar delivery skill",
     )
+    commands.add_parser(
+        "install-claude-skill",
+        help="install the personal Claude unified catalog skill",
+    )
     commands.add_parser("serve", help="serve the authenticated loopback MCP")
 
     scan = commands.add_parser("scan", help="import provider history into the catalog")
@@ -1071,6 +1076,14 @@ def main(
     if args.command == "install-sidebar-skill":
         try:
             installed = install_sidebar_skill()
+        except Exception:
+            _emit({"error": "configuration_error"})
+            return EXIT_CONFIG
+        _emit({"status": "installed", "path": str(installed)})
+        return EXIT_OK
+    if args.command == "install-claude-skill":
+        try:
+            installed = install_claude_skill()
         except Exception:
             _emit({"error": "configuration_error"})
             return EXIT_CONFIG
