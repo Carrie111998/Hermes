@@ -68,6 +68,7 @@ _MAX_CLI_VERSION_BYTES = 4096
 _CHARACTERIZATION_RECORD = ".claude-visibility-operation.json"
 _CHARACTERIZATION_SENTINEL = ".session-bridge-characterization.json"
 _CLEANUP_TTL_SECONDS = 7 * 24 * 60 * 60
+_MAX_CHARACTERIZATION_AUTH_RECOVERY_ATTEMPTS = 24
 _PROVIDER_REQUIRED_FIELDS = frozenset({
     "create",
     "discover",
@@ -727,7 +728,11 @@ def _validate_characterization_transcript(
         candidate, identity, marker_secret
     )
     messages = list(native.messages)
-    if len(messages) not in (2, 4):
+    if (
+        len(messages) < 2
+        or len(messages) % 2 != 0
+        or len(messages) > 2 + 2 * _MAX_CHARACTERIZATION_AUTH_RECOVERY_ATTEMPTS
+    ):
         raise RuntimeError("characterization_identity_mismatch:response")
     if any(
         message.ordinal != 0
@@ -742,44 +747,60 @@ def _validate_characterization_transcript(
         raise RuntimeError("characterization_identity_mismatch:response")
     if messages[0].role != "user" or messages[0].content != expected_prompt:
         raise RuntimeError("characterization_identity_mismatch:response")
-    tail = messages[1:]
+    first_response = messages[1]
     normal = (
-        len(tail) == 1
-        and tail[0].role == "assistant"
-        and _is_exact_registered_text(tail[0].content)
+        len(messages) == 2
+        and first_response.role == "assistant"
+        and _is_exact_registered_text(first_response.content)
     )
-    auth_failure = (
-        len(tail) == 1
-        and tail[0].role == "assistant"
-        and _is_bounded_authentication_failure(tail[0].content)
+    auth_sequence = (
+        first_response.role == "assistant"
+        and _is_bounded_authentication_failure(first_response.content)
+    )
+    for index in range(2, len(messages), 2):
+        recovery_user = messages[index]
+        recovery_response = messages[index + 1]
+        is_last = index + 1 == len(messages) - 1
+        if (
+            recovery_user.role != "user"
+            or recovery_user.content != recovery_prompt
+            or recovery_response.role != "assistant"
+            or (
+                not _is_bounded_authentication_failure(recovery_response.content)
+                and not (
+                    is_last and _is_exact_registered_text(recovery_response.content)
+                )
+            )
+        ):
+            auth_sequence = False
+            break
+    last_response = messages[-1]
+    auth_failure = auth_sequence and _is_bounded_authentication_failure(
+        last_response.content
     )
     recovered = (
-        len(tail) == 3
-        and tail[0].role == "assistant"
-        and _is_bounded_authentication_failure(tail[0].content)
-        and tail[1].role == "user"
-        and tail[1].content == recovery_prompt
-        and tail[2].role == "assistant"
-        and _is_exact_registered_text(tail[2].content)
+        auth_sequence
+        and len(messages) >= 4
+        and _is_exact_registered_text(last_response.content)
     )
     if auth_failure:
-        assert isinstance(tail[0].content, str)
+        assert isinstance(first_response.content, str)
         if _path_identity(transcript) != before:
             raise RuntimeError("characterization_identity_mismatch:path_changed")
         raise CharacterizationAuthenticationFailure(
-            hashlib.sha256(tail[0].content.encode("utf-8")).hexdigest()
+            hashlib.sha256(first_response.content.encode("utf-8")).hexdigest()
         )
     if not normal and not recovered:
         raise RuntimeError("characterization_identity_mismatch:response")
     if _path_identity(transcript) != before:
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     if recovered and not allow_recovered:
-        assert isinstance(tail[0].content, str)
+        assert isinstance(first_response.content, str)
         transcript_digest = _sha256_file(transcript)
         if _path_identity(transcript) != before:
             raise RuntimeError("characterization_identity_mismatch:path_changed")
         raise CharacterizationRecoveredTranscript(
-            hashlib.sha256(tail[0].content.encode("utf-8")).hexdigest(),
+            hashlib.sha256(first_response.content.encode("utf-8")).hexdigest(),
             hashlib.sha256(recovery_prompt.encode("utf-8")).hexdigest(),
             transcript_digest,
         )

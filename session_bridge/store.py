@@ -1436,11 +1436,57 @@ class SessionBridgeStore:
         )
         from .claude_visibility import normalized_claude_visibility_error
 
-        normalized_code, _retryable = normalized_claude_visibility_error(error_code)
+        normalized_code, retryable = normalized_claude_visibility_error(error_code)
         next_at = _finite_number(next_attempt_at, "next_attempt_at")
 
         def _write(conn):
             operation_time = _finite_number(self._clock(), "clock")
+            if not retryable:
+                recovery = conn.execute(
+                    """SELECT * FROM session_claude_auth_recoveries
+                       WHERE job_id = ? AND state = 'leased' AND lease_digest = ?
+                         AND lease_expires_at > ? AND call_started_at IS NOT NULL""",
+                    (normalized_job, normalized_lease, operation_time),
+                ).fetchone()
+                if recovery is None:
+                    raise ValueError(
+                        "exact active Claude authentication recovery required"
+                    )
+                failed = conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_failed', error_code = ?,
+                           error_detail = 'authentication recovery terminal failure',
+                           updated_at = ?
+                       WHERE id = ? AND reserved_claude_uuid = ? AND attempts = ?
+                         AND ((state = 'claude_failed'
+                               AND error_code = 'bridge_conflict')
+                              OR (state = 'claude_retry' AND error_code =
+                                  'claude_authentication_unavailable'))""",
+                    (
+                        normalized_code,
+                        operation_time,
+                        normalized_job,
+                        recovery["reserved_claude_uuid"],
+                        recovery["attempt_ordinal"],
+                    ),
+                )
+                if failed.rowcount != 1:
+                    raise ValueError("exact failed Claude visibility job required")
+                closed = conn.execute(
+                    """UPDATE session_claude_auth_recoveries
+                       SET state = 'completed', lease_digest = NULL,
+                           lease_expires_at = NULL, completed_at = ?, updated_at = ?
+                       WHERE job_id = ? AND state = 'leased' AND lease_digest = ?""",
+                    (
+                        operation_time,
+                        operation_time,
+                        normalized_job,
+                        normalized_lease,
+                    ),
+                )
+                if closed.rowcount != 1:
+                    raise ValueError("stale Claude authentication recovery failure")
+                return {"state": "failed", "error_code": normalized_code}
             cursor = conn.execute(
                 """UPDATE session_claude_auth_recoveries
                    SET state = 'retry', next_attempt_at = ?, lease_digest = NULL,

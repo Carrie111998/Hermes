@@ -464,10 +464,16 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
 
     first = SessionDB(path)
     assert _rows(first, "SELECT version FROM schema_version") == [{"version": 10}]
-    assert _rows(
-        first,
-        "SELECT migration_name FROM session_bridge_migrations",
-    ) == [{"migration_name": "claude_visibility_security_v24"}]
+    assert {
+        row["migration_name"]
+        for row in _rows(
+            first,
+            "SELECT migration_name FROM session_bridge_migrations",
+        )
+    } == {
+        "claude_visibility_security_v24",
+        "claude_auth_recovery_call_started_v25",
+    }
     first._conn.execute(
         """UPDATE session_claude_visibility_jobs
            SET state = 'claude_leased', lease_digest = 'valid-digest',
@@ -497,6 +503,80 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
         ]
     finally:
         reopened.close()
+
+
+def test_auth_recovery_call_started_upgrade_is_explicit_and_queryable(tmp_path) -> None:
+    path = tmp_path / "auth-recovery-c214.db"
+    legacy = SessionDB(path)
+    legacy._conn.executescript(
+        """DROP TABLE session_claude_auth_recoveries;
+        CREATE TABLE session_claude_auth_recoveries (
+            job_id TEXT PRIMARY KEY,
+            reserved_claude_uuid TEXT NOT NULL,
+            operation_id TEXT NOT NULL UNIQUE,
+            evidence_digest TEXT NOT NULL,
+            prompt_digest TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('leased', 'retry', 'completed')),
+            attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+            next_attempt_at REAL NOT NULL,
+            lease_digest TEXT UNIQUE,
+            lease_expires_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            completed_at REAL,
+            FOREIGN KEY (job_id, reserved_claude_uuid)
+                REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+                ON DELETE CASCADE
+        );
+        DELETE FROM session_bridge_migrations
+        WHERE migration_name = 'claude_auth_recovery_call_started_v25';
+        """
+    )
+    legacy._conn.commit()
+    legacy.close()
+
+    upgraded = SessionDB(path)
+    try:
+        assert "call_started_at" in {
+            row["name"]
+            for row in _rows(
+                upgraded, 'PRAGMA table_info("session_claude_auth_recoveries")'
+            )
+        }
+        assert _rows(
+            upgraded,
+            """SELECT migration_name FROM session_bridge_migrations
+               WHERE migration_name = 'claude_auth_recovery_call_started_v25'""",
+        ) == [{"migration_name": "claude_auth_recovery_call_started_v25"}]
+
+        store = SessionBridgeStore(
+            upgraded, clock=lambda: 100.0, local_timezone=timezone.utc
+        )
+        candidate, identity = _claude_visibility_identity("c214-upgrade")
+        _enqueue_claude_visibility_job(store, candidate, identity)
+        launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+        store.fail_claude_visibility_job(
+            identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+        )
+        recovery = store.claim_claude_auth_recovery(
+            job_id=identity.job_id,
+            reserved_claude_uuid=identity.claude_uuid,
+            operation_id="6ae1c4de-0000-4000-8000-000000000009",
+            evidence_digest="a" * 64,
+            prompt_digest="b" * 64,
+            now=100.0,
+            lease_seconds=10,
+            daily_limit=25,
+            cost_limit="1.00",
+            reserved_cost="0.02",
+            max_attempts=5,
+        )
+        started = store.begin_claude_auth_recovery(
+            identity.job_id, recovery["lease_digest"]
+        )
+        assert started["call_started_at"] == 100.0
+    finally:
+        upgraded.close()
 
 
 @pytest.mark.parametrize("legacy_value", ["0.02", "0.0200000", "1000000.000000"])
@@ -5763,12 +5843,35 @@ def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
     assert resumed["reserved_claude_uuid"] == recovery["reserved_claude_uuid"]
     assert store.claude_visibility_status(111.0)["usage"]["attempts"] == 3
     store.begin_claude_auth_recovery(identity.job_id, resumed["lease_digest"])
+    store.retry_claude_auth_recovery(
+        identity.job_id,
+        resumed["lease_digest"],
+        "claude_authentication_unavailable",
+        112.0,
+    )
+    clock[0] = 112.0
+    repeated = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000001",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=112.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    assert repeated["attempt_ordinal"] == resumed["attempt_ordinal"] + 1
+    assert store.claude_visibility_status(112.0)["usage"]["attempts"] == 4
+    store.begin_claude_auth_recovery(identity.job_id, repeated["lease_digest"])
     committed = store.commit_claude_auth_recovery(
         job_id=identity.job_id,
-        lease_digest=resumed["lease_digest"],
+        lease_digest=repeated["lease_digest"],
         reserved_claude_uuid=identity.claude_uuid,
         transcript_digest="c" * 64,
-        visible_at=111.0,
+        visible_at=112.0,
     )
     assert committed["state"] == "claude_visible"
     recovery_row = _rows(
@@ -5776,7 +5879,7 @@ def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
         "SELECT state, completed_at FROM session_claude_auth_recoveries WHERE job_id = ?",
         (identity.job_id,),
     )[0]
-    assert recovery_row == {"state": "completed", "completed_at": 111.0}
+    assert recovery_row == {"state": "completed", "completed_at": 112.0}
 
 
 def test_claude_auth_recovery_pre_call_crash_reuses_paid_reservation(
@@ -5950,6 +6053,62 @@ def test_claude_auth_recovery_refuses_when_any_other_open_job_exists(
         identity.job_id: "claude_failed",
         other_identity.job_id: "claude_pending",
     }
+
+
+def test_nonretryable_auth_recovery_output_terminalizes_immediately(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-fatal-output")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000010",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    store.begin_claude_auth_recovery(identity.job_id, recovery["lease_digest"])
+
+    result = store.retry_claude_auth_recovery(
+        identity.job_id, recovery["lease_digest"], "bridge_conflict", 101.0
+    )
+
+    assert result == {"state": "failed", "error_code": "bridge_conflict"}
+    row = _rows(
+        db,
+        """SELECT state, error_code, attempts
+           FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0]
+    assert row == {
+        "state": "claude_failed",
+        "error_code": "bridge_conflict",
+        "attempts": 2,
+    }
+    assert store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000010",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=101.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    ) == {"status": "completed", "job_id": identity.job_id}
 
 
 def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(

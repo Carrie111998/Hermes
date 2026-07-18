@@ -396,6 +396,34 @@ def test_auth_recovery_durably_marks_call_started_before_spawn() -> None:
     assert len(factory.spawns) == 1
 
 
+def test_auth_recovery_malformed_response_terminalizes_when_store_marks_fatal() -> None:
+    class FatalStore(FakeStore):
+        def retry_claude_auth_recovery(self, *args: Any) -> dict[str, Any]:
+            self.calls.append(("retry_auth_recovery", *args))
+            return {"state": "failed", "error_code": "bridge_conflict"}
+
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    store = FatalStore()
+
+    outcome = registrar(
+        FakeSource(), FakeFactory(FakePty(output="NOT REGISTERED", exit_code=0)), store
+    ).resume_auth_recovery(recovery, prompt)
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "bridge_conflict"
+
+
 def test_terminal_echo_and_ansi_are_removed_before_exact_response_check() -> None:
     item = claim()
     expected = build_claude_registration_prompt(

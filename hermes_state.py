@@ -1862,6 +1862,46 @@ class SessionDB:
                 connection.rollback()
             raise
 
+    def _apply_claude_auth_recovery_call_started_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Add the crash-accounting checkpoint to the c214 recovery table."""
+
+        migration_name = "claude_auth_recovery_call_started_v25"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                connection.commit()
+                return
+            columns = {
+                row["name"] if isinstance(row, sqlite3.Row) else row[1]
+                for row in cursor.execute(
+                    'PRAGMA table_info("session_claude_auth_recoveries")'
+                ).fetchall()
+            }
+            if "call_started_at" not in columns:
+                cursor.execute(
+                    "ALTER TABLE session_claude_auth_recoveries "
+                    "ADD COLUMN call_started_at REAL"
+                )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -1895,6 +1935,10 @@ class SessionDB:
         # This is idempotent and self-healing: even if a version-gated
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
+        # c214 created this table before its durable call-start checkpoint.
+        # Upgrade that exact shape before generic reconciliation so the
+        # migration remains explicit and auditable.
+        self._apply_claude_auth_recovery_call_started_migration(cursor)
         self._reconcile_columns(cursor)
 
         # Bridge security migrations have their own durable ledger. They must

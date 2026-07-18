@@ -853,20 +853,23 @@ class ClaudeNativeRegistrar:
                     pending = ("creation_ambiguous", "recovery cleanup unconfirmed")
         if pending is not None:
             code, detail = pending
+            status = "retry"
             try:
-                self._store.retry_claude_auth_recovery(
+                transition = self._store.retry_claude_auth_recovery(
                     str(job_id),
                     str(lease_digest),
                     code,
                     self._clock() + self._retry_delay,
                 )
+                if transition.get("state") == "failed":
+                    status = "failed"
             except Exception:
                 code, detail = (
                     "session_bridge_unavailable",
                     "store transition unavailable",
                 )
             return ClaudeRegistrarOutcome(
-                "retry", str(job_id), str(native_id), code, detail
+                status, str(job_id), str(native_id), code, detail
             )
         return ClaudeRegistrarOutcome("recovered", str(job_id), str(native_id))
 

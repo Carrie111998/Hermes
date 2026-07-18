@@ -161,6 +161,7 @@ def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
         )
     assert len(raised.value.evidence_digest) == 64
 
+    first_evidence = raised.value.evidence_digest
     projection.messages.extend([
         ProjectedMessage(
             "recovery-user",
@@ -171,7 +172,72 @@ def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
             ),
             12.0,
         ),
-        ProjectedMessage("recovery-assistant", 0, "assistant", "REGISTERED", 13.0),
+        ProjectedMessage(
+            "recovery-assistant",
+            0,
+            "assistant",
+            "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+            13.0,
+        ),
+    ])
+    with pytest.raises(CharacterizationAuthenticationFailure) as repeated:
+        _validate_characterization_transcript(
+            restarted=_RestartedSource(transcript, projection, marker),
+            projects_root=projects_root,
+            reserved_uuid=claim.reserved_claude_uuid or "",
+            native_name=claim.native_name or "",
+            source_cwd=claim.source_cwd or "",
+            signed_marker=marker,
+            marker_secret=SECRET,
+        )
+    assert repeated.value.evidence_digest == first_evidence
+
+    over_limit_messages = list(projection.messages[:2])
+    recovery_prompt = build_characterization_auth_recovery_prompt(
+        claim.reserved_claude_uuid or "", marker
+    )
+    for index in range(25):
+        over_limit_messages.extend([
+            ProjectedMessage(
+                f"bounded-user-{index}",
+                0,
+                "user",
+                recovery_prompt,
+                20.0 + index * 2,
+            ),
+            ProjectedMessage(
+                f"bounded-assistant-{index}",
+                0,
+                "assistant",
+                "Failed to authenticate. API Error: 401 Invalid authentication credentials",
+                21.0 + index * 2,
+            ),
+        ])
+    over_limit = replace(projection, messages=over_limit_messages)
+    with pytest.raises(
+        RuntimeError, match="characterization_identity_mismatch:response"
+    ):
+        _validate_characterization_transcript(
+            restarted=_RestartedSource(transcript, over_limit, marker),
+            projects_root=projects_root,
+            reserved_uuid=claim.reserved_claude_uuid or "",
+            native_name=claim.native_name or "",
+            source_cwd=claim.source_cwd or "",
+            signed_marker=marker,
+            marker_secret=SECRET,
+        )
+
+    projection.messages.extend([
+        ProjectedMessage(
+            "recovery-user-2",
+            0,
+            "user",
+            build_characterization_auth_recovery_prompt(
+                claim.reserved_claude_uuid or "", marker
+            ),
+            14.0,
+        ),
+        ProjectedMessage("recovery-assistant-2", 0, "assistant", "REGISTERED", 15.0),
     ])
     with pytest.raises(RuntimeError, match="recovery_authority_required"):
         _validate_characterization_transcript(
