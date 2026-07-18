@@ -6653,6 +6653,40 @@ def test_claude_visibility_commit_cannot_backdate_an_expired_lease(
         )
 
 
+def test_failed_malformed_registration_can_only_requeue_exact_uuid_reconciliation(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("provider-limit")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    failed = store.fail_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "bridge_conflict",
+        "registration response malformed",
+    )
+    assert failed["state"] == "claude_failed"
+
+    with pytest.raises(ValueError, match="exact failed Claude visibility job"):
+        store.requeue_failed_claude_visibility_reconciliation(
+            identity.job_id, "00000000-0000-4000-8000-000000000000"
+        )
+
+    repaired = store.requeue_failed_claude_visibility_reconciliation(
+        identity.job_id, identity.claude_uuid
+    )
+    assert repaired["state"] == "claude_retry"
+    assert repaired["error_code"] == "creation_ambiguous"
+
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    assert claim.lease_kind == "reconciliation"
+    assert claim.requires_exact_id_reconciliation is True
+    assert claim.launch_permitted is False
+    assert claim.reserved_claude_uuid == identity.claude_uuid
+
+
 @pytest.mark.parametrize(
     ("requested_code", "persisted_code"),
     [("source_conflict", "source_conflict"), ("invented_code", "unknown_error_code")],

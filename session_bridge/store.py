@@ -1706,6 +1706,60 @@ class SessionBridgeStore:
             next_attempt_at=None,
         )
 
+    def requeue_failed_claude_visibility_reconciliation(
+        self, job_id: str, reserved_claude_uuid: str
+    ) -> dict[str, Any]:
+        """Repair a known provider-limit failure without authorizing creation."""
+
+        normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_uuid = _exact_nonempty_text(
+            reserved_claude_uuid, "reserved Claude UUID"
+        )
+
+        def _write(conn):
+            operation_time = _finite_number(self._clock(), "clock")
+            other_open = conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs
+                   WHERE id != ? AND state IN (
+                       'claude_pending', 'claude_leased',
+                       'claude_retry', 'claude_failed'
+                   ) LIMIT 1""",
+                (normalized_job,),
+            ).fetchone()
+            if other_open is not None:
+                raise ValueError("exact failed Claude visibility job required")
+            cursor = conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_retry', next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       lease_kind = NULL,
+                       error_code = 'creation_ambiguous',
+                       error_detail =
+                           'provider limit requires exact UUID reconciliation',
+                       updated_at = ?
+                   WHERE id = ? AND reserved_claude_uuid = ?
+                     AND state = 'claude_failed'
+                     AND error_code = 'bridge_conflict'
+                     AND error_detail = 'registration response malformed'
+                     AND attempts > 0""",
+                (
+                    operation_time,
+                    operation_time,
+                    normalized_job,
+                    normalized_uuid,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("exact failed Claude visibility job required")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                    (normalized_job,),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
     def commit_claude_visibility_job(
         self,
         job_id: str,

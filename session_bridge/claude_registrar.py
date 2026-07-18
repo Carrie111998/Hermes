@@ -1049,6 +1049,12 @@ class ClaudeNativeRegistrar:
                     "claude_authentication_unavailable",
                     "Claude authentication unavailable",
                 )
+            elif _is_provider_limit_failure(output):
+                pending = (
+                    "retry",
+                    "creation_ambiguous",
+                    "Claude provider limit interrupted registration",
+                )
             elif not _has_exact_registered_response(output, prompt):
                 pending = ("fail", "bridge_conflict", "registration response malformed")
             else:
@@ -1384,6 +1390,16 @@ def _is_authentication_failure(output: str) -> bool:
             and ("authenticate" in folded or "authentication" in folded)
         )
     )
+
+
+def _is_provider_limit_failure(output: str) -> bool:
+    if not isinstance(output, str) or not (1 <= len(output) <= _MAX_RESPONSE_CHARS):
+        return False
+    folded = output.casefold()
+    return (
+        ("api error: 429" in folded or '"status":429' in folded)
+        and ("rate_limit" in folded or "rate limit" in folded)
+    ) or ("you've hit your limit" in folded and "resets" in folded)
 
 
 def _fileno_closed(resource: object) -> bool:

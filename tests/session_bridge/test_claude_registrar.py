@@ -830,6 +830,14 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
             ),
             "claude_authentication_unavailable",
         ),
+        (
+            None,
+            FakePty(
+                output="You've hit your limit · resets Jul 20, 4am "
+                "(America/New_York)\nAPI Error: 429 rate_limit"
+            ),
+            "creation_ambiguous",
+        ),
         (None, FakePty(exit_code=7), "clean_exit_not_observed"),
         (None, FakePty(read_error=TimeoutError()), "creation_ambiguous"),
     ],
