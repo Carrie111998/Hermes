@@ -146,6 +146,34 @@ def test_live_characterization_gate_is_allowlisted_but_not_persisted_in_config(
     assert not hasattr(config, "live_tests")
 
 
+@pytest.mark.parametrize(
+    "near_match",
+    (
+        "HERMES_SESSION_BRIDGE_LIVE_TESTS_EXTRA",
+        "HERMES_SESSION_BRIDGE_LIVE_TEST",
+        "HERMES_SESSION_BRIDGE_LIVE_TESTS_",
+    ),
+)
+def test_live_characterization_gate_rejects_near_match_environment_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    near_match: str,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: deepcopy(DEFAULT_CONFIG),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"unknown session bridge environment variable: {near_match}",
+    ):
+        _load(
+            tmp_path / "missing.toml",
+            environ={near_match: "1"},
+        )
+
+
 _SIDEBAR_DEFAULTS = {
     "enabled": False,
     "continuous": False,
