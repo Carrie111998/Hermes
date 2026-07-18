@@ -3,6 +3,10 @@
 </p>
 
 # Hermes Agent ☤
+
+> **Human rights are not subject to negotiation.**
+> — RFI-IRFOS × Emergent Interaction Lab, core doctrine.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
