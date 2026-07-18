@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import sqlite3
 from pathlib import Path
@@ -11,6 +12,10 @@ import pytest
 
 from hermes_state import SessionDB
 from session_bridge.claude_adapter import ClaudeSourceAdapter
+from session_bridge.claude_visibility import (
+    build_claude_visibility_candidate,
+    derive_claude_visibility_identity,
+)
 from session_bridge.codex_adapter import CodexSourceAdapter, CodexTargetAdapter
 from session_bridge.config import BridgeConfig
 from session_bridge.coordinator import SessionBridgeCoordinator
@@ -557,9 +562,7 @@ def test_backfill_stops_when_durable_error_rate_trips_breaker(
 
     assert blocked == []
     assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 1}
-    unclaimed_job_id = next(
-        job["id"] for job in jobs if job["id"] != first_claim["id"]
-    )
+    unclaimed_job_id = next(job["id"] for job in jobs if job["id"] != first_claim["id"])
     assert unclaimed_job_id in {
         queued["id"] for queued in store.list_mirror_jobs([MirrorJobState.QUEUED])
     }
@@ -678,9 +681,7 @@ def test_sidebar_codex_desktop_offline_keeps_durable_retry_and_recovers(
             harness.advance_retry()
             recovered = harness.run_worker_once(client)
 
-        assert offline == [
-            {"state": "sidebar_retry", "error_code": "desktop_offline"}
-        ]
+        assert offline == [{"state": "sidebar_retry", "error_code": "desktop_offline"}]
         assert durable is not None
         assert durable["state"] == "sidebar_retry"
         assert recovered == [
@@ -735,11 +736,262 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
             ):
                 harness.run_worker_once(client)
 
-        assert guarded == [
-            {"state": "sidebar_retry", "error_code": "desktop_offline"}
-        ]
+        assert guarded == [{"state": "sidebar_retry", "error_code": "desktop_offline"}]
         assert len(app_server_calls) == 1
         assert harness.native.app_server_create_calls == []
         assert harness.native.create_calls == []
     finally:
         harness.close()
+
+
+@pytest.mark.parametrize(
+    ("fault", "error_code"),
+    [
+        ("process_crash_before_transcript", "clean_exit_not_observed"),
+        ("timeout_after_transcript", "creation_ambiguous"),
+        ("delayed_indexing", "native_transcript_not_indexed"),
+        ("restart_while_leased", "lease_expired"),
+        ("stale_lease", "lease_expired"),
+        ("authentication_loss", "claude_authentication_unavailable"),
+        ("missing_executable", "claude_executable_unavailable"),
+        ("pty_failure", "pty_unavailable"),
+    ],
+)
+def test_claude_visibility_ambiguous_failure_matrix_never_replaces_uuid_or_relaunches(
+    tmp_path: Path, fault: str, error_code: str
+) -> None:
+    base = 1_700_000_000.0
+    current = [base]
+    database = SessionDB(tmp_path / f"{fault}.db")
+    store = SessionBridgeStore(database, clock=lambda: current[0])
+    try:
+        projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id=f"fault-{fault}",
+            title=fault,
+            cwd=str(tmp_path / "exact-cwd"),
+            started_at=10.0,
+            last_active=20.0,
+            messages=(_message(f"event-{fault}", "Perform a meaningful fault test"),),
+            origin_kind=OriginKind.NATIVE,
+        )
+        candidate = build_claude_visibility_candidate(projection, eligible_at=20.0)
+        identity = derive_claude_visibility_identity(candidate, MARKER_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        launch = store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
+        assert launch.lease_kind == "launch"
+        assert launch.reserved_claude_uuid == identity.claude_uuid
+
+        # A service restart or expired lease is represented by the same durable
+        # retry transition; every other injected ambiguity is recorded directly.
+        if error_code == "lease_expired":
+            current[0] = base + 11.0
+            retry_claim = store.claim_claude_visibility_job(
+                base + 11.0, 10.0, 25, "0.50", "0.02", 5
+            )
+        else:
+            store.retry_claude_visibility_job(
+                identity.job_id,
+                launch.lease_digest or "",
+                error_code,
+                base + 1.0,
+                fault,
+            )
+            current[0] = base + 1.0
+            retry_claim = store.claim_claude_visibility_job(
+                base + 1.0, 10.0, 25, "0.50", "0.02", 5
+            )
+
+        assert retry_claim.lease_kind == "reconciliation"
+        assert retry_claim.launch_permitted is False
+        assert retry_claim.registration_reserved is False
+        assert retry_claim.reserved_claude_uuid == identity.claude_uuid
+        status = store.claude_visibility_status(current[0])
+        assert status["usage"]["attempts"] == 1  # launch_count remains one
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("fault", "error_code"),
+    [
+        ("malformed_marker", "marker_conflict"),
+        ("wrong_cwd", "cwd_conflict"),
+        ("wrong_name", "name_conflict"),
+        ("duplicate_uuid", "duplicate_uuid"),
+        ("unknown_retry", "invented_future_retry"),
+    ],
+)
+def test_claude_visibility_fatal_failure_matrix_is_terminal_without_new_identity(
+    tmp_path: Path, fault: str, error_code: str
+) -> None:
+    database = SessionDB(tmp_path / f"fatal-{fault}.db")
+    base = 1_700_000_000.0
+    store = SessionBridgeStore(database, clock=lambda: base)
+    try:
+        projection = SessionProjection(
+            provider=Provider.HERMES,
+            native_id=f"fatal-{fault}",
+            title=fault,
+            cwd=str(tmp_path),
+            started_at=10.0,
+            last_active=20.0,
+            messages=(_message(f"event-{fault}", "Exercise a fatal identity fault"),),
+            origin_kind=OriginKind.NATIVE,
+        )
+        candidate = build_claude_visibility_candidate(projection, eligible_at=20.0)
+        identity = derive_claude_visibility_identity(candidate, MARKER_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        claim = store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
+        failed = store.fail_claude_visibility_job(
+            identity.job_id, claim.lease_digest or "", error_code, fault
+        )
+
+        assert failed["state"] == "claude_failed"
+        assert failed["reserved_claude_uuid"] == identity.claude_uuid
+        assert store.claude_visibility_status(base)["usage"]["attempts"] == 1
+    finally:
+        database.close()
+
+
+def test_claude_visibility_duplicate_idempotency_and_cost_rollover_fail_closed(
+    tmp_path: Path,
+) -> None:
+    base = 1_700_000_000.0
+    current = [base]
+    database = SessionDB(tmp_path / "duplicate-cost.db")
+    store = SessionBridgeStore(database, clock=lambda: current[0])
+    try:
+        projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id="duplicate-cost",
+            title="duplicate cost",
+            cwd=str(tmp_path),
+            started_at=10.0,
+            last_active=20.0,
+            messages=(
+                _message("event-duplicate-cost", "Test duplicate and cost rollover"),
+            ),
+            origin_kind=OriginKind.NATIVE,
+        )
+        candidate = build_claude_visibility_candidate(projection, eligible_at=20.0)
+        identity = derive_claude_visibility_identity(candidate, MARKER_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        first = store.claim_claude_visibility_job(base, 10.0, 25, "0.02", "0.02", 5)
+        assert first.reserved_claude_uuid == identity.claude_uuid
+
+        # Idempotent replay is accepted; a conflicting independent key is not.
+        replay = store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        assert replay["reserved_claude_uuid"] == identity.claude_uuid
+        with pytest.raises(ValueError, match="identity"):
+            store.enqueue_claude_visibility_job(
+                candidate,
+                replace(identity, idempotency_key="f" * 64),
+                MARKER_SECRET,
+            )
+        store.retry_claude_visibility_job(
+            identity.job_id,
+            first.lease_digest or "",
+            "creation_ambiguous",
+            base + 1.0,
+            "ambiguous",
+        )
+        current[0] = base + 1.0
+        reconciliation = store.claim_claude_visibility_job(
+            base + 1.0, 10.0, 25, "0.02", "0.02", 5
+        )
+        assert reconciliation.lease_kind == "reconciliation"
+        assert reconciliation.reserved_claude_uuid == identity.claude_uuid
+        assert store.claude_visibility_status(base + 1.0)["usage"]["attempts"] == 1
+        store.fail_claude_visibility_job(
+            identity.job_id,
+            reconciliation.lease_digest or "",
+            "bridge_conflict",
+            "finish first fault",
+        )
+        second_projection = replace(
+            projection,
+            native_id="duplicate-cost-second",
+            messages=(
+                _message("event-duplicate-cost-second", "Test the next cost slot"),
+            ),
+        )
+        second_candidate = build_claude_visibility_candidate(
+            second_projection, eligible_at=21.0
+        )
+        second_identity = derive_claude_visibility_identity(
+            second_candidate, MARKER_SECRET
+        )
+        store.enqueue_claude_visibility_job(
+            second_candidate, second_identity, MARKER_SECRET
+        )
+        current[0] = base + 2.0
+        gated = store.claim_claude_visibility_job(
+            base + 2.0, 10.0, 25, "0.02", "0.02", 5
+        )
+        assert gated.status == "cost_limit"
+        assert gated.reserved_claude_uuid is None
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("operation", ["claim", "commit"])
+def test_claude_visibility_database_busy_preserves_reserved_identity_and_attempt_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    base = 1_700_000_000.0
+    database = SessionDB(tmp_path / f"busy-{operation}.db")
+    store = SessionBridgeStore(database, clock=lambda: base)
+    try:
+        projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id=f"busy-{operation}",
+            title=operation,
+            cwd=str(tmp_path),
+            started_at=10.0,
+            last_active=20.0,
+            messages=(
+                _message(f"event-busy-{operation}", "Exercise database busy handling"),
+            ),
+            origin_kind=OriginKind.NATIVE,
+        )
+        candidate = build_claude_visibility_candidate(projection, eligible_at=20.0)
+        identity = derive_claude_visibility_identity(candidate, MARKER_SECRET)
+        store.enqueue_claude_visibility_job(candidate, identity, MARKER_SECRET)
+        claim = None
+        if operation == "commit":
+            claim = store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
+        original = database._execute_write
+        monkeypatch.setattr(
+            database,
+            "_execute_write",
+            lambda _fn: (_ for _ in ()).throw(
+                sqlite3.OperationalError("database is locked")
+            ),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            if operation == "claim":
+                store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
+            else:
+                assert claim is not None
+                store.commit_claude_visibility_job(
+                    identity.job_id,
+                    claim.lease_digest or "",
+                    "b" * 64,
+                    base,
+                )
+        monkeypatch.setattr(database, "_execute_write", original)
+
+        status = store.claude_visibility_status(base)
+        assert status["usage"]["attempts"] == (0 if operation == "claim" else 1)
+        row = database._conn.execute(
+            "SELECT reserved_claude_uuid, attempts, state FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        ).fetchone()
+        assert row["reserved_claude_uuid"] == identity.claude_uuid
+        assert row["attempts"] == (0 if operation == "claim" else 1)
+        assert row["state"] == (
+            "claude_pending" if operation == "claim" else "claude_leased"
+        )
+    finally:
+        database.close()

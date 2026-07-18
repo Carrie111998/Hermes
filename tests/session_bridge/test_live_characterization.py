@@ -16,6 +16,8 @@ from session_bridge.characterize import (
     run_live_characterization,
     write_characterization_report,
 )
+from session_bridge.cli import ConfigurationFailure, ProductionBackend
+from session_bridge.config import BridgeConfig
 
 
 _LIVE_ONLY = pytest.mark.skipif(
@@ -120,6 +122,16 @@ def test_characterization_defaults_follow_active_hermes_home(
     expected_root = hermes_home / "session-bridge" / "characterization"
     assert report_path.parent == expected_root
     assert gate.report_path == report_path
+
+
+def test_claude_visibility_live_characterization_uses_existing_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", raising=False)
+    backend = ProductionBackend(BridgeConfig())
+
+    with pytest.raises(ConfigurationFailure, match="live_characterization_not_enabled"):
+        backend.characterize_claude_visibility()
 
 
 def test_characterization_gate_latest_failure_blocks_older_pass(tmp_path: Path) -> None:

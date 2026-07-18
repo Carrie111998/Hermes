@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
 import time
 from typing import Any, Protocol
 
@@ -23,10 +24,15 @@ from .characterize import (
     LiveCharacterizationError,
     resolve_characterization_gate,
     resolve_cli_executable,
+    characterize_claude_visibility,
     run_live_characterization,
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
 from .claude_registrar import ClaudeNativeRegistrar
+from .claude_visibility import (
+    build_claude_visibility_candidate,
+    derive_claude_visibility_identity,
+)
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
@@ -85,6 +91,40 @@ _SENSITIVE_KEY_FRAGMENTS = (
 )
 
 
+def _claude_visibility_preflight(
+    command: Sequence[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, str] | None:
+    """Read version/auth state only; never starts a Claude conversation."""
+
+    try:
+        version = runner(
+            [*command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+        )
+        authentication = runner(
+            [*command, "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    version_text = version.stdout.strip() if version.returncode == 0 else ""
+    if not version_text or authentication.returncode != 0:
+        return None
+    return {"version": version_text, "authentication": "available"}
+
+
 def _production_codex_permission_preflight(cwd: str) -> bool:
     """Verify the production broker process can traverse the exact Codex cwd.
 
@@ -93,7 +133,11 @@ def _production_codex_permission_preflight(cwd: str) -> bool:
     handing a continuation back to Codex.
     """
 
-    if type(cwd) is not str or not cwd or any(character in cwd for character in "\x00\r\n"):
+    if (
+        type(cwd) is not str
+        or not cwd
+        or any(character in cwd for character in "\x00\r\n")
+    ):
         return False
     try:
         path = Path(cwd)
@@ -129,6 +173,7 @@ class _Backend(Protocol):
         self, *, enabled: bool
     ) -> Mapping[str, Any]: ...
     def claude_visibility_run_once(self) -> Mapping[str, Any]: ...
+    def characterize_claude_visibility(self) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
     def backfill_candidates(self, *, days: int) -> list[dict[str, Any]]: ...
@@ -428,15 +473,15 @@ class ProductionBackend:
             "open_reasons": _claude_visibility_open_reasons(raw),
             "fatal_reasons": status_fatal,
             "degraded_reasons": status_fatal,
-            "last_cycle": dict(raw.get(
-                "last_cycle", {"tracked": False, "value": None}
-            )),
-            "last_empty_cycle": dict(raw.get(
-                "last_empty_cycle", {"tracked": False, "value": None}
-            )),
-            "last_registrar_result": dict(raw.get(
-                "last_registrar_result", {"tracked": False, "value": None}
-            )),
+            "last_cycle": dict(
+                raw.get("last_cycle", {"tracked": False, "value": None})
+            ),
+            "last_empty_cycle": dict(
+                raw.get("last_empty_cycle", {"tracked": False, "value": None})
+            ),
+            "last_registrar_result": dict(
+                raw.get("last_registrar_result", {"tracked": False, "value": None})
+            ),
         }
 
     def claude_visibility_backfill(
@@ -455,11 +500,11 @@ class ProductionBackend:
         result = self._claude_visibility_runtime().backfill(
             days=days, limit=limit, apply=apply
         )
-        return _public_claude_apply(result, continuous=self.config.claude_visibility.continuous)
+        return _public_claude_apply(
+            result, continuous=self.config.claude_visibility.continuous
+        )
 
-    def set_claude_visibility_continuous(
-        self, *, enabled: bool
-    ) -> Mapping[str, Any]:
+    def set_claude_visibility_continuous(self, *, enabled: bool) -> Mapping[str, Any]:
         if type(enabled) is not bool:
             raise ConfigurationFailure("invalid_claude_visibility_continuous_mode")
         from hermes_cli.config import ConfigPersistenceRejected, mutate_config
@@ -487,7 +532,9 @@ class ProductionBackend:
         except ConfigPersistenceRejected as exc:
             raise ConfigurationFailure("config_persistence_rejected") from exc
         bridge = persisted.get("session_bridge")
-        visibility = bridge.get("claude_visibility") if isinstance(bridge, dict) else None
+        visibility = (
+            bridge.get("claude_visibility") if isinstance(bridge, dict) else None
+        )
         value = visibility.get("continuous") if isinstance(visibility, dict) else None
         if type(value) is not bool:
             raise ConfigurationFailure("invalid_persisted_claude_visibility_config")
@@ -511,6 +558,70 @@ class ProductionBackend:
         result = self._claude_visibility_runtime().run_once(discover_continuous=True)
         return _public_claude_run(
             result, continuous=self.config.claude_visibility.continuous
+        )
+
+    def characterize_claude_visibility(self) -> Mapping[str, Any]:
+        if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
+            raise ConfigurationFailure("live_characterization_not_enabled")
+        claude_command = resolve_cli_executable("claude")
+        if _claude_visibility_preflight(claude_command) is None:
+            raise ProviderDegraded("claude_visibility_preflight_failed")
+        store = self._require_store()
+        raw = store.claude_visibility_status(time.time())
+        if any(
+            int(raw.get("counts", {}).get(state, 0))
+            for state in (
+                "claude_pending",
+                "claude_leased",
+                "claude_retry",
+                "claude_failed",
+            )
+        ):
+            raise RolloutGateBlocked("claude_visibility_not_idle")
+        marker_secret = resolve_marker_key()
+        source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
+        registrar = ClaudeNativeRegistrar(
+            store,
+            source,
+            marker_secret=marker_secret,
+            claude_command=claude_command,
+            process_timeout=self.config.claude_visibility.process_timeout_seconds,
+            discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
+        )
+        policy = self.config.claude_visibility
+
+        def _reserve(projection: Any) -> Any:
+            candidate = build_claude_visibility_candidate(
+                projection, eligible_at=float(projection.last_active)
+            )
+            identity = derive_claude_visibility_identity(candidate, marker_secret)
+            store.enqueue_claude_visibility_job(candidate, identity, marker_secret)
+            claim = store.claim_claude_visibility_job(
+                time.time(),
+                policy.lease_seconds,
+                policy.daily_registration_limit,
+                policy.emergency_daily_cost_usd,
+                policy.reserved_cost_per_attempt_usd,
+                policy.max_attempts,
+            )
+            if claim.job_id != identity.job_id:
+                raise RolloutGateBlocked("characterization_claim_mismatch")
+            return claim
+
+        source_root = (
+            Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+            / "session-bridge"
+            / "characterization"
+            / "claude-visibility-sources"
+        )
+        return characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=_CLAUDE_PROJECTS_ROOT,
+            reserve=_reserve,
+            registrar=registrar,
+            restarted_source=lambda: ClaudeSourceAdapter(
+                _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+            ),
         )
 
     def _claude_visibility_runtime(self) -> ClaudeVisibilityCoordinator:
@@ -569,11 +680,13 @@ class ProductionBackend:
                 continue
             sources.append(source)
             existing.add(key)
-        sources.sort(key=lambda item: (
-            -float(item.projection.last_active),
-            item.source_session_id,
-            item.projection.provider.value,
-        ))
+        sources.sort(
+            key=lambda item: (
+                -float(item.projection.last_active),
+                item.source_session_id,
+                item.projection.provider.value,
+            )
+        )
         return tuple(sources)
 
     def characterize(self, *, provider: str) -> Mapping[str, Any]:
@@ -1014,9 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
         "claude-visibility-backfill",
         help="preview or enqueue a reviewed Claude visibility batch",
     )
-    claude_visibility_backfill.add_argument(
-        "--days", type=_positive_int, default=30
-    )
+    claude_visibility_backfill.add_argument("--days", type=_positive_int, default=30)
     claude_visibility_backfill.add_argument(
         "--limit", type=_bounded_claude_visibility_limit, default=10
     )
@@ -1038,6 +1149,12 @@ def build_parser() -> argparse.ArgumentParser:
         "claude-visibility-run-once",
         help="process at most one reviewed Claude visibility job",
     )
+
+    characterize_claude_visibility_parser = commands.add_parser(
+        "characterize-claude-visibility",
+        help="register and verify one disposable native Claude mirror",
+    )
+    characterize_claude_visibility_parser.add_argument("--json", action="store_true")
 
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
@@ -1132,9 +1249,7 @@ def main(
             _emit(payload)
             return EXIT_DEGRADED if int(payload.get("failed", 0)) else EXIT_OK
         if args.command == "sidebar-continuous":
-            payload = dict(
-                backend.set_sidebar_continuous(enabled=bool(args.enable))
-            )
+            payload = dict(backend.set_sidebar_continuous(enabled=bool(args.enable)))
             _emit(payload)
             return EXIT_OK
         if args.command == "claude-visibility-status":
@@ -1146,23 +1261,30 @@ def main(
                 else EXIT_OK
             )
         if args.command == "claude-visibility-backfill":
-            payload = dict(backend.claude_visibility_backfill(
-                days=args.days,
-                limit=args.limit,
-                apply=bool(args.apply),
-            ))
+            payload = dict(
+                backend.claude_visibility_backfill(
+                    days=args.days,
+                    limit=args.limit,
+                    apply=bool(args.apply),
+                )
+            )
             _emit(payload)
-            blocked = any(
-                payload.get(key)
-                for key in ("open_reasons", "fatal_reasons", "degraded_reasons")
-            ) or payload.get("degraded") is True
-            return EXIT_ROLLOUT_GATE if args.apply and blocked else (
-                EXIT_DEGRADED if blocked else EXIT_OK
+            blocked = (
+                any(
+                    payload.get(key)
+                    for key in ("open_reasons", "fatal_reasons", "degraded_reasons")
+                )
+                or payload.get("degraded") is True
+            )
+            return (
+                EXIT_ROLLOUT_GATE
+                if args.apply and blocked
+                else (EXIT_DEGRADED if blocked else EXIT_OK)
             )
         if args.command == "claude-visibility-continuous":
-            payload = dict(backend.set_claude_visibility_continuous(
-                enabled=bool(args.enable)
-            ))
+            payload = dict(
+                backend.set_claude_visibility_continuous(enabled=bool(args.enable))
+            )
             _emit(payload)
             return EXIT_OK
         if args.command == "claude-visibility-run-once":
@@ -1173,6 +1295,9 @@ def main(
                 if payload.get("degraded") is True or payload.get("fatal") is True
                 else EXIT_OK
             )
+        if args.command == "characterize-claude-visibility":
+            _emit(dict(backend.characterize_claude_visibility()))
+            return EXIT_OK
         if args.command == "characterize":
             _emit(dict(backend.characterize(provider=args.provider)))
             return EXIT_OK
@@ -1384,7 +1509,10 @@ def _claude_visibility_open_reasons(raw: Mapping[str, Any]) -> list[str]:
     if any(
         int(counts.get(state, 0)) > 0
         for state in (
-            "claude_pending", "claude_leased", "claude_retry", "claude_failed"
+            "claude_pending",
+            "claude_leased",
+            "claude_retry",
+            "claude_failed",
         )
     ):
         return ["open_visibility_work"]
@@ -1402,7 +1530,8 @@ def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:
         return ["invalid_status"]
     for item in fatal:
         if not isinstance(item, Mapping) or item.get("code") not in (
-            "unknown_job_state", "unknown_error_code"
+            "unknown_job_state",
+            "unknown_error_code",
         ):
             reasons.append("invalid_status")
         else:
@@ -1414,7 +1543,9 @@ def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:
         if int(count) <= 0:
             continue
         reasons.append(
-            str(code) if code in CLAUDE_VISIBILITY_FATAL_CODES else "unknown_failed_code"
+            str(code)
+            if code in CLAUDE_VISIBILITY_FATAL_CODES
+            else "unknown_failed_code"
         )
     return sorted(set(reasons))
 
@@ -1462,9 +1593,7 @@ def _public_sidebar_status(
         )
         for state in SidebarJobState
     }
-    state_counts["sidebar_excluded"] = _status_count(
-        counts.get("sidebar_excluded", 0)
-    )
+    state_counts["sidebar_excluded"] = _status_count(counts.get("sidebar_excluded", 0))
     raw_providers = raw.get("eligible_by_provider")
     providers = raw_providers if isinstance(raw_providers, Mapping) else {}
     eligible_by_provider = {
@@ -1477,23 +1606,24 @@ def _public_sidebar_status(
         max(0.0, status_time - heartbeat_at) if heartbeat_at is not None else None
     )
     threshold = 60 + grace_seconds
-    work_pending = sum(
-        state_counts[state.value]
-        for state in (
-            SidebarJobState.PENDING,
-            SidebarJobState.LEASED,
-            SidebarJobState.RETRY,
+    work_pending = (
+        sum(
+            state_counts[state.value]
+            for state in (
+                SidebarJobState.PENDING,
+                SidebarJobState.LEASED,
+                SidebarJobState.RETRY,
+            )
         )
-    ) > 0
+        > 0
+    )
     degraded_reasons: list[str] = []
     heartbeat_stale = (
         heartbeat_age > threshold
         if heartbeat_age is not None
         else oldest_age is not None and oldest_age > threshold
     )
-    overdue_work = (
-        work_pending and oldest_age is not None and oldest_age > threshold
-    )
+    overdue_work = work_pending and oldest_age is not None and oldest_age > threshold
     if overdue_work and heartbeat_stale:
         degraded_reasons.append("broker_heartbeat_stale")
     if overdue_work:
@@ -1501,11 +1631,9 @@ def _public_sidebar_status(
     raw_codes = raw.get("recent_error_codes")
     allowed_codes = SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
     recent_codes = (
-        [
-            code
-            for code in raw_codes
-            if isinstance(code, str) and code in allowed_codes
-        ][:10]
+        [code for code in raw_codes if isinstance(code, str) and code in allowed_codes][
+            :10
+        ]
         if isinstance(raw_codes, list)
         else []
     )

@@ -32,6 +32,7 @@ from .claude_adapter import (
 )
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter
 from .models import BridgeMarkerPayload, OriginKind, Provider, SessionProjection
+from .claude_visibility import ClaudeVisibilityClaim
 
 
 _CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
@@ -81,6 +82,151 @@ _PROVIDER_ALLOWED_FIELDS = {
         "total_latency_ms",
     },
 }
+
+
+def characterize_claude_visibility(
+    *,
+    source_root: Path,
+    projects_root: Path,
+    reserve: Callable[[SessionProjection], ClaudeVisibilityClaim],
+    registrar: Any,
+    restarted_source: Callable[[], ClaudeReadableSource],
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Register and safely remove one disposable native Claude mirror.
+
+    The caller owns the durable reservation transaction and registrar.  This
+    function deliberately calls each exactly once, then constructs a fresh
+    source adapter to prove restart-safe, exact-ID discovery before deleting
+    only the transcript whose complete identity has been verified.
+    """
+
+    root = Path(source_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    project_root = Path(projects_root).resolve(strict=True)
+    if root.is_symlink() or project_root.is_symlink():
+        raise RuntimeError("unsafe_characterization_root")
+    disposable = Path(
+        tempfile.mkdtemp(prefix="claude-visibility-", dir=str(root))
+    ).resolve(strict=True)
+    characterization_id = str(uuid.uuid4())
+    timestamp = float(now())
+    projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id=characterization_id,
+        title="Claude native visibility characterization",
+        cwd=str(disposable),
+        started_at=timestamp,
+        last_active=timestamp,
+        messages=[
+            # A real meaningful request keeps the disposable source on the
+            # exact same eligibility path as production mirrors.
+            # IDs are local characterization metadata, never provider state.
+            _characterization_message(timestamp)
+        ],
+        native_path=str(disposable / "source.json"),
+        native_hash="0" * 64,
+        origin_kind=OriginKind.NATIVE,
+    )
+    claim = reserve(projection)
+    if (
+        not isinstance(claim, ClaudeVisibilityClaim)
+        or not claim.claimed
+        or claim.lease_kind != "launch"
+        or claim.source_cwd != str(disposable)
+        or claim.source_provider is not Provider.CODEX
+        or not claim.reserved_claude_uuid
+        or not claim.signed_marker
+        or not claim.native_name
+    ):
+        raise RuntimeError("characterization_reservation_invalid")
+    outcome = registrar.process(claim)
+    if (
+        getattr(outcome, "status", None) != "visible"
+        or getattr(outcome, "reserved_claude_uuid", None) != claim.reserved_claude_uuid
+    ):
+        raise RuntimeError("characterization_registration_failed")
+
+    restarted = restarted_source()
+    finder = getattr(restarted, "find_native_sessions", None)
+    paths = (
+        list(finder(claim.reserved_claude_uuid))
+        if callable(finder)
+        else [
+            found
+            for found in [restarted.find_native_session(claim.reserved_claude_uuid)]
+            if found is not None
+        ]
+    )
+    if len(paths) != 1:
+        raise RuntimeError("characterization_identity_mismatch:exact_uuid")
+    transcript = Path(paths[0])
+    try:
+        resolved_transcript = transcript.resolve(strict=True)
+        relative = resolved_transcript.relative_to(project_root)
+    except (OSError, ValueError):
+        raise RuntimeError("characterization_identity_mismatch:path") from None
+    if (
+        transcript.is_symlink()
+        or not resolved_transcript.is_file()
+        or relative.name != f"{claim.reserved_claude_uuid}.jsonl"
+    ):
+        raise RuntimeError("characterization_identity_mismatch:path")
+    parsed = restarted.parse(transcript)
+    native = parsed.projection
+    try:
+        projected_path = Path(native.native_path or "").resolve(strict=True)
+    except OSError:
+        raise RuntimeError("characterization_identity_mismatch:path") from None
+    marker_check = getattr(restarted, "projection_has_exact_marker", None)
+    exact_marker = callable(marker_check) and marker_check(native, claim.signed_marker)
+    if (
+        native.provider is not Provider.CLAUDE
+        or native.native_id != claim.reserved_claude_uuid
+        or native.title != claim.native_name
+        or native.cwd != claim.source_cwd
+        or projected_path != resolved_transcript
+        or not exact_marker
+    ):
+        raise RuntimeError("characterization_identity_mismatch:metadata")
+
+    # Recheck the directory entry immediately before unlinking.  Identity
+    # changes fail closed and leave provider state untouched for diagnosis.
+    if (
+        transcript.resolve(strict=True) != resolved_transcript
+        or transcript.is_symlink()
+    ):
+        raise RuntimeError("characterization_identity_mismatch:path_changed")
+    transcript.unlink()
+    shutil.rmtree(disposable)
+    return {
+        "passed": True,
+        "source_provider": Provider.CODEX.value,
+        "source_cwd": str(disposable),
+        "reserved_claude_uuid": claim.reserved_claude_uuid,
+        "native_name": claim.native_name,
+        "restart_exact_id_verified": True,
+        "operator_checks": [
+            "Run /resume in Claude Code and select the deterministic characterization name.",
+            "Press Ctrl+A in /resume to verify the exact session across all projects.",
+            f"Resume the exact ID with: claude --resume {claim.reserved_claude_uuid}",
+        ],
+        "cleanup": "removed_exact_characterization",
+    }
+
+
+def _characterization_message(timestamp: float) -> Any:
+    from .models import ProjectedMessage
+
+    return ProjectedMessage(
+        "characterization-request",
+        0,
+        "user",
+        "Verify native Claude session visibility and exact-ID resume metadata.",
+        timestamp,
+    )
+
+
 _PROVIDER_NUMBER_FIELDS = frozenset({
     "create_cost_usd",
     "create_latency_ms",
