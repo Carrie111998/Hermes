@@ -65,6 +65,35 @@ export function createBoundedMessageStore(limit = 512) {
   return { remember, get };
 }
 
+// Bind the HTTP port with retries. When the gateway respawns the bridge,
+// taskkill on the old node returns before the OS releases :3000; a bare
+// app.listen() then dies on an unhandled EADDRINUSE 'error' event, taking
+// the whole process down (2026-07-18 flap RCA). listenFn must return a
+// net.Server-like emitter (e.g. () => app.listen(port, host)).
+export function listenWithRetry(listenFn, {
+  retries = 20,
+  delayMs = 1500,
+  onListening = () => {},
+  onFatal = () => {},
+  log = console,
+} = {}) {
+  let attempt = 0;
+  const tryOnce = () => {
+    const server = listenFn();
+    server.once('listening', () => onListening(server));
+    server.once('error', (err) => {
+      if (err && err.code === 'EADDRINUSE' && attempt < retries) {
+        attempt += 1;
+        log.warn(`[bridge] port busy (EADDRINUSE), retry ${attempt}/${retries} in ${delayMs}ms`);
+        setTimeout(tryOnce, delayMs);
+      } else {
+        onFatal(err);
+      }
+    });
+  };
+  tryOnce();
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret

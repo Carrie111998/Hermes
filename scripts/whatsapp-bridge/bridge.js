@@ -24,7 +24,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, existsSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
@@ -41,6 +41,7 @@ import {
   extractBridgeEvent,
   inferMediaType,
   mediaPayloadForFile,
+  listenWithRetry,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
@@ -307,23 +308,23 @@ function getContextInfo(messageContent) {
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
-// Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
-function buildLidMap() {
-  const map = {};
-  try {
-    for (const f of readdirSync(SESSION_DIR)) {
-      const m = f.match(/^lid-mapping-(\d+)\.json$/);
-      if (!m) continue;
-      const phone = m[1];
-      const lid = JSON.parse(readFileSync(path.join(SESSION_DIR, f), 'utf8'));
-      if (lid) map[String(lid)] = phone;
-    }
-  } catch {}
-  return map;
-}
-let lidToPhone = buildLidMap();
-
 const logger = pino({ level: 'warn' });
+
+// Last line of defense: a mature session dir holds tens of thousands of
+// files and Baileys fires many async errors under churn; without these
+// guards a single unhandled rejection or stray 'error' event kills the
+// whole bridge (observed as EADDRINUSE/stream crashes, 2026-07-18 RCA).
+process.on('unhandledRejection', (reason) => {
+  try {
+    console.error('[bridge] unhandledRejection:', reason?.stack || reason);
+  } catch {}
+});
+process.on('uncaughtException', (err) => {
+  try {
+    console.error('[bridge] uncaughtException:', err?.stack || err);
+  } catch {}
+  process.exit(1);
+});
 
 // Message queue for polling
 const messageQueue = [];
@@ -453,12 +454,43 @@ function emitPairEvent(event) {
   } catch {}
 }
 
+// Cache the WA Web version across reconnects: fetchLatestBaileysVersion()
+// is a network fetch, and a reconnect happens precisely when the network
+// just hiccuped — failing it must not abort the reconnect.
+let cachedWaVersion = null;
+async function resolveWaVersion() {
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedWaVersion = version;
+  } catch (err) {
+    console.warn(
+      `[bridge] fetchLatestBaileysVersion failed (${err?.message || err}); ` +
+      (cachedWaVersion ? 'using cached version' : 'using Baileys default')
+    );
+  }
+  return cachedWaVersion || undefined;
+}
+
+// All reconnects funnel through here so a rejected startSocket() (e.g.
+// version fetch or auth-state read failing mid network blip) retries
+// instead of surfacing as an unhandled rejection.
+function scheduleReconnect(delayMs) {
+  setTimeout(() => {
+    startSocket().catch((err) => {
+      console.error('[bridge] reconnect attempt failed:', err?.message || err);
+      scheduleReconnect(5000);
+    });
+  }, delayMs);
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveWaVersion();
 
   sock = makeWASocket({
-    version,
+    // Spread so an unresolved version falls through to the Baileys default
+    // instead of overriding it with undefined.
+    ...(version ? { version } : {}),
     auth: state,
     logger,
     printQRInTerminal: false,
@@ -474,7 +506,13 @@ async function startSocket() {
     },
   });
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  // NOTE: keep this handler cheap — creds.update fires constantly during a
+  // Baileys resync.  A previous version rebuilt a lid→phone map here with a
+  // synchronous scan of the whole session dir (33k+ files); that blocked the
+  // event loop past the keepalive/health deadlines and was the primary
+  // driver of the 2026-07 bridge flapping.  The map was never even read —
+  // allowlist.js resolves lid aliases lazily per file.
+  sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -509,7 +547,7 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -1192,7 +1230,14 @@ if (PAIR_ONLY) {
     process.exit(1);
   });
 } else {
-  app.listen(PORT, '127.0.0.1', () => {
+  listenWithRetry(() => app.listen(PORT, '127.0.0.1'), {
+    retries: 20,
+    delayMs: 1500,
+    onFatal: (err) => {
+      console.error(`[bridge] could not bind 127.0.0.1:${PORT}:`, err?.message || err);
+      process.exit(1);
+    },
+    onListening: () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
@@ -1218,6 +1263,7 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    scheduleReconnect(0);
+    },
   });
 }
