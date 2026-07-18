@@ -58,6 +58,7 @@ CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
     "marker_conflict",
     "duplicate_uuid",
     "duplicate_identity",
+    "max_attempts_exhausted",
     "unknown_error_code",
 })
 CLAUDE_VISIBILITY_ERROR_CODES = (

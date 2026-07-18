@@ -790,8 +790,47 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     assert result["enabled"] is True
     assert result["candidates"] == []
     assert result["degraded_reasons"] == []
+    assert result["last_cycle"] == {"tracked": False, "value": None}
     assert result["last_empty_cycle"] == {"tracked": False, "value": None}
     assert result["last_registrar_result"] == {"tracked": False, "value": None}
+
+
+def test_claude_visibility_status_exposes_durable_cycle_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracked = {
+        "tracked": True,
+        "value": {
+            "at": 100.0, "sequence": 1, "status": "no_due_job",
+            "error_code": None,
+        },
+    }
+
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {state: 0 for state in (
+                    "claude_pending", "claude_leased", "claude_retry",
+                    "claude_visible", "claude_failed",
+                )},
+                "retry_codes": {}, "failed_codes": {}, "fatal": [],
+                "usage": {"local_day": "2026-07-17", "attempts": 0,
+                          "reserved_cost_usd": "0"},
+                "last_cycle": tracked,
+                "last_empty_cycle": {"tracked": True, "value": 100.0},
+                "last_registrar_result": {"tracked": False, "value": None},
+            }
+
+    config = BridgeConfig()
+    backend = ProductionBackend(replace(
+        config, claude_visibility=replace(config.claude_visibility, enabled=True)
+    ))
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["last_cycle"] == tracked
+    assert result["last_empty_cycle"] == {"tracked": True, "value": 100.0}
 
 
 def test_claude_visibility_status_exposes_sanitized_unknown_state_fatal(

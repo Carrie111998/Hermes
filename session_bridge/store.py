@@ -61,6 +61,7 @@ _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
+_CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _PROFILE_SHADOW_SOURCE = "session_bridge_profile"
 _WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
 _WORKTREE_SNAPSHOT_FIELDS = frozenset({
@@ -756,6 +757,7 @@ class SessionBridgeStore:
         daily_limit: int,
         cost_limit: object,
         reserved_cost: object,
+        max_attempts: int = 5,
     ) -> ClaudeVisibilityClaim:
         from .claude_visibility import (
             ClaudeVisibilityClaim,
@@ -771,6 +773,12 @@ class SessionBridgeStore:
             raise ValueError("daily_limit must be a positive integer")
         if daily_limit > 25:
             raise ValueError("daily_limit cannot exceed 25")
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be a positive integer")
         maximum_cost = usd_microdollars(cost_limit, "cost_limit")
         attempt_cost = usd_microdollars(reserved_cost, "reserved_cost")
 
@@ -815,6 +823,22 @@ class SessionBridgeStore:
                     due,
                     claim_time=operation_time,
                     lease_duration=lease_duration,
+                )
+            if int(due["attempts"]) >= max_attempts:
+                cursor = conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_failed', lease_digest = NULL,
+                           lease_expires_at = NULL, lease_kind = NULL,
+                           error_code = 'max_attempts_exhausted',
+                           error_detail = 'maximum paid launch attempts exhausted',
+                           updated_at = ?
+                       WHERE id = ? AND state = ? AND attempts = ?""",
+                    (operation_time, due["id"], due["state"], due["attempts"]),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("stale Claude visibility exhaustion transition")
+                return ClaudeVisibilityClaim(
+                    status="max_attempts_exhausted", job_id=due["id"]
                 )
             usage = conn.execute(
                 """SELECT reserved_estimated_cost_usd
@@ -1175,6 +1199,10 @@ class SessionBridgeStore:
                    WHERE local_day = ?""",
                 (local_day,),
             ).fetchall()
+            cycle_row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_CLAUDE_VISIBILITY_CYCLE_STATE_KEY,),
+            ).fetchone()
         counts = {state: 0 for state in states}
         fatal: list[dict[str, Any]] = []
         for row in count_rows:
@@ -1219,6 +1247,9 @@ class SessionBridgeStore:
             (Decimal(row["reserved_estimated_cost_usd"]) for row in usage_rows),
             Decimal("0"),
         )
+        cycle = _decode_claude_visibility_cycle_state(
+            cycle_row["value_json"] if cycle_row is not None else None
+        )
         return {
             "counts": counts,
             "retry_codes": retry_codes,
@@ -1229,7 +1260,77 @@ class SessionBridgeStore:
                 "reserved_cost_usd": str(total_cost),
             },
             "fatal": fatal,
+            **_public_claude_visibility_cycle_state(cycle),
         }
+
+    def record_claude_visibility_cycle(
+        self,
+        *,
+        status: str,
+        error_code: str | None,
+        registrar_result: bool,
+    ) -> None:
+        safe_status = _claude_status_token(status)
+        if safe_status in {None, "invalid", "redacted"}:
+            safe_status = "degraded"
+        if error_code is None:
+            safe_error = None
+        else:
+            from .claude_visibility import CLAUDE_VISIBILITY_ERROR_CODES
+
+            safe_error = (
+                error_code
+                if error_code in CLAUDE_VISIBILITY_ERROR_CODES
+                or error_code in {
+                    "claim_failed", "provider_degraded", "registrar_failed",
+                    "unknown_claim_status", "unknown_job_state",
+                    "unknown_registrar_error_code", "unknown_registrar_status",
+                }
+                else "unknown_error_code"
+            )
+        if not isinstance(registrar_result, bool):
+            raise TypeError("registrar_result must be a boolean")
+
+        def _write(conn):
+            recorded_at = _finite_number(self._clock(), "clock")
+            row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_CLAUDE_VISIBILITY_CYCLE_STATE_KEY,),
+            ).fetchone()
+            previous = _decode_claude_visibility_cycle_state(
+                row["value_json"] if row is not None else None
+            )
+            sequence = int(previous.get("sequence", 0)) + 1
+            value: dict[str, Any] = {
+                "version": 1,
+                "sequence": sequence,
+                "last_cycle_at": recorded_at,
+                "last_result": {"status": safe_status, "error_code": safe_error},
+            }
+            if "last_empty_cycle_at" in previous:
+                value["last_empty_cycle_at"] = previous["last_empty_cycle_at"]
+            if "last_registrar_result" in previous:
+                value["last_registrar_result"] = previous["last_registrar_result"]
+            if safe_status == "no_due_job":
+                value["last_empty_cycle_at"] = recorded_at
+            if registrar_result:
+                value["last_registrar_result"] = {
+                    "at": recorded_at,
+                    "sequence": sequence,
+                    "status": safe_status,
+                    "error_code": safe_error,
+                }
+            value_json = json.dumps(value, sort_keys=True, separators=(",", ":"))
+            conn.execute(
+                """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value_json = excluded.value_json,
+                       updated_at = excluded.updated_at""",
+                (_CLAUDE_VISIBILITY_CYCLE_STATE_KEY, value_json, recorded_at),
+            )
+
+        self.db._execute_write(_write)
 
     def has_claude_visibility_source(self, source_session_id: str) -> bool:
         normalized = _exact_nonempty_text(
@@ -5881,6 +5982,103 @@ def _claude_status_token(value: Any, *, optional: bool = False) -> str | None:
             return "redacted"
         return value
     return "invalid"
+
+
+def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
+    if value_json is None:
+        return {}
+    try:
+        value = json.loads(value_json)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return {}
+    sequence = value.get("sequence")
+    last_cycle_at = value.get("last_cycle_at")
+    last_result = value.get("last_result")
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 1
+        or not isinstance(last_cycle_at, (int, float))
+        or isinstance(last_cycle_at, bool)
+        or not math.isfinite(float(last_cycle_at))
+        or not isinstance(last_result, dict)
+    ):
+        return {}
+    status = _claude_status_token(last_result.get("status"))
+    error_code = _claude_status_token(last_result.get("error_code"), optional=True)
+    if status in {None, "invalid", "redacted"} or error_code in {"invalid", "redacted"}:
+        return {}
+    decoded: dict[str, Any] = {
+        "version": 1,
+        "sequence": sequence,
+        "last_cycle_at": float(last_cycle_at),
+        "last_result": {"status": status, "error_code": error_code},
+    }
+    empty_at = value.get("last_empty_cycle_at")
+    if (
+        isinstance(empty_at, (int, float))
+        and not isinstance(empty_at, bool)
+        and math.isfinite(float(empty_at))
+    ):
+        decoded["last_empty_cycle_at"] = float(empty_at)
+    registrar = value.get("last_registrar_result")
+    if isinstance(registrar, dict):
+        registrar_status = _claude_status_token(registrar.get("status"))
+        registrar_error = _claude_status_token(
+            registrar.get("error_code"), optional=True
+        )
+        registrar_at = registrar.get("at")
+        registrar_sequence = registrar.get("sequence")
+        if (
+            registrar_status not in {None, "invalid", "redacted"}
+            and registrar_error not in {"invalid", "redacted"}
+            and isinstance(registrar_at, (int, float))
+            and not isinstance(registrar_at, bool)
+            and math.isfinite(float(registrar_at))
+            and isinstance(registrar_sequence, int)
+            and not isinstance(registrar_sequence, bool)
+            and registrar_sequence >= 1
+        ):
+            decoded["last_registrar_result"] = {
+                "at": float(registrar_at),
+                "sequence": registrar_sequence,
+                "status": registrar_status,
+                "error_code": registrar_error,
+            }
+    return decoded
+
+
+def _public_claude_visibility_cycle_state(
+    cycle: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not cycle:
+        return {
+            "last_cycle": {"tracked": False, "value": None},
+            "last_empty_cycle": {"tracked": False, "value": None},
+            "last_registrar_result": {"tracked": False, "value": None},
+        }
+    last_result = cycle["last_result"]
+    return {
+        "last_cycle": {
+            "tracked": True,
+            "value": {
+                "at": cycle["last_cycle_at"],
+                "sequence": cycle["sequence"],
+                "status": last_result["status"],
+                "error_code": last_result["error_code"],
+            },
+        },
+        "last_empty_cycle": {
+            "tracked": "last_empty_cycle_at" in cycle,
+            "value": cycle.get("last_empty_cycle_at"),
+        },
+        "last_registrar_result": {
+            "tracked": "last_registrar_result" in cycle,
+            "value": cycle.get("last_registrar_result"),
+        },
+    }
 
 
 def _mirror_state(job_states: Sequence[str], links: Sequence[dict[str, Any]]) -> str:

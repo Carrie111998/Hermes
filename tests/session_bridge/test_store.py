@@ -5561,6 +5561,181 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
         )
 
 
+def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("max-match")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
+    store.retry_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+    reconciliation = store.claim_claude_visibility_job(
+        100.0, 60, 25, "1.00", "0.02", 1
+    )
+    visible = store.commit_claude_visibility_job(
+        identity.job_id, reconciliation.lease_digest, "digest", 100.0
+    )
+    assert reconciliation.registration_reserved is False
+    assert visible["state"] == "claude_visible"
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+
+
+def test_claude_visibility_exact_absence_at_max_terminalizes_without_usage(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("max-absent")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
+    store.retry_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+    reconciliation = store.claim_claude_visibility_job(
+        100.0, 60, 25, "1.00", "0.02", 1
+    )
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
+        reconciliation.attempt_ordinal, "a" * 64,
+    )
+    clock[0] = 86_500.0
+    exhausted = store.claim_claude_visibility_job(
+        86_500.0, 60, 25, "1.00", "0.02", 1
+    )
+    row = _rows(
+        db, "SELECT state, attempts, error_code FROM session_claude_visibility_jobs"
+    )[0]
+    assert exhausted.status == "max_attempts_exhausted"
+    assert row == {
+        "state": "claude_failed", "attempts": 1,
+        "error_code": "max_attempts_exhausted",
+    }
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
+
+
+def test_claude_visibility_concurrent_exhaustion_has_one_terminal_transition(
+    tmp_path,
+) -> None:
+    path = tmp_path / "claude-max-race.db"
+    seed_db = SessionDB(path)
+    seed = SessionBridgeStore(seed_db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("max-race")
+    _enqueue_claude_visibility_job(seed, candidate, identity)
+    launch = seed.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
+    seed.retry_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+    reconciliation = seed.claim_claude_visibility_job(
+        100.0, 60, 25, "1.00", "0.02", 1
+    )
+    seed.record_claude_visibility_exact_id_absent(
+        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
+        reconciliation.attempt_ordinal, "a" * 64,
+    )
+    seed_db.close()
+    databases = (SessionDB(path), SessionDB(path))
+    try:
+        stores = tuple(
+            SessionBridgeStore(item, clock=lambda: 100.0, local_timezone=timezone.utc)
+            for item in databases
+        )
+        barrier = Barrier(2)
+
+        def claim(store):
+            barrier.wait()
+            return store.claim_claude_visibility_job(
+                100.0, 60, 25, "1.00", "0.02", 1
+            ).status
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, stores))
+
+        assert sorted(results) == ["max_attempts_exhausted", "no_due_job"]
+        assert _rows(
+            databases[0],
+            "SELECT state, error_code FROM session_claude_visibility_jobs",
+        ) == [{"state": "claude_failed", "error_code": "max_attempts_exhausted"}]
+        assert len(_rows(
+            databases[0], "SELECT * FROM session_claude_registration_usage"
+        )) == 1
+    finally:
+        for item in databases:
+            item.close()
+
+
+def test_claude_visibility_cycle_status_is_durable_and_preserves_last_empty(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+    first = store.claude_visibility_status(100.0)
+    clock[0] = 200.0
+    store.record_claude_visibility_cycle(
+        status="daily_limit", error_code=None, registrar_result=False
+    )
+    restarted = SessionBridgeStore(db, clock=lambda: 300.0, local_timezone=timezone.utc)
+    second = restarted.claude_visibility_status(300.0)
+    assert first["last_empty_cycle"] == {"tracked": True, "value": 100.0}
+    assert second["last_empty_cycle"] == {"tracked": True, "value": 100.0}
+    assert second["last_cycle"] == {
+        "tracked": True,
+        "value": {
+            "at": 200.0, "sequence": 2, "status": "daily_limit",
+            "error_code": None,
+        },
+    }
+    assert second["last_registrar_result"] == {"tracked": False, "value": None}
+
+
+def test_claude_visibility_cycle_status_sanitizes_error_code(db: SessionDB) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    store.record_claude_visibility_cycle(
+        status="retry", error_code="secret token / C:/private/path", registrar_result=True
+    )
+    status = store.claude_visibility_status(100.0)
+    assert status["last_cycle"]["value"]["error_code"] == "unknown_error_code"
+    assert "secret" not in repr(status)
+
+
+def test_claude_visibility_concurrent_cycles_use_transactional_sequence(tmp_path) -> None:
+    path = tmp_path / "claude-cycle-race.db"
+    seed = SessionDB(path)
+    seed.close()
+    databases = (SessionDB(path), SessionDB(path))
+    try:
+        stores = tuple(
+            SessionBridgeStore(
+                item, clock=lambda: 100.0, local_timezone=timezone.utc
+            )
+            for item in databases
+        )
+        barrier = Barrier(2)
+
+        def record(args):
+            store, status = args
+            barrier.wait()
+            store.record_claude_visibility_cycle(
+                status=status, error_code=None, registrar_result=False
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(record, zip(stores, ("daily_limit", "cost_limit"))))
+
+        cycle = stores[0].claude_visibility_status(100.0)["last_cycle"]
+        assert cycle["tracked"] is True
+        assert cycle["value"]["at"] == 100.0
+        assert cycle["value"]["sequence"] == 2
+        assert cycle["value"]["status"] in {"daily_limit", "cost_limit"}
+    finally:
+        for item in databases:
+            item.close()
+
+
 def test_claude_visibility_transitions_require_exact_active_lease(db: SessionDB) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity()

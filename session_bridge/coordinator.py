@@ -222,7 +222,11 @@ class _ClaudeVisibilityStore(Protocol):
         daily_limit: int,
         cost_limit: object,
         reserved_cost: object,
+        max_attempts: int,
     ) -> ClaudeVisibilityClaim: ...
+    def record_claude_visibility_cycle(
+        self, *, status: str, error_code: str | None, registrar_result: bool
+    ) -> None: ...
 
 
 _CLAUDE_VISIBILITY_DISCOVERY_CODES = CLAUDE_VISIBILITY_EXCLUSION_CODES | {
@@ -561,35 +565,73 @@ class ClaudeVisibilityCoordinator:
     def run_once(self, *, discover_continuous: bool = False) -> ClaudeVisibilityRunResult:
         if not self._config.claude_visibility.enabled:
             return ClaudeVisibilityRunResult(enabled=False, status="disabled")
+        def recorded(
+            result: ClaudeVisibilityRunResult, *, registrar_result: bool = False
+        ) -> ClaudeVisibilityRunResult:
+            try:
+                self._store.record_claude_visibility_cycle(
+                    status=result.status,
+                    error_code=result.error_code,
+                    registrar_result=registrar_result,
+                )
+            except Exception:
+                return ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status="degraded",
+                    job_id=result.job_id,
+                    error_code="provider_degraded",
+                    degraded=True,
+                    fatal=True,
+                    discovery=result.discovery,
+                )
+            return result
+
         discovery = self.continuous_once() if discover_continuous else None
         if discovery is not None and discovery.degraded:
-            return ClaudeVisibilityRunResult(
-                enabled=True, status="degraded", degraded=True, discovery=discovery
+            discovery_error = (
+                discovery.fatal_reasons[0]
+                if discovery.fatal_reasons
+                else "provider_degraded"
             )
+            return recorded(ClaudeVisibilityRunResult(
+                enabled=True, status="degraded", error_code=discovery_error,
+                degraded=True, discovery=discovery,
+            ))
         policy = self._config.claude_visibility
         try:
             status = self._store.claude_visibility_status(float(self._clock()))
             _open, fatal_reasons = _claude_visibility_enqueue_gates(status)
             if fatal_reasons:
-                return ClaudeVisibilityRunResult(
+                return recorded(ClaudeVisibilityRunResult(
                     enabled=True, status="degraded", error_code=fatal_reasons[0],
                     degraded=True, fatal=True, discovery=discovery,
-                )
+                ))
             claim = self._store.claim_claude_visibility_job(
                 float(self._clock()),
                 policy.lease_seconds,
                 policy.daily_registration_limit,
                 policy.emergency_daily_cost_usd,
                 policy.reserved_cost_per_attempt_usd,
+                policy.max_attempts,
             )
         except Exception:
-            return ClaudeVisibilityRunResult(
+            return recorded(ClaudeVisibilityRunResult(
                 enabled=True, status="degraded", degraded=True,
                 error_code="claim_failed", discovery=discovery,
-            )
+            ))
         if not claim.claimed:
+            if claim.status == "max_attempts_exhausted":
+                return recorded(ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status="failed",
+                    job_id=claim.job_id,
+                    error_code="max_attempts_exhausted",
+                    degraded=True,
+                    fatal=True,
+                    discovery=discovery,
+                ))
             if claim.status not in _CLAUDE_VISIBILITY_IDLE_CLAIM_STATUSES:
-                return ClaudeVisibilityRunResult(
+                return recorded(ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
                     job_id=claim.job_id,
@@ -597,17 +639,17 @@ class ClaudeVisibilityCoordinator:
                     degraded=True,
                     fatal=True,
                     discovery=discovery,
-                )
-            return ClaudeVisibilityRunResult(
+                ))
+            return recorded(ClaudeVisibilityRunResult(
                 enabled=True, status=claim.status, job_id=claim.job_id,
                 discovery=discovery,
-            )
+            ))
         try:
             outcome = self._registrar.process(claim)
             status = str(getattr(outcome, "status"))
             error_code = getattr(outcome, "error_code", None)
             if status not in _CLAUDE_VISIBILITY_REGISTRAR_STATUSES:
-                return ClaudeVisibilityRunResult(
+                return recorded(ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
                     job_id=claim.job_id,
@@ -615,7 +657,7 @@ class ClaudeVisibilityCoordinator:
                     degraded=True,
                     fatal=True,
                     discovery=discovery,
-                )
+                ))
             if (
                 status == "retry"
                 and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
@@ -623,7 +665,7 @@ class ClaudeVisibilityCoordinator:
                 status == "failed"
                 and error_code not in CLAUDE_VISIBILITY_FATAL_CODES
             ):
-                return ClaudeVisibilityRunResult(
+                return recorded(ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
                     job_id=claim.job_id,
@@ -631,8 +673,8 @@ class ClaudeVisibilityCoordinator:
                     degraded=True,
                     fatal=True,
                     discovery=discovery,
-                )
-            return ClaudeVisibilityRunResult(
+                ))
+            return recorded(ClaudeVisibilityRunResult(
                 enabled=True,
                 status=status,
                 job_id=claim.job_id,
@@ -640,12 +682,12 @@ class ClaudeVisibilityCoordinator:
                 degraded=status in {"retry", "failed"},
                 fatal=status == "failed",
                 discovery=discovery,
-            )
+            ), registrar_result=True)
         except Exception:
-            return ClaudeVisibilityRunResult(
+            return recorded(ClaudeVisibilityRunResult(
                 enabled=True, status="degraded", job_id=claim.job_id,
                 error_code="registrar_failed", degraded=True, discovery=discovery,
-            )
+            ))
 
 
 class ContinuationBlockedError(RuntimeError):

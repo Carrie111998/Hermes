@@ -57,6 +57,7 @@ class FakeStore:
         self.claim_calls = 0
         self.status_calls = 0
         self.source_checks = 0
+        self.cycle_records = []
         self.open_sources: set[str] = set()
         self.raw_status = {
             "counts": {
@@ -112,6 +113,9 @@ class FakeStore:
     def claim_claude_visibility_job(self, *args):
         self.claim_calls += 1
         return self.claim
+
+    def record_claude_visibility_cycle(self, **record):
+        self.cycle_records.append(record)
 
 
 class FakeRegistrar:
@@ -342,6 +346,65 @@ def test_run_once_claims_once_and_calls_registrar_once_only_for_claim() -> None:
     assert result.status == "visible"
     assert store.claim_calls == 1
     assert registrar.claims == [claim]
+    assert store.cycle_records == [{
+        "status": "visible", "error_code": None, "registrar_result": True,
+    }]
+
+
+def test_run_once_passes_configured_max_attempts_and_records_limits() -> None:
+    class InspectingStore(FakeStore):
+        def claim_claude_visibility_job(self, *args):
+            self.claim_args = args
+            return ClaudeVisibilityClaim(status="daily_limit")
+
+    store = InspectingStore()
+    config = _config()
+    coordinator, _calls = _coordinator([], store=store, config=config)
+
+    result = coordinator.run_once()
+
+    assert result.status == "daily_limit"
+    assert store.claim_args[-1] == config.claude_visibility.max_attempts
+    assert store.cycle_records[-1] == {
+        "status": "daily_limit", "error_code": None, "registrar_result": False,
+    }
+
+
+def test_run_once_cycle_persistence_failure_is_typed_provider_degraded() -> None:
+    class BrokenCycleStore(FakeStore):
+        def record_claude_visibility_cycle(self, **record):
+            raise RuntimeError("secret database path")
+
+    coordinator, _calls = _coordinator([], store=BrokenCycleStore())
+
+    result = coordinator.run_once()
+
+    assert result.status == "degraded"
+    assert result.error_code == "provider_degraded"
+    assert result.degraded is True
+    assert "secret" not in repr(result)
+
+
+def test_run_once_records_sanitized_continuous_discovery_failure() -> None:
+    store = FakeStore()
+
+    def inventory(_after: float):
+        raise RuntimeError("secret provider exception")
+
+    coordinator = ClaudeVisibilityCoordinator(
+        config=_config(continuous=True), store=store, inventory=inventory,
+        registrar=FakeRegistrar(), marker_secret=SECRET, clock=lambda: NOW,
+    )
+
+    result = coordinator.run_once(discover_continuous=True)
+
+    assert result.status == "degraded"
+    assert result.error_code == "provider_degraded"
+    assert store.cycle_records == [{
+        "status": "degraded", "error_code": "provider_degraded",
+        "registrar_result": False,
+    }]
+    assert "secret" not in repr(result)
 
 
 def test_provider_exception_is_sanitized_degraded_result() -> None:
@@ -379,6 +442,7 @@ def test_disabled_methods_touch_no_inventory_store_or_registrar() -> None:
     assert store.source_checks == 0
     assert store.enqueued == []
     assert store.claim_calls == 0
+    assert store.cycle_records == []
     assert registrar.claims == []
 
 

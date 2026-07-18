@@ -427,8 +427,15 @@ class ProductionBackend:
             "open_reasons": _claude_visibility_open_reasons(raw),
             "fatal_reasons": status_fatal,
             "degraded_reasons": status_fatal,
-            "last_empty_cycle": {"tracked": False, "value": None},
-            "last_registrar_result": {"tracked": False, "value": None},
+            "last_cycle": dict(raw.get(
+                "last_cycle", {"tracked": False, "value": None}
+            )),
+            "last_empty_cycle": dict(raw.get(
+                "last_empty_cycle", {"tracked": False, "value": None}
+            )),
+            "last_registrar_result": dict(raw.get(
+                "last_registrar_result", {"tracked": False, "value": None}
+            )),
         }
 
     def claude_visibility_backfill(
@@ -1419,6 +1426,7 @@ def _disabled_claude_visibility_payload(continuous: bool) -> dict[str, Any]:
         "open_reasons": [],
         "fatal_reasons": [],
         "degraded_reasons": [],
+        "last_cycle": {"tracked": False, "value": None},
         "last_empty_cycle": {"tracked": False, "value": None},
         "last_registrar_result": {"tracked": False, "value": None},
     }

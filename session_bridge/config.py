@@ -415,7 +415,7 @@ class BridgeConfig:
                     "backfill_days", claude_visibility_defaults.backfill_days
                 ),
                 "session_bridge.claude_visibility.backfill_days",
-                minimum=0,
+                minimum=1,
             ),
             continuous_batch_limit=_toml_int(
                 claude_visibility.get(
@@ -486,6 +486,11 @@ class BridgeConfig:
                 minimum=1,
             ),
         )
+        if claude_visibility_config.continuous_batch_limit != 1:
+            raise ValueError(
+                "session_bridge.claude_visibility.continuous_batch_limit "
+                "must be exactly 1"
+            )
         return cls(
             service=service_config,
             catalog=catalog_config,
