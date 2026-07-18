@@ -494,6 +494,16 @@ async def test_refresh_failure_is_reported_with_sanitized_provider_health() -> N
     assert secret not in repr(health)
 
 
+def test_default_refresh_timeout_covers_native_codex_read_budget() -> None:
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=object(),
+        adapters={},
+    )
+
+    assert coordinator._refresh_timeout == 30.0
+
+
 @pytest.mark.asyncio
 async def test_stop_drains_inflight_provider_call_before_returning() -> None:
     started = Event()
