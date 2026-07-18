@@ -65,7 +65,9 @@ def _b64url(data: bytes) -> str:
 
 def _signed_marker_body(body: bytes, secret: bytes = SECRET) -> str:
     encoded = _b64url(body)
-    signature = _b64url(hmac.new(secret, encoded.encode("ascii"), hashlib.sha256).digest())
+    signature = _b64url(
+        hmac.new(secret, encoded.encode("ascii"), hashlib.sha256).digest()
+    )
     return f"{MARKER_PREFIX}:{encoded}.{signature}"
 
 
@@ -361,14 +363,12 @@ def test_signed_marker_encode_rejects_hermes_target_provider():
 
 @pytest.mark.parametrize("target_provider", ["hermes", "unknown"])
 def test_signed_marker_decode_rejects_invalid_target_provider(target_provider):
-    marker = _signed_json_marker(
-        {
-            "bridge_id": "bridge-1",
-            "policy_generation": 3,
-            "source_session_id": "claude:source-1",
-            "target_provider": target_provider,
-        }
-    )
+    marker = _signed_json_marker({
+        "bridge_id": "bridge-1",
+        "policy_generation": 3,
+        "source_session_id": "claude:source-1",
+        "target_provider": target_provider,
+    })
 
     with pytest.raises(InvalidBridgeMarker):
         decode_bridge_marker(marker, SECRET)
@@ -391,7 +391,9 @@ def test_signed_marker_rejects_malformed_envelope(marker):
 
 def test_signed_marker_rejects_signed_invalid_base64():
     encoded = "%%%"
-    signature = _b64url(hmac.new(SECRET, encoded.encode("ascii"), hashlib.sha256).digest())
+    signature = _b64url(
+        hmac.new(SECRET, encoded.encode("ascii"), hashlib.sha256).digest()
+    )
     marker = f"{MARKER_PREFIX}:{encoded}.{signature}"
 
     with pytest.raises(InvalidBridgeMarker):

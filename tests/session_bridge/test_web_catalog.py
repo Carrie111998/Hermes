@@ -24,7 +24,9 @@ from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
 from session_bridge.store import SessionBridgeStore
 
 
-def _projection(provider: Provider, native_id: str, *, started_at: float) -> SessionProjection:
+def _projection(
+    provider: Provider, native_id: str, *, started_at: float
+) -> SessionProjection:
     return SessionProjection(
         provider=provider,
         native_id=native_id,
@@ -88,10 +90,12 @@ def _baseline_rows(db_path: Path) -> dict[str, dict[str, object]]:
 def _set_sync_error(db_path: Path, session_id: str, detail: str) -> None:
     db = SessionDB(db_path=db_path)
     try:
-        db._execute_write(lambda conn: conn.execute(
-            "UPDATE external_sessions SET sync_error = ? WHERE session_id = ?",
-            (detail, session_id),
-        ))
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE external_sessions SET sync_error = ? WHERE session_id = ?",
+                (detail, session_id),
+            )
+        )
     finally:
         db.close()
 
@@ -132,7 +136,9 @@ def _seed_sidebar_catalog_jobs(db_path: Path) -> dict[str, str]:
             )
             store.enqueue_sidebar_job(candidate)
 
-            def set_state(conn, *, source_id: str = session_id, job_state=state) -> None:
+            def set_state(
+                conn, *, source_id: str = session_id, job_state=state
+            ) -> None:
                 values = {
                     "state": job_state.value,
                     "lease_digest": (
@@ -153,8 +159,7 @@ def _seed_sidebar_catalog_jobs(db_path: Path) -> dict[str, str]:
                     ),
                     "error_code": (
                         secret_error
-                        if job_state
-                        in (SidebarJobState.RETRY, SidebarJobState.FAILED)
+                        if job_state in (SidebarJobState.RETRY, SidebarJobState.FAILED)
                         else None
                     ),
                     "visible_at": (
@@ -195,6 +200,7 @@ def _set_sidebar_catalog_field(
     assert field in {"codex_thread_id", "error_code", "lease_expires_at"}
     db = SessionDB(db_path=db_path)
     try:
+
         def update(conn) -> None:
             if ignore_checks:
                 conn.execute("PRAGMA ignore_check_constraints = ON")
@@ -324,9 +330,7 @@ async def test_sessions_api_exposes_only_sanitized_batched_sidebar_status(
             row["bridge_sidebar_error"],
             row["bridge_sidebar_stale"],
         ) == values
-        assert {
-            key for key in row if key.startswith("bridge_sidebar_")
-        } == {
+        assert {key for key in row if key.startswith("bridge_sidebar_")} == {
             "bridge_sidebar_state",
             "bridge_sidebar_codex_thread_id",
             "bridge_sidebar_error",
@@ -350,7 +354,10 @@ async def test_sessions_api_exposes_only_sanitized_batched_sidebar_status(
 @pytest.mark.parametrize(
     ("thread_id", "expected_thread_id"),
     [
-        ("44444444-4444-4444-8444-444444444444", "44444444-4444-4444-8444-444444444444"),
+        (
+            "44444444-4444-4444-8444-444444444444",
+            "44444444-4444-4444-8444-444444444444",
+        ),
         ("thread_01JABCDEF0123456789ABCDE", "thread_01JABCDEF0123456789ABCDE"),
         ("C:/private/native/sidebar.jsonl bearer-secret", None),
         (sqlite3.Binary(b"binary-thread-secret"), None),
@@ -382,7 +389,8 @@ async def test_sessions_api_validates_visible_codex_thread_identity(
     response = await web_server.get_sessions(limit=20)
 
     row = next(
-        session for session in response["sessions"]
+        session
+        for session in response["sessions"]
         if session["id"] == "sidebar-visible"
     )
     expected_state = "visible" if expected_thread_id is not None else "failed"
@@ -423,7 +431,8 @@ async def test_sessions_api_exposes_thread_identity_only_for_visible_rows(
     response = await web_server.get_sessions(limit=20)
 
     row = next(
-        session for session in response["sessions"]
+        session
+        for session in response["sessions"]
         if session["id"] == "sidebar-pending"
     )
     assert row["bridge_sidebar_state"] == "pending"
@@ -467,8 +476,7 @@ async def test_sessions_api_fails_closed_for_invalid_leased_expiry(
     response = await web_server.get_sessions(limit=20)
 
     row = next(
-        session for session in response["sessions"]
-        if session["id"] == "sidebar-leased"
+        session for session in response["sessions"] if session["id"] == "sidebar-leased"
     )
     assert (
         row["bridge_sidebar_state"],
@@ -526,8 +534,7 @@ async def test_sessions_api_fails_closed_for_errors_on_active_sidebar_states(
     response = await web_server.get_sessions(limit=20)
 
     row = next(
-        session for session in response["sessions"]
-        if session["id"] == session_id
+        session for session in response["sessions"] if session["id"] == session_id
     )
     assert (
         row["bridge_sidebar_state"],

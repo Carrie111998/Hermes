@@ -131,8 +131,8 @@ def characterize_claude_visibility(
         if state["phase"] == "prepared":
             raise RuntimeError("characterization_reservation_incomplete")
         disposable = _validate_disposable(state, root)
-        renew_ready_authority = (
-            state["phase"] == "ready" and timestamp > float(state["expires_at"])
+        renew_ready_authority = state["phase"] == "ready" and timestamp > float(
+            state["expires_at"]
         )
     else:
         operation_id = str(uuid.uuid4())
@@ -243,11 +243,9 @@ def characterize_claude_visibility(
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     transcript_identity = list(_path_identity(resolved_transcript))
     previous_transcript_identity = state["transcript_identity"]
-    if (
-        previous_transcript_identity is not None
-        and _recorded_object_identity(previous_transcript_identity)
-        != _object_identity(resolved_transcript)
-    ):
+    if previous_transcript_identity is not None and _recorded_object_identity(
+        previous_transcript_identity
+    ) != _object_identity(resolved_transcript):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     state["transcript_path"] = str(resolved_transcript)
     state["transcript_identity"] = transcript_identity

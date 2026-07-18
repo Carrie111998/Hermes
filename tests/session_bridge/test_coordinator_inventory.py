@@ -636,6 +636,4 @@ async def test_periodic_reconcile_marks_only_two_sided_divergence_without_contin
     await coordinator.reconcile_once()
 
     assert store.listed_continuations == 1
-    assert store.diverged == (
-        ["bridge-divergence"] if expected_diverged else []
-    )
+    assert store.diverged == (["bridge-divergence"] if expected_diverged else [])

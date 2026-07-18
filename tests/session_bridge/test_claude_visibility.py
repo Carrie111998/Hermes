@@ -14,7 +14,12 @@ from session_bridge.claude_visibility import (
     normalized_claude_visibility_error,
     validate_claude_visibility_identity_binding,
 )
-from session_bridge.models import OriginKind, ProjectedMessage, Provider, SessionProjection
+from session_bridge.models import (
+    OriginKind,
+    ProjectedMessage,
+    Provider,
+    SessionProjection,
+)
 
 
 SECRET = b"claude-visibility-test-secret"
@@ -208,9 +213,7 @@ def test_identity_validation_and_prompt_reject_canonical_forged_signature() -> N
     )
     identity = derive_claude_visibility_identity(candidate, SECRET)
     replacement = "A" if identity.signed_marker[-1] != "A" else "B"
-    forged = replace(
-        identity, signed_marker=identity.signed_marker[:-1] + replacement
-    )
+    forged = replace(identity, signed_marker=identity.signed_marker[:-1] + replacement)
 
     with pytest.raises(ValueError, match="signed marker"):
         validate_claude_visibility_identity_binding(candidate, forged, SECRET)
@@ -218,7 +221,9 @@ def test_identity_validation_and_prompt_reject_canonical_forged_signature() -> N
         build_claude_registration_prompt(candidate, forged, SECRET)
 
 
-def test_registration_prompt_redacts_secrets_and_ascii_escapes_line_separators() -> None:
+def test_registration_prompt_redacts_secrets_and_ascii_escapes_line_separators() -> (
+    None
+):
     secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
     candidate = build_claude_visibility_candidate(
         _projection(Provider.HERMES, content="safe request"),

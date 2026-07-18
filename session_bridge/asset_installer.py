@@ -176,9 +176,7 @@ def _copy_packaged_asset(
         target.parent.mkdir(parents=True, exist_ok=True)
         if identity is not None:
             identity.revalidate()
-            _guarded_write_bytes(
-                target, packaged_source.read_bytes(), identity
-            )
+            _guarded_write_bytes(target, packaged_source.read_bytes(), identity)
         else:
             target.write_bytes(packaged_source.read_bytes())
 

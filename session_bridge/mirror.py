@@ -919,12 +919,10 @@ def _enqueue_authorized_job(
                     target_provider=_external_provider(exact_job["target_provider"]),
                     policy_generation=existing_authority["policy_generation"],
                     require_unmapped=(
-                        bool(existing_authority["require_unmapped"])
-                        or require_unmapped
+                        bool(existing_authority["require_unmapped"]) or require_unmapped
                     ),
                     rollout_limited=(
-                        bool(existing_authority["rollout_limited"])
-                        or rollout_limited
+                        bool(existing_authority["rollout_limited"]) or rollout_limited
                     ),
                 )
                 cursor = connection.execute(
@@ -1258,11 +1256,7 @@ def _exact_job_ids(job_ids: Sequence[str] | None) -> tuple[str, ...] | None:
         raise ValueError("job_ids must contain at most 1000 IDs")
     normalized: list[str] = []
     for job_id in job_ids:
-        if (
-            not isinstance(job_id, str)
-            or not job_id
-            or job_id != job_id.strip()
-        ):
+        if not isinstance(job_id, str) or not job_id or job_id != job_id.strip():
             raise ValueError("job_ids must contain exact nonempty IDs")
         normalized.append(job_id)
     if len(set(normalized)) != len(normalized):

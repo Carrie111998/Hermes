@@ -9,7 +9,12 @@ from session_bridge.coordinator import (
     ClaudeVisibilityCoordinator,
     _claude_visibility_enqueue_gates,
 )
-from session_bridge.models import OriginKind, ProjectedMessage, Provider, SessionProjection
+from session_bridge.models import (
+    OriginKind,
+    ProjectedMessage,
+    Provider,
+    SessionProjection,
+)
 from session_bridge.store import SidebarSource
 
 
@@ -95,7 +100,9 @@ class FakeStore:
         open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(self.raw_status)
         if fatal_reasons:
             return {
-                "status": "fatal", "inserted": 0, "duplicates": 0,
+                "status": "fatal",
+                "inserted": 0,
+                "duplicates": 0,
                 "fatal_reasons": list(fatal_reasons),
             }
         if open_reasons:
@@ -212,7 +219,9 @@ def test_discovery_interleaves_hermes_and_codex_newest_first_stably() -> None:
 def test_dry_run_never_writes_claims_or_invokes_registrar() -> None:
     store = FakeStore()
     registrar = FakeRegistrar()
-    coordinator, _calls = _coordinator([_source("one")], store=store, registrar=registrar)
+    coordinator, _calls = _coordinator(
+        [_source("one")], store=store, registrar=registrar
+    )
 
     result = coordinator.backfill(days=30, limit=10, apply=False)
 
@@ -237,7 +246,9 @@ def test_apply_refuses_every_nonvisible_open_or_failed_state() -> None:
 
 
 def test_apply_hard_caps_ten_and_uses_reviewed_deterministic_enqueue() -> None:
-    sources = [_source(f"source-{index:02d}", active=NOW - index) for index in range(15)]
+    sources = [
+        _source(f"source-{index:02d}", active=NOW - index) for index in range(15)
+    ]
     store = FakeStore()
     coordinator, _calls = _coordinator(sources, store=store)
 
@@ -269,7 +280,9 @@ def test_apply_does_not_count_or_enqueue_an_already_queued_source() -> None:
 
 def test_manual_limit_is_applied_after_queued_sources_are_excluded() -> None:
     store = FakeStore()
-    sources = [_source(f"source-{index:02d}", active=NOW - index) for index in range(20)]
+    sources = [
+        _source(f"source-{index:02d}", active=NOW - index) for index in range(20)
+    ]
     store.open_sources.update(source.source_session_id for source in sources[:10])
     coordinator, _calls = _coordinator(sources, store=store)
 
@@ -346,9 +359,13 @@ def test_run_once_claims_once_and_calls_registrar_once_only_for_claim() -> None:
     assert result.status == "visible"
     assert store.claim_calls == 1
     assert registrar.claims == [claim]
-    assert store.cycle_records == [{
-        "status": "visible", "error_code": None, "registrar_result": True,
-    }]
+    assert store.cycle_records == [
+        {
+            "status": "visible",
+            "error_code": None,
+            "registrar_result": True,
+        }
+    ]
 
 
 def test_run_once_passes_configured_max_attempts_and_records_limits() -> None:
@@ -366,7 +383,9 @@ def test_run_once_passes_configured_max_attempts_and_records_limits() -> None:
     assert result.status == "daily_limit"
     assert store.claim_args[-1] == config.claude_visibility.max_attempts
     assert store.cycle_records[-1] == {
-        "status": "daily_limit", "error_code": None, "registrar_result": False,
+        "status": "daily_limit",
+        "error_code": None,
+        "registrar_result": False,
     }
 
 
@@ -392,18 +411,25 @@ def test_run_once_records_sanitized_continuous_discovery_failure() -> None:
         raise RuntimeError("secret provider exception")
 
     coordinator = ClaudeVisibilityCoordinator(
-        config=_config(continuous=True), store=store, inventory=inventory,
-        registrar=FakeRegistrar(), marker_secret=SECRET, clock=lambda: NOW,
+        config=_config(continuous=True),
+        store=store,
+        inventory=inventory,
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
+        clock=lambda: NOW,
     )
 
     result = coordinator.run_once(discover_continuous=True)
 
     assert result.status == "degraded"
     assert result.error_code == "provider_degraded"
-    assert store.cycle_records == [{
-        "status": "degraded", "error_code": "provider_degraded",
-        "registrar_result": False,
-    }]
+    assert store.cycle_records == [
+        {
+            "status": "degraded",
+            "error_code": "provider_degraded",
+            "registrar_result": False,
+        }
+    ]
     assert "secret" not in repr(result)
 
 
@@ -412,8 +438,12 @@ def test_provider_exception_is_sanitized_degraded_result() -> None:
         raise RuntimeError("secret-token-123 raw provider failure")
 
     coordinator = ClaudeVisibilityCoordinator(
-        config=_config(), store=FakeStore(), inventory=inventory,
-        registrar=FakeRegistrar(), marker_secret=SECRET, clock=lambda: NOW,
+        config=_config(),
+        store=FakeStore(),
+        inventory=inventory,
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
+        clock=lambda: NOW,
     )
 
     result = coordinator.discover(days=30, limit=10)
@@ -427,7 +457,9 @@ def test_disabled_methods_touch_no_inventory_store_or_registrar() -> None:
     store = FakeStore()
     registrar = FakeRegistrar()
     coordinator, inventory_calls = _coordinator(
-        [_source("one")], store=store, registrar=registrar,
+        [_source("one")],
+        store=store,
+        registrar=registrar,
         config=_config(enabled=False),
     )
 
@@ -467,7 +499,9 @@ def test_apply_fails_closed_on_unknown_or_malformed_status_codes() -> None:
 
 def test_continuous_scans_past_ten_already_queued_candidates() -> None:
     store = FakeStore()
-    sources = [_source(f"source-{index:02d}", active=NOW - index) for index in range(11)]
+    sources = [
+        _source(f"source-{index:02d}", active=NOW - index) for index in range(11)
+    ]
     store.open_sources.update(source.source_session_id for source in sources[:10])
     coordinator, _calls = _coordinator(
         sources, store=store, config=_config(continuous=True)
@@ -481,7 +515,9 @@ def test_continuous_scans_past_ten_already_queued_candidates() -> None:
 
 def test_continuous_scans_past_one_thousand_already_queued_candidates() -> None:
     store = FakeStore()
-    sources = [_source(f"source-{index:04d}", active=NOW - index) for index in range(1001)]
+    sources = [
+        _source(f"source-{index:04d}", active=NOW - index) for index in range(1001)
+    ]
     store.open_sources.update(source.source_session_id for source in sources[:1000])
     coordinator, _calls = _coordinator(
         sources, store=store, config=_config(continuous=True)
@@ -502,8 +538,11 @@ def test_discovery_malformed_item_bad_clock_and_evaluator_are_typed_degraded(
     assert malformed.reasons == ("inventory_invalid",)
 
     bad_clock = ClaudeVisibilityCoordinator(
-        config=_config(), store=FakeStore(), inventory=lambda _after: [],
-        registrar=FakeRegistrar(), marker_secret=SECRET,
+        config=_config(),
+        store=FakeStore(),
+        inventory=lambda _after: [],
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
         clock=lambda: "secret-bad-clock",
     ).discover(days=30, limit=10)
     assert bad_clock.degraded is True
@@ -525,11 +564,16 @@ def test_inventory_iteration_failure_on_later_page_is_provider_degraded() -> Non
         def pages():
             yield _source("first")
             raise RuntimeError("later-page-secret")
+
         return pages()
 
     coordinator = ClaudeVisibilityCoordinator(
-        config=_config(), store=FakeStore(), inventory=inventory,
-        registrar=FakeRegistrar(), marker_secret=SECRET, clock=lambda: NOW,
+        config=_config(),
+        store=FakeStore(),
+        inventory=inventory,
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
+        clock=lambda: NOW,
     )
     result = coordinator.discover(days=30, limit=10)
 
@@ -553,7 +597,9 @@ def test_run_once_fails_closed_on_unknown_claim_and_registrar_statuses() -> None
     class UnknownRegistrar(FakeRegistrar):
         def process(self, claim):
             self.claims.append(claim)
-            return type("Outcome", (), {"status": "future_outcome", "error_code": None})()
+            return type(
+                "Outcome", (), {"status": "future_outcome", "error_code": None}
+            )()
 
     claimed = ClaudeVisibilityClaim(status="claimed", lease_kind="launch", job_id="job")
     store = FakeStore(claim=claimed)
@@ -571,10 +617,14 @@ def test_run_once_fails_closed_on_unknown_claim_and_registrar_statuses() -> None
 
 def test_run_once_blocks_before_claim_on_unknown_persisted_job_state() -> None:
     store = FakeStore()
-    store.raw_status["fatal"] = [{
-        "code": "unknown_job_state", "state": "future_state",
-        "error_code": "future-code", "count": 1,
-    }]
+    store.raw_status["fatal"] = [
+        {
+            "code": "unknown_job_state",
+            "state": "future_state",
+            "error_code": "future-code",
+            "count": 1,
+        }
+    ]
     coordinator, _calls = _coordinator([], store=store)
 
     result = coordinator.run_once()

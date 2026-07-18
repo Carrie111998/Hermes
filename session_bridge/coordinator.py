@@ -292,7 +292,9 @@ def _claude_visibility_enqueue_gates(
 
     open_reasons = (
         ("open_visibility_work",)
-        if any(count_values.get(state, 0) > 0 for state in _CLAUDE_VISIBILITY_OPEN_STATES)
+        if any(
+            count_values.get(state, 0) > 0 for state in _CLAUDE_VISIBILITY_OPEN_STATES
+        )
         else ()
     )
     fatal: set[str] = set()
@@ -312,7 +314,9 @@ def _claude_visibility_enqueue_gates(
     for code, count in failed_values.items():
         if count <= 0:
             continue
-        fatal.add(code if code in CLAUDE_VISIBILITY_FATAL_CODES else "unknown_failed_code")
+        fatal.add(
+            code if code in CLAUDE_VISIBILITY_FATAL_CODES else "unknown_failed_code"
+        )
     return open_reasons, tuple(sorted(fatal))
 
 
@@ -404,8 +408,11 @@ class ClaudeVisibilityCoordinator:
                         automation_only=source.automation_only,
                         subagent_only=source.subagent_only,
                     )
-                    if reason == "eligible" and self._store.has_claude_visibility_source(
-                        source.source_session_id
+                    if (
+                        reason == "eligible"
+                        and self._store.has_claude_visibility_source(
+                            source.source_session_id
+                        )
                     ):
                         reason = "duplicate_source"
                 seen.add(key)
@@ -488,9 +495,13 @@ class ClaudeVisibilityCoordinator:
             if status != "inserted":
                 fatal = atomic.get("fatal_reasons")
                 return ClaudeVisibilityApplyResult(
-                    enabled=True, mode=mode, candidates=discovery.candidates,
-                    exclusions=discovery.exclusions, degraded=True,
-                    fatal_reasons=tuple(fatal) if isinstance(fatal, (list, tuple))
+                    enabled=True,
+                    mode=mode,
+                    candidates=discovery.candidates,
+                    exclusions=discovery.exclusions,
+                    degraded=True,
+                    fatal_reasons=tuple(fatal)
+                    if isinstance(fatal, (list, tuple))
                     else ("enqueue_failed",),
                 )
             applied = int(atomic.get("inserted", 0))
@@ -525,48 +536,68 @@ class ClaudeVisibilityCoordinator:
         )
         if discovery.degraded:
             return ClaudeVisibilityApplyResult(
-                enabled=True, mode="continuous", degraded=True,
-                candidates=discovery.candidates, exclusions=discovery.exclusions,
+                enabled=True,
+                mode="continuous",
+                degraded=True,
+                candidates=discovery.candidates,
+                exclusions=discovery.exclusions,
                 fatal_reasons=discovery.reasons,
             )
         try:
             candidate = next(iter(discovery.candidates), None)
             if candidate is None:
                 return ClaudeVisibilityApplyResult(
-                    enabled=True, mode="continuous",
-                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                    enabled=True,
+                    mode="continuous",
+                    candidates=discovery.candidates,
+                    exclusions=discovery.exclusions,
                 )
             atomic = self._store.enqueue_claude_visibility_batch_if_idle(
                 ((candidate.candidate, candidate.identity),), self._marker_secret
             )
             if atomic.get("status") == "open_work":
                 return ClaudeVisibilityApplyResult(
-                    enabled=True, mode="continuous",
-                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                    enabled=True,
+                    mode="continuous",
+                    candidates=discovery.candidates,
+                    exclusions=discovery.exclusions,
                     open_reasons=("open_visibility_work",),
                 )
             if atomic.get("status") != "inserted":
                 return ClaudeVisibilityApplyResult(
-                    enabled=True, mode="continuous", degraded=True,
-                    candidates=discovery.candidates, exclusions=discovery.exclusions,
+                    enabled=True,
+                    mode="continuous",
+                    degraded=True,
+                    candidates=discovery.candidates,
+                    exclusions=discovery.exclusions,
                     fatal_reasons=("enqueue_failed",),
                 )
             applied = int(atomic.get("inserted", 0))
             duplicates = int(atomic.get("duplicates", 0))
         except Exception:
             return ClaudeVisibilityApplyResult(
-                enabled=True, mode="continuous", degraded=True,
-                candidates=discovery.candidates, exclusions=discovery.exclusions,
+                enabled=True,
+                mode="continuous",
+                degraded=True,
+                candidates=discovery.candidates,
+                exclusions=discovery.exclusions,
                 fatal_reasons=("enqueue_failed",),
             )
         return ClaudeVisibilityApplyResult(
-            enabled=True, mode="continuous", candidates=discovery.candidates,
-            exclusions=discovery.exclusions, applied=applied, duplicates=duplicates,
+            enabled=True,
+            mode="continuous",
+            candidates=discovery.candidates,
+            exclusions=discovery.exclusions,
+            applied=applied,
+            duplicates=duplicates,
         )
 
-    def run_once(self, *, discover_continuous: bool = False) -> ClaudeVisibilityRunResult:
+    def run_once(
+        self, *, discover_continuous: bool = False
+    ) -> ClaudeVisibilityRunResult:
         if not self._config.claude_visibility.enabled:
             return ClaudeVisibilityRunResult(enabled=False, status="disabled")
+
         def recorded(
             result: ClaudeVisibilityRunResult, *, registrar_result: bool = False
         ) -> ClaudeVisibilityRunResult:
@@ -595,19 +626,30 @@ class ClaudeVisibilityCoordinator:
                 if discovery.fatal_reasons
                 else "provider_degraded"
             )
-            return recorded(ClaudeVisibilityRunResult(
-                enabled=True, status="degraded", error_code=discovery_error,
-                degraded=True, discovery=discovery,
-            ))
+            return recorded(
+                ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status="degraded",
+                    error_code=discovery_error,
+                    degraded=True,
+                    discovery=discovery,
+                )
+            )
         policy = self._config.claude_visibility
         try:
             status = self._store.claude_visibility_status(float(self._clock()))
             _open, fatal_reasons = _claude_visibility_enqueue_gates(status)
             if fatal_reasons:
-                return recorded(ClaudeVisibilityRunResult(
-                    enabled=True, status="degraded", error_code=fatal_reasons[0],
-                    degraded=True, fatal=True, discovery=discovery,
-                ))
+                return recorded(
+                    ClaudeVisibilityRunResult(
+                        enabled=True,
+                        status="degraded",
+                        error_code=fatal_reasons[0],
+                        degraded=True,
+                        fatal=True,
+                        discovery=discovery,
+                    )
+                )
             claim = self._store.claim_claude_visibility_job(
                 float(self._clock()),
                 policy.lease_seconds,
@@ -617,86 +659,114 @@ class ClaudeVisibilityCoordinator:
                 policy.max_attempts,
             )
         except Exception:
-            return recorded(ClaudeVisibilityRunResult(
-                enabled=True, status="degraded", degraded=True,
-                error_code="claim_failed", discovery=discovery,
-            ))
-        if not claim.claimed:
-            if claim.status == "max_attempts_exhausted":
-                return recorded(ClaudeVisibilityRunResult(
-                    enabled=True,
-                    status="failed",
-                    job_id=claim.job_id,
-                    error_code="max_attempts_exhausted",
-                    degraded=True,
-                    fatal=True,
-                    discovery=discovery,
-                ))
-            if claim.status not in _CLAUDE_VISIBILITY_IDLE_CLAIM_STATUSES:
-                return recorded(ClaudeVisibilityRunResult(
+            return recorded(
+                ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
-                    job_id=claim.job_id,
-                    error_code="unknown_claim_status",
                     degraded=True,
-                    fatal=True,
+                    error_code="claim_failed",
                     discovery=discovery,
-                ))
-            return recorded(ClaudeVisibilityRunResult(
-                enabled=True, status=claim.status, job_id=claim.job_id,
-                discovery=discovery,
-            ))
+                )
+            )
+        if not claim.claimed:
+            if claim.status == "max_attempts_exhausted":
+                return recorded(
+                    ClaudeVisibilityRunResult(
+                        enabled=True,
+                        status="failed",
+                        job_id=claim.job_id,
+                        error_code="max_attempts_exhausted",
+                        degraded=True,
+                        fatal=True,
+                        discovery=discovery,
+                    )
+                )
+            if claim.status not in _CLAUDE_VISIBILITY_IDLE_CLAIM_STATUSES:
+                return recorded(
+                    ClaudeVisibilityRunResult(
+                        enabled=True,
+                        status="degraded",
+                        job_id=claim.job_id,
+                        error_code="unknown_claim_status",
+                        degraded=True,
+                        fatal=True,
+                        discovery=discovery,
+                    )
+                )
+            return recorded(
+                ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status=claim.status,
+                    job_id=claim.job_id,
+                    discovery=discovery,
+                )
+            )
         try:
             outcome = self._registrar.process(claim)
             status = str(getattr(outcome, "status"))
             error_code = getattr(outcome, "error_code", None)
             if status not in _CLAUDE_VISIBILITY_REGISTRAR_STATUSES:
-                return recorded(ClaudeVisibilityRunResult(
-                    enabled=True,
-                    status="degraded",
-                    job_id=claim.job_id,
-                    error_code="unknown_registrar_status",
-                    degraded=True,
-                    fatal=True,
-                    discovery=discovery,
-                ))
+                return recorded(
+                    ClaudeVisibilityRunResult(
+                        enabled=True,
+                        status="degraded",
+                        job_id=claim.job_id,
+                        error_code="unknown_registrar_status",
+                        degraded=True,
+                        fatal=True,
+                        discovery=discovery,
+                    )
+                )
             if (
-                status == "retry"
-                and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
+                status == "retry" and error_code not in CLAUDE_VISIBILITY_RETRY_CODES
             ) or (
-                status == "failed"
-                and error_code not in CLAUDE_VISIBILITY_FATAL_CODES
+                status == "failed" and error_code not in CLAUDE_VISIBILITY_FATAL_CODES
             ):
-                return recorded(ClaudeVisibilityRunResult(
+                return recorded(
+                    ClaudeVisibilityRunResult(
+                        enabled=True,
+                        status="degraded",
+                        job_id=claim.job_id,
+                        error_code="unknown_registrar_error_code",
+                        degraded=True,
+                        fatal=True,
+                        discovery=discovery,
+                    )
+                )
+            return recorded(
+                ClaudeVisibilityRunResult(
+                    enabled=True,
+                    status=status,
+                    job_id=claim.job_id,
+                    error_code=error_code if isinstance(error_code, str) else None,
+                    degraded=status in {"retry", "failed"},
+                    fatal=status == "failed",
+                    discovery=discovery,
+                ),
+                registrar_result=True,
+            )
+        except Exception:
+            return recorded(
+                ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
                     job_id=claim.job_id,
-                    error_code="unknown_registrar_error_code",
+                    error_code="registrar_failed",
                     degraded=True,
-                    fatal=True,
                     discovery=discovery,
-                ))
-            return recorded(ClaudeVisibilityRunResult(
-                enabled=True,
-                status=status,
-                job_id=claim.job_id,
-                error_code=error_code if isinstance(error_code, str) else None,
-                degraded=status in {"retry", "failed"},
-                fatal=status == "failed",
-                discovery=discovery,
-            ), registrar_result=True)
-        except Exception:
-            return recorded(ClaudeVisibilityRunResult(
-                enabled=True, status="degraded", job_id=claim.job_id,
-                error_code="registrar_failed", degraded=True, discovery=discovery,
-            ))
+                )
+            )
 
 
 class ContinuationBlockedError(RuntimeError):
     """Visible fixed-code refusal before a continuation can create or hydrate."""
 
     def __init__(self, code: str, warning: str) -> None:
-        if code not in {"source_cwd_missing", "source_identity_mismatch", "permission_preflight_failed"}:
+        if code not in {
+            "source_cwd_missing",
+            "source_identity_mismatch",
+            "permission_preflight_failed",
+        }:
             raise ValueError("invalid continuation blocking code")
         self.code = code
         self.warnings = (warning,)
@@ -831,7 +901,9 @@ class SessionBridgeCoordinator:
         self._watcher_state = "not_started"
         self._watcher_error_code: str | None = None
         self._lifecycle_lock = asyncio.Lock()
-        self._scan_locks = {provider: asyncio.Lock() for provider in _EXTERNAL_PROVIDERS}
+        self._scan_locks = {
+            provider: asyncio.Lock() for provider in _EXTERNAL_PROVIDERS
+        }
         self._job_lock = asyncio.Lock()
         self._sidebar_registration_lock = asyncio.Lock()
         self._continuation_locks: dict[str, asyncio.Lock] = {}
@@ -859,9 +931,7 @@ class SessionBridgeCoordinator:
             Provider.HERMES.value: 0,
             "failed": 0,
             "excluded": 0,
-            "excluded_by_reason": {
-                reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
-            },
+            "excluded_by_reason": {reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS},
         }
 
     @asynccontextmanager
@@ -963,9 +1033,7 @@ class SessionBridgeCoordinator:
             duration_ms=sum(summary.duration_ms for summary in summaries),
         )
 
-    async def scan_all_history(
-        self, provider: Provider | None = None
-    ) -> ScanSummary:
+    async def scan_all_history(self, provider: Provider | None = None) -> ScanSummary:
         """Index one complete provider inventory without mirror side effects."""
 
         if not self._config.catalog.enabled:
@@ -1012,9 +1080,7 @@ class SessionBridgeCoordinator:
                 by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
                 failed=0,
                 excluded=0,
-                excluded_by_reason={
-                    reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
-                },
+                excluded_by_reason={reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS},
             )
             self._set_sidebar_registration_counts(summary)
             return summary
@@ -1050,9 +1116,7 @@ class SessionBridgeCoordinator:
                 by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
                 failed=0,
                 excluded=0,
-                excluded_by_reason={
-                    reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
-                },
+                excluded_by_reason={reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS},
             )
         async with self._sidebar_registration_lock:
             return await self._register_sidebar_jobs_locked(
@@ -1070,10 +1134,7 @@ class SessionBridgeCoordinator:
         now: float | None = None,
         limit: int = 5,
     ) -> tuple[SidebarDeliveryClaim, ...]:
-        if (
-            type(limit) is not int
-            or not 1 <= limit <= 5
-        ):
+        if type(limit) is not int or not 1 <= limit <= 5:
             raise ValueError("sidebar delivery limit must be between 1 and 5")
         claim_time = _finite_number(self._clock() if now is None else now, "now")
         verifier = self._sidebar_verifier
@@ -1112,9 +1173,7 @@ class SessionBridgeCoordinator:
 
         try:
             delivery: list[SidebarDeliveryClaim] = []
-            for raw_claim, lease_token in zip(
-                raw_claims, owned_tokens, strict=True
-            ):
+            for raw_claim, lease_token in zip(raw_claims, owned_tokens, strict=True):
                 assert isinstance(raw_claim, Mapping)
                 source_session_id = _exact_sidebar_claim_text(
                     raw_claim.get("source_session_id"), "source session ID"
@@ -1496,9 +1555,7 @@ class SessionBridgeCoordinator:
         queued = 0
         failed = 0
         excluded = 0
-        excluded_by_reason = {
-            reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
-        }
+        excluded_by_reason = {reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS}
         examined = 0
         seen: set[str] = set()
         durable_cursor = (
@@ -1521,9 +1578,7 @@ class SessionBridgeCoordinator:
             else _SIDEBAR_BACKFILL_EXAMINED_BUDGET
         )
         while (
-            queued < limit
-            and query_count < query_budget
-            and examined < examined_budget
+            queued < limit and query_count < query_budget and examined < examined_budget
         ):
             if persist_cursor and newest_probe:
                 page_size = min(
@@ -1659,9 +1714,7 @@ class SessionBridgeCoordinator:
                                 indexed_git_metadata
                                 and worktree_snapshot.git_root is None
                             ):
-                                raise WorktreeSnapshotError(
-                                    "source_identity_mismatch"
-                                )
+                                raise WorktreeSnapshotError("source_identity_mismatch")
                             candidate = replace(
                                 candidate,
                                 cwd=worktree_snapshot.cwd,
@@ -1716,9 +1769,10 @@ class SessionBridgeCoordinator:
                                 enqueue_method,
                                 candidate,
                             )
-                        if not isinstance(result, Mapping) or type(
-                            result.get("created")
-                        ) is not bool:
+                        if (
+                            not isinstance(result, Mapping)
+                            or type(result.get("created")) is not bool
+                        ):
                             raise ValueError("sidebar enqueue result is malformed")
                         if result["created"]:
                             queued += 1
@@ -1728,9 +1782,7 @@ class SessionBridgeCoordinator:
                 except Exception:
                     failed += 1
                     if apply:
-                        self._record_error_code(
-                            "sidebar_registration_candidate_failed"
-                        )
+                        self._record_error_code("sidebar_registration_candidate_failed")
                 if queued >= limit:
                     break
 
@@ -1934,9 +1986,7 @@ class SessionBridgeCoordinator:
         )
 
     async def _reconcile_continuations(self) -> ReconcileSummary:
-        if not callable(
-            getattr(self._store, "list_continuation_snapshots", None)
-        ):
+        if not callable(getattr(self._store, "list_continuation_snapshots", None)):
             return ReconcileSummary(examined=0, recovered=0, retried=0, failed=0)
         after_bridge_id = await self._load_continuation_reconcile_cursor()
         snapshots = await asyncio.to_thread(
@@ -2095,10 +2145,9 @@ class SessionBridgeCoordinator:
             fallback_authority = (
                 "automatic" if effective_policy.automatic_creation else "manual"
             )
-            limited_claim = (
-                job.get("claim_authority", fallback_authority) == "automatic"
-                or job.get("rollout_limited", False)
-            )
+            limited_claim = job.get(
+                "claim_authority", fallback_authority
+            ) == "automatic" or job.get("rollout_limited", False)
             limited_attempts += int(limited_claim)
             if outcome is MirrorJobState.SUCCEEDED:
                 succeeded += 1
@@ -2114,10 +2163,7 @@ class SessionBridgeCoordinator:
             retried=retried,
             manual_failure=manual_failure,
         )
-        if (
-            limited_attempts
-            and not uses_atomic_controls
-        ):
+        if limited_attempts and not uses_atomic_controls:
             await self._save_breaker_progress(
                 BatchProgress(
                     attempts=breaker.attempts + limited_attempts,
@@ -2236,9 +2282,7 @@ class SessionBridgeCoordinator:
         async with lock:
             return await self._continue_locked(request)
 
-    async def _refresh_continuation_source(
-        self, session_id: str
-    ) -> RefreshResult:
+    async def _refresh_continuation_source(self, session_id: str) -> RefreshResult:
         native_snapshot_method = getattr(
             self._store, "get_native_session_snapshot", None
         )
@@ -2268,9 +2312,7 @@ class SessionBridgeCoordinator:
         return await self.refresh_session(session_id, timeout=self._refresh_timeout)
 
     async def _continue_locked(self, request: ContinueRequest) -> ContinueResult:
-        exact_worktree, worktree_warnings = await self._continuation_worktree(
-            request
-        )
+        exact_worktree, worktree_warnings = await self._continuation_worktree(request)
         snapshot = await asyncio.to_thread(
             _call,
             self._store,
@@ -2356,9 +2398,7 @@ class SessionBridgeCoordinator:
                         stale=source.stale,
                         diverged=False,
                         exact_cwd=(
-                            exact_worktree.cwd
-                            if exact_worktree is not None
-                            else None
+                            exact_worktree.cwd if exact_worktree is not None else None
                         ),
                         worktree_warnings=worktree_warnings,
                     ),
@@ -2425,8 +2465,8 @@ class SessionBridgeCoordinator:
                 )
                 warnings = (*warnings, "linked_sessions_diverged")
         if exact_worktree is not None:
-            exact_worktree, final_worktree_warnings = (
-                await self._continuation_worktree(request)
+            exact_worktree, final_worktree_warnings = await self._continuation_worktree(
+                request
             )
             non_worktree_warnings = tuple(
                 warning for warning in warnings if warning not in worktree_warnings
@@ -2549,18 +2589,14 @@ class SessionBridgeCoordinator:
             "watcher_error_code": self._watcher_error_code,
             "queue_counts": queue_counts,
             "mirror_mode": (
-                "automatic"
-                if self._config.mirrors.automatic_creation
-                else "manual"
+                "automatic" if self._config.mirrors.automatic_creation else "manual"
             ),
             "backfill_progress": {
                 provider.value: dict(progress)
                 for provider, progress in self._backfill_progress.items()
             },
             "registration_turn_fallback": self._registration_turn_fallback,
-            "sidebar_registration_counts": dict(
-                self._sidebar_registration_counts
-            ),
+            "sidebar_registration_counts": dict(self._sidebar_registration_counts),
             "provider_calls_inflight": len(self._provider_tasks),
             "recent_error_codes": list(self._recent_error_codes),
         }
@@ -2696,9 +2732,8 @@ class SessionBridgeCoordinator:
         self._continuous_watermark = watermark
 
     async def _discovery_mode(self, provider: Provider) -> DiscoveryMode:
-        if (
-            not self._config.mirrors.automatic_creation
-            or not isinstance(self._store, SessionBridgeStore)
+        if not self._config.mirrors.automatic_creation or not isinstance(
+            self._store, SessionBridgeStore
         ):
             return DiscoveryMode.CONTINUOUS
         state = await asyncio.to_thread(
@@ -2708,11 +2743,7 @@ class SessionBridgeCoordinator:
             _BACKFILL_KEYS[provider],
         )
         completed, _ = _decode_backfill_state(state)
-        return (
-            DiscoveryMode.CONTINUOUS
-            if completed
-            else DiscoveryMode.INITIAL_BACKFILL
-        )
+        return DiscoveryMode.CONTINUOUS if completed else DiscoveryMode.INITIAL_BACKFILL
 
     async def _load_backfill_processed(
         self,
@@ -2736,10 +2767,7 @@ class SessionBridgeCoordinator:
         discovery_mode: DiscoveryMode,
         native_ids: Sequence[str],
     ) -> None:
-        if (
-            discovery_mode is not DiscoveryMode.INITIAL_BACKFILL
-            or not native_ids
-        ):
+        if discovery_mode is not DiscoveryMode.INITIAL_BACKFILL or not native_ids:
             return
         processed = await self._load_backfill_processed(provider, discovery_mode)
         processed.update(native_ids)
@@ -3436,9 +3464,7 @@ class SessionBridgeCoordinator:
         committed_fingerprints = await self._load_claude_fingerprints(
             _CLAUDE_FINGERPRINT_KEY
         )
-        staged_fingerprints = await self._load_claude_fingerprints(
-            _CLAUDE_STAGED_KEY
-        )
+        staged_fingerprints = await self._load_claude_fingerprints(_CLAUDE_STAGED_KEY)
         backfill_processed = await self._load_backfill_processed(
             provider,
             discovery_mode,
@@ -3463,12 +3489,9 @@ class SessionBridgeCoordinator:
                 continue
             paths_by_native_id[native_id] = path
             current_fingerprints[native_id] = fingerprint
-            if (
-                committed_fingerprints.get(native_id) != fingerprint
-                or (
-                    discovery_mode is DiscoveryMode.INITIAL_BACKFILL
-                    and native_id not in backfill_processed
-                )
+            if committed_fingerprints.get(native_id) != fingerprint or (
+                discovery_mode is DiscoveryMode.INITIAL_BACKFILL
+                and native_id not in backfill_processed
             ):
                 changed_ids.append(native_id)
 
@@ -3477,8 +3500,7 @@ class SessionBridgeCoordinator:
             native_id
             for native_id in changed_ids
             if native_id not in pending_set
-            or staged_fingerprints.get(native_id)
-            != current_fingerprints.get(native_id)
+            or staged_fingerprints.get(native_id) != current_fingerprints.get(native_id)
         ]
         staged_ids = _merge_native_ids(promoted_ids, pending_ids)
         await self._save_pending(provider, staged_ids)
@@ -3492,9 +3514,7 @@ class SessionBridgeCoordinator:
             },
         )
         selected_ids = [
-            native_id
-            for native_id in staged_ids
-            if native_id not in unavailable_ids
+            native_id for native_id in staged_ids if native_id not in unavailable_ids
         ][: self._scan_batch_size]
         indexed = 0
         rebuilt = 0
@@ -4044,7 +4064,10 @@ def _safe_target_error_code(provider: Provider, code: object) -> str:
         isinstance(code, str)
         and 0 < len(code) <= 64
         and "a" <= code[0] <= "z"
-        and all(character.islower() or character.isdigit() or character == "_" for character in code)
+        and all(
+            character.islower() or character.isdigit() or character == "_"
+            for character in code
+        )
     ):
         return code
     return f"{provider.value}_target_failed"
@@ -4054,12 +4077,9 @@ def _healthy_breaker_batch_completed(
     progress: BatchProgress,
     policy: MirrorPolicy,
 ) -> bool:
-    return (
-        progress.attempts >= policy.stop_after_attempts
-        and (
-            progress.errors == 0
-            or progress.errors / progress.attempts < policy.stop_error_rate
-        )
+    return progress.attempts >= policy.stop_after_attempts and (
+        progress.errors == 0
+        or progress.errors / progress.attempts < policy.stop_error_rate
     )
 
 
@@ -4310,10 +4330,7 @@ def _decode_native_id_set_state(state: object, *, label: str) -> list[str]:
     if not isinstance(state, Mapping):
         raise RuntimeError(f"invalid {label} state")
     typed_state = cast("dict[str, Any]", dict(state))
-    if (
-        set(typed_state) != {"version", "native_ids"}
-        or typed_state.get("version") != 1
-    ):
+    if set(typed_state) != {"version", "native_ids"} or typed_state.get("version") != 1:
         raise RuntimeError(f"invalid {label} state")
     native_ids = typed_state.get("native_ids")
     if not isinstance(native_ids, list):
@@ -4681,11 +4698,7 @@ def _validated_process_job_ids(
         raise ValueError("job_ids must contain at most 1000 IDs")
     normalized: list[str] = []
     for job_id in job_ids:
-        if (
-            not isinstance(job_id, str)
-            or not job_id
-            or job_id != job_id.strip()
-        ):
+        if not isinstance(job_id, str) or not job_id or job_id != job_id.strip():
             raise ValueError("job_ids must contain exact nonempty IDs")
         normalized.append(job_id)
     if len(set(normalized)) != len(normalized):

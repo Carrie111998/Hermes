@@ -1355,9 +1355,7 @@ def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
     )
     delay = retry_delay_seconds(job["idempotency_key"], 1)
     current_time[0] = NOW + delay
-    second_claim = store.claim_due_jobs(
-        now=current_time[0], limit=1, policy=policy
-    )[0]
+    second_claim = store.claim_due_jobs(now=current_time[0], limit=1, policy=policy)[0]
     final_state = record_mirror_failure(
         store,
         second_claim,

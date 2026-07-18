@@ -61,7 +61,9 @@ def _projection(
         native_cursor=cursor or f"cursor:{native_id}",
         native_hash=source_hash or f"hash:{native_id}",
         origin_kind=(
-            OriginKind.BRIDGE_PLACEHOLDER if bridge_id is not None else OriginKind.NATIVE
+            OriginKind.BRIDGE_PLACEHOLDER
+            if bridge_id is not None
+            else OriginKind.NATIVE
         ),
         origin_bridge_id=bridge_id,
     )
@@ -207,7 +209,9 @@ async def test_initial_backfill_is_durable_before_continuous_mode(
 
 
 @pytest.mark.asyncio
-async def test_codex_new_inventory_id_is_promoted_once_ahead_of_pending_backlog() -> None:
+async def test_codex_new_inventory_id_is_promoted_once_ahead_of_pending_backlog() -> (
+    None
+):
     store = _StateStore()
     store.states["session-bridge:scan:codex:pending"] = {
         "version": 1,
@@ -588,7 +592,9 @@ async def test_continuation_reconcile_cursor_reaches_second_page(
             after_bridge_id: str | None = None,
         ):
             self.after_calls.append(after_bridge_id)
-            start = 0 if after_bridge_id is None else int(after_bridge_id.split(":")[1]) + 1
+            start = (
+                0 if after_bridge_id is None else int(after_bridge_id.split(":")[1]) + 1
+            )
             return [
                 {
                     "version": 1,
@@ -664,9 +670,7 @@ async def test_background_scan_failure_is_reported_and_next_cycle_runs(
     await coordinator.start()
     try:
         await asyncio.wait_for(recovered.wait(), timeout=1.0)
-        assert "catalog_scan_loop_failed" in coordinator.health()[
-            "recent_error_codes"
-        ]
+        assert "catalog_scan_loop_failed" in coordinator.health()["recent_error_codes"]
     finally:
         await coordinator.stop()
 
@@ -690,9 +694,7 @@ def test_sidebar_rename_failure_reconciles_without_duplicate_create(
             harness.advance_retry()
             recovered = harness.run_worker_once(client)
 
-        assert failed == [
-            {"state": "sidebar_retry", "error_code": "rename_failed"}
-        ]
+        assert failed == [{"state": "sidebar_retry", "error_code": "rename_failed"}]
         assert retry_job is not None
         assert retry_job["state"] == "sidebar_retry"
         assert recovered == [

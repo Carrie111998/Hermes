@@ -42,7 +42,11 @@ from session_bridge.models import (
     SidebarJobState,
     decode_bridge_marker,
 )
-from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
+from session_bridge.sidebar import (
+    SidebarCandidate,
+    VerifiedSidebarThread,
+    sidebar_bridge_id,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -517,9 +521,7 @@ def test_catalog_browse_enriches_native_and_external_sessions(db: SessionDB) -> 
             ("C:/repo/local", 100.0, "hermes-one"),
         )
     )
-    db.append_message(
-        "hermes-one", "user", "local session", timestamp=110.0
-    )
+    db.append_message("hermes-one", "user", "local session", timestamp=110.0)
 
     result = UnifiedCatalog(db, store).search(limit=10)
 
@@ -747,18 +749,22 @@ def test_tools_list_exposes_exactly_the_ten_approved_tools(db: SessionDB) -> Non
         response = _rpc(client, "tools/list")
 
     names = {tool["name"] for tool in response["result"]["tools"]}
-    assert names == EXPECTED_TOOLS == {
-        "session_search",
-        "session_get",
-        "session_continue",
-        "session_mirror",
-        "session_status",
-        "session_claude_visibility_status",
-        "session_sidebar_pending",
-        "session_sidebar_bind",
-        "session_sidebar_commit",
-        "session_sidebar_fail",
-    }
+    assert (
+        names
+        == EXPECTED_TOOLS
+        == {
+            "session_search",
+            "session_get",
+            "session_continue",
+            "session_mirror",
+            "session_status",
+            "session_claude_visibility_status",
+            "session_sidebar_pending",
+            "session_sidebar_bind",
+            "session_sidebar_commit",
+            "session_sidebar_fail",
+        }
+    )
 
 
 def test_all_eight_tools_are_callable_and_search_filters_are_forwarded(
@@ -806,9 +812,7 @@ def test_all_eight_tools_are_callable_and_search_filters_are_forwarded(
     assert fetched["window"] == 200
     assert continued["pack_id"] == "pack-stable"
     assert continued["payload"] == "immutable context payload"
-    assert continued["warnings"] == [
-        "source_refresh_timeout_using_catalog_snapshot"
-    ]
+    assert continued["warnings"] == ["source_refresh_timeout_using_catalog_snapshot"]
     assert coordinator.continue_requests[0].context_budget_chars == 100_000
     assert mirrored["dry_run"] is True
     assert mirrored["would_enqueue"] is False
@@ -935,7 +939,11 @@ def test_session_sidebar_pending_never_reads_transcript_after_enqueue(
             "INSERT INTO messages (session_id, role, content, timestamp, active) "
             "VALUES (?, 'user', ?, ?, 1)",
             [
-                (candidate.source_session_id, f"private transcript {index}", 901.0 + index)
+                (
+                    candidate.source_session_id,
+                    f"private transcript {index}",
+                    901.0 + index,
+                )
                 for index in range(600)
             ],
         )
@@ -1068,9 +1076,7 @@ def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_cla
         response = _call_tool(client, "session_sidebar_pending", {"limit": 5})
 
     good_claim = claims[1 - failed_index]
-    assert [job["lease_token"] for job in response["jobs"]] == [
-        good_claim.lease_token
-    ]
+    assert [job["lease_token"] for job in response["jobs"]] == [good_claim.lease_token]
     failed = store.get_sidebar_job_for_source(failed_source)
     assert failed is not None
     assert failed["state"] == "sidebar_failed"
@@ -1280,10 +1286,14 @@ def test_session_sidebar_commit_has_two_argument_schema_and_is_idempotent(
 
     assert set(schema["properties"]) == {"lease_token", "codex_thread_id"}
     assert set(first) == {"state", "codex_thread_id"}
-    assert replay == first == {
-        "state": "sidebar_visible",
-        "codex_thread_id": thread_id,
-    }
+    assert (
+        replay
+        == first
+        == {
+            "state": "sidebar_visible",
+            "codex_thread_id": thread_id,
+        }
+    )
     assert coordinator.sidebar_commits == [
         ("plaintext-opaque-lease", thread_id),
         ("plaintext-opaque-lease", thread_id),
@@ -1326,10 +1336,14 @@ def test_session_sidebar_bind_has_two_argument_schema_and_is_idempotent(
         )
 
     assert set(schema["properties"]) == {"lease_token", "codex_thread_id"}
-    assert replay == first == {
-        "state": "sidebar_leased",
-        "codex_thread_id": thread_id,
-    }
+    assert (
+        replay
+        == first
+        == {
+            "state": "sidebar_leased",
+            "codex_thread_id": thread_id,
+        }
+    )
     assert coordinator.sidebar_binds == [
         ("plaintext-opaque-lease", thread_id),
         ("plaintext-opaque-lease", thread_id),
@@ -1468,8 +1482,9 @@ def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract
     )
 
 
-def test_claude_visibility_status_rejects_coercible_counts_and_shapes_heartbeats(
-) -> None:
+def test_claude_visibility_status_rejects_coercible_counts_and_shapes_heartbeats() -> (
+    None
+):
     config = ClaudeVisibilityConfig(
         enabled=True,
         continuous=True,
@@ -1721,7 +1736,9 @@ def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(
 ) -> None:
     class Hostile:
         def __str__(self) -> str:
-            raise AssertionError("status sanitizer must never stringify unknown objects")
+            raise AssertionError(
+                "status sanitizer must never stringify unknown objects"
+            )
 
     store, candidate = _seed_sidebar_source(db)
     coordinator = _FakeCoordinator(
@@ -2003,10 +2020,14 @@ def test_session_continue_is_idempotent_for_identical_snapshot_and_budget(
         "warnings",
         "exact_cwd",
     }
-    assert all(request.bridge_id == bridge_id for request in coordinator.continue_requests)
+    assert all(
+        request.bridge_id == bridge_id for request in coordinator.continue_requests
+    )
 
 
-@pytest.mark.parametrize("exact_cwd", [object(), "relative/source", "C:/source/../other"])
+@pytest.mark.parametrize(
+    "exact_cwd", [object(), "relative/source", "C:/source/../other"]
+)
 def test_session_continue_rejects_noncanonical_fake_exact_cwd(
     db: SessionDB,
     exact_cwd: object,
@@ -2115,9 +2136,7 @@ def test_session_mirror_dry_run_is_side_effect_free_and_manual_enqueue_is_durabl
     assert queued["state"] == "queued"
     assert queued["authority"] == "manual"
     assert store.mirror_job_counts()["queued"] == 1
-    authority = store.get_state(
-        f"session-bridge:mirror-authority:{queued['job_id']}"
-    )
+    authority = store.get_state(f"session-bridge:mirror-authority:{queued['job_id']}")
     assert authority is not None
     assert authority["require_unmapped"] is True
 
@@ -2169,7 +2188,9 @@ def test_marker_key_uses_a_bounded_descriptor_read(
     _restrict_secret_file(marker_key_file)
 
     def forbid_path_reopen(_path: Path) -> bytes:
-        raise AssertionError("marker key must be consumed from its validated descriptor")
+        raise AssertionError(
+            "marker key must be consumed from its validated descriptor"
+        )
 
     monkeypatch.setattr(Path, "read_bytes", forbid_path_reopen)
 

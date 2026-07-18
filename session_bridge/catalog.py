@@ -20,10 +20,19 @@ _HIDDEN_SOURCES = ("subagent", "tool", "session_bridge_profile")
 _MESSAGE_COLUMNS = (
     "id, session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp"
 )
-_PROVIDERS = frozenset({Provider.HERMES.value, Provider.CLAUDE.value, Provider.CODEX.value})
-_MIRROR_STATES = frozenset(
-    {"catalog_only", "queued", "failed", "mirrored", "continued", "diverged"}
-)
+_PROVIDERS = frozenset({
+    Provider.HERMES.value,
+    Provider.CLAUDE.value,
+    Provider.CODEX.value,
+})
+_MIRROR_STATES = frozenset({
+    "catalog_only",
+    "queued",
+    "failed",
+    "mirrored",
+    "continued",
+    "diverged",
+})
 
 _LAST_ACTIVE_SQL = """COALESCE(
     (SELECT MAX(activity.timestamp)
@@ -135,7 +144,9 @@ class UnifiedCatalog:
         before: float | None = None,
         after: float | None = None,
     ) -> dict[str, Any]:
-        normalized_window = _clamp_int(window, default=5, minimum=1, maximum=_MAX_WINDOW)
+        normalized_window = _clamp_int(
+            window, default=5, minimum=1, maximum=_MAX_WINDOW
+        )
         normalized_limit = _clamp_int(limit, default=10, minimum=1, maximum=_MAX_LIMIT)
         normalized_session_id = _optional_text(session_id, "session ID", maximum=512)
         normalized_query = _text(query, "query", maximum=4_000, allow_empty=True)
@@ -193,26 +204,36 @@ class UnifiedCatalog:
             for profile, database, owned in databases:
                 if owned and not self.store._profile_catalog_compatible(database):
                     continue
-                catalog = self if not owned else UnifiedCatalog(
-                    database,
-                    SessionBridgeStore(
+                catalog = (
+                    self
+                    if not owned
+                    else UnifiedCatalog(
                         database,
-                        hermes_profile_db_paths=lambda: (),
-                    ),
+                        SessionBridgeStore(
+                            database,
+                            hermes_profile_db_paths=lambda: (),
+                        ),
+                    )
                 )
                 try:
-                    result = (
-                        catalog._scroll(
+                    if mode == "scroll":
+                        if around_message_id is None:
+                            raise ValueError(
+                                "scroll mode requires an around-message ID"
+                            )
+                        result = catalog._scroll(
                             session_id,
                             around_message_id,
                             window=window,
                         )
-                        if mode == "scroll"
-                        else catalog._read(session_id, window=window)
-                    )
+                    else:
+                        result = catalog._read(session_id, window=window)
                 except KeyError:
                     continue
-                if not owned and result["session"].get("source") == "session_bridge_profile":
+                if (
+                    not owned
+                    and result["session"].get("source") == "session_bridge_profile"
+                ):
                     continue
                 if owned:
                     result["session"]["profile"] = profile
@@ -321,7 +342,7 @@ class UnifiedCatalog:
                         ON source.session_id = link.from_session_id
                       JOIN external_sessions AS target
                         ON target.session_id = link.to_session_id
-                     WHERE {' AND '.join(where)}
+                     WHERE {" AND ".join(where)}
                      ORDER BY CASE link.relation
                                   WHEN '{Relation.CONTINUES.value}' THEN 0 ELSE 1 END,
                               link.created_at DESC, link.id""",
@@ -402,16 +423,16 @@ class UnifiedCatalog:
             ).fetchone()
 
         if source["origin_kind"] != OriginKind.NATIVE.value:
-            return _mirror_plan(
-                normalized_session_id, target, False, "bridge_origin"
-            )
+            return _mirror_plan(normalized_session_id, target, False, "bridge_origin")
         if mapping is not None:
-            return _mirror_plan(
-                normalized_session_id, target, False, "already_mapped"
-            )
+            return _mirror_plan(normalized_session_id, target, False, "already_mapped")
         if job is not None:
             state = str(job["state"])
-            reason = "failed" if state == MirrorJobState.MANUAL_FAILURE.value else "already_queued"
+            reason = (
+                "failed"
+                if state == MirrorJobState.MANUAL_FAILURE.value
+                else "already_queued"
+            )
             return _mirror_plan(normalized_session_id, target, False, reason)
         return _mirror_plan(normalized_session_id, target, True, "eligible")
 
@@ -436,7 +457,10 @@ class UnifiedCatalog:
             }
             for row in rows
         }
-        return {"providers": providers, "total_sessions": sum(v["sessions"] for v in providers.values())}
+        return {
+            "providers": providers,
+            "total_sessions": sum(v["sessions"] for v in providers.values()),
+        }
 
     def _browse(self, *, limit: int, filters: _Filters) -> dict[str, Any]:
         where, params = filters.sql()
@@ -476,13 +500,11 @@ class UnifiedCatalog:
                 "limit": limit,
             }
         where, params = filters.sql()
-        where.extend(
-            [
-                "messages_fts MATCH ?",
-                "(m.active = 1 OR m.compacted = 1)",
-                "m.role IN ('user', 'assistant')",
-            ]
-        )
+        where.extend([
+            "messages_fts MATCH ?",
+            "(m.active = 1 OR m.compacted = 1)",
+            "m.role IN ('user', 'assistant')",
+        ])
         params.append(sanitized_query)
         where.extend("s.source != ?" for _ in _HIDDEN_SOURCES)
         params.extend(_HIDDEN_SOURCES)
@@ -497,7 +519,7 @@ class UnifiedCatalog:
                       JOIN messages AS m ON m.id = messages_fts.rowid
                       JOIN sessions AS s ON s.id = m.session_id
                       LEFT JOIN external_sessions AS e ON e.session_id = s.id
-                     WHERE {' AND '.join(where)}
+                     WHERE {" AND ".join(where)}
                      GROUP BY s.id
                      ORDER BY match_rank,
                               CASE WHEN s.source = 'cron' THEN 1 ELSE 0 END,
@@ -512,30 +534,30 @@ class UnifiedCatalog:
                 result["session_id"], match_id, window=window, bookend=3
             )
             anchor = next(
-                (message for message in view.get("window", []) if message["id"] == match_id),
+                (
+                    message
+                    for message in view.get("window", [])
+                    if message["id"] == match_id
+                ),
                 None,
             )
-            result.update(
-                {
-                    "matched_role": anchor.get("role") if anchor else None,
-                    "match_message_id": match_id,
-                    "snippet": _snippet(anchor.get("content") if anchor else ""),
-                    "bookend_start": [
-                        _shape_message(message)
-                        for message in view.get("bookend_start", [])
-                    ],
-                    "messages": [
-                        _shape_message(message, anchor_id=match_id)
-                        for message in view.get("window", [])
-                    ],
-                    "bookend_end": [
-                        _shape_message(message)
-                        for message in view.get("bookend_end", [])
-                    ],
-                    "messages_before": view.get("messages_before", 0),
-                    "messages_after": view.get("messages_after", 0),
-                }
-            )
+            result.update({
+                "matched_role": anchor.get("role") if anchor else None,
+                "match_message_id": match_id,
+                "snippet": _snippet(anchor.get("content") if anchor else ""),
+                "bookend_start": [
+                    _shape_message(message) for message in view.get("bookend_start", [])
+                ],
+                "messages": [
+                    _shape_message(message, anchor_id=match_id)
+                    for message in view.get("window", [])
+                ],
+                "bookend_end": [
+                    _shape_message(message) for message in view.get("bookend_end", [])
+                ],
+                "messages_before": view.get("messages_before", 0),
+                "messages_after": view.get("messages_after", 0),
+            })
         return {
             "success": True,
             "mode": "discover",
@@ -573,7 +595,9 @@ class UnifiedCatalog:
         *,
         window: int,
     ) -> dict[str, Any]:
-        if not isinstance(around_message_id, int) or isinstance(around_message_id, bool):
+        if not isinstance(around_message_id, int) or isinstance(
+            around_message_id, bool
+        ):
             raise ValueError("around_message_id must be an integer")
         row = self._session_row(session_id)
         if row is None:
@@ -819,7 +843,9 @@ class UnifiedCatalog:
                 "origin_bridge_id": row["origin_bridge_id"],
                 "mirror_state": row["mirror_state"],
                 "links": session_links,
-                "diverged": any(link["diverged_at"] is not None for link in session_links),
+                "diverged": any(
+                    link["diverged_at"] is not None for link in session_links
+                ),
                 "sync_health": (
                     "local"
                     if provider == Provider.HERMES.value
@@ -850,12 +876,17 @@ class UnifiedCatalog:
                 [*session_ids, *session_ids],
             ).fetchall()
         known = set(session_ids)
-        links: dict[str, list[dict[str, Any]]] = {session_id: [] for session_id in session_ids}
+        links: dict[str, list[dict[str, Any]]] = {
+            session_id: [] for session_id in session_ids
+        }
         for row in rows:
             summary = dict(row)
             if row["from_session_id"] in known:
                 links[row["from_session_id"]].append(summary)
-            if row["to_session_id"] in known and row["to_session_id"] != row["from_session_id"]:
+            if (
+                row["to_session_id"] in known
+                and row["to_session_id"] != row["from_session_id"]
+            ):
                 links[row["to_session_id"]].append(summary)
         return links
 
@@ -927,7 +958,9 @@ class _Filters:
         normalized_relation = None
         if relation is not None:
             try:
-                normalized_relation = Relation(_text(relation, "relation", maximum=32)).value
+                normalized_relation = Relation(
+                    _text(relation, "relation", maximum=32)
+                ).value
             except ValueError as exc:
                 raise ValueError(f"unknown relation: {relation!r}") from exc
         normalized_cwd = _optional_text(cwd, "cwd", maximum=32_768)

@@ -115,11 +115,7 @@ def _read_restricted_marker_key(path: Path) -> bytes:
             raise PermissionError(
                 "session bridge marker key file must be a non-redirect regular file"
             )
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags)
         opened = os.fstat(descriptor)
         if not _same_secret_file(before, opened):
@@ -190,11 +186,7 @@ def create_app(
         raise ValueError("catalog and MCP service must share one bridge store")
     if not _is_loopback_host(config.service.host):
         raise ValueError("session bridge MCP must bind to a loopback host")
-    bearer_token = (
-        resolve_bearer_token()
-        if token is None
-        else _validated_token(token)
-    )
+    bearer_token = resolve_bearer_token() if token is None else _validated_token(token)
     if marker_key is not None and (
         not isinstance(marker_key, bytes) or len(marker_key) < _MIN_MARKER_KEY_BYTES
     ):
@@ -787,9 +779,7 @@ def _nonnegative_int(value: Any, degraded: set[str]) -> int:
     return selected
 
 
-def _tracked_result_value(
-    value: Any, *, include_empty: bool
-) -> dict[str, Any] | None:
+def _tracked_result_value(value: Any, *, include_empty: bool) -> dict[str, Any] | None:
     expected = {"at", "sequence", "status", "error_code"}
     if include_empty:
         expected.add("empty_verified")
@@ -807,10 +797,7 @@ def _tracked_result_value(
         or not _FIXED_CODE.fullmatch(status)
         or (
             error_code is not None
-            and (
-                type(error_code) is not str
-                or not _FIXED_CODE.fullmatch(error_code)
-            )
+            and (type(error_code) is not str or not _FIXED_CODE.fullmatch(error_code))
         )
     ):
         return None
@@ -920,7 +907,9 @@ $rules = @($acl.GetAccessRules(
             timeout=_WINDOWS_ACL_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise PermissionError("session bridge token file ACL could not be verified") from exc
+        raise PermissionError(
+            "session bridge token file ACL could not be verified"
+        ) from exc
     try:
         snapshot = json.loads(result.stdout)
         _validate_windows_token_acl(
@@ -929,7 +918,9 @@ $rules = @($acl.GetAccessRules(
             rules=snapshot["rules"],
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise PermissionError("session bridge token file ACL could not be verified") from exc
+        raise PermissionError(
+            "session bridge token file ACL could not be verified"
+        ) from exc
 
 
 def _secret_metadata_is_redirect(info: os.stat_result) -> bool:
@@ -958,7 +949,10 @@ def _validate_windows_token_acl(
     if not isinstance(current_sid, str) or not current_sid.strip():
         raise PermissionError("session bridge token file ACL has no current user")
     normalized_current = current_sid.strip().casefold()
-    if not isinstance(owner_sid, str) or owner_sid.strip().casefold() != normalized_current:
+    if (
+        not isinstance(owner_sid, str)
+        or owner_sid.strip().casefold() != normalized_current
+    ):
         raise PermissionError("session bridge token file has the wrong owner")
     if not isinstance(rules, list):
         raise PermissionError("session bridge token file ACL is invalid")
@@ -1125,12 +1119,8 @@ def _catalog_status(value: object) -> dict[str, Any]:
                 continue
             raw_provider = cast(Mapping[str, Any], raw_provider)
             shaped_providers[provider] = {
-                "sessions": _nonnegative_status_int(
-                    raw_provider.get("sessions"), 0
-                ),
-                "degraded": _nonnegative_status_int(
-                    raw_provider.get("degraded"), 0
-                ),
+                "sessions": _nonnegative_status_int(raw_provider.get("sessions"), 0),
+                "degraded": _nonnegative_status_int(raw_provider.get("degraded"), 0),
             }
     return {
         "providers": shaped_providers,
@@ -1147,9 +1137,7 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     latencies = source.get("delivery_latency_seconds")
     latency_values = _status_mapping(latencies)
     task_id = source.get("last_visible_task_id")
-    if type(task_id) is not str or re.fullmatch(
-        r"task:[0-9a-f]{16}", task_id
-    ) is None:
+    if type(task_id) is not str or re.fullmatch(r"task:[0-9a-f]{16}", task_id) is None:
         task_id = None
     recent = source.get("recent_error_codes")
     return {
@@ -1167,9 +1155,7 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         "last_heartbeat_at": _finite_status_number(source.get("last_heartbeat_at")),
         "last_visible_task_id": task_id,
         "recent_error_codes": (
-            _fixed_status_codes(recent)
-            if isinstance(recent, (list, tuple))
-            else []
+            _fixed_status_codes(recent) if isinstance(recent, (list, tuple)) else []
         ),
         "delivery_latency_seconds": {
             percentile: _finite_status_number(latency_values.get(percentile))
@@ -1263,9 +1249,7 @@ def _build_sidebar_broker_job(
     source_session_id = _exact_sidebar_text(
         getattr(claim, "source_session_id", None), "source session ID"
     )
-    bridge_id = _exact_sidebar_text(
-        getattr(claim, "bridge_id", None), "bridge ID"
-    )
+    bridge_id = _exact_sidebar_text(getattr(claim, "bridge_id", None), "bridge ID")
     reconcile_required = getattr(claim, "reconcile_required", None)
     rename_required = getattr(claim, "rename_required", None)
     if type(reconcile_required) is not bool or type(rename_required) is not bool:
@@ -1298,7 +1282,10 @@ def _build_sidebar_broker_job(
             or getattr(recovered, "bridge_id", None) != bridge_id
         ):
             raise ValueError("recovered sidebar identity is malformed")
-        if recovered_thread_id is not None and recovered_thread_id != verified_thread_id:
+        if (
+            recovered_thread_id is not None
+            and recovered_thread_id != verified_thread_id
+        ):
             raise ValueError("recovered sidebar thread identity is malformed")
         recovered_thread_id = verified_thread_id
     return {

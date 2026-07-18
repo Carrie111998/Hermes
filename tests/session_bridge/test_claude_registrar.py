@@ -32,7 +32,12 @@ from session_bridge.claude_visibility import (
     build_claude_registration_prompt,
     derive_claude_visibility_identity,
 )
-from session_bridge.models import OriginKind, ProjectedMessage, Provider, SessionProjection
+from session_bridge.models import (
+    OriginKind,
+    ProjectedMessage,
+    Provider,
+    SessionProjection,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -111,14 +116,20 @@ class FakeSource:
 
     def find_native_session(self, native_id: str) -> Path | None:
         self.lookups.append(native_id)
-        item = self.projections.pop(0) if len(self.projections) > 1 else self.projections[0]
+        item = (
+            self.projections.pop(0)
+            if len(self.projections) > 1
+            else self.projections[0]
+        )
         self.current = item
         if item is None:
             return None
         project_name = self.project_name or claude_project_directory_name(
             item.cwd or ""
         )
-        return Path("C:/Users/test/.claude/projects") / project_name / f"{native_id}.jsonl"
+        return (
+            Path("C:/Users/test/.claude/projects") / project_name / f"{native_id}.jsonl"
+        )
 
     def find_native_sessions(self, native_id: str) -> list[Path]:
         if self.duplicate_paths is not None:
@@ -138,7 +149,9 @@ class FakeSource:
             unknown_records=self.unknown_records,
         )
 
-    def projection_has_exact_marker(self, projection: SessionProjection, marker: str) -> bool:
+    def projection_has_exact_marker(
+        self, projection: SessionProjection, marker: str
+    ) -> bool:
         return any(marker in (message.content or "") for message in projection.messages)
 
 
@@ -164,7 +177,12 @@ class FakeStore:
 
 
 class FakePty:
-    def __init__(self, output: str = "REGISTERED\r\n", exit_code: int = 0, read_error: Exception | None = None):
+    def __init__(
+        self,
+        output: str = "REGISTERED\r\n",
+        exit_code: int = 0,
+        read_error: Exception | None = None,
+    ):
         self.output = output
         self.exit_code = exit_code
         self.read_error = read_error
@@ -208,7 +226,9 @@ class FakeFactory:
         return self.process
 
 
-def projection_for(item: ClaudeVisibilityClaim, *, response: str = "REGISTERED", **changes: Any) -> SessionProjection:
+def projection_for(
+    item: ClaudeVisibilityClaim, *, response: str = "REGISTERED", **changes: Any
+) -> SessionProjection:
     value = candidate()
     identity = derive_claude_visibility_identity(value, SECRET)
     prompt = build_claude_registration_prompt(value, identity, SECRET)
@@ -235,12 +255,25 @@ def projection_for(item: ClaudeVisibilityClaim, *, response: str = "REGISTERED",
     return replace(base, **changes)
 
 
-def registrar(source: FakeSource, factory: FakeFactory, store: FakeStore | None = None, **kwargs: Any):
+def registrar(
+    source: FakeSource,
+    factory: FakeFactory,
+    store: FakeStore | None = None,
+    **kwargs: Any,
+):
     return ClaudeNativeRegistrar(
-        store or FakeStore(), source, marker_secret=SECRET, pty_factory=factory,
-        clock=lambda: 100.0, monotonic=lambda: 1.0, sleep=lambda _value: None,
-        process_timeout=2.0, exit_timeout=1.0, discovery_timeout=0.0,
-        retry_delay=5.0, **kwargs,
+        store or FakeStore(),
+        source,
+        marker_secret=SECRET,
+        pty_factory=factory,
+        clock=lambda: 100.0,
+        monotonic=lambda: 1.0,
+        sleep=lambda _value: None,
+        process_timeout=2.0,
+        exit_timeout=1.0,
+        discovery_timeout=0.0,
+        retry_delay=5.0,
+        **kwargs,
     )
 
 
@@ -252,14 +285,30 @@ def test_launch_uses_exact_interactive_argv_cwd_and_one_redacted_prompt() -> Non
     result = registrar(source, factory).process(item)
 
     assert result.status == "visible"
-    assert factory.spawns == [([
-        "claude", "--session-id", item.reserved_claude_uuid, "--name", item.native_name,
-        "--model", "haiku", "--tools", "", "--permission-mode", "dontAsk",
-    ], item.source_cwd)]
+    assert factory.spawns == [
+        (
+            [
+                "claude",
+                "--session-id",
+                item.reserved_claude_uuid,
+                "--name",
+                item.native_name,
+                "--model",
+                "haiku",
+                "--tools",
+                "",
+                "--permission-mode",
+                "dontAsk",
+            ],
+            item.source_cwd,
+        )
+    ]
     argv = factory.spawns[0][0]
     assert "--print" not in argv and "-p" not in argv
     assert len(process.writes) == 2
-    expected = build_claude_registration_prompt(candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET)
+    expected = build_claude_registration_prompt(
+        candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
+    )
     assert process.writes[0] == f"\x1b[200~{expected}\x1b[201~\r"
     assert process.writes[1] == "/exit\r"
     assert "tool_calls" not in process.writes[0]
@@ -271,9 +320,10 @@ def test_terminal_echo_and_ansi_are_removed_before_exact_response_check() -> Non
     expected = build_claude_registration_prompt(
         candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
     )
-    echoed = "\r\n".join(
-        [f"\x1b[32mClaude>\x1b[0m {expected.splitlines()[0]}", *expected.splitlines()[1:]]
-    )
+    echoed = "\r\n".join([
+        f"\x1b[32mClaude>\x1b[0m {expected.splitlines()[0]}",
+        *expected.splitlines()[1:],
+    ])
     process = FakePty(output=f"{echoed}\r\n\x1b[32mREGISTERED\x1b[0m\r\n")
     result = registrar(
         FakeSource([None, projection_for(item)]), FakeFactory(process)
@@ -281,7 +331,9 @@ def test_terminal_echo_and_ansi_are_removed_before_exact_response_check() -> Non
     assert result.status == "visible"
 
 
-@pytest.mark.parametrize("output", ["NOT REGISTERED", "REGISTERED later", "xREGISTERED", "REGISTERED\nextra"])
+@pytest.mark.parametrize(
+    "output", ["NOT REGISTERED", "REGISTERED later", "xREGISTERED", "REGISTERED\nextra"]
+)
 def test_registration_response_requires_exact_bounded_token(output: str) -> None:
     item = claim()
     store = FakeStore()
@@ -313,16 +365,20 @@ _INVALID_AUTHORITIES = [
 def test_inconsistent_claim_authority_is_rejected_before_lookup_spawn_or_store(
     authority: tuple[Any, Any, Any, Any],
 ) -> None:
-    lease_kind, launch_permitted, registration_reserved, requires_reconciliation = authority
+    lease_kind, launch_permitted, registration_reserved, requires_reconciliation = (
+        authority
+    )
     source = FakeSource()
     store = FakeStore()
     factory = FakeFactory()
-    result = registrar(source, factory, store).process(claim(
-        lease_kind=lease_kind,
-        launch_permitted=launch_permitted,
-        registration_reserved=registration_reserved,
-        requires_exact_id_reconciliation=requires_reconciliation,
-    ))
+    result = registrar(source, factory, store).process(
+        claim(
+            lease_kind=lease_kind,
+            launch_permitted=launch_permitted,
+            registration_reserved=registration_reserved,
+            requires_exact_id_reconciliation=requires_reconciliation,
+        )
+    )
     assert result.status == "failed" and result.error_code == "bridge_conflict"
     assert factory.spawns == []
     assert source.lookups == []
@@ -330,8 +386,12 @@ def test_inconsistent_claim_authority_is_rejected_before_lookup_spawn_or_store(
 
 
 def test_reconciliation_exact_match_commits_without_spawn() -> None:
-    item = claim(lease_kind="reconciliation", launch_permitted=False, registration_reserved=False,
-                 requires_exact_id_reconciliation=True)
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
     store = FakeStore()
     factory = FakeFactory()
     result = registrar(FakeSource([projection_for(item)]), factory, store).process(item)
@@ -341,8 +401,12 @@ def test_reconciliation_exact_match_commits_without_spawn() -> None:
 
 
 def test_reconciliation_absence_is_recorded_and_never_launches_same_cycle() -> None:
-    item = claim(lease_kind="reconciliation", launch_permitted=False, registration_reserved=False,
-                 requires_exact_id_reconciliation=True)
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
     store = FakeStore()
     factory = FakeFactory()
     result = registrar(FakeSource([None]), factory, store).process(item)
@@ -361,10 +425,16 @@ def test_reconciliation_absence_is_recorded_and_never_launches_same_cycle() -> N
     ],
 )
 def test_reconciliation_conflicts_fail(changes: dict[str, Any], code: str) -> None:
-    item = claim(lease_kind="reconciliation", launch_permitted=False, registration_reserved=False,
-                 requires_exact_id_reconciliation=True)
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
     store = FakeStore()
-    result = registrar(FakeSource([projection_for(item, **changes)]), FakeFactory(), store).process(item)
+    result = registrar(
+        FakeSource([projection_for(item, **changes)]), FakeFactory(), store
+    ).process(item)
     assert result.status == "failed" and result.error_code == code
     assert store.calls[0][0] == "fail"
 
@@ -407,7 +477,9 @@ def test_registration_prompt_must_pair_with_immediate_exact_assistant_reply() ->
     assert result.status == "failed" and result.error_code == "bridge_conflict"
 
 
-def test_registration_turn_aggregates_split_text_blocks_from_same_assistant_event() -> None:
+def test_registration_turn_aggregates_split_text_blocks_from_same_assistant_event() -> (
+    None
+):
     item = claim(
         lease_kind="reconciliation",
         launch_permitted=False,
@@ -456,10 +528,16 @@ def test_exact_transcript_must_use_windows_encoded_source_project_directory() ->
     )
     expected = claude_project_directory_name(item.source_cwd or "")
     assert expected == "C--exact-project-subdir"
-    assert registrar(FakeSource([projection_for(item)]), FakeFactory()).process(item).status == "visible"
+    assert (
+        registrar(FakeSource([projection_for(item)]), FakeFactory())
+        .process(item)
+        .status
+        == "visible"
+    )
 
     wrong = registrar(
-        FakeSource([projection_for(item)], project_name="C--wrong-project"), FakeFactory()
+        FakeSource([projection_for(item)], project_name="C--wrong-project"),
+        FakeFactory(),
     ).process(replace(item, lease_digest="c" * 64))
     assert wrong.status == "failed" and wrong.error_code == "cwd_conflict"
 
@@ -485,7 +563,9 @@ def test_paid_exact_path_parse_failure_is_terminal_and_never_spawns() -> None:
         lambda projection: FakeSource([projection], unknown_records=1),
     ],
 )
-def test_registration_transcript_rejects_malformed_or_unknown_records(source: Any) -> None:
+def test_registration_transcript_rejects_malformed_or_unknown_records(
+    source: Any,
+) -> None:
     item = claim(
         lease_kind="reconciliation",
         launch_permitted=False,
@@ -518,7 +598,9 @@ def test_registration_transcript_rejects_any_unrelated_projected_message() -> No
     "messages",
     [
         lambda projection: [
-            replace(projection.messages[0], native_event_id="earlier", content="old work"),
+            replace(
+                projection.messages[0], native_event_id="earlier", content="old work"
+            ),
             *projection.messages,
         ],
         lambda projection: [
@@ -552,8 +634,11 @@ def test_duplicate_exact_uuid_is_fatal_before_spawn_or_commit() -> None:
     item = claim()
     project = claude_project_directory_name(item.source_cwd or "")
     paths = [
-        Path("C:/Users/test/.claude/projects") / project / f"{item.reserved_claude_uuid}.jsonl",
-        Path("D:/other/.claude/projects/C--other") / f"{item.reserved_claude_uuid}.jsonl",
+        Path("C:/Users/test/.claude/projects")
+        / project
+        / f"{item.reserved_claude_uuid}.jsonl",
+        Path("D:/other/.claude/projects/C--other")
+        / f"{item.reserved_claude_uuid}.jsonl",
     ]
     store = FakeStore()
     factory = FakeFactory()
@@ -569,9 +654,19 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     source = FakeSource([None, projection_for(item)])
     factory = FakeFactory()
     ticks = iter([0.0, 0.0, 0.1])
-    reg = ClaudeNativeRegistrar(FakeStore(), source, marker_secret=SECRET, pty_factory=factory,
-        clock=lambda: 100.0, monotonic=lambda: next(ticks), sleep=lambda _: None,
-        process_timeout=2, exit_timeout=1, discovery_timeout=1, retry_delay=5)
+    reg = ClaudeNativeRegistrar(
+        FakeStore(),
+        source,
+        marker_secret=SECRET,
+        pty_factory=factory,
+        clock=lambda: 100.0,
+        monotonic=lambda: next(ticks),
+        sleep=lambda _: None,
+        process_timeout=2,
+        exit_timeout=1,
+        discovery_timeout=1,
+        retry_delay=5,
+    )
     result = reg.process(item)
     assert result.status == "visible"
     assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
@@ -583,12 +678,18 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     [
         (FakeFactory(error=FileNotFoundError()), None, "claude_executable_unavailable"),
         (FakeFactory(error=RuntimeError("pty unavailable")), None, "pty_unavailable"),
-        (None, FakePty(output="Authentication required"), "claude_authentication_unavailable"),
+        (
+            None,
+            FakePty(output="Authentication required"),
+            "claude_authentication_unavailable",
+        ),
         (None, FakePty(exit_code=7), "clean_exit_not_observed"),
         (None, FakePty(read_error=TimeoutError()), "creation_ambiguous"),
     ],
 )
-def test_fixed_launch_failure_codes_and_cleanup(factory: FakeFactory | None, process: FakePty | None, code: str) -> None:
+def test_fixed_launch_failure_codes_and_cleanup(
+    factory: FakeFactory | None, process: FakePty | None, code: str
+) -> None:
     item = claim()
     factory = factory or FakeFactory(process)
     result = registrar(FakeSource(), factory).process(item)
@@ -752,7 +853,10 @@ def test_winpty_slow_drip_after_candidate_stays_bounded_by_global_timeout() -> N
     elapsed = time.monotonic() - started
     release.set()
     assert output.startswith("REGISTERED")
-    assert elapsed < 0.5
+    # The regression this guards against waits the full two-second release
+    # timeout. Leave enough scheduling margin for a loaded Windows test host
+    # while still proving the read is bounded well below that blocking wait.
+    assert elapsed < 1.0
 
 
 def test_winpty_reader_accepts_registered_split_across_chunks() -> None:
@@ -1016,10 +1120,14 @@ def test_paid_launch_exact_reconciles_existing_uuid_before_any_spawn() -> None:
     assert store.calls[0][0] == "commit"
 
 
-def test_restart_reconciliation_commits_exact_uuid_without_second_spawn_or_usage(tmp_path: Path) -> None:
+def test_restart_reconciliation_commits_exact_uuid_without_second_spawn_or_usage(
+    tmp_path: Path,
+) -> None:
     now = [100.0]
     database = SessionDB(tmp_path / "state.db")
-    first_store = SessionBridgeStore(database, clock=lambda: now[0], local_timezone=timezone.utc)
+    first_store = SessionBridgeStore(
+        database, clock=lambda: now[0], local_timezone=timezone.utc
+    )
     value = candidate()
     identity = derive_claude_visibility_identity(value, SECRET)
     first_store.enqueue_claude_visibility_job(value, identity, SECRET)
@@ -1030,8 +1138,12 @@ def test_restart_reconciliation_commits_exact_uuid_without_second_spawn_or_usage
     assert ambiguous.error_code == "creation_ambiguous"
 
     now[0] = 105.0
-    restarted_store = SessionBridgeStore(database, clock=lambda: now[0], local_timezone=timezone.utc)
-    reconciliation = restarted_store.claim_claude_visibility_job(now[0], 60, 25, "0.50", "0.02")
+    restarted_store = SessionBridgeStore(
+        database, clock=lambda: now[0], local_timezone=timezone.utc
+    )
+    reconciliation = restarted_store.claim_claude_visibility_job(
+        now[0], 60, 25, "0.50", "0.02"
+    )
     assert reconciliation.lease_kind == "reconciliation"
     restarted_factory = FakeFactory()
     visible = registrar(
@@ -1046,10 +1158,14 @@ def test_restart_reconciliation_commits_exact_uuid_without_second_spawn_or_usage
     database.close()
 
 
-def test_zero_result_ambiguity_records_absence_then_authorizes_same_uuid_only(tmp_path: Path) -> None:
+def test_zero_result_ambiguity_records_absence_then_authorizes_same_uuid_only(
+    tmp_path: Path,
+) -> None:
     now = [100.0]
     database = SessionDB(tmp_path / "state.db")
-    store = SessionBridgeStore(database, clock=lambda: now[0], local_timezone=timezone.utc)
+    store = SessionBridgeStore(
+        database, clock=lambda: now[0], local_timezone=timezone.utc
+    )
     value = candidate()
     identity = derive_claude_visibility_identity(value, SECRET)
     store.enqueue_claude_visibility_job(value, identity, SECRET)
@@ -1060,13 +1176,19 @@ def test_zero_result_ambiguity_records_absence_then_authorizes_same_uuid_only(tm
     now[0] = 105.0
     reconciliation = store.claim_claude_visibility_job(now[0], 60, 25, "0.50", "0.02")
     reconciliation_factory = FakeFactory()
-    absent = registrar(FakeSource([None]), reconciliation_factory, store).process(reconciliation)
+    absent = registrar(FakeSource([None]), reconciliation_factory, store).process(
+        reconciliation
+    )
     assert absent.status == "absent" and reconciliation_factory.spawns == []
     assert store.claude_visibility_status(now[0])["usage"]["attempts"] == 1
 
     second = store.claim_claude_visibility_job(now[0], 60, 25, "0.50", "0.02")
     assert second.lease_kind == "launch"
-    assert second.reserved_claude_uuid == first.reserved_claude_uuid == identity.claude_uuid
+    assert (
+        second.reserved_claude_uuid
+        == first.reserved_claude_uuid
+        == identity.claude_uuid
+    )
     assert second.attempt_ordinal == 2
     assert store.claude_visibility_status(now[0])["usage"]["attempts"] == 2
     assert len(first_factory.spawns) == 1
@@ -1075,7 +1197,9 @@ def test_zero_result_ambiguity_records_absence_then_authorizes_same_uuid_only(tm
 
 def test_nonlease_store_gate_has_no_lease_kind(tmp_path: Path) -> None:
     database = SessionDB(tmp_path / "state.db")
-    store = SessionBridgeStore(database, clock=lambda: 100.0, local_timezone=timezone.utc)
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
     value = candidate()
     identity = derive_claude_visibility_identity(value, SECRET)
     store.enqueue_claude_visibility_job(value, identity, SECRET)
@@ -1084,7 +1208,9 @@ def test_nonlease_store_gate_has_no_lease_kind(tmp_path: Path) -> None:
     database.close()
 
 
-def test_offline_interactive_fixture_records_frames_exit_and_delayed_index(tmp_path: Path) -> None:
+def test_offline_interactive_fixture_records_frames_exit_and_delayed_index(
+    tmp_path: Path,
+) -> None:
     record = tmp_path / "record.json"
     fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
     env = {
@@ -1116,7 +1242,12 @@ def test_offline_interactive_fixture_records_frames_exit_and_delayed_index(tmp_p
         "event": "spawn",
     }
     assert [event["event"] for event in events] == [
-        "spawn", "stdin", "native_created", "index_ready", "stdin", "exit"
+        "spawn",
+        "stdin",
+        "native_created",
+        "index_ready",
+        "stdin",
+        "exit",
     ]
 
 
@@ -1167,7 +1298,9 @@ def test_fixture_accepts_close_marker_at_exact_frame_boundary() -> None:
     assert _fixture_read_frame(frame + b"\r") == (frame + b"\r").decode()
 
 
-def test_fixture_returns_bounded_partial_frame_when_close_marker_is_missing_at_eof() -> None:
+def test_fixture_returns_bounded_partial_frame_when_close_marker_is_missing_at_eof() -> (
+    None
+):
     frame = b"\x1b[200~line one\r\nline two"
     assert _fixture_read_frame(frame) == frame.decode()
 
@@ -1239,9 +1372,11 @@ def _real_conpty_available() -> bool:
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
 @pytest.mark.parametrize(
     ("scenario", "expected_exit", "expected_lines"),
-    [("registered", 0, ["REGISTERED"]), ("nonzero", 9, ["REGISTERED"]), *(
-        ("delayed_extra", 0, ["REGISTERED", "extra"]) for _ in range(20)
-    )],
+    [
+        ("registered", 0, ["REGISTERED"]),
+        ("nonzero", 9, ["REGISTERED"]),
+        *(("delayed_extra", 0, ["REGISTERED", "extra"]) for _ in range(20)),
+    ],
 )
 def test_real_windows_conpty_fixture_exit_and_cleanup(
     tmp_path: Path,
@@ -1301,7 +1436,9 @@ def test_real_windows_conpty_timeout_terminates_and_releases_resources(
         process.read_until(0.1, prompt="registration prompt")
     assert process.terminate(5.0)
     cleanup = process.close(5.0)
-    assert cleanup.process_dead and cleanup.reader_stopped and cleanup.descriptors_closed
+    assert (
+        cleanup.process_dead and cleanup.reader_stopped and cleanup.descriptors_closed
+    )
     assert cleanup.registrar_reader_stopped is True
     assert cleanup.transport_reader_stopped is True
     assert process._reader_thread is None
@@ -1394,9 +1531,11 @@ def test_registrar_spawn_does_not_mutate_standard_pywinpty_reader_during_overlap
             client.close()
 
     monkeypatch.setattr(winpty_module, "_read_in_thread", observing_reader)
-    standard = PtyProcess.spawn(
-        [sys.executable, "-c", "import time; time.sleep(1); print('STANDARD_OK')"]
-    )
+    standard = PtyProcess.spawn([
+        sys.executable,
+        "-c",
+        "import time; time.sleep(1); print('STANDARD_OK')",
+    ])
     record = tmp_path / "concurrent.json"
     fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
     monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))

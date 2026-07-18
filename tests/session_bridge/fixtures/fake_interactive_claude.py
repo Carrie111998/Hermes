@@ -97,7 +97,9 @@ def main() -> int:
     _record(event="stdin", frame=exit_frame)
     if exit_frame.strip() != "/exit":
         return _exit(scenario, 7)
-    sequence = 9 if scenario == "nonzero" else int(os.environ.get("FAKE_CLAUDE_EXIT", "0"))
+    sequence = (
+        9 if scenario == "nonzero" else int(os.environ.get("FAKE_CLAUDE_EXIT", "0"))
+    )
     return _exit(scenario, sequence)
 
 

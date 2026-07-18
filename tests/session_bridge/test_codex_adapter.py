@@ -111,9 +111,9 @@ class TestInventory:
         }
         client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
 
-        [summary] = CodexSourceAdapter(
-            client, marker_secret=SECRET
-        ).list_inventory(archived=False)
+        [summary] = CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+            archived=False
+        )
 
         assert summary.cwd == "C:/work/equal"
 
@@ -128,14 +128,12 @@ class TestInventory:
         client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
 
         with pytest.raises(ValueError, match="thread/list"):
-            CodexSourceAdapter(
-                client, marker_secret=SECRET
-            ).list_inventory(archived=False)
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
 
     @pytest.mark.parametrize("malformed", [None, 7, "", "relative/path", "C:/bad\0cwd"])
-    def test_inventory_rejects_malformed_later_cwd_alias(
-        self, malformed: Any
-    ) -> None:
+    def test_inventory_rejects_malformed_later_cwd_alias(self, malformed: Any) -> None:
         row = {
             "id": "malformed-cwd-alias",
             "cwd": "C:/work/valid",
@@ -146,9 +144,9 @@ class TestInventory:
         client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
 
         with pytest.raises(ValueError, match="thread/list"):
-            CodexSourceAdapter(
-                client, marker_secret=SECRET
-            ).list_inventory(archived=False)
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
 
     @pytest.mark.parametrize("alias", ["workingDirectory", "working_directory"])
     def test_inventory_accepts_each_alternate_cwd_alias(self, alias: str) -> None:
@@ -160,9 +158,9 @@ class TestInventory:
         }
         client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
 
-        [summary] = CodexSourceAdapter(
-            client, marker_secret=SECRET
-        ).list_inventory(archived=False)
+        [summary] = CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+            archived=False
+        )
 
         assert summary.cwd == "C:/work/alternate"
 
@@ -179,9 +177,9 @@ class TestInventory:
         }
         client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
 
-        [summary] = CodexSourceAdapter(
-            client, marker_secret=SECRET
-        ).list_inventory(archived=False)
+        [summary] = CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+            archived=False
+        )
 
         assert summary.cwd == "C:/Work/Repo/."
 
@@ -199,12 +197,16 @@ class TestInventory:
         read_cwd = r"c:\work\repo"
         client = FakeInitializingClient({
             "thread/list": [{"data": [row]}, {"data": []}],
-            "thread/read": [{"thread": {
-                "id": "windows-read-cwd",
-                "workingDirectory": read_cwd,
-                "source": "vscode",
-                "turns": [],
-            }}],
+            "thread/read": [
+                {
+                    "thread": {
+                        "id": "windows-read-cwd",
+                        "workingDirectory": read_cwd,
+                        "source": "vscode",
+                        "turns": [],
+                    }
+                }
+            ],
         })
 
         [candidate] = CodexSourceAdapter(
@@ -238,18 +240,63 @@ class TestInventory:
                 {"data": [entry("archived", 200, archived=True)]},
             ],
             "thread/read": [
-                {"thread": {"id": "linked-or-uncataloged", "source": "vscode", "turns": [{"items": [{
-                    "type": "userMessage", "id": "u1",
-                    "content": [{"type": "text", "text": "Build API"}],
-                }]}]}},
-                {"thread": {"id": "archived", "source": "vscode", "turns": [{"items": [{
-                    "type": "userMessage", "id": "u3",
-                    "content": [{"type": "text", "text": "Archived request"}],
-                }]}]}},
-                {"thread": {"id": "older", "source": "vscode", "turns": [{"items": [{
-                    "type": "userMessage", "id": "u2",
-                    "content": [{"type": "text", "text": "Older request"}],
-                }]}]}},
+                {
+                    "thread": {
+                        "id": "linked-or-uncataloged",
+                        "source": "vscode",
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "u1",
+                                        "content": [
+                                            {"type": "text", "text": "Build API"}
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
+                {
+                    "thread": {
+                        "id": "archived",
+                        "source": "vscode",
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "u3",
+                                        "content": [
+                                            {"type": "text", "text": "Archived request"}
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
+                {
+                    "thread": {
+                        "id": "older",
+                        "source": "vscode",
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "u2",
+                                        "content": [
+                                            {"type": "text", "text": "Older request"}
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
             ],
         })
 
@@ -258,7 +305,9 @@ class TestInventory:
         ).list_claude_visibility_sources(after=50)
 
         assert [source.source_session_id for source in sources] == [
-            "codex:linked-or-uncataloged", "codex:archived", "codex:older"
+            "codex:linked-or-uncataloged",
+            "codex:archived",
+            "codex:older",
         ]
         newest = sources[0]
         assert newest.projection.messages[0].content == "Build API"
@@ -268,8 +317,12 @@ class TestInventory:
         assert newest.worktree_id == "wt-linked-or-uncataloged"
         assert sources[1].projection.native_status == "archived"
         assert [call[0] for call in client.calls] == [
-            "thread/list", "thread/list", "thread/list",
-            "thread/read", "thread/read", "thread/read",
+            "thread/list",
+            "thread/list",
+            "thread/list",
+            "thread/read",
+            "thread/read",
+            "thread/read",
         ]
 
     def test_claude_visibility_inventory_preserves_normal_automation_and_subagent_kinds(
@@ -378,9 +431,9 @@ class TestInventory:
         }
         client = FakeInitializingClient({
             "thread/list": [{"data": [row]}, {"data": []}],
-            "thread/read": [{
-                "thread": {"id": "spawned", "source": source, "turns": []}
-            }],
+            "thread/read": [
+                {"thread": {"id": "spawned", "source": source, "turns": []}}
+            ],
         })
 
         [candidate] = CodexSourceAdapter(
@@ -402,11 +455,15 @@ class TestInventory:
     def test_claude_visibility_rejects_malformed_thread_spawn_optional_fields(
         self, invalid_fields: dict[str, Any]
     ) -> None:
-        source = {"subAgent": {"thread_spawn": {
-            "depth": 1,
-            "parent_thread_id": "parent-thread",
-            **invalid_fields,
-        }}}
+        source = {
+            "subAgent": {
+                "thread_spawn": {
+                    "depth": 1,
+                    "parent_thread_id": "parent-thread",
+                    **invalid_fields,
+                }
+            }
+        }
         row = {
             "id": "bad-spawn",
             "cwd": "C:/work/bad-spawn",
@@ -416,9 +473,9 @@ class TestInventory:
         }
         client = FakeInitializingClient({
             "thread/list": [{"data": [row]}, {"data": []}],
-            "thread/read": [{
-                "thread": {"id": "bad-spawn", "source": source, "turns": []}
-            }],
+            "thread/read": [
+                {"thread": {"id": "bad-spawn", "source": source, "turns": []}}
+            ],
         })
 
         with pytest.raises(ValueError, match="thread/list"):
@@ -558,9 +615,7 @@ class TestInventory:
         }
         client = FakeInitializingClient({
             "thread/list": [{"data": [row]}, {"data": []}],
-            "thread/read": [{
-                "thread": {"id": "exact", "turns": [], **metadata}
-            }],
+            "thread/read": [{"thread": {"id": "exact", "turns": [], **metadata}}],
         })
 
         [candidate] = CodexSourceAdapter(
@@ -586,13 +641,15 @@ class TestInventory:
         }
         client = FakeInitializingClient({
             "thread/list": [{"data": [row]}, {"data": []}],
-            "thread/read": [{
-                "thread": {
-                    "id": "bad-source-kind",
-                    "source": source_kind,
-                    "turns": [],
+            "thread/read": [
+                {
+                    "thread": {
+                        "id": "bad-source-kind",
+                        "source": source_kind,
+                        "turns": [],
+                    }
                 }
-            }],
+            ],
         })
 
         with pytest.raises(ValueError, match="thread/list"):
@@ -612,13 +669,15 @@ class TestInventory:
         }
         client = FakeInitializingClient({
             "thread/list": [{"data": [row]}, {"data": []}],
-            "thread/read": [{
-                "thread": {
-                    "id": "conflict",
-                    "source": {"subAgent": "review"},
-                    "turns": [],
+            "thread/read": [
+                {
+                    "thread": {
+                        "id": "conflict",
+                        "source": {"subAgent": "review"},
+                        "turns": [],
+                    }
                 }
-            }],
+            ],
         })
 
         with pytest.raises(ValueError, match="source kind"):
@@ -646,8 +705,7 @@ class TestInventory:
         })
         adapter = CodexSourceAdapter(client, marker_secret=SECRET)
         assert [
-            summary.native_id
-            for summary in adapter.list_full_inventory(archived=False)
+            summary.native_id for summary in adapter.list_full_inventory(archived=False)
         ] == ["thread-cached"]
         client.calls.clear()
 
@@ -674,9 +732,7 @@ class TestInventory:
             "thread-active",
             "thread-fallback",
         ]
-        assert client.initialize_calls == [
-            {"capabilities": {"experimentalApi": True}}
-        ]
+        assert client.initialize_calls == [{"capabilities": {"experimentalApi": True}}]
         list_calls = [call for call in client.calls if call[0] == "thread/list"]
         assert list_calls[0][1]["archived"] is False
         assert "cursor" not in list_calls[0][1]
@@ -722,9 +778,7 @@ class TestInventory:
             adapter.list_inventory(archived=False)
 
         assert latched_failure.value.__cause__ is None
-        assert client.initialize_calls == [
-            {"capabilities": {"experimentalApi": True}}
-        ]
+        assert client.initialize_calls == [{"capabilities": {"experimentalApi": True}}]
         assert client.calls == []
 
     def test_archived_pass_is_explicit_and_normalizes_inventory(self) -> None:
@@ -1522,15 +1576,18 @@ class TestBridgeMarkers:
         projection = adapter.project_thread(_summary())
 
         assert adapter.projection_has_marker_payload(projection, payload) is True
-        assert adapter.projection_has_marker_payload(
-            projection,
-            BridgeMarkerPayload(
-                bridge_id=payload.bridge_id,
-                source_session_id="claude:different-source",
-                target_provider=payload.target_provider,
-                policy_generation=payload.policy_generation,
-            ),
-        ) is False
+        assert (
+            adapter.projection_has_marker_payload(
+                projection,
+                BridgeMarkerPayload(
+                    bridge_id=payload.bridge_id,
+                    source_session_id="claude:different-source",
+                    target_provider=payload.target_provider,
+                    policy_generation=payload.policy_generation,
+                ),
+            )
+            is False
+        )
 
     def test_codex_marker_is_placeholder_until_later_human_user_text(self) -> None:
         marker = _marker("bridge-1")

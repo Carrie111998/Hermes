@@ -93,14 +93,25 @@ class FakeBackend:
         default_factory=lambda: {
             "enabled": False,
             "continuous": False,
-            "counts": {"claude_pending": 0, "claude_leased": 0,
-                       "claude_retry": 0, "claude_visible": 0,
-                       "claude_failed": 0},
-            "retry_codes": {}, "failed_codes": {},
-            "usage": {"local_day": "2026-07-17", "attempts": 0,
-                      "reserved_cost_usd": "0"},
-            "candidates": [], "exclusions": [], "open_reasons": [],
-            "fatal_reasons": [], "degraded_reasons": [],
+            "counts": {
+                "claude_pending": 0,
+                "claude_leased": 0,
+                "claude_retry": 0,
+                "claude_visible": 0,
+                "claude_failed": 0,
+            },
+            "retry_codes": {},
+            "failed_codes": {},
+            "usage": {
+                "local_day": "2026-07-17",
+                "attempts": 0,
+                "reserved_cost_usd": "0",
+            },
+            "candidates": [],
+            "exclusions": [],
+            "open_reasons": [],
+            "fatal_reasons": [],
+            "degraded_reasons": [],
         }
     )
     calls: list[tuple[Any, ...]] = field(default_factory=list)
@@ -125,11 +136,12 @@ class FakeBackend:
         self.calls.append(("sidebar_status",))
         return dict(self.sidebar_status_payload)
 
-    def sidebar_backfill(
-        self, *, days: int, limit: int, apply: bool
-    ) -> dict[str, Any]:
+    def sidebar_backfill(self, *, days: int, limit: int, apply: bool) -> dict[str, Any]:
         self.calls.append(("sidebar_backfill", days, limit, apply))
-        return {**self.sidebar_backfill_payload, "mode": "apply" if apply else "dry_run"}
+        return {
+            **self.sidebar_backfill_payload,
+            "mode": "apply" if apply else "dry_run",
+        }
 
     def set_sidebar_continuous(self, *, enabled: bool) -> dict[str, Any]:
         self.calls.append(("set_sidebar_continuous", enabled))
@@ -141,9 +153,13 @@ class FakeBackend:
 
     def claude_visibility_backfill(self, *, days: int, limit: int, apply: bool):
         self.calls.append(("claude_visibility_backfill", days, limit, apply))
-        return {**self.claude_visibility_payload,
-                "mode": "apply" if apply else "dry_run",
-                "dry_run": not apply, "applied": apply, "enqueued": 0}
+        return {
+            **self.claude_visibility_payload,
+            "mode": "apply" if apply else "dry_run",
+            "dry_run": not apply,
+            "applied": apply,
+            "enqueued": 0,
+        }
 
     def set_claude_visibility_continuous(self, *, enabled: bool):
         self.calls.append(("set_claude_visibility_continuous", enabled))
@@ -151,8 +167,12 @@ class FakeBackend:
 
     def claude_visibility_run_once(self):
         self.calls.append(("claude_visibility_run_once",))
-        return {"enabled": True, "status": "no_due_job", "degraded": False,
-                "fatal": False}
+        return {
+            "enabled": True,
+            "status": "no_due_job",
+            "degraded": False,
+            "fatal": False,
+        }
 
     def characterize(self, *, provider: str) -> dict[str, Any]:
         self.calls.append(("characterize", provider))
@@ -296,15 +316,21 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
 
     assert _run(["sidebar-status", "--json"], backend) == 0
     assert _json_output(capsys)["healthy"] is True
-    assert _run(
-        ["sidebar-backfill", "--days", "30", "--limit", "10", "--dry-run"],
-        backend,
-    ) == 0
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", "--dry-run"],
+            backend,
+        )
+        == 0
+    )
     assert _json_output(capsys)["mode"] == "dry_run"
-    assert _run(
-        ["sidebar-backfill", "--days", "30", "--limit", "10", "--apply"],
-        backend,
-    ) == 0
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", "--apply"],
+            backend,
+        )
+        == 0
+    )
     assert _json_output(capsys)["mode"] == "apply"
     assert _run(["sidebar-continuous", "--enable"], backend) == 0
     assert _json_output(capsys) == {"continuous": True, "enabled": True}
@@ -323,7 +349,9 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
         ("set_sidebar_continuous", False),
         ("close",),
     ]
-    assert not any(call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls)
+    assert not any(
+        call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls
+    )
 
 
 def test_claude_visibility_exact_commands_route_with_safe_defaults(capsys) -> None:
@@ -331,18 +359,31 @@ def test_claude_visibility_exact_commands_route_with_safe_defaults(capsys) -> No
 
     assert _run(["claude-visibility-status", "--json"], backend) == 0
     assert _json_output(capsys)["counts"]["claude_pending"] == 0
-    assert _run(
-        ["claude-visibility-backfill", "--days", "30", "--limit", "10", "--dry-run"],
-        backend,
-    ) == 0
+    assert (
+        _run(
+            [
+                "claude-visibility-backfill",
+                "--days",
+                "30",
+                "--limit",
+                "10",
+                "--dry-run",
+            ],
+            backend,
+        )
+        == 0
+    )
     dry_run = _json_output(capsys)
     assert dry_run["mode"] == "dry_run"
     assert dry_run["dry_run"] is True
     assert dry_run["applied"] is False
-    assert _run(
-        ["claude-visibility-backfill", "--days", "30", "--limit", "10", "--apply"],
-        backend,
-    ) == 0
+    assert (
+        _run(
+            ["claude-visibility-backfill", "--days", "30", "--limit", "10", "--apply"],
+            backend,
+        )
+        == 0
+    )
     assert _json_output(capsys)["mode"] == "apply"
     assert _run(["claude-visibility-continuous", "--enable"], backend) == 0
     assert _json_output(capsys) == {"continuous": True, "enabled": False}
@@ -352,21 +393,28 @@ def test_claude_visibility_exact_commands_route_with_safe_defaults(capsys) -> No
     assert _json_output(capsys)["status"] == "no_due_job"
 
     assert backend.calls == [
-        ("claude_visibility_status",), ("close",),
-        ("claude_visibility_backfill", 30, 10, False), ("close",),
-        ("claude_visibility_backfill", 30, 10, True), ("close",),
-        ("set_claude_visibility_continuous", True), ("close",),
-        ("set_claude_visibility_continuous", False), ("close",),
-        ("claude_visibility_run_once",), ("close",),
+        ("claude_visibility_status",),
+        ("close",),
+        ("claude_visibility_backfill", 30, 10, False),
+        ("close",),
+        ("claude_visibility_backfill", 30, 10, True),
+        ("close",),
+        ("set_claude_visibility_continuous", True),
+        ("close",),
+        ("set_claude_visibility_continuous", False),
+        ("close",),
+        ("claude_visibility_run_once",),
+        ("close",),
     ]
 
 
 def test_claude_visibility_backfill_defaults_to_explicit_dry_run_json(capsys) -> None:
     backend = FakeBackend()
 
-    assert _run(
-        ["claude-visibility-backfill", "--days", "30", "--limit", "10"], backend
-    ) == 0
+    assert (
+        _run(["claude-visibility-backfill", "--days", "30", "--limit", "10"], backend)
+        == 0
+    )
 
     assert _json_output(capsys) == {
         **backend.claude_visibility_payload,
@@ -375,12 +423,12 @@ def test_claude_visibility_backfill_defaults_to_explicit_dry_run_json(capsys) ->
         "dry_run": True,
         "enqueued": 0,
     }
-    assert backend.calls == [
-        ("claude_visibility_backfill", 30, 10, False), ("close",)
-    ]
+    assert backend.calls == [("claude_visibility_backfill", 30, 10, False), ("close",)]
 
 
-def test_claude_visibility_backfill_validation_precedes_backend_mutation(capsys) -> None:
+def test_claude_visibility_backfill_validation_precedes_backend_mutation(
+    capsys,
+) -> None:
     backend = FakeBackend()
 
     with pytest.raises(SystemExit):
@@ -388,28 +436,54 @@ def test_claude_visibility_backfill_validation_precedes_backend_mutation(capsys)
     with pytest.raises(SystemExit):
         _run(["claude-visibility-backfill", "--days", "30", "--limit", "11"], backend)
     with pytest.raises(SystemExit):
-        _run([
-            "claude-visibility-backfill", "--days", "30", "--limit", "10",
-            "--dry-run", "--apply",
-        ], backend)
+        _run(
+            [
+                "claude-visibility-backfill",
+                "--days",
+                "30",
+                "--limit",
+                "10",
+                "--dry-run",
+                "--apply",
+            ],
+            backend,
+        )
 
     assert backend.calls == []
 
 
-def test_claude_visibility_apply_and_run_once_use_typed_nonzero_contract(capsys) -> None:
-    backend = FakeBackend(claude_visibility_payload={
-        "enabled": True, "continuous": False, "counts": {}, "retry_codes": {},
-        "failed_codes": {"unknown_error_code": 1}, "usage": {},
-        "candidates": [], "exclusions": [], "open_reasons": [],
-        "fatal_reasons": ["unknown_retry"], "degraded_reasons": [],
-    })
-    assert _run([
-        "claude-visibility-backfill", "--days", "30", "--limit", "10", "--apply"
-    ], backend) != 0
+def test_claude_visibility_apply_and_run_once_use_typed_nonzero_contract(
+    capsys,
+) -> None:
+    backend = FakeBackend(
+        claude_visibility_payload={
+            "enabled": True,
+            "continuous": False,
+            "counts": {},
+            "retry_codes": {},
+            "failed_codes": {"unknown_error_code": 1},
+            "usage": {},
+            "candidates": [],
+            "exclusions": [],
+            "open_reasons": [],
+            "fatal_reasons": ["unknown_retry"],
+            "degraded_reasons": [],
+        }
+    )
+    assert (
+        _run(
+            ["claude-visibility-backfill", "--days", "30", "--limit", "10", "--apply"],
+            backend,
+        )
+        != 0
+    )
     _json_output(capsys)
 
     backend.claude_visibility_run_once = lambda: {
-        "enabled": True, "status": "degraded", "degraded": True, "fatal": False
+        "enabled": True,
+        "status": "degraded",
+        "degraded": True,
+        "fatal": False,
     }
     assert _run(["claude-visibility-run-once"], backend) != 0
     _json_output(capsys)
@@ -433,10 +507,13 @@ def test_sidebar_backfill_candidate_failures_exit_degraded(
     )
     mode = "--apply" if apply else "--dry-run"
 
-    assert _run(
-        ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
-        backend,
-    ) == 3
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
+            backend,
+        )
+        == 3
+    )
     assert _json_output(capsys)["failed"] == 1
 
 
@@ -460,13 +537,14 @@ def test_sidebar_backfill_exclusions_do_not_exit_degraded(
     )
     mode = "--apply" if apply else "--dry-run"
 
-    assert _run(
-        ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
-        backend,
-    ) == 0
-    assert _json_output(capsys)["excluded_by_reason"] == {
-        "source_cwd_missing": 1
-    }
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["excluded_by_reason"] == {"source_cwd_missing": 1}
 
 
 def test_sidebar_backfill_rejects_a_limit_above_ten() -> None:
@@ -576,9 +654,7 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
         "broker_heartbeat_stale",
         "oldest_pending_stale",
     ]
-    expected_tag = hashlib.sha256(
-        b"019f-secret-thread-identifier"
-    ).hexdigest()[:16]
+    expected_tag = hashlib.sha256(b"019f-secret-thread-identifier").hexdigest()[:16]
     assert status["last_visible_task_id"] == f"task:{expected_tag}"
     assert "019f-secret-thread-identifier" not in rendered
     assert "lease_token" not in rendered
@@ -693,6 +769,7 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
         },
     }
     saved: list[tuple[dict[str, Any], set[tuple[str, ...]] | None]] = []
+
     def mutate_config(mutator, **kwargs):
         value = json.loads(json.dumps(loaded))
         mutator(value)
@@ -705,16 +782,22 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
     result = backend.set_sidebar_continuous(enabled=True)
 
     assert result == {"enabled": False, "continuous": True}
-    assert saved == [(
-        {
-            "theme": "midnight",
-            "session_bridge": {
-                "sidebar": {"enabled": True, "continuous": True, "backfill_days": 30},
-                "future_key": {"keep": "exactly"},
+    assert saved == [
+        (
+            {
+                "theme": "midnight",
+                "session_bridge": {
+                    "sidebar": {
+                        "enabled": True,
+                        "continuous": True,
+                        "backfill_days": 30,
+                    },
+                    "future_key": {"keep": "exactly"},
+                },
             },
-        },
-        {("session_bridge", "sidebar", "continuous")},
-    )]
+            {("session_bridge", "sidebar", "continuous")},
+        )
+    ]
 
 
 def test_claude_visibility_continuous_preserves_unrelated_config_and_enabled_flag(
@@ -724,7 +807,9 @@ def test_claude_visibility_continuous_preserves_unrelated_config_and_enabled_fla
         "theme": "midnight",
         "session_bridge": {
             "claude_visibility": {
-                "enabled": False, "continuous": False, "backfill_days": 30
+                "enabled": False,
+                "continuous": False,
+                "backfill_days": 30,
             },
             "future_key": {"keep": "exactly"},
         },
@@ -743,18 +828,22 @@ def test_claude_visibility_continuous_preserves_unrelated_config_and_enabled_fla
     result = backend.set_claude_visibility_continuous(enabled=True)
 
     assert result == {"enabled": False, "continuous": True}
-    assert saved == [(
-        {
-            "theme": "midnight",
-            "session_bridge": {
-                "claude_visibility": {
-                    "enabled": False, "continuous": True, "backfill_days": 30
+    assert saved == [
+        (
+            {
+                "theme": "midnight",
+                "session_bridge": {
+                    "claude_visibility": {
+                        "enabled": False,
+                        "continuous": True,
+                        "backfill_days": 30,
+                    },
+                    "future_key": {"keep": "exactly"},
                 },
-                "future_key": {"keep": "exactly"},
             },
-        },
-        {("session_bridge", "claude_visibility", "continuous")},
-    )]
+            {("session_bridge", "claude_visibility", "continuous")},
+        )
+    ]
 
 
 def test_claude_visibility_continuous_postwrite_mismatch_keeps_runtime_unchanged(
@@ -768,7 +857,9 @@ def test_claude_visibility_continuous_postwrite_mismatch_keeps_runtime_unchanged
     )
     backend = ProductionBackend(BridgeConfig())
 
-    with pytest.raises(ConfigurationFailure, match="claude_visibility_continuous_not_persisted"):
+    with pytest.raises(
+        ConfigurationFailure, match="claude_visibility_continuous_not_persisted"
+    ):
         backend.set_claude_visibility_continuous(enabled=True)
 
     assert backend.config.claude_visibility.continuous is False
@@ -780,20 +871,32 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     class ReadOnlyStore:
         def claude_visibility_status(self, _now):
             return {
-                "counts": {state: 0 for state in (
-                    "claude_pending", "claude_leased", "claude_retry",
-                    "claude_visible", "claude_failed",
-                )},
-                "retry_codes": {}, "failed_codes": {},
-                "usage": {"local_day": "2026-07-17", "attempts": 0,
-                          "reserved_cost_usd": "0"},
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "usage": {
+                    "local_day": "2026-07-17",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
             }
 
     config = BridgeConfig()
-    backend = ProductionBackend(replace(
-        config,
-        claude_visibility=replace(config.claude_visibility, enabled=True),
-    ))
+    backend = ProductionBackend(
+        replace(
+            config,
+            claude_visibility=replace(config.claude_visibility, enabled=True),
+        )
+    )
     monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
     monkeypatch.setattr(
         "session_bridge.cli.resolve_marker_key",
@@ -824,30 +927,46 @@ def test_claude_visibility_status_exposes_durable_cycle_tracking(
     tracked = {
         "tracked": True,
         "value": {
-            "at": 100.0, "sequence": 1, "status": "no_due_job",
-            "error_code": None, "empty_verified": True,
+            "at": 100.0,
+            "sequence": 1,
+            "status": "no_due_job",
+            "error_code": None,
+            "empty_verified": True,
         },
     }
 
     class ReadOnlyStore:
         def claude_visibility_status(self, _now):
             return {
-                "counts": {state: 0 for state in (
-                    "claude_pending", "claude_leased", "claude_retry",
-                    "claude_visible", "claude_failed",
-                )},
-                "retry_codes": {}, "failed_codes": {}, "fatal": [],
-                "usage": {"local_day": "2026-07-17", "attempts": 0,
-                          "reserved_cost_usd": "0"},
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": "2026-07-17",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
                 "last_cycle": tracked,
                 "last_empty_cycle": {"tracked": True, "value": 100.0},
                 "last_registrar_result": {"tracked": False, "value": None},
             }
 
     config = BridgeConfig()
-    backend = ProductionBackend(replace(
-        config, claude_visibility=replace(config.claude_visibility, enabled=True)
-    ))
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
     monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
 
     result = backend.claude_visibility_status()
@@ -862,30 +981,52 @@ def test_claude_visibility_status_exposes_sanitized_unknown_state_fatal(
     class ReadOnlyStore:
         def claude_visibility_status(self, _now):
             return {
-                "counts": {state: 0 for state in (
-                    "claude_pending", "claude_leased", "claude_retry",
-                    "claude_visible", "claude_failed",
-                )},
-                "retry_codes": {}, "failed_codes": {},
-                "usage": {"local_day": "2026-07-17", "attempts": 0,
-                          "reserved_cost_usd": "0"},
-                "fatal": [{"code": "unknown_job_state", "state": "future_state",
-                           "error_code": "future-code", "count": 1}],
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "usage": {
+                    "local_day": "2026-07-17",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+                "fatal": [
+                    {
+                        "code": "unknown_job_state",
+                        "state": "future_state",
+                        "error_code": "future-code",
+                        "count": 1,
+                    }
+                ],
             }
 
     config = BridgeConfig()
-    backend = ProductionBackend(replace(
-        config, claude_visibility=replace(config.claude_visibility, enabled=True)
-    ))
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
     monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
 
     result = backend.claude_visibility_status()
 
     assert result["fatal_reasons"] == ["unknown_job_state"]
-    assert result["fatal"] == [{
-        "code": "unknown_job_state", "state": "future_state",
-        "error_code": "future-code", "count": 1,
-    }]
+    assert result["fatal"] == [
+        {
+            "code": "unknown_job_state",
+            "state": "future_state",
+            "error_code": "future-code",
+            "count": 1,
+        }
+    ]
 
 
 def test_claude_visibility_json_is_one_sanitized_stdout_document(capsys) -> None:
@@ -1209,28 +1350,38 @@ def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
             self.calls.append(method)
             if method == "thread/list":
                 if self.published and params.get("archived") is False:
-                    return {"data": [{
-                        "id": thread_id,
-                        "title": "Native task",
-                        "cwd": str(tmp_path),
-                        "createdAt": now,
-                        "updatedAt": now,
-                        "revision": "revision-1",
-                    }]}
+                    return {
+                        "data": [
+                            {
+                                "id": thread_id,
+                                "title": "Native task",
+                                "cwd": str(tmp_path),
+                                "createdAt": now,
+                                "updatedAt": now,
+                                "revision": "revision-1",
+                            }
+                        ]
+                    }
                 return {"data": []}
             if method == "thread/read":
-                return {"thread": {
-                    "id": thread_id,
-                    "turns": [{
-                        "id": "registration-turn",
-                        "status": "completed",
-                        "items": [{
-                            "type": "userMessage",
-                            "id": "registration-item",
-                            "content": [{"type": "text", "text": marker}],
-                        }],
-                    }],
-                }}
+                return {
+                    "thread": {
+                        "id": thread_id,
+                        "turns": [
+                            {
+                                "id": "registration-turn",
+                                "status": "completed",
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "registration-item",
+                                        "content": [{"type": "text", "text": marker}],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
             raise AssertionError(f"unexpected production request: {method}")
 
         def take_notification(self, timeout: float = 0.0) -> None:

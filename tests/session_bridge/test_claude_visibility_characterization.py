@@ -684,7 +684,9 @@ def test_expired_ready_operation_revalidates_identity_and_renews_same_operation(
     )
     assert renewed["cleanup_token"]["id"] == pending["cleanup_token"]["id"]
     assert renewed["reserved_claude_uuid"] == pending["reserved_claude_uuid"]
-    assert renewed["cleanup_token"]["capability"] != pending["cleanup_token"]["capability"]
+    assert (
+        renewed["cleanup_token"]["capability"] != pending["cleanup_token"]["capability"]
+    )
     assert renewed["cleanup_expires_at"] == renewed_record["expires_at"]
     assert renewed_record["expires_at"] > first_record["expires_at"]
     assert len(registrar.claims) == 1
@@ -729,7 +731,9 @@ def test_expired_ready_operation_renews_after_native_resume_appends_transcript(
 
     assert renewed["cleanup_token"]["id"] == pending["cleanup_token"]["id"]
     assert renewed["reserved_claude_uuid"] == pending["reserved_claude_uuid"]
-    assert renewed["cleanup_token"]["capability"] != pending["cleanup_token"]["capability"]
+    assert (
+        renewed["cleanup_token"]["capability"] != pending["cleanup_token"]["capability"]
+    )
     assert len(registrar.claims) == 1
     assert renewal_registrar.claims == []
 

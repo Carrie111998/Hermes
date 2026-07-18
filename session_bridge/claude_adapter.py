@@ -448,9 +448,7 @@ class ClaudeTargetAdapter:
             completed = None
         except FileNotFoundError:
             completed = None
-            provider_failure = PlaceholderCreationError(
-                "claude_executable_not_found"
-            )
+            provider_failure = PlaceholderCreationError("claude_executable_not_found")
         except Exception:
             completed = None
             provider_failure = PlaceholderCreationError("claude_process_failed")
@@ -510,18 +508,14 @@ class ClaudeTargetAdapter:
                     projection = self._source_adapter.parse(path).projection
                 except Exception:
                     projection = None
-                    parse_failure = PlaceholderCreationError(
-                        "claude_target_unreadable"
-                    )
+                    parse_failure = PlaceholderCreationError("claude_target_unreadable")
                 if parse_failure is not None:
                     raise parse_failure
                 assert projection is not None
                 if projection.native_id != native_id:
                     raise PlaceholderCreationError("claude_target_mismatch")
                 if projection.title != title:
-                    raise PlaceholderCreationError(
-                        "claude_target_title_mismatch"
-                    )
+                    raise PlaceholderCreationError("claude_target_title_mismatch")
                 if cwd is not None and not _same_filesystem_location(
                     projection.cwd, cwd
                 ):
@@ -544,9 +538,7 @@ class ClaudeTargetAdapter:
             self._sleep(self._poll_interval)
 
 
-def _registration_prompt(
-    *, marker: str, source_session_id: str, bridge_id: str
-) -> str:
+def _registration_prompt(*, marker: str, source_session_id: str, bridge_id: str) -> str:
     return (
         "Hermes Session Bridge registration metadata. "
         f"Signed marker: {marker}. "
@@ -616,9 +608,7 @@ def _single_line_required_text(value: Any, *, label: str) -> str:
     return normalized
 
 
-def _command_prefix(
-    value: str | Sequence[str], *, label: str
-) -> tuple[str, ...]:
+def _command_prefix(value: str | Sequence[str], *, label: str) -> tuple[str, ...]:
     values: Sequence[str] = (value,) if isinstance(value, str) else value
     if not values:
         raise ValueError(f"{label} must not be empty")
@@ -653,13 +643,7 @@ def resolve_claude_command(
         raise RuntimeError("unsupported_shell_shim")
 
     npm_root = candidate.parent
-    cli = (
-        npm_root
-        / "node_modules"
-        / "@anthropic-ai"
-        / "claude-code"
-        / "cli.js"
-    )
+    cli = npm_root / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
     local_node = npm_root / "node.exe"
     resolved_node = (
         local_node
@@ -971,9 +955,7 @@ def _validated_record_native_id(
     subagent_native_id = _subagent_native_id(transcript_path)
     if subagent_native_id is not None:
         expected_agent_id = subagent_native_id.removeprefix("agent-")
-        if len(agent_ids) > 1 or (
-            agent_ids and agent_ids != {expected_agent_id}
-        ):
+        if len(agent_ids) > 1 or (agent_ids and agent_ids != {expected_agent_id}):
             raise ValueError("Claude transcript native identity conflict")
         return subagent_native_id
     return _single_native_id(native_ids)

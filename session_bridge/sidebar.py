@@ -366,9 +366,7 @@ def _is_exact_registration_block(value: object) -> bool:
     try:
         marker = _prompt_line_value(lines[2], "Signed marker: ")
         source = _decode_canonical_prompt_field(lines[3], "Source session ID: ")
-        provider_value = _decode_canonical_prompt_field(
-            lines[4], "Source provider: "
-        )
+        provider_value = _decode_canonical_prompt_field(lines[4], "Source provider: ")
         cwd = _decode_canonical_prompt_field(lines[5], "Source cwd: ")
         git_root = _decode_canonical_prompt_field(lines[6], "Git root: ")
         git_branch = _decode_canonical_prompt_field(lines[7], "Git branch: ")

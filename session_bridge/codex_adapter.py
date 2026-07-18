@@ -187,10 +187,13 @@ class SidebarThreadVerifier:
         self._inventory_thread_cap = inventory_thread_cap
         self._monotonic = monotonic
         self._sleep = sleep
-        self._inventory_snapshot: tuple[
-            float,
-            tuple[SessionProjection, ...],
-        ] | None = None
+        self._inventory_snapshot: (
+            tuple[
+                float,
+                tuple[SessionProjection, ...],
+            ]
+            | None
+        ) = None
 
     def verify_thread(
         self, *, thread_id: str, expected: BridgeMarkerPayload
@@ -279,9 +282,7 @@ class SidebarThreadVerifier:
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            raise SidebarVerificationError(
-                "bridge_temporarily_unavailable"
-            ) from None
+            raise SidebarVerificationError("bridge_temporarily_unavailable") from None
         matches: dict[str, VerifiedSidebarThread] = {}
         for projection in projections:
             if projection.native_status == "archived":
@@ -451,7 +452,9 @@ class CodexSourceAdapter:
             deadline=deadline,
             page_cap=page_cap,
         )
-        found = next((summary for summary in active if summary.native_id == wanted), None)
+        found = next(
+            (summary for summary in active if summary.native_id == wanted), None
+        )
         if found is not None:
             return found
         archived, _ = self._bounded_sidebar_inventory_kind(
@@ -663,7 +666,9 @@ class CodexSourceAdapter:
                     continue
                 prior = combined.get(summary.native_id)
                 if prior is not None and prior != summary:
-                    raise ValueError("Codex thread/list contains conflicting inventory entries")
+                    raise ValueError(
+                        "Codex thread/list contains conflicting inventory entries"
+                    )
                 if prior is None:
                     combined[summary.native_id] = summary
         summaries = sorted(
@@ -678,17 +683,19 @@ class CodexSourceAdapter:
             )
             if reconciled.source_kind is None:
                 raise ValueError("Codex thread source kind is missing")
-            sources.append(SidebarSource(
-                source_session_id=canonical_session_id(
-                    Provider.CODEX, reconciled.native_id
-                ),
-                projection=projection,
-                git_root=reconciled.git_root,
-                git_head=reconciled.git_head,
-                worktree_id=reconciled.worktree_id,
-                automation_only=reconciled.automation_only,
-                subagent_only=reconciled.subagent_only,
-            ))
+            sources.append(
+                SidebarSource(
+                    source_session_id=canonical_session_id(
+                        Provider.CODEX, reconciled.native_id
+                    ),
+                    projection=projection,
+                    git_root=reconciled.git_root,
+                    git_head=reconciled.git_head,
+                    worktree_id=reconciled.worktree_id,
+                    automation_only=reconciled.automation_only,
+                    subagent_only=reconciled.subagent_only,
+                )
+            )
         return tuple(sources)
 
     def project_thread(
@@ -829,9 +836,7 @@ class CodexSourceAdapter:
         self._ensure_initialized()
         wanted = native_id.strip()
 
-        active = self._fetch_inventory(
-            archived=False, source_kinds=source_kinds
-        )
+        active = self._fetch_inventory(archived=False, source_kinds=source_kinds)
         found = next(
             (summary for summary in active if summary.native_id == wanted), None
         )
@@ -839,15 +844,14 @@ class CodexSourceAdapter:
             self._inventory_cache[wanted] = found
             return found
 
-        archived = self._fetch_inventory(
-            archived=True, source_kinds=source_kinds
-        )
+        archived = self._fetch_inventory(archived=True, source_kinds=source_kinds)
         found = next(
             (summary for summary in archived if summary.native_id == wanted), None
         )
         if found is not None:
             self._inventory_cache[wanted] = found
         return found
+
     def _ensure_initialized(self) -> None:
         if self._initialization_failed:
             raise RuntimeError(
@@ -888,9 +892,7 @@ class CodexSourceAdapter:
         source_kinds: tuple[str, ...] | None = None,
     ) -> list[CodexThreadSummary]:
         if source_kinds is None:
-            return self._fetch_inventory_pages(
-                archived=archived, source_kinds=None
-            )
+            return self._fetch_inventory_pages(archived=archived, source_kinds=None)
         try:
             return self._fetch_inventory_pages(
                 archived=archived, source_kinds=source_kinds
@@ -931,7 +933,9 @@ class CodexSourceAdapter:
             raw_entry_count += len(entries)
             for entry in entries:
                 if not isinstance(entry, dict):
-                    raise ValueError("Codex thread/list inventory entry must be an object")
+                    raise ValueError(
+                        "Codex thread/list inventory entry must be an object"
+                    )
                 try:
                     summary = _normalize_summary(entry, archived=archived)
                 except (TypeError, ValueError):
@@ -1065,9 +1069,7 @@ class CodexTargetAdapter:
             )
         except TimeoutError:
             started = None
-            start_failure = AmbiguousPlaceholderCreation(
-                "codex_creation_ambiguous"
-            )
+            start_failure = AmbiguousPlaceholderCreation("codex_creation_ambiguous")
         except Exception:
             started = None
             start_failure = PlaceholderCreationError("codex_thread_start_failed")
@@ -1143,9 +1145,7 @@ class CodexTargetAdapter:
                                 classify_codex_empty_read_error(read_exc, native_id)
                             )
                             if not missing_rollout:
-                                raise PlaceholderCreationError(
-                                    error_code
-                                ) from read_exc
+                                raise PlaceholderCreationError(error_code) from read_exc
                         used_registration_turn = True
                         registration_turn_id = self._start_registration_turn(
                             native_id=native_id, hydration=hydration
@@ -1276,9 +1276,7 @@ class CodexTargetAdapter:
         if identity_failure is not None:
             raise identity_failure
 
-        self._wait_for_registration_completion(
-            native_id=native_id, turn_id=turn_id
-        )
+        self._wait_for_registration_completion(native_id=native_id, turn_id=turn_id)
         return turn_id
 
     def _wait_for_registration_completion(
@@ -1298,7 +1296,10 @@ class CodexTargetAdapter:
                 )
             if notification_failure is not None:
                 raise notification_failure
-            if isinstance(notification, dict) and notification.get("method") == "turn/completed":
+            if (
+                isinstance(notification, dict)
+                and notification.get("method") == "turn/completed"
+            ):
                 params = notification.get("params")
                 turn = params.get("turn") if isinstance(params, dict) else None
                 observed_turn_id = (
@@ -1424,8 +1425,7 @@ class CodexTargetAdapter:
             turn
             for turn in thread["turns"]
             if isinstance(turn, dict)
-            and _nonempty_string(_first(turn, "id", "turnId", "turn_id"))
-            == turn_id
+            and _nonempty_string(_first(turn, "id", "turnId", "turn_id")) == turn_id
         ]
         if not matches:
             raise PlaceholderCreationError("codex_registration_turn_not_found")
@@ -1436,9 +1436,7 @@ class CodexTargetAdapter:
         if status == "inProgress":
             raise PlaceholderCreationError("codex_registration_turn_in_progress")
         if status != "completed":
-            raise PlaceholderCreationError(
-                "codex_registration_turn_not_completed"
-            )
+            raise PlaceholderCreationError("codex_registration_turn_not_completed")
         if not _codex_turn_has_exact_marker(exact_turn, marker=marker):
             raise PlaceholderCreationError("codex_target_marker_mismatch")
         return self._source_adapter.project_thread(summary, response=response)
@@ -1467,9 +1465,7 @@ def _codex_projection_is_authenticated(
     )
 
 
-def _projection_has_exact_marker(
-    projection: SessionProjection, *, marker: str
-) -> bool:
+def _projection_has_exact_marker(projection: SessionProjection, *, marker: str) -> bool:
     return any(
         message.role == "user"
         and bool(message.content)
@@ -1490,8 +1486,7 @@ def _codex_turn_has_exact_marker(turn: dict[str, Any], *, marker: str) -> bool:
             continue
         content = _message_content(item.get("content"))
         if content is not None and any(
-            match.group(0) == marker
-            for match in _MARKER_CANDIDATE_RE.finditer(content)
+            match.group(0) == marker for match in _MARKER_CANDIDATE_RE.finditer(content)
         ):
             return True
     return False
@@ -1676,9 +1671,7 @@ def _codex_existing_directory(value: Path | str | None) -> str | None:
     return None
 
 
-def classify_codex_empty_read_error(
-    exc: Exception, native_id: str
-) -> tuple[bool, str]:
+def classify_codex_empty_read_error(exc: Exception, native_id: str) -> tuple[bool, str]:
     message = getattr(exc, "message", None)
     if not isinstance(message, str) or native_id not in message:
         return False, "codex_empty_read_identity_unconfirmed"
@@ -1686,8 +1679,7 @@ def classify_codex_empty_read_error(
         return False, "codex_empty_read_rpc_error"
     normalized = message.lower()
     missing_rollout = "rollout" in normalized and any(
-        phrase in normalized
-        for phrase in ("failed", "not found", "not persisted")
+        phrase in normalized for phrase in ("failed", "not found", "not persisted")
     )
     if missing_rollout:
         return True, "codex_empty_read_missing_rollout"
@@ -1820,9 +1812,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
             ("gitHead", "git_head", "head"),
             git_aliases=("sha", "gitHead", "git_head", "head"),
         ),
-        worktree_id=_summary_metadata(
-            entry, ("worktreeId", "worktree_id", "worktree")
-        ),
+        worktree_id=_summary_metadata(entry, ("worktreeId", "worktree_id", "worktree")),
         source_kind=source_kind,
         automation_only=automation_only,
         subagent_only=subagent_only,
@@ -1854,7 +1844,9 @@ def _source_kind_metadata(
 
 def _valid_subagent_source(value: Any) -> bool:
     if isinstance(value, str) and value in {
-        "review", "compact", "memory_consolidation"
+        "review",
+        "compact",
+        "memory_consolidation",
     }:
         return True
     if not isinstance(value, dict) or len(value) != 1:
@@ -1947,8 +1939,7 @@ def _cwd_alias_metadata(entry: dict[str, Any]) -> str | None:
         return None
     selected = values[0]
     if any(
-        not _same_filesystem_location(selected, candidate)
-        for candidate in values[1:]
+        not _same_filesystem_location(selected, candidate) for candidate in values[1:]
     ):
         raise CodexInventoryProtocolError("metadata_conflict")
     return selected
@@ -1992,9 +1983,7 @@ def _reconcile_summary_metadata(
             raise CodexInventoryProtocolError("metadata_conflict", field=field)
         return right if right is not None else left
 
-    source_kind = reconcile(
-        summary.source_kind, read_source_kind, field="source kind"
-    )
+    source_kind = reconcile(summary.source_kind, read_source_kind, field="source kind")
     read_cwd = read_metadata["cwd"]
     if (
         summary.cwd is not None

@@ -55,19 +55,34 @@ class InteractivePtyFactory(Protocol):
 
 class ClaudeVisibilityStore(Protocol):
     def commit_claude_visibility_job(
-        self, job_id: str, lease_digest: str, transcript_digest: str,
+        self,
+        job_id: str,
+        lease_digest: str,
+        transcript_digest: str,
         visible_at: float,
     ) -> dict[str, object]: ...
     def retry_claude_visibility_job(
-        self, job_id: str, lease_digest: str, error_code: str,
-        next_attempt_at: float, detail: str,
+        self,
+        job_id: str,
+        lease_digest: str,
+        error_code: str,
+        next_attempt_at: float,
+        detail: str,
     ) -> dict[str, object]: ...
     def fail_claude_visibility_job(
-        self, job_id: str, lease_digest: str, error_code: str, detail: str,
+        self,
+        job_id: str,
+        lease_digest: str,
+        error_code: str,
+        detail: str,
     ) -> dict[str, object]: ...
     def record_claude_visibility_exact_id_absent(
-        self, job_id: str, lease_digest: str, reserved_claude_uuid: str,
-        attempt_ordinal: int, evidence_digest: str,
+        self,
+        job_id: str,
+        lease_digest: str,
+        reserved_claude_uuid: str,
+        attempt_ordinal: int,
+        evidence_digest: str,
     ) -> dict[str, object]: ...
 
 
@@ -214,7 +229,11 @@ def _registrar_pywinpty_process_type() -> Any:
                     raise EOFError("Pty process exited") from exc
                 raise
             if data:
-                return data if isinstance(data, str) else bytes(data).decode("utf-8", "replace")
+                return (
+                    data
+                    if isinstance(data, str)
+                    else bytes(data).decode("utf-8", "replace")
+                )
             if self._native_process_alive() is False:
                 raise EOFError("Pty process exited")
             ready, _, _ = select.select(
@@ -320,10 +339,13 @@ def _reclaim_unadapted_process(process: object, *, timeout: float) -> bool:
         process_dead = not bool(process.isalive())  # type: ignore[attr-defined]
     except Exception:
         process_dead = False
-    descriptors_closed = all(
-        _fileno_closed(getattr(process, name, None))
-        for name in ("fileobj", "_server")
-    ) and getattr(process, "fd", None) == -1
+    descriptors_closed = (
+        all(
+            _fileno_closed(getattr(process, name, None))
+            for name in ("fileobj", "_server")
+        )
+        and getattr(process, "fd", None) == -1
+    )
     reader_stopped = not isinstance(reader, threading.Thread) or not reader.is_alive()
     if process_dead and reader_stopped:
         release_native_pty = getattr(process, "release_native_pty", None)
@@ -335,7 +357,9 @@ def _reclaim_unadapted_process(process: object, *, timeout: float) -> bool:
     native_pty_released = not hasattr(process, "release_native_pty") or (
         getattr(process, "pty", object()) is None
     )
-    return process_dead and descriptors_closed and reader_stopped and native_pty_released
+    return (
+        process_dead and descriptors_closed and reader_stopped and native_pty_released
+    )
 
 
 class _WinPtyProcess:
@@ -407,14 +431,20 @@ class _WinPtyProcess:
                             return
                         time.sleep(0.01)
                         continue
-                    text = chunk.decode("utf-8", "replace") if isinstance(chunk, bytes) else str(chunk)
+                    text = (
+                        chunk.decode("utf-8", "replace")
+                        if isinstance(chunk, bytes)
+                        else str(chunk)
+                    )
                     result.put(text)
             except (EOFError, StopIteration):
                 result.put(None)
             except BaseException as exc:
                 result.put(exc)
 
-        reader = threading.Thread(target=_read, daemon=True, name="session-bridge-winpty-reader")
+        reader = threading.Thread(
+            target=_read, daemon=True, name="session-bridge-winpty-reader"
+        )
         self._reader_thread = reader
         reader.start()
         deadline = time.monotonic() + timeout
@@ -423,12 +453,16 @@ class _WinPtyProcess:
         chunks: list[str] = []
         while True:
             now = time.monotonic()
-            wake_at = deadline if settle_deadline is None else min(deadline, settle_deadline)
+            wake_at = (
+                deadline if settle_deadline is None else min(deadline, settle_deadline)
+            )
             remaining = wake_at - now
             if remaining <= 0:
                 joined = "".join(chunks)
                 if candidate_seen:
-                    return self._finish_read(_normalized_terminal_output(joined, prompt))
+                    return self._finish_read(
+                        _normalized_terminal_output(joined, prompt)
+                    )
                 self._stop_reader()
                 raise TimeoutError
             try:
@@ -438,7 +472,9 @@ class _WinPtyProcess:
             if value is None:
                 joined = "".join(chunks)
                 if candidate_seen:
-                    return self._finish_read(_normalized_terminal_output(joined, prompt))
+                    return self._finish_read(
+                        _normalized_terminal_output(joined, prompt)
+                    )
                 return self._finish_read(_normalized_terminal_output(joined, prompt))
             if isinstance(value, BaseException):
                 self._stop_reader()
@@ -464,7 +500,9 @@ class _WinPtyProcess:
         chunks: list[str] = []
         while True:
             now = time.monotonic()
-            wake_at = deadline if settle_deadline is None else min(deadline, settle_deadline)
+            wake_at = (
+                deadline if settle_deadline is None else min(deadline, settle_deadline)
+            )
             remaining = wake_at - now
             if remaining <= 0:
                 joined = "".join(chunks)
@@ -601,7 +639,11 @@ class _WinPtyProcess:
             exit_code = self._exit_code()
             release_native_pty = getattr(self._process, "release_native_pty", None)
             native_pty_released = not callable(release_native_pty)
-            if process_dead and transport_reader_stopped and callable(release_native_pty):
+            if (
+                process_dead
+                and transport_reader_stopped
+                and callable(release_native_pty)
+            ):
                 try:
                     release_native_pty()
                     native_pty_released = True
@@ -634,7 +676,9 @@ class _WinPtyProcess:
     def _exit_code(self) -> int | None:
         value = getattr(self._process, "exitstatus", None)
         if value is None:
-            getter = getattr(getattr(self._process, "pty", None), "get_exitstatus", None)
+            getter = getattr(
+                getattr(self._process, "pty", None), "get_exitstatus", None
+            )
             try:
                 value = getter() if callable(getter) else None
             except Exception:
@@ -678,13 +722,18 @@ class ClaudeNativeRegistrar:
 
     def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
         if not claim.claimed:
-            return ClaudeRegistrarOutcome(claim.status, claim.job_id, claim.reserved_claude_uuid)
+            return ClaudeRegistrarOutcome(
+                claim.status, claim.job_id, claim.reserved_claude_uuid
+            )
         try:
             self._validate_claim_authority(claim)
         except ValueError:
             return ClaudeRegistrarOutcome(
-                "failed", claim.job_id, claim.reserved_claude_uuid,
-                "bridge_conflict", "claim authority conflict",
+                "failed",
+                claim.job_id,
+                claim.reserved_claude_uuid,
+                "bridge_conflict",
+                "claim authority conflict",
             )
         try:
             candidate, identity = self._materialize_claim(claim)
@@ -761,7 +810,9 @@ class ClaudeNativeRegistrar:
             raise ValueError("inconsistent reconciliation authority")
 
     def _reconcile(
-        self, claim: ClaudeVisibilityClaim, candidate: ClaudeVisibilityCandidate,
+        self,
+        claim: ClaudeVisibilityClaim,
+        candidate: ClaudeVisibilityCandidate,
         identity: ClaudeVisibilityIdentity,
     ) -> ClaudeRegistrarOutcome:
         try:
@@ -769,26 +820,42 @@ class ClaudeNativeRegistrar:
         except _TranscriptConflict as exc:
             return self._fail(claim, exc.code, "exact transcript identity conflict")
         except ValueError:
-            return self._fail(claim, "uuid_conflict", "exact transcript identity conflict")
+            return self._fail(
+                claim, "uuid_conflict", "exact transcript identity conflict"
+            )
         except (OSError, RuntimeError):
-            return self._retry(claim, "native_transcript_not_indexed", "exact transcript lookup unavailable")
+            return self._retry(
+                claim,
+                "native_transcript_not_indexed",
+                "exact transcript lookup unavailable",
+            )
         if found is None:
             evidence = hashlib.sha256(
                 f"absent:{identity.claude_uuid}:{claim.attempt_ordinal}".encode()
             ).hexdigest()
             try:
                 self._store.record_claude_visibility_exact_id_absent(
-                    claim.job_id or "", claim.lease_digest or "", identity.claude_uuid,
-                    claim.attempt_ordinal or 0, evidence,
+                    claim.job_id or "",
+                    claim.lease_digest or "",
+                    identity.claude_uuid,
+                    claim.attempt_ordinal or 0,
+                    evidence,
                 )
             except Exception:
-                return ClaudeRegistrarOutcome("retry", claim.job_id, identity.claude_uuid,
-                                               "session_bridge_unavailable", "store transition unavailable")
+                return ClaudeRegistrarOutcome(
+                    "retry",
+                    claim.job_id,
+                    identity.claude_uuid,
+                    "session_bridge_unavailable",
+                    "store transition unavailable",
+                )
             return ClaudeRegistrarOutcome("absent", claim.job_id, identity.claude_uuid)
         return self._validate_and_commit(claim, candidate, identity, found)
 
     def _launch(
-        self, claim: ClaudeVisibilityClaim, candidate: ClaudeVisibilityCandidate,
+        self,
+        claim: ClaudeVisibilityClaim,
+        candidate: ClaudeVisibilityCandidate,
         identity: ClaudeVisibilityIdentity,
     ) -> ClaudeRegistrarOutcome:
         try:
@@ -801,14 +868,26 @@ class ClaudeNativeRegistrar:
             )
         except (OSError, RuntimeError):
             return self._retry(
-                claim, "native_transcript_not_indexed", "exact transcript lookup unavailable"
+                claim,
+                "native_transcript_not_indexed",
+                "exact transcript lookup unavailable",
             )
         if existing is not None:
             return self._validate_and_commit(claim, candidate, identity, existing)
 
-        argv = [*self._command, "--session-id", identity.claude_uuid,
-                "--name", candidate.native_name, "--model", "haiku", "--tools", "",
-                "--permission-mode", "dontAsk"]
+        argv = [
+            *self._command,
+            "--session-id",
+            identity.claude_uuid,
+            "--name",
+            candidate.native_name,
+            "--model",
+            "haiku",
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+        ]
         process: InteractivePty | None = None
         launched = False
         clean_exit = False
@@ -820,18 +899,30 @@ class ClaudeNativeRegistrar:
             process.write(f"\x1b[200~{prompt}\x1b[201~\r")
             output = process.read_until(self._process_timeout, prompt=prompt)
             if _is_authentication_failure(output):
-                pending = ("retry", "claude_authentication_unavailable", "Claude authentication unavailable")
+                pending = (
+                    "retry",
+                    "claude_authentication_unavailable",
+                    "Claude authentication unavailable",
+                )
             elif not _has_exact_registered_response(output, prompt):
                 pending = ("fail", "bridge_conflict", "registration response malformed")
             else:
                 process.write("/exit\r")
                 exit_code = process.wait(self._exit_timeout)
                 if type(exit_code) is not int or exit_code != 0:
-                    pending = ("retry", "clean_exit_not_observed", "Claude did not exit cleanly")
+                    pending = (
+                        "retry",
+                        "clean_exit_not_observed",
+                        "Claude did not exit cleanly",
+                    )
                 else:
                     clean_exit = True
         except FileNotFoundError:
-            pending = ("retry", "claude_executable_unavailable", "Claude executable unavailable")
+            pending = (
+                "retry",
+                "claude_executable_unavailable",
+                "Claude executable unavailable",
+            )
         except TimeoutError:
             pending = ("retry", "creation_ambiguous", "registration result ambiguous")
         except RuntimeError:
@@ -849,7 +940,8 @@ class ClaudeNativeRegistrar:
                         terminated = False
                     if not terminated:
                         pending = (
-                            "retry", "creation_ambiguous",
+                            "retry",
+                            "creation_ambiguous",
                             "PTY termination was not confirmed",
                         )
                 try:
@@ -858,7 +950,8 @@ class ClaudeNativeRegistrar:
                     cleanup = PtyCleanupResult(False, False, False, None)
                 if not cleanup.succeeded:
                     pending = (
-                        "retry", "creation_ambiguous",
+                        "retry",
+                        "creation_ambiguous",
                         "PTY cleanup postconditions failed",
                     )
 
@@ -883,7 +976,11 @@ class ClaudeNativeRegistrar:
             if found is not None:
                 return self._validate_and_commit(claim, candidate, identity, found)
             if self._monotonic() >= deadline:
-                return self._retry(claim, "native_transcript_not_indexed", "native transcript not indexed")
+                return self._retry(
+                    claim,
+                    "native_transcript_not_indexed",
+                    "native transcript not indexed",
+                )
             self._sleep(self._poll_interval)
 
     def _read_exact(self, native_id: str) -> _ExactTranscript | None:
@@ -902,8 +999,11 @@ class ClaudeNativeRegistrar:
         return _ExactTranscript(path=exact_path, parsed=parsed)
 
     def _validate_and_commit(
-        self, claim: ClaudeVisibilityClaim, candidate: ClaudeVisibilityCandidate,
-        identity: ClaudeVisibilityIdentity, transcript: _ExactTranscript,
+        self,
+        claim: ClaudeVisibilityClaim,
+        candidate: ClaudeVisibilityCandidate,
+        identity: ClaudeVisibilityIdentity,
+        transcript: _ExactTranscript,
     ) -> ClaudeRegistrarOutcome:
         try:
             _validate_projection(transcript, candidate, identity, self._secret)
@@ -912,59 +1012,95 @@ class ClaudeNativeRegistrar:
         projection = transcript.projection
         digest = projection.native_hash
         if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            digest = hashlib.sha256(json.dumps({
-                "native_id": projection.native_id, "native_path": projection.native_path,
-                "last_active": projection.last_active,
-            }, sort_keys=True).encode()).hexdigest()
+            digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "native_id": projection.native_id,
+                        "native_path": projection.native_path,
+                        "last_active": projection.last_active,
+                    },
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
         try:
             self._store.commit_claude_visibility_job(
                 claim.job_id or "", claim.lease_digest or "", digest, self._clock()
             )
         except Exception:
-            return ClaudeRegistrarOutcome("retry", claim.job_id, identity.claude_uuid,
-                                           "session_bridge_unavailable", "store transition unavailable")
+            return ClaudeRegistrarOutcome(
+                "retry",
+                claim.job_id,
+                identity.claude_uuid,
+                "session_bridge_unavailable",
+                "store transition unavailable",
+            )
         return ClaudeRegistrarOutcome("visible", claim.job_id, identity.claude_uuid)
 
-    def _retry(self, claim: ClaudeVisibilityClaim, code: str, detail: str) -> ClaudeRegistrarOutcome:
+    def _retry(
+        self, claim: ClaudeVisibilityClaim, code: str, detail: str
+    ) -> ClaudeRegistrarOutcome:
         try:
             self._store.retry_claude_visibility_job(
-                claim.job_id or "", claim.lease_digest or "", code,
-                self._clock() + self._retry_delay, detail,
+                claim.job_id or "",
+                claim.lease_digest or "",
+                code,
+                self._clock() + self._retry_delay,
+                detail,
             )
         except Exception:
             code, detail = "session_bridge_unavailable", "store transition unavailable"
-        return ClaudeRegistrarOutcome("retry", claim.job_id, claim.reserved_claude_uuid, code, detail)
+        return ClaudeRegistrarOutcome(
+            "retry", claim.job_id, claim.reserved_claude_uuid, code, detail
+        )
 
-    def _fail(self, claim: ClaudeVisibilityClaim, code: str, detail: str) -> ClaudeRegistrarOutcome:
+    def _fail(
+        self, claim: ClaudeVisibilityClaim, code: str, detail: str
+    ) -> ClaudeRegistrarOutcome:
         try:
             self._store.fail_claude_visibility_job(
                 claim.job_id or "", claim.lease_digest or "", code, detail
             )
         except Exception:
             code, detail = "session_bridge_unavailable", "store transition unavailable"
-        return ClaudeRegistrarOutcome("failed", claim.job_id, claim.reserved_claude_uuid, code, detail)
+        return ClaudeRegistrarOutcome(
+            "failed", claim.job_id, claim.reserved_claude_uuid, code, detail
+        )
 
 
 def _validate_projection(
-    transcript: _ExactTranscript, candidate: ClaudeVisibilityCandidate,
-    identity: ClaudeVisibilityIdentity, marker_secret: bytes,
+    transcript: _ExactTranscript,
+    candidate: ClaudeVisibilityCandidate,
+    identity: ClaudeVisibilityIdentity,
+    marker_secret: bytes,
 ) -> None:
     projection = transcript.projection
     if transcript.parsed.malformed_lines or transcript.parsed.unknown_records:
         raise _TranscriptConflict("bridge_conflict")
-    if projection.provider is not Provider.CLAUDE or projection.native_id != identity.claude_uuid:
+    if (
+        projection.provider is not Provider.CLAUDE
+        or projection.native_id != identity.claude_uuid
+    ):
         raise _TranscriptConflict("uuid_conflict")
-    if transcript.path.parent.name != claude_project_directory_name(candidate.source_cwd):
+    if transcript.path.parent.name != claude_project_directory_name(
+        candidate.source_cwd
+    ):
         raise _TranscriptConflict("cwd_conflict")
     if projection.cwd != candidate.source_cwd:
         raise _TranscriptConflict("cwd_conflict")
     if projection.title != candidate.native_name:
         raise _TranscriptConflict("name_conflict")
-    if projection.origin_bridge_id != identity.bridge_id or projection.origin_kind is not OriginKind.BRIDGE_PLACEHOLDER:
+    if (
+        projection.origin_bridge_id != identity.bridge_id
+        or projection.origin_kind is not OriginKind.BRIDGE_PLACEHOLDER
+    ):
         raise _TranscriptConflict("bridge_conflict")
     expected = build_claude_registration_prompt(candidate, identity, marker_secret)
     messages = list(projection.messages)
-    prompt_indexes = [index for index, message in enumerate(messages) if message.role == "user" and message.content == expected]
+    prompt_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.role == "user" and message.content == expected
+    ]
     if len(prompt_indexes) != 1:
         raise _TranscriptConflict("marker_conflict")
     if prompt_indexes != [0]:
@@ -995,12 +1131,12 @@ def _validate_projection(
             or message.reasoning
         ):
             raise _TranscriptConflict("bridge_conflict")
-    if [message.ordinal for message in turn_messages] != list(range(len(turn_messages))):
+    if [message.ordinal for message in turn_messages] != list(
+        range(len(turn_messages))
+    ):
         raise _TranscriptConflict("bridge_conflict")
     aggregate = "".join(
-        message.content
-        for message in turn_messages
-        if isinstance(message.content, str)
+        message.content for message in turn_messages if isinstance(message.content, str)
     )
     if not _is_exact_registered_text(aggregate):
         raise _TranscriptConflict("bridge_conflict")
@@ -1015,7 +1151,11 @@ def _is_exact_registered_text(content: object) -> bool:
 
 def _is_authentication_failure(output: str) -> bool:
     folded = output.casefold()
-    return "authentication required" in folded or "not authenticated" in folded or "please log in" in folded
+    return (
+        "authentication required" in folded
+        or "not authenticated" in folded
+        or "please log in" in folded
+    )
 
 
 def _fileno_closed(resource: object) -> bool:
@@ -1041,7 +1181,7 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
         line = raw.strip()
         for prefix in ("Claude>", ">"):
             if line.startswith(prefix):
-                line = line[len(prefix):].strip()
+                line = line[len(prefix) :].strip()
                 break
         if not line or line in prompt_lines:
             continue
@@ -1068,7 +1208,7 @@ def _has_exact_registered_response(output: str, prompt: str) -> bool:
             continue
         for prefix in ("Claude>", ">"):
             if line.startswith(prefix):
-                line = line[len(prefix):].strip()
+                line = line[len(prefix) :].strip()
                 break
         if line in prompt_lines:
             continue
@@ -1090,13 +1230,13 @@ def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
         line = raw.strip()
         for prefix in ("Claude>", ">"):
             if line.startswith(prefix):
-                line = line[len(prefix):].strip()
+                line = line[len(prefix) :].strip()
                 break
         if line == "REGISTERED":
             suffix = ["REGISTERED"]
             suffix.extend(
                 remainder.strip()
-                for remainder in lines[index + 1:]
+                for remainder in lines[index + 1 :]
                 if remainder.strip()
             )
             return "\n".join(suffix) + "\n"
@@ -1104,7 +1244,10 @@ def _registered_suffix(output: str, *, require_complete: bool) -> str | None:
 
 
 __all__ = [
-    "ClaudeNativeRegistrar", "ClaudeRegistrarOutcome", "InteractivePty",
-    "InteractivePtyFactory", "WindowsConPtyFactory",
+    "ClaudeNativeRegistrar",
+    "ClaudeRegistrarOutcome",
+    "InteractivePty",
+    "InteractivePtyFactory",
+    "WindowsConPtyFactory",
     "PtyCleanupResult",
 ]

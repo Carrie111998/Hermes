@@ -147,9 +147,9 @@ class _SidebarSkillContract:
             if tuple(precedence) != ("cwd", "git_root", "inbox"):
                 raise ValueError("project precedence")
 
-            mapping_block = text.split(
-                "\n## Fixed Failure Mapping\n", 1
-            )[1].split("\n## Deterministic Call-Failure Rules\n", 1)[0]
+            mapping_block = text.split("\n## Fixed Failure Mapping\n", 1)[1].split(
+                "\n## Deterministic Call-Failure Rules\n", 1
+            )[0]
             failure_codes = {
                 label.strip(): code
                 for label, code in re.findall(
@@ -171,9 +171,7 @@ class _SidebarSkillContract:
             ):
                 raise ValueError("fixed failure mapping")
 
-            no_app_server_rule = (
-                "Never use app-server thread creation as a fallback"
-            )
+            no_app_server_rule = "Never use app-server thread creation as a fallback"
             required_rules = (
                 "choose its sidebar project in this exact order",
                 "reconcile before creating anything",
@@ -222,7 +220,9 @@ class _SidebarSkillContract:
             candidate = candidates[source]
             if candidate is not None and candidate in projects:
                 return projects[candidate]
-        raise ValueError(self.failure_code("Project listing or canonical lookup failed"))
+        raise ValueError(
+            self.failure_code("Project listing or canonical lookup failed")
+        )
 
     def validate_trace(self, trace: list[dict[str, Any]]) -> None:
         if not trace or trace[0]["tool"] != self.status_tool:
@@ -273,9 +273,7 @@ class _SidebarSkillContract:
                     self.rename_tool
                 ) > tools.index(self.commit_tool):
                     raise AssertionError("rename must precede commit")
-            fail_events = [
-                event for event in events if event["tool"] == self.fail_tool
-            ]
+            fail_events = [event for event in events if event["tool"] == self.fail_tool]
             if len(fail_events) > 1:
                 raise AssertionError("lease may be failed only once")
             for event in fail_events:
@@ -354,13 +352,17 @@ class _SyntheticCodexClient:
                         for key in (
                             "id",
                             "title",
-                            "cwd",
                             "createdAt",
                             "updatedAt",
                             "archived",
                             "revision",
                         )
                     }
+                    | (
+                        {"cwd": deepcopy(thread["cwd"])}
+                        if thread.get("cwd") is not None
+                        else {}
+                    )
                     for thread in self._threads.values()
                     if bool(thread["archived"]) is archived
                 ]
@@ -376,16 +378,18 @@ class _SyntheticCodexClient:
         if method == "thread/start":
             native_id = f"codex-target-{self._next_thread}"
             self._next_thread += 1
-            self._threads[native_id] = {
+            thread = {
                 "id": native_id,
                 "title": None,
-                "cwd": params.get("cwd"),
                 "createdAt": 200.0,
                 "updatedAt": 200.0,
                 "archived": False,
                 "revision": "revision-1",
                 "turns": [],
             }
+            if params.get("cwd") is not None:
+                thread["cwd"] = params["cwd"]
+            self._threads[native_id] = thread
             return {"thread": {"id": native_id}}
         if method == "thread/name/set":
             thread = self._threads[params["threadId"]]
@@ -578,9 +582,7 @@ class _SyntheticHarnessAdapter:
                 f"{native_id}:{ordinal + 1}:{content}".encode()
             ).hexdigest(),
             origin_kind=(
-                OriginKind.BRIDGE_CONTINUATION
-                if continuation
-                else current.origin_kind
+                OriginKind.BRIDGE_CONTINUATION if continuation else current.origin_kind
             ),
         )
         self.sessions[native_id] = updated
@@ -644,13 +646,11 @@ def _write_claude_transcript(
     path.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
     if title is not None:
-        records.append(
-            {
-                "type": "custom-title",
-                "sessionId": native_id,
-                "customTitle": title,
-            }
-        )
+        records.append({
+            "type": "custom-title",
+            "sessionId": native_id,
+            "customTitle": title,
+        })
     records.extend([
         {
             "type": "user",
@@ -886,18 +886,19 @@ async def test_provider_outage_is_isolated_and_later_scan_recovers(
 
         outage = await coordinator.scan_once(provider)
         assert (outage.indexed, outage.failed) == (0, 1)
-        assert coordinator.health()["providers"][provider.value][
-            "degraded_reason"
-        ] is not None
+        assert (
+            coordinator.health()["providers"][provider.value]["degraded_reason"]
+            is not None
+        )
 
         claude.available = True
         codex_client.available = True
         recovered = await coordinator.scan_once(provider)
 
         assert (recovered.indexed, recovered.failed) == (1, 0)
-        assert coordinator.health()["providers"][provider.value][
-            "degraded_reason"
-        ] is None
+        assert (
+            coordinator.health()["providers"][provider.value]["degraded_reason"] is None
+        )
         assert UnifiedCatalog(db, store).search(
             provider=provider.value,
             limit=10,
@@ -1042,9 +1043,10 @@ async def test_bidirectional_handoff_hydration_continuation_and_local_lifecycle(
         if target_provider is Provider.CLAUDE:
             assert len(claude_runner.calls) == 1
         else:
-            assert sum(
-                method == "thread/start" for method, _params in codex_client.calls
-            ) == 1
+            assert (
+                sum(method == "thread/start" for method, _params in codex_client.calls)
+                == 1
+            )
         marker_payload = BridgeMarkerPayload(
             bridge_id=bridge_id,
             source_session_id=source_id,
@@ -1106,14 +1108,10 @@ async def test_bidirectional_handoff_hydration_continuation_and_local_lifecycle(
         assert target_row["origin_kind"] == OriginKind.BRIDGE_CONTINUATION.value
 
         codex_native_id = (
-            source_native_id
-            if source_provider is Provider.CODEX
-            else target_native_id
+            source_native_id if source_provider is Provider.CODEX else target_native_id
         )
         claude_native_id = (
-            source_native_id
-            if source_provider is Provider.CLAUDE
-            else target_native_id
+            source_native_id if source_provider is Provider.CLAUDE else target_native_id
         )
         codex_id = canonical_session_id(Provider.CODEX, codex_native_id)
         claude_id = canonical_session_id(Provider.CLAUDE, claude_native_id)
@@ -1179,9 +1177,12 @@ async def test_restart_mid_job_recovers_exact_claude_target_once(
             job_ids=[job["id"]],
         )
         assert len(claimed) == 1
-        bridge_id = "bridge:" + hashlib.sha256(
-            f"session-bridge:{job['idempotency_key']}".encode()
-        ).hexdigest()
+        bridge_id = (
+            "bridge:"
+            + hashlib.sha256(
+                f"session-bridge:{job['idempotency_key']}".encode()
+            ).hexdigest()
+        )
         target_native_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -1299,13 +1300,11 @@ class _FakeNativeCodexTasks:
         self.rename_failures_remaining = 0
 
     def add_project(self, project_id: str, path: Path) -> None:
-        self.projects.append(
-            {
-                "projectId": project_id,
-                "path": _canonical_sidebar_path(path),
-                "hostId": None,
-            }
-        )
+        self.projects.append({
+            "projectId": project_id,
+            "path": _canonical_sidebar_path(path),
+            "hostId": None,
+        })
 
     def list_projects(self) -> list[dict[str, Any]]:
         return [dict(project) for project in self.projects]
@@ -1366,9 +1365,7 @@ class _FakeNativeCodexTasks:
     ) -> VerifiedSidebarThread | None:
         self.reconciliation_calls.append(expected)
         matches = [
-            thread
-            for thread in self.threads.values()
-            if thread["payload"] == expected
+            thread for thread in self.threads.values() if thread["payload"] == expected
         ]
         if not matches:
             return None
@@ -1647,9 +1644,7 @@ class _SidebarEndToEndHarness:
         )
 
     def scan_claude_history(self):
-        return asyncio.run(
-            self.coordinator.scan_all_history(Provider.CLAUDE)
-        )
+        return asyncio.run(self.coordinator.scan_all_history(Provider.CLAUDE))
 
     @contextmanager
     def client(self):
@@ -1686,8 +1681,7 @@ class _SidebarEndToEndHarness:
             self.contract.projects_tool,
         )()
         projects = {
-            project["path"]: project["projectId"]
-            for project in listed_projects
+            project["path"]: project["projectId"] for project in listed_projects
         }
 
         trace.append({
@@ -2151,13 +2145,10 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
                 }
             ]
             assert (
-                harness.native.reconciliation_calls[-1].source_session_id
-                == source_id
+                harness.native.reconciliation_calls[-1].source_session_id == source_id
             )
         else:
-            assert first == [
-                {"state": "commit_unknown", "fail_attempted": True}
-            ]
+            assert first == [{"state": "commit_unknown", "fail_attempted": True}]
             assert state_after_drop["state"] == SidebarJobState.VISIBLE.value
             assert second == []
         assert len(harness.native.create_calls) == 1

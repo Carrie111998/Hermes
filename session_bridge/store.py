@@ -234,17 +234,16 @@ def _native_session_snapshot_identity(
     *,
     decode_content: Callable[[Any], Any],
 ) -> dict[str, str]:
-    session_payload = {
-        key: session_row[key] for key in _NATIVE_SESSION_SNAPSHOT_FIELDS
-    }
+    session_payload = {key: session_row[key] for key in _NATIVE_SESSION_SNAPSHOT_FIELDS}
     messages_payload: list[dict[str, Any]] = []
     for row in message_rows:
         message = {key: row[key] for key in _NATIVE_MESSAGE_SNAPSHOT_FIELDS}
         message["content"] = decode_content(message.get("content"))
         messages_payload.append(message)
-    canonical = _canonical_snapshot_value(
-        {"session": session_payload, "messages": messages_payload}
-    )
+    canonical = _canonical_snapshot_value({
+        "session": session_payload,
+        "messages": messages_payload,
+    })
     encoded = json.dumps(
         canonical,
         separators=(",", ":"),
@@ -345,9 +344,7 @@ class SessionBridgeStore:
         sidebar_jitter: Callable[[float], float] | None = None,
         local_timezone: tzinfo | None = None,
         claude_lease_factory: Callable[[], str] | None = None,
-        hermes_profile_db_paths: Callable[
-            [], Sequence[tuple[str, Path]]
-        ] | None = None,
+        hermes_profile_db_paths: Callable[[], Sequence[tuple[str, Path]]] | None = None,
     ) -> None:
         self.db = db
         self._clock = clock
@@ -384,6 +381,7 @@ class SessionBridgeStore:
         if not isinstance(identity, ClaudeVisibilityIdentity):
             raise TypeError("identity must be a ClaudeVisibilityIdentity")
         validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+
         def _write(conn):
             now = _finite_number(self._clock(), "clock")
             row, _created = self._insert_claude_visibility_job(
@@ -394,49 +392,53 @@ class SessionBridgeStore:
         return self.db._execute_write(_write)
 
     def _insert_claude_visibility_job(
-        self, conn: Any, candidate: Any, identity: Any,
-        marker_secret: bytes, now: float,
+        self,
+        conn: Any,
+        candidate: Any,
+        identity: Any,
+        marker_secret: bytes,
+        now: float,
     ) -> tuple[dict[str, Any], bool]:
         from .claude_visibility import validate_claude_visibility_identity_binding
 
         validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
         collisions = conn.execute(
-                """SELECT * FROM session_claude_visibility_jobs
+            """SELECT * FROM session_claude_visibility_jobs
                    WHERE source_session_id = ? OR bridge_id = ?
                       OR idempotency_key = ? OR reserved_claude_uuid = ?
                    ORDER BY id LIMIT 5""",
-                (
-                    candidate.source_session_id,
-                    identity.bridge_id,
-                    identity.idempotency_key,
-                    identity.claude_uuid,
-                ),
-            ).fetchall()
+            (
+                candidate.source_session_id,
+                identity.bridge_id,
+                identity.idempotency_key,
+                identity.claude_uuid,
+            ),
+        ).fetchall()
         if collisions:
             if len(collisions) == 1:
                 existing = dict(collisions[0])
                 immutable = {
-                        "id": identity.job_id,
-                        "source_session_id": candidate.source_session_id,
-                        "bridge_id": identity.bridge_id,
-                        "idempotency_key": identity.idempotency_key,
-                        "reserved_claude_uuid": identity.claude_uuid,
-                        "native_name": candidate.native_name,
-                        "source_provider": candidate.source_provider.value,
-                        "source_cwd": candidate.source_cwd,
-                        "git_root": candidate.git_root,
-                        "git_branch": candidate.git_branch,
-                        "git_head": candidate.git_head,
-                        "worktree_id": candidate.worktree_id,
-                        "signed_marker": identity.signed_marker,
-                        "eligible_at": candidate.eligible_at,
+                    "id": identity.job_id,
+                    "source_session_id": candidate.source_session_id,
+                    "bridge_id": identity.bridge_id,
+                    "idempotency_key": identity.idempotency_key,
+                    "reserved_claude_uuid": identity.claude_uuid,
+                    "native_name": candidate.native_name,
+                    "source_provider": candidate.source_provider.value,
+                    "source_cwd": candidate.source_cwd,
+                    "git_root": candidate.git_root,
+                    "git_branch": candidate.git_branch,
+                    "git_head": candidate.git_head,
+                    "worktree_id": candidate.worktree_id,
+                    "signed_marker": identity.signed_marker,
+                    "eligible_at": candidate.eligible_at,
                 }
                 if all(existing[key] == value for key, value in immutable.items()):
                     return existing, False
             raise ValueError("Claude visibility identity collision")
         try:
             conn.execute(
-                    """INSERT INTO session_claude_visibility_jobs (
+                """INSERT INTO session_claude_visibility_jobs (
                        id, source_session_id, bridge_id, idempotency_key,
                        reserved_claude_uuid, native_name, source_provider,
                        source_cwd, git_root, git_branch, git_head, worktree_id,
@@ -444,25 +446,25 @@ class SessionBridgeStore:
                        eligible_at, created_at, updated_at
                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                  'claude_pending', 0, ?, ?, ?, ?)""",
-                    (
-                        identity.job_id,
-                        candidate.source_session_id,
-                        identity.bridge_id,
-                        identity.idempotency_key,
-                        identity.claude_uuid,
-                        candidate.native_name,
-                        candidate.source_provider.value,
-                        candidate.source_cwd,
-                        candidate.git_root,
-                        candidate.git_branch,
-                        candidate.git_head,
-                        candidate.worktree_id,
-                        identity.signed_marker,
-                        candidate.eligible_at,
-                        candidate.eligible_at,
-                        now,
-                        now,
-                    ),
+                (
+                    identity.job_id,
+                    candidate.source_session_id,
+                    identity.bridge_id,
+                    identity.idempotency_key,
+                    identity.claude_uuid,
+                    candidate.native_name,
+                    candidate.source_provider.value,
+                    candidate.source_cwd,
+                    candidate.git_root,
+                    candidate.git_branch,
+                    candidate.git_head,
+                    candidate.worktree_id,
+                    identity.signed_marker,
+                    candidate.eligible_at,
+                    candidate.eligible_at,
+                    now,
+                    now,
+                ),
             )
         except sqlite3.IntegrityError as exc:
             raise ValueError("Claude visibility identity collision") from exc
@@ -504,13 +506,18 @@ class SessionBridgeStore:
                     GROUP BY state, error_code"""
             ).fetchall()
             known = {
-                "claude_pending", "claude_leased", "claude_retry",
-                "claude_visible", "claude_failed",
+                "claude_pending",
+                "claude_leased",
+                "claude_retry",
+                "claude_visible",
+                "claude_failed",
             }
             unknown = [row for row in grouped if row["state"] not in known]
             if unknown:
                 return {
-                    "status": "fatal", "inserted": 0, "duplicates": 0,
+                    "status": "fatal",
+                    "inserted": 0,
+                    "duplicates": 0,
                     "fatal_reasons": ["unknown_job_state"],
                 }
             fatal_reasons: set[str] = set()
@@ -521,30 +528,35 @@ class SessionBridgeStore:
                         fatal_reasons.add("unknown_retry_code")
                 if row["state"] == "claude_failed" and code is not None:
                     fatal_reasons.add(
-                        code if code in CLAUDE_VISIBILITY_FATAL_CODES
+                        code
+                        if code in CLAUDE_VISIBILITY_FATAL_CODES
                         else "unknown_failed_code"
                     )
-                if row["state"] in {
-                    "claude_pending", "claude_visible"
-                } and code is not None:
+                if (
+                    row["state"] in {"claude_pending", "claude_visible"}
+                    and code is not None
+                ):
                     fatal_reasons.add("unknown_error_code")
                 if (
                     row["state"] == "claude_leased"
                     and code is not None
-                    and code not in (
+                    and code
+                    not in (
                         CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
                     )
                 ):
                     fatal_reasons.add("unknown_error_code")
             if fatal_reasons:
                 return {
-                    "status": "fatal", "inserted": 0, "duplicates": 0,
+                    "status": "fatal",
+                    "inserted": 0,
+                    "duplicates": 0,
                     "fatal_reasons": sorted(fatal_reasons),
                 }
             if any(
-                row["state"] in {
-                    "claude_pending", "claude_leased", "claude_retry", "claude_failed"
-                } and int(row["count"]) > 0
+                row["state"]
+                in {"claude_pending", "claude_leased", "claude_retry", "claude_failed"}
+                and int(row["count"]) > 0
                 for row in grouped
             ):
                 return {"status": "open_work", "inserted": 0, "duplicates": 0}
@@ -558,7 +570,8 @@ class SessionBridgeStore:
                 inserted += int(created)
                 duplicates += int(not created)
             return {
-                "status": "inserted", "inserted": inserted,
+                "status": "inserted",
+                "inserted": inserted,
                 "duplicates": duplicates,
             }
 
@@ -598,9 +611,7 @@ class SessionBridgeStore:
         if due is None:
             return ClaudeVisibilityClaim(status="no_due_job")
         prior_error = (
-            "lease_expired"
-            if due["state"] == "claude_leased"
-            else due["error_code"]
+            "lease_expired" if due["state"] == "claude_leased" else due["error_code"]
         )
         return ClaudeVisibilityClaim(
             status="reconciliation_required",
@@ -702,6 +713,7 @@ class SessionBridgeStore:
             raise ValueError(
                 "Claude reconciliation evidence digest must be lowercase SHA-256"
             )
+
         def _write(conn):
             reconciled_at = _finite_number(self._clock(), "clock")
             inserted = conn.execute(
@@ -773,7 +785,11 @@ class SessionBridgeStore:
         lease_duration = _finite_number(lease_seconds, "lease_seconds")
         if lease_duration <= 0:
             raise ValueError("lease_seconds must be positive")
-        if not isinstance(daily_limit, int) or isinstance(daily_limit, bool) or daily_limit < 1:
+        if (
+            not isinstance(daily_limit, int)
+            or isinstance(daily_limit, bool)
+            or daily_limit < 1
+        ):
             raise ValueError("daily_limit must be a positive integer")
         if daily_limit > 25:
             raise ValueError("daily_limit cannot exceed 25")
@@ -865,11 +881,14 @@ class SessionBridgeStore:
             lease_digest = hashlib.sha256(
                 self._claude_lease_factory().encode("utf-8")
             ).hexdigest()
-            if conn.execute(
-                """SELECT 1 FROM session_claude_visibility_jobs
+            if (
+                conn.execute(
+                    """SELECT 1 FROM session_claude_visibility_jobs
                    WHERE lease_digest = ? LIMIT 1""",
-                (lease_digest,),
-            ).fetchone() is not None:
+                    (lease_digest,),
+                ).fetchone()
+                is not None
+            ):
                 raise ValueError("Claude visibility lease factory returned a duplicate")
             attempt = int(due["attempts"]) + 1
             prior_error_code = due["error_code"]
@@ -950,11 +969,14 @@ class SessionBridgeStore:
         lease_digest = hashlib.sha256(
             self._claude_lease_factory().encode("utf-8")
         ).hexdigest()
-        if conn.execute(
-            """SELECT 1 FROM session_claude_visibility_jobs
+        if (
+            conn.execute(
+                """SELECT 1 FROM session_claude_visibility_jobs
                WHERE lease_digest = ? LIMIT 1""",
-            (lease_digest,),
-        ).fetchone() is not None:
+                (lease_digest,),
+            ).fetchone()
+            is not None
+        ):
             raise ValueError("Claude visibility lease factory returned a duplicate")
         cursor = conn.execute(
             """UPDATE session_claude_visibility_jobs
@@ -1116,6 +1138,7 @@ class SessionBridgeStore:
         normalized_lease = _exact_nonempty_text(
             lease_digest, "Claude visibility lease digest"
         )
+
         def _write(conn):
             updated_at = _finite_number(self._clock(), "clock")
             active = conn.execute(
@@ -1214,7 +1237,8 @@ class SessionBridgeStore:
                 counts[row["state"]] = int(row["count"])
             else:
                 matching_codes = [
-                    code_row for code_row in code_rows
+                    code_row
+                    for code_row in code_rows
                     if code_row["state"] == row["state"]
                 ]
                 if not matching_codes:
@@ -1227,8 +1251,7 @@ class SessionBridgeStore:
                             code_row["error_code"], optional=True
                         ),
                         "count": int(
-                            code_row["count"]
-                            if code_row["count"] is not None else 0
+                            code_row["count"] if code_row["count"] is not None else 0
                         ),
                     })
         retry_codes: dict[str, int] = {}
@@ -1237,9 +1260,13 @@ class SessionBridgeStore:
             safe_code = _claude_status_token(row["error_code"])
             assert safe_code is not None
             if row["state"] == "claude_retry":
-                retry_codes[safe_code] = retry_codes.get(safe_code, 0) + int(row["count"])
+                retry_codes[safe_code] = retry_codes.get(safe_code, 0) + int(
+                    row["count"]
+                )
             elif row["state"] == "claude_failed":
-                failed_codes[safe_code] = failed_codes.get(safe_code, 0) + int(row["count"])
+                failed_codes[safe_code] = failed_codes.get(safe_code, 0) + int(
+                    row["count"]
+                )
             elif row["state"] in counts:
                 fatal.append({
                     "code": "unknown_error_code",
@@ -1377,9 +1404,7 @@ class SessionBridgeStore:
 
     @contextmanager
     def _native_hermes_databases(self):
-        databases: list[tuple[str, SessionDB, bool]] = [
-            ("default", self.db, False)
-        ]
+        databases: list[tuple[str, SessionDB, bool]] = [("default", self.db, False)]
         seen = {str(self.db.db_path.resolve()).casefold()}
         try:
             for profile, raw_path in self._hermes_profile_db_paths():
@@ -1447,12 +1472,29 @@ class SessionBridgeStore:
         session_columns = cls._database_columns(database, "sessions")
         message_columns = cls._database_columns(database, "messages")
         return {
-            "id", "source", "model", "title", "started_at", "ended_at",
-            "message_count", "cwd", "git_branch", "git_repo_root",
-            "parent_session_id", "archived",
+            "id",
+            "source",
+            "model",
+            "title",
+            "started_at",
+            "ended_at",
+            "message_count",
+            "cwd",
+            "git_branch",
+            "git_repo_root",
+            "parent_session_id",
+            "archived",
         }.issubset(session_columns) and {
-            "id", "session_id", "role", "content", "tool_call_id",
-            "tool_calls", "tool_name", "timestamp", "active", "compacted",
+            "id",
+            "session_id",
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "timestamp",
+            "active",
+            "compacted",
         }.issubset(message_columns)
 
     def try_acquire_mirror_worker_lock(self) -> _MirrorWorkerFileLock | None:
@@ -2010,9 +2052,13 @@ class SessionBridgeStore:
 
         cutoff = _finite_number(after, "Claude visibility candidate cutoff")
         if limit is not None and (
-            not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
         ):
-            raise ValueError("Claude visibility candidate limit must be between 1 and 1000")
+            raise ValueError(
+                "Claude visibility candidate limit must be between 1 and 1000"
+            )
         sources: list[SidebarSource] = []
         with self._native_hermes_databases() as databases:
             for _profile, database, _owned in databases:
@@ -2088,9 +2134,7 @@ class SessionBridgeStore:
                         sort_keys=True,
                         separators=(",", ":"),
                     )
-                    snapshots[source_id] = _decode_worktree_snapshot(
-                        payload, source_id
-                    )
+                    snapshots[source_id] = _decode_worktree_snapshot(payload, source_id)
             for start in range(0, len(keys), _MESSAGE_KEY_QUERY_CHUNK):
                 batch = keys[start : start + _MESSAGE_KEY_QUERY_CHUNK]
                 placeholders = ",".join("?" for _ in batch)
@@ -2101,9 +2145,7 @@ class SessionBridgeStore:
                 ).fetchall()
                 for row in rows:
                     source_id = key_to_source[row["key"]]
-                    snapshot = _decode_worktree_snapshot(
-                        row["value_json"], source_id
-                    )
+                    snapshot = _decode_worktree_snapshot(row["value_json"], source_id)
                     prior = snapshots.get(source_id)
                     if prior is not None and prior != snapshot:
                         raise ValueError(
@@ -2206,13 +2248,15 @@ class SessionBridgeStore:
                 for message in message_rows:
                     message_id = int(message["id"])
                     decoded = database._decode_content(message["content"])
-                    messages[message["session_id"]].append(ProjectedMessage(
-                        native_event_id=f"hermes-message:{message_id}",
-                        ordinal=message_id,
-                        role=message["role"],
-                        content=decoded if isinstance(decoded, str) else None,
-                        timestamp=float(message["timestamp"]),
-                    ))
+                    messages[message["session_id"]].append(
+                        ProjectedMessage(
+                            native_event_id=f"hermes-message:{message_id}",
+                            ordinal=message_id,
+                            role=message["role"],
+                            content=decoded if isinstance(decoded, str) else None,
+                            timestamp=float(message["timestamp"]),
+                        )
+                    )
         sources: list[SidebarSource] = []
         for row in rows:
             incoming_relation = row["incoming_relation"]
@@ -2223,27 +2267,29 @@ class SessionBridgeStore:
             else:
                 origin_kind = OriginKind.NATIVE
             source_session_id = row["session_id"]
-            sources.append(SidebarSource(
-                source_session_id=source_session_id,
-                projection=SessionProjection(
-                    provider=Provider.HERMES,
-                    native_id=source_session_id,
-                    title=row["title"],
-                    cwd=row["cwd"],
-                    started_at=float(row["started_at"]),
-                    last_active=float(row["last_active"]),
-                    messages=tuple(messages[source_session_id]),
-                    native_status="active",
-                    origin_kind=origin_kind,
-                    origin_bridge_id=row["incoming_bridge_id"],
-                    git_branch=row["git_branch"],
-                ),
-                git_root=row["git_repo_root"],
-                git_head=None,
-                worktree_id=None,
-                automation_only=bool(row["automation_only"]),
-                subagent_only=bool(row["subagent_only"]),
-            ))
+            sources.append(
+                SidebarSource(
+                    source_session_id=source_session_id,
+                    projection=SessionProjection(
+                        provider=Provider.HERMES,
+                        native_id=source_session_id,
+                        title=row["title"],
+                        cwd=row["cwd"],
+                        started_at=float(row["started_at"]),
+                        last_active=float(row["last_active"]),
+                        messages=tuple(messages[source_session_id]),
+                        native_status="active",
+                        origin_kind=origin_kind,
+                        origin_bridge_id=row["incoming_bridge_id"],
+                        git_branch=row["git_branch"],
+                    ),
+                    git_root=row["git_repo_root"],
+                    git_head=None,
+                    worktree_id=None,
+                    automation_only=bool(row["automation_only"]),
+                    subagent_only=bool(row["subagent_only"]),
+                )
+            )
         return sources
 
     def list_sidebar_candidates(
@@ -2514,9 +2560,7 @@ class SessionBridgeStore:
                     AND candidate.session_id > :cursor_session_id
                 )
             )"""
-            params.update(
-                cursor_activity=cursor[0], cursor_session_id=cursor[1]
-            )
+            params.update(cursor_activity=cursor[0], cursor_session_id=cursor[1])
         with self.db._lock:
             root_conn = self.db._conn
             assert root_conn is not None
@@ -2647,9 +2691,7 @@ class SessionBridgeStore:
                 return metadata
         return None
 
-    def get_native_session_snapshot(
-        self, session_id: str
-    ) -> dict[str, str] | None:
+    def get_native_session_snapshot(self, session_id: str) -> dict[str, str] | None:
         """Return a stable snapshot identity for a native Hermes session.
 
         External harness sessions already carry provider cursors and hashes in
@@ -2660,15 +2702,19 @@ class SessionBridgeStore:
 
         normalized_session_id = _nonempty_text(session_id, "session ID")
         with self._native_hermes_databases() as databases:
-            matches: list[tuple[str, SessionDB, Mapping[str, Any], list[Mapping[str, Any]]]] = []
+            matches: list[
+                tuple[str, SessionDB, Mapping[str, Any], list[Mapping[str, Any]]]
+            ] = []
             for profile, database, _owned in databases:
-                if database is not self.db and not self._profile_catalog_compatible(database):
+                if database is not self.db and not self._profile_catalog_compatible(
+                    database
+                ):
                     continue
                 with database._lock:
                     conn = database._conn
                     assert conn is not None
                     session_row = conn.execute(
-                """SELECT s.id, s.source, s.model, s.title, s.started_at,
+                        """SELECT s.id, s.source, s.model, s.title, s.started_at,
                           s.ended_at, s.end_reason, s.message_count,
                           s.tool_call_count, s.cwd, s.git_branch,
                           s.git_repo_root, s.rewind_count, s.archived,
@@ -2676,14 +2722,14 @@ class SessionBridgeStore:
                      FROM sessions AS s
                      LEFT JOIN external_sessions AS e ON e.session_id = s.id
                     WHERE s.id = ?""",
-                (normalized_session_id,),
+                        (normalized_session_id,),
                     ).fetchone()
                     if session_row is None:
                         continue
                     if session_row["source"] == _PROFILE_SHADOW_SOURCE:
                         continue
                     message_rows = conn.execute(
-                """SELECT id, role, content, tool_call_id, tool_calls,
+                        """SELECT id, role, content, tool_call_id, tool_calls,
                           tool_name, timestamp, finish_reason, reasoning,
                           reasoning_details, codex_reasoning_items,
                           reasoning_content, codex_message_items, active,
@@ -2691,13 +2737,15 @@ class SessionBridgeStore:
                      FROM messages
                     WHERE session_id = ?
                     ORDER BY id""",
-                (normalized_session_id,),
+                        (normalized_session_id,),
                     ).fetchall()
                 matches.append((profile, database, session_row, message_rows))
             if not matches:
                 raise KeyError(normalized_session_id)
             if len(matches) != 1:
-                raise ValueError("duplicate native Hermes session identity across profiles")
+                raise ValueError(
+                    "duplicate native Hermes session identity across profiles"
+                )
             profile, database, session_row, message_rows = matches[0]
             if session_row["external_session_id"] is not None:
                 return None
@@ -3266,9 +3314,7 @@ class SessionBridgeStore:
 
         token_digest = _sidebar_lease_digest(lease_token)
         thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
-        source_id = _exact_nonempty_text(
-            source_session_id, "sidebar source session ID"
-        )
+        source_id = _exact_nonempty_text(source_session_id, "sidebar source session ID")
         normalized_bridge_id = _exact_nonempty_text(bridge_id, "sidebar bridge ID")
         commit_time = _finite_number(now, "now")
 
@@ -3729,9 +3775,7 @@ class SessionBridgeStore:
                 eligible_by_provider[row["provider"]] = int(row["job_count"])
         oldest_at = oldest["actionable_at"] if oldest is not None else None
         oldest_age = (
-            max(0.0, status_time - float(oldest_at))
-            if oldest_at is not None
-            else None
+            max(0.0, status_time - float(oldest_at)) if oldest_at is not None else None
         )
         heartbeat = self.get_state("session-bridge:sidebar:broker-heartbeat")
         heartbeat_at = heartbeat.get("at") if isinstance(heartbeat, Mapping) else None
@@ -3743,14 +3787,14 @@ class SessionBridgeStore:
             code = row["error_code"]
             if code in allowed_codes and code not in recent_codes:
                 recent_codes.append(code)
-        latencies = sorted(
-            max(0.0, float(row["latency"])) for row in latency_rows
-        )
+        latencies = sorted(max(0.0, float(row["latency"])) for row in latency_rows)
         return {
             "eligible_by_provider": eligible_by_provider,
             "counts": counts,
             "oldest_pending_age_seconds": oldest_age,
-            "last_heartbeat_at": float(heartbeat_at) if heartbeat_at is not None else None,
+            "last_heartbeat_at": float(heartbeat_at)
+            if heartbeat_at is not None
+            else None,
             "last_visible_task_id": (
                 last_visible["codex_thread_id"] if last_visible is not None else None
             ),
@@ -3785,9 +3829,7 @@ class SessionBridgeStore:
     ) -> SidebarCandidate:
         """Read immutable, bounded delivery metadata for an already queued job."""
 
-        source_id = _exact_nonempty_text(
-            source_session_id, "sidebar source session ID"
-        )
+        source_id = _exact_nonempty_text(source_session_id, "sidebar source session ID")
         state_key = _sidebar_delivery_state_key(source_id)
         with self.db._lock:
             conn = self.db._conn
@@ -3824,9 +3866,7 @@ class SessionBridgeStore:
     ) -> dict[str, Any]:
         """Idempotently bind one verified native Codex task to its source."""
 
-        source_id = _exact_nonempty_text(
-            source_session_id, "sidebar source session ID"
-        )
+        source_id = _exact_nonempty_text(source_session_id, "sidebar source session ID")
         normalized_bridge_id = _exact_nonempty_text(bridge_id, "sidebar bridge ID")
         thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
 
@@ -4183,11 +4223,7 @@ class SessionBridgeStore:
             current = _read_breaker_progress(conn)
             if reset and current["pending"]:
                 raise ValueError("cannot reset mirror breaker with pending attempts")
-            base = (
-                {"attempts": 0, "errors": 0, "pending": 0}
-                if reset
-                else current
-            )
+            base = {"attempts": 0, "errors": 0, "pending": 0} if reset else current
             updated = {
                 "attempts": base["attempts"] + attempts,
                 "errors": base["errors"] + errors,
@@ -4812,9 +4848,7 @@ class SessionBridgeStore:
             raise ValueError(f"bridge state {key!r} is not a JSON object")
         return value
 
-    def get_continuation_snapshot(
-        self, bridge_id: str
-    ) -> dict[str, Any] | None:
+    def get_continuation_snapshot(self, bridge_id: str) -> dict[str, Any] | None:
         normalized_bridge_id = _nonempty_text(bridge_id, "bridge ID")
         state_key = _continuation_snapshot_state_key(normalized_bridge_id)
         with self.db._lock:
@@ -4870,9 +4904,7 @@ class SessionBridgeStore:
             ).fetchall()
             snapshots: list[dict[str, Any]] = []
             for row in rows:
-                raw_bridge_id = row["key"][
-                    len(_CONTINUATION_SNAPSHOT_STATE_PREFIX) :
-                ]
+                raw_bridge_id = row["key"][len(_CONTINUATION_SNAPSHOT_STATE_PREFIX) :]
                 bridge_id = _nonempty_text(
                     raw_bridge_id,
                     "continuation snapshot bridge ID",
@@ -5171,11 +5203,14 @@ def _decode_worktree_snapshot(
         or payload.get("source_session_id") != expected_source_session_id
     ):
         raise ValueError("invalid worktree snapshot")
-    required_values = tuple(payload.get(field) for field in (
-        "source_session_id",
-        "cwd",
-        "worktree_id",
-    ))
+    required_values = tuple(
+        payload.get(field)
+        for field in (
+            "source_session_id",
+            "cwd",
+            "worktree_id",
+        )
+    )
     if any(
         not isinstance(value, str)
         or not value
@@ -5184,11 +5219,14 @@ def _decode_worktree_snapshot(
         for value in required_values
     ):
         raise ValueError("invalid worktree snapshot")
-    optional_values = tuple(payload.get(field) for field in (
-        "git_root",
-        "branch",
-        "head",
-    ))
+    optional_values = tuple(
+        payload.get(field)
+        for field in (
+            "git_root",
+            "branch",
+            "head",
+        )
+    )
     if any(
         value is not None
         and (
@@ -5304,19 +5342,12 @@ def _decode_sidebar_delivery_candidate(value_json: object) -> SidebarCandidate:
         for value in required
     ) or any(
         value is not None
-        and (
-            not isinstance(value, str)
-            or not value.strip()
-            or _redact(value) != value
-        )
+        and (not isinstance(value, str) or not value.strip() or _redact(value) != value)
         for value in optional
     ):
         raise ValueError("invalid sidebar delivery candidate")
     title = payload["title"]
-    if any(
-        character in title
-        for character in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
-    ):
+    if any(character in title for character in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"):
         raise ValueError("invalid sidebar delivery candidate")
     try:
         candidate = SidebarCandidate(
@@ -5403,7 +5434,9 @@ def _read_rate_attempts(conn: Any, *, now: float) -> list[float]:
     return recent
 
 
-def _write_rate_attempts(conn: Any, attempted_at: Sequence[float], *, updated_at: float) -> None:
+def _write_rate_attempts(
+    conn: Any, attempted_at: Sequence[float], *, updated_at: float
+) -> None:
     value_json = json.dumps(
         {"version": 1, "attempted_at": list(attempted_at)},
         sort_keys=True,
@@ -5478,10 +5511,7 @@ def _healthy_breaker_batch_completed(
     return (
         attempts >= stop_after_attempts
         and progress["pending"] == 0
-        and (
-            progress["errors"] == 0
-            or progress["errors"] / attempts < stop_error_rate
-        )
+        and (progress["errors"] == 0 or progress["errors"] / attempts < stop_error_rate)
     )
 
 
@@ -5490,8 +5520,10 @@ def _breaker_is_halted(
 ) -> bool:
     attempts = progress["attempts"]
     errors = progress["errors"]
-    return progress["pending"] > 0 or attempts >= stop_after_attempts or (
-        attempts > 0 and errors > 0 and errors / attempts >= stop_error_rate
+    return (
+        progress["pending"] > 0
+        or attempts >= stop_after_attempts
+        or (attempts > 0 and errors > 0 and errors / attempts >= stop_error_rate)
     )
 
 
@@ -5689,7 +5721,9 @@ def _model_config_has_delegate(value: object) -> bool:
     return isinstance(decoded, Mapping) and decoded.get("_delegate_from") is not None
 
 
-def _nearest_rank_percentile(values: Sequence[float], percentile: float) -> float | None:
+def _nearest_rank_percentile(
+    values: Sequence[float], percentile: float
+) -> float | None:
     if not values:
         return None
     rank = max(1, math.ceil(percentile * len(values)))
@@ -5736,9 +5770,7 @@ def _validated_sidebar_candidate_cursor(
     if not isinstance(cursor, tuple) or len(cursor) != 2:
         raise ValueError("sidebar candidate cursor must be an exact pair")
     activity = _finite_number(cursor[0], "sidebar candidate cursor activity")
-    session_id = _exact_nonempty_text(
-        cursor[1], "sidebar candidate cursor session ID"
-    )
+    session_id = _exact_nonempty_text(cursor[1], "sidebar candidate cursor session ID")
     from .sidebar import sidebar_idempotency_key
 
     sidebar_idempotency_key(session_id)
@@ -6027,9 +6059,7 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
         return {}
     status = _claude_status_token(last_result.get("status"))
     error_code = _claude_status_token(last_result.get("error_code"), optional=True)
-    empty_verified = (
-        last_result.get("empty_verified") if current_version else False
-    )
+    empty_verified = last_result.get("empty_verified") if current_version else False
     if (
         status in {None, "invalid", "redacted"}
         or error_code in {"invalid", "redacted"}
@@ -6037,9 +6067,7 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
     ):
         return {}
     decoded: dict[str, Any] = {
-        "version": (
-            _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION if current_version else 1
-        ),
+        "version": (_CLAUDE_VISIBILITY_CYCLE_STATE_VERSION if current_version else 1),
         "sequence": sequence,
         "last_cycle_at": float(last_cycle_at),
         "last_result": {

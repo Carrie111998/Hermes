@@ -193,7 +193,9 @@ class _SuccessfulCodexAdapter:
         return (
             []
             if archived
-            else [_codex_summary(self.projection.native_id, self.projection.last_active)]
+            else [
+                _codex_summary(self.projection.native_id, self.projection.last_active)
+            ]
         )
 
     def project_thread(self, summary: object) -> SessionProjection:
@@ -344,9 +346,10 @@ class _BacklogCodexAdapter:
             self.operations.append(("inventory", ()))
             return []
         batch = self.inventory_batches.pop(0)
-        self.operations.append(
-            ("inventory", tuple(summary.native_id for summary in batch))
-        )
+        self.operations.append((
+            "inventory",
+            tuple(summary.native_id for summary in batch),
+        ))
         return batch
 
     def find_native_thread(
@@ -502,9 +505,12 @@ def _attempt_sidecar(bridge_id: str) -> dict[str, Any]:
 
 
 def _expected_bridge_id(job: Mapping[str, Any]) -> str:
-    return "bridge:" + hashlib.sha256(
-        f"session-bridge:{job['idempotency_key']}".encode()
-    ).hexdigest()
+    return (
+        "bridge:"
+        + hashlib.sha256(
+            f"session-bridge:{job['idempotency_key']}".encode()
+        ).hexdigest()
+    )
 
 
 class _JobCodexSourceAdapter:
@@ -684,9 +690,11 @@ class _JobStore:
         *,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        self.operations.append(
-            ("list_jobs", tuple(str(state) for state in states), limit)
-        )
+        self.operations.append((
+            "list_jobs",
+            tuple(str(state) for state in states),
+            limit,
+        ))
         return deepcopy(self.running)
 
     def mirror_job_counts(self) -> dict[str, int]:
@@ -783,9 +791,11 @@ class _ActiveJobStore(_JobStore):
         *,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        self.operations.append(
-            ("list_jobs", tuple(str(state) for state in states), limit)
-        )
+        self.operations.append((
+            "list_jobs",
+            tuple(str(state) for state in states),
+            limit,
+        ))
         return deepcopy(self.running if self.active else [])
 
     def complete_job(
@@ -1021,9 +1031,7 @@ class _ContinuationStore:
             "source_hash": source_hash,
         }
 
-    def get_native_session_snapshot(
-        self, session_id: str
-    ) -> dict[str, Any] | None:
+    def get_native_session_snapshot(self, session_id: str) -> dict[str, Any] | None:
         self.operations.append(("get_native", session_id))
         row = self.native.get(session_id)
         return deepcopy(row) if row is not None else None
@@ -1096,12 +1104,14 @@ class _ContinuationStore:
         target_cursor: str,
         target_hash: str,
     ) -> dict[str, Any]:
-        self.operations.append(
-            ("transition", bridge_id, pack_id, target_cursor, target_hash)
-        )
-        self.transition_calls.append(
-            (bridge_id, pack_id, target_cursor, target_hash)
-        )
+        self.operations.append((
+            "transition",
+            bridge_id,
+            pack_id,
+            target_cursor,
+            target_hash,
+        ))
+        self.transition_calls.append((bridge_id, pack_id, target_cursor, target_hash))
         assert self.pack is not None
         assert self.pack.id == pack_id
         if self.pack.immutable_at is None:
@@ -1231,9 +1241,7 @@ def _exact_cwd_repo(path: Path) -> Path:
     subprocess.run([*git, "init", "-b", "main"], check=True, capture_output=True)
     (path / "tracked.txt").write_text("initial", encoding="utf-8")
     subprocess.run([*git, "add", "tracked.txt"], check=True, capture_output=True)
-    subprocess.run(
-        [*git, "commit", "-m", "initial"], check=True, capture_output=True
-    )
+    subprocess.run([*git, "commit", "-m", "initial"], check=True, capture_output=True)
     return path
 
 
@@ -1242,7 +1250,7 @@ def _remove_tree(path: Path) -> None:
         os.chmod(value, stat.S_IWRITE)
         function(value)
 
-    shutil.rmtree(path, onexc=_make_writable)
+    shutil.rmtree(path, onerror=_make_writable)
 
 
 def _directory_alias(alias: Path, target: Path) -> str:
@@ -1259,9 +1267,7 @@ def _directory_alias(alias: Path, target: Path) -> str:
             timeout=10,
         )
         if completed.returncode != 0:
-            pytest.skip(
-                "directory retarget race test requires a symlink or junction"
-            )
+            pytest.skip("directory retarget race test requires a symlink or junction")
         return "junction"
 
 
@@ -1536,8 +1542,9 @@ async def test_scan_all_history_is_newest_first_catalog_only_and_aggregates_fail
 
 
 @pytest.mark.asyncio
-async def test_scan_all_codex_history_includes_archived_when_steady_state_excludes_it(
-) -> None:
+async def test_scan_all_codex_history_includes_archived_when_steady_state_excludes_it() -> (
+    None
+):
     codex = _FullHistoryCodexAdapter(
         active=[_codex_summary("codex-active", 300.0)],
         archived=[_codex_summary("codex-archived", 200.0)],
@@ -1931,8 +1938,9 @@ async def test_claude_bounded_scan_isolates_a_path_that_disappears_before_stat(
 
 
 @pytest.mark.asyncio
-async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_loss(
-) -> None:
+async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_loss() -> (
+    None
+):
     summaries = {
         "codex-new": _codex_summary("codex-new", 300.0),
         "codex-middle": _codex_summary("codex-middle", 200.0),
@@ -2117,8 +2125,8 @@ async def test_periodic_all_provider_scan_recovers_without_watcher_events(
     try:
         await _wait_until(
             lambda: (
-                    claude.discover_calls >= 3
-                    and codex.inventory_calls == 2 * claude.discover_calls
+                claude.discover_calls >= 3
+                and codex.inventory_calls == 2 * claude.discover_calls
             )
         )
 
@@ -2157,9 +2165,7 @@ async def test_watcher_failure_is_sanitized_and_periodic_scans_continue(
             )
         )
         awatch.fail(RuntimeError(f"watch failed {secret} at {private_path}"))
-        await _wait_until(
-            lambda: coordinator.health()["watcher_state"] == "degraded"
-        )
+        await _wait_until(lambda: coordinator.health()["watcher_state"] == "degraded")
         calls_at_failure = (claude.discover_calls, codex.inventory_calls)
         await _wait_until(
             lambda: (
@@ -2233,14 +2239,12 @@ async def test_process_jobs_once_passes_exact_scope_and_limit_to_atomic_store() 
             policy: MirrorPolicy,
             job_ids: Sequence[str] | None = None,
         ) -> list[dict[str, Any]]:
-            self.scoped_claims.append(
-                {
-                    "now": now,
-                    "limit": limit,
-                    "policy": policy,
-                    "job_ids": job_ids,
-                }
-            )
+            self.scoped_claims.append({
+                "now": now,
+                "limit": limit,
+                "policy": policy,
+                "job_ids": job_ids,
+            })
             return []
 
     store = ScopedStore()
@@ -2420,8 +2424,9 @@ async def test_successful_create_indexes_exact_target_before_completing_job() ->
 
 
 @pytest.mark.asyncio
-async def test_explicit_manual_retry_runs_while_automatic_creation_is_disabled(
-) -> None:
+async def test_explicit_manual_retry_runs_while_automatic_creation_is_disabled() -> (
+    None
+):
     job = _running_job(attempts=2)
     store = _JobStore(claimed=[job])
     source = _JobCodexSourceAdapter(store.operations)
@@ -2480,8 +2485,9 @@ async def test_ambiguous_creation_with_native_id_reconciles_exact_target() -> No
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_creation_without_identity_fails_closed_without_duplicate(
-) -> None:
+async def test_ambiguous_creation_without_identity_fails_closed_without_duplicate() -> (
+    None
+):
     job = _running_job()
     store = _JobStore(claimed=[job])
     source = _JobCodexSourceAdapter(store.operations)
@@ -2512,8 +2518,9 @@ async def test_ambiguous_creation_without_identity_fails_closed_without_duplicat
 
 
 @pytest.mark.asyncio
-async def test_reconcile_running_job_without_sidecar_retries_without_provider_call(
-) -> None:
+async def test_reconcile_running_job_without_sidecar_retries_without_provider_call() -> (
+    None
+):
     job = _running_job()
     store = _JobStore(running=[job])
     source = _JobCodexSourceAdapter(store.operations)
@@ -2543,8 +2550,9 @@ async def test_reconcile_running_job_without_sidecar_retries_without_provider_ca
 
 
 @pytest.mark.asyncio
-async def test_reconcile_running_job_with_sidecar_completes_exact_catalog_target(
-) -> None:
+async def test_reconcile_running_job_with_sidecar_completes_exact_catalog_target() -> (
+    None
+):
     job = _running_job()
     bridge_id = _expected_bridge_id(job)
     target_native_id = "codex-restart-target"
@@ -2872,18 +2880,21 @@ def test_sidebar_candidate_query_is_batched_structural_and_stably_paginated(
     assert "reverse-loop-codex" not in source_ids
     assert "bridge-placeholder" not in source_ids
     assert "old-hermes" not in source_ids
-    assert next(
-        source for source in sources if source.projection.native_id == "ack-hermes"
-    ).projection.messages[0].content == "yes"
+    assert (
+        next(
+            source for source in sources if source.projection.native_id == "ack-hermes"
+        )
+        .projection.messages[0]
+        .content
+        == "yes"
+    )
     automation = next(
         source
         for source in sources
         if source.projection.native_id == "automation-hermes"
     )
     subagent = next(
-        source
-        for source in sources
-        if source.projection.native_id == "subagent-hermes"
+        source for source in sources if source.projection.native_id == "subagent-hermes"
     )
     assert automation.automation_only is True
     assert automation.subagent_only is False
@@ -2944,7 +2955,9 @@ def test_sidebar_candidate_query_excludes_only_incoming_hermes_bridge_lineage(
 
 class _ForbiddenSidebarTarget:
     def __getattr__(self, name: str) -> object:
-        raise AssertionError(f"sidebar registration called target adapter method {name}")
+        raise AssertionError(
+            f"sidebar registration called target adapter method {name}"
+        )
 
 
 @pytest.mark.asyncio
@@ -3063,20 +3076,24 @@ async def test_sidebar_backfill_preview_matches_apply_exclusions(
     valid = _exact_cwd_repo(tmp_path / "valid")
     deleted = _exact_cwd_repo(tmp_path / "deleted")
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="valid-preview",
-        content="Keep this exact worktree",
-        last_active=now,
-        cwd=str(valid),
-    ))
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="deleted-preview",
-        content="This historical worktree is gone",
-        last_active=now - 1,
-        cwd=str(deleted),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="valid-preview",
+            content="Keep this exact worktree",
+            last_active=now,
+            cwd=str(valid),
+        )
+    )
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="deleted-preview",
+            content="This historical worktree is gone",
+            last_active=now - 1,
+            cwd=str(deleted),
+        )
+    )
     _remove_tree(deleted)
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(continuous=False),
@@ -3129,13 +3146,15 @@ async def test_sidebar_backfill_nonmissing_preflight_error_is_not_excluded(
     now = 3_000_000.0
     source = _exact_cwd_repo(tmp_path / "source")
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id=f"preflight-{error_code}",
-        content="Preserve unknown preflight failures",
-        last_active=now,
-        cwd=str(source),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id=f"preflight-{error_code}",
+            content="Preserve unknown preflight failures",
+            last_active=now,
+            cwd=str(source),
+        )
+    )
 
     def _raise_preflight(_cwd: str) -> None:
         raise WorktreeSnapshotError(error_code)
@@ -3175,13 +3194,15 @@ async def test_sidebar_backfill_confirms_transient_identity_capture_failure(
     now = 3_000_000.0
     source = _exact_cwd_repo(tmp_path / "source")
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="transient-identity-capture",
-        content="Confirm a transient Git capture timeout",
-        last_active=now,
-        cwd=str(source),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="transient-identity-capture",
+            content="Confirm a transient Git capture timeout",
+            last_active=now,
+            cwd=str(source),
+        )
+    )
     real_capture = capture_worktree_snapshot
     calls = 0
 
@@ -3225,13 +3246,15 @@ async def test_sidebar_backfill_existing_job_wins_after_cwd_disappears(
     now = 3_000_000.0
     source = _exact_cwd_repo(tmp_path / "source")
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="existing-job",
-        content="Keep the existing delivery job",
-        last_active=now,
-        cwd=str(source),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="existing-job",
+            content="Keep the existing delivery job",
+            last_active=now,
+            cwd=str(source),
+        )
+    )
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(continuous=False),
         store=store,
@@ -3270,13 +3293,15 @@ async def test_persisted_sidebar_exclusions_do_not_starve_older_valid_source(
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
     for offset in range(41):
         native_id = f"excluded-{offset}"
-        store.upsert_projection(_sidebar_projection(
-            provider=Provider.CLAUDE,
-            native_id=native_id,
-            content="Historical deleted worktree",
-            last_active=now - offset,
-            cwd=str(tmp_path / native_id),
-        ))
+        store.upsert_projection(
+            _sidebar_projection(
+                provider=Provider.CLAUDE,
+                native_id=native_id,
+                content="Historical deleted worktree",
+                last_active=now - offset,
+                cwd=str(tmp_path / native_id),
+            )
+        )
         store.record_sidebar_exclusion(
             source_session_id=f"claude:{native_id}",
             provider=Provider.CLAUDE,
@@ -3284,13 +3309,15 @@ async def test_persisted_sidebar_exclusions_do_not_starve_older_valid_source(
             now=now,
         )
     valid = _exact_cwd_repo(tmp_path / "older-valid")
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="older-valid",
-        content="Reach the valid source after exclusions",
-        last_active=now - 100,
-        cwd=str(valid),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="older-valid",
+            content="Reach the valid source after exclusions",
+            last_active=now - 100,
+            cwd=str(valid),
+        )
+    )
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(continuous=False),
         store=store,
@@ -3320,21 +3347,25 @@ async def test_backfill_paginates_past_ineligible_sources(
     now = 3_000_000.0
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
     for offset in range(40):
-        store.upsert_projection(_sidebar_projection(
-            provider=Provider.CLAUDE,
-            native_id=f"acknowledgement-{offset}",
-            content="ok",
-            last_active=now - offset,
-            cwd=str(tmp_path),
-        ))
+        store.upsert_projection(
+            _sidebar_projection(
+                provider=Provider.CLAUDE,
+                native_id=f"acknowledgement-{offset}",
+                content="ok",
+                last_active=now - offset,
+                cwd=str(tmp_path),
+            )
+        )
     valid = _exact_cwd_repo(tmp_path / "older-meaningful")
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="older-meaningful",
-        content="Reach the meaningful source after acknowledgements",
-        last_active=now - 100,
-        cwd=str(valid),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="older-meaningful",
+            content="Reach the meaningful source after acknowledgements",
+            last_active=now - 100,
+            cwd=str(valid),
+        )
+    )
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(continuous=False),
         store=store,
@@ -3363,22 +3394,26 @@ async def test_backfill_preview_never_exceeds_its_queue_limit(
 ) -> None:
     now = 3_000_000.0
     store = SessionBridgeStore(sidebar_db, clock=lambda: now)
-    store.upsert_projection(_sidebar_projection(
-        provider=Provider.CLAUDE,
-        native_id="newest-acknowledgement",
-        content="ok",
-        last_active=now,
-        cwd=str(tmp_path),
-    ))
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="newest-acknowledgement",
+            content="ok",
+            last_active=now,
+            cwd=str(tmp_path),
+        )
+    )
     valid = _exact_cwd_repo(tmp_path / "bounded-preview")
     for offset in range(11):
-        store.upsert_projection(_sidebar_projection(
-            provider=Provider.CLAUDE,
-            native_id=f"bounded-{offset}",
-            content=f"Queue bounded meaningful request {offset}",
-            last_active=now - offset - 1,
-            cwd=str(valid),
-        ))
+        store.upsert_projection(
+            _sidebar_projection(
+                provider=Provider.CLAUDE,
+                native_id=f"bounded-{offset}",
+                content=f"Queue bounded meaningful request {offset}",
+                last_active=now - offset - 1,
+                cwd=str(valid),
+            )
+        )
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(continuous=False),
         store=store,
@@ -3428,7 +3463,9 @@ class _EmptySidebarVerifier:
 
 
 @pytest.mark.asyncio
-async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_claim() -> None:
+async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_claim() -> (
+    None
+):
     successful = _HeartbeatClaimStore()
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(),
@@ -3698,7 +3735,9 @@ class _PagedSidebarStore:
 
 
 @pytest.mark.asyncio
-async def test_sidebar_registration_drains_pages_past_ineligible_and_existing_rows() -> None:
+async def test_sidebar_registration_drains_pages_past_ineligible_and_existing_rows() -> (
+    None
+):
     now = 3_000_000.0
     first_cursor = (now - 1, "ack-first-page")
     page_one = SidebarSourcePage(
@@ -3837,9 +3876,7 @@ async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
 
     first_summary = await first.register_sidebar_jobs_once(now=now, limit=1)
     first_call_count = len(store.list_calls)
-    durable_after_first = store.get_state(
-        "session-bridge:sidebar:registration-cursor"
-    )
+    durable_after_first = store.get_state("session-bridge:sidebar:registration-cursor")
 
     assert first_summary.queued == 0
     assert first_summary.examined <= 40
@@ -3875,9 +3912,10 @@ async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
     assert newest_summary.queued == 1
     assert len(store.list_calls) - before_newest_probe == 1
     assert store.get_sidebar_job_for_source("newest-eligible") is not None
-    assert store.get_state(
-        "session-bridge:sidebar:registration-cursor"
-    ) == durable_after_first
+    assert (
+        store.get_state("session-bridge:sidebar:registration-cursor")
+        == durable_after_first
+    )
 
     older_summary = None
     for _ in range(8):
@@ -3964,9 +4002,7 @@ async def test_sidebar_registration_caps_candidate_page_size() -> None:
 
     await coordinator.register_sidebar_jobs_once(limit=100)
 
-    assert store.sidebar_list_calls == [
-        (3_000_000.0 - 30 * 86_400, 30, None)
-    ]
+    assert store.sidebar_list_calls == [(3_000_000.0 - 30 * 86_400, 30, None)]
 
 
 class _BarrierEnqueueSidebarStore(SessionBridgeStore):
@@ -4015,10 +4051,12 @@ async def test_concurrent_sidebar_registration_counts_one_transactional_enqueue(
         for _ in range(2)
     ]
 
-    summaries = await asyncio.gather(*(
-        coordinator.register_sidebar_jobs_once(now=now, limit=1)
-        for coordinator in coordinators
-    ))
+    summaries = await asyncio.gather(
+        *(
+            coordinator.register_sidebar_jobs_once(now=now, limit=1)
+            for coordinator in coordinators
+        )
+    )
 
     assert sum(summary.queued for summary in summaries) == 1
     assert seed_store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 1
@@ -4058,9 +4096,7 @@ async def test_successful_provider_scan_only_registers_sidebar_in_continuous_mod
     assert summary.failed == 0
     assert len(store.sidebar_list_calls) == int(continuous)
     if continuous:
-        assert store.sidebar_list_calls == [
-            (now - 30 * 86_400, 30, None)
-        ]
+        assert store.sidebar_list_calls == [(now - 30 * 86_400, 30, None)]
 
 
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.CODEX])
@@ -4102,8 +4138,9 @@ async def test_refresh_session_reads_exact_provider_and_persists_fresh_projectio
 
 
 @pytest.mark.asyncio
-async def test_refresh_failure_uses_durable_snapshot_with_fixed_sanitized_warning(
-) -> None:
+async def test_refresh_failure_uses_durable_snapshot_with_fixed_sanitized_warning() -> (
+    None
+):
     operations: list[tuple[object, ...]] = []
     projection = _refresh_projection(Provider.CODEX)
     session_id = f"codex:{projection.native_id}"
@@ -4171,8 +4208,9 @@ async def test_refresh_failure_refuses_when_durable_snapshot_is_unavailable() ->
 
 
 @pytest.mark.asyncio
-async def test_continue_refreshes_before_build_and_atomically_transitions_exact_pack(
-) -> None:
+async def test_continue_refreshes_before_build_and_atomically_transitions_exact_pack() -> (
+    None
+):
     operations: list[tuple[object, ...]] = []
     projection = _refresh_projection(Provider.CLAUDE)
     target_projection = replace(
@@ -4235,21 +4273,19 @@ async def test_continue_refreshes_before_build_and_atomically_transitions_exact_
         )
     ]
     source_refresh_index = operations.index(("refresh_upsert", session_id))
-    target_refresh_index = operations.index(
-        ("refresh_upsert", "codex:target-existing")
-    )
-    build_index = operations.index(
-        ("build", "claude-cursor-fresh", "claude-hash-fresh")
-    )
-    transition_index = operations.index(
-        (
-            "transition",
-            "bridge-continue-1",
-            "pack-continue-1",
-            "codex-target-cursor-fresh",
-            "codex-target-hash-fresh",
-        )
-    )
+    target_refresh_index = operations.index(("refresh_upsert", "codex:target-existing"))
+    build_index = operations.index((
+        "build",
+        "claude-cursor-fresh",
+        "claude-hash-fresh",
+    ))
+    transition_index = operations.index((
+        "transition",
+        "bridge-continue-1",
+        "pack-continue-1",
+        "codex-target-cursor-fresh",
+        "codex-target-hash-fresh",
+    ))
     assert source_refresh_index < build_index
     assert target_refresh_index < build_index < transition_index
     assert result.pack.id == "pack-continue-1"
@@ -4270,8 +4306,9 @@ async def test_continue_refreshes_before_build_and_atomically_transitions_exact_
 
 
 @pytest.mark.asyncio
-async def test_continue_hydrates_native_hermes_source_without_external_adapter(
-) -> None:
+async def test_continue_hydrates_native_hermes_source_without_external_adapter() -> (
+    None
+):
     operations: list[tuple[object, ...]] = []
     source_id = "hermes-native-source"
     bridge_id = "sidebar:hermes-native-source"
@@ -4326,8 +4363,9 @@ async def test_continue_hydrates_native_hermes_source_without_external_adapter(
 
 
 @pytest.mark.asyncio
-async def test_periodic_reconcile_refreshes_native_hermes_source_without_adapter(
-) -> None:
+async def test_periodic_reconcile_refreshes_native_hermes_source_without_adapter() -> (
+    None
+):
     operations: list[tuple[object, ...]] = []
     source_id = "hermes-native-reconcile"
     bridge_id = "bridge-native-reconcile"
@@ -4553,8 +4591,7 @@ async def test_exact_cwd_is_authoritative_for_every_continuation_operation(
     assert result.exact_cwd == os.path.abspath(str(repo))
     assert builder.requests[0].exact_cwd == result.exact_cwd
     assert any(
-        warning
-        == "worktree_branch_drift: recorded=main current=feature/drift"
+        warning == "worktree_branch_drift: recorded=main current=feature/drift"
         for warning in result.warnings
     )
     assert store.transition_calls == [
@@ -4726,8 +4763,9 @@ async def test_worktree_missing_legacy_snapshot_blocks_sidebar_continuation(
 
 
 @pytest.mark.asyncio
-async def test_continue_stale_fallback_is_explicit_and_identical_replay_is_stable(
-) -> None:
+async def test_continue_stale_fallback_is_explicit_and_identical_replay_is_stable() -> (
+    None
+):
     operations: list[tuple[object, ...]] = []
     projection = _refresh_projection(Provider.CLAUDE)
     target_projection = replace(
@@ -4811,8 +4849,9 @@ async def test_continue_stale_fallback_is_explicit_and_identical_replay_is_stabl
 
 
 @pytest.mark.asyncio
-async def test_continue_replay_marks_divergence_only_when_both_descendants_advance(
-) -> None:
+async def test_continue_replay_marks_divergence_only_when_both_descendants_advance() -> (
+    None
+):
     operations: list[tuple[object, ...]] = []
     source_projection = _refresh_projection(Provider.CLAUDE)
     target_projection = replace(
@@ -4885,13 +4924,16 @@ async def test_continue_replay_marks_divergence_only_when_both_descendants_advan
     assert replay.warnings == ("linked_sessions_diverged",)
     assert store.divergence_calls == [("bridge-continue-1", 100.0)]
     assert store.get_continuation_snapshot("bridge-continue-1") == initial_snapshot
-    divergence_index = replay_operations.index(
-        ("mark_diverged", "bridge-continue-1", 100.0)
-    )
+    divergence_index = replay_operations.index((
+        "mark_diverged",
+        "bridge-continue-1",
+        100.0,
+    ))
     assert replay_operations.index(("refresh_upsert", session_id)) < divergence_index
-    assert replay_operations.index(
-        ("refresh_upsert", "codex:target-existing")
-    ) < divergence_index
+    assert (
+        replay_operations.index(("refresh_upsert", "codex:target-existing"))
+        < divergence_index
+    )
 
 
 @pytest.mark.asyncio
@@ -5159,9 +5201,12 @@ async def test_reconcile_rejects_non_deterministic_claude_attempt_sidecar(
     job = _running_job(job_id="job:claude-sidecar")
     job["idempotency_key"] = "claude-sidecar-idempotency"
     job["target_provider"] = Provider.CLAUDE.value
-    expected_bridge = "bridge:" + hashlib.sha256(
-        f"session-bridge:{job['idempotency_key']}".encode()
-    ).hexdigest()
+    expected_bridge = (
+        "bridge:"
+        + hashlib.sha256(
+            f"session-bridge:{job['idempotency_key']}".encode()
+        ).hexdigest()
+    )
     expected_native_id = str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,

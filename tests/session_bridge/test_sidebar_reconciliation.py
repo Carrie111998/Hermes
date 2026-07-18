@@ -12,7 +12,11 @@ from session_bridge.codex_adapter import SidebarVerificationError
 from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.coordinator import SessionBridgeCoordinator
 from session_bridge.models import BridgeMarkerPayload, Provider
-from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
+from session_bridge.sidebar import (
+    SidebarCandidate,
+    VerifiedSidebarThread,
+    sidebar_bridge_id,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -133,6 +137,7 @@ class BlockingVerifier(FakeVerifier):
         self.started.set()
         assert self.release.wait(timeout=5)
         return None
+
 
 class ForbiddenTargetAdapter:
     def create_placeholder(self, **_: Any) -> Any:
@@ -260,9 +265,7 @@ async def test_related_near_match_is_persisted_fatal_and_never_exposed(
 @pytest.mark.asyncio
 async def test_inventory_budget_exhaustion_is_retryable_and_exposes_no_claim() -> None:
     store = FakeSidebarStore()
-    verifier = FakeVerifier(
-        SidebarVerificationError("bridge_temporarily_unavailable")
-    )
+    verifier = FakeVerifier(SidebarVerificationError("bridge_temporarily_unavailable"))
     coordinator = _coordinator(store, verifier)
 
     assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
@@ -291,7 +294,9 @@ async def test_native_not_indexed_defers_reconciliation_to_native_broker() -> No
 
 
 @pytest.mark.asyncio
-async def test_recovered_rename_failure_renames_same_thread_before_verified_commit() -> None:
+async def test_recovered_rename_failure_renames_same_thread_before_verified_commit() -> (
+    None
+):
     events: list[tuple[str, str]] = []
     store = FakeSidebarStore()
     verifier = FakeVerifier(_verified())
@@ -318,9 +323,7 @@ async def test_recovered_rename_failure_renames_same_thread_before_verified_comm
 @pytest.mark.asyncio
 async def test_commit_binds_native_id_before_transient_verification_failure() -> None:
     store = FakeSidebarStore()
-    verifier = FakeVerifier(
-        SidebarVerificationError("bridge_temporarily_unavailable")
-    )
+    verifier = FakeVerifier(SidebarVerificationError("bridge_temporarily_unavailable"))
     coordinator = _coordinator(store, verifier, clock=lambda: 101.0)
 
     with pytest.raises(SidebarVerificationError) as failure:
@@ -349,18 +352,20 @@ async def test_commit_and_exact_replay_survive_coordinator_and_store_restart(
         sidebar_jitter=lambda _bound: 0.0,
     )
     first_db.ensure_session(source, source="cli")
-    first_store.enqueue_sidebar_job(SidebarCandidate(
-        source_session_id=source,
-        provider=Provider.CLAUDE,
-        bridge_id=bridge,
-        title="[Claude] Restart source",
-        cwd="C:/source",
-        git_root=None,
-        git_branch=None,
-        git_head=None,
-        worktree_id=None,
-        eligible_at=10.0,
-    ))
+    first_store.enqueue_sidebar_job(
+        SidebarCandidate(
+            source_session_id=source,
+            provider=Provider.CLAUDE,
+            bridge_id=bridge,
+            title="[Claude] Restart source",
+            cwd="C:/source",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=10.0,
+        )
+    )
     verified = VerifiedSidebarThread(THREAD, source, bridge)
     first = SessionBridgeCoordinator(
         config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
@@ -397,10 +402,13 @@ async def test_commit_and_exact_replay_survive_coordinator_and_store_restart(
         sidebar_verifier=FakeVerifier(verified),
         clock=lambda: 201.0,
     )
-    assert await replay.commit_sidebar_job(
-        lease_token=token,
-        codex_thread_id=THREAD,
-    ) == committed
+    assert (
+        await replay.commit_sidebar_job(
+            lease_token=token,
+            codex_thread_id=THREAD,
+        )
+        == committed
+    )
     replay_db.close()
 
 
@@ -413,7 +421,9 @@ class ExpiringFailureStore(FakeSidebarStore):
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_failure_uses_fresh_clock_and_hides_expired_lease() -> None:
+async def test_reconciliation_failure_uses_fresh_clock_and_hides_expired_lease() -> (
+    None
+):
     store = ExpiringFailureStore()
     verifier = FakeVerifier(SidebarVerificationError("marker_conflict"))
     coordinator = _coordinator(store, verifier, clock=lambda: 401.0)
@@ -435,18 +445,20 @@ async def test_cancelled_reconciliation_releases_every_claimed_lease(tmp_path) -
         source = f"claude:cancelled-{ordinal}"
         sources.append(source)
         db.ensure_session(source, source="cli")
-        store.enqueue_sidebar_job(SidebarCandidate(
-            source_session_id=source,
-            provider=Provider.CLAUDE,
-            bridge_id=sidebar_bridge_id(source),
-            title=f"[Claude] Cancelled {ordinal}",
-            cwd=f"C:/cancelled/{ordinal}",
-            git_root=None,
-            git_branch=None,
-            git_head=None,
-            worktree_id=None,
-            eligible_at=10.0 + ordinal,
-        ))
+        store.enqueue_sidebar_job(
+            SidebarCandidate(
+                source_session_id=source,
+                provider=Provider.CLAUDE,
+                bridge_id=sidebar_bridge_id(source),
+                title=f"[Claude] Cancelled {ordinal}",
+                cwd=f"C:/cancelled/{ordinal}",
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+                eligible_at=10.0 + ordinal,
+            )
+        )
     verifier = BlockingVerifier()
     coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
 
@@ -483,18 +495,20 @@ async def test_cancelled_durable_claim_returns_by_deadline_then_recovers_in_back
         source = f"claude:claim-boundary-{ordinal}"
         sources.append(source)
         db.ensure_session(source, source="cli")
-        store.enqueue_sidebar_job(SidebarCandidate(
-            source_session_id=source,
-            provider=Provider.CLAUDE,
-            bridge_id=sidebar_bridge_id(source),
-            title=f"[Claude] Claim boundary {ordinal}",
-            cwd=f"C:/claim-boundary/{ordinal}",
-            git_root=None,
-            git_branch=None,
-            git_head=None,
-            worktree_id=None,
-            eligible_at=10.0 + ordinal,
-        ))
+        store.enqueue_sidebar_job(
+            SidebarCandidate(
+                source_session_id=source,
+                provider=Provider.CLAUDE,
+                bridge_id=sidebar_bridge_id(source),
+                title=f"[Claude] Claim boundary {ordinal}",
+                cwd=f"C:/claim-boundary/{ordinal}",
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+                eligible_at=10.0 + ordinal,
+            )
+        )
     committed = threading.Event()
     release = threading.Event()
     original_claim = store.claim_sidebar_jobs
@@ -596,7 +610,9 @@ async def test_non_cancelled_claim_worker_exception_propagates_unchanged() -> No
     assert await asyncio.to_thread(store.started.wait, 5)
 
     store.release.set()
-    with pytest.raises(RuntimeError, match="claim worker failed with lease=must-not-leak"):
+    with pytest.raises(
+        RuntimeError, match="claim worker failed with lease=must-not-leak"
+    ):
         await claim_task
 
     assert coordinator._sidebar_recovery_tasks == set()
@@ -678,18 +694,20 @@ async def test_repeated_cancellation_during_cleanup_still_releases_full_batch(
         source = f"claude:repeated-cancel-{ordinal}"
         sources.append(source)
         db.ensure_session(source, source="cli")
-        store.enqueue_sidebar_job(SidebarCandidate(
-            source_session_id=source,
-            provider=Provider.CLAUDE,
-            bridge_id=sidebar_bridge_id(source),
-            title=f"[Claude] Repeated cancel {ordinal}",
-            cwd=f"C:/repeated-cancel/{ordinal}",
-            git_root=None,
-            git_branch=None,
-            git_head=None,
-            worktree_id=None,
-            eligible_at=10.0 + ordinal,
-        ))
+        store.enqueue_sidebar_job(
+            SidebarCandidate(
+                source_session_id=source,
+                provider=Provider.CLAUDE,
+                bridge_id=sidebar_bridge_id(source),
+                title=f"[Claude] Repeated cancel {ordinal}",
+                cwd=f"C:/repeated-cancel/{ordinal}",
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+                eligible_at=10.0 + ordinal,
+            )
+        )
     verifier = BlockingVerifier()
     cleanup_started = threading.Event()
     cleanup_release = threading.Event()
@@ -743,18 +761,20 @@ async def test_hung_cleanup_does_not_block_cancelled_caller_or_shutdown(
     )
     source = "claude:hung-cleanup"
     db.ensure_session(source, source="cli")
-    store.enqueue_sidebar_job(SidebarCandidate(
-        source_session_id=source,
-        provider=Provider.CLAUDE,
-        bridge_id=sidebar_bridge_id(source),
-        title="[Claude] Hung cleanup",
-        cwd="C:/hung-cleanup",
-        git_root=None,
-        git_branch=None,
-        git_head=None,
-        worktree_id=None,
-        eligible_at=10.0,
-    ))
+    store.enqueue_sidebar_job(
+        SidebarCandidate(
+            source_session_id=source,
+            provider=Provider.CLAUDE,
+            bridge_id=sidebar_bridge_id(source),
+            title="[Claude] Hung cleanup",
+            cwd="C:/hung-cleanup",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=10.0,
+        )
+    )
     verifier = BlockingVerifier()
     cleanup_started = threading.Event()
     cleanup_release = threading.Event()

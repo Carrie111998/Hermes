@@ -357,12 +357,12 @@ class ContextPackBuilder:
         message_records = [dict(row) for row in message_rows]
         decode_content = self.db._decode_content
         if session is not None and session.get("source") == "session_bridge_profile":
-            profile_matches: list[
-                tuple[dict[str, Any], list[dict[str, Any]], Any]
-            ] = []
+            profile_matches: list[tuple[dict[str, Any], list[dict[str, Any]], Any]] = []
             with self.store._native_hermes_databases() as databases:
                 for _profile, database, owned in databases:
-                    if not owned or not self.store._profile_catalog_compatible(database):
+                    if not owned or not self.store._profile_catalog_compatible(
+                        database
+                    ):
                         continue
                     with database._lock:
                         profile_conn = database._conn
@@ -377,13 +377,11 @@ class ContextPackBuilder:
                             "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
                             (request.source_session_id,),
                         ).fetchall()
-                    profile_matches.append(
-                        (
-                            dict(profile_session),
-                            [dict(row) for row in profile_messages],
-                            database._decode_content,
-                        )
-                    )
+                    profile_matches.append((
+                        dict(profile_session),
+                        [dict(row) for row in profile_messages],
+                        database._decode_content,
+                    ))
             if len(profile_matches) != 1:
                 raise ValueError("profile-native source identity is ambiguous")
             session, message_records, decode_content = profile_matches[0]
@@ -448,9 +446,10 @@ class ContextPackBuilder:
             raise ValueError("context pack stale source warning missing")
         if request.diverged and _DIVERGED_WARNING not in warning_lines:
             raise ValueError("context pack diverged warning missing")
-        if request.exact_cwd is not None and _exact_cwd_instruction(
-            request.exact_cwd
-        ) not in warning_lines:
+        if (
+            request.exact_cwd is not None
+            and _exact_cwd_instruction(request.exact_cwd) not in warning_lines
+        ):
             raise ValueError("context pack exact cwd instruction missing")
         if any(
             f"- [{warning}]" not in warning_lines

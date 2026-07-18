@@ -116,8 +116,7 @@ class BridgeConfig:
         )
         if unknown_environment:
             raise ValueError(
-                f"unknown session bridge environment variable: "
-                f"{unknown_environment[0]}"
+                f"unknown session bridge environment variable: {unknown_environment[0]}"
             )
         document = _load_document(config_path)
         from hermes_cli.config import load_config

@@ -30,20 +30,17 @@ CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
 CLAUDE_VISIBILITY_ERROR_CODES = (
     CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
 )
-CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES = (
-    CLAUDE_VISIBILITY_ERROR_CODES
-    | frozenset({
-        "claim_failed",
-        "enqueue_failed",
-        "invalid_visibility_status",
-        "inventory_invalid",
-        "provider_degraded",
-        "registrar_failed",
-        "unknown_claim_status",
-        "unknown_failed_code",
-        "unknown_job_state",
-        "unknown_registrar_error_code",
-        "unknown_registrar_status",
-        "unknown_retry_code",
-    })
-)
+CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES = CLAUDE_VISIBILITY_ERROR_CODES | frozenset({
+    "claim_failed",
+    "enqueue_failed",
+    "invalid_visibility_status",
+    "inventory_invalid",
+    "provider_degraded",
+    "registrar_failed",
+    "unknown_claim_status",
+    "unknown_failed_code",
+    "unknown_job_state",
+    "unknown_registrar_error_code",
+    "unknown_registrar_status",
+    "unknown_retry_code",
+})

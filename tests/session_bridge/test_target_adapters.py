@@ -301,13 +301,15 @@ class MutableSidebarInventory:
             cwd=None,
             started_at=0.0,
             last_active=0.0,
-            messages=(ProjectedMessage(
-                native_event_id="marker",
-                ordinal=0,
-                role="user",
-                content=encode_bridge_marker(_sidebar_expected(), SECRET),
-                timestamp=0.0,
-            ),),
+            messages=(
+                ProjectedMessage(
+                    native_event_id="marker",
+                    ordinal=0,
+                    role="user",
+                    content=encode_bridge_marker(_sidebar_expected(), SECRET),
+                    timestamp=0.0,
+                ),
+            ),
         )
 
 
@@ -348,7 +350,9 @@ def _write_claude_marker_transcript(
     )
 
 
-def test_codex_empty_read_classifier_requires_rpc_code_exact_id_and_missing_rollout() -> None:
+def test_codex_empty_read_classifier_requires_rpc_code_exact_id_and_missing_rollout() -> (
+    None
+):
     recognized, code = classify_codex_empty_read_error(
         FakeCodexRpcError(
             -32603,
@@ -511,7 +515,10 @@ def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None
         "thread/list",
         "thread/read",
     ]
-    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+    assert all(
+        method not in {"thread/start", "thread/name/set"}
+        for method, _, _ in client.calls
+    )
 
 
 def test_sidebar_thread_verifier_accepts_structural_read_only_inventory() -> None:
@@ -549,9 +556,9 @@ def test_sidebar_marker_lookup_page_cap_is_retryable_not_false_zero() -> None:
 
 def test_sidebar_marker_lookup_thread_cap_stops_before_thread_reads() -> None:
     first = _codex_inventory()["data"][0]
-    second = _codex_inventory(
-        native_id="33333333-3333-4333-8333-333333333333"
-    )["data"][0]
+    second = _codex_inventory(native_id="33333333-3333-4333-8333-333333333333")["data"][
+        0
+    ]
     client = FakeRequestClient({
         "thread/list": [{"data": [first, second]}, {"data": []}],
     })
@@ -627,7 +634,9 @@ def test_sidebar_marker_lookup_deadline_after_list_is_retryable() -> None:
     assert [method for method, _, _ in client.calls] == ["thread/list"]
 
 
-def test_sidebar_marker_lookup_deadline_between_list_and_read_never_false_zero() -> None:
+def test_sidebar_marker_lookup_deadline_between_list_and_read_never_false_zero() -> (
+    None
+):
     ticks = iter((0.0, 0.0, 0.0, 0.0, 2.0))
     client = FakeRequestClient({
         "thread/list": [_codex_inventory(), {"data": []}],
@@ -706,9 +715,9 @@ def test_two_sidebar_claim_markers_reuse_one_bounded_inventory_snapshot() -> Non
 
     assert verifier.find_by_marker(_sidebar_expected()) is not None
     now[0] = 0.5
-    assert verifier.find_by_marker(BridgeMarkerPayload(
-        "bridge-2", "hermes-source-2", Provider.CODEX, 1
-    )) == VerifiedSidebarThread(other_id, "hermes-source-2", "bridge-2")
+    assert verifier.find_by_marker(
+        BridgeMarkerPayload("bridge-2", "hermes-source-2", Provider.CODEX, 1)
+    ) == VerifiedSidebarThread(other_id, "hermes-source-2", "bridge-2")
     assert [method for method, _, _ in client.calls] == [
         "thread/list",
         "thread/list",
@@ -748,7 +757,10 @@ def test_sidebar_snapshot_ttl_is_capped_below_lease_retry_window() -> None:
 @pytest.mark.parametrize(
     ("read", "code"),
     [
-        (_codex_signed_read(source_session_id="claude:other"), "source_identity_mismatch"),
+        (
+            _codex_signed_read(source_session_id="claude:other"),
+            "source_identity_mismatch",
+        ),
         (_codex_signed_read(bridge_id="bridge-other"), "source_identity_mismatch"),
         (_codex_signed_read(target_provider=Provider.CLAUDE), "provider_mismatch"),
         (_codex_signed_read(policy_generation=2), "provider_mismatch"),
@@ -773,20 +785,30 @@ def test_sidebar_thread_verifier_rejects_wrong_authenticated_lineage(
     assert raised.value.code == code
 
 
-def test_sidebar_thread_verifier_rejects_invalid_signature_and_duplicate_marker() -> None:
+def test_sidebar_thread_verifier_rejects_invalid_signature_and_duplicate_marker() -> (
+    None
+):
     valid = encode_bridge_marker(_sidebar_expected(), SECRET)
     invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
     for content in (invalid, f"{valid}\n{valid}"):
         client = FakeRequestClient({
             "thread/list": [_codex_inventory()],
-            "thread/read": [_codex_read(turns=[{
-                "id": "registration",
-                "items": [{
-                    "type": "userMessage",
-                    "id": "item-1",
-                    "content": [{"type": "text", "text": content}],
-                }],
-            }])],
+            "thread/read": [
+                _codex_read(
+                    turns=[
+                        {
+                            "id": "registration",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "item-1",
+                                    "content": [{"type": "text", "text": content}],
+                                }
+                            ],
+                        }
+                    ]
+                )
+            ],
         })
         verifier = SidebarThreadVerifier(
             CodexSourceAdapter(client, marker_secret=SECRET),
@@ -850,14 +872,14 @@ def test_sidebar_marker_lookup_searches_exact_marker_before_thread_reads() -> No
         "thread/search",
         "thread/read",
     ]
-    search_calls = [params for method, params, _ in client.calls if method == "thread/search"]
+    search_calls = [
+        params for method, params, _ in client.calls if method == "thread/search"
+    ]
     assert [params["archived"] for params in search_calls] == [False, True]
     unsigned_marker = marker.rsplit(".", 1)[0]
     assert all(params["searchTerm"] == unsigned_marker for params in search_calls)
     assert all(method != "thread/list" for method, _, _ in client.calls)
-    assert client.initialize_calls == [
-        {"capabilities": {"experimentalApi": True}}
-    ]
+    assert client.initialize_calls == [{"capabilities": {"experimentalApi": True}}]
 
 
 def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> None:
@@ -870,14 +892,22 @@ def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> N
             {"data": [{"thread": row, "snippet": f"Signed marker: {invalid}"}]},
             {"data": []},
         ],
-        "thread/read": [_codex_read(turns=[{
-            "id": "registration",
-            "items": [{
-                "type": "userMessage",
-                "id": "item-1",
-                "content": [{"type": "text", "text": invalid}],
-            }],
-        }])],
+        "thread/read": [
+            _codex_read(
+                turns=[
+                    {
+                        "id": "registration",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [{"type": "text", "text": invalid}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -889,8 +919,12 @@ def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> N
         verifier.find_by_marker(expected)
 
     assert raised.value.code == "marker_conflict"
-    search_calls = [params for method, params, _ in client.calls if method == "thread/search"]
-    assert all(params["searchTerm"] == valid.rsplit(".", 1)[0] for params in search_calls)
+    search_calls = [
+        params for method, params, _ in client.calls if method == "thread/search"
+    ]
+    assert all(
+        params["searchTerm"] == valid.rsplit(".", 1)[0] for params in search_calls
+    )
 
 
 def test_sidebar_marker_lookup_ignores_archived_duplicate() -> None:
@@ -916,7 +950,10 @@ def test_sidebar_marker_lookup_ignores_archived_duplicate() -> None:
         "claude:source-1",
         "bridge-1",
     )
-    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+    assert all(
+        method not in {"thread/start", "thread/name/set"}
+        for method, _, _ in client.calls
+    )
 
 
 def test_sidebar_marker_lookup_rejects_multiple_active_authenticated_threads() -> None:
@@ -972,12 +1009,14 @@ def test_sidebar_marker_lookup_rejects_authenticated_related_near_match(
 ) -> None:
     client = FakeRequestClient({
         "thread/list": [_codex_inventory(), {"data": []}],
-        "thread/read": [_codex_signed_read(
-            bridge_id=observed.bridge_id,
-            source_session_id=observed.source_session_id,
-            target_provider=observed.target_provider,
-            policy_generation=observed.policy_generation,
-        )],
+        "thread/read": [
+            _codex_signed_read(
+                bridge_id=observed.bridge_id,
+                source_session_id=observed.source_session_id,
+                target_provider=observed.target_provider,
+                policy_generation=observed.policy_generation,
+            )
+        ],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1007,14 +1046,24 @@ def test_sidebar_marker_lookup_rejects_exact_plus_related_near_match(
     related = encode_bridge_marker(near, SECRET)
     client = FakeRequestClient({
         "thread/list": [_codex_inventory(), {"data": []}],
-        "thread/read": [_codex_read(turns=[{
-            "id": "registration",
-            "items": [{
-                "type": "userMessage",
-                "id": "item-1",
-                "content": [{"type": "text", "text": f"{exact}\n{related}"}],
-            }],
-        }])],
+        "thread/read": [
+            _codex_read(
+                turns=[
+                    {
+                        "id": "registration",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [
+                                    {"type": "text", "text": f"{exact}\n{related}"}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1031,10 +1080,12 @@ def test_sidebar_marker_lookup_rejects_exact_plus_related_near_match(
 def test_sidebar_marker_lookup_ignores_fully_unrelated_authenticated_marker() -> None:
     client = FakeRequestClient({
         "thread/list": [_codex_inventory(), {"data": []}],
-        "thread/read": [_codex_signed_read(
-            bridge_id="bridge-unrelated",
-            source_session_id="hermes-unrelated",
-        )],
+        "thread/read": [
+            _codex_signed_read(
+                bridge_id="bridge-unrelated",
+                source_session_id="hermes-unrelated",
+            )
+        ],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1043,7 +1094,10 @@ def test_sidebar_marker_lookup_ignores_fully_unrelated_authenticated_marker() ->
     )
 
     assert verifier.find_by_marker(_sidebar_expected()) is None
-    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+    assert all(
+        method not in {"thread/start", "thread/name/set"}
+        for method, _, _ in client.calls
+    )
 
 
 def test_sidebar_marker_lookup_ignores_multiple_fully_unrelated_markers() -> None:
@@ -1059,14 +1113,24 @@ def test_sidebar_marker_lookup_ignores_multiple_fully_unrelated_markers() -> Non
     ]
     client = FakeRequestClient({
         "thread/list": [_codex_inventory(), {"data": []}],
-        "thread/read": [_codex_read(turns=[{
-            "id": "registration",
-            "items": [{
-                "type": "userMessage",
-                "id": "item-1",
-                "content": [{"type": "text", "text": "\n".join(unrelated)}],
-            }],
-        }])],
+        "thread/read": [
+            _codex_read(
+                turns=[
+                    {
+                        "id": "registration",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [
+                                    {"type": "text", "text": "\n".join(unrelated)}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1086,14 +1150,22 @@ def test_sidebar_marker_lookup_never_turns_expected_invalid_signature_into_zero(
     content = f"{valid}\n{invalid}" if include_valid else invalid
     client = FakeRequestClient({
         "thread/list": [_codex_inventory(), {"data": []}],
-        "thread/read": [_codex_read(turns=[{
-            "id": "registration",
-            "items": [{
-                "type": "userMessage",
-                "id": "item-1",
-                "content": [{"type": "text", "text": content}],
-            }],
-        }])],
+        "thread/read": [
+            _codex_read(
+                turns=[
+                    {
+                        "id": "registration",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [{"type": "text", "text": content}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1144,6 +1216,7 @@ def test_sidebar_thread_verifier_bounds_not_indexed_polling() -> None:
     })
     now = [0.0]
     sleeps: list[float] = []
+
     def advance(delay: float) -> None:
         sleeps.append(delay)
         now[0] += delay
@@ -1187,7 +1260,9 @@ def test_claude_uses_exact_no_shell_argv_and_verifies_the_signed_target() -> Non
 
     def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append((list(args), dict(kwargs)))
-        return subprocess.CompletedProcess(args, 0, stdout='{"result":"ready"}', stderr="")
+        return subprocess.CompletedProcess(
+            args, 0, stdout='{"result":"ready"}', stderr=""
+        )
 
     result = ClaudeTargetAdapter(
         source,
@@ -1225,7 +1300,10 @@ def test_claude_uses_exact_no_shell_argv_and_verifies_the_signed_target() -> Non
     prompt = args[-1]
     assert "HERMES_SESSION_BRIDGE_V1:" in prompt
     assert "codex:source-1" in prompt
-    assert "This registration message is metadata, not a substantive user message." in prompt
+    assert (
+        "This registration message is metadata, not a substantive user message."
+        in prompt
+    )
     assert "Do not call any tool now." in prompt
     assert "Reply exactly REGISTERED and nothing else." in prompt
     assert "On the first subsequent substantive user message" in prompt
@@ -1322,9 +1400,7 @@ def test_claude_target_resolves_recognized_npm_shim_to_literal_node_argv(
     shim.write_text("recognized npm shim", encoding="utf-8")
     calls: list[tuple[list[str], dict[str, Any]]] = []
 
-    def runner(
-        args: list[str], **kwargs: Any
-    ) -> subprocess.CompletedProcess[str]:
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append((list(args), dict(kwargs)))
         return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
 
@@ -1662,9 +1738,7 @@ def test_claude_rejects_same_bridge_marker_with_wrong_signed_payload(
         SECRET,
     )
 
-    def runner(
-        args: list[str], **kwargs: Any
-    ) -> subprocess.CompletedProcess[str]:
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         transcript.write_text(
             json.dumps({
                 "type": "custom-title",
@@ -1795,25 +1869,33 @@ def test_claude_parse_boundary_drops_secret_exception_chain() -> None:
 
 
 def test_claude_process_failure_exposes_only_a_bounded_json_subtype() -> None:
-    assert classify_claude_process_failure(
-        subprocess.CompletedProcess(
-            ["claude"],
-            1,
-            stdout=(
-                '{"type":"result","subtype":"error_max_budget_usd",'
-                '"result":"sk-proj-THIS-MUST-NOT-LEAK-1234567890"}'
-            ),
-            stderr="provider token=secret",
+    assert (
+        classify_claude_process_failure(
+            subprocess.CompletedProcess(
+                ["claude"],
+                1,
+                stdout=(
+                    '{"type":"result","subtype":"error_max_budget_usd",'
+                    '"result":"sk-proj-THIS-MUST-NOT-LEAK-1234567890"}'
+                ),
+                stderr="provider token=secret",
+            )
         )
-    ) == "claude_process_error_max_budget_usd"
-    assert classify_claude_process_failure(
-        subprocess.CompletedProcess(
-            ["claude"], 9, stdout="not json sk-proj-secret", stderr="private"
+        == "claude_process_error_max_budget_usd"
+    )
+    assert (
+        classify_claude_process_failure(
+            subprocess.CompletedProcess(
+                ["claude"], 9, stdout="not json sk-proj-secret", stderr="private"
+            )
         )
-    ) == "claude_process_exit_9"
+        == "claude_process_exit_9"
+    )
 
 
-def test_claude_process_failure_preserves_only_allowlisted_numeric_diagnostics() -> None:
+def test_claude_process_failure_preserves_only_allowlisted_numeric_diagnostics() -> (
+    None
+):
     secret = "sk-proj-THIS-MUST-NOT-LEAK-1234567890"
     marker = "HERMES_SESSION_BRIDGE_V1:payload.signature"
     failed = ClaudeTargetAdapter(
@@ -1999,13 +2081,15 @@ def test_codex_visible_native_target_gets_one_authenticated_registration_turn() 
         (_codex_signed_read(bridge_id="different"), None, 0),
         (
             _codex_read(),
-            _codex_read(turns=[
-                {
-                    "id": "turn-registration",
-                    "status": "completed",
-                    "items": [],
-                }
-            ]),
+            _codex_read(
+                turns=[
+                    {
+                        "id": "turn-registration",
+                        "status": "completed",
+                        "items": [],
+                    }
+                ]
+            ),
             1,
         ),
     ],
@@ -2028,7 +2112,9 @@ def test_codex_wrong_or_missing_signed_provenance_fails_closed(
         responses["turn/start"].append({"turn": {"id": "turn-registration"}})
     adapter, client = _codex_adapter(responses)
 
-    with pytest.raises(AmbiguousPlaceholderCreation, match="codex_target_marker_mismatch"):
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_target_marker_mismatch"
+    ):
         adapter.create_placeholder(
             title="Mirror title",
             source_session_id="claude:source-1",
@@ -2037,7 +2123,9 @@ def test_codex_wrong_or_missing_signed_provenance_fails_closed(
         )
 
     assert [method for method, _, _ in client.calls].count("thread/start") == 1
-    assert [method for method, _, _ in client.calls].count("turn/start") == expected_turns
+    assert [method for method, _, _ in client.calls].count(
+        "turn/start"
+    ) == expected_turns
 
 
 @pytest.mark.parametrize(
@@ -2069,7 +2157,9 @@ def test_codex_rejects_same_bridge_marker_with_wrong_signed_payload(
         require_registration_turn=False,
     )
 
-    with pytest.raises(AmbiguousPlaceholderCreation, match="codex_target_marker_mismatch"):
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_target_marker_mismatch"
+    ):
         adapter.create_placeholder(
             title="Mirror title",
             source_session_id="claude:source-1",
@@ -2084,9 +2174,7 @@ def test_codex_exact_discovery_can_include_sidebar_and_app_server_threads() -> N
     client = FakeRequestClient({"thread/list": [_codex_inventory()]})
     source = CodexSourceAdapter(client, marker_secret=SECRET)
 
-    found = source.find_native_thread(
-        CODEX_ID, source_kinds=("vscode", "appServer")
-    )
+    found = source.find_native_thread(CODEX_ID, source_kinds=("vscode", "appServer"))
 
     assert found is not None and found.native_id == CODEX_ID
     assert client.calls == [
@@ -2101,7 +2189,9 @@ def test_codex_exact_discovery_can_include_sidebar_and_app_server_threads() -> N
     ]
 
 
-def test_codex_source_kinds_enum_drift_retries_read_only_inventory_without_filter() -> None:
+def test_codex_source_kinds_enum_drift_retries_read_only_inventory_without_filter() -> (
+    None
+):
     adapter, client = _codex_adapter({
         "thread/start": [{"thread": {"id": CODEX_ID}}],
         "thread/name/set": [{}],
@@ -2144,12 +2234,12 @@ def test_codex_source_kinds_fallback_still_requires_exact_signed_provenance() ->
             FakeCodexRpcError(-32602, "invalid params: sourceKinds enum value"),
             _codex_inventory(),
         ],
-        "thread/read": [
-            _codex_signed_read(source_session_id="claude:wrong-source")
-        ],
+        "thread/read": [_codex_signed_read(source_session_id="claude:wrong-source")],
     })
 
-    with pytest.raises(AmbiguousPlaceholderCreation, match="codex_target_marker_mismatch"):
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_target_marker_mismatch"
+    ):
         adapter.create_placeholder(
             title="Mirror title",
             source_session_id="claude:source-1",
@@ -2256,7 +2346,9 @@ def test_codex_ambiguous_name_timeout_reconciles_before_any_mutation_retry() -> 
     ]
 
 
-def test_codex_post_start_ambiguity_carries_exact_native_id_for_reconciliation() -> None:
+def test_codex_post_start_ambiguity_carries_exact_native_id_for_reconciliation() -> (
+    None
+):
     adapter, client = _codex_adapter({
         "thread/start": [{"thread": {"id": CODEX_ID}}],
         "thread/name/set": [TimeoutError("unknown outcome")],
@@ -2330,15 +2422,15 @@ def test_codex_registration_turn_fallback_is_exactly_once_and_verified() -> None
     assert result.used_registration_turn is True
 
 
-def test_codex_production_default_waits_for_exact_registration_turn_completion() -> None:
+def test_codex_production_default_waits_for_exact_registration_turn_completion() -> (
+    None
+):
     exact_turn_id = "turn-registration-exact"
     client = CompletionAwareFakeRequestClient(
         {
             "thread/start": [{"thread": {"id": CODEX_ID}}],
             "thread/name/set": [{}],
-            "turn/start": [
-                {"turn": {"id": exact_turn_id, "status": "inProgress"}}
-            ],
+            "turn/start": [{"turn": {"id": exact_turn_id, "status": "inProgress"}}],
             "thread/list": [_codex_inventory()],
             "thread/read": [_codex_signed_read(turn_id=exact_turn_id)],
         },
@@ -2391,18 +2483,14 @@ def test_codex_registration_rejects_marker_on_a_different_returned_turn() -> Non
         {
             "thread/start": [{"thread": {"id": CODEX_ID}}],
             "thread/name/set": [{}],
-            "turn/start": [
-                {"turn": {"id": returned_turn_id, "status": "inProgress"}}
-            ],
+            "turn/start": [{"turn": {"id": returned_turn_id, "status": "inProgress"}}],
             "thread/list": [_codex_inventory()],
             "thread/read": [_codex_signed_read(turn_id="different-marker-turn")],
         },
         notifications=[
             {
                 "method": "turn/completed",
-                "params": {
-                    "turn": {"id": returned_turn_id, "status": "completed"}
-                },
+                "params": {"turn": {"id": returned_turn_id, "status": "completed"}},
             }
         ],
     )
@@ -2471,9 +2559,7 @@ def test_codex_registration_rejects_noncompleted_exact_turn_in_thread_read(
         {
             "thread/start": [{"thread": {"id": CODEX_ID}}],
             "thread/name/set": [{}],
-            "thread/read": [
-                _codex_signed_read(turn_id=turn_id, turn_status=status)
-            ],
+            "thread/read": [_codex_signed_read(turn_id=turn_id, turn_status=status)],
             "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
             "thread/list": [_codex_inventory()],
         },
@@ -2620,7 +2706,9 @@ def test_codex_registration_fallback_polls_until_sidebar_inventory_is_visible() 
     assert sleeps == [0.1]
 
 
-def test_codex_start_timeout_is_ambiguous_without_retry_and_errors_are_sanitized() -> None:
+def test_codex_start_timeout_is_ambiguous_without_retry_and_errors_are_sanitized() -> (
+    None
+):
     secret = "sk-proj-THIS-MUST-NOT-LEAK-1234567890"
     adapter, client = _codex_adapter({
         "thread/start": [TimeoutError(f"request leaked {secret}")],
@@ -2954,9 +3042,10 @@ def test_characterization_report_uses_exclusive_same_root_temporary_file(
     assert temporary.read_text(encoding="utf-8") == "preexisting"
     assert report == report_root / f"{characterization_id}.json"
     assert report.is_file()
-    assert sorted(path.name for path in report_root.iterdir()) == sorted(
-        [temporary.name, report.name]
-    )
+    assert sorted(path.name for path in report_root.iterdir()) == sorted([
+        temporary.name,
+        report.name,
+    ])
 
 
 def test_claude_quarantine_rejects_symlinked_destination_root(tmp_path: Path) -> None:
@@ -3027,28 +3116,26 @@ def test_claude_quarantine_rejects_broken_symlink_destination(tmp_path: Path) ->
 def test_codex_resume_polls_until_exact_started_turn_is_read() -> None:
     nonce = "c" * 32
     client = FakeRequestClient({
-        "turn/start": [
-            {"turn": {"id": "turn-resume-exact", "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": "turn-resume-exact", "status": "inProgress"}}],
         "thread/read": [
             _codex_read(
+                turns=[{"id": "turn-registration", "status": "completed", "items": []}]
+            ),
+            _codex_read(
                 turns=[
-                    {"id": "turn-registration", "status": "completed", "items": []}
+                    {"id": "turn-registration", "status": "completed", "items": []},
+                    {
+                        "id": "turn-resume-exact",
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": nonce}],
+                            }
+                        ],
+                    },
                 ]
             ),
-            _codex_read(turns=[
-                {"id": "turn-registration", "status": "completed", "items": []},
-                {
-                    "id": "turn-resume-exact",
-                    "status": "completed",
-                    "items": [
-                        {
-                            "type": "userMessage",
-                            "content": [{"type": "text", "text": nonce}],
-                        }
-                    ],
-                },
-            ]),
         ],
     })
     waited: list[tuple[str, str, float]] = []
@@ -3064,8 +3151,8 @@ def test_codex_resume_polls_until_exact_started_turn_is_read() -> None:
         verification_poll_interval=0.1,
         monotonic=times.__next__,
         sleep=sleeps.append,
-        completion_waiter=lambda client, thread_id, expected_turn_id, timeout: waited.append(
-            (thread_id, expected_turn_id, timeout)
+        completion_waiter=lambda client, thread_id, expected_turn_id, timeout: (
+            waited.append((thread_id, expected_turn_id, timeout))
         ),
     )
 
@@ -3086,9 +3173,7 @@ def test_codex_resume_proves_baseline_thread_completion_and_exact_nonce() -> Non
     nonce = "d" * 32
     turn_id = "turn-resume-proof"
     baseline = _codex_read(
-        turns=[
-            {"id": "turn-registration", "status": "completed", "items": []}
-        ]
+        turns=[{"id": "turn-registration", "status": "completed", "items": []}]
     )
     resumed = _codex_read(
         turns=[
@@ -3112,9 +3197,7 @@ def test_codex_resume_proves_baseline_thread_completion_and_exact_nonce() -> Non
     )
     client = FakeRequestClient({
         "thread/read": [baseline, resumed],
-        "turn/start": [
-            {"turn": {"id": turn_id, "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
     })
     waited: list[tuple[str, str, float]] = []
 
@@ -3125,8 +3208,8 @@ def test_codex_resume_proves_baseline_thread_completion_and_exact_nonce() -> Non
         request_timeout=45.0,
         verification_timeout=1.0,
         verification_poll_interval=0.1,
-        completion_waiter=lambda client, thread_id, expected_turn_id, timeout: waited.append(
-            (thread_id, expected_turn_id, timeout)
+        completion_waiter=lambda client, thread_id, expected_turn_id, timeout: (
+            waited.append((thread_id, expected_turn_id, timeout))
         ),
     )
 
@@ -3149,22 +3232,22 @@ def test_codex_resume_uses_noncompleted_notification_as_wakeup(status: str) -> N
         {
             "thread/read": [
                 _codex_read(turns=[]),
-                _codex_read(turns=[
-                    {
-                        "id": turn_id,
-                        "status": "completed",
-                        "items": [
-                            {
-                                "type": "userMessage",
-                                "content": [{"type": "text", "text": nonce}],
-                            }
-                        ],
-                    }
-                ]),
+                _codex_read(
+                    turns=[
+                        {
+                            "id": turn_id,
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "content": [{"type": "text", "text": nonce}],
+                                }
+                            ],
+                        }
+                    ]
+                ),
             ],
-            "turn/start": [
-                {"turn": {"id": turn_id, "status": "inProgress"}}
-            ],
+            "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
         },
         notifications=[
             {
@@ -3196,22 +3279,22 @@ def test_codex_resume_rejects_noncompleted_exact_turn_in_thread_read(
     client = FakeRequestClient({
         "thread/read": [
             _codex_read(turns=[]),
-            _codex_read(turns=[
-                {
-                    "id": turn_id,
-                    "status": status,
-                    "items": [
-                        {
-                            "type": "userMessage",
-                            "content": [{"type": "text", "text": nonce}],
-                        }
-                    ],
-                }
-            ]),
+            _codex_read(
+                turns=[
+                    {
+                        "id": turn_id,
+                        "status": status,
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": nonce}],
+                            }
+                        ],
+                    }
+                ]
+            ),
         ],
-        "turn/start": [
-            {"turn": {"id": turn_id, "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
     })
 
     with pytest.raises(RuntimeError, match="codex_resume_turn_not_completed"):
@@ -3248,9 +3331,7 @@ def test_codex_resume_polls_durable_inprogress_turn_until_completed() -> None:
             _codex_read(turns=[durable_turn("inProgress")]),
             _codex_read(turns=[durable_turn("completed")]),
         ],
-        "turn/start": [
-            {"turn": {"id": turn_id, "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
     })
     times = iter([0.0, 0.0])
     sleeps: list[float] = []
@@ -3281,9 +3362,7 @@ def test_codex_resume_rejects_post_read_for_wrong_thread() -> None:
                 turns=[{"id": turn_id, "status": "completed", "items": []}],
             ),
         ],
-        "turn/start": [
-            {"turn": {"id": turn_id, "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
     })
 
     with pytest.raises(RuntimeError, match="codex_resume_identity_mismatch"):
@@ -3316,9 +3395,7 @@ def test_codex_resume_rejects_preexisting_returned_turn_id() -> None:
     )
     client = FakeRequestClient({
         "thread/read": [stale],
-        "turn/start": [
-            {"turn": {"id": turn_id, "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
     })
 
     with pytest.raises(RuntimeError, match="codex_resume_turn_preexisting"):
@@ -3346,18 +3423,14 @@ def test_codex_resume_rejects_exact_new_turn_without_nonce() -> None:
                         "items": [
                             {
                                 "type": "userMessage",
-                                "content": [
-                                    {"type": "text", "text": "wrong nonce"}
-                                ],
+                                "content": [{"type": "text", "text": "wrong nonce"}],
                             }
                         ],
                     }
                 ]
             ),
         ],
-        "turn/start": [
-            {"turn": {"id": turn_id, "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
     })
 
     with pytest.raises(RuntimeError, match="codex_resume_nonce_mismatch"):
@@ -3374,16 +3447,12 @@ def test_codex_resume_rejects_exact_new_turn_without_nonce() -> None:
 
 def test_codex_resume_rejects_stale_or_wrong_turn_identity() -> None:
     client = FakeRequestClient({
-        "turn/start": [
-            {"turn": {"id": "turn-resume-exact", "status": "inProgress"}}
-        ],
+        "turn/start": [{"turn": {"id": "turn-resume-exact", "status": "inProgress"}}],
         "thread/read": [
             _codex_read(turns=[]),
             _codex_read(
-                turns=[
-                    {"id": "turn-registration", "status": "completed", "items": []}
-                ]
-            )
+                turns=[{"id": "turn-registration", "status": "completed", "items": []}]
+            ),
         ],
     })
 
@@ -3748,10 +3817,14 @@ def test_characterization_report_preserves_only_sanitized_claude_failure_metrics
         raise failure
 
     monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
-    monkeypatch.setattr(characterize_module, "resolve_cli_executable", lambda value: value)
+    monkeypatch.setattr(
+        characterize_module, "resolve_cli_executable", lambda value: value
+    )
     monkeypatch.setattr(characterize_module, "_cli_version", lambda args: "test")
     monkeypatch.setattr(characterize_module, "_characterize_claude", fail_claude)
-    monkeypatch.setattr(characterize_module, "_characterize_codex", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        characterize_module, "_characterize_codex", lambda *args, **kwargs: None
+    )
 
     with pytest.raises(LiveCharacterizationError) as raised:
         run_live_characterization(
@@ -3848,11 +3921,14 @@ def test_claude_live_metrics_accept_only_finite_numeric_result_fields() -> None:
         "duration_ms": 12601.0,
         "num_turns": 1,
     }
-    assert _claude_result_metrics(
-        subprocess.CompletedProcess(
-            ["claude"], 0, stdout='{"total_cost_usd":"secret"}', stderr=""
+    assert (
+        _claude_result_metrics(
+            subprocess.CompletedProcess(
+                ["claude"], 0, stdout='{"total_cost_usd":"secret"}', stderr=""
+            )
         )
-    ) == {}
+        == {}
+    )
 
 
 @pytest.mark.parametrize("suffix", [".cmd", ".ps1"])
@@ -3891,9 +3967,9 @@ def test_live_characterization_rejects_unrecognized_shell_shims(
 
 
 def test_live_characterization_keeps_native_executable_as_single_argv_prefix() -> None:
-    assert resolve_cli_executable(
-        "C:/tools/claude.exe", which=lambda _: None
-    ) == ("C:/tools/claude.exe",)
+    assert resolve_cli_executable("C:/tools/claude.exe", which=lambda _: None) == (
+        "C:/tools/claude.exe",
+    )
 
 
 def test_codex_resolver_preserves_launchable_absolute_npm_cmd_over_windowsapps_exe(
@@ -3909,9 +3985,7 @@ def test_codex_resolver_preserves_launchable_absolute_npm_cmd_over_windowsapps_e
 
     resolved = resolve_cli_executable(
         "codex",
-        which=lambda name: str(
-            inaccessible_native if name == "codex.exe" else shim
-        ),
+        which=lambda name: str(inaccessible_native if name == "codex.exe" else shim),
     )
 
     assert resolved == (str(shim.resolve()),)

@@ -23,7 +23,11 @@ from .models import (
     encode_bridge_marker,
 )
 from .context_pack import redact_sensitive_text
-from .sidebar import is_meaningful_user_text, normalize_meaningful_user_text, sidebar_title
+from .sidebar import (
+    is_meaningful_user_text,
+    normalize_meaningful_user_text,
+    sidebar_title,
+)
 
 
 CLAUDE_VISIBILITY_UUID_NAMESPACE = uuid.uuid5(
@@ -180,7 +184,9 @@ def build_claude_visibility_candidate(
     if projection.provider is Provider.CODEX:
         sanitized = "[Codex] " + sanitized.removeprefix("[Claude] ")
     return ClaudeVisibilityCandidate(
-        source_session_id=canonical_session_id(projection.provider, projection.native_id),
+        source_session_id=canonical_session_id(
+            projection.provider, projection.native_id
+        ),
         source_provider=projection.provider,
         native_name=sanitized,
         source_cwd=source_cwd,
@@ -226,7 +232,9 @@ def _identity_values(
     bridge_id = f"claude-visibility:{identity_digest}"
     idempotency_key = f"claude-visibility:{identity_digest}:v1"
     claude_uuid = str(uuid.uuid5(CLAUDE_VISIBILITY_UUID_NAMESPACE, bridge_id))
-    job_id = f"claude-visibility-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+    job_id = (
+        f"claude-visibility-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+    )
     return job_id, bridge_id, idempotency_key, claude_uuid
 
 
@@ -236,7 +244,10 @@ def build_claude_registration_prompt(
     marker_secret: bytes,
 ) -> str:
     validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
-    if redact_sensitive_text(candidate.source_session_id) != candidate.source_session_id:
+    if (
+        redact_sensitive_text(candidate.source_session_id)
+        != candidate.source_session_id
+    ):
         raise ValueError("source session ID cannot be represented safely")
     metadata = {
         "bridge_id": identity.bridge_id,
@@ -317,12 +328,18 @@ def _validate_candidate(candidate: ClaudeVisibilityCandidate) -> None:
         raise ValueError("Claude visibility candidate is malformed")
     if candidate.source_provider not in (Provider.CODEX, Provider.HERMES):
         raise ValueError("Claude visibility source provider must be Codex or Hermes")
-    canonical = canonical_session_id(candidate.source_provider, candidate.source_session_id.removeprefix(f"{candidate.source_provider.value}:"))
+    canonical = canonical_session_id(
+        candidate.source_provider,
+        candidate.source_session_id.removeprefix(f"{candidate.source_provider.value}:"),
+    )
     if canonical != candidate.source_session_id:
         raise ValueError("Claude visibility source identity is not canonical")
-    if not candidate.native_name.startswith(
-        "[Codex] " if candidate.source_provider is Provider.CODEX else "[Hermes] "
-    ) or len(candidate.native_name) > 120:
+    if (
+        not candidate.native_name.startswith(
+            "[Codex] " if candidate.source_provider is Provider.CODEX else "[Hermes] "
+        )
+        or len(candidate.native_name) > 120
+    ):
         raise ValueError("Claude visibility native name is invalid")
     _required_metadata(candidate.source_cwd, "source cwd")
     for value, label in (
@@ -384,7 +401,11 @@ def usd_microdollars(value: object, label: str) -> int:
 
 
 def canonical_usd(microdollars: int) -> str:
-    if not isinstance(microdollars, int) or isinstance(microdollars, bool) or microdollars < 0:
+    if (
+        not isinstance(microdollars, int)
+        or isinstance(microdollars, bool)
+        or microdollars < 0
+    ):
         raise ValueError("microdollars must be a non-negative integer")
     whole, fraction = divmod(microdollars, 1_000_000)
     return f"{whole}.{fraction:06d}"

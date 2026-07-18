@@ -47,7 +47,9 @@ def _job(provider: Provider, *, state: MirrorJobState = MirrorJobState.RUNNING):
         "id": f"job:safety-{provider.value}",
         "idempotency_key": f"safety-{provider.value}-idempotency",
         "source_session_id": (
-            "codex:source-native" if provider is Provider.CLAUDE else "claude:source-native"
+            "codex:source-native"
+            if provider is Provider.CLAUDE
+            else "claude:source-native"
         ),
         "target_provider": provider.value,
         "state": state.value,
@@ -202,19 +204,15 @@ class _SafetyStore:
         target_session_id: str,
         bridge_id: str,
     ) -> None:
-        self.completions.append(
-            {
-                "job_id": job_id,
-                "target_native_id": target_native_id,
-                "target_session_id": target_session_id,
-                "bridge_id": bridge_id,
-            }
-        )
+        self.completions.append({
+            "job_id": job_id,
+            "target_native_id": target_native_id,
+            "target_session_id": target_session_id,
+            "bridge_id": bridge_id,
+        })
 
     def fail_job_manually(self, job_id: str, *, code: str, detail: str) -> None:
-        self.manual_failures.append(
-            {"job_id": job_id, "code": code, "detail": detail}
-        )
+        self.manual_failures.append({"job_id": job_id, "code": code, "detail": detail})
 
     def retry_job(
         self,
@@ -224,14 +222,12 @@ class _SafetyStore:
         detail: str,
         next_attempt_at: float,
     ) -> None:
-        self.retries.append(
-            {
-                "job_id": job_id,
-                "code": code,
-                "detail": detail,
-                "next_attempt_at": next_attempt_at,
-            }
-        )
+        self.retries.append({
+            "job_id": job_id,
+            "code": code,
+            "detail": detail,
+            "next_attempt_at": next_attempt_at,
+        })
 
 
 class _ClaudeSource:
@@ -396,7 +392,9 @@ async def test_restart_indexes_deterministic_claude_target_before_completion() -
 
 
 @pytest.mark.asyncio
-async def test_launch_uses_sanitized_metadata_and_reports_registration_fallback() -> None:
+async def test_launch_uses_sanitized_metadata_and_reports_registration_fallback() -> (
+    None
+):
     job = _job(Provider.CODEX)
     store = _SafetyStore(
         claimed=[job],
@@ -573,14 +571,12 @@ class _ReplayStore:
         target_cursor: str,
         target_hash: str,
     ):
-        self.transition_calls.append(
-            {
-                "bridge_id": bridge_id,
-                "pack_id": pack_id,
-                "target_cursor": target_cursor,
-                "target_hash": target_hash,
-            }
-        )
+        self.transition_calls.append({
+            "bridge_id": bridge_id,
+            "pack_id": pack_id,
+            "target_cursor": target_cursor,
+            "target_hash": target_hash,
+        })
         self.pack = replace(self.pack, immutable_at=100.0)
         return {
             "id": "link-existing",
@@ -636,8 +632,12 @@ async def test_continuation_replay_rejects_target_provider_mismatch(
         del timeout
         return RefreshResult(
             session_id=session_id,
-            cursor=("source-cursor" if session_id.startswith("claude:") else "target-cursor"),
-            source_hash=("source-hash" if session_id.startswith("claude:") else "target-hash"),
+            cursor=(
+                "source-cursor" if session_id.startswith("claude:") else "target-cursor"
+            ),
+            source_hash=(
+                "source-hash" if session_id.startswith("claude:") else "target-hash"
+            ),
             stale=False,
             warning=None,
         )
@@ -684,8 +684,14 @@ async def test_crash_recovery_finalizes_existing_mutable_pack_without_rebuild(
         del timeout
         return RefreshResult(
             session_id=session_id,
-            cursor=(pack.source_cursor if session_id.startswith("claude:") else "target-cursor"),
-            source_hash=(pack.source_hash if session_id.startswith("claude:") else "target-hash"),
+            cursor=(
+                pack.source_cursor
+                if session_id.startswith("claude:")
+                else "target-cursor"
+            ),
+            source_hash=(
+                pack.source_hash if session_id.startswith("claude:") else "target-hash"
+            ),
             stale=False,
             warning=None,
         )

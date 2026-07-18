@@ -72,7 +72,7 @@ def _remove_tree(path: Path) -> None:
         os.chmod(value, stat.S_IWRITE)
         function(value)
 
-    shutil.rmtree(path, onexc=_make_writable)
+    shutil.rmtree(path, onerror=_make_writable)
 
 
 def test_worktree_snapshot_captures_exact_spelling_and_linked_identity(

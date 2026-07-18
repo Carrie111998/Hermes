@@ -343,10 +343,13 @@ def test_fresh_claude_visibility_schema_has_exact_columns_states_and_uniques(
         "job_id",
         "attempt_ordinal",
     ) in _unique_column_sets(db, "session_claude_registration_usage")
-    assert _rows(
-        db,
-        'PRAGMA foreign_key_list("session_claude_visibility_jobs")',
-    ) == []
+    assert (
+        _rows(
+            db,
+            'PRAGMA foreign_key_list("session_claude_visibility_jobs")',
+        )
+        == []
+    )
 
 
 def test_claude_registration_usage_migrates_existing_database_idempotently(
@@ -389,10 +392,13 @@ def test_claude_registration_usage_migrates_existing_database_idempotently(
             "job_id",
             "attempt_ordinal",
         ) in _unique_column_sets(migrated, "session_claude_registration_usage")
-        assert _rows(
-            migrated,
-            'PRAGMA foreign_key_list("session_claude_visibility_jobs")',
-        ) == []
+        assert (
+            _rows(
+                migrated,
+                'PRAGMA foreign_key_list("session_claude_visibility_jobs")',
+            )
+            == []
+        )
     finally:
         migrated.close()
 
@@ -421,12 +427,17 @@ def test_v24_migration_invalidates_legacy_authorization_and_ambiguous_lease(
                FROM session_claude_visibility_jobs ORDER BY id""",
         )
         assert all(row["state"] == "claude_retry" for row in rows)
-        assert all(row["lease_digest"] is None and row["lease_kind"] is None for row in rows)
-        assert any("authorization sentinel invalidated" in row["error_detail"] for row in rows)
+        assert all(
+            row["lease_digest"] is None and row["lease_kind"] is None for row in rows
+        )
+        assert any(
+            "authorization sentinel invalidated" in row["error_detail"] for row in rows
+        )
         assert any("active lease invalidated" in row["error_detail"] for row in rows)
-        assert _rows(
-            migrated, "SELECT * FROM session_claude_visibility_reconciliations"
-        ) == []
+        assert (
+            _rows(migrated, "SELECT * FROM session_claude_visibility_reconciliations")
+            == []
+        )
         with pytest.raises(sqlite3.IntegrityError, match="lease fields"):
             migrated._conn.execute(
                 """UPDATE session_claude_visibility_jobs
@@ -469,17 +480,21 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
 
     reopened = SessionDB(path)
     try:
-        assert _rows(reopened, "SELECT version FROM schema_version") == [{"version": 10}]
+        assert _rows(reopened, "SELECT version FROM schema_version") == [
+            {"version": 10}
+        ]
         assert _rows(
             reopened,
             """SELECT state, lease_digest, lease_kind
                FROM session_claude_visibility_jobs WHERE id = ?""",
             (job_id,),
-        ) == [{
-            "state": "claude_leased",
-            "lease_digest": "valid-digest",
-            "lease_kind": "launch",
-        }]
+        ) == [
+            {
+                "state": "claude_leased",
+                "lease_digest": "valid-digest",
+                "lease_kind": "launch",
+            }
+        ]
     finally:
         reopened.close()
 
@@ -594,11 +609,13 @@ def test_delete_session_preserves_claude_visibility_job_and_usage_audit(
     assert _rows(
         db,
         "SELECT id, source_session_id, state FROM session_claude_visibility_jobs",
-    ) == [{
-        "id": job_id,
-        "source_session_id": source_session_id,
-        "state": state,
-    }]
+    ) == [
+        {
+            "id": job_id,
+            "source_session_id": source_session_id,
+            "state": state,
+        }
+    ]
     assert _rows(
         db,
         "SELECT job_id, attempt_ordinal FROM session_claude_registration_usage",
@@ -637,20 +654,25 @@ def test_prune_sessions_preserves_claude_visibility_job_and_usage_audit(
     )
     assert _rows(db, "PRAGMA foreign_keys") == [{"foreign_keys": 1}]
 
-    assert db.prune_sessions(
-        older_than_days=None,
-        started_before=10**12,
-    ) == 1
+    assert (
+        db.prune_sessions(
+            older_than_days=None,
+            started_before=10**12,
+        )
+        == 1
+    )
 
     assert db.get_session(source_session_id) is None
     assert _rows(
         db,
         "SELECT id, source_session_id, state FROM session_claude_visibility_jobs",
-    ) == [{
-        "id": job_id,
-        "source_session_id": source_session_id,
-        "state": state,
-    }]
+    ) == [
+        {
+            "id": job_id,
+            "source_session_id": source_session_id,
+            "state": state,
+        }
+    ]
     assert _rows(
         db,
         "SELECT job_id, attempt_ordinal FROM session_claude_registration_usage",
@@ -892,10 +914,10 @@ def _enqueue_automatic_job(
     now: float,
 ):
     policy = MirrorPolicy(automatic_creation=True)
-    source_session_id = canonical_session_id(
-        projection.provider, projection.native_id
+    source_session_id = canonical_session_id(projection.provider, projection.native_id)
+    target = (
+        Provider.CODEX if projection.provider is Provider.CLAUDE else Provider.CLAUDE
     )
-    target = Provider.CODEX if projection.provider is Provider.CLAUDE else Provider.CLAUDE
     candidate = MirrorCandidate(
         source_session_id=source_session_id,
         target_provider=target,
@@ -1152,16 +1174,17 @@ def test_list_existing_target_mappings_returns_exact_provider_pairs(db):
         )
     )
 
-    assert store.list_existing_target_mappings(
-        ["claude:source", "claude:unmapped"]
-    ) == frozenset({("claude:source", Provider.CODEX)})
+    assert store.list_existing_target_mappings([
+        "claude:source",
+        "claude:unmapped",
+    ]) == frozenset({("claude:source", Provider.CODEX)})
     assert store.list_existing_target_mappings([]) == frozenset()
     with pytest.raises(TypeError, match="sequence"):
         store.list_existing_target_mappings("claude:source")
     with pytest.raises(ValueError, match="at most 1000"):
-        store.list_existing_target_mappings(
-            [f"claude:source-{index}" for index in range(1001)]
-        )
+        store.list_existing_target_mappings([
+            f"claude:source-{index}" for index in range(1001)
+        ])
 
 
 def test_first_import_is_idempotent_and_append_only(db):
@@ -1782,9 +1805,7 @@ def test_low_level_mirror_job_is_idempotent_but_public_claim_fails_closed(db):
         )
     assert _rows(db, "SELECT * FROM session_mirror_jobs")[0]["state"] == "queued"
 
-    assert (
-        store.claim_due_jobs(now=100.0, limit=10, policy=MirrorPolicy()) == []
-    )
+    assert store.claim_due_jobs(now=100.0, limit=10, policy=MirrorPolicy()) == []
     failed = _rows(db, "SELECT * FROM session_mirror_jobs")[0]
     assert failed["state"] == "manual_failure"
     assert failed["attempts"] == 0
@@ -1917,10 +1938,13 @@ def test_atomic_claim_keeps_manual_authority_when_automatic_breaker_halts(db):
 
     assert [job["id"] for job in claimed] == [manual["id"]]
     assert claimed[0]["claim_authority"] == "manual"
-    rows = {job["id"]: job for job in store.list_mirror_jobs([
-        MirrorJobState.QUEUED,
-        MirrorJobState.RUNNING,
-    ])}
+    rows = {
+        job["id"]: job
+        for job in store.list_mirror_jobs([
+            MirrorJobState.QUEUED,
+            MirrorJobState.RUNNING,
+        ])
+    }
     assert rows[automatic["id"]]["state"] == "queued"
 
 
@@ -1984,12 +2008,15 @@ def test_atomic_claim_accepts_an_exact_job_id_scope(db):
     )
 
     assert [job["id"] for job in claimed] == [jobs[1]["id"]]
-    assert store.claim_due_jobs_with_limits(
-        now=100.0,
-        limit=1,
-        policy=MirrorPolicy(),
-        job_ids=[],
-    ) == []
+    assert (
+        store.claim_due_jobs_with_limits(
+            now=100.0,
+            limit=1,
+            policy=MirrorPolicy(),
+            job_ids=[],
+        )
+        == []
+    )
     queued = store.list_mirror_jobs([MirrorJobState.QUEUED])
     assert [job["id"] for job in queued] == [jobs[0]["id"]]
     with pytest.raises(TypeError, match="sequence"):
@@ -2132,8 +2159,7 @@ def test_atomic_claim_reserves_breaker_attempt_and_never_overshoots_cap(db):
     assert store.get_mirror_breaker_progress() == {"attempts": 20, "errors": 1}
     assert store.claim_due_jobs_with_limits(now=100.0, limit=6, policy=policy) == []
     assert jobs[1]["id"] in {
-        row["id"]
-        for row in store.list_mirror_jobs([MirrorJobState.QUEUED])
+        row["id"] for row in store.list_mirror_jobs([MirrorJobState.QUEUED])
     }
 
 
@@ -2281,16 +2307,12 @@ def test_guarded_public_claim_preserves_retry_order_and_cas_transitions(db):
     current_time = [100.0]
     store = SessionBridgeStore(db, clock=lambda: current_time[0])
     store.upsert_projection(_projection(_message("e1", "source")))
-    first = _enqueue_manual_job(
-        store, "claude:native-1", Provider.CODEX, generation=4
-    )
+    first = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX, generation=4)
 
     claimed = store.claim_due_jobs(now=100.0, limit=10, policy=MirrorPolicy())
     assert claimed[0]["state"] == "running"
     assert claimed[0]["attempts"] == 1
-    assert store.claim_due_jobs(
-        now=100.0, limit=10, policy=MirrorPolicy()
-    ) == []
+    assert store.claim_due_jobs(now=100.0, limit=10, policy=MirrorPolicy()) == []
 
     attempt_key = f"session-bridge:attempt:{first['id']}"
     store.set_state(attempt_key, {"version": 1, "attempts": 1})
@@ -2299,13 +2321,9 @@ def test_guarded_public_claim_preserves_retry_order_and_cas_transitions(db):
     )
     assert store.get_state(attempt_key) is None
     current_time[0] = 119.0
-    assert store.claim_due_jobs(
-        now=119.0, limit=10, policy=MirrorPolicy()
-    ) == []
+    assert store.claim_due_jobs(now=119.0, limit=10, policy=MirrorPolicy()) == []
     current_time[0] = 120.0
-    reclaimed = store.claim_due_jobs(
-        now=120.0, limit=10, policy=MirrorPolicy()
-    )
+    reclaimed = store.claim_due_jobs(now=120.0, limit=10, policy=MirrorPolicy())
     assert reclaimed[0]["attempts"] == 2
 
 
@@ -2581,9 +2599,7 @@ def test_terminal_jobs_cannot_be_retried_or_overwritten(db):
     store.upsert_projection(
         _projection(_message("s2", "terminal"), native_id="native-terminal")
     )
-    terminal = _enqueue_manual_job(
-        store, "claude:native-terminal", Provider.CODEX
-    )
+    terminal = _enqueue_manual_job(store, "claude:native-terminal", Provider.CODEX)
     store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
     store.fail_job_manually(terminal["id"], code="manual", detail="operator required")
     store.fail_job_manually(terminal["id"], code="manual", detail="operator required")
@@ -2690,9 +2706,7 @@ def test_mirror_link_transitions_to_continues_from_an_immutable_pack(db):
     assert transitioned["source_cursor"] == "cursor-snapshot"
     assert transitioned["source_hash"] == "hash-snapshot"
     assert transitioned["hydrated_at"] == 100.0
-    assert store.get_context_pack("bridge-1", budget_chars=4000)[
-        "immutable_at"
-    ] == 90.0
+    assert store.get_context_pack("bridge-1", budget_chars=4000)["immutable_at"] == 90.0
     assert store.get_continuation_snapshot("bridge-1") == {
         "version": 1,
         "pack_id": "pack-1",
@@ -3563,9 +3577,9 @@ def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tm
     )
     queued = store.enqueue_sidebar_job(candidate)
     assert queued["created"] is True
-    assert _rows(db, "SELECT source FROM sessions WHERE id = ?", (
-        "hermes-profile-native",
-    )) == [{"source": "session_bridge_profile"}]
+    assert _rows(
+        db, "SELECT source FROM sessions WHERE id = ?", ("hermes-profile-native",)
+    ) == [{"source": "session_bridge_profile"}]
 
     db._execute_write(
         lambda conn: (
@@ -3606,9 +3620,7 @@ def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tm
             "diverged_at": None,
         }
     ]
-    assert read["messages"][0]["content"] == (
-        "ship the cross-profile sidebar bridge"
-    )
+    assert read["messages"][0]["content"] == ("ship the cross-profile sidebar bridge")
 
 
 def test_native_hermes_snapshot_canonicalizes_binary_and_nonfinite_content(db):
@@ -3654,7 +3666,9 @@ def test_claude_visibility_hermes_inventory_is_independent_and_stable(db) -> Non
         ("hermes-origin", "cli", 100.0),
     ):
         db.create_session(session_id, source, cwd="C:/workspace/project")
-        db.append_message(session_id, "user", f"meaningful {session_id}", timestamp=timestamp)
+        db.append_message(
+            session_id, "user", f"meaningful {session_id}", timestamp=timestamp
+        )
 
     def sidebar_candidate(session_id: str) -> SidebarCandidate:
         return SidebarCandidate(
@@ -3674,40 +3688,59 @@ def test_claude_visibility_hermes_inventory_is_independent_and_stable(db) -> Non
     visible = sidebar_candidate("hermes-visible")
     store.enqueue_sidebar_job(pending)
     store.enqueue_sidebar_job(visible)
-    db._execute_write(lambda conn: conn.execute(
-        """UPDATE session_sidebar_jobs
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_sidebar_jobs
               SET state = 'sidebar_visible', codex_thread_id = ?, visible_at = ?,
                   completion_digest = ?
             WHERE source_session_id = ?""",
-        ("visible-thread", 200.0, "a" * 64, visible.source_session_id),
-    ))
+            ("visible-thread", 200.0, "a" * 64, visible.source_session_id),
+        )
+    )
     store.record_sidebar_exclusion(
         "hermes-excluded", Provider.HERMES, "source_cwd_missing", now=200.0
     )
-    db._execute_write(lambda conn: conn.execute(
-        """INSERT INTO session_links (
+    db._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO session_links (
                id, from_session_id, to_session_id, relation, bridge_id,
                created_at, hydrated_at
            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        ("visibility-bridge-link", "hermes-origin", "hermes-bridge",
-         Relation.CONTINUES.value, "bridge:visibility", 101.0, 101.0),
-    ))
-    store.upsert_projection(_projection(
-        _message("native-claude", "must not pollute Hermes inventory"),
-        provider=Provider.CLAUDE,
-        native_id="native-claude",
-        last_active=106.0,
-    ))
+            (
+                "visibility-bridge-link",
+                "hermes-origin",
+                "hermes-bridge",
+                Relation.CONTINUES.value,
+                "bridge:visibility",
+                101.0,
+                101.0,
+            ),
+        )
+    )
+    store.upsert_projection(
+        _projection(
+            _message("native-claude", "must not pollute Hermes inventory"),
+            provider=Provider.CLAUDE,
+            native_id="native-claude",
+            last_active=106.0,
+        )
+    )
 
     sources = store.list_claude_visibility_hermes_sources(after=0.0, limit=20)
 
     assert [source.source_session_id for source in sources] == [
-        "hermes-pending", "hermes-visible", "hermes-excluded",
-        "hermes-automation", "hermes-bridge", "hermes-origin",
+        "hermes-pending",
+        "hermes-visible",
+        "hermes-excluded",
+        "hermes-automation",
+        "hermes-bridge",
+        "hermes-origin",
     ]
     by_id = {source.source_session_id: source for source in sources}
     assert by_id["hermes-automation"].automation_only is True
-    assert by_id["hermes-bridge"].projection.origin_kind is OriginKind.BRIDGE_CONTINUATION
+    assert (
+        by_id["hermes-bridge"].projection.origin_kind is OriginKind.BRIDGE_CONTINUATION
+    )
     assert by_id["hermes-bridge"].projection.origin_bridge_id == "bridge:visibility"
     assert len(by_id) == len(sources)
 
@@ -3838,14 +3871,16 @@ def _seed_sidebar_codex_target(
     *,
     bridge_id: str | None = None,
 ) -> str:
-    store.upsert_projection(_projection(
-        _message(f"target-{thread_id}", "Hermes Session Bridge placeholder"),
-        provider=Provider.CODEX,
-        native_id=thread_id,
-        last_active=150.0,
-        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
-        origin_bridge_id=bridge_id or candidate.bridge_id,
-    ))
+    store.upsert_projection(
+        _projection(
+            _message(f"target-{thread_id}", "Hermes Session Bridge placeholder"),
+            provider=Provider.CODEX,
+            native_id=thread_id,
+            last_active=150.0,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=bridge_id or candidate.bridge_id,
+        )
+    )
     return f"codex:{thread_id}"
 
 
@@ -3880,14 +3915,16 @@ def test_sidebar_exclusion_recording_is_idempotent_counted_and_bounded(db) -> No
         "created": True,
     }
     assert replay == {**first, "created": False}
-    assert _rows(db, "SELECT * FROM session_sidebar_exclusions") == [{
-        "source_session_id": candidate.source_session_id,
-        "provider": Provider.CLAUDE.value,
-        "reason_code": "source_cwd_missing",
-        "source_identity_digest": expected_digest,
-        "excluded_at": 125.0,
-        "updated_at": 125.0,
-    }]
+    assert _rows(db, "SELECT * FROM session_sidebar_exclusions") == [
+        {
+            "source_session_id": candidate.source_session_id,
+            "provider": Provider.CLAUDE.value,
+            "reason_code": "source_cwd_missing",
+            "source_identity_digest": expected_digest,
+            "excluded_at": 125.0,
+            "updated_at": 125.0,
+        }
+    ]
     assert SIDEBAR_EXCLUSION_REASONS == frozenset({"source_cwd_missing"})
     assert store.sidebar_exclusion_counts() == {
         "total": 1,
@@ -3945,11 +3982,13 @@ def test_sidebar_exclusion_replay_fails_closed_on_corrupted_digest(db) -> None:
         db,
         "SELECT source_identity_digest, excluded_at, updated_at "
         "FROM session_sidebar_exclusions",
-    ) == [{
-        "source_identity_digest": "0" * 64,
-        "excluded_at": 125.0,
-        "updated_at": 125.0,
-    }]
+    ) == [
+        {
+            "source_identity_digest": "0" * 64,
+            "excluded_at": 125.0,
+            "updated_at": 125.0,
+        }
+    ]
 
 
 def test_sidebar_candidates_exclude_persisted_rows_before_limit(db) -> None:
@@ -4019,9 +4058,10 @@ def test_sidebar_enqueue_persists_versioned_delivery_candidate_across_restart(
 ) -> None:
     store = SessionBridgeStore(db, clock=lambda: 125.0)
     candidate = _sidebar_candidate(db)
-    state_key = "session-bridge:sidebar-delivery:" + hashlib.sha256(
-        candidate.source_session_id.encode()
-    ).hexdigest()
+    state_key = (
+        "session-bridge:sidebar-delivery:"
+        + hashlib.sha256(candidate.source_session_id.encode()).hexdigest()
+    )
 
     store.enqueue_sidebar_job(candidate)
     row = _rows(
@@ -4104,9 +4144,10 @@ def test_sidebar_delivery_candidate_missing_or_malformed_state_fails_closed(db) 
     store = SessionBridgeStore(db, clock=lambda: 125.0)
     candidate = _sidebar_candidate(db)
     store.enqueue_sidebar_job(candidate)
-    state_key = "session-bridge:sidebar-delivery:" + hashlib.sha256(
-        candidate.source_session_id.encode()
-    ).hexdigest()
+    state_key = (
+        "session-bridge:sidebar-delivery:"
+        + hashlib.sha256(candidate.source_session_id.encode()).hexdigest()
+    )
 
     db._execute_write(
         lambda conn: conn.execute(
@@ -4169,8 +4210,7 @@ def test_sidebar_claims_are_ordered_bounded_and_digest_tokens_at_rest(db) -> Non
     assert [job["lease_token"] for job in claimed] == list(tokens[:2])
     assert all(job["lease_expires_at"] == 500.0 for job in claimed)
     persisted = {
-        row["id"]: row
-        for row in _rows(db, "SELECT * FROM session_sidebar_jobs")
+        row["id"]: row for row in _rows(db, "SELECT * FROM session_sidebar_jobs")
     }
     for job, token in zip(claimed, tokens[:2], strict=True):
         row = persisted[job["id"]]
@@ -4227,9 +4267,7 @@ def test_sidebar_claim_rejects_nonfinite_times(db, now) -> None:
     "lease_seconds",
     [299, 301, 300.0, True, False, "300", None],
 )
-def test_sidebar_claim_rejects_every_nonexact_lease_duration(
-    db, lease_seconds
-) -> None:
+def test_sidebar_claim_rejects_every_nonexact_lease_duration(db, lease_seconds) -> None:
     store = SessionBridgeStore(db)
 
     with pytest.raises(ValueError, match="exactly 300"):
@@ -4342,9 +4380,7 @@ def test_sidebar_commit_requires_exact_unexpired_token_and_is_idempotent(db) -> 
     assert committed["visible_at"] == 399.999
     assert committed["lease_digest"] is None
     assert committed["lease_expires_at"] is None
-    assert committed["completion_digest"] == hashlib.sha256(
-        b"commit-token"
-    ).hexdigest()
+    assert committed["completion_digest"] == hashlib.sha256(b"commit-token").hexdigest()
 
 
 def test_sidebar_bind_persists_exact_thread_across_retry_and_rejects_rebind(db) -> None:
@@ -4419,9 +4455,9 @@ def test_sidebar_atomic_lineage_commit_and_exact_replay_are_idempotent(db) -> No
 
     assert replay == committed
     assert committed["state"] == SidebarJobState.VISIBLE.value
-    links = _rows(db, "SELECT * FROM session_links WHERE bridge_id = ?", (
-        candidate.bridge_id,
-    ))
+    links = _rows(
+        db, "SELECT * FROM session_links WHERE bridge_id = ?", (candidate.bridge_id,)
+    )
     assert len(links) == 1
     assert links[0]["from_session_id"] == candidate.source_session_id
     assert links[0]["to_session_id"] == target_id
@@ -4460,9 +4496,14 @@ def test_sidebar_atomic_lineage_commit_has_no_partial_state_on_validation_failur
             now=400.0 if failure == "expired" else 200.0,
         )
 
-    assert _rows(db, "SELECT * FROM session_links WHERE bridge_id = ?", (
-        candidate.bridge_id,
-    )) == []
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_links WHERE bridge_id = ?",
+            (candidate.bridge_id,),
+        )
+        == []
+    )
     job = store.get_sidebar_job_for_source(candidate.source_session_id)
     assert job is not None
     assert job["state"] == (
@@ -4484,24 +4525,29 @@ def test_sidebar_atomic_lineage_write_fault_rolls_back_job_and_link(db) -> None:
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
     thread_id = "atomic-link-fault-thread"
     target_id = _seed_sidebar_codex_target(store, candidate, thread_id)
-    collision_id = "sidebar-link:" + hashlib.sha256(
-        f"{candidate.bridge_id}\0{candidate.source_session_id}\0{target_id}".encode()
-    ).hexdigest()
+    collision_id = (
+        "sidebar-link:"
+        + hashlib.sha256(
+            f"{candidate.bridge_id}\0{candidate.source_session_id}\0{target_id}".encode()
+        ).hexdigest()
+    )
     db.ensure_session("collision-source", source="cli")
     db.ensure_session("collision-target", source="cli")
-    db._execute_write(lambda conn: conn.execute(
-        """INSERT INTO session_links (
+    db._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO session_links (
                id, from_session_id, to_session_id, relation, bridge_id, created_at
            ) VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            collision_id,
-            "collision-source",
-            "collision-target",
-            Relation.MIRRORS.value,
-            "collision-bridge",
-            1.0,
-        ),
-    ))
+            (
+                collision_id,
+                "collision-source",
+                "collision-target",
+                Relation.MIRRORS.value,
+                "collision-bridge",
+                1.0,
+            ),
+        )
+    )
 
     with pytest.raises(ValueError, match="collision"):
         store.commit_sidebar_job_with_lineage(
@@ -4512,9 +4558,14 @@ def test_sidebar_atomic_lineage_write_fault_rolls_back_job_and_link(db) -> None:
             now=200.0,
         )
 
-    assert _rows(db, "SELECT * FROM session_links WHERE bridge_id = ?", (
-        candidate.bridge_id,
-    )) == []
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_links WHERE bridge_id = ?",
+            (candidate.bridge_id,),
+        )
+        == []
+    )
     job = store.get_sidebar_job_for_source(candidate.source_session_id)
     assert job is not None
     assert job["state"] == SidebarJobState.LEASED.value
@@ -4650,9 +4701,9 @@ def test_sidebar_broker_heartbeat_is_monotonic_across_overlapping_stores(db) -> 
             older.result(timeout=5)
             newer.result(timeout=5)
 
-        assert older_store.get_state(
-            "session-bridge:sidebar:broker-heartbeat"
-        ) == {"at": 200.0}
+        assert older_store.get_state("session-bridge:sidebar:broker-heartbeat") == {
+            "at": 200.0
+        }
     finally:
         newer_db.close()
 
@@ -4678,7 +4729,9 @@ def test_sidebar_broker_heartbeat_recovers_malformed_ephemeral_state(db) -> None
     assert store.get_state("session-bridge:sidebar:broker-heartbeat") == {"at": 123.0}
 
 
-def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:
+def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(
+    db,
+) -> None:
     store = SessionBridgeStore(
         db,
         sidebar_token_factory=_token_factory("lookup-token"),
@@ -4972,9 +5025,10 @@ def test_sidebar_retry_rejects_out_of_range_jitter_and_rolls_back_lease(
     assert after == before
     assert after is not None
     assert after["state"] == SidebarJobState.LEASED.value
-    assert after["lease_digest"] == hashlib.sha256(
-        lease["lease_token"].encode()
-    ).hexdigest()
+    assert (
+        after["lease_digest"]
+        == hashlib.sha256(lease["lease_token"].encode()).hexdigest()
+    )
     assert after["attempts"] == 0
 
 
@@ -5350,9 +5404,7 @@ def test_sidebar_claim_scans_bounded_pages_and_eventually_passes_malformed_rows(
     assert first == []
     assert after_first[SidebarJobState.FAILED.value] == 40
     assert after_first[SidebarJobState.PENDING.value] == 6
-    assert [job["source_session_id"] for job in second] == [
-        valid.source_session_id
-    ]
+    assert [job["source_session_id"] for job in second] == [valid.source_session_id]
     assert len({job["id"] for job in second}) == 1
     assert len(due_queries) == 2
     assert all("LIMIT 40" in statement for statement in due_queries)
@@ -5432,9 +5484,7 @@ def test_claude_visibility_enqueue_rejects_each_independent_identity_collision(
     elif collision == "bridge_id":
         identity = replace(identity, bridge_id=existing_identity.bridge_id)
     elif collision == "idempotency_key":
-        identity = replace(
-            identity, idempotency_key=existing_identity.idempotency_key
-        )
+        identity = replace(identity, idempotency_key=existing_identity.idempotency_key)
     else:
         identity = replace(identity, claude_uuid=existing_identity.claude_uuid)
 
@@ -5459,9 +5509,7 @@ def test_claude_visibility_enqueue_rejects_forged_marker_signature(
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     candidate, identity = _claude_visibility_identity()
     replacement = "A" if identity.signed_marker[-1] != "A" else "B"
-    forged = replace(
-        identity, signed_marker=identity.signed_marker[:-1] + replacement
-    )
+    forged = replace(identity, signed_marker=identity.signed_marker[:-1] + replacement)
 
     with pytest.raises(ValueError, match="signed marker"):
         _enqueue_claude_visibility_job(store, candidate, forged)
@@ -5478,8 +5526,11 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     first = store.claim_claude_visibility_job(100.0, 10, 25, "0.50", "0.02")
     with pytest.raises(ValueError, match="reconciliation lease"):
         store.record_claude_visibility_exact_id_absent(
-            identity.job_id, first.lease_digest, identity.claude_uuid,
-            first.attempt_ordinal, "a" * 64
+            identity.job_id,
+            first.lease_digest,
+            identity.claude_uuid,
+            first.attempt_ordinal,
+            "a" * 64,
         )
     retried = store.retry_claude_visibility_job(
         identity.job_id,
@@ -5503,28 +5554,42 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
     with pytest.raises(ValueError, match="reconciliation lease"):
         restarted.record_claude_visibility_exact_id_absent(
-            identity.job_id, "wrong", identity.claude_uuid,
-            reconciliation.attempt_ordinal, "b" * 64
+            identity.job_id,
+            "wrong",
+            identity.claude_uuid,
+            reconciliation.attempt_ordinal,
+            "b" * 64,
         )
     with pytest.raises(ValueError, match="reconciliation lease"):
         restarted.record_claude_visibility_exact_id_absent(
-            "forged-job-id", reconciliation.lease_digest, identity.claude_uuid,
-            reconciliation.attempt_ordinal, "b" * 64
+            "forged-job-id",
+            reconciliation.lease_digest,
+            identity.claude_uuid,
+            reconciliation.attempt_ordinal,
+            "b" * 64,
         )
     with pytest.raises(ValueError, match="reconciliation lease"):
         restarted.record_claude_visibility_exact_id_absent(
-            identity.job_id, reconciliation.lease_digest,
+            identity.job_id,
+            reconciliation.lease_digest,
             "00000000-0000-4000-8000-000000000000",
-            reconciliation.attempt_ordinal, "b" * 64
+            reconciliation.attempt_ordinal,
+            "b" * 64,
         )
     with pytest.raises(ValueError, match="reconciliation lease"):
         restarted.record_claude_visibility_exact_id_absent(
-            identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
-            reconciliation.attempt_ordinal + 1, "b" * 64
+            identity.job_id,
+            reconciliation.lease_digest,
+            identity.claude_uuid,
+            reconciliation.attempt_ordinal + 1,
+            "b" * 64,
         )
     absent = restarted.record_claude_visibility_exact_id_absent(
-        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
-        reconciliation.attempt_ordinal, "b" * 64
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "b" * 64,
     )
     assert absent["state"] == "claude_retry"
     assert absent["error_code"] == "creation_ambiguous"
@@ -5533,9 +5598,7 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     after_restart = SessionBridgeStore(
         db, clock=lambda: 120.0, local_timezone=timezone.utc
     )
-    second = after_restart.claim_claude_visibility_job(
-        120.0, 10, 25, "0.50", "0.02"
-    )
+    second = after_restart.claim_claude_visibility_job(120.0, 10, 25, "0.50", "0.02")
     assert second.reserved_claude_uuid == identity.claude_uuid
     assert second.attempt_ordinal == 2
     assert second.prior_error_code == "creation_ambiguous"
@@ -5546,9 +5609,7 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     after_expiry = SessionBridgeStore(
         db, clock=lambda: 131.0, local_timezone=timezone.utc
     )
-    stale = after_expiry.claim_claude_visibility_job(
-        131.0, 10, 25, "0.50", "0.02"
-    )
+    stale = after_expiry.claim_claude_visibility_job(131.0, 10, 25, "0.50", "0.02")
     assert stale.status == "claimed"
     assert stale.reserved_claude_uuid == identity.claude_uuid
     assert stale.attempt_ordinal == 2
@@ -5559,8 +5620,11 @@ def test_claude_visibility_retry_restart_and_stale_lease_preserve_uuid(
     expired = SessionBridgeStore(db, clock=lambda: 142.0, local_timezone=timezone.utc)
     with pytest.raises(ValueError, match="reconciliation lease"):
         expired.record_claude_visibility_exact_id_absent(
-            identity.job_id, stale.lease_digest, identity.claude_uuid,
-            stale.attempt_ordinal, "e" * 64
+            identity.job_id,
+            stale.lease_digest,
+            identity.claude_uuid,
+            stale.attempt_ordinal,
+            "e" * 64,
         )
 
 
@@ -5574,9 +5638,7 @@ def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(
     store.retry_claude_visibility_job(
         identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
-    reconciliation = store.claim_claude_visibility_job(
-        100.0, 60, 25, "1.00", "0.02", 1
-    )
+    reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
     visible = store.commit_claude_visibility_job(
         identity.job_id, reconciliation.lease_digest, "digest", 100.0
     )
@@ -5596,23 +5658,23 @@ def test_claude_visibility_exact_absence_at_max_terminalizes_without_usage(
     store.retry_claude_visibility_job(
         identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
-    reconciliation = store.claim_claude_visibility_job(
-        100.0, 60, 25, "1.00", "0.02", 1
-    )
+    reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
     store.record_claude_visibility_exact_id_absent(
-        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
-        reconciliation.attempt_ordinal, "a" * 64,
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "a" * 64,
     )
     clock[0] = 86_500.0
-    exhausted = store.claim_claude_visibility_job(
-        86_500.0, 60, 25, "1.00", "0.02", 1
-    )
+    exhausted = store.claim_claude_visibility_job(86_500.0, 60, 25, "1.00", "0.02", 1)
     row = _rows(
         db, "SELECT state, attempts, error_code FROM session_claude_visibility_jobs"
     )[0]
     assert exhausted.status == "max_attempts_exhausted"
     assert row == {
-        "state": "claude_failed", "attempts": 1,
+        "state": "claude_failed",
+        "attempts": 1,
         "error_code": "max_attempts_exhausted",
     }
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
@@ -5630,12 +5692,13 @@ def test_claude_visibility_concurrent_exhaustion_has_one_terminal_transition(
     seed.retry_claude_visibility_job(
         identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
-    reconciliation = seed.claim_claude_visibility_job(
-        100.0, 60, 25, "1.00", "0.02", 1
-    )
+    reconciliation = seed.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
     seed.record_claude_visibility_exact_id_absent(
-        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
-        reconciliation.attempt_ordinal, "a" * 64,
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "a" * 64,
     )
     seed_db.close()
     databases = (SessionDB(path), SessionDB(path))
@@ -5660,9 +5723,10 @@ def test_claude_visibility_concurrent_exhaustion_has_one_terminal_transition(
             databases[0],
             "SELECT state, error_code FROM session_claude_visibility_jobs",
         ) == [{"state": "claude_failed", "error_code": "max_attempts_exhausted"}]
-        assert len(_rows(
-            databases[0], "SELECT * FROM session_claude_registration_usage"
-        )) == 1
+        assert (
+            len(_rows(databases[0], "SELECT * FROM session_claude_registration_usage"))
+            == 1
+        )
     finally:
         for item in databases:
             item.close()
@@ -5690,8 +5754,11 @@ def test_claude_visibility_cycle_status_is_durable_and_preserves_last_empty(
     assert second["last_cycle"] == {
         "tracked": True,
         "value": {
-            "at": 200.0, "sequence": 2, "status": "no_due_job",
-            "error_code": None, "empty_verified": False,
+            "at": 200.0,
+            "sequence": 2,
+            "status": "no_due_job",
+            "error_code": None,
+            "empty_verified": False,
         },
     }
     assert second["last_registrar_result"] == {"tracked": False, "value": None}
@@ -5702,13 +5769,16 @@ def test_legacy_v1_cycle_discards_unverified_empty_history_on_restart_and_write(
 ) -> None:
     clock = [100.0]
     seed = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
-    seed.set_state("session-bridge:claude-visibility:cycle", {
-        "version": 1,
-        "sequence": 7,
-        "last_cycle_at": 50.0,
-        "last_result": {"status": "no_due_job", "error_code": None},
-        "last_empty_cycle_at": 50.0,
-    })
+    seed.set_state(
+        "session-bridge:claude-visibility:cycle",
+        {
+            "version": 1,
+            "sequence": 7,
+            "last_cycle_at": 50.0,
+            "last_result": {"status": "no_due_job", "error_code": None},
+            "last_empty_cycle_at": 50.0,
+        },
+    )
     restarted = SessionBridgeStore(
         db, clock=lambda: clock[0], local_timezone=timezone.utc
     )
@@ -5727,8 +5797,11 @@ def test_legacy_v1_cycle_discards_unverified_empty_history_on_restart_and_write(
     assert legacy["last_cycle"] == {
         "tracked": True,
         "value": {
-            "at": 50.0, "sequence": 7, "status": "no_due_job",
-            "error_code": None, "empty_verified": False,
+            "at": 50.0,
+            "sequence": 7,
+            "status": "no_due_job",
+            "error_code": None,
+            "empty_verified": False,
         },
     }
     assert legacy["last_empty_cycle"] == {"tracked": False, "value": None}
@@ -5746,12 +5819,15 @@ def test_unversioned_cycle_discards_unverified_empty_history_on_next_write(
     db: SessionDB,
 ) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
-    store.set_state("session-bridge:claude-visibility:cycle", {
-        "sequence": 3,
-        "last_cycle_at": 25.0,
-        "last_result": {"status": "no_due_job", "error_code": None},
-        "last_empty_cycle_at": 25.0,
-    })
+    store.set_state(
+        "session-bridge:claude-visibility:cycle",
+        {
+            "sequence": 3,
+            "last_cycle_at": 25.0,
+            "last_result": {"status": "no_due_job", "error_code": None},
+            "last_empty_cycle_at": 25.0,
+        },
+    )
 
     legacy = store.claude_visibility_status(100.0)
     store.record_claude_visibility_cycle(
@@ -5796,16 +5872,20 @@ def test_malformed_or_future_cycle_version_is_untracked(
     version: object,
 ) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
-    store.set_state("session-bridge:claude-visibility:cycle", {
-        "version": version,
-        "sequence": 9,
-        "last_cycle_at": 90.0,
-        "last_result": {
-            "status": "no_due_job", "error_code": None,
-            "empty_verified": True,
+    store.set_state(
+        "session-bridge:claude-visibility:cycle",
+        {
+            "version": version,
+            "sequence": 9,
+            "last_cycle_at": 90.0,
+            "last_result": {
+                "status": "no_due_job",
+                "error_code": None,
+                "empty_verified": True,
+            },
+            "last_empty_cycle_at": 90.0,
         },
-        "last_empty_cycle_at": 90.0,
-    })
+    )
 
     status = store.claude_visibility_status(100.0)
 
@@ -5883,9 +5963,7 @@ def test_no_due_cycle_advances_empty_for_zero_or_visible_only_rows(
     if visible_only:
         candidate, identity = _claude_visibility_identity("visible-empty")
         _enqueue_claude_visibility_job(store, candidate, identity)
-        claim = store.claim_claude_visibility_job(
-            100.0, 60, 25, "1.00", "0.02", 5
-        )
+        claim = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 5)
         store.commit_claude_visibility_job(
             identity.job_id, claim.lease_digest, "digest", 100.0
         )
@@ -5918,7 +5996,8 @@ def test_later_no_due_cycle_advances_empty_after_work_clears(db: SessionDB) -> N
     )
 
     assert store.claude_visibility_status(200.0)["last_empty_cycle"] == {
-        "tracked": True, "value": 200.0,
+        "tracked": True,
+        "value": 200.0,
     }
 
 
@@ -5950,7 +6029,9 @@ def test_cycle_empty_verification_serializes_after_concurrent_insert(tmp_path) -
             assert inserted.wait(timeout=10)
             recording = executor.submit(
                 record_store.record_claude_visibility_cycle,
-                status="no_due_job", error_code=None, registrar_result=False,
+                status="no_due_job",
+                error_code=None,
+                registrar_result=False,
             )
             release.set()
             insertion.result(timeout=10)
@@ -5967,7 +6048,9 @@ def test_cycle_empty_verification_serializes_after_concurrent_insert(tmp_path) -
 def test_claude_visibility_cycle_status_sanitizes_error_code(db: SessionDB) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     store.record_claude_visibility_cycle(
-        status="retry", error_code="secret token / C:/private/path", registrar_result=True
+        status="retry",
+        error_code="secret token / C:/private/path",
+        registrar_result=True,
     )
     status = store.claude_visibility_status(100.0)
     assert status["last_cycle"]["value"]["error_code"] == "unknown_error_code"
@@ -5980,7 +6063,9 @@ def test_claude_visibility_public_cycle_error_codes_round_trip(
     clock = [100.0]
     store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
     assert {
-        "inventory_invalid", "enqueue_failed", "invalid_visibility_status",
+        "inventory_invalid",
+        "enqueue_failed",
+        "invalid_visibility_status",
         "unknown_retry_code",
     } <= CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES
 
@@ -5997,16 +6082,16 @@ def test_claude_visibility_public_cycle_error_codes_round_trip(
         clock[0] += 1
 
 
-def test_claude_visibility_concurrent_cycles_use_transactional_sequence(tmp_path) -> None:
+def test_claude_visibility_concurrent_cycles_use_transactional_sequence(
+    tmp_path,
+) -> None:
     path = tmp_path / "claude-cycle-race.db"
     seed = SessionDB(path)
     seed.close()
     databases = (SessionDB(path), SessionDB(path))
     try:
         stores = tuple(
-            SessionBridgeStore(
-                item, clock=lambda: 100.0, local_timezone=timezone.utc
-            )
+            SessionBridgeStore(item, clock=lambda: 100.0, local_timezone=timezone.utc)
             for item in databases
         )
         barrier = Barrier(2)
@@ -6031,7 +6116,9 @@ def test_claude_visibility_concurrent_cycles_use_transactional_sequence(tmp_path
             item.close()
 
 
-def test_claude_visibility_transitions_require_exact_active_lease(db: SessionDB) -> None:
+def test_claude_visibility_transitions_require_exact_active_lease(
+    db: SessionDB,
+) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
@@ -6068,9 +6155,7 @@ def test_claude_visibility_commit_cannot_backdate_an_expired_lease(
     db: SessionDB,
 ) -> None:
     clock = [100.0]
-    store = SessionBridgeStore(
-        db, clock=lambda: clock[0], local_timezone=timezone.utc
-    )
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
     claim = store.claim_claude_visibility_job(100.0, 10, 25, "0.50", "0.02")
@@ -6180,16 +6265,19 @@ def test_claude_visibility_status_reports_unknown_state_as_sanitized_fatal(
 
     status = store.claude_visibility_status(100.0)
 
-    assert status["fatal"] == [{
-        "code": "unknown_job_state",
-        "state": "future_state",
-        "error_code": "future-code",
-        "count": 1,
-    }]
+    assert status["fatal"] == [
+        {
+            "code": "unknown_job_state",
+            "state": "future_state",
+            "error_code": "future-code",
+            "count": 1,
+        }
+    ]
 
 
 def test_atomic_idle_batch_rolls_back_all_rows_when_second_insert_fails(
-    db: SessionDB, monkeypatch: pytest.MonkeyPatch,
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     items = [_claude_visibility_identity(str(index)) for index in range(2)]
@@ -6219,7 +6307,8 @@ def test_atomic_idle_batch_reports_exact_duplicates_and_blocks_open_work(
     store.commit_claude_visibility_job(
         duplicate[1].job_id,
         store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").lease_digest,
-        "digest", 100.0,
+        "digest",
+        100.0,
     )
     fresh = _claude_visibility_identity("fresh")
 
@@ -6265,10 +6354,13 @@ def test_atomic_idle_batch_two_connections_allow_only_one_coordinator(
             results = list(executor.map(enqueue, zip(stores, batches)))
 
         assert sorted(result["status"] for result in results) == [
-            "inserted", "open_work"
+            "inserted",
+            "open_work",
         ]
         assert sorted(result["inserted"] for result in results) == [0, 10]
-        assert len(_rows(first_db, "SELECT * FROM session_claude_visibility_jobs")) == 10
+        assert (
+            len(_rows(first_db, "SELECT * FROM session_claude_visibility_jobs")) == 10
+        )
     finally:
         first_db.close()
         second_db.close()
@@ -6316,23 +6408,23 @@ def test_claude_visibility_accounting_uses_authoritative_clock_and_local_day(
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
 
-    claim = store.claim_claude_visibility_job(
-        caller_future, 60, 25, "0.50", "0.02"
-    )
+    claim = store.claim_claude_visibility_job(caller_future, 60, 25, "0.50", "0.02")
 
     assert claim.status == "claimed"
     assert _rows(
         db,
         """SELECT local_day, reserved_at, reserved_estimated_cost_usd
            FROM session_claude_registration_usage""",
-    ) == [{
-        "local_day": "2026-03-08",
-        "reserved_at": authoritative,
-        "reserved_estimated_cost_usd": "0.020000",
-    }]
-    assert _rows(
-        db, "SELECT lease_expires_at FROM session_claude_visibility_jobs"
-    ) == [{"lease_expires_at": authoritative + 60}]
+    ) == [
+        {
+            "local_day": "2026-03-08",
+            "reserved_at": authoritative,
+            "reserved_estimated_cost_usd": "0.020000",
+        }
+    ]
+    assert _rows(db, "SELECT lease_expires_at FROM session_claude_visibility_jobs") == [
+        {"lease_expires_at": authoritative + 60}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -6357,12 +6449,15 @@ def test_claude_visibility_local_day_handles_midnight_and_dst_transition(
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
 
-    assert store.claim_claude_visibility_job(
-        9_999_999_999.0, 60, 25, "0.50", "0.02"
-    ).status == "claimed"
-    assert _rows(
-        db, "SELECT local_day FROM session_claude_registration_usage"
-    ) == [{"local_day": expected_day}]
+    assert (
+        store.claim_claude_visibility_job(
+            9_999_999_999.0, 60, 25, "0.50", "0.02"
+        ).status
+        == "claimed"
+    )
+    assert _rows(db, "SELECT local_day FROM session_claude_registration_usage") == [
+        {"local_day": expected_day}
+    ]
 
 
 def test_claude_visibility_money_is_exact_bounded_microdollars(db: SessionDB) -> None:
@@ -6389,7 +6484,8 @@ def test_claude_visibility_money_is_exact_bounded_microdollars(db: SessionDB) ->
     assert {
         row["reserved_estimated_cost_usd"]
         for row in _rows(
-            db, "SELECT reserved_estimated_cost_usd FROM session_claude_registration_usage"
+            db,
+            "SELECT reserved_estimated_cost_usd FROM session_claude_registration_usage",
         )
     } == {"0.020000"}
 
@@ -6431,9 +6527,7 @@ def test_claude_visibility_two_connections_cannot_exceed_daily_cap(tmp_path) -> 
 
         def claim(store: SessionBridgeStore):
             barrier.wait()
-            return store.claim_claude_visibility_job(
-                100.0, 60, 25, "1.00", "0.02"
-            )
+            return store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(claim, (first, second)))
@@ -6442,9 +6536,10 @@ def test_claude_visibility_two_connections_cannot_exceed_daily_cap(tmp_path) -> 
             "claimed",
             "daily_limit",
         ]
-        assert len(
-            _rows(first_db, "SELECT * FROM session_claude_registration_usage")
-        ) == 25
+        assert (
+            len(_rows(first_db, "SELECT * FROM session_claude_registration_usage"))
+            == 25
+        )
     finally:
         first_db.close()
         second_db.close()
@@ -6476,9 +6571,7 @@ def test_claude_visibility_emergency_cost_gate_is_independent(db: SessionDB) -> 
         store.fail_claude_visibility_job(
             claim.job_id, claim.lease_digest, "source_conflict", "bounded test"
         )
-    blocked = store.claim_claude_visibility_job(
-        1_768_608_000.0, 60, 25, "0.05", "0.02"
-    )
+    blocked = store.claim_claude_visibility_job(1_768_608_000.0, 60, 25, "0.05", "0.02")
 
     assert blocked.status == "cost_limit"
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2
@@ -6492,9 +6585,7 @@ def test_claude_visibility_read_only_reconciliation_consumes_no_slot(
     )
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
-    claim = store.claim_claude_visibility_job(
-        1_768_608_000.0, 60, 25, "0.50", "0.02"
-    )
+    claim = store.claim_claude_visibility_job(1_768_608_000.0, 60, 25, "0.50", "0.02")
     store.retry_claude_visibility_job(
         identity.job_id,
         claim.lease_digest,
@@ -6549,15 +6640,16 @@ def test_claude_visibility_retry_with_no_usage_requires_absence_before_one_launc
         (identity.job_id,),
     )
 
-    reconciliation = store.claim_claude_visibility_job(
-        100.0, 60, 25, "0.50", "0.02"
-    )
+    reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     assert reconciliation.registration_reserved is False
     assert reconciliation.launch_permitted is False
     assert _rows(db, "SELECT * FROM session_claude_registration_usage") == []
     store.record_claude_visibility_exact_id_absent(
-        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
-        reconciliation.attempt_ordinal, "d" * 64
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "d" * 64,
     )
 
     assert store.inspect_due_claude_visibility_reconciliation(100.0).status == (
@@ -6570,9 +6662,10 @@ def test_claude_visibility_retry_with_no_usage_requires_absence_before_one_launc
     assert paid.registration_reserved is True
     assert paid.launch_permitted is True
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
-    assert store.claim_claude_visibility_job(
-        100.0, 60, 25, "0.50", "0.02"
-    ).status == "no_due_job"
+    assert (
+        store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").status
+        == "no_due_job"
+    )
 
 
 def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
@@ -6583,9 +6676,7 @@ def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
     )
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
-    launch = store.claim_claude_visibility_job(
-        1_768_608_000.0, 200, 25, "0.50", "0.02"
-    )
+    launch = store.claim_claude_visibility_job(1_768_608_000.0, 200, 25, "0.50", "0.02")
     store.retry_claude_visibility_job(
         identity.job_id,
         launch.lease_digest,
@@ -6594,9 +6685,7 @@ def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
         "unknown launch result",
     )
 
-    reconciliation = store.claim_claude_visibility_reconciliation(
-        1_768_608_100.0, 60
-    )
+    reconciliation = store.claim_claude_visibility_reconciliation(1_768_608_100.0, 60)
 
     assert reconciliation.status == "claimed"
     assert reconciliation.registration_reserved is False
@@ -6615,11 +6704,13 @@ def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
         db,
         """SELECT reserved_claude_uuid, attempt_ordinal, outcome
            FROM session_claude_visibility_reconciliations""",
-    ) == [{
-        "reserved_claude_uuid": identity.claude_uuid,
-        "attempt_ordinal": 1,
-        "outcome": "exact_match",
-    }]
+    ) == [
+        {
+            "reserved_claude_uuid": identity.claude_uuid,
+            "attempt_ordinal": 1,
+            "outcome": "exact_match",
+        }
+    ]
 
 
 def test_claude_visibility_transient_reconciliation_retries_never_launch_or_spend(
@@ -6661,9 +6752,7 @@ def test_claude_visibility_reconciliation_lease_can_fail_conflict_without_slot(
     store.retry_claude_visibility_job(
         identity.job_id, paid.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
-    reconciliation = store.claim_claude_visibility_job(
-        100.0, 60, 25, "0.50", "0.02"
-    )
+    reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
 
     failed = store.fail_claude_visibility_job(
         identity.job_id,
@@ -6690,12 +6779,13 @@ def test_claude_visibility_new_ambiguity_invalidates_prior_absence(
     store.retry_claude_visibility_job(
         identity.job_id, first.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
-    reconciliation = store.claim_claude_visibility_job(
-        100.0, 60, 25, "0.50", "0.02"
-    )
+    reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     store.record_claude_visibility_exact_id_absent(
-        identity.job_id, reconciliation.lease_digest, identity.claude_uuid,
-        reconciliation.attempt_ordinal, "c" * 64
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "c" * 64,
     )
     second = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     assert second.launch_permitted is True
@@ -6703,9 +6793,7 @@ def test_claude_visibility_new_ambiguity_invalidates_prior_absence(
         identity.job_id, second.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
 
-    required_again = store.claim_claude_visibility_job(
-        100.0, 60, 25, "0.50", "0.02"
-    )
+    required_again = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     assert required_again.registration_reserved is False
     assert required_again.launch_permitted is False
     assert required_again.attempt_ordinal == 2

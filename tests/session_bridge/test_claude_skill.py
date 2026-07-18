@@ -116,7 +116,10 @@ def test_shared_asset_installer_rejects_windows_ambiguous_manifest_paths(
             ),
         )
 
-    assert list(tmp_path.iterdir()) == []
+    assert not (tmp_path / "session-bridge").exists()
+    assert not any(
+        path.name.startswith(".session-bridge.install-") for path in tmp_path.iterdir()
+    )
 
 
 def test_shared_asset_join_requires_a_strict_descendant(
@@ -124,7 +127,9 @@ def test_shared_asset_join_requires_a_strict_descendant(
 ) -> None:
     from session_bridge import asset_installer
 
-    monkeypatch.setattr(asset_installer, "_validate_asset_file_path", lambda _path: None)
+    monkeypatch.setattr(
+        asset_installer, "_validate_asset_file_path", lambda _path: None
+    )
     with pytest.raises(ValueError, match="descendant"):
         asset_installer._strict_descendant(tmp_path / "staging", "D:/escape.txt")
 

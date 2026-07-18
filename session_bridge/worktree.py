@@ -203,8 +203,10 @@ def _validate_recorded_snapshot(snapshot: WorktreeSnapshot) -> None:
     if not isinstance(snapshot, WorktreeSnapshot):
         raise WorktreeSnapshotError("source_identity_mismatch")
     for value in (snapshot.cwd, snapshot.worktree_id):
-        if not isinstance(value, str) or not value or any(
-            character in value for character in "\x00\r\n"
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(character in value for character in "\x00\r\n")
         ):
             raise WorktreeSnapshotError("source_identity_mismatch")
     if not os.path.isabs(snapshot.cwd):

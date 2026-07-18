@@ -111,7 +111,14 @@ def test_environment_cannot_grant_non_loopback_access(tmp_path: Path) -> None:
         )
 
 
-def test_mcp_token_is_whitelisted_but_not_persisted_in_config(tmp_path: Path) -> None:
+def test_mcp_token_is_whitelisted_but_not_persisted_in_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: deepcopy(DEFAULT_CONFIG),
+    )
     config = _load(
         tmp_path / "missing.toml",
         environ={"HERMES_SESSION_BRIDGE_TOKEN": "x" * 32},
@@ -337,8 +344,16 @@ def test_claude_visibility_config_parses_every_valid_override(
         ("daily_registration_limit", -1, "daily_registration_limit must be at least 1"),
         ("process_timeout_seconds", 0, "process_timeout_seconds must be at least 1"),
         ("process_timeout_seconds", -1, "process_timeout_seconds must be at least 1"),
-        ("discovery_timeout_seconds", 0, "discovery_timeout_seconds must be at least 1"),
-        ("discovery_timeout_seconds", -1, "discovery_timeout_seconds must be at least 1"),
+        (
+            "discovery_timeout_seconds",
+            0,
+            "discovery_timeout_seconds must be at least 1",
+        ),
+        (
+            "discovery_timeout_seconds",
+            -1,
+            "discovery_timeout_seconds must be at least 1",
+        ),
         (
             "reserved_cost_per_attempt_usd",
             "0",

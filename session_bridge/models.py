@@ -145,13 +145,18 @@ def canonical_session_id(provider: Provider | str, native_id: str) -> str:
     normalized_native_id = native_id.strip()
     if normalized_provider is Provider.HERMES:
         if normalized_native_id.startswith(("claude:", "codex:")):
-            raise ValueError("Hermes session ID uses a reserved external-provider prefix")
+            raise ValueError(
+                "Hermes session ID uses a reserved external-provider prefix"
+            )
         return normalized_native_id
     return f"{normalized_provider.value}:{normalized_native_id}"
 
 
 def stable_message_key(message: ProjectedMessage) -> str:
-    if not isinstance(message.native_event_id, str) or not message.native_event_id.strip():
+    if (
+        not isinstance(message.native_event_id, str)
+        or not message.native_event_id.strip()
+    ):
         raise ValueError("native event ID must not be empty")
     if (
         not isinstance(message.ordinal, int)
@@ -160,7 +165,9 @@ def stable_message_key(message: ProjectedMessage) -> str:
     ):
         raise ValueError("message ordinal must be a non-negative integer")
 
-    identity = f"{len(message.native_event_id)}:{message.native_event_id}:{message.ordinal}"
+    identity = (
+        f"{len(message.native_event_id)}:{message.native_event_id}:{message.ordinal}"
+    )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -173,11 +180,15 @@ def encode_bridge_marker(payload: BridgeMarkerPayload, secret: bytes) -> str:
         if not isinstance(payload.bridge_id, str):
             raise InvalidBridgeMarker("bridge marker bridge_id must be a string")
         if not isinstance(payload.source_session_id, str):
-            raise InvalidBridgeMarker("bridge marker source_session_id must be a string")
+            raise InvalidBridgeMarker(
+                "bridge marker source_session_id must be a string"
+            )
         if not isinstance(payload.policy_generation, int) or isinstance(
             payload.policy_generation, bool
         ):
-            raise InvalidBridgeMarker("bridge marker policy_generation must be an integer")
+            raise InvalidBridgeMarker(
+                "bridge marker policy_generation must be an integer"
+            )
 
         body = json.dumps(
             {
@@ -233,7 +244,9 @@ def decode_bridge_marker(marker: str, secret: bytes) -> BridgeMarkerPayload:
         target_provider_value = decoded["target_provider"]
         if not isinstance(bridge_id, str) or not isinstance(source_session_id, str):
             raise InvalidBridgeMarker("malformed bridge marker payload")
-        if not isinstance(policy_generation, int) or isinstance(policy_generation, bool):
+        if not isinstance(policy_generation, int) or isinstance(
+            policy_generation, bool
+        ):
             raise InvalidBridgeMarker("malformed bridge marker payload")
         if not isinstance(target_provider_value, str):
             raise InvalidBridgeMarker("malformed bridge marker payload")

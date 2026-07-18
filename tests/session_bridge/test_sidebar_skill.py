@@ -152,13 +152,11 @@ def test_sidebar_skill_metadata_matches_the_personal_codex_contract() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     metadata = (ASSET / "agents" / "openai.yaml").read_text(encoding="utf-8")
 
-    assert skill.startswith(
-        "---\nname: session-sidebar-sync\ndescription: Use when "
-    )
+    assert skill.startswith("---\nname: session-sidebar-sync\ndescription: Use when ")
     assert "\n---\n" in skill
     assert "TODO" not in skill
     assert metadata == (
-        'interface:\n'
+        "interface:\n"
         '  display_name: "Session Sidebar Sync"\n'
         '  short_description: "Deliver leased Claude and Hermes sessions to the Codex sidebar"\n'
         '  default_prompt: "Run $session-sidebar-sync once and end quietly when no work is pending."\n'
@@ -260,9 +258,7 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
 
     assert "`list_projects({})` exactly once" in skill
     assert "canonical path to its returned `projectId`" in skill
-    assert (
-        '`list_threads({"query":"<exact signed marker>","limit":20})`' in skill
-    )
+    assert '`list_threads({"query":"<exact signed marker>","limit":20})`' in skill
     assert (
         '`read_thread({"threadId":"<candidate threadId>",'
         '"hostId":"<candidate hostId>","turnLimit":10,'
@@ -286,8 +282,7 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
         "codex_thread_id=<threadId>)`" in skill
     )
     assert (
-        '`set_thread_title({"threadId":"<threadId>","title":"<exact title>"})`'
-        in skill
+        '`set_thread_title({"threadId":"<threadId>","title":"<exact title>"})`' in skill
     )
 
 
@@ -297,20 +292,18 @@ def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() ->
 
     assert (
         '`read_thread({"threadId":"<recovered_thread_id>",'
-        '"turnLimit":10,"includeOutputs":false})`'
-        in reconcile_step
+        '"turnLimit":10,"includeOutputs":false})`' in reconcile_step
     )
     assert '"turnLimit":20' not in reconcile_step
     assert "Ten is the bounded reconciliation and read limit" in reconcile_step
     assert "Do not call `list_threads` before this recovered-ID read" in reconcile_step
     assert (
         "Only when `recovered_thread_id` is absent, call "
-        '`list_threads({"query":"<exact signed marker>","limit":20})`'
-        in reconcile_step
+        '`list_threads({"query":"<exact signed marker>","limit":20})`' in reconcile_step
     )
-    recovered_branch = reconcile_step.split(
-        "When `recovered_thread_id` is present", 1
-    )[1].split("Only when `recovered_thread_id` is absent", 1)[0]
+    recovered_branch = reconcile_step.split("When `recovered_thread_id` is present", 1)[
+        1
+    ].split("Only when `recovered_thread_id` is absent", 1)[0]
     assert "missing or mismatched task maps to `marker_conflict`" in recovered_branch
     assert "never permits creation" in recovered_branch
 
@@ -323,8 +316,7 @@ def test_sidebar_skill_matches_the_native_read_thread_response_schema() -> None:
     assert "absence of a top-level thread ID is expected" in reconcile_step
     assert "`thread.id`, `thread.hostId`, and `thread.cwd`" in reconcile_step
     assert (
-        "missing or null `thread.hostId` and explicit `local` normalize only to "
-        "`local`"
+        "missing or null `thread.hostId` and explicit `local` normalize only to `local`"
     ) in reconcile_step
     assert "every other explicit `thread.hostId` maps to `codex_thread_conflict`" in (
         reconcile_step
@@ -393,14 +385,13 @@ def test_sidebar_skill_normalizes_only_current_local_host_identity() -> None:
     reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
 
     assert "(`projectId`, original returned `hostId`, normalized host)" in project_step
-    assert (
-        "missing or null `hostId` and the explicit string `local`"
-        in project_step
-    )
+    assert "missing or null `hostId` and the explicit string `local`" in project_step
     assert "current-local sentinel `local`" in project_step
     assert "Reject every other explicit host value" in project_step
     assert "never infer or coerce an arbitrary host string" in project_step
-    assert "Apply the same host normalization to every thread candidate" in reconcile_step
+    assert (
+        "Apply the same host normalization to every thread candidate" in reconcile_step
+    )
     assert "normalized host is `local`" in reconcile_step
     assert "equals the chosen project's normalized host" in reconcile_step
     assert "original candidate `hostId`" in reconcile_step
@@ -417,13 +408,13 @@ def test_sidebar_skill_filters_explicit_remote_candidate_before_read() -> None:
         "`read_thread` call"
     )
     read_schema = (
-        '`read_thread({"threadId":"<candidate threadId>",'
-        '"hostId":"<candidate hostId>"'
+        '`read_thread({"threadId":"<candidate threadId>","hostId":"<candidate hostId>"'
     )
     assert filter_rule in reconcile_step
     assert reconcile_step.index(filter_rule) < reconcile_step.index(read_schema)
-    assert "explicit non-`local` host maps to `codex_thread_conflict` without a read" in (
-        reconcile_step
+    assert (
+        "explicit non-`local` host maps to `codex_thread_conflict` without a read"
+        in (reconcile_step)
     )
     assert "only when that summary supplies project identity" in reconcile_step
     assert "do not invent a missing project field" in reconcile_step
@@ -563,9 +554,7 @@ def test_install_sidebar_skill_rejects_observed_staging_redirect_before_copy(
         swapped.update(staging=staging, preserved=preserved)
         real_copy(staging, *guard)
 
-    monkeypatch.setattr(
-        sidebar_skill, "_copy_packaged_skill", swap_staging_to_redirect
-    )
+    monkeypatch.setattr(sidebar_skill, "_copy_packaged_skill", swap_staging_to_redirect)
 
     with pytest.raises(PermissionError, match="redirect|identity"):
         sidebar_skill.install_sidebar_skill(codex_home)
@@ -671,9 +660,7 @@ def test_install_sidebar_skill_preserves_promotion_and_restore_failures(
             raise PermissionError("restore failed")
         real_guarded_replace(source, target, identity)
 
-    monkeypatch.setattr(
-        sidebar_skill, "_guarded_replace", fail_promotion_and_restore
-    )
+    monkeypatch.setattr(sidebar_skill, "_guarded_replace", fail_promotion_and_restore)
 
     with pytest.raises(BaseExceptionGroup) as captured:
         sidebar_skill.install_sidebar_skill(codex_home)
@@ -700,12 +687,8 @@ def test_filesystem_lock_closes_descriptor_when_unlock_fails(
             self.closed = True
 
     tracked = TrackedStream()
-    monkeypatch.setattr(
-        sidebar_skill, "_open_lock_descriptor", lambda _path: tracked
-    )
-    monkeypatch.setattr(
-        sidebar_skill, "_try_lock_descriptor", lambda _descriptor: True
-    )
+    monkeypatch.setattr(sidebar_skill, "_open_lock_descriptor", lambda _path: tracked)
+    monkeypatch.setattr(sidebar_skill, "_try_lock_descriptor", lambda _descriptor: True)
     monkeypatch.setattr(
         sidebar_skill,
         "_unlock_descriptor",
@@ -770,7 +753,9 @@ def test_install_sidebar_skill_serializes_concurrent_repeated_installs(
 
     codex_home = tmp_path / "codex"
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda _index: install_sidebar_skill(codex_home), range(8)))
+        results = list(
+            pool.map(lambda _index: install_sidebar_skill(codex_home), range(8))
+        )
 
     assert len(set(results)) == 1
     assert _installed_files(results[0]) == _installed_files(ASSET)
@@ -981,9 +966,7 @@ def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
     assert "session_bridge/assets/session-sidebar-sync/SKILL.md" in names
     assert "session_bridge/assets/session-sidebar-sync/agents/openai.yaml" in names
     assert "session_bridge/entrypoint.py" in names
-    assert (
-        "hermes-session-bridge = session_bridge.entrypoint:main" in entry_points
-    )
+    assert "hermes-session-bridge = session_bridge.entrypoint:main" in entry_points
 
     codex_home = tmp_path / "wheel-codex-home"
     environment = {
