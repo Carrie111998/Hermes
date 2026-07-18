@@ -37,6 +37,22 @@ _LOCAL_PERSISTED_CWD_SOURCES = frozenset({"cli", "tui"})
 _MAX_PERSISTED_CWD_CHARS = 4096
 
 
+def _is_canonical_absolute_cwd(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > _MAX_PERSISTED_CWD_CHARS
+        or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
+        or not os.path.isabs(value)
+    ):
+        return False
+    separator_tail = value[2:] if value.startswith(("\\\\", "//")) else value
+    if re.search(r"[\\/]{2}", separator_tail):
+        return False
+    return not any(part in {".", ".."} for part in re.split(r"[\\/]", value))
+
+
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
@@ -3272,15 +3288,7 @@ class SessionDB:
         ):
             return None
         cwd = parent.get("cwd")
-        if (
-            not isinstance(cwd, str)
-            or not cwd
-            or cwd != cwd.strip()
-            or len(cwd) > _MAX_PERSISTED_CWD_CHARS
-            or any(char in cwd for char in "\r\n\x00")
-            or not os.path.isabs(cwd)
-            or ".." in Path(cwd).parts
-        ):
+        if not _is_canonical_absolute_cwd(cwd):
             return None
         return cwd
 

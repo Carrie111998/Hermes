@@ -147,6 +147,10 @@ class TestSessionLifecycle:
             ("cli", "cli", "relative/project"),
             ("cli", "cli", " C:/work/project"),
             ("cli", "cli", "C:/work/project\n"),
+            ("cli", "cli", "C:/work/pro\tject"),
+            ("cli", "cli", "C:/work/pro\x1fject"),
+            ("cli", "cli", "C:\\work\\.\\project"),
+            ("cli", "cli", "C:\\work\\\\project"),
         ],
     )
     def test_local_child_cwd_rejects_non_authoritative_parent_metadata(
