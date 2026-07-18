@@ -25,6 +25,7 @@ from session_bridge.cli import (
     ProductionBackend,
     ProviderDegraded,
     RolloutGateBlocked,
+    _run_continuous_visibility_worker,
     _claude_characterization_open_work_allowed,
     main,
 )
@@ -1254,6 +1255,31 @@ def test_production_serve_blocks_automatic_mode_without_passing_gate(
         backend.serve()
 
     assert raised.value.gate == "characterization_failed"
+
+
+def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
+    calls: list[str] = []
+    waits: list[float] = []
+    moments = iter((10.0, 46.5))
+
+    class StopAfterOneCycle:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            waits.append(timeout)
+            return True
+
+    _run_continuous_visibility_worker(
+        run_once=lambda: calls.append("run"),
+        close=lambda: calls.append("close"),
+        stop=StopAfterOneCycle(),
+        interval_seconds=60.0,
+        monotonic=lambda: next(moments),
+    )
+
+    assert calls == ["run", "close"]
+    assert waits == [pytest.approx(23.5)]
 
 
 def test_scan_defaults_to_catalog_only_all_history_newest_first(capsys):

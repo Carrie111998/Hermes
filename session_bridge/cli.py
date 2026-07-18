@@ -9,10 +9,12 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 from typing import Any, Protocol
 
@@ -91,6 +93,31 @@ _SENSITIVE_KEY_FRAGMENTS = (
     "source_hash",
     "token",
 )
+_LOG = logging.getLogger(__name__)
+
+
+def _run_continuous_visibility_worker(
+    *,
+    run_once: Callable[[], object],
+    close: Callable[[], object],
+    stop: Any,
+    interval_seconds: float = 60.0,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Run one local visibility cycle per interval without AI heartbeats."""
+
+    try:
+        while not stop.is_set():
+            started = monotonic()
+            try:
+                run_once()
+            except Exception:
+                _LOG.exception("continuous Claude visibility cycle failed")
+            elapsed = max(0.0, monotonic() - started)
+            if stop.wait(max(0.0, interval_seconds - elapsed)):
+                break
+    finally:
+        close()
 
 
 def _claude_visibility_preflight(
@@ -241,6 +268,8 @@ class ProductionBackend:
             db.close()
 
     def serve(self) -> None:
+        visibility_stop: threading.Event | None = None
+        visibility_thread: threading.Thread | None = None
         try:
             if self.config.mirrors.automatic_creation:
                 try:
@@ -262,6 +291,23 @@ class ProductionBackend:
                 config=self.config,
                 token=token,
             )
+            if (
+                self.config.claude_visibility.enabled
+                and self.config.claude_visibility.continuous
+            ):
+                visibility_backend = ProductionBackend(self.config)
+                visibility_stop = threading.Event()
+                visibility_thread = threading.Thread(
+                    target=_run_continuous_visibility_worker,
+                    kwargs={
+                        "run_once": visibility_backend.claude_visibility_run_once,
+                        "close": visibility_backend.close,
+                        "stop": visibility_stop,
+                    },
+                    name="session-bridge-claude-visibility",
+                    daemon=True,
+                )
+                visibility_thread.start()
             import uvicorn
 
             uvicorn.run(
@@ -278,6 +324,11 @@ class ProductionBackend:
             if "token" in str(exc).casefold() or "marker" in str(exc).casefold():
                 raise ConfigurationFailure("service_authorization_failed") from exc
             raise ProviderDegraded("service_start_failed") from exc
+        finally:
+            if visibility_stop is not None:
+                visibility_stop.set()
+            if visibility_thread is not None:
+                visibility_thread.join(timeout=5.0)
 
     def scan(
         self, *, provider: str, all_history: bool, newest_first: bool
