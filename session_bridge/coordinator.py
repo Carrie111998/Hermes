@@ -870,7 +870,7 @@ class SessionBridgeCoordinator:
         scan_batch_size: int = 100,
         claude_projects_root: Path | None = None,
         watch_debounce_seconds: float = 0.25,
-        refresh_timeout: float = 30.0,
+        refresh_timeout: float = 60.0,
         sidebar_verifier: _SidebarVerifier | None = None,
         sidebar_cancellation_recovery_timeout: float = (
             _SIDEBAR_CANCELLATION_RECOVERY_SECONDS

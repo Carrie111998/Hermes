@@ -501,7 +501,7 @@ def test_default_refresh_timeout_covers_native_codex_read_budget() -> None:
         adapters={},
     )
 
-    assert coordinator._refresh_timeout == 30.0
+    assert coordinator._refresh_timeout == 60.0
 
 
 @pytest.mark.asyncio
