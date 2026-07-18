@@ -65,7 +65,7 @@ def _successful_characterization_messages(
             build_claude_registration_prompt(candidate, identity, SECRET),
             timestamp,
         ),
-        ProjectedMessage("a", 1, "assistant", "REGISTERED", timestamp + 1.0),
+        ProjectedMessage("a", 0, "assistant", "REGISTERED", timestamp + 1.0),
     ]
 
 
@@ -138,7 +138,7 @@ def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
             _successful_characterization_messages(claim, marker)[0],
             ProjectedMessage(
                 "a",
-                1,
+                0,
                 "assistant",
                 "Failed to authenticate. API Error: 401 Invalid authentication credentials",
                 11.0,
@@ -164,16 +164,16 @@ def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
     projection.messages.extend([
         ProjectedMessage(
             "recovery-user",
-            2,
+            0,
             "user",
             build_characterization_auth_recovery_prompt(
                 claim.reserved_claude_uuid or "", marker
             ),
             12.0,
         ),
-        ProjectedMessage("recovery-assistant", 3, "assistant", "REGISTERED", 13.0),
+        ProjectedMessage("recovery-assistant", 0, "assistant", "REGISTERED", 13.0),
     ])
-    assert (
+    with pytest.raises(RuntimeError, match="recovery_authority_required"):
         _validate_characterization_transcript(
             restarted=_RestartedSource(transcript, projection, marker),
             projects_root=projects_root,
@@ -183,8 +183,68 @@ def test_characterization_rejects_exact_uuid_transcript_with_auth_failure(
             signed_marker=marker,
             marker_secret=SECRET,
         )
-        == transcript
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        lambda messages: [
+            ProjectedMessage("prefix", 0, "user", "prefix", 9.0),
+            *messages,
+        ],
+        lambda messages: [replace(messages[0], ordinal=1), messages[1]],
+        lambda messages: [messages[0], replace(messages[1], native_event_id="u")],
+        lambda messages: [messages[0], replace(messages[1], tool_name="tool")],
+        lambda messages: [messages[0], replace(messages[1], tool_calls=[])],
+        lambda messages: [messages[0], replace(messages[1], tool_call_id="call")],
+        lambda messages: [messages[0], replace(messages[1], reasoning="hidden")],
+    ],
+)
+def test_characterization_requires_exact_structured_transcript(
+    tmp_path: Path, messages: Any
+) -> None:
+    projects_root = tmp_path / "projects"
+    source_projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id="operation",
+        title="Claude native visibility characterization",
+        cwd=str(tmp_path / "source"),
+        started_at=10.0,
+        last_active=10.0,
+        messages=[ProjectedMessage("source", 0, "user", "request", 10.0)],
+        native_path=str(tmp_path / "source" / "source.json"),
+        native_hash="0" * 64,
+        origin_kind=OriginKind.NATIVE,
     )
+    claim, marker = _claim_for(source_projection)
+    transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("native", encoding="utf-8")
+    projection = SessionProjection(
+        provider=Provider.CLAUDE,
+        native_id=claim.reserved_claude_uuid,
+        title=claim.native_name,
+        cwd=claim.source_cwd,
+        started_at=10.0,
+        last_active=11.0,
+        messages=messages(_successful_characterization_messages(claim, marker)),
+        native_path=str(transcript),
+        native_hash="b" * 64,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="characterization_identity_mismatch:response"
+    ):
+        _validate_characterization_transcript(
+            restarted=_RestartedSource(transcript, projection, marker),
+            projects_root=projects_root,
+            reserved_uuid=claim.reserved_claude_uuid or "",
+            native_name=claim.native_name or "",
+            source_cwd=claim.source_cwd or "",
+            signed_marker=marker,
+            marker_secret=SECRET,
+        )
 
 
 def _claim_for(projection: SessionProjection) -> tuple[ClaudeVisibilityClaim, str]:
@@ -834,7 +894,7 @@ def test_characterization_salvages_bounded_auth_failure_by_resuming_same_uuid(
             _successful_characterization_messages(claim, marker)[0],
             ProjectedMessage(
                 "a",
-                1,
+                0,
                 "assistant",
                 "Failed to authenticate. API Error: 401 Invalid authentication credentials",
                 11.0,
@@ -883,8 +943,8 @@ def test_characterization_salvages_bounded_auth_failure_by_resuming_same_uuid(
         assert operation["reserved_claude_uuid"] == state["claim"].reserved_claude_uuid
         assert len(evidence_digest) == 64
         state["messages"].extend([
-            ProjectedMessage("ru", 2, "user", prompt, 12.0),
-            ProjectedMessage("ra", 3, "assistant", "REGISTERED", 13.0),
+            ProjectedMessage("ru", 0, "user", prompt, 12.0),
+            ProjectedMessage("ra", 0, "assistant", "REGISTERED", 13.0),
         ])
         return {
             "status": "recovered",
@@ -893,6 +953,24 @@ def test_characterization_salvages_bounded_auth_failure_by_resuming_same_uuid(
             "lease_digest": "c" * 64,
         }
 
+    def crash_after_resume(recovery: Mapping[str, Any], digest: str) -> None:
+        completed.append((recovery, digest))
+        raise RuntimeError("simulated_post_resume_crash")
+
+    with pytest.raises(RuntimeError, match="simulated_post_resume_crash"):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=FailedRegistrar(),
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            recover_auth_failure=recover,
+            complete_auth_recovery=crash_after_resume,
+            now=lambda: 14.0,
+        )
+
+    reconciled: list[tuple[str, str, str]] = []
     result = characterize_claude_visibility(
         source_root=source_root,
         projects_root=projects_root,
@@ -900,16 +978,16 @@ def test_characterization_salvages_bounded_auth_failure_by_resuming_same_uuid(
         registrar=FailedRegistrar(),
         restarted_source=restarted_source,
         marker_secret=SECRET,
-        recover_auth_failure=recover,
-        complete_auth_recovery=lambda recovery, digest: completed.append((
-            recovery,
-            digest,
-        )),
+        reconcile_auth_recovery=lambda operation, evidence, prompt, transcript: (
+            reconciled.append((evidence, prompt, transcript))
+        ),
         now=lambda: 14.0,
     )
 
     assert result["reserved_claude_uuid"] == state["claim"].reserved_claude_uuid
     assert len(completed) == 1 and len(completed[0][1]) == 64
+    assert len(reconciled) == 1
+    assert all(len(digest) == 64 for digest in reconciled[0])
 
 
 def test_characterization_recovers_same_cleanup_capability_after_ready_write_error(

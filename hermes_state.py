@@ -1053,6 +1053,7 @@ CREATE TABLE IF NOT EXISTS session_claude_auth_recoveries (
     next_attempt_at REAL NOT NULL,
     lease_digest TEXT UNIQUE,
     lease_expires_at REAL,
+    call_started_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     completed_at REAL,

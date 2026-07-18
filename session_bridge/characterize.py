@@ -85,6 +85,16 @@ class CharacterizationAuthenticationFailure(RuntimeError):
         self.evidence_digest = evidence_digest
 
 
+class CharacterizationRecoveredTranscript(RuntimeError):
+    def __init__(
+        self, evidence_digest: str, prompt_digest: str, transcript_digest: str
+    ) -> None:
+        super().__init__("characterization_recovery_authority_required")
+        self.evidence_digest = evidence_digest
+        self.prompt_digest = prompt_digest
+        self.transcript_digest = transcript_digest
+
+
 def build_characterization_auth_recovery_prompt(
     reserved_uuid: str, signed_marker: str
 ) -> str:
@@ -136,6 +146,8 @@ def characterize_claude_visibility(
     recover_auth_failure: Callable[[Mapping[str, Any], str, str], Mapping[str, Any]]
     | None = None,
     complete_auth_recovery: Callable[[Mapping[str, Any], str], None] | None = None,
+    reconcile_auth_recovery: Callable[[Mapping[str, Any], str, str, str], None]
+    | None = None,
     record_writer: Callable[[Path, dict[str, Any], bytes], None] | None = None,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
@@ -175,6 +187,17 @@ def characterize_claude_visibility(
                     signed_marker=_required_state_text(state, "signed_marker"),
                     marker_secret=marker_secret,
                 )
+            except CharacterizationRecoveredTranscript as exc:
+                if reconcile_auth_recovery is None:
+                    raise
+                reconcile_auth_recovery(
+                    state,
+                    exc.evidence_digest,
+                    exc.prompt_digest,
+                    exc.transcript_digest,
+                )
+                state["phase"] = "launched"
+                writer(active_path, state, marker_secret)
             except CharacterizationAuthenticationFailure as exc:
                 if recover_auth_failure is None or complete_auth_recovery is None:
                     raise
@@ -200,6 +223,7 @@ def characterize_claude_visibility(
                     source_cwd=_required_state_text(state, "source_cwd"),
                     signed_marker=_required_state_text(state, "signed_marker"),
                     marker_secret=marker_secret,
+                    allow_recovered=True,
                 )
                 complete_auth_recovery(recovery, _sha256_file(recovered_transcript))
                 state["phase"] = "launched"
@@ -317,6 +341,7 @@ def characterize_claude_visibility(
         source_cwd=source_cwd,
         signed_marker=signed_marker,
         marker_secret=marker_secret,
+        allow_recovered=True,
     )
     if state["transcript_path"] not in (None, str(resolved_transcript)):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
@@ -516,6 +541,7 @@ def _cleanup_characterized_claude_visibility_locked(
             source_cwd=_required_state_text(state, "source_cwd"),
             signed_marker=_required_state_text(state, "signed_marker"),
             marker_secret=marker_secret,
+            allow_recovered=True,
         )
         if transcript != _safe_contained_file(
             project_root, _required_state_text(state, "transcript_path")
@@ -641,6 +667,7 @@ def _validate_characterization_transcript(
     source_cwd: str,
     signed_marker: str,
     marker_secret: bytes,
+    allow_recovered: bool = False,
 ) -> Path:
     finder = getattr(restarted, "find_native_sessions", None)
     paths = (
@@ -699,14 +726,23 @@ def _validate_characterization_transcript(
     expected_prompt = build_claude_registration_prompt(
         candidate, identity, marker_secret
     )
-    marker_indexes = [
-        index
-        for index, message in enumerate(native.messages)
-        if message.role == "user" and message.content == expected_prompt
-    ]
-    if len(marker_indexes) != 1:
+    messages = list(native.messages)
+    if len(messages) not in (2, 4):
         raise RuntimeError("characterization_identity_mismatch:response")
-    tail = list(native.messages)[marker_indexes[0] + 1 :]
+    if any(
+        message.ordinal != 0
+        or not isinstance(message.native_event_id, str)
+        or not message.native_event_id
+        or message.tool_name is not None
+        or message.tool_calls is not None
+        or message.tool_call_id is not None
+        or message.reasoning is not None
+        for message in messages
+    ) or len({message.native_event_id for message in messages}) != len(messages):
+        raise RuntimeError("characterization_identity_mismatch:response")
+    if messages[0].role != "user" or messages[0].content != expected_prompt:
+        raise RuntimeError("characterization_identity_mismatch:response")
+    tail = messages[1:]
     normal = (
         len(tail) == 1
         and tail[0].role == "assistant"
@@ -728,6 +764,8 @@ def _validate_characterization_transcript(
     )
     if auth_failure:
         assert isinstance(tail[0].content, str)
+        if _path_identity(transcript) != before:
+            raise RuntimeError("characterization_identity_mismatch:path_changed")
         raise CharacterizationAuthenticationFailure(
             hashlib.sha256(tail[0].content.encode("utf-8")).hexdigest()
         )
@@ -735,6 +773,16 @@ def _validate_characterization_transcript(
         raise RuntimeError("characterization_identity_mismatch:response")
     if _path_identity(transcript) != before:
         raise RuntimeError("characterization_identity_mismatch:path_changed")
+    if recovered and not allow_recovered:
+        assert isinstance(tail[0].content, str)
+        transcript_digest = _sha256_file(transcript)
+        if _path_identity(transcript) != before:
+            raise RuntimeError("characterization_identity_mismatch:path_changed")
+        raise CharacterizationRecoveredTranscript(
+            hashlib.sha256(tail[0].content.encode("utf-8")).hexdigest(),
+            hashlib.sha256(recovery_prompt.encode("utf-8")).hexdigest(),
+            transcript_digest,
+        )
     return transcript
 
 

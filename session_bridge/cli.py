@@ -694,6 +694,22 @@ class ProductionBackend:
                 visible_at=time.time(),
             )
 
+        def _reconcile_auth_recovery(
+            operation: Mapping[str, Any],
+            evidence_digest: str,
+            prompt_digest: str,
+            transcript_digest: str,
+        ) -> None:
+            store.reconcile_claude_auth_recovery(
+                job_id=str(operation["job_id"]),
+                reserved_claude_uuid=str(operation["reserved_claude_uuid"]),
+                operation_id=str(operation["operation_id"]),
+                evidence_digest=evidence_digest,
+                prompt_digest=prompt_digest,
+                transcript_digest=transcript_digest,
+                visible_at=time.time(),
+            )
+
         return characterize_claude_visibility(
             source_root=source_root,
             projects_root=_CLAUDE_PROJECTS_ROOT,
@@ -705,6 +721,7 @@ class ProductionBackend:
             marker_secret=marker_secret,
             recover_auth_failure=_recover_auth_failure,
             complete_auth_recovery=_complete_auth_recovery,
+            reconcile_auth_recovery=_reconcile_auth_recovery,
         )
 
     def _claude_visibility_runtime(self) -> ClaudeVisibilityCoordinator:

@@ -180,6 +180,10 @@ class FakeStore:
         self.calls.append(("retry_auth_recovery", *args))
         return {"state": "retry"}
 
+    def begin_claude_auth_recovery(self, *args: Any) -> dict[str, Any]:
+        self.calls.append(("begin_auth_recovery", *args))
+        return {"state": "leased", "call_started_at": 100.0}
+
 
 class FakePty:
     def __init__(
@@ -363,6 +367,33 @@ def test_auth_recovery_resumes_exact_uuid_in_print_mode_without_create_or_exit()
     assert "--session-id" not in factory.spawns[0][0]
     assert "--no-session-persistence" not in factory.spawns[0][0]
     assert process.writes == []
+
+
+def test_auth_recovery_durably_marks_call_started_before_spawn() -> None:
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    store = FakeStore()
+    factory = FakeFactory(FakePty(output="REGISTERED\r\n", exit_code=0))
+
+    outcome = registrar(FakeSource(), factory, store).resume_auth_recovery(
+        recovery, prompt
+    )
+
+    assert outcome.status == "recovered"
+    assert store.calls == [
+        ("begin_auth_recovery", item.job_id, "b" * 64),
+    ]
+    assert len(factory.spawns) == 1
 
 
 def test_terminal_echo_and_ansi_are_removed_before_exact_response_check() -> None:

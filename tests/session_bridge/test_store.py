@@ -5742,6 +5742,8 @@ def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
     assert recovery["attempt_ordinal"] == 2
     assert store.claude_visibility_status(100.0)["usage"]["attempts"] == 2
 
+    store.begin_claude_auth_recovery(identity.job_id, recovery["lease_digest"])
+
     clock[0] = 111.0
     resumed = store.claim_claude_auth_recovery(
         job_id=identity.job_id,
@@ -5757,9 +5759,10 @@ def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
         max_attempts=5,
     )
     assert resumed["status"] == "claimed"
-    assert resumed["attempt_ordinal"] == recovery["attempt_ordinal"]
+    assert resumed["attempt_ordinal"] == recovery["attempt_ordinal"] + 1
     assert resumed["reserved_claude_uuid"] == recovery["reserved_claude_uuid"]
-    assert store.claude_visibility_status(111.0)["usage"]["attempts"] == 2
+    assert store.claude_visibility_status(111.0)["usage"]["attempts"] == 3
+    store.begin_claude_auth_recovery(identity.job_id, resumed["lease_digest"])
     committed = store.commit_claude_auth_recovery(
         job_id=identity.job_id,
         lease_digest=resumed["lease_digest"],
@@ -5774,6 +5777,145 @@ def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
         (identity.job_id,),
     )[0]
     assert recovery_row == {"state": "completed", "completed_at": 111.0}
+
+
+def test_claude_auth_recovery_pre_call_crash_reuses_paid_reservation(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-pre-call-crash")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000003",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+
+    clock[0] = 111.0
+    resumed = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000003",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=111.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+
+    assert resumed["attempt_ordinal"] == recovery["attempt_ordinal"]
+    assert store.claude_visibility_status(111.0)["usage"]["attempts"] == 2
+
+
+def test_claude_auth_recovery_accepts_exact_authentication_retry_state(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-retry-state")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.retry_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "claude_authentication_unavailable",
+        101.0,
+        "redacted",
+    )
+
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id="6ae1c4de-0000-4000-8000-000000000004",
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+
+    assert recovery["status"] == "claimed"
+    assert recovery["reserved_claude_uuid"] == identity.claude_uuid
+
+
+def test_claude_auth_recovery_reconciles_completed_transcript_without_new_call(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("auth-reconcile-crash")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+    operation_id = "6ae1c4de-0000-4000-8000-000000000005"
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    store.begin_claude_auth_recovery(identity.job_id, recovery["lease_digest"])
+
+    completed = store.reconcile_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        transcript_digest="c" * 64,
+        visible_at=101.0,
+    )
+
+    assert completed["state"] == "claude_visible"
+    assert store.claude_visibility_status(101.0)["usage"]["attempts"] == 2
+
+    repeated = store.reconcile_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        transcript_digest="c" * 64,
+        visible_at=102.0,
+    )
+    assert repeated["state"] == "claude_visible"
+
+    with pytest.raises(ValueError, match="recovery authority"):
+        store.reconcile_claude_auth_recovery(
+            job_id=identity.job_id,
+            reserved_claude_uuid=identity.claude_uuid,
+            operation_id=operation_id,
+            evidence_digest="a" * 64,
+            prompt_digest="b" * 64,
+            transcript_digest="d" * 64,
+            visible_at=102.0,
+        )
 
 
 def test_claude_auth_recovery_refuses_when_any_other_open_job_exists(

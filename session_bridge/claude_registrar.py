@@ -92,6 +92,9 @@ class ClaudeVisibilityStore(Protocol):
         error_code: str,
         next_attempt_at: float,
     ) -> dict[str, object]: ...
+    def begin_claude_auth_recovery(
+        self, job_id: str, lease_digest: str
+    ) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -797,6 +800,16 @@ class ClaudeNativeRegistrar:
         process: InteractivePty | None = None
         clean_exit = False
         pending: tuple[str, str] | None = None
+        try:
+            self._store.begin_claude_auth_recovery(str(job_id), str(lease_digest))
+        except Exception:
+            return ClaudeRegistrarOutcome(
+                "retry",
+                str(job_id),
+                str(native_id),
+                "session_bridge_unavailable",
+                "call start checkpoint unavailable",
+            )
         try:
             process = self._factory.spawn(argv, cwd=str(source_cwd))
             output = process.read_until(self._process_timeout, prompt=prompt)
