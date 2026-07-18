@@ -200,7 +200,30 @@ def test_codex_automation_envelopes_are_structurally_excluded(content: str) -> N
     )
 
 
-def test_legacy_codex_bridge_registration_is_excluded_even_after_key_rotation() -> None:
+@pytest.mark.parametrize(
+    "registration",
+    [
+        (
+            "Hermes Session Bridge registration only. "
+            "Hermes Session Bridge placeholder.\n"
+            "Signed marker: HERMES_SESSION_BRIDGE_V1:retired.signature\n"
+            "Canonical source session: claude:source-1"
+        ),
+        (
+            "Hermes Session Bridge registration only. Signed marker: "
+            "HERMES_SESSION_BRIDGE_V1:retired.signature "
+            "Do not perform project work; reply READY."
+        ),
+        (
+            "Hermes registration diagnostic. Hermes Session Bridge diagnostic "
+            "placeholder.\nSigned marker: "
+            "HERMES_SESSION_BRIDGE_V1:retired.signature\nReply READY."
+        ),
+    ],
+)
+def test_legacy_codex_bridge_registration_is_excluded_even_after_key_rotation(
+    registration: str,
+) -> None:
     projection = replace(
         _projection(Provider.CODEX),
         messages=(
@@ -208,12 +231,7 @@ def test_legacy_codex_bridge_registration_is_excluded_even_after_key_rotation() 
                 "registration",
                 0,
                 "user",
-                (
-                    "Hermes Session Bridge registration only. "
-                    "Hermes Session Bridge placeholder.\n"
-                    "Signed marker: HERMES_SESSION_BRIDGE_V1:retired.signature\n"
-                    "Canonical source session: claude:source-1"
-                ),
+                registration,
                 11.0,
             ),
             ProjectedMessage(

@@ -65,10 +65,20 @@ _CODEX_INJECTED_USER_PREFIXES = (
     "# AGENTS.md instructions for ",
     "<skill>\n",
 )
-_LEGACY_CODEX_REGISTRATION_PREFIX = (
-    "Hermes Session Bridge registration only. "
-    "Hermes Session Bridge placeholder.\n"
-    "Signed marker: HERMES_SESSION_BRIDGE_V1:"
+_LEGACY_CODEX_REGISTRATION_PREFIXES = (
+    (
+        "Hermes Session Bridge registration only. "
+        "Hermes Session Bridge placeholder.\n"
+        "Signed marker: HERMES_SESSION_BRIDGE_V1:"
+    ),
+    (
+        "Hermes Session Bridge registration only. Signed marker: "
+        "HERMES_SESSION_BRIDGE_V1:"
+    ),
+    (
+        "Hermes registration diagnostic. Hermes Session Bridge diagnostic "
+        "placeholder.\nSigned marker: HERMES_SESSION_BRIDGE_V1:"
+    ),
 )
 
 
@@ -262,7 +272,7 @@ def _is_codex_automation_envelope(value: object) -> bool:
 
 def _is_legacy_codex_registration(value: object) -> bool:
     return isinstance(value, str) and value.startswith(
-        _LEGACY_CODEX_REGISTRATION_PREFIX
+        _LEGACY_CODEX_REGISTRATION_PREFIXES
     )
 
 
