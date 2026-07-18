@@ -52,8 +52,6 @@ def _is_canonical_absolute_cwd(value: object, *, platform: str) -> bool:
     if platform == "windows":
         drive_match = re.match(r"^[A-Za-z]:[\\/]", value)
         if drive_match is not None:
-            if len(value) == 3:
-                return False
             lexical_tail = value[2:]
             components = re.split(r"[\\/]", value[3:])
         elif len(value) >= 2 and value[0] in "\\/" and value[1] == value[0]:
