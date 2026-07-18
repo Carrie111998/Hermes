@@ -409,3 +409,91 @@ def run_followup_plan_fingerprint(followup_plan_record: dict[str, Any]) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+EXECUTION_REQUEST_PENDING = "pending"
+EXECUTION_REQUEST_CANCELLED = "cancelled"
+
+EXECUTION_REQUEST_STATUSES: frozenset[str] = frozenset(
+    {
+        EXECUTION_REQUEST_PENDING,
+        EXECUTION_REQUEST_CANCELLED,
+    }
+)
+
+EXECUTION_KINDS: frozenset[str] = frozenset(
+    {
+        "manual_open_link",
+        "rerun_task",
+        "regenerate_output",
+        "update_documentation",
+        "external_action",
+        "other",
+    }
+)
+
+
+def run_execution_request_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run execution request record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_execution_request_record.json"
+
+
+def _normalize_execution_items(
+    execution_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in execution_items:
+        normalized.append(
+            {
+                "item_id": item["item_id"],
+                "source_followup_item_id": item["source_followup_item_id"],
+                "title": item["title"],
+                "execution_kind": item["execution_kind"],
+                "command": item["command"],
+                "approval_reason": item.get("approval_reason"),
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def make_run_execution_request_record(
+    *,
+    run_id: str,
+    source_followup_plan_fingerprint: str,
+    execution_items: list[dict[str, Any]],
+    requester: str = "human",
+    request_status: str = EXECUTION_REQUEST_PENDING,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated review-gated run execution request record envelope."""
+    execution_request_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_followup_plan_fingerprint": source_followup_plan_fingerprint,
+        "requester": requester,
+        "request_status": request_status,
+        "execution_items": _normalize_execution_items(execution_items),
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(execution_request_record, "run_execution_request_record")
+    return execution_request_record
+
+
+def run_execution_request_fingerprint(execution_request_record: dict[str, Any]) -> str:
+    """Return a stable semantic fingerprint for a run execution request record."""
+    validate_schema(execution_request_record, "run_execution_request_record")
+    return json.dumps(
+        execution_request_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

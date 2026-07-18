@@ -1,34 +1,34 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-18  
-**Task:** Task 8 — Review-Gated Follow-up Planning API  
+**Task:** Task 9 — Review-Gated Execution Request API  
 **Status:** Complete — awaiting Architect acceptance
 
 ---
 
 ## 1. One-paragraph state
 
-Task 8 adds **review-gated follow-up planning** after a run is completed and reviewed. A plan (authored by human, assistant, tool, or mixed process) is validated, fingerprinted, stored in `run_followup_plan_record.json`, and audited via `manual_run_followup_planned` in `task_events.jsonl`. This task **records and audits only** — it does not execute, schedule, delegate, or mutate lifecycle status. **331/331 tests pass**.
+Task 9 adds **review-gated execution requests** after a run is completed, reviewed, and has a follow-up plan. An execution request (authored by human, assistant, tool, or mixed process) is validated, fingerprinted, stored in `run_execution_request_record.json`, and audited via `run_execution_requested` in `task_events.jsonl`. **Execution requests are not execution** — they record approved future actions only. This task **prepares controlled automation** but does not execute, schedule, delegate, or mutate lifecycle status. Actual execution is deferred to Task 10 (not started).
 
 ---
 
-## 2. Task 8 APIs
+## 2. Task 9 APIs
 
 | Module | Key APIs |
 |--------|----------|
-| `contracts.py` | `make_run_followup_plan_record`, `run_followup_plan_fingerprint`, `FOLLOWUP_PLAN_*` |
-| `events.py` | `plan_run_followup`, `EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED` |
-| `schemas.py` | `run_followup_plan_record` validation |
+| `contracts.py` | `make_run_execution_request_record`, `run_execution_request_fingerprint`, `EXECUTION_REQUEST_*`, `EXECUTION_KINDS` |
+| `events.py` | `request_run_execution`, `EVENT_TYPE_RUN_EXECUTION_REQUESTED` |
+| `schemas.py` | `run_execution_request_record` validation |
 
 ---
 
 ## 3. Lifecycle semantics
 
-- **Preconditions:** run `completed`; `run_completion_record.json` exists; `run_review_record.json` exists; `source_review_decision` matches review record
-- **Write order:** follow-up plan record → event append
-- **Replay-only** when `run_followup_plan_record.json` already exists
+- **Preconditions:** run `completed`; `run_completion_record.json` exists; `run_review_record.json` exists; `run_followup_plan_record.json` exists; `source_followup_plan_fingerprint` matches follow-up plan record
+- **Write order:** execution request record → event append
+- **Replay-only** when `run_execution_request_record.json` already exists
 - **Does not** update run_manifest, task_status, attempt_status
-- **followup_items** are planning notes, not tasks — no task_id, no execution
+- **execution_items** are approved future actions, not performed actions — no Runtime, no task creation
 
 ---
 
@@ -36,13 +36,13 @@ Task 8 adds **review-gated follow-up planning** after a run is completed and rev
 
 | Automated (safe bookkeeping) | Not automated (human gate) |
 |------------------------------|----------------------------|
-| Schema validation | Task/attempt creation |
+| Schema validation | Actual execution |
 | Fingerprints | Runtime/delegate_task calls |
 | Idempotency / replay | Scheduling / HEAL / DECO |
 | Audit events | Lifecycle status mutation |
 | Record storage | Artifact/result inspection |
 
-Plan content may be tool-assisted; execution remains out of scope.
+Request content may be tool-assisted; execution remains Task 10.
 
 ---
 
@@ -54,7 +54,10 @@ Plan content may be tool-assisted; execution remains out of scope.
 | Completion record | `{run_root}/run_completion_record.json` |
 | Review record | `{run_root}/run_review_record.json` |
 | Follow-up plan record | `{run_root}/run_followup_plan_record.json` |
-| Follow-up plan event | `{run_root}/task_events.jsonl` (shared, no `task_id`) |
+| Execution request record | `{run_root}/run_execution_request_record.json` |
+| Execution request event | `{run_root}/task_events.jsonl` (shared, no `task_id`) |
+
+JSON records remain source of truth; event log is audit-only.
 
 ---
 
@@ -64,11 +67,10 @@ Plan content may be tool-assisted; execution remains out of scope.
 cd /home/unaliu/.hermes/hermes-agent
 source venv/bin/activate
 python3 -m pytest tests/htr/ -v
-# 331 passed in 3.49s
 ```
 
 ---
 
 ## 7. Owner handoff
 
-Task 8 complete. Do not start Task 9 until Architect assigns scope.
+Task 9 complete. Task 10 (actual controlled execution adapter) not started — await Architect scope.

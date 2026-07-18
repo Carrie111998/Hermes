@@ -19,6 +19,7 @@ SchemaName = Literal[
     "run_completion_record",
     "run_review_record",
     "run_followup_plan_record",
+    "run_execution_request_record",
 ]
 
 
@@ -138,6 +139,18 @@ class RunFollowupPlanRecord(TypedDict):
     created_at: str
 
 
+class RunExecutionRequestRecord(TypedDict):
+    schema_version: int
+    run_id: str
+    source_followup_plan_fingerprint: str
+    requester: str
+    request_status: str
+    execution_items: list[dict[str, Any]]
+    notes: str | None
+    metadata: dict[str, Any]
+    created_at: str
+
+
 class AttemptResult(TypedDict):
     schema_version: str
     run_id: str
@@ -242,6 +255,17 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_execution_request_record": (
+        "schema_version",
+        "run_id",
+        "source_followup_plan_fingerprint",
+        "requester",
+        "request_status",
+        "execution_items",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -287,6 +311,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_review_record(data)
     elif schema_name == "run_followup_plan_record":
         _validate_run_followup_plan_record(data)
+    elif schema_name == "run_execution_request_record":
+        _validate_run_execution_request_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -567,3 +593,83 @@ def _validate_run_followup_plan_record(data: dict[str, Any]) -> None:
             )
     if not isinstance(data["metadata"], dict):
         raise ValueError("run_followup_plan_record: metadata must be a dict")
+
+
+def _validate_run_execution_request_record(data: dict[str, Any]) -> None:
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError("run_execution_request_record: schema_version must be an int")
+    _require_str(data, "run_id", "run_execution_request_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError("run_execution_request_record: run_id must be a valid run id")
+    _require_str(
+        data, "source_followup_plan_fingerprint", "run_execution_request_record"
+    )
+    _require_str(data, "requester", "run_execution_request_record")
+    _require_str(data, "request_status", "run_execution_request_record")
+    if data["request_status"] not in {"pending", "cancelled"}:
+        raise ValueError(
+            "run_execution_request_record: request_status must be one of "
+            "pending, cancelled"
+        )
+    _require_str(data, "created_at", "run_execution_request_record")
+    if "notes" not in data:
+        raise ValueError("run_execution_request_record: missing fields: notes")
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError("run_execution_request_record: notes must be a string or null")
+    execution_items = data.get("execution_items")
+    if not isinstance(execution_items, list):
+        raise ValueError(
+            "run_execution_request_record: execution_items must be a list"
+        )
+    for item in execution_items:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_execution_request_record: each execution item must be a dict"
+            )
+        for field in (
+            "item_id",
+            "source_followup_item_id",
+            "title",
+            "execution_kind",
+        ):
+            if field not in item or not isinstance(item[field], str) or not item[field]:
+                raise ValueError(
+                    f"run_execution_request_record: execution item {field} must be a "
+                    "non-empty string"
+                )
+        if item["execution_kind"] not in {
+            "manual_open_link",
+            "rerun_task",
+            "regenerate_output",
+            "update_documentation",
+            "external_action",
+            "other",
+        }:
+            raise ValueError(
+                "run_execution_request_record: execution item execution_kind is invalid"
+            )
+        if "command" not in item or not isinstance(item["command"], dict):
+            raise ValueError(
+                "run_execution_request_record: execution item command must be a dict"
+            )
+        if "approval_reason" not in item:
+            raise ValueError(
+                "run_execution_request_record: execution item missing fields: "
+                "approval_reason"
+            )
+        approval_reason = item["approval_reason"]
+        if approval_reason is not None and not isinstance(approval_reason, str):
+            raise ValueError(
+                "run_execution_request_record: execution item approval_reason must "
+                "be a string or null"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_execution_request_record: execution item metadata must be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_execution_request_record: metadata must be a dict")

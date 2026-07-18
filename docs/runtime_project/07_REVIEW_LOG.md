@@ -660,3 +660,36 @@ Do not automate execution, scheduling, delegation, or lifecycle mutation.
 - No run_manifest/task_status/attempt_status updates
 
 **Awaiting:** Architect acceptance before Task 9.
+
+---
+
+## Task 9 — Review-Gated Execution Request API (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance  
+**Tests:** full HTR suite (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_execution_request_record` schema + `make_run_execution_request_record()`
+- `run_execution_request_fingerprint()` — stable canonical JSON
+- `request_run_execution()` — review-gated execution request after completion + review + follow-up plan records exist
+- `run_execution_requested` event + replay-only when execution request record exists
+- Request status constants: `pending`, `cancelled`
+- `execution_items` are approved future actions — not performed actions
+- `requester` may be human, assistant, tool, or mixed process
+
+### Design principle
+
+Automate safe bookkeeping (schema, fingerprint, idempotency, replay, audit events).
+Execution requests prepare controlled automation; they do not execute work.
+
+### Non-goals confirmed
+
+- No actual execution, Runtime/delegate_task/DECO/HEAL/scheduler/queue/database
+- No task/attempt creation from execution items
+- No artifact/result/verification content inspection
+- No run_manifest/task_status/attempt_status updates
+- Task 10 not started
+
+**Awaiting:** Architect acceptance before Task 10.
