@@ -42,33 +42,52 @@ _OFFER_PATTERNS = [
 ]
 
 
-def _stage_transition_payload(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize PIPELINE_UPDATE payloads from tracker/tailor mailbox messages."""
+def _stage_transition_payload(
+    d: Dict[str, Any], from_agent: Optional[str] = None
+) -> Dict[str, Any]:
+    """Normalize PIPELINE_UPDATE payloads from tracker/tailor mailbox messages.
+
+    Emits the `prior_stage` key that both the pipeline_state.manager producer
+    and the TelegramNotifier formatter treat as canonical. `previous_stage` is
+    also emitted as a back-compat alias for any older consumer.  `actor` is
+    populated so the formatter's "(by <actor>)" clause is not "(by ?)":
+    an explicit `actor` in the message wins, otherwise it defaults to the
+    sending agent (mailbox `from`), canonicalised.
+    """
     metadata = d.get("metadata") or {}
     job_id = d.get("job_id")
     job_key = d.get("job_key") or job_id
-    previous_stage = d.get("previous_stage")
-    if previous_stage is None:
-        previous_stage = d.get("from_stage")
+    prior_stage = d.get("prior_stage")
+    if prior_stage is None:
+        prior_stage = d.get("previous_stage")
+    if prior_stage is None:
+        prior_stage = d.get("from_stage")
     new_stage = d.get("new_stage")
     if new_stage is None:
         new_stage = d.get("to_stage")
     company = d.get("company") or metadata.get("company")
     title = d.get("title") or metadata.get("title")
+    actor = d.get("actor")
+    if actor is None and from_agent:
+        actor = canonical_agent_source(from_agent)
 
     out: Dict[str, Any] = {}
     if job_key is not None:
         out["job_key"] = job_key
     if job_id is not None:
         out["job_id"] = job_id
-    if previous_stage is not None:
-        out["previous_stage"] = previous_stage
+    if prior_stage is not None:
+        out["prior_stage"] = prior_stage
+        # Back-compat alias — older consumers keyed on `previous_stage`.
+        out["previous_stage"] = prior_stage
     if new_stage is not None:
         out["new_stage"] = new_stage
     if company is not None:
         out["company"] = company
     if title is not None:
         out["title"] = title
+    if actor is not None:
+        out["actor"] = actor
     return out
 
 
@@ -93,7 +112,7 @@ class MailboxTranslator(BaseSubscriber):
         inner = payload.get("inner_payload") or payload.get("payload") or {}
         correlation_id = event.correlation_id
 
-        emissions = self._translate(message_type, inner)
+        emissions = self._translate(message_type, inner, payload.get("from"))
         for et, out_payload, priority in emissions:
             try:
                 self.bus.emit(
@@ -169,6 +188,7 @@ class MailboxTranslator(BaseSubscriber):
         self,
         message_type: str,
         inner: Dict[str, Any],
+        from_agent: Optional[str] = None,
     ) -> List[Tuple[EventType, Dict[str, Any], Optional[Priority]]]:
         """Return a list of (event_type, payload, priority_override_or_None)."""
         results: List[Tuple[EventType, Dict[str, Any], Optional[Priority]]] = []
@@ -210,8 +230,8 @@ class MailboxTranslator(BaseSubscriber):
                 inner, ["company", "title", "job_key", "question"]), None))
 
         elif message_type == "PIPELINE_UPDATE":
-            transition = _stage_transition_payload(inner)
-            prev = transition.get("previous_stage")
+            transition = _stage_transition_payload(inner, from_agent)
+            prev = transition.get("prior_stage")
             new = transition.get("new_stage")
             # Emit on any real transition — including first assignment where prev is None.
             if new and new != prev:

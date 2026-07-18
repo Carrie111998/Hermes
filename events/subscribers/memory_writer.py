@@ -194,8 +194,12 @@ class MemoryWriter(BaseSubscriber):
                 return (f"{et.type_string}: {p.get('company', '?')} — "
                         f"{p.get('detail', 'no detail')}")
             if et == EventType.STAGE_TRANSITION:
+                # Canonical prior-stage key is `prior_stage` (both producers +
+                # the Telegram formatter). Keep `old_stage` as a fallback for
+                # any historical payload.
+                prior = p.get("prior_stage") or p.get("old_stage", "?")
                 return (f"Pipeline: {p.get('company', '?')} moved to "
-                        f"{p.get('new_stage', '?')} from {p.get('old_stage', '?')}")
+                        f"{p.get('new_stage', '?')} from {prior}")
 
         if target == "mempalace":
             # Verbatim evidence

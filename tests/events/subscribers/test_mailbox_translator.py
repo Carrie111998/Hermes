@@ -149,6 +149,46 @@ def test_pipeline_update_emits_on_first_stage_assignment(bus):
     assert transitions[0]["new_stage"] == "discovered"
 
 
+def test_pipeline_update_emits_prior_stage_key_for_formatter(bus):
+    """The TelegramNotifier formatter reads `prior_stage` (matching the
+    pipeline_state.manager producer + the '? →' symptom). The mailbox path
+    must emit that canonical key, not only `previous_stage`, or the prior
+    stage renders as '?'.
+    """
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j1", "previous_stage": "discovered", "new_stage": "scored"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["prior_stage"] == "discovered"
+    # legacy alias kept for back-compat with any older consumer
+    assert t["previous_stage"] == "discovered"
+
+
+def test_pipeline_update_populates_actor_from_mailbox_sender(bus):
+    """The '(by ?)' symptom: mailbox-sourced transitions never set `actor`,
+    so the formatter falls back to '?'. Actor must default to the sending
+    agent (mailbox 'from'), canonicalised.
+    """
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j1", "new_stage": "archived"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["actor"] == "matcher"
+
+
+def test_pipeline_update_explicit_actor_wins_over_sender(bus):
+    """An explicit actor in the mailbox payload takes precedence over the
+    sender attribution."""
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j1", "new_stage": "applied", "actor": "diego"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["actor"] == "diego"
+
+
 def test_pipeline_update_accepts_tailor_alias_fields(bus):
     _mailbox_event(bus, "PIPELINE_UPDATE", {
         "job_id": "48f36c8d-ad38-4bf4-aaf5-d38be28a97e3",
