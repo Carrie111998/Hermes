@@ -90,9 +90,10 @@ export interface SessionRecoveryDeps {
    */
   onRecovered?: (liveSessionId: string) => void
   /**
-   * Non-null reason ⇒ abort instead of retrying. Evaluated AFTER the resume
-   * and BEFORE the retry, because the resume is the slow await during which a
-   * profile switch or route rebind can land.
+   * Non-null reason ⇒ abort instead of resuming or retrying. Evaluated before
+   * the resume, after a failed resume, and after a successful resume because
+   * either gateway RPC is a slow await during which a profile switch or route
+   * rebind can land.
    */
   driftReason?: () => null | string
 }
@@ -163,11 +164,23 @@ export async function withSessionNotFoundResume<T>(
       throw err
     }
 
+    const beforeResumeDrift = deps.driftReason?.()
+
+    if (beforeResumeDrift) {
+      throw new SessionRecoveryAborted(beforeResumeDrift, sessionId)
+    }
+
     let recoveredId: null | string
 
     try {
       recoveredId = await resumeStoredRuntimeSession(storedSessionId, deps)
     } catch {
+      const failedResumeDrift = deps.driftReason?.()
+
+      if (failedResumeDrift) {
+        throw new SessionRecoveryAborted(failedResumeDrift, sessionId)
+      }
+
       throw err
     }
 
