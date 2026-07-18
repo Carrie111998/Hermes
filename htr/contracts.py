@@ -684,3 +684,180 @@ def run_execution_result_fingerprint(execution_result_record: dict[str, Any]) ->
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+EXECUTION_VERIFICATION_ACCEPTED = "accepted"
+EXECUTION_VERIFICATION_REJECTED = "rejected"
+EXECUTION_VERIFICATION_NEEDS_CHANGES = "needs_changes"
+
+EXECUTION_VERIFICATION_DECISIONS: frozenset[str] = frozenset(
+    {
+        EXECUTION_VERIFICATION_ACCEPTED,
+        EXECUTION_VERIFICATION_REJECTED,
+        EXECUTION_VERIFICATION_NEEDS_CHANGES,
+    }
+)
+
+EXECUTION_ITEM_VERIFICATION_ACCEPTED = "accepted"
+EXECUTION_ITEM_VERIFICATION_REJECTED = "rejected"
+EXECUTION_ITEM_VERIFICATION_NEEDS_CHANGES = "needs_changes"
+EXECUTION_ITEM_VERIFICATION_NOT_REVIEWED = "not_reviewed"
+
+EXECUTION_ITEM_VERIFICATION_DECISIONS: frozenset[str] = frozenset(
+    {
+        EXECUTION_ITEM_VERIFICATION_ACCEPTED,
+        EXECUTION_ITEM_VERIFICATION_REJECTED,
+        EXECUTION_ITEM_VERIFICATION_NEEDS_CHANGES,
+        EXECUTION_ITEM_VERIFICATION_NOT_REVIEWED,
+    }
+)
+
+
+def run_execution_verification_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run execution verification record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_execution_verification_record.json"
+
+
+def _normalize_item_verifications(
+    item_verifications: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in item_verifications:
+        normalized.append(
+            {
+                "item_id": item["item_id"],
+                "source_followup_item_id": item["source_followup_item_id"],
+                "execution_kind": item["execution_kind"],
+                "item_status": item["item_status"],
+                "verification_decision": item["verification_decision"],
+                "reviewer_notes": item.get("reviewer_notes"),
+                "evidence": item["evidence"] if item.get("evidence") is not None else {},
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def _validate_execution_verification_decision_consistency(
+    verification_record: dict[str, Any],
+) -> None:
+    """Validate run-level and item-level verification decision consistency."""
+    decision = verification_record["verification_decision"]
+    item_decisions = [
+        item["verification_decision"]
+        for item in verification_record["item_verifications"]
+    ]
+
+    if decision == EXECUTION_VERIFICATION_ACCEPTED:
+        if item_decisions and not all(
+            d == EXECUTION_ITEM_VERIFICATION_ACCEPTED for d in item_decisions
+        ):
+            raise ValueError(
+                "run_execution_verification_record: accepted decision requires all "
+                "item_verifications to be accepted"
+            )
+    elif decision == EXECUTION_VERIFICATION_REJECTED:
+        if EXECUTION_ITEM_VERIFICATION_REJECTED not in item_decisions:
+            raise ValueError(
+                "run_execution_verification_record: rejected decision requires at "
+                "least one item_verification rejected"
+            )
+    elif decision == EXECUTION_VERIFICATION_NEEDS_CHANGES:
+        if EXECUTION_ITEM_VERIFICATION_NEEDS_CHANGES not in item_decisions:
+            raise ValueError(
+                "run_execution_verification_record: needs_changes decision requires "
+                "at least one item_verification needs_changes"
+            )
+
+    if any(
+        d == EXECUTION_ITEM_VERIFICATION_NOT_REVIEWED for d in item_decisions
+    ) and decision not in {
+        EXECUTION_VERIFICATION_REJECTED,
+        EXECUTION_VERIFICATION_NEEDS_CHANGES,
+    }:
+        raise ValueError(
+            "run_execution_verification_record: not_reviewed items are allowed only "
+            "when verification_decision is rejected or needs_changes"
+        )
+
+
+def validate_item_verifications_correspond_to_results(
+    item_verifications: list[dict[str, Any]],
+    item_results: list[dict[str, Any]],
+    *,
+    allow_partial: bool = False,
+) -> None:
+    """Ensure item verifications align with execution result item_results."""
+    result_by_id = {item["item_id"]: item for item in item_results}
+    verification_by_id = {item["item_id"]: item for item in item_verifications}
+
+    if not allow_partial:
+        if set(result_by_id) != set(verification_by_id):
+            raise ValueError(
+                "item_verifications item_id set does not match item_results"
+            )
+
+    for item_id, verification in verification_by_id.items():
+        if item_id not in result_by_id:
+            raise ValueError(
+                f"item_verifications contains unknown item_id {item_id!r}"
+            )
+        result = result_by_id[item_id]
+        for field in ("source_followup_item_id", "execution_kind", "item_status"):
+            if verification[field] != result[field]:
+                raise ValueError(
+                    f"item_verifications {field} does not match item_results for "
+                    f"{item_id!r}"
+                )
+
+    if not allow_partial:
+        missing = set(result_by_id) - set(verification_by_id)
+        if missing:
+            raise ValueError(
+                "item_verifications missing item_id(s): "
+                + ", ".join(sorted(missing))
+            )
+
+
+def make_run_execution_verification_record(
+    *,
+    run_id: str,
+    source_execution_result_fingerprint: str,
+    item_verifications: list[dict[str, Any]],
+    reviewer: str = "human",
+    verification_decision: str = EXECUTION_VERIFICATION_ACCEPTED,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated manual run execution verification record envelope."""
+    verification_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_execution_result_fingerprint": source_execution_result_fingerprint,
+        "reviewer": reviewer,
+        "verification_decision": verification_decision,
+        "item_verifications": _normalize_item_verifications(item_verifications),
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(verification_record, "run_execution_verification_record")
+    return verification_record
+
+
+def run_execution_verification_fingerprint(
+    verification_record: dict[str, Any],
+) -> str:
+    """Return a stable semantic fingerprint for a run execution verification record."""
+    validate_schema(verification_record, "run_execution_verification_record")
+    return json.dumps(
+        verification_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

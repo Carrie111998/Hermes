@@ -727,3 +727,35 @@ Execution requests prepare controlled automation; they do not execute work.
 - Task 11 not started
 
 **Awaiting:** Architect acceptance before Task 11.
+
+---
+
+## Task 11 — Manual Verification Gate for Execution Results (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance  
+**Tests:** 559 passed (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_execution_verification_record` schema + `make_run_execution_verification_record()`
+- `run_execution_verification_fingerprint()` — stable canonical JSON
+- `verify_run_execution_result()` — manual verification after execution result exists
+- Events: `run_execution_verified`, `run_execution_rejected`, `run_execution_needs_changes`
+- Item-level verification decisions with run-level consistency rules
+- `item_verifications` must correspond to execution result `item_results`
+
+### Design principle
+
+Verification is human/reviewer-provided, not automatically inferred.
+Records reviewer decision as source-of-truth JSON; event log is audit-only.
+
+### Non-goals confirmed
+
+- No automatic verification inference or execution
+- No prior execution record mutation
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
+- No task/attempt lifecycle mutation
+- Task 12 not started
+
+**Awaiting:** Architect acceptance before Task 12.

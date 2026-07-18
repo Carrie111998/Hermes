@@ -21,6 +21,7 @@ SchemaName = Literal[
     "run_followup_plan_record",
     "run_execution_request_record",
     "run_execution_result_record",
+    "run_execution_verification_record",
 ]
 
 
@@ -278,6 +279,17 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_execution_verification_record": (
+        "schema_version",
+        "run_id",
+        "source_execution_result_fingerprint",
+        "reviewer",
+        "verification_decision",
+        "item_verifications",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -327,6 +339,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_execution_request_record(data)
     elif schema_name == "run_execution_result_record":
         _validate_run_execution_result_record(data)
+    elif schema_name == "run_execution_verification_record":
+        _validate_run_execution_verification_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -767,3 +781,110 @@ def _validate_run_execution_result_record(data: dict[str, Any]) -> None:
             )
     if not isinstance(data["metadata"], dict):
         raise ValueError("run_execution_result_record: metadata must be a dict")
+
+
+def _validate_run_execution_verification_record(data: dict[str, Any]) -> None:
+    from htr.contracts import _validate_execution_verification_decision_consistency
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError(
+            "run_execution_verification_record: schema_version must be an int"
+        )
+    _require_str(data, "run_id", "run_execution_verification_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError(
+            "run_execution_verification_record: run_id must be a valid run id"
+        )
+    _require_str(
+        data, "source_execution_result_fingerprint", "run_execution_verification_record"
+    )
+    _require_str(data, "reviewer", "run_execution_verification_record")
+    _require_str(data, "verification_decision", "run_execution_verification_record")
+    if data["verification_decision"] not in {"accepted", "rejected", "needs_changes"}:
+        raise ValueError(
+            "run_execution_verification_record: verification_decision must be one of "
+            "accepted, rejected, needs_changes"
+        )
+    _require_str(data, "created_at", "run_execution_verification_record")
+    if "notes" not in data:
+        raise ValueError("run_execution_verification_record: missing fields: notes")
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError(
+            "run_execution_verification_record: notes must be a string or null"
+        )
+    item_verifications = data.get("item_verifications")
+    if not isinstance(item_verifications, list):
+        raise ValueError(
+            "run_execution_verification_record: item_verifications must be a list"
+        )
+    for item in item_verifications:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_execution_verification_record: each item verification must be a dict"
+            )
+        for field in (
+            "item_id",
+            "source_followup_item_id",
+            "execution_kind",
+            "item_status",
+            "verification_decision",
+        ):
+            if field not in item or not isinstance(item[field], str) or not item[field]:
+                raise ValueError(
+                    f"run_execution_verification_record: item verification {field} "
+                    "must be a non-empty string"
+                )
+        if item["execution_kind"] not in {
+            "manual_open_link",
+            "rerun_task",
+            "regenerate_output",
+            "update_documentation",
+            "external_action",
+            "other",
+        }:
+            raise ValueError(
+                "run_execution_verification_record: item verification execution_kind "
+                "is invalid"
+            )
+        if item["item_status"] not in {"completed", "skipped", "failed", "unsupported"}:
+            raise ValueError(
+                "run_execution_verification_record: item verification item_status "
+                "is invalid"
+            )
+        if item["verification_decision"] not in {
+            "accepted",
+            "rejected",
+            "needs_changes",
+            "not_reviewed",
+        }:
+            raise ValueError(
+                "run_execution_verification_record: item verification "
+                "verification_decision is invalid"
+            )
+        if "reviewer_notes" not in item:
+            raise ValueError(
+                "run_execution_verification_record: item verification missing fields: "
+                "reviewer_notes"
+            )
+        reviewer_notes = item["reviewer_notes"]
+        if reviewer_notes is not None and not isinstance(reviewer_notes, str):
+            raise ValueError(
+                "run_execution_verification_record: item verification reviewer_notes "
+                "must be a string or null"
+            )
+        if "evidence" not in item or not isinstance(item["evidence"], dict):
+            raise ValueError(
+                "run_execution_verification_record: item verification evidence must "
+                "be a dict"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_execution_verification_record: item verification metadata must "
+                "be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_execution_verification_record: metadata must be a dict")
+    _validate_execution_verification_decision_consistency(data)

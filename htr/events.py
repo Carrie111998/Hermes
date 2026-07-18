@@ -21,6 +21,9 @@ from htr.io import (
 )
 from htr.contracts import (
     EXECUTION_REQUEST_PENDING,
+    EXECUTION_VERIFICATION_ACCEPTED,
+    EXECUTION_VERIFICATION_NEEDS_CHANGES,
+    EXECUTION_VERIFICATION_REJECTED,
     make_run_execution_result_record,
     process_execution_items,
     result_fingerprint,
@@ -30,12 +33,15 @@ from htr.contracts import (
     run_execution_request_record_json_path,
     run_execution_result_fingerprint,
     run_execution_result_record_json_path,
+    run_execution_verification_fingerprint,
+    run_execution_verification_record_json_path,
     run_followup_plan_fingerprint,
     run_followup_plan_record_json_path,
     run_review_fingerprint,
     run_review_record_json_path,
     task_completion_fingerprint,
     task_completion_record_json_path,
+    validate_item_verifications_correspond_to_results,
     verification_fingerprint,
     verification_result_json_path,
 )
@@ -66,6 +72,15 @@ EVENT_TYPE_MANUAL_RUN_REVIEWED = "manual_run_reviewed"
 EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED = "manual_run_followup_planned"
 EVENT_TYPE_RUN_EXECUTION_REQUESTED = "run_execution_requested"
 EVENT_TYPE_RUN_EXECUTION_COMPLETED = "run_execution_completed"
+EVENT_TYPE_RUN_EXECUTION_VERIFIED = "run_execution_verified"
+EVENT_TYPE_RUN_EXECUTION_REJECTED = "run_execution_rejected"
+EVENT_TYPE_RUN_EXECUTION_NEEDS_CHANGES = "run_execution_needs_changes"
+
+_EXECUTION_VERIFICATION_EVENT_TYPES: dict[str, str] = {
+    EXECUTION_VERIFICATION_ACCEPTED: EVENT_TYPE_RUN_EXECUTION_VERIFIED,
+    EXECUTION_VERIFICATION_REJECTED: EVENT_TYPE_RUN_EXECUTION_REJECTED,
+    EXECUTION_VERIFICATION_NEEDS_CHANGES: EVENT_TYPE_RUN_EXECUTION_NEEDS_CHANGES,
+}
 
 EVENT_TYPES = frozenset(
     {
@@ -80,6 +95,9 @@ EVENT_TYPES = frozenset(
         EVENT_TYPE_MANUAL_RUN_FOLLOWUP_PLANNED,
         EVENT_TYPE_RUN_EXECUTION_REQUESTED,
         EVENT_TYPE_RUN_EXECUTION_COMPLETED,
+        EVENT_TYPE_RUN_EXECUTION_VERIFIED,
+        EVENT_TYPE_RUN_EXECUTION_REJECTED,
+        EVENT_TYPE_RUN_EXECUTION_NEEDS_CHANGES,
     }
 )
 
@@ -1518,3 +1536,180 @@ def execute_run_execution_request(
     atomic_write_json(execution_result_record_path, execution_result_record)
     append_run_event(run_id, candidate, base_dir)
     return execution_result_record
+
+
+def _execution_verification_event_type(verification_decision: str) -> str:
+    """Return the audit event type for *verification_decision*."""
+    return _EXECUTION_VERIFICATION_EVENT_TYPES[verification_decision]
+
+
+def _matches_run_execution_verification_replay(
+    existing: dict[str, Any],
+    *,
+    run_id: str,
+    actor: str,
+    verification_record: dict[str, Any],
+) -> bool:
+    """Return True when *existing* matches a successful verification replay."""
+    payload = existing.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    expected_event_type = _execution_verification_event_type(
+        verification_record["verification_decision"]
+    )
+    return (
+        existing.get("event_type") == expected_event_type
+        and existing.get("run_id") == run_id
+        and existing.get("actor") == actor
+        and payload.get("run_id") == run_id
+        and payload.get("reviewer") == verification_record["reviewer"]
+        and payload.get("verification_decision")
+        == verification_record["verification_decision"]
+        and payload.get("source_execution_result_fingerprint")
+        == verification_record["source_execution_result_fingerprint"]
+        and payload.get("run_execution_verification_fingerprint")
+        == run_execution_verification_fingerprint(verification_record)
+    )
+
+
+def verify_run_execution_result(
+    project_dir: Path | str,
+    run_id: str,
+    verification_record: dict[str, Any],
+    actor: str,
+    *,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Record a manual verification decision for a completed execution result.
+
+    The verification record is reviewer-provided; this API validates, stores,
+    and audits the decision without executing work or mutating prior records.
+    """
+    validate_id(run_id, "run")
+    validate_schema(verification_record, "run_execution_verification_record")
+    if verification_record["run_id"] != run_id:
+        raise ValueError(
+            "verification_record run_id does not match submission target"
+        )
+    if not isinstance(actor, str) or not actor:
+        raise ValueError("actor must be a non-empty string")
+
+    submitted_fingerprint = run_execution_verification_fingerprint(verification_record)
+    base_dir = Path(project_dir)
+    verification_record_path = run_execution_verification_record_json_path(
+        run_id, base_dir
+    )
+    execution_result_record_path = run_execution_result_record_json_path(
+        run_id, base_dir
+    )
+    execution_request_record_path = run_execution_request_record_json_path(
+        run_id, base_dir
+    )
+    followup_plan_record_path = run_followup_plan_record_json_path(run_id, base_dir)
+    completion_record_path = run_completion_record_json_path(run_id, base_dir)
+    review_record_path = run_review_record_json_path(run_id, base_dir)
+    manifest_path = paths.run_manifest_path(run_id, base_dir)
+
+    if not manifest_path.exists():
+        raise InvalidTransition(f"run {run_id!r} is not completed")
+
+    current_run_manifest = read_json(manifest_path)
+    if current_run_manifest["status"] != RUN_COMPLETED:
+        raise InvalidTransition(
+            f"run {run_id!r} is not completed; "
+            f"status is {current_run_manifest['status']!r}"
+        )
+
+    if not completion_record_path.exists():
+        raise InvalidTransition("run_completion_record.json is missing")
+
+    if not review_record_path.exists():
+        raise InvalidTransition("run_review_record.json is missing")
+
+    if not followup_plan_record_path.exists():
+        raise InvalidTransition("run_followup_plan_record.json is missing")
+
+    if not execution_request_record_path.exists():
+        raise InvalidTransition("run_execution_request_record.json is missing")
+
+    if not execution_result_record_path.exists():
+        raise InvalidTransition("run_execution_result_record.json is missing")
+
+    stored_execution_result_record = read_json(execution_result_record_path)
+    validate_schema(stored_execution_result_record, "run_execution_result_record")
+    expected_result_fingerprint = run_execution_result_fingerprint(
+        stored_execution_result_record
+    )
+    if (
+        verification_record["source_execution_result_fingerprint"]
+        != expected_result_fingerprint
+    ):
+        raise InvalidTransition(
+            "source_execution_result_fingerprint does not match "
+            "run_execution_result_record"
+        )
+
+    try:
+        validate_item_verifications_correspond_to_results(
+            verification_record["item_verifications"],
+            stored_execution_result_record["item_results"],
+        )
+    except ValueError as exc:
+        raise InvalidTransition(str(exc)) from exc
+
+    if verification_record_path.exists():
+        existing_verification_record = read_json(verification_record_path)
+        validate_schema(
+            existing_verification_record, "run_execution_verification_record"
+        )
+        if event_id is None:
+            raise InvalidTransition(
+                "run_execution_verification_record.json already exists"
+            )
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise InvalidTransition(
+                "run_execution_verification_record.json already exists"
+            )
+        if _matches_run_execution_verification_replay(
+            existing_event,
+            run_id=run_id,
+            actor=actor,
+            verification_record=verification_record,
+        ):
+            return existing_verification_record
+        if existing_event.get("event_type") in _EXECUTION_VERIFICATION_EVENT_TYPES.values():
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise InvalidTransition(
+            "run_execution_verification_record.json already exists"
+        )
+
+    event_type = _execution_verification_event_type(
+        verification_record["verification_decision"]
+    )
+    candidate = make_run_event(
+        event_type=event_type,
+        run_id=run_id,
+        actor=actor,
+        payload={
+            "run_id": run_id,
+            "reviewer": verification_record["reviewer"],
+            "verification_decision": verification_record["verification_decision"],
+            "source_execution_result_fingerprint": verification_record[
+                "source_execution_result_fingerprint"
+            ],
+            "run_execution_verification_fingerprint": submitted_fingerprint,
+            "run_execution_verification_record_path": str(verification_record_path),
+        },
+        event_id=event_id,
+    )
+    existing = _resolve_idempotent_event(run_id, candidate, base_dir)
+    if existing is not None:
+        return verification_record
+
+    ensure_dir(verification_record_path.parent)
+    atomic_write_json(verification_record_path, verification_record)
+    append_run_event(run_id, candidate, base_dir)
+    return verification_record

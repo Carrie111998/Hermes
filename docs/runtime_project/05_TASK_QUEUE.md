@@ -1,50 +1,49 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-18 (Task 10 completed by Cursor)
+**Last updated:** 2026-07-18 (Task 11 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect acceptance for Task 10.
+None — awaiting Architect acceptance for Task 11.
 
 ---
 
 ## Completed
 
-### Task 10 — Controlled One-Shot Execution Adapter
+### Task 11 — Manual Verification Gate for Execution Results
 
 **Status:** ✅ Completed  
-**Tests:** `python3 -m pytest tests/htr/ -v` → **488 passed**
+**Tests:** `python3 -m pytest tests/htr/ -v` → **559 passed**
 
 Changes:
 
-- `run_execution_result_record` contract + schema validation
-- `make_run_execution_result_record`, `run_execution_result_fingerprint`
-- `process_execution_items`, `compute_execution_result_status`
-- `execute_run_execution_request()` — manually triggered one-shot adapter
-- Requires completed run + completion/review/follow-up plan/execution request records
-- `request_status` must be `pending`; fingerprints must match on-disk records
-- Writes `run_execution_result_record.json`, appends `run_execution_completed` event
-- **Command dict is data, not executable code** — no subprocess, HTTP, browser, or docs mutation
-- `manual_open_link` → human-action instruction output (skipped)
-- `update_documentation` → proposed update output (skipped)
-- `rerun_task` / `regenerate_output` / `external_action` → unsupported
+- `run_execution_verification_record` contract + schema validation
+- `make_run_execution_verification_record`, `run_execution_verification_fingerprint`
+- `validate_item_verifications_correspond_to_results`
+- `verify_run_execution_result()` — manual reviewer-provided verification gate
+- Requires full run chain through execution result record
+- `item_verifications` must correspond to `item_results`
+- Decision consistency: accepted / rejected / needs_changes rules enforced
+- Writes `run_execution_verification_record.json`
+- Appends `run_execution_verified`, `run_execution_rejected`, or `run_execution_needs_changes` event
+- **Records reviewer decision only** — no execution, no prior record mutation
 - Does **not** update `run_manifest`, `task_status`, or `attempt_status`
 
-### Task 9 — Review-Gated Execution Request API
+### Task 10 — Controlled One-Shot Execution Adapter
 
 **Status:** ✅ Accepted
 
-### Task 8 / Task 7 / Task 0–6
+### Task 9 / Task 8 / Task 0–7
 
-**Status:** ✅ Accepted (regression verified in 488-test suite)
+**Status:** ✅ Accepted (regression verified in 559-test suite)
 
 ---
 
 ## Next Task (Architect)
 
-Task 11 — not started. Await scope assignment.
+Task 12 — not started. Await scope assignment.
 
 ---
 
