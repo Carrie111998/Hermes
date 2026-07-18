@@ -27,7 +27,7 @@ from .characterize import (
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
 from .claude_registrar import ClaudeNativeRegistrar
-from .claude_visibility import (
+from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
 )

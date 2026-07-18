@@ -8,6 +8,11 @@ import math
 import uuid
 from typing import Literal
 
+from .claude_visibility_codes import (
+    CLAUDE_VISIBILITY_ERROR_CODES,
+    CLAUDE_VISIBILITY_FATAL_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
+)
 from .models import (
     BridgeMarkerPayload,
     OriginKind,
@@ -37,34 +42,6 @@ CLAUDE_VISIBILITY_EXCLUSION_CODES = frozenset({
     "no_meaningful_request",
     "unstable_identity",
 })
-CLAUDE_VISIBILITY_RETRY_CODES = frozenset({
-    "claude_executable_unavailable",
-    "claude_authentication_unavailable",
-    "desktop_unavailable",
-    "pty_unavailable",
-    "native_transcript_not_indexed",
-    "clean_exit_not_observed",
-    "session_bridge_unavailable",
-    "creation_ambiguous",
-    "lease_expired",
-})
-CLAUDE_VISIBILITY_FATAL_CODES = frozenset({
-    "uuid_conflict",
-    "source_conflict",
-    "bridge_conflict",
-    "provider_conflict",
-    "cwd_conflict",
-    "name_conflict",
-    "marker_conflict",
-    "duplicate_uuid",
-    "duplicate_identity",
-    "max_attempts_exhausted",
-    "unknown_error_code",
-})
-CLAUDE_VISIBILITY_ERROR_CODES = (
-    CLAUDE_VISIBILITY_RETRY_CODES | CLAUDE_VISIBILITY_FATAL_CODES
-)
-
 _ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready"})
 _CONTROLS = frozenset({
     "resume",

@@ -18,6 +18,9 @@ from session_bridge.claude_visibility import (
     ClaudeVisibilityIdentity,
     derive_claude_visibility_identity,
 )
+from session_bridge.claude_visibility_codes import (
+    CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES,
+)
 from session_bridge.mirror import (
     DiscoveryMode,
     EligibilityContext,
@@ -5674,9 +5677,11 @@ def test_claude_visibility_cycle_status_is_durable_and_preserves_last_empty(
         status="no_due_job", error_code=None, registrar_result=False
     )
     first = store.claude_visibility_status(100.0)
+    candidate, identity = _claude_visibility_identity("future-work")
+    _enqueue_claude_visibility_job(store, candidate, identity)
     clock[0] = 200.0
     store.record_claude_visibility_cycle(
-        status="daily_limit", error_code=None, registrar_result=False
+        status="no_due_job", error_code=None, registrar_result=False
     )
     restarted = SessionBridgeStore(db, clock=lambda: 300.0, local_timezone=timezone.utc)
     second = restarted.claude_visibility_status(300.0)
@@ -5685,11 +5690,145 @@ def test_claude_visibility_cycle_status_is_durable_and_preserves_last_empty(
     assert second["last_cycle"] == {
         "tracked": True,
         "value": {
-            "at": 200.0, "sequence": 2, "status": "daily_limit",
-            "error_code": None,
+            "at": 200.0, "sequence": 2, "status": "no_due_job",
+            "error_code": None, "empty_verified": False,
         },
     }
     assert second["last_registrar_result"] == {"tracked": False, "value": None}
+
+
+@pytest.mark.parametrize(
+    "job_state",
+    ("claude_pending", "claude_retry", "claude_leased", "claude_failed", "unknown"),
+)
+def test_no_due_cycle_does_not_advance_empty_with_open_or_fatal_work(
+    db: SessionDB,
+    job_state: str,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity(f"not-empty-{job_state}")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    if job_state == "claude_leased":
+        store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 5)
+    else:
+        with db._lock:
+            assert db._conn is not None
+            if job_state == "unknown":
+                db._conn.execute("PRAGMA ignore_check_constraints = ON")
+                db._conn.execute(
+                    "UPDATE session_claude_visibility_jobs SET state = 'future_state'"
+                )
+                db._conn.execute("PRAGMA ignore_check_constraints = OFF")
+            elif job_state == "claude_retry":
+                db._conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_retry', next_attempt_at = 999,
+                           error_code = 'lease_expired'"""
+                )
+            elif job_state == "claude_failed":
+                db._conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_failed', error_code = 'source_conflict'"""
+                )
+            db._conn.commit()
+
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+
+    status = store.claude_visibility_status(100.0)
+    assert status["last_cycle"]["value"]["empty_verified"] is False
+    assert status["last_empty_cycle"] == {"tracked": False, "value": None}
+
+
+@pytest.mark.parametrize("visible_only", (False, True))
+def test_no_due_cycle_advances_empty_for_zero_or_visible_only_rows(
+    db: SessionDB,
+    visible_only: bool,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    if visible_only:
+        candidate, identity = _claude_visibility_identity("visible-empty")
+        _enqueue_claude_visibility_job(store, candidate, identity)
+        claim = store.claim_claude_visibility_job(
+            100.0, 60, 25, "1.00", "0.02", 5
+        )
+        store.commit_claude_visibility_job(
+            identity.job_id, claim.lease_digest, "digest", 100.0
+        )
+
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+
+    status = store.claude_visibility_status(100.0)
+    assert status["last_cycle"]["value"]["empty_verified"] is True
+    assert status["last_empty_cycle"] == {"tracked": True, "value": 100.0}
+
+
+def test_later_no_due_cycle_advances_empty_after_work_clears(db: SessionDB) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("cleared-work")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 5)
+    store.commit_claude_visibility_job(
+        identity.job_id, claim.lease_digest, "digest", 100.0
+    )
+    clock[0] = 200.0
+
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+
+    assert store.claude_visibility_status(200.0)["last_empty_cycle"] == {
+        "tracked": True, "value": 200.0,
+    }
+
+
+def test_cycle_empty_verification_serializes_after_concurrent_insert(tmp_path) -> None:
+    path = tmp_path / "claude-empty-insert-race.db"
+    seed = SessionDB(path)
+    seed.close()
+    insert_db, record_db = SessionDB(path), SessionDB(path)
+    try:
+        insert_store = SessionBridgeStore(
+            insert_db, clock=lambda: 100.0, local_timezone=timezone.utc
+        )
+        record_store = SessionBridgeStore(
+            record_db, clock=lambda: 100.0, local_timezone=timezone.utc
+        )
+        candidate, identity = _claude_visibility_identity("empty-race")
+        inserted = Event()
+        release = Event()
+
+        def insert_while_locked(conn):
+            insert_store._insert_claude_visibility_job(
+                conn, candidate, identity, _CLAUDE_MARKER_SECRET, 100.0
+            )
+            inserted.set()
+            assert release.wait(timeout=10)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            insertion = executor.submit(insert_db._execute_write, insert_while_locked)
+            assert inserted.wait(timeout=10)
+            recording = executor.submit(
+                record_store.record_claude_visibility_cycle,
+                status="no_due_job", error_code=None, registrar_result=False,
+            )
+            release.set()
+            insertion.result(timeout=10)
+            recording.result(timeout=10)
+
+        status = record_store.claude_visibility_status(100.0)
+        assert status["last_cycle"]["value"]["empty_verified"] is False
+        assert status["last_empty_cycle"] == {"tracked": False, "value": None}
+    finally:
+        insert_db.close()
+        record_db.close()
 
 
 def test_claude_visibility_cycle_status_sanitizes_error_code(db: SessionDB) -> None:
@@ -5700,6 +5839,29 @@ def test_claude_visibility_cycle_status_sanitizes_error_code(db: SessionDB) -> N
     status = store.claude_visibility_status(100.0)
     assert status["last_cycle"]["value"]["error_code"] == "unknown_error_code"
     assert "secret" not in repr(status)
+
+
+def test_claude_visibility_public_cycle_error_codes_round_trip(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    assert {
+        "inventory_invalid", "enqueue_failed", "invalid_visibility_status",
+        "unknown_retry_code",
+    } <= CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES
+
+    for error_code in sorted(CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES):
+        store.record_claude_visibility_cycle(
+            status="degraded", error_code=error_code, registrar_result=False
+        )
+        assert (
+            store.claude_visibility_status(clock[0])["last_cycle"]["value"][
+                "error_code"
+            ]
+            == error_code
+        )
+        clock[0] += 1
 
 
 def test_claude_visibility_concurrent_cycles_use_transactional_sequence(tmp_path) -> None:

@@ -802,7 +802,7 @@ def test_claude_visibility_status_exposes_durable_cycle_tracking(
         "tracked": True,
         "value": {
             "at": 100.0, "sequence": 1, "status": "no_due_job",
-            "error_code": None,
+            "error_code": None, "empty_verified": True,
         },
     }
 

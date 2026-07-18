@@ -16,14 +16,16 @@ import uuid
 from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
 from .claude_visibility import (
     CLAUDE_VISIBILITY_EXCLUSION_CODES,
-    CLAUDE_VISIBILITY_FATAL_CODES,
-    CLAUDE_VISIBILITY_RETRY_CODES,
     ClaudeVisibilityCandidate,
     ClaudeVisibilityClaim,
     ClaudeVisibilityIdentity,
     build_claude_visibility_candidate,
     derive_claude_visibility_identity,
     evaluate_claude_visibility,
+)
+from .claude_visibility_codes import (
+    CLAUDE_VISIBILITY_FATAL_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
 )
 from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig

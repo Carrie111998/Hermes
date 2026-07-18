@@ -27,6 +27,11 @@ else:
 
 from hermes_state import SessionDB
 
+from .claude_visibility_codes import (
+    CLAUDE_VISIBILITY_FATAL_CODES,
+    CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES,
+    CLAUDE_VISIBILITY_RETRY_CODES,
+)
 from .models import (
     ContextPack,
     MirrorJobState,
@@ -471,8 +476,6 @@ class SessionBridgeStore:
         self, items: Sequence[tuple[Any, Any]], marker_secret: bytes
     ) -> dict[str, Any]:
         from .claude_visibility import (
-            CLAUDE_VISIBILITY_FATAL_CODES,
-            CLAUDE_VISIBILITY_RETRY_CODES,
             ClaudeVisibilityCandidate,
             ClaudeVisibilityIdentity,
             validate_claude_visibility_identity_binding,
@@ -1276,16 +1279,9 @@ class SessionBridgeStore:
         if error_code is None:
             safe_error = None
         else:
-            from .claude_visibility import CLAUDE_VISIBILITY_ERROR_CODES
-
             safe_error = (
                 error_code
-                if error_code in CLAUDE_VISIBILITY_ERROR_CODES
-                or error_code in {
-                    "claim_failed", "provider_degraded", "registrar_failed",
-                    "unknown_claim_status", "unknown_job_state",
-                    "unknown_registrar_error_code", "unknown_registrar_status",
-                }
+                if error_code in CLAUDE_VISIBILITY_PUBLIC_RESULT_ERROR_CODES
                 else "unknown_error_code"
             )
         if not isinstance(registrar_result, bool):
@@ -1301,17 +1297,32 @@ class SessionBridgeStore:
                 row["value_json"] if row is not None else None
             )
             sequence = int(previous.get("sequence", 0)) + 1
+            empty_verified = False
+            if safe_status == "no_due_job":
+                state_rows = conn.execute(
+                    """SELECT state, COUNT(*) AS count
+                       FROM session_claude_visibility_jobs GROUP BY state"""
+                ).fetchall()
+                empty_verified = all(
+                    state_row["state"] == "claude_visible"
+                    and int(state_row["count"]) >= 1
+                    for state_row in state_rows
+                )
             value: dict[str, Any] = {
                 "version": 1,
                 "sequence": sequence,
                 "last_cycle_at": recorded_at,
-                "last_result": {"status": safe_status, "error_code": safe_error},
+                "last_result": {
+                    "status": safe_status,
+                    "error_code": safe_error,
+                    "empty_verified": empty_verified,
+                },
             }
             if "last_empty_cycle_at" in previous:
                 value["last_empty_cycle_at"] = previous["last_empty_cycle_at"]
             if "last_registrar_result" in previous:
                 value["last_registrar_result"] = previous["last_registrar_result"]
-            if safe_status == "no_due_job":
+            if empty_verified:
                 value["last_empty_cycle_at"] = recorded_at
             if registrar_result:
                 value["last_registrar_result"] = {
@@ -6008,13 +6019,22 @@ def _decode_claude_visibility_cycle_state(value_json: Any) -> dict[str, Any]:
         return {}
     status = _claude_status_token(last_result.get("status"))
     error_code = _claude_status_token(last_result.get("error_code"), optional=True)
-    if status in {None, "invalid", "redacted"} or error_code in {"invalid", "redacted"}:
+    empty_verified = last_result.get("empty_verified", False)
+    if (
+        status in {None, "invalid", "redacted"}
+        or error_code in {"invalid", "redacted"}
+        or not isinstance(empty_verified, bool)
+    ):
         return {}
     decoded: dict[str, Any] = {
         "version": 1,
         "sequence": sequence,
         "last_cycle_at": float(last_cycle_at),
-        "last_result": {"status": status, "error_code": error_code},
+        "last_result": {
+            "status": status,
+            "error_code": error_code,
+            "empty_verified": empty_verified,
+        },
     }
     empty_at = value.get("last_empty_cycle_at")
     if (
@@ -6068,6 +6088,7 @@ def _public_claude_visibility_cycle_state(
                 "sequence": cycle["sequence"],
                 "status": last_result["status"],
                 "error_code": last_result["error_code"],
+                "empty_verified": last_result["empty_verified"],
             },
         },
         "last_empty_cycle": {
