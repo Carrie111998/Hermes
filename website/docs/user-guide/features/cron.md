@@ -330,6 +330,7 @@ By default (`cron.wrap_response: true`), delivered cron output includes a proven
 
 ```
 Cronjob Response: Morning feeds
+(job_id: abc123)
 -------------
 
 <agent output here>
