@@ -16,7 +16,7 @@ from session_bridge.characterize import (
     run_live_characterization,
     write_characterization_report,
 )
-from session_bridge.cli import ConfigurationFailure, ProductionBackend
+from session_bridge.cli import ConfigurationFailure, ProductionBackend, main
 from session_bridge.config import BridgeConfig
 
 
@@ -124,14 +124,54 @@ def test_characterization_defaults_follow_active_hermes_home(
     assert gate.report_path == report_path
 
 
+@pytest.mark.parametrize("gate_value", (None, "", "0", "true"))
 def test_claude_visibility_live_characterization_uses_existing_gate(
     monkeypatch: pytest.MonkeyPatch,
+    gate_value: str | None,
 ) -> None:
-    monkeypatch.delenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", raising=False)
+    if gate_value is None:
+        monkeypatch.delenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", gate_value)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda _name: (_ for _ in ()).throw(
+            AssertionError("blocked characterization must not launch Claude")
+        ),
+    )
     backend = ProductionBackend(BridgeConfig())
 
     with pytest.raises(ConfigurationFailure, match="live_characterization_not_enabled"):
         backend.characterize_claude_visibility()
+
+
+def test_live_characterization_gate_survives_cli_config_composition_without_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"session_bridge": {}})
+    calls: list[str] = []
+    loaded: list[BridgeConfig] = []
+
+    backend = SimpleNamespace(
+        characterize_claude_visibility=lambda: (
+            calls.append("characterize") or {"status": "composed"}
+        ),
+        close=lambda: None,
+    )
+
+    exit_code = main(
+        ["characterize-claude-visibility", "--json"],
+        config_loader=lambda: BridgeConfig.load(path=tmp_path / "missing.toml"),
+        backend_factory=lambda config: loaded.append(config) or backend,
+    )
+
+    assert exit_code == 0
+    assert calls == ["characterize"]
+    assert loaded == [BridgeConfig()]
+    assert json.loads(capsys.readouterr().out) == {"status": "composed"}
 
 
 def test_claude_visibility_cleanup_bypasses_auth_idle_store_and_registrar(

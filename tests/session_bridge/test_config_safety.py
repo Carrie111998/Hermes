@@ -128,6 +128,24 @@ def test_mcp_token_is_whitelisted_but_not_persisted_in_config(
     assert not hasattr(config, "token")
 
 
+def test_live_characterization_gate_is_allowlisted_but_not_persisted_in_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: deepcopy(DEFAULT_CONFIG),
+    )
+
+    config = _load(
+        tmp_path / "missing.toml",
+        environ={"HERMES_SESSION_BRIDGE_LIVE_TESTS": "1"},
+    )
+
+    assert config == BridgeConfig()
+    assert not hasattr(config, "live_tests")
+
+
 _SIDEBAR_DEFAULTS = {
     "enabled": False,
     "continuous": False,

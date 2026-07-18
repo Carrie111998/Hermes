@@ -35,6 +35,9 @@ _ENV_NAMES = frozenset({
         "TOKEN",
     )
 })
+_LIVE_CHARACTERIZATION_ENV_NAMES = frozenset({
+    f"{_ENV_PREFIX}LIVE_TESTS",
+})
 _Result = TypeVar("_Result")
 
 
@@ -112,7 +115,9 @@ class BridgeConfig:
         unknown_environment = sorted(
             name
             for name in environment
-            if name.startswith(_ENV_PREFIX) and name not in _ENV_NAMES
+            if name.startswith(_ENV_PREFIX)
+            and name not in _ENV_NAMES
+            and name not in _LIVE_CHARACTERIZATION_ENV_NAMES
         )
         if unknown_environment:
             raise ValueError(
