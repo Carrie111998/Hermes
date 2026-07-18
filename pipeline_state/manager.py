@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_PATH = Path.home() / ".hermes" / "workspaces" / "tracker" / "pipeline.json"
 
+# Bounded retry for the atomic replace in _write_atomic(). On Windows a
+# concurrent lock-free reader makes os.replace() fail transiently with
+# WinError 5; total worst-case wait is 20+40+60+80 = 200ms across 5 attempts.
+_REPLACE_MAX_ATTEMPTS = 5
+_REPLACE_BACKOFF_SECONDS = 0.02
+
 
 # Lazy-cached EventBus singleton — loaded once per process. Used by
 # update_stage() to emit STAGE_TRANSITION events without forcing every
@@ -210,16 +216,36 @@ class PipelineManager:
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp, self.path)
+        # Windows: os.replace() (MoveFileEx REPLACE_EXISTING) fails with
+        # PermissionError WinError 5 (ACCESS_DENIED) if ANY process has the
+        # destination open for read at this instant, because CPython opens
+        # files without FILE_SHARE_DELETE. Our readers (_read/get_job/
+        # list_jobs/stats) are lock-free by design, and cross-process readers
+        # (Control Center :9120, JobFlow dashboard :3001) poll this file, so
+        # the sub-millisecond replace window genuinely collides in production
+        # (observed 2026-07-17: intent-applier dead-letters). The collision is
+        # transient — a short bounded retry absorbs it. POSIX rename never
+        # hits this (inode swap), so the retry is a no-op there.
+        for attempt in range(_REPLACE_MAX_ATTEMPTS):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except PermissionError:
+                if attempt == _REPLACE_MAX_ATTEMPTS - 1:
+                    raise
+                time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
 
     # -- public API -----------------------------------------------------------
 
     def get_job(self, job_id: str) -> Optional[dict]:
         """Return the job record (by job_id, then by url if job_id doesn't match).
 
-        Read is lock-free — readers are fine racing writers since the atomic
-        rename guarantees they see either the previous valid state or the new
-        valid state, never a partial file.
+        Read is lock-free: a reader sees either the previous valid state or the
+        new one, never a partial file. But NOTE the Windows caveat — a live read
+        handle blocks the writer's os.replace (CPython opens without
+        FILE_SHARE_DELETE), so a lock-free read here can make a concurrent
+        _write_atomic fail with WinError 5. _write_atomic absorbs that with a
+        bounded retry; do not "fix" this by asserting readers never interfere.
         """
         data = self._read()
         for j in data.get("jobs", []) or []:
