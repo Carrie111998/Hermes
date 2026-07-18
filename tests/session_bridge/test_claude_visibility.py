@@ -162,6 +162,100 @@ def test_injected_internal_events_plus_context_only_retry_are_not_eligible() -> 
 @pytest.mark.parametrize(
     "content",
     [
+        "<recommended_plugins>\nPlugin catalog injected by Codex",
+        "# AGENTS.md instructions for C:/work/project\n\n<INSTRUCTIONS>rules",
+        "<skill>\n<name>session-sidebar-sync</name>\ninjected skill body",
+    ],
+)
+def test_codex_injected_context_is_not_a_meaningful_user_request(
+    content: str,
+) -> None:
+    assert (
+        evaluate_claude_visibility(_projection(Provider.CODEX, content=content))
+        == "no_meaningful_request"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        (
+            "Automation: Session Sidebar Sync Canary\n"
+            "Automation ID: session-sidebar-sync-canary\n"
+            "Automation memory: $CODEX_HOME/automations/canary/memory.md\n"
+            "Last run: never\n\nInvoke the worker exactly once."
+        ),
+        (
+            "<heartbeat>\n"
+            "  <automation_id>session-sidebar-backfill-rollout</automation_id>\n"
+            "  <instructions>Continue the rollout.</instructions>\n"
+            "</heartbeat>"
+        ),
+    ],
+)
+def test_codex_automation_envelopes_are_structurally_excluded(content: str) -> None:
+    assert (
+        evaluate_claude_visibility(_projection(Provider.CODEX, content=content))
+        == "automation_only"
+    )
+
+
+def test_legacy_codex_bridge_registration_is_excluded_even_after_key_rotation() -> None:
+    projection = replace(
+        _projection(Provider.CODEX),
+        messages=(
+            ProjectedMessage(
+                "registration",
+                0,
+                "user",
+                (
+                    "Hermes Session Bridge registration only. "
+                    "Hermes Session Bridge placeholder.\n"
+                    "Signed marker: HERMES_SESSION_BRIDGE_V1:retired.signature\n"
+                    "Canonical source session: claude:source-1"
+                ),
+                11.0,
+            ),
+            ProjectedMessage(
+                "characterization",
+                1,
+                "user",
+                "Hermes Bridge live characterization verification. Reply READY.",
+                12.0,
+            ),
+        ),
+    )
+
+    assert evaluate_claude_visibility(projection) == "bridge_placeholder"
+
+
+def test_codex_injected_context_does_not_hide_a_real_user_request() -> None:
+    projection = replace(
+        _projection(Provider.CODEX),
+        messages=(
+            ProjectedMessage(
+                "plugins",
+                0,
+                "user",
+                "<recommended_plugins>\nPlugin catalog injected by Codex",
+                11.0,
+            ),
+            ProjectedMessage(
+                "request",
+                1,
+                "user",
+                "Repair the failing production deployment",
+                12.0,
+            ),
+        ),
+    )
+
+    assert evaluate_claude_visibility(projection) == "eligible"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
         (
             " [System: The active model for this chat has changed to model-x via "
             "provider provider-y.]"

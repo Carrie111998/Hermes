@@ -60,6 +60,16 @@ _CONTROLS = frozenset({
 })
 _MAX_PROMPT_CHARS = 8192
 _MAX_METADATA_CHARS = 4096
+_CODEX_INJECTED_USER_PREFIXES = (
+    "<recommended_plugins>\n",
+    "# AGENTS.md instructions for ",
+    "<skill>\n",
+)
+_LEGACY_CODEX_REGISTRATION_PREFIX = (
+    "Hermes Session Bridge registration only. "
+    "Hermes Session Bridge placeholder.\n"
+    "Signed marker: HERMES_SESSION_BRIDGE_V1:"
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +148,18 @@ def evaluate_claude_visibility(
     user_contents = tuple(
         message.content for message in projection.messages if message.role == "user"
     )
+    if projection.provider is Provider.CODEX:
+        if any(
+            _is_legacy_codex_registration(content) for content in user_contents
+        ):
+            return "bridge_placeholder"
+        if any(_is_codex_automation_envelope(content) for content in user_contents):
+            return "automation_only"
+        user_contents = tuple(
+            content
+            for content in user_contents
+            if not _is_codex_injected_context(content)
+        )
     normalized_user_texts = tuple(
         normalized
         for content in user_contents
@@ -177,9 +199,9 @@ def build_claude_visibility_candidate(
     timestamp = _finite_float(eligible_at, "eligible_at")
     source_cwd = _required_metadata(projection.cwd, "source cwd")
     first_request = next(
-        message.content
-        for message in projection.messages
-        if message.role == "user" and is_meaningful_user_text(message.content)
+        content
+        for content in _visibility_user_contents(projection)
+        if is_meaningful_user_text(content)
     )
     if not isinstance(first_request, str):
         raise ValueError("Claude visibility request text must be a string")
@@ -201,6 +223,46 @@ def build_claude_visibility_candidate(
         git_head=_optional_metadata(git_head, "git head"),
         worktree_id=_optional_metadata(worktree_id, "worktree id"),
         eligible_at=timestamp,
+    )
+
+
+def _visibility_user_contents(projection: SessionProjection) -> tuple[str, ...]:
+    contents = tuple(
+        message.content
+        for message in projection.messages
+        if message.role == "user" and isinstance(message.content, str)
+    )
+    if projection.provider is not Provider.CODEX:
+        return contents
+    return tuple(
+        content for content in contents if not _is_codex_injected_context(content)
+    )
+
+
+def _is_codex_injected_context(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(_CODEX_INJECTED_USER_PREFIXES)
+
+
+def _is_codex_automation_envelope(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value.startswith("<heartbeat>\n"):
+        return (
+            "<automation_id>" in value
+            and "<instructions>" in value
+            and value.endswith("</heartbeat>")
+        )
+    return (
+        value.startswith("Automation: ")
+        and "\nAutomation ID: " in value
+        and "\nAutomation memory: " in value
+        and "\nLast run: " in value
+    )
+
+
+def _is_legacy_codex_registration(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(
+        _LEGACY_CODEX_REGISTRATION_PREFIX
     )
 
 
