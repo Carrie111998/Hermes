@@ -10,10 +10,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
+
+# Bounded retry for the atomic replace in save_state(). On Windows a concurrent
+# lock-free reader makes os.replace() fail transiently with PermissionError
+# WinError 5, because CPython opens files without FILE_SHARE_DELETE; total
+# worst-case wait is 20+40+60+80 = 200ms across 5 attempts. Mirrors the same
+# fix in pipeline_state.manager._write_atomic (see that module for full detail).
+# POSIX rename swaps inodes and never hits this, so the retry is a no-op there.
+_REPLACE_MAX_ATTEMPTS = 5
+_REPLACE_BACKOFF_SECONDS = 0.02
 
 
 def load_state(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
@@ -35,4 +45,13 @@ def save_state(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp_path, path)
+    # Bounded retry absorbs the transient Windows WinError 5 reader/writer race
+    # on the replace (see _REPLACE_MAX_ATTEMPTS note above).
+    for attempt in range(_REPLACE_MAX_ATTEMPTS):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
