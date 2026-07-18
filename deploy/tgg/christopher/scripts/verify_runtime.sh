@@ -69,7 +69,16 @@ home = pathlib.Path(sys.argv[2])
 deploy = app / "deploy/tgg/christopher"
 runtime = home / "runtime"
 slot = (runtime / "engine-slot").read_text().strip()
-assert slot in {"gpt-5.4-mini", "gpt-5.6-luna"}, slot
+# slot id -> model. gpt-5.6-luna-low runs gpt-5.6-luna at reasoning_effort low.
+SLOT_MODELS = {
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-luna-low": "gpt-5.6-luna",
+}
+SLOT_REASONING_EFFORT = {"gpt-5.6-luna-low": "low"}
+assert slot in SLOT_MODELS, slot
+slot_model = SLOT_MODELS[slot]
+slot_effort = SLOT_REASONING_EFFORT.get(slot)
 
 expected = {}
 for line in (deploy / "runtime-slots/SHA256SUMS").read_text().splitlines():
@@ -85,8 +94,12 @@ assert config["pa"]["enabled"] is False
 assert config["group_sessions_per_user"] is False
 assert config["platforms"]["whatsapp"]["enabled"] is False
 assert config["model"]["provider"] == "openai-direct-primary"
-assert config["model"]["default"] == slot
-assert constitution["runtime"] == {"provider": "openai-direct-primary", "model": slot}
+assert config["model"]["default"] == slot_model
+if slot_effort is None:
+    assert "reasoning_effort" not in config["agent"]
+else:
+    assert config["agent"]["reasoning_effort"] == slot_effort
+assert constitution["runtime"] == {"provider": "openai-direct-primary", "model": slot_model}
 
 gate = json.loads((runtime / "processing-gate.json").read_text())
 assert gate["enabled"] is False
@@ -144,7 +157,8 @@ print(json.dumps({
     "quick_verify": "pass",
     "slot": slot,
     "provider": "openai-direct-primary",
-    "model": slot,
+    "model": slot_model,
+    "reasoning_effort": slot_effort,
     "config_sha256": sha(home / "config.yaml"),
     "constitution_sha256": sha(home / "christopher_tgg_constitution.yaml"),
     "production_turns_after_disabled_boundary": production_turns,

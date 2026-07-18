@@ -16,7 +16,14 @@ from pathlib import Path
 import yaml
 
 
-ALLOWED_SLOTS = ("gpt-5.4-mini", "gpt-5.6-luna")
+# slot id -> model. gpt-5.6-luna-low runs gpt-5.6-luna at reasoning_effort low.
+SLOT_MODELS = {
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-luna-low": "gpt-5.6-luna",
+}
+SLOT_REASONING_EFFORT = {"gpt-5.6-luna-low": "low"}
+ALLOWED_SLOTS = tuple(SLOT_MODELS)
 DEFAULT_SLOT = ALLOWED_SLOTS[0]
 
 
@@ -67,7 +74,9 @@ def _select_slot(slot_file: Path, requested: str | None) -> str:
     return selected
 
 
-def _validate_slot(slot_root: Path, model: str) -> None:
+def _validate_slot(slot_root: Path, slot: str) -> None:
+    model = SLOT_MODELS[slot]
+    effort = SLOT_REASONING_EFFORT.get(slot)
     config = yaml.safe_load((slot_root / "config.yaml").read_text(encoding="utf-8"))
     constitution = yaml.safe_load(
         (slot_root / "christopher_tgg_constitution.yaml").read_text(encoding="utf-8")
@@ -77,6 +86,10 @@ def _validate_slot(slot_root: Path, model: str) -> None:
     assert config["platforms"]["whatsapp"]["enabled"] is False
     assert config["model"]["provider"] == "openai-direct-primary"
     assert config["model"]["default"] == model
+    if effort is None:
+        assert "reasoning_effort" not in config["agent"]
+    else:
+        assert config["agent"]["reasoning_effort"] == effort
     assert constitution["runtime"] == {
         "provider": "openai-direct-primary",
         "model": model,
@@ -137,7 +150,8 @@ def main() -> int:
         "selected_at": datetime.now(timezone.utc).isoformat(),
         "slot": selected,
         "provider": "openai-direct-primary",
-        "model": selected,
+        "model": SLOT_MODELS[selected],
+        "reasoning_effort": SLOT_REASONING_EFFORT.get(selected),
         "config_sha256": _sha256(hermes_home / "config.yaml"),
         "constitution_sha256": _sha256(
             hermes_home / "christopher_tgg_constitution.yaml"

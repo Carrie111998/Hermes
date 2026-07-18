@@ -130,6 +130,35 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 20
+          tgg_clarification_raise:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/clarifications
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_attention_raise:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/attention-items
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_case_wc_attach:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/work-costings
+            path_params:
+            - jobNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
           agent_config_read:
             type: http
             tenant: tgg
@@ -265,3 +294,6 @@ providers:
 
 # one conversation per group chat (teren-greenlit 2026-06-17) — overrides per-participant default
 group_sessions_per_user: false
+memory:
+  memory_enabled: false
+  user_profile_enabled: false

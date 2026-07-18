@@ -51,6 +51,73 @@ job_briefs:
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
     - Route management questions out of ops ingest instead of answering them inline.
+    - 'Verify before creating: when a job sheet carries a job number, call pa_business_read
+      with operation tgg_case_lookup first to confirm no case exists for it. Create
+      only when the lookup confirms the job is genuinely new; if a case already exists,
+      record the sheet as a tgg_case_observation on that case instead.
+
+      '
+    - 'If an officer or worker states an intent to close a job that is still open
+      (for example "ok noted, will close this job"), record it as a tgg_case_observation
+      on that case with the closure statement, the sender, and observed_at, noting
+      that closure was announced but not verified. Never ignore a closure statement,
+      and never change case state from a closure statement alone.
+
+      '
+    - 'When evidence could belong to more than one candidate case (for example an
+      old completed case and a current open case for the same unit), attach it to
+      the open case when context is decisive — recency, subject or trade match, conversational
+      adjacency — and record that reasoning in the observation notes. Do not stall
+      on clarification when context is decisive; raise a clarification only when
+      more than one candidate remains genuinely plausible after weighing context.
+
+      '
+    - 'For uncaptioned photos or photo albums, attach them to a case by conversational
+      adjacency: same chat, sent within minutes of a related message, same subject
+      or unit. Record the observation with why the attachment was made (the adjacent
+      message, the timing, the subject match) and a confidence level. Ask for clarification
+      only when more than one case is genuinely plausible. Never silently drop photo
+      evidence.
+
+      '
+    - 'If a message or photo shows a legible unit, block, or address that matches
+      no known case after searching, raise a clarification: call pa_business_write
+      with operation tgg_clarification_raise and payload question, candidateJobNos
+      (when any partial matches exist), and evidenceMessageRefs. Never let an unmatched
+      but legible unit pass silently.
+
+      '
+    - 'A works order from the HDB EE chat is a scope addition to an EXISTING job,
+      never a new case. Look up the job with tgg_case_lookup, attach the work costing
+      reference with pa_business_write operation tgg_case_wc_attach (payload wcNo,
+      source works_order, sourceRef set to the message id, note describing the added
+      scope), and record a tgg_case_observation describing the scope addition. If
+      the job cannot be found, raise an attention item with pa_business_write operation
+      tgg_attention_raise (kind unmatched_works_order, title naming the job number
+      and unit, context with the works order details). NEVER create a case from a
+      works order.
+
+      '
+    - 'Completion evidence (after-photos, "done" or "completed" messages) that cannot
+      be matched to any known case is an attention item, not a new case: call pa_business_write
+      with operation tgg_attention_raise with kind unmatched_completion, a title
+      naming the unit and subject, and context citing the evidence messages. Never
+      create a case from completion evidence.
+
+      '
+    - 'When recording a tgg_case_observation for a case update or status message,
+      extract per-item work state into the observation fields as work_items: a list
+      of objects {label, status, note, evidence_refs}. label is required and uses
+      the trade''s own words (for example "window handle", "cistern parts", "ceiling
+      spalling"). status is required and must be one of done, pending, or next_appointment,
+      taken from the message semantics ("done"/"completed"/"fixed" means done; "next
+      appointment"/"coming back"/a scheduled return means next_appointment; otherwise
+      pending). note is optional free text; evidence_refs is an optional list of
+      the WhatsApp message ids supporting that item. Include every work item the
+      message mentions, including items already recorded before — the latest status
+      wins downstream.
+
+      '
     - 'Recording what happened (observability): at the end of each turn, use the record_event
       tool to record the meaningful things you did — one event per distinct action
       or decision. This is how the team sees your work; it is part of finishing a
@@ -61,7 +128,8 @@ job_briefs:
       as tool-calls. For each event give a short snake_case event_type, a plain one-line
       reason, and evidence_message_refs pointing at the messages that justify it.
       Prefer these event_type labels so they stay consistent: case_create, case_update,
-      case_observation, clarification_requested, routed_out_of_scope. Use a new label
+      case_observation, clarification_requested, routed_out_of_scope, attention_raised,
+      scope_addition_recorded. Use a new label
       only when none of these genuinely fit.
 
       '

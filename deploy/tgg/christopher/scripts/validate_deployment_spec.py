@@ -15,6 +15,14 @@ import yaml
 EXPECTED_API_VERSION = "pa.papercutlabs.com/v1"
 EXPECTED_KIND = "ClientAgentDeployment"
 
+# slot id -> model. gpt-5.6-luna-low runs gpt-5.6-luna at reasoning_effort low.
+SLOT_MODELS = {
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-luna-low": "gpt-5.6-luna",
+}
+SLOT_REASONING_EFFORT = {"gpt-5.6-luna-low": "low"}
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -141,42 +149,49 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
     allowed_slots = list(engine["allowedSlots"])
     if default_slot != "gpt-5.4-mini":
         raise RuntimeError("default engine slot must remain gpt-5.4-mini")
-    if allowed_slots != ["gpt-5.4-mini", "gpt-5.6-luna"]:
+    if allowed_slots != list(SLOT_MODELS):
         raise RuntimeError("engine slot set drifted")
 
     slot_manifest_path = _resolve(app_root, engine["slotManifest"])
     checksums = _parse_checksums(slot_manifest_path)
     slot_hashes: dict[str, dict[str, str]] = {}
-    for model in allowed_slots:
-        slot_root = app_root / "deploy/tgg/christopher/runtime-slots" / model
+    for slot in allowed_slots:
+        model = SLOT_MODELS[slot]
+        effort = SLOT_REASONING_EFFORT.get(slot)
+        slot_root = app_root / "deploy/tgg/christopher/runtime-slots" / slot
         config_path = slot_root / "config.yaml"
         constitution_path = slot_root / "christopher_tgg_constitution.yaml"
         config = _load_yaml(config_path)
         constitution = _load_yaml(constitution_path)
         if config["pa"]["enabled"] is not False:
-            raise RuntimeError(f"slot {model} enables PA")
+            raise RuntimeError(f"slot {slot} enables PA")
         if config["platforms"]["whatsapp"]["enabled"] is not False:
-            raise RuntimeError(f"slot {model} enables the built-in WhatsApp gateway")
+            raise RuntimeError(f"slot {slot} enables the built-in WhatsApp gateway")
         if config["group_sessions_per_user"] is not False:
-            raise RuntimeError(f"slot {model} changed group_sessions_per_user")
+            raise RuntimeError(f"slot {slot} changed group_sessions_per_user")
         if config["model"]["provider"] != engine["provider"]:
-            raise RuntimeError(f"slot {model} provider mismatch")
+            raise RuntimeError(f"slot {slot} provider mismatch")
         if config["model"]["default"] != model:
-            raise RuntimeError(f"slot {model} model mismatch")
+            raise RuntimeError(f"slot {slot} model mismatch")
+        if effort is None:
+            if "reasoning_effort" in config.get("agent", {}):
+                raise RuntimeError(f"slot {slot} sets an unexpected reasoning effort")
+        elif config.get("agent", {}).get("reasoning_effort") != effort:
+            raise RuntimeError(f"slot {slot} reasoning effort mismatch")
         if constitution["runtime"] != {
             "provider": engine["provider"],
             "model": model,
         }:
-            raise RuntimeError(f"slot {model} constitution engine mismatch")
-        relative_config = f"{model}/config.yaml"
-        relative_constitution = f"{model}/christopher_tgg_constitution.yaml"
+            raise RuntimeError(f"slot {slot} constitution engine mismatch")
+        relative_config = f"{slot}/config.yaml"
+        relative_constitution = f"{slot}/christopher_tgg_constitution.yaml"
         config_hash = _sha256(config_path)
         constitution_hash = _sha256(constitution_path)
         if checksums.get(relative_config) != config_hash:
             raise RuntimeError(f"slot manifest mismatch for {relative_config}")
         if checksums.get(relative_constitution) != constitution_hash:
             raise RuntimeError(f"slot manifest mismatch for {relative_constitution}")
-        slot_hashes[model] = {
+        slot_hashes[slot] = {
             "config": config_hash,
             "constitution": constitution_hash,
         }
