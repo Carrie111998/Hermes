@@ -108,6 +108,9 @@ config/mcporter.json
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+# Superpowers plugin scratch (brainstorm servers, ports, session state) written
+# into the checkout root during agent sessions — never a codebase artifact.
+.superpowers/
 # Working directory for the Hermes Agent's session state (~/.hermes/ at runtime;
 # also created in-repo when an agent operates in this checkout). Plans, audit
 # logs, and per-session caches are never artifacts of the codebase.
