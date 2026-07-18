@@ -64,13 +64,28 @@ def test_native_meaningful_codex_and_hermes_are_eligible(provider: Provider) -> 
 
 
 @pytest.mark.parametrize(
+    "content, expected",
+    [
+        ("okay", "acknowledgement_only"),
+        ("/resume", "control_only"),
+        ("", "no_meaningful_request"),
+    ],
+)
+def test_nonmeaningful_exclusion_precedes_source_cwd_validation(
+    content: str,
+    expected: str,
+) -> None:
+    projection = replace(_projection(Provider.HERMES, content=content), cwd=None)
+
+    assert evaluate_claude_visibility(projection) == expected
+
+
+@pytest.mark.parametrize(
     "cwd",
     [None, "", " C:/work/project", "C:/work/project\n", "x" * 4097],
 )
-def test_source_cwd_is_classified_before_meaningful_request_eligibility(
-    cwd: str | None,
-) -> None:
-    projection = replace(_projection(Provider.HERMES, content="okay"), cwd=cwd)
+def test_meaningful_request_requires_canonical_source_cwd(cwd: str | None) -> None:
+    projection = replace(_projection(Provider.HERMES), cwd=cwd)
 
     assert "source_cwd_missing" in CLAUDE_VISIBILITY_EXCLUSION_CODES
     assert evaluate_claude_visibility(projection) == "source_cwd_missing"

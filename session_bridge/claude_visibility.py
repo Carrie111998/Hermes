@@ -135,11 +135,6 @@ def evaluate_claude_visibility(
         canonical_session_id(projection.provider, projection.native_id)
     except ValueError:
         return "unstable_identity"
-    try:
-        _required_metadata(projection.cwd, "source cwd")
-    except ValueError:
-        return "source_cwd_missing"
-
     normalized_user_texts = tuple(
         normalized
         for message in projection.messages
@@ -147,6 +142,10 @@ def evaluate_claude_visibility(
         if (normalized := normalize_meaningful_user_text(message.content)) is not None
     )
     if any(is_meaningful_user_text(value) for value in normalized_user_texts):
+        try:
+            _required_metadata(projection.cwd, "source cwd")
+        except ValueError:
+            return "source_cwd_missing"
         return "eligible"
     folded = {value.casefold() for value in normalized_user_texts}
     if folded and folded <= _ACKNOWLEDGEMENTS:

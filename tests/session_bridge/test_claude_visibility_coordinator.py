@@ -238,6 +238,19 @@ def test_discovery_reports_missing_source_cwd_without_invalidating_inventory() -
     ]
 
 
+def test_discovery_preserves_nonmeaningful_reason_when_source_cwd_is_missing() -> None:
+    source = _source("empty", provider=Provider.HERMES, text="")
+    source = replace(source, projection=replace(source.projection, cwd=None))
+    coordinator, _calls = _coordinator([source])
+
+    result = coordinator.discover(days=30, limit=10)
+
+    assert result.degraded is False
+    assert [(item.source_session_id, item.reason) for item in result.exclusions] == [
+        ("hermes:empty", "no_meaningful_request")
+    ]
+
+
 def test_discovery_keeps_unknown_candidate_metadata_validation_fail_closed() -> None:
     malformed = replace(_source("bad-git-root"), git_root=" C:/work")
     coordinator, _calls = _coordinator([malformed])

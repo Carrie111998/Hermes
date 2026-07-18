@@ -396,6 +396,57 @@ class TestInventory:
         assert by_id["subagent"].projection.native_status == "archived"
 
     @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<codex_delegation>\nReview this bounded subtask", True),
+            ("Discuss the literal <codex_delegation> tag", False),
+        ],
+    )
+    def test_claude_visibility_detects_only_delegation_prompt_prefix(
+        self, text: str, expected: bool
+    ) -> None:
+        row = {
+            "id": "delegated",
+            "cwd": "C:/work/delegated",
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [
+                {
+                    "thread": {
+                        **row,
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "delegation-request",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": text,
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        })
+
+        [candidate] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=0)
+
+        assert candidate.automation_only is False
+        assert candidate.subagent_only is expected
+
+    @pytest.mark.parametrize(
         "optional_fields",
         [
             {"agent_nickname": "scout"},

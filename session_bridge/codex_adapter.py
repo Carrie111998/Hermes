@@ -37,6 +37,7 @@ _PARSER_VERSION = 1
 _REQUEST_TIMEOUT = 30.0
 _TARGET_SOURCE_KINDS = ("vscode", "appServer")
 _CWD_ALIASES = ("cwd", "workingDirectory", "working_directory")
+_CODEX_DELEGATION_PREFIX = "<codex_delegation>"
 _SUPPORTED_ITEM_TYPES = frozenset({
     "agentMessage",
     "commandExecution",
@@ -693,7 +694,10 @@ class CodexSourceAdapter:
                     git_head=reconciled.git_head,
                     worktree_id=reconciled.worktree_id,
                     automation_only=reconciled.automation_only,
-                    subagent_only=reconciled.subagent_only,
+                    subagent_only=(
+                        reconciled.subagent_only
+                        or _starts_with_codex_delegation(projection)
+                    ),
                 )
             )
         return tuple(sources)
@@ -1725,6 +1729,18 @@ def _thread_from_response(response: dict[str, Any]) -> dict[str, Any]:
     if "turns" not in thread or not isinstance(thread["turns"], list):
         raise ValueError("Codex thread/read response must include a turns list")
     return thread
+
+
+def _starts_with_codex_delegation(projection: SessionProjection) -> bool:
+    first_user = next(
+        (message for message in projection.messages if message.role == "user"),
+        None,
+    )
+    return bool(
+        first_user is not None
+        and isinstance(first_user.content, str)
+        and first_user.content.startswith(_CODEX_DELEGATION_PREFIX)
+    )
 
 
 def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadSummary:
