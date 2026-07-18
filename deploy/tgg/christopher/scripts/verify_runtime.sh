@@ -203,22 +203,32 @@ runuser -u pclaw -- env \
   --slot-file "$RUNTIME_ROOT/engine-slot" \
   --report "$full_report"
 
-"$APP_ROOT/.venv/bin/python" - "$full_report" <<'PY'
+"$APP_ROOT/.venv/bin/python" - "$full_report" "$RUNTIME_ROOT/engine-slot" <<'PY'
 import json, pathlib, sys
 p = json.loads(pathlib.Path(sys.argv[1]).read_text())
+slot = pathlib.Path(sys.argv[2]).read_text().strip()
+SLOT_MODELS = {
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.6-luna": "gpt-5.6-luna",
+    "gpt-5.6-luna-low": "gpt-5.6-luna",
+}
+SLOT_REASONING_EFFORT = {"gpt-5.6-luna-low": "low"}
+assert slot in SLOT_MODELS, slot
 assert p["ok"] is True
 assert p["mode"] == "fixture-only"
 assert p["result"]["processed"] == 1
 assert p["result"]["turn_id"]
 assert p["result"]["provider"] == "openai-direct-primary"
-assert p["result"]["model"] in {"gpt-5.4-mini", "gpt-5.6-luna"}
+assert p["result"]["model"] == SLOT_MODELS[slot], (p["result"]["model"], slot)
 assert p["client_mutation_requests"] == 0
 assert p["external_outbound_sent"] == 0
 print(json.dumps({
     "full_verify": "pass",
+    "slot": slot,
     "turn_id": p["result"]["turn_id"],
     "provider": p["result"]["provider"],
     "model": p["result"]["model"],
+    "reasoning_effort": SLOT_REASONING_EFFORT.get(slot),
     "client_mutation_requests": 0,
     "external_outbound_sent": 0,
 }, sort_keys=True))

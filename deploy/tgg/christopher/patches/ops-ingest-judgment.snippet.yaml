@@ -1,9 +1,3 @@
-    - 'Verify before creating: when a job sheet carries a job number, call pa_business_read
-      with operation tgg_case_lookup first to confirm no case exists for it. Create
-      only when the lookup confirms the job is genuinely new; if a case already exists,
-      record the sheet as a tgg_case_observation on that case instead.
-
-      '
     - 'If an officer or worker states an intent to close a job that is still open
       (for example "ok noted, will close this job"), record it as a tgg_case_observation
       on that case with the closure statement, the sender, and observed_at, noting
@@ -23,15 +17,17 @@
       adjacency: same chat, sent within minutes of a related message, same subject
       or unit. Record the observation with why the attachment was made (the adjacent
       message, the timing, the subject match) and a confidence level. Ask for clarification
-      only when more than one case is genuinely plausible. Never silently drop photo
-      evidence.
+      only when more than one case is genuinely plausible. If no plausible case exists
+      at all, raise an attention item with pa_business_write operation tgg_attention_raise
+      (kind unmatched_evidence) instead of guessing or creating. Never silently drop
+      photo evidence.
 
       '
     - 'If a message or photo shows a legible unit, block, or address that matches
-      no known case after searching, raise a clarification: call pa_business_write
-      with operation tgg_clarification_raise and payload question, candidateJobNos
-      (when any partial matches exist), and evidenceMessageRefs. Never let an unmatched
-      but legible unit pass silently.
+      no known case after searching with pa_business_read operation tgg_case_search,
+      raise a clarification: call pa_business_write with operation tgg_clarification_raise
+      and payload question, candidateJobNos (when any partial matches exist), and
+      evidenceMessageRefs. Never let an unmatched but legible unit pass silently.
 
       '
     - 'A works order from the HDB EE chat is a scope addition to an EXISTING job,
@@ -60,8 +56,10 @@
       taken from the message semantics ("done"/"completed"/"fixed" means done; "next
       appointment"/"coming back"/a scheduled return means next_appointment; otherwise
       pending). note is optional free text; evidence_refs is an optional list of
-      the WhatsApp message ids supporting that item. Include every work item the
-      message mentions, including items already recorded before — the latest status
-      wins downstream.
+      the supporting message ids, copied EXACTLY as they appear in the message context
+      (WhatsApp message ids or ledger import ids) — exact ids let the portal show
+      the full conversation behind each item; never invent or truncate an id. Include
+      every work item the message mentions, including items already recorded before
+      — the latest status wins downstream.
 
       '

@@ -54,7 +54,34 @@ EVENT_LABELS_NEW = (
 )
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
-NEW_INSTRUCTION_COUNT = 8
+NEW_INSTRUCTION_COUNT = 7
+
+# The single universal jobNo/create policy replaces the June create instruction
+# 1-for-1 — no other instruction anywhere in the constitution may permit a
+# broader create path (codex 2026-07-19 finding 1: two rules of differing
+# breadth on jobNo = nondeterministic create behavior).
+CREATE_POLICY_OLD = (
+    "    - For clearly new case reports with zone, address, problem, and WhatsApp source,\n"
+    "      call pa_business_write with operation tgg_case_create before any state update.\n"
+    "      Include jobNo when present; otherwise let PS generate a WA job number. If address,\n"
+    "      problem, source, or confidence is unclear, do not create; surface the missing\n"
+    "      facts for clarification.\n"
+)
+CREATE_POLICY_NEW = (
+    "    - 'tgg_case_create has exactly one trigger — a genuinely new case report (a new\n"
+    "      job sheet, or a new problem report with zone, address, problem, and WhatsApp\n"
+    "      source). When a job number is present, first call pa_business_read with operation\n"
+    "      tgg_case_lookup; if a case already exists, record the material as a tgg_case_observation\n"
+    "      on that case instead of creating. Only a genuinely new report without a job\n"
+    "      number may let PS generate a WA job number. Never create a placeholder case\n"
+    "      for photos, evidence, works orders, completion reports, or anything you have\n"
+    "      raised a clarification or attention item about — those paths are observation,\n"
+    "      scope addition (tgg_case_wc_attach), attention item, or clarification. If address,\n"
+    "      problem, source, or confidence is unclear, do not create; raise a clarification\n"
+    "      instead.\n"
+    "\n"
+    "      '\n"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -114,6 +141,12 @@ def _constitution(source: str, slot: dict) -> str:
     )
     rendered = _replace_once(
         source,
+        CREATE_POLICY_OLD,
+        CREATE_POLICY_NEW,
+        label="ops-ingest create policy",
+    )
+    rendered = _replace_once(
+        rendered,
         OPS_INGEST_OBSERVABILITY_ANCHOR,
         judgment_snippet + OPS_INGEST_OBSERVABILITY_ANCHOR,
         label="ops-ingest observability instruction",
@@ -187,6 +220,12 @@ def _validate(
     assert "tgg_clarification_raise" in joined
     assert "tgg_case_wc_attach" in joined
     assert "attention_raised" in joined
+    # Exactly one create policy: the consolidated rule is present, the broader
+    # June create instruction is gone, and no other instruction names the
+    # create operation.
+    assert "tgg_case_create has exactly one trigger" in joined
+    assert "before any state update" not in joined
+    assert sum("tgg_case_create" in item for item in instructions) == 1
 
 
 def main() -> int:

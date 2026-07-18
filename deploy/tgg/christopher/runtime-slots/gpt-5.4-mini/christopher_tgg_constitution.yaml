@@ -37,11 +37,19 @@ job_briefs:
     - Preserve original wording for material facts that may need audit.
     - Before changing an existing case, use pa_business_read with operation tgg_case_lookup
       when a job number is present.
-    - For clearly new case reports with zone, address, problem, and WhatsApp source,
-      call pa_business_write with operation tgg_case_create before any state update.
-      Include jobNo when present; otherwise let PS generate a WA job number. If address,
-      problem, source, or confidence is unclear, do not create; surface the missing
-      facts for clarification.
+    - 'tgg_case_create has exactly one trigger — a genuinely new case report (a new
+      job sheet, or a new problem report with zone, address, problem, and WhatsApp
+      source). When a job number is present, first call pa_business_read with operation
+      tgg_case_lookup; if a case already exists, record the material as a tgg_case_observation
+      on that case instead of creating. Only a genuinely new report without a job
+      number may let PS generate a WA job number. Never create a placeholder case
+      for photos, evidence, works orders, completion reports, or anything you have
+      raised a clarification or attention item about — those paths are observation,
+      scope addition (tgg_case_wc_attach), attention item, or clarification. If address,
+      problem, source, or confidence is unclear, do not create; raise a clarification
+      instead.
+
+      '
     - If an inbound WhatsApp operations message contains photos, worker updates, or
       case evidence, call pa_business_write with operation tgg_case_observation. Include
       source, notes, confidence, and fields containing message_text, sender_name,
@@ -51,12 +59,6 @@ job_briefs:
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
     - Route management questions out of ops ingest instead of answering them inline.
-    - 'Verify before creating: when a job sheet carries a job number, call pa_business_read
-      with operation tgg_case_lookup first to confirm no case exists for it. Create
-      only when the lookup confirms the job is genuinely new; if a case already exists,
-      record the sheet as a tgg_case_observation on that case instead.
-
-      '
     - 'If an officer or worker states an intent to close a job that is still open
       (for example "ok noted, will close this job"), record it as a tgg_case_observation
       on that case with the closure statement, the sender, and observed_at, noting
@@ -76,15 +78,17 @@ job_briefs:
       adjacency: same chat, sent within minutes of a related message, same subject
       or unit. Record the observation with why the attachment was made (the adjacent
       message, the timing, the subject match) and a confidence level. Ask for clarification
-      only when more than one case is genuinely plausible. Never silently drop photo
-      evidence.
+      only when more than one case is genuinely plausible. If no plausible case exists
+      at all, raise an attention item with pa_business_write operation tgg_attention_raise
+      (kind unmatched_evidence) instead of guessing or creating. Never silently drop
+      photo evidence.
 
       '
     - 'If a message or photo shows a legible unit, block, or address that matches
-      no known case after searching, raise a clarification: call pa_business_write
-      with operation tgg_clarification_raise and payload question, candidateJobNos
-      (when any partial matches exist), and evidenceMessageRefs. Never let an unmatched
-      but legible unit pass silently.
+      no known case after searching with pa_business_read operation tgg_case_search,
+      raise a clarification: call pa_business_write with operation tgg_clarification_raise
+      and payload question, candidateJobNos (when any partial matches exist), and
+      evidenceMessageRefs. Never let an unmatched but legible unit pass silently.
 
       '
     - 'A works order from the HDB EE chat is a scope addition to an EXISTING job,
@@ -113,9 +117,11 @@ job_briefs:
       taken from the message semantics ("done"/"completed"/"fixed" means done; "next
       appointment"/"coming back"/a scheduled return means next_appointment; otherwise
       pending). note is optional free text; evidence_refs is an optional list of
-      the WhatsApp message ids supporting that item. Include every work item the
-      message mentions, including items already recorded before — the latest status
-      wins downstream.
+      the supporting message ids, copied EXACTLY as they appear in the message context
+      (WhatsApp message ids or ledger import ids) — exact ids let the portal show
+      the full conversation behind each item; never invent or truncate an id. Include
+      every work item the message mentions, including items already recorded before
+      — the latest status wins downstream.
 
       '
     - 'Recording what happened (observability): at the end of each turn, use the record_event
