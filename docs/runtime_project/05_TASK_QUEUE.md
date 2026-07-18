@@ -1,49 +1,44 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-18 (Task 11 completed by Cursor)
+**Last updated:** 2026-07-18 (Task 12 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect acceptance for Task 11.
+None — awaiting Architect acceptance for Task 12.
 
 ---
 
 ## Completed
 
-### Task 11 — Manual Verification Gate for Execution Results
+### Task 12 — Verification-Driven Follow-up Planning
 
-**Status:** ✅ Completed  
-**Tests:** `python3 -m pytest tests/htr/ -v` → **559 passed**
+**Status:** ✅ Completed (awaiting Architect review — not checkpointed)  
+**Tests:** `python3 -m pytest tests/htr/ -v`
 
 Changes:
 
-- `run_execution_verification_record` contract + schema validation
-- `make_run_execution_verification_record`, `run_execution_verification_fingerprint`
-- `validate_item_verifications_correspond_to_results`
-- `verify_run_execution_result()` — manual reviewer-provided verification gate
-- Requires full run chain through execution result record
-- `item_verifications` must correspond to `item_results`
-- Decision consistency: accepted / rejected / needs_changes rules enforced
-- Writes `run_execution_verification_record.json`
-- Appends `run_execution_verified`, `run_execution_rejected`, or `run_execution_needs_changes` event
-- **Records reviewer decision only** — no execution, no prior record mutation
-- Does **not** update `run_manifest`, `task_status`, or `attempt_status`
+- `run_post_verification_followup_plan_record` contract + schema validation
+- `make_run_post_verification_followup_plan_record`, `run_post_verification_followup_plan_fingerprint`
+- `derive_post_verification_followup_items`, `validate_post_verification_followup_items_correspond`
+- `plan_post_verification_followup()` — planning after execution verification record exists
+- Fingerprints must match on-disk result + verification records
+- `followup_items` must correspond to execution items + item verifications
+- Writes `run_post_verification_followup_plan_record.json`, appends `run_post_verification_followup_planned` event
+- **Planning only** — no execution, no prior record mutation, no task/attempt creation
+- Accepted verification normally produces `empty` plan; rejected/needs_changes produce `planned` items
+- No artifact/result/verification_result inspection
 
-### Task 10 — Controlled One-Shot Execution Adapter
+### Task 11 / Task 10 / Task 0–9
 
-**Status:** ✅ Accepted
-
-### Task 9 / Task 8 / Task 0–7
-
-**Status:** ✅ Accepted (regression verified in 559-test suite)
+**Status:** ✅ Accepted (checkpointed)
 
 ---
 
 ## Next Task (Architect)
 
-Task 12 — not started. Await scope assignment.
+Task 13 — not started. Await scope assignment.
 
 ---
 

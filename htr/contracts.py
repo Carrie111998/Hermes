@@ -861,3 +861,229 @@ def run_execution_verification_fingerprint(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_PLANNED = "planned"
+POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_EMPTY = "empty"
+
+POST_VERIFICATION_FOLLOWUP_PLAN_STATUSES: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_PLANNED,
+        POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_EMPTY,
+    }
+)
+
+POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_REJECTED_ITEM = "review_rejected_item"
+POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NEEDS_CHANGES_ITEM = "review_needs_changes_item"
+POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NOT_REVIEWED_ITEM = "review_not_reviewed_item"
+POST_VERIFICATION_FOLLOWUP_KIND_REOPEN_LINK_MANUALLY = "reopen_link_manually"
+POST_VERIFICATION_FOLLOWUP_KIND_UPDATE_DOCUMENTATION_MANUALLY = (
+    "update_documentation_manually"
+)
+POST_VERIFICATION_FOLLOWUP_KIND_PREPARE_NEW_EXECUTION_REQUEST = (
+    "prepare_new_execution_request"
+)
+POST_VERIFICATION_FOLLOWUP_KIND_OTHER = "other"
+
+POST_VERIFICATION_FOLLOWUP_KINDS: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_REJECTED_ITEM,
+        POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NEEDS_CHANGES_ITEM,
+        POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NOT_REVIEWED_ITEM,
+        POST_VERIFICATION_FOLLOWUP_KIND_REOPEN_LINK_MANUALLY,
+        POST_VERIFICATION_FOLLOWUP_KIND_UPDATE_DOCUMENTATION_MANUALLY,
+        POST_VERIFICATION_FOLLOWUP_KIND_PREPARE_NEW_EXECUTION_REQUEST,
+        POST_VERIFICATION_FOLLOWUP_KIND_OTHER,
+    }
+)
+
+_VERIFICATION_TO_FOLLOWUP_KIND: dict[str, str] = {
+    EXECUTION_ITEM_VERIFICATION_REJECTED: POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_REJECTED_ITEM,
+    EXECUTION_ITEM_VERIFICATION_NEEDS_CHANGES: POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NEEDS_CHANGES_ITEM,
+    EXECUTION_ITEM_VERIFICATION_NOT_REVIEWED: POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NOT_REVIEWED_ITEM,
+}
+
+
+def run_post_verification_followup_plan_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON post-verification follow-up plan record path for *run_id*."""
+    return (
+        paths.run_root(run_id, base_dir)
+        / "run_post_verification_followup_plan_record.json"
+    )
+
+
+def _normalize_post_verification_followup_items(
+    followup_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in followup_items:
+        normalized.append(
+            {
+                "followup_item_id": item["followup_item_id"],
+                "source_execution_item_id": item.get("source_execution_item_id"),
+                "source_followup_item_id": item.get("source_followup_item_id"),
+                "execution_kind": item.get("execution_kind"),
+                "item_status": item.get("item_status"),
+                "verification_decision": item["verification_decision"],
+                "followup_kind": item["followup_kind"],
+                "instructions": item.get("instructions"),
+                "command": item["command"] if item.get("command") is not None else {},
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def _validate_post_verification_followup_plan_status_consistency(
+    plan_record: dict[str, Any],
+) -> None:
+    plan_status = plan_record["plan_status"]
+    followup_items = plan_record["followup_items"]
+    if plan_status == POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_EMPTY:
+        if followup_items:
+            raise ValueError(
+                "run_post_verification_followup_plan_record: empty plan_status "
+                "requires followup_items to be empty"
+            )
+    elif plan_status == POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_PLANNED:
+        if not followup_items:
+            raise ValueError(
+                "run_post_verification_followup_plan_record: planned plan_status "
+                "requires non-empty followup_items"
+            )
+
+
+def derive_post_verification_followup_items(
+    execution_result_record: dict[str, Any],
+    verification_record: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Derive deterministic follow-up items from execution verification items."""
+    validate_schema(execution_result_record, "run_execution_result_record")
+    validate_schema(verification_record, "run_execution_verification_record")
+    if verification_record["verification_decision"] == EXECUTION_VERIFICATION_ACCEPTED:
+        return []
+
+    followup_items: list[dict[str, Any]] = []
+    for item_verification in verification_record["item_verifications"]:
+        decision = item_verification["verification_decision"]
+        followup_kind = _VERIFICATION_TO_FOLLOWUP_KIND.get(decision)
+        if followup_kind is None:
+            continue
+        followup_items.append(
+            {
+                "followup_item_id": f"pvfp-{item_verification['item_id']}",
+                "source_execution_item_id": item_verification["item_id"],
+                "source_followup_item_id": item_verification["source_followup_item_id"],
+                "execution_kind": item_verification["execution_kind"],
+                "item_status": item_verification["item_status"],
+                "verification_decision": decision,
+                "followup_kind": followup_kind,
+                "instructions": None,
+                "command": {},
+                "metadata": {},
+            }
+        )
+    return followup_items
+
+
+def validate_post_verification_followup_items_correspond(
+    followup_items: list[dict[str, Any]],
+    execution_result_record: dict[str, Any],
+    verification_record: dict[str, Any],
+) -> None:
+    """Ensure follow-up items align with execution result and verification items."""
+    result_by_id = {
+        item["item_id"]: item for item in execution_result_record["item_results"]
+    }
+    verification_by_id = {
+        item["item_id"]: item for item in verification_record["item_verifications"]
+    }
+
+    for followup_item in followup_items:
+        source_execution_item_id = followup_item.get("source_execution_item_id")
+        if source_execution_item_id is None:
+            continue
+        if source_execution_item_id not in result_by_id:
+            raise ValueError(
+                f"followup item references unknown source_execution_item_id "
+                f"{source_execution_item_id!r}"
+            )
+        if source_execution_item_id not in verification_by_id:
+            raise ValueError(
+                f"followup item references unknown verification item_id "
+                f"{source_execution_item_id!r}"
+            )
+        result_item = result_by_id[source_execution_item_id]
+        verification_item = verification_by_id[source_execution_item_id]
+        for field in ("source_followup_item_id", "execution_kind", "item_status"):
+            expected = result_item[field]
+            actual = followup_item.get(field)
+            if actual is not None and actual != expected:
+                raise ValueError(
+                    f"followup item {field} does not match execution result for "
+                    f"{source_execution_item_id!r}"
+                )
+        if (
+            followup_item["verification_decision"]
+            != verification_item["verification_decision"]
+        ):
+            raise ValueError(
+                f"followup item verification_decision does not match verification "
+                f"record for {source_execution_item_id!r}"
+            )
+
+
+def make_run_post_verification_followup_plan_record(
+    *,
+    run_id: str,
+    source_execution_result_fingerprint: str,
+    source_execution_verification_fingerprint: str,
+    followup_items: list[dict[str, Any]],
+    planner: str = "human",
+    plan_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated post-verification follow-up plan record envelope."""
+    normalized_items = _normalize_post_verification_followup_items(followup_items)
+    resolved_plan_status = plan_status
+    if resolved_plan_status is None:
+        resolved_plan_status = (
+            POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_EMPTY
+            if not normalized_items
+            else POST_VERIFICATION_FOLLOWUP_PLAN_STATUS_PLANNED
+        )
+    plan_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_execution_result_fingerprint": source_execution_result_fingerprint,
+        "source_execution_verification_fingerprint": (
+            source_execution_verification_fingerprint
+        ),
+        "planner": planner,
+        "plan_status": resolved_plan_status,
+        "followup_items": normalized_items,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(plan_record, "run_post_verification_followup_plan_record")
+    return plan_record
+
+
+def run_post_verification_followup_plan_fingerprint(
+    plan_record: dict[str, Any],
+) -> str:
+    """Return a stable semantic fingerprint for a post-verification follow-up plan."""
+    validate_schema(plan_record, "run_post_verification_followup_plan_record")
+    return json.dumps(
+        plan_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

@@ -759,3 +759,34 @@ Records reviewer decision as source-of-truth JSON; event log is audit-only.
 - Task 12 not started
 
 **Awaiting:** Architect acceptance before Task 12.
+
+---
+
+## Task 12 — Verification-Driven Follow-up Planning (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance (not checkpointed)  
+**Tests:** full HTR suite (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_post_verification_followup_plan_record` schema + factory + fingerprint
+- `derive_post_verification_followup_items()` — deterministic derivation from verification items
+- `plan_post_verification_followup()` — after full execution verification chain
+- `run_post_verification_followup_planned` event + replay-only semantics
+- Plan statuses: `planned`, `empty`
+- Post-verification follow-up kinds for rejected/needs_changes/not_reviewed/manual actions
+
+### Design principle
+
+Planning based only on execution result + execution verification JSON records.
+No artifact/result/verification_result inspection; no automatic execution.
+
+### Non-goals confirmed
+
+- No execution, rerun, repair, task/attempt creation, or lifecycle mutation
+- No prior record mutation
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
+- Task 13 not started
+
+**Awaiting:** Architect acceptance before checkpoint / Task 13.

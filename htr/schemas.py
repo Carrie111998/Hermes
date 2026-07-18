@@ -22,6 +22,7 @@ SchemaName = Literal[
     "run_execution_request_record",
     "run_execution_result_record",
     "run_execution_verification_record",
+    "run_post_verification_followup_plan_record",
 ]
 
 
@@ -290,6 +291,18 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_post_verification_followup_plan_record": (
+        "schema_version",
+        "run_id",
+        "source_execution_result_fingerprint",
+        "source_execution_verification_fingerprint",
+        "planner",
+        "plan_status",
+        "followup_items",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -341,6 +354,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_execution_result_record(data)
     elif schema_name == "run_execution_verification_record":
         _validate_run_execution_verification_record(data)
+    elif schema_name == "run_post_verification_followup_plan_record":
+        _validate_run_post_verification_followup_plan_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -888,3 +903,120 @@ def _validate_run_execution_verification_record(data: dict[str, Any]) -> None:
     if not isinstance(data["metadata"], dict):
         raise ValueError("run_execution_verification_record: metadata must be a dict")
     _validate_execution_verification_decision_consistency(data)
+
+
+def _require_str_or_null(
+    data: dict[str, Any], field: str, schema_name: str
+) -> None:
+    if field not in data:
+        raise ValueError(f"{schema_name}: missing fields: {field}")
+    value = data[field]
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(
+            f"{schema_name}: {field} must be a non-empty string or null"
+        )
+
+
+def _validate_run_post_verification_followup_plan_record(data: dict[str, Any]) -> None:
+    from htr.contracts import (
+        POST_VERIFICATION_FOLLOWUP_KINDS,
+        POST_VERIFICATION_FOLLOWUP_PLAN_STATUSES,
+        _validate_post_verification_followup_plan_status_consistency,
+    )
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError(
+            "run_post_verification_followup_plan_record: schema_version must be an int"
+        )
+    _require_str(data, "run_id", "run_post_verification_followup_plan_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError(
+            "run_post_verification_followup_plan_record: run_id must be a valid run id"
+        )
+    _require_str(
+        data,
+        "source_execution_result_fingerprint",
+        "run_post_verification_followup_plan_record",
+    )
+    _require_str(
+        data,
+        "source_execution_verification_fingerprint",
+        "run_post_verification_followup_plan_record",
+    )
+    _require_str(data, "planner", "run_post_verification_followup_plan_record")
+    _require_str(data, "plan_status", "run_post_verification_followup_plan_record")
+    if data["plan_status"] not in POST_VERIFICATION_FOLLOWUP_PLAN_STATUSES:
+        raise ValueError(
+            "run_post_verification_followup_plan_record: plan_status must be one of "
+            "planned, empty"
+        )
+    _require_str(data, "created_at", "run_post_verification_followup_plan_record")
+    if "notes" not in data:
+        raise ValueError(
+            "run_post_verification_followup_plan_record: missing fields: notes"
+        )
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError(
+            "run_post_verification_followup_plan_record: notes must be a string or null"
+        )
+    followup_items = data.get("followup_items")
+    if not isinstance(followup_items, list):
+        raise ValueError(
+            "run_post_verification_followup_plan_record: followup_items must be a list"
+        )
+    for item in followup_items:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_post_verification_followup_plan_record: each followup item "
+                "must be a dict"
+            )
+        _require_str(
+            item, "followup_item_id", "run_post_verification_followup_plan_record"
+        )
+        for optional_field in (
+            "source_execution_item_id",
+            "source_followup_item_id",
+            "execution_kind",
+            "item_status",
+        ):
+            _require_str_or_null(
+                item, optional_field, "run_post_verification_followup_plan_record"
+            )
+        _require_str(
+            item, "verification_decision", "run_post_verification_followup_plan_record"
+        )
+        _require_str(item, "followup_kind", "run_post_verification_followup_plan_record")
+        if item["followup_kind"] not in POST_VERIFICATION_FOLLOWUP_KINDS:
+            raise ValueError(
+                "run_post_verification_followup_plan_record: followup item "
+                "followup_kind is invalid"
+            )
+        if "instructions" not in item:
+            raise ValueError(
+                "run_post_verification_followup_plan_record: followup item missing "
+                "fields: instructions"
+            )
+        instructions = item["instructions"]
+        if instructions is not None and not isinstance(instructions, str):
+            raise ValueError(
+                "run_post_verification_followup_plan_record: followup item "
+                "instructions must be a string or null"
+            )
+        if "command" not in item or not isinstance(item["command"], dict):
+            raise ValueError(
+                "run_post_verification_followup_plan_record: followup item command "
+                "must be a dict"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_post_verification_followup_plan_record: followup item metadata "
+                "must be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError(
+            "run_post_verification_followup_plan_record: metadata must be a dict"
+        )
+    _validate_post_verification_followup_plan_status_consistency(data)
