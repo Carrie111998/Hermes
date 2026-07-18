@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 # Bounded retry for the atomic replace in save_state(). On Windows a concurrent
 # lock-free reader makes os.replace() fail transiently with PermissionError
 # WinError 5, because CPython opens files without FILE_SHARE_DELETE; total
-# worst-case wait is 20+40+60+80 = 200ms across 5 attempts. Mirrors the same
-# fix in pipeline_state.manager._write_atomic (see that module for full detail).
+# worst-case wait is 20+40+...+180 = 900ms across 10 attempts (9 backoff sleeps).
+# Mirrors the same fix + budget in pipeline_state.manager._write_atomic (see
+# that module for full detail and the harness-derived budget rationale).
 # POSIX rename swaps inodes and never hits this, so the retry is a no-op there.
-_REPLACE_MAX_ATTEMPTS = 5
+_REPLACE_MAX_ATTEMPTS = 10
 _REPLACE_BACKOFF_SECONDS = 0.02
 
 

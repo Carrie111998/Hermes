@@ -23,8 +23,11 @@ PIPELINE_PATH = Path.home() / ".hermes" / "workspaces" / "tracker" / "pipeline.j
 
 # Bounded retry for the atomic replace in _write_atomic(). On Windows a
 # concurrent lock-free reader makes os.replace() fail transiently with
-# WinError 5; total worst-case wait is 20+40+60+80 = 200ms across 5 attempts.
-_REPLACE_MAX_ATTEMPTS = 5
+# WinError 5; total worst-case wait is 20+40+...+180 = 900ms across 10 attempts
+# (9 backoff sleeps). A forced-collision harness showed 5 attempts leaves ~10%
+# surfaced under pathological continuous polling; 10 clears it to 0 while a
+# realistic dashboard poll rate is already absorbed by far fewer.
+_REPLACE_MAX_ATTEMPTS = 10
 _REPLACE_BACKOFF_SECONDS = 0.02
 
 
