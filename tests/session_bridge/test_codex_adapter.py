@@ -325,6 +325,67 @@ class TestInventory:
             "thread/read",
         ]
 
+    def test_continuous_visibility_uses_fast_recency_inventory_and_stops_at_cutoff(
+        self,
+    ) -> None:
+        def entry(native_id: str, updated: int):
+            return {
+                "id": native_id,
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": updated - 10,
+                "updatedAt": updated,
+                "source": "vscode",
+            }
+
+        client = FakeInitializingClient({
+            "thread/list": [
+                {
+                    "data": [entry("new", 300), entry("before-cutoff", 200)],
+                    "nextCursor": "must-not-be-read",
+                },
+                {"data": [entry("older-page", 100)]},
+                {"data": []},
+            ],
+            "thread/read": [
+                {
+                    "thread": {
+                        **entry("new", 300),
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "request",
+                                        "content": [
+                                            {"type": "text", "text": "New request"}
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        })
+
+        sources = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=250, state_db_only=True)
+
+        assert [source.projection.native_id for source in sources] == ["new"]
+        assert [call[0] for call in client.calls] == [
+            "thread/list",
+            "thread/list",
+            "thread/read",
+        ]
+        for method, params, _timeout in client.calls[:2]:
+            assert method == "thread/list"
+            assert params["limit"] == 100
+            assert params["sortKey"] == "updated_at"
+            assert params["sortDirection"] == "desc"
+            assert params["useStateDbOnly"] is True
+            assert "cursor" not in params
+
     def test_claude_visibility_inventory_preserves_normal_automation_and_subagent_kinds(
         self,
     ) -> None:

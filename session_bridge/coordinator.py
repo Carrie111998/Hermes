@@ -333,6 +333,7 @@ class ClaudeVisibilityCoordinator:
         inventory: _ClaudeVisibilityInventory,
         registrar: _ClaudeVisibilityRegistrar,
         marker_secret: bytes,
+        continuous_inventory: _ClaudeVisibilityInventory | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if not isinstance(config, BridgeConfig):
@@ -342,6 +343,7 @@ class ClaudeVisibilityCoordinator:
         self._config = config
         self._store = store
         self._inventory = inventory
+        self._continuous_inventory = continuous_inventory or inventory
         self._registrar = registrar
         self._marker_secret = marker_secret
         self._clock = clock
@@ -401,7 +403,8 @@ class ClaudeVisibilityCoordinator:
                     enabled=True, degraded=True, reasons=("provider_degraded",)
                 )
         try:
-            sources = tuple(self._inventory(after))
+            inventory = self._inventory if manual else self._continuous_inventory
+            sources = tuple(inventory(after))
         except Exception:
             return ClaudeVisibilityDiscoveryResult(
                 enabled=True, degraded=True, reasons=("provider_degraded",)

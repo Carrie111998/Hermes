@@ -654,15 +654,28 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return summaries
 
-    def list_claude_visibility_sources(self, *, after: float) -> tuple[Any, ...]:
+    def list_claude_visibility_sources(
+        self, *, after: float, state_db_only: bool = False
+    ) -> tuple[Any, ...]:
         """Read every active and archived native Codex thread without bridge state."""
 
         cutoff = float(after)
         if not math.isfinite(cutoff):
             raise ValueError("Codex visibility cutoff must be finite")
+        self._ensure_initialized()
         combined: dict[str, CodexThreadSummary] = {}
         for archived in (False, True):
-            for summary in self.list_full_inventory(archived=archived):
+            summaries = (
+                self._fetch_inventory_pages(
+                    archived=archived,
+                    source_kinds=None,
+                    state_db_only=True,
+                    stop_after=cutoff,
+                )
+                if state_db_only
+                else self.list_full_inventory(archived=archived)
+            )
+            for summary in summaries:
                 if summary.last_active < cutoff:
                     continue
                 prior = combined.get(summary.native_id)
@@ -913,6 +926,8 @@ class CodexSourceAdapter:
         *,
         archived: bool,
         source_kinds: tuple[str, ...] | None,
+        state_db_only: bool = False,
+        stop_after: float | None = None,
     ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
@@ -920,6 +935,13 @@ class CodexSourceAdapter:
         raw_entry_count = 0
         while True:
             params: dict[str, Any] = {"archived": archived}
+            if state_db_only:
+                params.update({
+                    "limit": 100,
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                    "useStateDbOnly": True,
+                })
             if source_kinds is not None:
                 params["sourceKinds"] = list(source_kinds)
             if cursor is not None:
@@ -955,6 +977,11 @@ class CodexSourceAdapter:
                     )
 
             next_cursor = _first(response, "nextCursor", "next_cursor")
+            if stop_after is not None and any(
+                summary.last_active < stop_after
+                for summary in normalized.values()
+            ):
+                break
             if next_cursor in (None, ""):
                 break
             cursor_key = _canonical_json(next_cursor)

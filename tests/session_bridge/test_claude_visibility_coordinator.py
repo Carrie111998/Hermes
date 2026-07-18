@@ -416,6 +416,33 @@ def test_manual_discovery_ignores_continuous_empty_cycle_cursor() -> None:
     assert calls == [NOW - 30 * 86400]
 
 
+def test_continuous_discovery_uses_dedicated_fast_inventory() -> None:
+    store = FakeStore()
+    store.raw_status["last_empty_cycle"] = {
+        "tracked": True,
+        "value": NOW - 30,
+    }
+    full_calls: list[float] = []
+    fast_calls: list[float] = []
+
+    coordinator = ClaudeVisibilityCoordinator(
+        config=_config(continuous=True),
+        store=store,
+        inventory=lambda after: full_calls.append(after) or [],
+        continuous_inventory=lambda after: fast_calls.append(after) or [],
+        registrar=FakeRegistrar(),
+        marker_secret=SECRET,
+        clock=lambda: NOW,
+    )
+
+    assert coordinator.continuous_once().degraded is False
+    assert fast_calls == [NOW - 150]
+    assert full_calls == []
+
+    assert coordinator.discover(days=30, limit=10).degraded is False
+    assert full_calls == [NOW - 30 * 86400]
+
+
 def test_disabled_config_short_circuits_every_dependency() -> None:
     coordinator, calls = _coordinator([_source("one")], config=_config(enabled=False))
 

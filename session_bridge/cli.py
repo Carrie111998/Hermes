@@ -749,6 +749,11 @@ class ProductionBackend:
                 inventory=lambda after: self._claude_visibility_inventory(
                     after, marker_secret=marker_secret
                 ),
+                continuous_inventory=lambda after: self._claude_visibility_inventory(
+                    after,
+                    marker_secret=marker_secret,
+                    state_db_only=True,
+                ),
                 registrar=registrar,
                 marker_secret=marker_secret,
                 clock=time.time,
@@ -760,7 +765,11 @@ class ProductionBackend:
             raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
 
     def _claude_visibility_inventory(
-        self, after: float, *, marker_secret: bytes
+        self,
+        after: float,
+        *,
+        marker_secret: bytes,
+        state_db_only: bool = False,
     ) -> Sequence[SidebarSource]:
         store = self._require_store()
         sources = list(store.list_claude_visibility_hermes_sources(after, None))
@@ -770,7 +779,10 @@ class ProductionBackend:
                 raise RuntimeError("codex_direct_runtime_required")
             self._codex_client = CodexAppServerClient(codex_bin=codex_command[0])
         codex = CodexSourceAdapter(self._codex_client, marker_secret=marker_secret)
-        page = codex.list_claude_visibility_sources(after=after)
+        page = codex.list_claude_visibility_sources(
+            after=after,
+            state_db_only=state_db_only,
+        )
         existing = {
             (item.projection.provider, item.source_session_id) for item in sources
         }
