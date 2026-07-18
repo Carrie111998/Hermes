@@ -297,6 +297,16 @@ def test_meaningful_text_requires_three_unicode_alphanumerics(
             "(exit code 0). Command: test Output: done]",
             False,
         ),
+        (
+            " [System: The active model for this chat has changed to model-x via "
+            "provider provider-y.]",
+            True,
+        ),
+        (
+            "［System: The active model for this chat has changed to model-x via "
+            "provider provider-y.]",
+            True,
+        ),
         ("try again", False),
         ("Explain the [IMPORTANT: Background process] event format", True),
     ],

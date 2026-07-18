@@ -86,12 +86,10 @@ def normalize_meaningful_user_text(value: object) -> str | None:
 
 
 def is_meaningful_user_text(value: object) -> bool:
+    if isinstance(value, str) and value.startswith(_INTERNAL_USER_EVENT_PREFIXES):
+        return False
     normalized = normalize_meaningful_user_text(value)
-    if (
-        normalized is None
-        or normalized.casefold() in ACK_OR_CONTROL_ONLY
-        or normalized.startswith(_INTERNAL_USER_EVENT_PREFIXES)
-    ):
+    if normalized is None or normalized.casefold() in ACK_OR_CONTROL_ONLY:
         return False
     return sum(character.isalnum() for character in normalized) >= 3
 
