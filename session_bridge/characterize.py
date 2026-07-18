@@ -385,6 +385,10 @@ def _cleanup_characterized_claude_visibility_locked(
             project_root, _required_state_text(state, "transcript_path")
         ):
             raise RuntimeError("characterization_identity_mismatch:path_changed")
+        if _recorded_object_identity(
+            state.get("transcript_identity")
+        ) != _object_identity(transcript):
+            raise RuntimeError("characterization_identity_mismatch:path_changed")
         state["transcript_identity"] = list(_path_identity(transcript))
         state["phase"] = "transcript_removing"
         _write_characterization_record(claimed, state, marker_secret)

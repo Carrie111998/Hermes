@@ -764,6 +764,71 @@ def test_expired_ready_operation_rejects_replaced_transcript_with_same_content(
     assert renewal_registrar.claims == []
 
 
+def test_direct_cleanup_rejects_replaced_transcript_with_same_content(
+    tmp_path: Path,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    active = state["source_root"] / ".claude-visibility-operation.json"
+    original_record = _read_characterization_record(active, SECRET)
+    original_identity = original_record["transcript_identity"]
+    transcript = state["transcript"]
+    original = transcript.read_bytes()
+    replacement = transcript.with_name(f".{transcript.name}.replacement")
+    replacement.write_bytes(original)
+    os.replace(replacement, transcript)
+    replacement_identity = transcript.stat()
+    assert (replacement_identity.st_dev, replacement_identity.st_ino) != tuple(
+        original_identity[:2]
+    )
+
+    with pytest.raises(RuntimeError, match="identity_mismatch:path_changed"):
+        cleanup_characterized_claude_visibility(
+            cleanup_token=pending["cleanup_token"],
+            source_root=state["source_root"],
+            projects_root=state["projects_root"],
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )
+
+    claimed = (
+        state["source_root"]
+        / ".cleanup-claims"
+        / f"{pending['cleanup_token']['id']}.json"
+    )
+    claimed_record = _read_characterization_record(claimed, SECRET)
+    assert claimed_record["transcript_identity"] == original_identity
+    assert transcript.exists()
+    assert transcript.read_bytes() == original
+    assert Path(state["claim"].source_cwd).exists()
+
+
+def test_direct_cleanup_allows_legitimate_in_place_transcript_append(
+    tmp_path: Path,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    transcript = state["transcript"]
+    before = transcript.stat()
+    with transcript.open("a", encoding="utf-8") as stream:
+        stream.write("\nlegitimate native resume append")
+    after = transcript.stat()
+    assert after.st_size > before.st_size
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+
+    cleaned = cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+
+    assert cleaned["cleanup"] == "removed_exact_characterization"
+    assert not transcript.exists()
+    assert not Path(state["claim"].source_cwd).exists()
+
+
 def test_claimed_cleanup_remains_authorized_across_expiry_after_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
