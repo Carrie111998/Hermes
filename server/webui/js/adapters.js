@@ -30,6 +30,7 @@ const DATA_ENVELOPE_ROUTES = new Set([
   'onboarding.updateIntegrations',
   'onboarding.reviewBrain',
   'brain.update',
+  'company.updateEmailTemplates',
 ]);
 
 /* Routes whose real response is the company-section envelope. */
@@ -40,6 +41,8 @@ const SECTION_ROUTES = new Set([
   'company.updatePositioning',
   'company.getSalesPreferences',
   'company.updateSalesPreferences',
+  'company.getEmailTemplates',
+  'company.updateEmailTemplates',
 ]);
 
 function displayName(email) {

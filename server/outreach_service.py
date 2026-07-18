@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from .crypto import CredentialCipher
 from .db import Database, json_dump, json_load, new_id, now
-from .email_providers import GmailProvider, MicrosoftProvider, OutgoingEmail, StubEmailProvider
+from .email_providers import EMAIL_PROVIDERS, OutgoingEmail
 from .quality import content_hash, is_bounce, preflight_message
 from .whatsapp_provider import WhatsAppCloudProvider
 
@@ -278,11 +278,7 @@ class OutreachService:
 
     def _deliver_email(self, company_id: str, content: dict, mode: str):
         integration, credentials = self._integration(company_id, "email")
-        provider = {
-            "google": GmailProvider,
-            "microsoft": MicrosoftProvider,
-            "stub": StubEmailProvider,
-        }.get(integration["provider"])
+        provider = EMAIL_PROVIDERS.get(integration["provider"])
         if not provider:
             raise HTTPException(422, "Unsupported email provider")
         adapter = provider()
@@ -298,8 +294,7 @@ class OutreachService:
 
     def poll_email_replies(self, company_id: str) -> dict:
         integration, credentials = self._integration(company_id, "email")
-        provider_cls = {"google": GmailProvider, "microsoft": MicrosoftProvider,
-                        "stub": StubEmailProvider}.get(integration["provider"])
+        provider_cls = EMAIL_PROVIDERS.get(integration["provider"])
         if not provider_cls:
             raise HTTPException(422, "Unsupported email provider")
         adapter = provider_cls()

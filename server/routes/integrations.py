@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import json_dump, json_load, new_id, now
-from ..email_providers import GmailProvider, MicrosoftProvider, StubEmailProvider
+from ..email_providers import EMAIL_PROVIDERS
 from ..whatsapp_provider import WhatsAppCloudProvider
 
 
@@ -86,10 +86,33 @@ def connect_microsoft(body: IntegrationConnect, request: Request,
     return _connect("email", "microsoft", body, request, principal, x_company_id)
 
 
-@router.post("/integrations/email/connect/zoho", status_code=501)
-@router.post("/integrations/email/connect/smtp", status_code=501)
-def connect_future_email_provider():
-    raise HTTPException(501, "Zoho and SMTP are scheduled for email provider v1.1")
+@router.post("/integrations/email/connect/smtp", status_code=201)
+def connect_smtp(body: IntegrationConnect, request: Request,
+                 principal: Principal = Depends(current_principal),
+                 x_company_id: str | None = Header(default=None)):
+    """Any email service via username + password (SMTP send, optional IMAP)."""
+    required = {"username", "password", "smtp_host"}
+    missing = required - {k for k, v in body.credentials.items() if v}
+    if missing:
+        raise HTTPException(422, {"message": "Missing SMTP credentials", "fields": sorted(missing)})
+    data = {**body.data, "mailbox": body.credentials.get("from_addr") or body.credentials["username"]}
+    return _connect("email", "smtp", IntegrationConnect(credentials=body.credentials, data=data),
+                    request, principal, x_company_id)
+
+
+@router.post("/integrations/email/connect/browser", status_code=201)
+def connect_browser(body: IntegrationConnect, request: Request,
+                    principal: Principal = Depends(current_principal),
+                    x_company_id: str | None = Header(default=None)):
+    """Agent-browser webmail: the agent signs into the webmail UI and drives it."""
+    required = {"webmail_url", "username", "password"}
+    missing = required - {k for k, v in body.credentials.items() if v}
+    if missing:
+        raise HTTPException(422, {"message": "Missing webmail credentials", "fields": sorted(missing)})
+    data = {**body.data, "mailbox": body.credentials["username"],
+            "webmail_url": body.credentials["webmail_url"]}
+    return _connect("email", "browser", IntegrationConnect(credentials=body.credentials, data=data),
+                    request, principal, x_company_id)
 
 
 @router.get("/integrations/email/{integration_id}")
@@ -135,8 +158,7 @@ def delete_email_integration(integration_id: str, request: Request,
 
 def _email_adapter(row, request: Request):
     credentials = request.app.state.cipher.decrypt(row["encrypted_credentials"])
-    cls = {"google": GmailProvider, "microsoft": MicrosoftProvider,
-           "stub": StubEmailProvider}.get(row["provider"])
+    cls = EMAIL_PROVIDERS.get(row["provider"])
     if not cls:
         raise HTTPException(422, "Integration provider cannot be tested")
     adapter = cls()

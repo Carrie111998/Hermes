@@ -19,6 +19,7 @@ const NAV_GROUPS = [
   { label: 'Outreach', items: [
     { path: '/app/outreach', label: 'Campaigns', icon: 'mail' },
     { path: '/app/custom-outreach', label: 'Custom Outreach', icon: 'send' },
+    { path: '/app/email-templates', label: 'Email Templates', icon: 'mail' },
   ]},
   { label: 'Intelligence', items: [
     { path: '/app/company-brain', label: 'Company Brain', icon: 'brain' },

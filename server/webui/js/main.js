@@ -17,6 +17,7 @@ import * as leads from './pages/leads.js';
 import * as contacts from './pages/contacts.js';
 import * as outreach from './pages/outreach.js';
 import * as customOutreach from './pages/custom-outreach.js';
+import * as emailTemplates from './pages/email-templates.js';
 import * as analytics from './pages/analytics.js';
 import * as agentRuns from './pages/agent-runs.js';
 import * as integrations from './pages/integrations.js';
@@ -112,6 +113,7 @@ const routes = [
   { path: '/app/outreach',        mount: appPage('Outreach', outreach.mountList) },
   { path: '/app/outreach/campaigns/:campaignId', mount: appPage('Campaign', outreach.mountDetail) },
   { path: '/app/custom-outreach', mount: appPage('Custom Outreach', customOutreach.mount) },
+  { path: '/app/email-templates', mount: appPage('Email Templates', emailTemplates.mount) },
   { path: '/app/analytics',       mount: appPage('Analytics', analytics.mount) },
   { path: '/app/agent-runs',      mount: appPage('Agent Runs', agentRuns.mountList) },
   { path: '/app/agent-runs/:runId', mount: appPage('Agent Run', agentRuns.mountDetail) },

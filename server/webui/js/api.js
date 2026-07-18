@@ -92,6 +92,8 @@ export const routes = {
   'company.updatePositioning':  ['PATCH',  '/company/positioning'],
   'company.getSalesPreferences':    ['GET',   '/company/sales-preferences'],
   'company.updateSalesPreferences': ['PATCH', '/company/sales-preferences'],
+  'company.getEmailTemplates':      ['GET',   '/company/email-templates'],
+  'company.updateEmailTemplates':   ['PATCH', '/company/email-templates'],
 
   // 7.5 Onboarding
   'onboarding.status':              ['GET',   '/onboarding/status'],
@@ -244,6 +246,7 @@ export const routes = {
   'emailIntegrations.connectMicrosoft': ['POST','/integrations/email/connect/microsoft'],
   'emailIntegrations.connectZoho':   ['POST',   '/integrations/email/connect/zoho'],
   'emailIntegrations.connectSmtp':   ['POST',   '/integrations/email/connect/smtp'],
+  'emailIntegrations.connectBrowser':['POST',   '/integrations/email/connect/browser'],
   'emailIntegrations.get':           ['GET',    '/integrations/email/:integrationId'],
   'emailIntegrations.update':        ['PATCH',  '/integrations/email/:integrationId'],
   'emailIntegrations.delete':        ['DELETE', '/integrations/email/:integrationId'],

@@ -406,6 +406,11 @@ export const handlers = {
   'company.updatePositioning': ({ body }) => { Object.assign(db.company.positioning, body || {}); return db.company.positioning; },
   'company.getSalesPreferences': () => db.company.sales_preferences,
   'company.updateSalesPreferences': ({ body }) => { Object.assign(db.company.sales_preferences, body || {}); return db.company.sales_preferences; },
+  'company.getEmailTemplates': () => ({ data: (db.company.email_templates ||= { templates: {} }) }),
+  'company.updateEmailTemplates': ({ body }) => {
+    db.company.email_templates = { ...(db.company.email_templates || {}), ...((body && body.data) || body || {}) };
+    return { data: db.company.email_templates };
+  },
 
   /* ---------- onboarding ---------- */
   'onboarding.status': () => db.onboarding,
@@ -1135,6 +1140,7 @@ export const handlers = {
   'emailIntegrations.connectMicrosoft': () => connectEmail('microsoft', 'Microsoft 365'),
   'emailIntegrations.connectZoho': () => connectEmail('zoho', 'Zoho Mail'),
   'emailIntegrations.connectSmtp': ({ body }) => connectEmail('smtp', `SMTP (${body?.host || 'custom'})`),
+  'emailIntegrations.connectBrowser': ({ body }) => connectEmail('browser', `Webmail (${body?.credentials?.username || 'agent browser'})`),
   'emailIntegrations.get': ({ params }) => findOr404(db.integrations.email, params.integrationId, 'Integration'),
   'emailIntegrations.update': ({ params, body }) => Object.assign(findOr404(db.integrations.email, params.integrationId, 'Integration'), body || {}),
   'emailIntegrations.delete': ({ params }) => {

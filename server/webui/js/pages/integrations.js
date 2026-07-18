@@ -14,7 +14,18 @@ import {
 const EMAIL_PROVIDERS = [
   { key: 'google', title: 'Google Workspace', route: 'emailIntegrations.connectGoogle', logo: 'G' },
   { key: 'microsoft', title: 'Microsoft 365', route: 'emailIntegrations.connectMicrosoft', logo: 'M' },
+  { key: 'smtp', title: 'Any email (SMTP)', route: 'emailIntegrations.connectSmtp', logo: '@', credential: 'smtp' },
+  { key: 'browser', title: 'Any webmail (agent browser)', route: 'emailIntegrations.connectBrowser', logo: 'W', credential: 'browser' },
 ];
+
+// Common webmail SMTP/IMAP presets so the user only supplies username + password.
+const SMTP_PRESETS = {
+  custom: { label: 'Custom / other', smtp_host: '', smtp_port: 587, imap_host: '' },
+  gmail: { label: 'Gmail (app password)', smtp_host: 'smtp.gmail.com', smtp_port: 587, imap_host: 'imap.gmail.com' },
+  outlook: { label: 'Outlook / Microsoft', smtp_host: 'smtp.office365.com', smtp_port: 587, imap_host: 'outlook.office365.com' },
+  yahoo: { label: 'Yahoo Mail', smtp_host: 'smtp.mail.yahoo.com', smtp_port: 465, imap_host: 'imap.mail.yahoo.com' },
+  zoho: { label: 'Zoho Mail', smtp_host: 'smtp.zoho.com', smtp_port: 465, imap_host: 'imap.zoho.com' },
+};
 
 export async function mount(root, ctx) {
   let disposed = false;
@@ -78,7 +89,7 @@ function emailSection(items, onChange) {
           integrationLogo(provider.logo),
           el('div', { class: 'ifz-integration-body' },
             el('div', { class: 'ifz-integration-name' }, provider.title),
-            el('div', { class: 'ifz-integration-sub' }, connected ? connected.mailbox : 'Not connected'),
+            el('div', { class: 'ifz-integration-sub' }, connected ? (connected.mailbox || connected.data?.mailbox || 'Connected') : 'Not connected'),
             el('div', { class: 'ifz-mt-2' }, connected ? badge(connected.status) : badge('not_connected'))),
           el('div', { class: 'ifz-col' },
             connected ? button('Test', { size: 'sm', onClick: async () => {
@@ -96,11 +107,103 @@ function emailSection(items, onChange) {
 }
 
 function connectProvider(provider, onChange) {
+  if (provider.credential === 'smtp') return connectSmtp(provider, onChange);
+  if (provider.credential === 'browser') return connectBrowserWebmail(provider, onChange);
   call(provider.route).then(() => {
     toast(`${provider.title} connected`, 'success');
     onChange();
   }).catch(err => {
     toast(err.message || `${provider.title} is not available on this server`, 'error');
+  });
+}
+
+function connectSmtp(provider, onChange) {
+  const presetSel = select(Object.entries(SMTP_PRESETS).map(([value, p]) => ({ value, label: p.label })),
+    { value: 'gmail' });
+  const username = input({ placeholder: 'you@example.com', autocomplete: 'username' });
+  const password = input({ type: 'password', placeholder: 'App password or mailbox password', autocomplete: 'current-password' });
+  const smtpHost = input({ value: SMTP_PRESETS.gmail.smtp_host, placeholder: 'smtp.example.com' });
+  const smtpPort = input({ type: 'number', value: String(SMTP_PRESETS.gmail.smtp_port) });
+  const imapHost = input({ value: SMTP_PRESETS.gmail.imap_host, placeholder: 'imap.example.com (optional, for drafts + replies)' });
+  presetSel.addEventListener('change', () => {
+    const p = SMTP_PRESETS[presetSel.value];
+    smtpHost.value = p.smtp_host; smtpPort.value = String(p.smtp_port); imapHost.value = p.imap_host;
+  });
+  const save = button('Connect mailbox', { kind: 'primary', icon: 'check' });
+  const dialog = modal({
+    title: 'Connect any email service',
+    body: el('div', {},
+      el('p', { class: 'ifz-muted ifz-small ifz-mb-4' },
+        'Send from any provider with your username and password. For Gmail/Outlook use an app password. Credentials are encrypted server-side and never stored in the browser.'),
+      field('Email service', presetSel),
+      el('div', { class: 'ifz-form-row' }, field('Username / email', username, { required: true }), field('Password', password, { required: true })),
+      el('div', { class: 'ifz-form-row' }, field('SMTP host', smtpHost, { required: true }), field('SMTP port', smtpPort)),
+      field('IMAP host', imapHost, { hint: 'Optional. Enables saved drafts and reply detection.' })),
+    actions: save,
+  });
+  save.addEventListener('click', async () => {
+    if (!username.value.trim() || !password.value || !smtpHost.value.trim()) {
+      toast('Username, password, and SMTP host are required', 'warning');
+      return;
+    }
+    setBusy(save, true, 'Connecting...');
+    try {
+      await call(provider.route, { body: { credentials: {
+        username: username.value.trim(),
+        password: password.value,
+        smtp_host: smtpHost.value.trim(),
+        smtp_port: Number(smtpPort.value) || 587,
+        imap_host: imapHost.value.trim() || undefined,
+        from_addr: username.value.trim(),
+      } } });
+      toast('Mailbox connected', 'success');
+      dialog.close();
+      onChange();
+    } catch (err) {
+      setBusy(save, false);
+      toast(err.message || 'Could not connect mailbox', 'error');
+    }
+  });
+}
+
+function connectBrowserWebmail(provider, onChange) {
+  const url = input({ placeholder: 'https://mail.example.com', type: 'url' });
+  const username = input({ placeholder: 'you@example.com', autocomplete: 'username' });
+  const password = input({ type: 'password', placeholder: 'Mailbox password', autocomplete: 'current-password' });
+  const hint = input({ placeholder: 'e.g. Roundcube, Zimbra, Yandex (optional)' });
+  const save = button('Connect webmail', { kind: 'primary', icon: 'check' });
+  const dialog = modal({
+    title: 'Connect webmail via agent browser',
+    body: el('div', {},
+      el('p', { class: 'ifz-muted ifz-small ifz-mb-4' },
+        'For providers without SMTP access. The agent signs into this webmail in a browser and sends each approved message through the provider’s own UI. Sends take minutes, not seconds. Credentials are encrypted server-side. Accounts with CAPTCHA or two-factor login will fail — use SMTP or an API provider for those.'),
+      field('Webmail URL', url, { required: true }),
+      el('div', { class: 'ifz-form-row' },
+        field('Username / email', username, { required: true }),
+        field('Password', password, { required: true })),
+      field('Provider hint', hint)),
+    actions: save,
+  });
+  save.addEventListener('click', async () => {
+    if (!url.value.trim() || !username.value.trim() || !password.value) {
+      toast('Webmail URL, username, and password are required', 'warning');
+      return;
+    }
+    setBusy(save, true, 'Connecting...');
+    try {
+      await call(provider.route, { body: { credentials: {
+        webmail_url: url.value.trim(),
+        username: username.value.trim(),
+        password: password.value,
+        provider_hint: hint.value.trim() || undefined,
+      } } });
+      toast('Webmail connected', 'success');
+      dialog.close();
+      onChange();
+    } catch (err) {
+      setBusy(save, false);
+      toast(err.message || 'Could not connect webmail', 'error');
+    }
   });
 }
 
