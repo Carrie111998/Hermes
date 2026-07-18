@@ -224,3 +224,100 @@ def task_completion_fingerprint(completion_record: dict[str, Any]) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def run_completion_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run completion record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_completion_record.json"
+
+
+def make_run_completion_record(
+    *,
+    run_id: str,
+    completed_task_ids: list[str],
+    reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: str = "1",
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated manual run completion record envelope."""
+    completion_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "completed_task_ids": list(completed_task_ids),
+        "reason": reason,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(completion_record, "run_completion_record")
+    return completion_record
+
+
+def run_completion_fingerprint(completion_record: dict[str, Any]) -> str:
+    """Return a stable semantic fingerprint for a run completion record envelope."""
+    validate_schema(completion_record, "run_completion_record")
+    return json.dumps(
+        completion_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+RUN_REVIEW_ACCEPTED = "accepted"
+RUN_REVIEW_REJECTED = "rejected"
+RUN_REVIEW_NEEDS_FOLLOWUP = "needs_followup"
+
+RUN_REVIEW_DECISIONS: frozenset[str] = frozenset(
+    {
+        RUN_REVIEW_ACCEPTED,
+        RUN_REVIEW_REJECTED,
+        RUN_REVIEW_NEEDS_FOLLOWUP,
+    }
+)
+
+
+def run_review_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run review record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_review_record.json"
+
+
+def make_run_review_record(
+    *,
+    run_id: str,
+    decision: str,
+    reviewer: str = "human",
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: str = "1",
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated manual run review record envelope."""
+    review_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "decision": decision,
+        "reviewer": reviewer,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(review_record, "run_review_record")
+    return review_record
+
+
+def run_review_fingerprint(review_record: dict[str, Any]) -> str:
+    """Return a stable semantic fingerprint for a run review record envelope."""
+    validate_schema(review_record, "run_review_record")
+    return json.dumps(
+        review_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

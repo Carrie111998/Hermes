@@ -1,44 +1,50 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-18 (Task 5 completed by Cursor)
+**Last updated:** 2026-07-18 (Task 7 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect acceptance for Task 5.
+None — awaiting Architect acceptance for Task 7.
 
 ---
 
 ## Completed
 
-### Task 5 — Manual Task Completion API
+### Task 7 — Manual Run Review API
 
 **Status:** ✅ Completed  
-**Tests:** `python3 -m pytest tests/htr/ -v` → **194 passed**
+**Tests:** `python3 -m pytest tests/htr/ -v` → **265 passed**
 
 Changes:
 
-- `task_completion_record` contract + schema validation
-- `make_task_completion_record`, `task_completion_fingerprint`
-- `complete_task_manually()` — requires `attempt_status == verification_passed`
-- Writes `task_completion_record.json`, appends `manual_task_completed` event, updates `task_status` only
-- Replay-only path when task already `completed`
-- Transition: `running → completed` (via existing `TASK_LEGAL_TRANSITIONS`)
+- `run_review_record` contract + schema validation
+- `make_run_review_record`, `run_review_fingerprint`
+- `review_run_manually()` — requires run `completed` + `run_completion_record.json`
+- Writes `run_review_record.json`, appends `manual_run_reviewed` event
+- Does **not** update `run_manifest` by default
+- Replay-only when `run_review_record.json` already exists
+- Run-level events use shared `task_events.jsonl` (no `task_id` field)
 
-### Task 4 — Manual Verification Record API
+### Task 6 — Manual Run Completion API
+
+**Status:** ✅ Accepted  
+**Tests:** 228 passed (regression verified in 265-test suite)
+
+### Task 5 — Manual Task Completion API
 
 **Status:** ✅ Accepted
 
-### Task 3 / Task 2 / Task 1 / Task 0
+### Task 4 / Task 3 / Task 2 / Task 1 / Task 0
 
-**Status:** ✅ Completed (regression verified in 194-test suite)
+**Status:** ✅ Accepted (regression verified in 265-test suite)
 
 ---
 
 ## Next Task (Architect)
 
-Task 6 — not started. Await scope assignment.
+Task 8 — not started. Await scope assignment.
 
 ---
 

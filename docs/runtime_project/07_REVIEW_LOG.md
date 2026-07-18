@@ -575,3 +575,56 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 - No SQLite, scheduler, event replay from log
 
 **Awaiting:** Architect acceptance before Task 6.
+
+---
+
+## Task 6 — Manual Run Completion API (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance  
+**Tests:** 228 passed (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_completion_record` schema + `make_run_completion_record()` with None-only defaults
+- `run_completion_fingerprint()` — stable canonical JSON
+- `complete_run_manually()` — requires every listed task already `completed`, updates `run_manifest` only
+- `manual_run_completed` event + replay-only path for completed runs
+- Run-level event helpers: `make_run_event`, `append_run_event`, `_find_run_event_by_id`
+- Run status constants + `assert_valid_run_transition()` in `state.py`
+- Event schema: `task_id` optional (run-level events omit it)
+
+### Non-goals confirmed
+
+- No task execution, verification runner, HEAL execution, Runtime/delegate_task
+- No task_status / attempt_status updates
+- No automatic task discovery or completion
+- No SQLite, scheduler, event replay from log
+
+**Awaiting:** Architect acceptance before Task 7.
+
+---
+
+## Task 7 — Manual Run Review API (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect acceptance  
+**Tests:** 265 passed (`python3 -m pytest tests/htr/ -v`)
+
+### Delivered
+
+- `run_review_record` schema + `make_run_review_record()` with None-only defaults
+- `run_review_fingerprint()` — stable canonical JSON
+- `review_run_manually()` — requires completed run + existing `run_completion_record.json`
+- `manual_run_reviewed` event + replay-only when review record exists
+- Decision constants: `accepted`, `rejected`, `needs_followup`
+- Does not update `run_manifest`, `task_status`, or `attempt_status`
+
+### Non-goals confirmed
+
+- No task execution, verification runner, HEAL execution, Runtime/delegate_task
+- No artifact/result/verification content inspection
+- No automatic task discovery or completion
+- No SQLite, scheduler, event replay from log
+
+**Awaiting:** Architect acceptance before Task 8.

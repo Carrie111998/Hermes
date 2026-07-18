@@ -1,59 +1,70 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-18  
-**Task:** Task 5 — Manual Task Completion API  
+**Task:** Task 7 — Manual Run Review API  
 **Status:** Complete — awaiting Architect acceptance
 
 ---
 
 ## 1. One-paragraph state
 
-Task 5 adds manual task completion after a specific attempt reaches `verification_passed`. It writes `task_completion_record.json`, appends `manual_task_completed`, and updates `task_status` to `completed` only. No task execution, artifact verification, HEAL, Runtime integration, attempt_status updates, or run_status updates. **194/194 tests pass**.
+Task 7 adds manual run review after a run is already `completed` and `run_completion_record.json` exists. A human provides an explicit decision (`accepted`, `rejected`, or `needs_followup`). The API writes `run_review_record.json`, appends `manual_run_reviewed` to the shared run event log (`task_events.jsonl`), and does **not** update `run_manifest`, `task_status`, or `attempt_status`. No artifact/result/verification inspection. **265/265 tests pass**.
 
 ---
 
-## 2. Task 5 APIs
+## 2. Task 7 APIs
 
 | Module | Key APIs |
 |--------|----------|
-| `contracts.py` | `make_task_completion_record`, `task_completion_fingerprint`, `task_completion_record_json_path` |
-| `events.py` | `complete_task_manually`, `EVENT_TYPE_MANUAL_TASK_COMPLETED` |
-| `schemas.py` | `task_completion_record` validation |
+| `contracts.py` | `make_run_review_record`, `run_review_fingerprint`, `run_review_record_json_path`, `RUN_REVIEW_*` constants |
+| `events.py` | `review_run_manually`, `EVENT_TYPE_MANUAL_RUN_REVIEWED` |
+| `schemas.py` | `run_review_record` validation |
 
 ---
 
 ## 3. Lifecycle semantics
 
-- **Precondition:** `attempt_status == verification_passed`
-- **Task transition:** `running → completed` (task must be in a legal active status)
-- **Write order:** completion record → event append → task_status update
-- **Replay-only** when `task_status` already `completed`
-- **Does not** update attempt_status, run_status, or execute verification
+- **Preconditions:** `run_manifest.status == completed`; `run_completion_record.json` exists
+- **Write order:** run review record → event append
+- **Replay-only** when `run_review_record.json` already exists
+- **Does not** update run_manifest, task_status, attempt_status, or inspect artifacts
 
 ---
 
-## 4. Non-goals (confirmed)
+## 4. Run model summary
+
+| Item | Location |
+|------|----------|
+| Run status | `run_manifest.json` |
+| Run completion record | `{run_root}/run_completion_record.json` |
+| Run review record | `{run_root}/run_review_record.json` |
+| Review event | `{run_root}/task_events.jsonl` (shared run-scoped log, no `task_id`) |
+
+---
+
+## 5. Non-goals (confirmed)
 
 1. No task execution or artifact verification
 2. No HEAL execution or Runtime/delegate_task integration
-3. No attempt_status / run_status updates
-4. No SQLite / queue / scheduler
-5. Event log audit-only; status files source of truth
-6. Task 6 not started
+3. No run_manifest / task_status / attempt_status updates
+4. No artifact/result/verification content inspection
+5. No SQLite / queue / scheduler
+6. Event log audit-only; record files source of truth
+7. Task 8 not started
 
 ---
 
-## 5. Test entry
+## 6. Test entry
 
 ```bash
 cd /home/unaliu/.hermes/hermes-agent
 source venv/bin/activate
 python3 -m pytest tests/htr/ -v
-# 194 passed in 1.70s
+# 265 passed in 2.69s
 ```
 
 ---
 
-## 6. Owner handoff
+## 7. Owner handoff
 
-Task 5 complete. Do not start Task 6 until Architect assigns scope.
+Task 7 complete. Do not start Task 8 until Architect assigns scope.

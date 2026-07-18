@@ -16,6 +16,8 @@ SchemaName = Literal[
     "verification_result",
     "verification_check",
     "task_completion_record",
+    "run_completion_record",
+    "run_review_record",
 ]
 
 
@@ -103,6 +105,25 @@ class TaskCompletionRecord(TypedDict):
     created_at: str
 
 
+class RunCompletionRecord(TypedDict):
+    schema_version: str
+    run_id: str
+    completed_task_ids: list[str]
+    reason: str | None
+    metadata: dict[str, Any]
+    created_at: str
+
+
+class RunReviewRecord(TypedDict):
+    schema_version: str
+    run_id: str
+    decision: str
+    reviewer: str
+    notes: str | None
+    metadata: dict[str, Any]
+    created_at: str
+
+
 class AttemptResult(TypedDict):
     schema_version: str
     run_id: str
@@ -127,7 +148,6 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "event_id",
         "event_type",
         "run_id",
-        "task_id",
         "created_at",
         "actor",
         "payload",
@@ -179,6 +199,23 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_completion_record": (
+        "schema_version",
+        "run_id",
+        "completed_task_ids",
+        "reason",
+        "metadata",
+        "created_at",
+    ),
+    "run_review_record": (
+        "schema_version",
+        "run_id",
+        "decision",
+        "reviewer",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -218,6 +255,10 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_verification_check(data)
     elif schema_name == "task_completion_record":
         _validate_task_completion_record(data)
+    elif schema_name == "run_completion_record":
+        _validate_run_completion_record(data)
+    elif schema_name == "run_review_record":
+        _validate_run_review_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -273,11 +314,12 @@ def _validate_event(data: dict[str, Any]) -> None:
         "event_id",
         "event_type",
         "run_id",
-        "task_id",
         "created_at",
         "actor",
     ):
         _require_str(data, field, "event")
+    if "task_id" in data:
+        _require_str(data, "task_id", "event")
     if not isinstance(data["payload"], dict):
         raise ValueError("event: payload must be a dict")
     for optional_field in ("attempt_id", "previous_status", "new_status"):
@@ -385,3 +427,44 @@ def _validate_task_completion_record(data: dict[str, Any]) -> None:
         raise ValueError("task_completion_record: reason must be a string or null")
     if not isinstance(data["metadata"], dict):
         raise ValueError("task_completion_record: metadata must be a dict")
+
+
+def _validate_run_completion_record(data: dict[str, Any]) -> None:
+    for field in ("schema_version", "run_id", "created_at"):
+        _require_str(data, field, "run_completion_record")
+    if "reason" not in data:
+        raise ValueError("run_completion_record: missing fields: reason")
+    reason = data["reason"]
+    if reason is not None and not isinstance(reason, str):
+        raise ValueError("run_completion_record: reason must be a string or null")
+    completed_task_ids = data.get("completed_task_ids")
+    if not isinstance(completed_task_ids, list) or not completed_task_ids:
+        raise ValueError("run_completion_record: completed_task_ids must be a non-empty list")
+    seen: set[str] = set()
+    for task_id in completed_task_ids:
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError(
+                "run_completion_record: each completed_task_id must be a non-empty string"
+            )
+        if task_id in seen:
+            raise ValueError("run_completion_record: completed_task_ids must be unique")
+        seen.add(task_id)
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_completion_record: metadata must be a dict")
+
+
+def _validate_run_review_record(data: dict[str, Any]) -> None:
+    for field in ("schema_version", "run_id", "decision", "reviewer", "created_at"):
+        _require_str(data, field, "run_review_record")
+    if data["decision"] not in {"accepted", "rejected", "needs_followup"}:
+        raise ValueError(
+            "run_review_record: decision must be one of "
+            "accepted, rejected, needs_followup"
+        )
+    if "notes" not in data:
+        raise ValueError("run_review_record: missing fields: notes")
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError("run_review_record: notes must be a string or null")
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_review_record: metadata must be a dict")

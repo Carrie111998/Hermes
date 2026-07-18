@@ -21,6 +21,10 @@ from htr.io import (
 )
 from htr.contracts import (
     result_fingerprint,
+    run_completion_fingerprint,
+    run_completion_record_json_path,
+    run_review_fingerprint,
+    run_review_record_json_path,
     task_completion_fingerprint,
     task_completion_record_json_path,
     verification_fingerprint,
@@ -32,11 +36,13 @@ from htr.state import (
     ATTEMPT_RESULT_SUBMITTED,
     ATTEMPT_VERIFICATION_FAILED,
     ATTEMPT_VERIFICATION_PASSED,
+    RUN_COMPLETED,
     TASK_COMPLETED,
     AttemptAlreadyRegistered,
     EventConflict,
     InvalidTransition,
     assert_valid_attempt_transition,
+    assert_valid_run_transition,
     assert_valid_task_transition,
 )
 
@@ -46,6 +52,8 @@ EVENT_TYPE_ATTEMPT_STATUS_CHANGED = "attempt_status_changed"
 EVENT_TYPE_ATTEMPT_RESULT_SUBMITTED = "attempt_result_submitted"
 EVENT_TYPE_MANUAL_VERIFICATION_SUBMITTED = "manual_verification_submitted"
 EVENT_TYPE_MANUAL_TASK_COMPLETED = "manual_task_completed"
+EVENT_TYPE_MANUAL_RUN_COMPLETED = "manual_run_completed"
+EVENT_TYPE_MANUAL_RUN_REVIEWED = "manual_run_reviewed"
 
 EVENT_TYPES = frozenset(
     {
@@ -55,6 +63,8 @@ EVENT_TYPES = frozenset(
         EVENT_TYPE_ATTEMPT_RESULT_SUBMITTED,
         EVENT_TYPE_MANUAL_VERIFICATION_SUBMITTED,
         EVENT_TYPE_MANUAL_TASK_COMPLETED,
+        EVENT_TYPE_MANUAL_RUN_COMPLETED,
+        EVENT_TYPE_MANUAL_RUN_REVIEWED,
     }
 )
 
@@ -80,11 +90,13 @@ def _utc_now_iso() -> str:
 def _validate_event_ids(event: dict[str, Any]) -> None:
     for value, kind in (
         (event["run_id"], "run"),
-        (event["task_id"], "task"),
         (event["event_id"], "event"),
     ):
         if not validate_id(value, kind):
             raise ValueError(f"invalid {kind} id: {value!r}")
+    task_id = event.get("task_id")
+    if task_id is not None and not validate_id(task_id, "task"):
+        raise ValueError(f"invalid task id: {task_id!r}")
     attempt_id = event.get("attempt_id")
     if attempt_id is not None and not validate_id(attempt_id, "attempt"):
         raise ValueError(f"invalid attempt id: {attempt_id!r}")
@@ -155,6 +167,35 @@ def make_event(
     return event
 
 
+def make_run_event(
+    *,
+    event_type: str,
+    run_id: str,
+    actor: str,
+    payload: dict[str, Any] | None = None,
+    event_id: str | None = None,
+    previous_status: str | None = None,
+    new_status: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated run-level lifecycle event envelope."""
+    event: dict[str, Any] = {
+        "event_id": event_id or new_event_id(),
+        "event_type": event_type,
+        "run_id": run_id,
+        "created_at": created_at or _utc_now_iso(),
+        "actor": actor,
+        "payload": payload if payload is not None else {},
+    }
+    if previous_status is not None:
+        event["previous_status"] = previous_status
+    if new_status is not None:
+        event["new_status"] = new_status
+    validate_schema(event, "event")
+    _validate_event_ids(event)
+    return event
+
+
 def append_task_event(
     run_id: str,
     event: dict[str, Any],
@@ -165,6 +206,21 @@ def append_task_event(
     _validate_event_ids(event)
     if event["run_id"] != run_id:
         raise ValueError("event run_id does not match append target run_id")
+    append_jsonl(paths.task_events_path(run_id, base_dir), event)
+
+
+def append_run_event(
+    run_id: str,
+    event: dict[str, Any],
+    base_dir: Path | None = None,
+) -> None:
+    """Append one run-level lifecycle event to ``task_events.jsonl``."""
+    validate_schema(event, "event")
+    _validate_event_ids(event)
+    if event["run_id"] != run_id:
+        raise ValueError("event run_id does not match append target run_id")
+    if "task_id" in event:
+        raise ValueError("run-level event must not include task_id")
     append_jsonl(paths.task_events_path(run_id, base_dir), event)
 
 
@@ -774,4 +830,238 @@ def complete_task_manually(
     updated_task_status["status"] = TASK_COMPLETED
     validate_schema(updated_task_status, "task_status")
     atomic_write_json(task_status_path, updated_task_status)
+    return candidate
+
+
+def _find_run_event_by_id(
+    run_id: str,
+    event_id: str,
+    base_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Return the run-level event for *event_id*, else None."""
+    existing = _find_event_by_id(run_id, event_id, base_dir)
+    if existing is None or existing.get("run_id") != run_id:
+        return None
+    if "task_id" in existing:
+        return None
+    return existing
+
+
+def _matches_manual_run_completed_replay(
+    existing: dict[str, Any],
+    *,
+    run_id: str,
+    actor: str,
+    completion_record: dict[str, Any],
+) -> bool:
+    """Return True when *existing* matches a successful manual run completion replay."""
+    payload = existing.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        existing.get("event_type") == EVENT_TYPE_MANUAL_RUN_COMPLETED
+        and existing.get("run_id") == run_id
+        and existing.get("new_status") == RUN_COMPLETED
+        and existing.get("actor") == actor
+        and payload.get("completed_task_ids")
+        == completion_record["completed_task_ids"]
+        and payload.get("run_completion_fingerprint")
+        == run_completion_fingerprint(completion_record)
+    )
+
+
+def complete_run_manually(
+    run_id: str,
+    completion_record: dict[str, Any],
+    *,
+    actor: str = "human",
+    event_id: str | None = None,
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Manually mark a run completed after listed tasks are already completed."""
+    validate_id(run_id, "run")
+    validate_schema(completion_record, "run_completion_record")
+    if completion_record["run_id"] != run_id:
+        raise ValueError("completion_record run_id does not match submission target")
+
+    submitted_fingerprint = run_completion_fingerprint(completion_record)
+    completion_record_path = run_completion_record_json_path(run_id, base_dir)
+
+    manifest_path = paths.run_manifest_path(run_id, base_dir)
+    if not manifest_path.exists():
+        create_run_workspace(run_id, base_dir)
+
+    for task_id in completion_record["completed_task_ids"]:
+        validate_id(task_id, "task")
+        task_status_path = paths.task_status_path(run_id, task_id, base_dir)
+        if not task_status_path.exists():
+            raise InvalidTransition(
+                f"task {task_id!r} is not completed; task_status is missing"
+            )
+        task_status = read_json(task_status_path)
+        if task_status["status"] != TASK_COMPLETED:
+            raise InvalidTransition(
+                f"task {task_id!r} is not completed; "
+                f"status is {task_status['status']!r}"
+            )
+
+    current_run_manifest = read_json(manifest_path)
+    previous_run_status = current_run_manifest["status"]
+
+    if previous_run_status == RUN_COMPLETED:
+        if event_id is None:
+            raise InvalidTransition(
+                f"illegal run transition: {previous_run_status!r} -> "
+                f"{RUN_COMPLETED!r}"
+            )
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise InvalidTransition(
+                f"illegal run transition: {previous_run_status!r} -> "
+                f"{RUN_COMPLETED!r}"
+            )
+        if _matches_manual_run_completed_replay(
+            existing_event,
+            run_id=run_id,
+            actor=actor,
+            completion_record=completion_record,
+        ):
+            return existing_event
+        if existing_event.get("event_type") == EVENT_TYPE_MANUAL_RUN_COMPLETED:
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise EventConflict(
+            f"event_id {event_id!r} already exists with different semantics"
+        )
+
+    if completion_record_path.exists():
+        raise InvalidTransition(
+            "run_completion_record.json exists while run status is not completed"
+        )
+
+    assert_valid_run_transition(previous_run_status, RUN_COMPLETED)
+
+    candidate = make_run_event(
+        event_type=EVENT_TYPE_MANUAL_RUN_COMPLETED,
+        run_id=run_id,
+        actor=actor,
+        payload={
+            "completed_task_ids": list(completion_record["completed_task_ids"]),
+            "run_completion_fingerprint": submitted_fingerprint,
+            "run_completion_record_path": str(completion_record_path),
+        },
+        event_id=event_id,
+        previous_status=previous_run_status,
+        new_status=RUN_COMPLETED,
+    )
+    existing = _resolve_idempotent_event(run_id, candidate, base_dir)
+    if existing is not None:
+        return existing
+
+    ensure_dir(completion_record_path.parent)
+    atomic_write_json(completion_record_path, completion_record)
+    append_run_event(run_id, candidate, base_dir)
+
+    updated_run_manifest = dict(current_run_manifest)
+    updated_run_manifest["status"] = RUN_COMPLETED
+    validate_schema(updated_run_manifest, "run_manifest")
+    atomic_write_json(manifest_path, updated_run_manifest)
+    return candidate
+
+
+def _matches_manual_run_reviewed_replay(
+    existing: dict[str, Any],
+    *,
+    run_id: str,
+    actor: str,
+    review_record: dict[str, Any],
+) -> bool:
+    """Return True when *existing* matches a successful manual run review replay."""
+    payload = existing.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        existing.get("event_type") == EVENT_TYPE_MANUAL_RUN_REVIEWED
+        and existing.get("run_id") == run_id
+        and existing.get("actor") == actor
+        and payload.get("decision") == review_record["decision"]
+        and payload.get("reviewer") == review_record["reviewer"]
+        and payload.get("run_review_fingerprint")
+        == run_review_fingerprint(review_record)
+    )
+
+
+def review_run_manually(
+    run_id: str,
+    review_record: dict[str, Any],
+    *,
+    actor: str = "human",
+    event_id: str | None = None,
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Manually record a human review decision for a completed run."""
+    validate_id(run_id, "run")
+    validate_schema(review_record, "run_review_record")
+    if review_record["run_id"] != run_id:
+        raise ValueError("review_record run_id does not match submission target")
+
+    submitted_fingerprint = run_review_fingerprint(review_record)
+    review_record_path = run_review_record_json_path(run_id, base_dir)
+    completion_record_path = run_completion_record_json_path(run_id, base_dir)
+    manifest_path = paths.run_manifest_path(run_id, base_dir)
+
+    if not manifest_path.exists():
+        raise InvalidTransition(f"run {run_id!r} is not completed")
+
+    current_run_manifest = read_json(manifest_path)
+    if current_run_manifest["status"] != RUN_COMPLETED:
+        raise InvalidTransition(
+            f"run {run_id!r} is not completed; "
+            f"status is {current_run_manifest['status']!r}"
+        )
+
+    if not completion_record_path.exists():
+        raise InvalidTransition("run_completion_record.json is missing")
+
+    if review_record_path.exists():
+        if event_id is None:
+            raise InvalidTransition("run_review_record.json already exists")
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise InvalidTransition("run_review_record.json already exists")
+        if _matches_manual_run_reviewed_replay(
+            existing_event,
+            run_id=run_id,
+            actor=actor,
+            review_record=review_record,
+        ):
+            return existing_event
+        if existing_event.get("event_type") == EVENT_TYPE_MANUAL_RUN_REVIEWED:
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise EventConflict(
+            f"event_id {event_id!r} already exists with different semantics"
+        )
+
+    candidate = make_run_event(
+        event_type=EVENT_TYPE_MANUAL_RUN_REVIEWED,
+        run_id=run_id,
+        actor=actor,
+        payload={
+            "decision": review_record["decision"],
+            "reviewer": review_record["reviewer"],
+            "run_review_fingerprint": submitted_fingerprint,
+            "run_review_record_path": str(review_record_path),
+        },
+        event_id=event_id,
+    )
+    existing = _resolve_idempotent_event(run_id, candidate, base_dir)
+    if existing is not None:
+        return existing
+
+    ensure_dir(review_record_path.parent)
+    atomic_write_json(review_record_path, review_record)
+    append_run_event(run_id, candidate, base_dir)
     return candidate
