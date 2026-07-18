@@ -17,7 +17,6 @@ Key design decisions:
 import asyncio
 import json
 import logging
-import ntpath
 import os
 import random
 import re
@@ -36,46 +35,56 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_PERSISTED_CWD_SOURCES = frozenset({"cli", "tui"})
 _MAX_PERSISTED_CWD_CHARS = 4096
+_NATIVE_CWD_PLATFORM = "windows" if os.name == "nt" else "posix"
 
 
-def _is_fully_qualified_path(value: str) -> bool:
-    if os.name != "nt":
-        return os.path.isabs(value)
-    if value.startswith(("\\\\", "//")):
-        if len(value) < 3 or value[2] in "\\/":
-            return False
-        components = re.split(r"[\\/]", value[2:])
-        return (
-            len(components) >= 2
-            and bool(components[0])
-            and bool(components[1])
-            and components[0] not in {"?", "."}
-        )
-    if value.startswith(("\\", "/")):
-        return False
-    drive, tail = ntpath.splitdrive(value)
-    return (
-        len(drive) == 2
-        and drive[0].isalpha()
-        and drive[1] == ":"
-        and tail.startswith(("\\", "/"))
-    )
-
-
-def _is_canonical_absolute_cwd(value: object) -> bool:
+def _is_canonical_absolute_cwd(value: object, *, platform: str) -> bool:
+    """Validate original cwd text under an explicit lexical path grammar."""
     if (
         not isinstance(value, str)
         or not value
         or value != value.strip()
         or len(value) > _MAX_PERSISTED_CWD_CHARS
         or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
-        or not _is_fully_qualified_path(value)
     ):
         return False
-    separator_tail = value[2:] if value.startswith(("\\\\", "//")) else value
-    if re.search(r"[\\/]{2}", separator_tail):
+
+    if platform == "windows":
+        drive_match = re.match(r"^[A-Za-z]:[\\/]", value)
+        if drive_match is not None:
+            if len(value) == 3:
+                return False
+            lexical_tail = value[2:]
+            components = re.split(r"[\\/]", value[3:])
+        elif len(value) >= 2 and value[0] in "\\/" and value[1] == value[0]:
+            if len(value) < 3 or value[2] in "\\/":
+                return False
+            lexical_tail = value[2:]
+            components = re.split(r"[\\/]", lexical_tail)
+            if (
+                len(components) < 2
+                or not components[0]
+                or not components[1]
+                or components[0] in {"?", "."}
+            ):
+                return False
+        else:
+            return False
+        if re.search(r"[\\/]{2}", lexical_tail):
+            return False
+    elif platform == "posix":
+        if not value.startswith("/") or value.startswith("//"):
+            return False
+        if value == "/":
+            return True
+        lexical_tail = value[1:]
+        if "//" in lexical_tail:
+            return False
+        components = lexical_tail.split("/")
+    else:
         return False
-    return not any(part in {".", ".."} for part in re.split(r"[\\/]", value))
+
+    return not any(part in {".", ".."} for part in components)
 
 
 def _delegate_from_json(col: str = "model_config") -> str:
@@ -3313,7 +3322,7 @@ class SessionDB:
         ):
             return None
         cwd = parent.get("cwd")
-        if not _is_canonical_absolute_cwd(cwd):
+        if not _is_canonical_absolute_cwd(cwd, platform=_NATIVE_CWD_PLATFORM):
             return None
         return cwd
 

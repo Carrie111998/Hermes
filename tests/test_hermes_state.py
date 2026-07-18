@@ -76,6 +76,62 @@ def db(tmp_path):
     session_db.close()
 
 
+@pytest.mark.parametrize(
+    ("platform", "cwd", "expected"),
+    [
+        ("windows", None, False),
+        ("windows", "", False),
+        ("windows", "C:\\" + "x" * 4095, False),
+        ("windows", "C:\\work\\project", True),
+        ("windows", "C:/work/project", True),
+        ("windows", "\\\\server\\share", True),
+        ("windows", "\\\\server\\share\\project", True),
+        ("windows", "//server/share/project", True),
+        ("windows", "é:\\work\\project", False),
+        ("windows", "C:", False),
+        ("windows", "C:\\", False),
+        ("windows", "C:work\\project", False),
+        ("windows", "\\work\\project", False),
+        ("windows", "/work/project", False),
+        ("windows", "\\\\\\server\\share\\project", False),
+        ("windows", "///server/share/project", False),
+        ("windows", "\\\\server", False),
+        ("windows", "\\\\?\\C:\\work\\project", False),
+        ("windows", "\\\\.\\C:\\work\\project", False),
+        ("windows", "C:\\work\\\\project", False),
+        ("windows", "C:/work//project", False),
+        ("windows", "C:\\work\\.\\project", False),
+        ("windows", "C:\\work\\..\\project", False),
+        ("windows", " C:\\work\\project", False),
+        ("windows", "C:\\work\\project ", False),
+        ("windows", "C:\\work\\pro\tject", False),
+        ("windows", "C:\\work\\pro\x1fject", False),
+        ("windows", "C:\\work\\pro\x85ject", False),
+        ("posix", "/", True),
+        ("posix", "", False),
+        ("posix", "/" + "x" * 4096, False),
+        ("posix", "/work", True),
+        ("posix", "/work/project", True),
+        ("posix", "//server/share", False),
+        ("posix", "///server/share", False),
+        ("posix", "/work//project", False),
+        ("posix", "/work/./project", False),
+        ("posix", "/work/../project", False),
+        ("posix", "work/project", False),
+        ("posix", " /work/project", False),
+        ("posix", "/work/project\n", False),
+        ("posix", "/work/pro\tject", False),
+        ("posix", "/work/pro\x85ject", False),
+        ("posix", "/work\\..\\project", True),
+        ("unknown", "/work/project", False),
+    ],
+)
+def test_canonical_absolute_cwd_has_explicit_platform_semantics(
+    platform, cwd, expected
+):
+    assert hermes_state._is_canonical_absolute_cwd(cwd, platform=platform) is expected
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================
