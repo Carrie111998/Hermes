@@ -45,6 +45,7 @@ CLAUDE_VISIBILITY_EXCLUSION_CODES = frozenset({
     "control_only",
     "no_meaningful_request",
     "unstable_identity",
+    "source_cwd_missing",
 })
 _ACKNOWLEDGEMENTS = frozenset({"ok", "okay", "yes", "y", "ready"})
 _CONTROLS = frozenset({
@@ -134,6 +135,10 @@ def evaluate_claude_visibility(
         canonical_session_id(projection.provider, projection.native_id)
     except ValueError:
         return "unstable_identity"
+    try:
+        _required_metadata(projection.cwd, "source cwd")
+    except ValueError:
+        return "source_cwd_missing"
 
     normalized_user_texts = tuple(
         normalized

@@ -216,6 +216,40 @@ def test_discovery_interleaves_hermes_and_codex_newest_first_stably() -> None:
     ]
 
 
+def test_discovery_reports_missing_source_cwd_without_invalidating_inventory() -> None:
+    missing_cwd = replace(
+        _source("missing-cwd", provider=Provider.HERMES).projection,
+        cwd=None,
+    )
+    source = replace(
+        _source("missing-cwd", provider=Provider.HERMES),
+        projection=missing_cwd,
+    )
+    coordinator, _calls = _coordinator([source, _source("valid")])
+
+    result = coordinator.discover(days=30, limit=10)
+
+    assert result.degraded is False
+    assert [item.candidate.source_session_id for item in result.candidates] == [
+        "codex:valid"
+    ]
+    assert [(item.source_session_id, item.reason) for item in result.exclusions] == [
+        ("hermes:missing-cwd", "source_cwd_missing")
+    ]
+
+
+def test_discovery_keeps_unknown_candidate_metadata_validation_fail_closed() -> None:
+    malformed = replace(_source("bad-git-root"), git_root=" C:/work")
+    coordinator, _calls = _coordinator([malformed])
+
+    result = coordinator.discover(days=30, limit=10)
+
+    assert result.degraded is True
+    assert result.reasons == ("inventory_invalid",)
+    assert result.candidates == ()
+    assert result.exclusions == ()
+
+
 def test_dry_run_never_writes_claims_or_invokes_registrar() -> None:
     store = FakeStore()
     registrar = FakeRegistrar()
