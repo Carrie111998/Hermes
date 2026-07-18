@@ -1337,6 +1337,7 @@ def test_session_sidebar_bind_has_two_argument_schema_and_is_idempotent(
 
 def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract(
     db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
     coordinator = _FakeCoordinator(
@@ -1351,6 +1352,58 @@ def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract
             emergency_daily_cost_usd="0.50",
         )
     )
+    observed_status_calls: list[float] = []
+
+    def populated_status(now: float) -> dict[str, Any]:
+        observed_status_calls.append(now)
+        return {
+            "counts": {
+                "claude_pending": 2,
+                "claude_leased": 1,
+                "claude_retry": 1,
+                "claude_visible": 3,
+                "claude_failed": 1,
+            },
+            "retry_codes": {"future_retry_code": 1},
+            "failed_codes": {"marker_conflict": 1},
+            "usage": {
+                "local_day": "2026-07-17",
+                "attempts": 4,
+                "reserved_cost_usd": "0.08",
+            },
+            "fatal": [
+                {
+                    "code": "unknown_job_state",
+                    "state": "future_state",
+                    "error_code": None,
+                    "count": 1,
+                }
+            ],
+            "last_cycle": {
+                "tracked": True,
+                "value": {
+                    "at": 120.0,
+                    "sequence": 9,
+                    "status": "retry",
+                    "error_code": "native_transcript_not_indexed",
+                    "empty_verified": False,
+                },
+            },
+            "last_empty_cycle": {"tracked": True, "value": 100.0},
+            "last_registrar_result": {
+                "tracked": True,
+                "value": {
+                    "at": 119.0,
+                    "sequence": 8,
+                    "status": "registered",
+                    "error_code": None,
+                },
+            },
+        }
+
+    monkeypatch.setattr(store, "claude_visibility_status", populated_status)
+    assert db._conn is not None
+    changes_before = db._conn.total_changes
     app = create_app(
         catalog=UnifiedCatalog(db, store),
         coordinator=coordinator,
@@ -1367,31 +1420,50 @@ def test_claude_visibility_status_is_read_only_and_exposes_fixed_health_contract
     assert payload["enabled"] is True
     assert payload["continuous"] is True
     assert payload["counts"] == {
-        "claude_pending": 0,
-        "claude_leased": 0,
-        "claude_retry": 0,
-        "claude_visible": 0,
-        "claude_failed": 0,
+        "claude_pending": 2,
+        "claude_leased": 1,
+        "claude_retry": 1,
+        "claude_visible": 3,
+        "claude_failed": 1,
     }
     assert payload["cost_gates"] == {
         "daily_registration_limit": 25,
-        "attempts_remaining": 25,
+        "attempts_remaining": 21,
         "reserved_cost_per_attempt_usd": "0.02",
         "emergency_daily_cost_usd": "0.50",
-        "reserved_cost_remaining_usd": "0.50",
+        "reserved_cost_remaining_usd": "0.42",
         "registration_limit_reached": False,
         "emergency_cost_limit_reached": False,
     }
-    assert payload["degraded_reasons"] == []
-    assert payload["last_cycle"] == {"tracked": False, "value": None}
-    assert payload["last_empty_cycle"] == {"tracked": False, "value": None}
-    assert payload["last_registrar_result"] == {"tracked": False, "value": None}
+    assert payload["retry_codes"] == {"future_retry_code": 1}
+    assert payload["failed_codes"] == {"marker_conflict": 1}
+    assert payload["degraded_reasons"] == [
+        "marker_conflict",
+        "unknown_job_state",
+        "unknown_retry_code",
+    ]
+    assert payload["last_cycle"]["value"]["sequence"] == 9
+    assert payload["last_empty_cycle"] == {"tracked": True, "value": 100.0}
+    assert payload["last_registrar_result"]["value"] == {
+        "at": 119.0,
+        "sequence": 8,
+        "status": "registered",
+        "error_code": None,
+    }
+    assert len(observed_status_calls) == 1
+    assert db._conn.total_changes == changes_before
     names = {tool["name"] for tool in listed["result"]["tools"]}
     assert not any(
         fragment in name
         for name in names
-        for fragment in ("claude_pending", "claude_claim", "claude_create",
-                         "claude_bind", "claude_commit", "claude_fail")
+        for fragment in (
+            "claude_pending",
+            "claude_claim",
+            "claude_create",
+            "claude_bind",
+            "claude_commit",
+            "claude_fail",
+        )
     )
 
 

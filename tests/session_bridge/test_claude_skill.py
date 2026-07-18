@@ -59,9 +59,10 @@ def test_install_claude_skill_is_idempotent_and_preserves_unrelated_user_files(
 def test_claude_skill_uses_authenticated_catalog_tools_and_explicit_selection() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "session_bridge:session_search" in skill
-    assert "session_bridge:session_get" in skill
-    assert "session_bridge:session_continue" in skill
+    assert "mcp__session_bridge__session_search" in skill
+    assert "mcp__session_bridge__session_get" in skill
+    assert "mcp__session_bridge__session_continue" in skill
+    assert "session_bridge:session_" not in skill
     for field in ("provider", "title", "cwd", "activity", "mirror", "preview"):
         assert field in skill.lower()
     assert "explicit" in skill.lower() and "selection" in skill.lower()
@@ -106,7 +107,7 @@ def test_install_claude_skill_rejects_redirected_destination(tmp_path: Path) -> 
     assert list(outside.iterdir()) == []
 
 
-def test_claude_install_copy_failure_preserves_existing_tree(
+def test_claude_install_promotion_failure_restores_existing_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from session_bridge import claude_skill
@@ -115,13 +116,24 @@ def test_claude_install_copy_failure_preserves_existing_tree(
     destination = claude_home / "skills" / "session-bridge"
     destination.mkdir(parents=True)
     (destination / "old.txt").write_text("preserve", encoding="utf-8")
-    monkeypatch.setattr(
-        claude_skill,
-        "_copy_packaged_skill",
-        lambda _destination, *_guard: (_ for _ in ()).throw(PermissionError("denied")),
-    )
+    real_replace = claude_skill._guarded_replace
+    replacements: list[tuple[Path, Path]] = []
 
-    with pytest.raises(PermissionError, match="denied"):
+    def fail_promotion(source: Path, target: Path, identity: object) -> None:
+        replacements.append((source, target))
+        if target == destination and source.name.startswith(".session-bridge.install-"):
+            raise PermissionError("promotion denied")
+        real_replace(source, target, identity)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(claude_skill, "_guarded_replace", fail_promotion)
+
+    with pytest.raises(PermissionError, match="promotion denied"):
         claude_skill.install_claude_skill(claude_home)
 
     assert (destination / "old.txt").read_text(encoding="utf-8") == "preserve"
+    assert not (destination / "SKILL.md").exists()
+    assert any(
+        target.name.startswith("session-bridge.backup") for _, target in replacements
+    )
+    assert replacements[-1][0].name.startswith("session-bridge.backup")
+    assert replacements[-1][1] == destination
