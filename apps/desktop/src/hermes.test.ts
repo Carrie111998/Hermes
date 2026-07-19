@@ -46,6 +46,7 @@ describe('Hermes REST helpers', () => {
   })
 
   afterEach(() => {
+    setApiRequestProfile(null)
     setSpeechSynthesisTimeoutSeconds(undefined)
     vi.restoreAllMocks()
     Reflect.deleteProperty(window, 'hermesDesktop')
