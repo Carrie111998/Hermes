@@ -1,11 +1,12 @@
 import { type MutableRefObject, useCallback } from 'react'
 
-import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS, getSessionMessages } from '@/hermes'
+import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import type { Translations } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, textPart, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { refreshIfTranscriptStale } from '@/lib/stale-transcript-guard'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -73,7 +74,7 @@ interface SubmitPromptDeps {
   }
 }
 
-// Stable identity ??a fresh default object per render would churn the
+// Stable identity — a fresh default object per render would churn the
 // useCallback below on every render.
 const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
   clearAttachments: clearComposerAttachments,
@@ -122,7 +123,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // workspace-relative paths the remote gateway can resolve). Seed the
       // optimistic message with the pre-sync refs, then rewrite once synced.
       // Images use their base64 preview so the thumbnail renders inline without
-      // a (remote-mode 403-prone) /api/media fetch ??see optimisticAttachmentRef.
+      // a (remote-mode 403-prone) /api/media fetch — see optimisticAttachmentRef.
       let attachmentRefs = attachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
 
       const buildContextText = (atts: ComposerAttachment[]): string => {
@@ -141,8 +142,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         )
       }
 
-      // Queue drains fire on the busy?�false settle edge, where busyRef (synced
-      // from $busy by a separate effect) may still read true ??honoring it would
+      // Queue drains fire on the busy→false settle edge, where busyRef (synced
+      // from $busy by a separate effect) may still read true — honoring it would
       // bounce the drained send. The drain lock serializes them; the user path
       // keeps the guard so a stray Enter mid-turn can't double-submit.
       //
@@ -193,8 +194,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
-      // can redirect the user's text into a different chat (#54527). Mutable ??
-      // not const ??because a new-chat submit legitimately re-homes to the
+      // can redirect the user's text into a different chat (#54527). Mutable —
+      // not const — because a new-chat submit legitimately re-homes to the
       // session it creates (see the re-pin after createBackendSessionForSend).
       const startingActiveSessionId = activeSessionIdRef.current
       const selectedStoredSessionId = selectedStoredSessionIdRef.current
@@ -219,7 +220,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // under this in-flight submit. sessionContextDrift ignores the churn a
       // busy gateway produces (selection null-resets on a gateway/profile
       // switch, search/hash-only route changes, background active-ref
-      // retargets) so a second-session send doesn't silently abort ??it fires
+      // retargets) so a second-session send doesn't silently abort — it fires
       // only on a real move to a DIFFERENT chat. Reads the live refs/route each
       // call and measures against the (mutable) baseline, which is re-pinned to
       // the created chat after createBackendSessionForSend. submitTargetStoredId
@@ -246,7 +247,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionDriftReason()
 
-      // One submit in flight per session ??drop any concurrent re-fire so a
+      // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns. The
       // foreground ChatBar and background drainers can briefly overlap during a
       // session switch; this per-session lock makes that safe.
@@ -285,7 +286,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         }
       }
 
-      // Idempotent optimistic insert ??re-running with the resolved sessionId
+      // Idempotent optimistic insert — re-running with the resolved sessionId
       // after createBackendSessionForSend just overwrites with the same id.
       const seedOptimistic = (sid: string) =>
         updateSessionState(
@@ -299,7 +300,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             awaitingResponse: true,
             pendingBranchGroup: null,
             sawAssistantPayload: false,
-            // Fresh submit = new turn ??clear any leftover interrupt flag, else
+            // Fresh submit = new turn — clear any leftover interrupt flag, else
             // mutateStream/completeAssistantMessage drop every delta of this turn
             // (what made drained-after-interrupt sends go silent).
             interrupted: false
@@ -415,7 +416,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // background queue drain only has the durable id). Continue that target
         // conversation; only a genuine new-chat draft may create a new session.
         try {
-          // Re-register on the session's OWNING profile ??resuming on whichever
+          // Re-register on the session's OWNING profile — resuming on whichever
           // profile is live would fork the conversation into the wrong DB (#67603).
           const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
 
@@ -480,7 +481,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         if (!sessionId) {
           // createBackendSessionForSend returns null when the user switched
-          // sessions mid-create (it closes the orphaned session itself) ??
+          // sessions mid-create (it closes the orphaned session itself) —
           // abort silently. Anything else is a real failure worth a toast.
           const createNullDrift = sessionDriftReason()
 
@@ -535,7 +536,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         // Rewrite the optimistic message + prompt text with the synced refs so
         // the gateway receives @file: paths that resolve in its workspace.
-        // (Images keep their inline base64 preview ??see optimisticAttachmentRef.)
+        // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(sessionId)
         const text = buildContextText(syncedAttachments)
@@ -543,57 +544,46 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // Multi-window stale guard (#65047): another Desktop window may own the
         // live transcript while this one still shows an open-time snapshot.
         // Block send + refresh rather than injecting an out-of-date context.
+        // Profile is resolved inside refreshIfTranscriptStale so cross-profile
+        // sessions hit the owning backend (see getSessionMessages routing).
         const guardStoredId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
         if (guardStoredId && sessionId) {
           const localSnapshot = updateSessionState(sessionId, state => state, targetStoredSessionId)
-          const localCount = localSnapshot.messages.filter(message => message.id !== optimisticId).length
 
-          try {
-            const remote = await getSessionMessages(guardStoredId)
+          const refreshed = await refreshIfTranscriptStale(guardStoredId, localSnapshot.messages, {
+            excludeMessageId: optimisticId
+          })
 
-            if (sessionDriftReason()) {
-              return abortForSessionSwitch(sessionId)
+          if (sessionDriftReason()) {
+            return abortForSessionSwitch(sessionId)
+          }
+
+          if (refreshed) {
+            updateSessionState(
+              sessionId,
+              state => ({
+                ...state,
+                messages: refreshed,
+                busy: false,
+                awaitingResponse: false,
+                pendingBranchGroup: null
+              }),
+              targetStoredSessionId
+            )
+
+            if (targetIsCurrentView()) {
+              scope.setMessages(() => refreshed)
+              notify({
+                kind: 'warning',
+                title: copy.staleSessionTitle,
+                message: copy.staleSessionBody
+              })
             }
 
-            // Compare ChatMessage lengths (tools are folded by toChatMessages),
-            // not raw SessionMessage counts — otherwise a tool-using transcript
-            // looks "ahead" forever and soft-locks every subsequent send.
-            const remoteChat = toChatMessages(remote.messages)
+            releaseBusy()
 
-            if (remoteChat.length > localCount) {
-              const refreshed = preserveLocalAssistantErrors(
-                remoteChat,
-                localSnapshot.messages.filter(message => message.id !== optimisticId)
-              )
-
-              updateSessionState(
-                sessionId,
-                state => ({
-                  ...state,
-                  messages: refreshed,
-                  busy: false,
-                  awaitingResponse: false,
-                  pendingBranchGroup: null
-                }),
-                targetStoredSessionId
-              )
-
-              if (targetIsCurrentView()) {
-                scope.setMessages(() => refreshed)
-                notify({
-                  kind: 'warning',
-                  title: copy.staleSessionTitle,
-                  message: copy.staleSessionBody
-                })
-              }
-
-              releaseBusy()
-
-              return false
-            }
-          } catch {
-            // Authoritative check failed: do not soft-lock the composer.
+            return false
           }
         }
 
@@ -619,7 +609,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // Re-register the session in the gateway and get a fresh live ID.
             // Timeouts recover the same way as "session not found": a starved
             // backend loop (#55578 symptom d) rejects the submit even though
-            // the stored session is fine ??resume + retry instead of erroring
+            // the stored session is fine — resume + retry instead of erroring
             // out and losing the session binding.
             const resumeProfile = await resolveSessionProfile(recoverStoredSessionId)
 
@@ -663,7 +653,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           scope.clearAttachments()
         }
 
-        // Submit landed ??the turn now runs (busy stays true), but the submit
+        // Submit landed — the turn now runs (busy stays true), but the submit
         // window is closed, so release the lock for the next (sequential) send.
         releaseSubmitLock()
 
@@ -672,7 +662,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         releaseBusy()
 
         // A queued drain that raced a not-yet-settled turn gets a transient
-        // "session busy" (4009). Don't surface an error bubble/toast ??the entry
+        // "session busy" (4009). Don't surface an error bubble/toast — the entry
         // stays queued and the composer's bounded auto-drain retries when idle.
         if (options?.fromQueue && isSessionBusyError(err)) {
           return false
