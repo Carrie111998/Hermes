@@ -12640,6 +12640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                _event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18202,6 +18203,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        _event: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18220,6 +18222,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                _event=_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18231,6 +18234,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                _event=_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -18352,6 +18356,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        _event: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -18608,6 +18613,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            # Fire on_tool_call_start hook before the progress_queue guard so
+            # reaction swapping works even when tool progress messages are off.
+            if event_type == "tool.started" and tool_name and _status_adapter and _loop_for_step and _run_still_current():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _status_adapter._run_processing_hook(
+                            "on_tool_call_start", _event, tool_name
+                        ),
+                        _loop_for_step,
+                    )
+                except Exception:
+                    pass
+
             # Live status line (Slack's assistant status): stash the current
             # tool phrase on the adapter; the _keep_typing refresh renders it
             # within a couple of seconds. Handled before every other gate
@@ -18634,19 +18652,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _live_status_adapter.set_status_text(source.chat_id, None)
                 except Exception as _ls_err:
                     logger.debug("live status update failed: %s", _ls_err)
-
-            # Fire on_tool_call_start hook before the progress_queue guard so
-            # reaction swapping works even when tool progress messages are off.
-            if event_type == "tool.started" and tool_name and _status_adapter and _loop_for_step and _run_still_current():
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _status_adapter._run_processing_hook(
-                            "on_tool_call_start", source, tool_name
-                        ),
-                        _loop_for_step,
-                    )
-                except Exception:
-                    pass
 
             if not progress_queue or not _run_still_current():
                 return
