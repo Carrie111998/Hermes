@@ -450,9 +450,20 @@ class TestClassifyApiError:
 
     # ── Provider-specific: llama.cpp grammar-parse ──
 
+    def test_llama_cpp_failed_to_parse_grammar_phrase(self):
+        """LM Studio's engine surfaces this as 'failed to initialize samplers: failed to parse grammar'."""
+        e = MockAPIError(
+            "Failed to initialize samplers: failed to parse grammar",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="openai-compatible")
+        assert result.reason == FailoverReason.llama_cpp_grammar_pattern
 
-
-
+    def test_llama_cpp_grammar_requires_400(self):
+        """A 500 with the same phrase isn't the llama.cpp grammar case."""
+        e = MockAPIError("error parsing grammar", status_code=500)
+        result = classify_api_error(e, provider="openai-compatible")
+        assert result.reason != FailoverReason.llama_cpp_grammar_pattern
 
     # ── Provider-specific: Anthropic long-context tier ──
 
