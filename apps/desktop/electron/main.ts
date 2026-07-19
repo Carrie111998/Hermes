@@ -136,12 +136,7 @@ import {
 import { remainingLinkTitleMs, withLinkTitleTimeout } from './link-title-deadline'
 import { createLinkTitlePinnedResolver } from './link-title-dns'
 import { createLinkTitleFetcher } from './link-title-fetch'
-import { createLinkTitleRenderQueue } from './link-title-render-queue'
-import {
-  createLinkTitleSocksGatewayController,
-  startLinkTitleSocksGateway
-} from './link-title-socks'
-import { configureLinkTitleSession, createLinkTitleWindow, readLinkTitleWindowTitle } from './link-title-window'
+import { createLinkTitleSocksGatewayController, startLinkTitleSocksGateway } from './link-title-socks'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
@@ -4389,7 +4384,9 @@ function filenameFromUrl(rawUrl, fallback = 'image') {
   }
 }
 
-// Link title resolution — curl (tier 1) → hidden BrowserWindow (tier 2).
+// Link title resolution uses a pinned SOCKS-backed curl path only. Do not load
+// linked pages in a hidden renderer: even public URLs can invoke native
+// credential/passkey UI before page-level controls apply.
 // Use bundle-time require here so the Electron composite project does not pull
 // the shared workspace's source tree under its own rootDir.
 const { admitLinkTitleUrl, isPublicLinkTitleAddress } = require('@hermes/shared') as {
@@ -4416,14 +4413,6 @@ const TITLE_ERROR_RE =
 
 const HTML_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', '#39': "'" }
 
-// Tier-2 renderer fallback config. Only invoked when curl came back empty or
-// matched TITLE_ERROR_RE — keeps cold/CDN-cached pages on the cheap path.
-const RENDER_TITLE_MAX_CONCURRENT = 2
-const RENDER_TITLE_TIMEOUT_MS = 8000
-const RENDER_TITLE_GRACE_MS = 700
-
-let linkTitleSession = null
-let linkTitleSessionPending = null
 let linkTitleQuitting = false
 let linkTitleQuitCleanupStarted = false
 let linkTitleGatewayClosed = false
@@ -4567,156 +4556,6 @@ const fetchHtmlTitleWithCurl = createLinkTitleCurlFetcher({
   timeoutMs: TITLE_TIMEOUT_MS
 })
 
-async function getLinkTitleSession(timeoutMs: number) {
-  if (linkTitleQuitting || !app.isReady()) {
-    return null
-  }
-
-  if (linkTitleSession) {
-    return linkTitleSession
-  }
-
-  if (linkTitleSessionPending) {
-    return withLinkTitleTimeout(linkTitleSessionPending, timeoutMs).catch(() => null)
-  }
-
-  const deadline = Date.now() + timeoutMs
-
-  const pending = (async () => {
-    const gateway = await withLinkTitleTimeout(linkTitleGatewayController.get(), remainingLinkTitleMs(deadline))
-    const candidate = session.fromPartition('hermes:link-titles', { cache: false })
-    await configureLinkTitleSession(
-      candidate,
-      admitLinkTitleUrl,
-      gateway.proxyUrl,
-      remainingLinkTitleMs(deadline)
-    )
-    linkTitleSession = candidate
-
-    return candidate
-  })()
-    .catch(() => null)
-    .finally(() => {
-      if (linkTitleSessionPending === pending) {
-        linkTitleSessionPending = null
-      }
-    })
-
-  linkTitleSessionPending = pending
-
-  return pending
-}
-
-async function runRenderTitleJob(rawUrl: string, deadline: number): Promise<string> {
-  const url = admitLinkTitleUrl(rawUrl)
-
-  if (!url || linkTitleQuitting) {
-    return ''
-  }
-
-  if (!app.isReady()) {
-    return ''
-  }
-
-  const partitionSession = await getLinkTitleSession(remainingLinkTitleMs(deadline))
-
-  if (!partitionSession || linkTitleQuitting) {
-    return ''
-  }
-
-  const remainingMs = remainingLinkTitleMs(deadline)
-
-  if (remainingMs <= 0) {
-    return ''
-  }
-
-  return new Promise<string>(resolve => {
-
-    let settled = false
-    let window = null
-    let hardTimer = null
-    let graceTimer = null
-
-    const finish = title => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-
-      if (hardTimer) {
-        clearTimeout(hardTimer)
-      }
-
-      if (graceTimer) {
-        clearTimeout(graceTimer)
-      }
-
-      const value = (title || '').replace(/\s+/g, ' ').trim()
-
-      try {
-        if (window && !window.isDestroyed()) {
-          window.destroy()
-        }
-      } catch {
-        // BrowserWindow may already be torn down; ignore.
-      }
-
-      resolve(value)
-    }
-
-    try {
-      window = createLinkTitleWindow(BrowserWindow, partitionSession)
-    } catch {
-      return finish('')
-    }
-
-    const finishWithTitle = () => finish(readLinkTitleWindowTitle(window))
-
-    const scheduleGrace = () => {
-      if (graceTimer) {
-        clearTimeout(graceTimer)
-      }
-
-      graceTimer = setTimeout(finishWithTitle, RENDER_TITLE_GRACE_MS)
-    }
-
-    hardTimer = setTimeout(finishWithTitle, remainingMs)
-
-    window.webContents.setUserAgent(TITLE_USER_AGENT)
-    window.webContents.on('page-title-updated', scheduleGrace)
-    window.webContents.on('did-finish-load', scheduleGrace)
-    window.webContents.on('did-fail-load', (_event, _code, _desc, _validatedURL, isMainFrame) => {
-      if (isMainFrame) {
-        finish('')
-      }
-    })
-
-    window
-      .loadURL(url, {
-        httpReferrer: 'https://www.google.com/',
-        userAgent: TITLE_USER_AGENT
-      })
-      .catch(() => finish(''))
-  })
-}
-
-const linkTitleRenderQueue = createLinkTitleRenderQueue({
-  concurrency: RENDER_TITLE_MAX_CONCURRENT,
-  run: runRenderTitleJob,
-  timeoutMs: RENDER_TITLE_TIMEOUT_MS
-})
-
-function fetchHtmlTitleWithRenderer(rawUrl: string): Promise<string> {
-  const url = admitLinkTitleUrl(rawUrl)
-
-  if (!url || linkTitleQuitting) {
-    return Promise.resolve('')
-  }
-
-  return linkTitleRenderQueue.enqueue(url)
-}
-
 // Strips known error/captcha titles (e.g. "GetYourGuide – Error", "Just a
 // moment...") so they don't get cached as the resolved title.
 function usableTitle(value: string): string {
@@ -4728,7 +4567,6 @@ const fetchLinkTitle = createLinkTitleFetcher({
   cache: titleCache,
   cacheKey: canonicalTitleCacheKey,
   fetchWithCurl: fetchHtmlTitleWithCurl,
-  fetchWithRenderer: fetchHtmlTitleWithRenderer,
   inflight: titleInflight,
   normalizeTitle: usableTitle,
   storeCachedTitle: cacheTitle
@@ -11832,9 +11670,6 @@ app.on('before-quit', event => {
 
   linkTitleQuitCleanupStarted = true
   linkTitleQuitting = true
-  linkTitleRenderQueue.close()
-  linkTitleSession = null
-  linkTitleSessionPending = null
   linkTitleGatewayClosePromise = linkTitleGatewayController.close().catch(() => undefined)
   void linkTitleGatewayClosePromise.finally(() => {
     linkTitleGatewayClosed = true
