@@ -2854,27 +2854,19 @@ class DiscordAdapter(BasePlatformAdapter):
         self._active_tool_reactions[message.id] = tool_emoji
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Replace the active reaction with ✅ (success) or ❌ (failure),
-        then restore the persona emoji so the agent's identity is visible,
-        and record durable handling state.
+        """Restore the persona emoji on completion, and record durable handling state.
 
-        Persona emoji identifies the agent during work; the terminal
-        reaction is a status indicator independent of identity.
+        The persona emoji identifies the agent — it stays on the message
+        as a persistent identity marker. No terminal ✅/❌ is added.
         """
         if self._reactions_enabled():
             message = event.raw_message
             if hasattr(message, "add_reaction"):
                 current = self._active_tool_reactions.pop(message.id, self._persona_emoji())
                 await self._remove_reaction(message, current)
-                if outcome == ProcessingOutcome.SUCCESS:
-                    await self._add_reaction(message, "✅")
-                elif outcome == ProcessingOutcome.FAILURE:
-                    await self._add_reaction(message, "❌")
-                # CANCELLED: remove active reaction, leave nothing
-                # Restore persona emoji after the terminal reaction so the
-                # agent's identity is still visible on the message.
-                if outcome in (ProcessingOutcome.SUCCESS, ProcessingOutcome.FAILURE):
-                    await self._add_reaction(message, self._persona_emoji())
+                # Restore the persona emoji so the agent's identity is
+                # always visible on the message.
+                await self._add_reaction(message, self._persona_emoji())
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
