@@ -18652,16 +18652,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _live_status_adapter.set_status_text(source.chat_id, None)
                 except Exception as _ls_err:
                     logger.debug("live status update failed: %s", _ls_err)
-            # "log" mode: append tool.started lines to the log queue and stay
-            # silent in chat. Handled before the progress_queue guard because
-            # log mode runs without a chat progress queue.
-            if log_queue is not None:
-                if event_type == "tool.started" and tool_name and tool_name != "_thinking":
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    preview_str = f' "{preview}"' if preview else ""
-                    log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
-                if not progress_queue:
-                    return
+
+            # Fire on_tool_call_start hook before the progress_queue guard so
+            # reaction swapping works even when tool progress messages are off.
+            if event_type == "tool.started" and tool_name and _status_adapter and _loop_for_step and _run_still_current():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _status_adapter._run_processing_hook(
+                            "on_tool_call_start", source, tool_name
+                        ),
+                        _loop_for_step,
+                    )
+                except Exception:
+                    pass
+
             if not progress_queue or not _run_still_current():
                 return
 

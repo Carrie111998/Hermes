@@ -2555,6 +2555,9 @@ DEFAULT_CONFIG = {
             "limit": 100,                 # Global cap on messages scanned per reconnect
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
         },
+        "reactions": True,             # Add emoji reactions to messages during processing
+        # persona_emoji: ""            # Per-platform override (inherits global persona_emoji if unset)
+        # dynamic_reactions: true      # Per-platform override (inherits global dynamic_reactions if unset)
         # Discord Gateway transport health. These settings inspect the active
         # WebSocket's ready/open/heartbeat state; they never use Discord REST as
         # proof that Gateway events are still arriving. Set any value to 0 to
@@ -2563,6 +2566,8 @@ DEFAULT_CONFIG = {
         "websocket_liveness_failure_threshold": 2,
         "websocket_heartbeat_ack_max_age_seconds": 60,
         "websocket_max_latency_seconds": 30,
+        "persona_emoji": "",           # Agent identity emoji shown on ack + completion (e.g. 🔎). Empty = 👀
+        "dynamic_reactions": True,     # Swap reaction per tool call to show current activity
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
