@@ -4451,35 +4451,33 @@ def test_sidebar_claim_is_atomic_across_independent_store_instances(tmp_path) ->
         first_db.close()
 
 
-def test_expired_sidebar_lease_recovers_to_retry_then_can_be_released_again(db) -> None:
+def test_expired_sidebar_lease_is_reclaimed_by_first_claim_with_bound_thread(
+    db,
+) -> None:
     store = SessionBridgeStore(
         db,
-        sidebar_token_factory=_token_factory(
-            "expired-token", "other-token", "replacement-token"
-        ),
+        sidebar_token_factory=_token_factory("expired-token", "recovered-token"),
         sidebar_jitter=lambda _bound: 0.0,
     )
-    expired = _sidebar_candidate(db, native_id="expired", eligible_at=20.0)
-    store.enqueue_sidebar_job(expired)
+    candidate = _sidebar_candidate(db, native_id="expired-bound", eligible_at=20.0)
+    store.enqueue_sidebar_job(candidate)
     first = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
-    other = _sidebar_candidate(db, native_id="other", eligible_at=10.0)
-    store.enqueue_sidebar_job(other)
+    store.bind_sidebar_thread(
+        lease_token=first["lease_token"],
+        codex_thread_id="codex-bound-thread",
+        now=150.0,
+    )
 
-    claimed_other = store.claim_sidebar_jobs(now=400.0, limit=1)[0]
+    recovered = store.claim_sidebar_jobs(now=400.0, limit=1)[0]
 
-    assert claimed_other["source_session_id"] == other.source_session_id
-    recovered = store.get_sidebar_job_for_source(expired.source_session_id)
-    assert recovered is not None
-    assert recovered["state"] == SidebarJobState.RETRY.value
-    assert recovered["attempts"] == 0
-    assert recovered["lease_digest"] is None
-    replacement = store.claim_sidebar_jobs(now=400.0, limit=1)[0]
-    assert replacement["source_session_id"] == expired.source_session_id
-    assert replacement["lease_token"] == "replacement-token"
+    assert recovered["source_session_id"] == candidate.source_session_id
+    assert recovered["lease_token"] == "recovered-token"
+    assert recovered["codex_thread_id"] == "codex-bound-thread"
+    assert recovered["state"] == SidebarJobState.LEASED.value
     with pytest.raises(ValueError, match="lease token"):
         store.commit_sidebar_job(
             lease_token=first["lease_token"],
-            codex_thread_id="codex-old",
+            codex_thread_id="codex-bound-thread",
             now=400.0,
         )
 
@@ -5590,6 +5588,25 @@ def test_sidebar_counts_and_source_lookup_have_stable_public_shapes(db) -> None:
         "sidebar_retry": 0,
         "sidebar_failed": 0,
     }
+
+
+def test_sidebar_delivery_status_reclassifies_expired_lease_as_retry(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("status-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="status-expired")
+    store.enqueue_sidebar_job(candidate)
+    store.claim_sidebar_jobs(now=100.0, limit=1)
+
+    active = store.sidebar_delivery_status(now=399.999)
+    expired = store.sidebar_delivery_status(now=400.0)
+
+    assert active["counts"]["sidebar_leased"] == 1
+    assert active["counts"]["sidebar_retry"] == 0
+    assert expired["counts"]["sidebar_leased"] == 0
+    assert expired["counts"]["sidebar_retry"] == 1
 
 
 def test_claude_visibility_enqueue_claim_commit_and_idempotency(db: SessionDB) -> None:

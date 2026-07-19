@@ -3810,6 +3810,19 @@ class SessionBridgeStore:
             raise ValueError("sidebar lease duration must be exactly 300 seconds")
 
         def _write(conn):
+            conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+                       lease_expires_at = NULL, error_code = NULL, updated_at = ?
+                   WHERE state = ? AND lease_expires_at <= ?""",
+                (
+                    SidebarJobState.RETRY.value,
+                    claim_time,
+                    claim_time,
+                    SidebarJobState.LEASED.value,
+                    claim_time,
+                ),
+            )
             due = conn.execute(
                 """SELECT * FROM session_sidebar_jobs
                    WHERE state IN (?, ?) AND next_attempt_at <= ?
@@ -3824,19 +3837,6 @@ class SessionBridgeStore:
                     _SIDEBAR_CLAIM_SCAN_LIMIT,
                 ),
             ).fetchall()
-            conn.execute(
-                """UPDATE session_sidebar_jobs
-                   SET state = ?, next_attempt_at = ?, lease_digest = NULL,
-                       lease_expires_at = NULL, error_code = NULL, updated_at = ?
-                   WHERE state = ? AND lease_expires_at <= ?""",
-                (
-                    SidebarJobState.RETRY.value,
-                    claim_time,
-                    claim_time,
-                    SidebarJobState.LEASED.value,
-                    claim_time,
-                ),
-            )
             claimed: list[dict[str, Any]] = []
             for raw_row in due:
                 if len(claimed) >= limit:
@@ -4489,6 +4489,16 @@ class SessionBridgeStore:
                     LIMIT ?""",
                 (SidebarJobState.VISIBLE.value, _SIDEBAR_LATENCY_SAMPLE_LIMIT),
             ).fetchall()
+            expired_row = conn.execute(
+                """SELECT COUNT(*) AS job_count
+                     FROM session_sidebar_jobs
+                    WHERE state = ? AND lease_expires_at <= ?""",
+                (SidebarJobState.LEASED.value, status_time),
+            ).fetchone()
+
+        expired_leases = int(expired_row["job_count"])
+        counts[SidebarJobState.LEASED.value] -= expired_leases
+        counts[SidebarJobState.RETRY.value] += expired_leases
 
         eligible_by_provider = {
             Provider.CLAUDE.value: 0,
