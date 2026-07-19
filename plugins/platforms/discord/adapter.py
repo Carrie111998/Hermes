@@ -2843,9 +2843,9 @@ class DiscordAdapter(BasePlatformAdapter):
         """Swap the active reaction to the tool-specific emoji.
 
         Called by the gateway's progress_callback on every ``tool.started``
-        event. Removes the previous reaction (persona or prior tool) and
-        adds the emoji that represents the current tool, so the message
-        always shows exactly one reaction reflecting what the agent is doing.
+        event. Adds the new tool emoji *before* removing the previous one so
+        the message never has a gap with no reaction (which causes the
+        message to visually jump in Discord).
         """
         if not self._dynamic_reactions_enabled():
             return
@@ -2855,9 +2855,11 @@ class DiscordAdapter(BasePlatformAdapter):
         from agent.display import get_tool_emoji
         tool_emoji = get_tool_emoji(tool_name, default="⚙️")
         current = self._active_tool_reactions.get(message.id)
+        # Add new emoji first, then remove old one — avoids a gap with no
+        # reaction that makes the message visually jump in Discord.
+        await self._add_reaction(message, tool_emoji)
         if current and current != tool_emoji:
             await self._remove_reaction(message, current)
-        await self._add_reaction(message, tool_emoji)
         self._active_tool_reactions[message.id] = tool_emoji
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
