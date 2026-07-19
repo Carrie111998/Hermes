@@ -51,7 +51,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo", "memory", "artifact",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -213,6 +213,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "artifact": {
+        "description": "Living artifacts: named models (maps/charts/tables/…) shared with clients and revisioned",
+        "tools": ["artifact"],
+        "includes": []
+    },
+
     "feed": {
         "description": "Publish curated articles to the user's news feed (HermesNative feed view)",
         "tools": ["feed_publish"],
@@ -363,7 +369,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
+            "todo", "memory", "artifact",
             "session_search", "clarify",
             "execute_code", "delegate_task",
         ],
@@ -395,7 +401,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
+            "todo", "memory", "artifact",
             "session_search",
             "execute_code", "delegate_task",
         ],
@@ -421,7 +427,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             # Planning & memory
-            "todo", "memory",
+            "todo", "memory", "artifact",
             # Session history search
             "session_search",
             # Code execution + delegation

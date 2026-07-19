@@ -15831,6 +15831,115 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5056, str(e))
 
 
+@method("artifact.set")
+def _(rid, params: dict) -> dict:
+    """Upsert a living artifact (a named model in the client render
+    dialects — map/chart/graph/stats/table/markdown — that any writer
+    maintains). Merges per kind server-side (map: markers union by label;
+    others replace) unless replace=true; appends a revision; emits
+    `artifact.changed` so connected clients stream the update live."""
+    try:
+        from tui_gateway.artifact_store import set_artifact
+
+        stored = set_artifact(
+            artifact_id=str(params.get("id", "")),
+            kind=str(params.get("kind", "")),
+            content=str(params.get("content", "")),
+            title=params.get("title"),
+            updated_by=str(params.get("updated_by", "")),
+            replace=bool(params.get("replace", False)),
+        )
+        _emit("artifact.changed", "", {
+            "id": stored["id"], "kind": stored["kind"],
+            "title": stored["title"], "rev": stored["rev"],
+            "updated_at": stored["updated_at"],
+            "updated_by": stored["updated_by"],
+        })
+        return _ok(rid, {"artifact": stored})
+    except ValueError as e:
+        return _err(rid, 4001, str(e))
+    except Exception as e:
+        logger.exception("artifact.set failed")
+        return _err(rid, 5210, str(e))
+
+
+@method("artifact.get")
+def _(rid, params: dict) -> dict:
+    """Fetch one artifact with content."""
+    try:
+        from tui_gateway.artifact_store import get_artifact
+
+        artifact = get_artifact(str(params.get("id", "")))
+        if artifact is None:
+            return _err(rid, 4004, "artifact not found")
+        return _ok(rid, {"artifact": artifact})
+    except Exception as e:
+        logger.exception("artifact.get failed")
+        return _err(rid, 5211, str(e))
+
+
+@method("artifact.list")
+def _(rid, params: dict) -> dict:
+    """All artifacts without content, newest first."""
+    try:
+        from tui_gateway.artifact_store import list_artifacts
+
+        return _ok(rid, {"artifacts": list_artifacts()})
+    except Exception as e:
+        logger.exception("artifact.list failed")
+        return _err(rid, 5212, str(e))
+
+
+@method("artifact.delete")
+def _(rid, params: dict) -> dict:
+    """Remove an artifact (and its revisions); emits artifact.changed with
+    deleted=true."""
+    try:
+        from tui_gateway.artifact_store import delete_artifact
+
+        artifact_id = str(params.get("id", ""))
+        if not delete_artifact(artifact_id):
+            return _err(rid, 4004, "artifact not found")
+        _emit("artifact.changed", "", {"id": artifact_id, "deleted": True})
+        return _ok(rid, {"deleted": artifact_id})
+    except Exception as e:
+        logger.exception("artifact.delete failed")
+        return _err(rid, 5213, str(e))
+
+
+@method("artifact.revisions")
+def _(rid, params: dict) -> dict:
+    """Revision metadata for an artifact (no content), newest first —
+    the audit trail: who changed what, when."""
+    try:
+        from tui_gateway.artifact_store import get_artifact, list_revisions
+
+        artifact_id = str(params.get("id", ""))
+        if get_artifact(artifact_id) is None:
+            return _err(rid, 4004, "artifact not found")
+        return _ok(rid, {"revisions": list_revisions(artifact_id)})
+    except Exception as e:
+        logger.exception("artifact.revisions failed")
+        return _err(rid, 5214, str(e))
+
+
+@method("artifact.revision")
+def _(rid, params: dict) -> dict:
+    """One revision's full content (time-travel view / restore source)."""
+    try:
+        from tui_gateway.artifact_store import get_revision
+
+        revision = get_revision(str(params.get("id", "")), int(params.get("rev", 0)))
+        if revision is None:
+            return _err(rid, 4004, "revision not found")
+        return _ok(rid, {"revision": revision})
+    except (TypeError, ValueError):
+        return _err(rid, 4001, "rev must be an integer")
+    except Exception as e:
+        logger.exception("artifact.revision failed")
+        return _err(rid, 5215, str(e))
+
+
 @method("feed.get")
 def _(rid, params: dict) -> dict:
     """Return curated news feed from digest pipelines."""
