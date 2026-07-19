@@ -7100,6 +7100,13 @@ class BasePlatformAdapter(ABC):
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
             profile=profile,
+            # Bot account this adapter instance serves (#8287). This is the
+            # single inbound-construction site every platform's normal-event
+            # path flows through, so stamping here (not in per-platform
+            # helpers) is what actually routes named-bot traffic to its own
+            # session key and egress adapter. None on default/single-bot
+            # adapters — byte-identical to before.
+            account=getattr(self, "account_name", None),
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
@@ -7114,7 +7121,7 @@ class BasePlatformAdapter(ABC):
         # routes to unserved profiles consistently without surfacing HTTP 500s.
         source.profile_route_rejected = profile_route_rejected
         return source
-    
+
     @abstractmethod
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """

@@ -371,6 +371,18 @@ def _handle_send(args):
     thread_id = None
 
     prepare_send_message_platforms()
+
+    # Named-bot-account targets (#8287) — e.g. "telegram@support:123" — are
+    # supported for cron delivery and inbound routing, but this send path
+    # always uses the platform's default account. Reject the @account form
+    # with an actionable error rather than the opaque "Unknown platform".
+    if "@" in platform_name:
+        _base, _, _acct = platform_name.partition("@")
+        return tool_error(
+            f"send targets the default {_base} account; per-account send "
+            f"(@{_acct}) is not supported here yet. Send via the default "
+            f"account, or use a cron job with deliver='{platform_name}:<chat>'."
+        )
     if target_ref:
         chat_id, thread_id, resolution_error = resolve_send_target(
             platform_name, target_ref
