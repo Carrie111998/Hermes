@@ -1115,6 +1115,196 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
+    def test_standalone_delivery_writes_accepted_receipt_with_message_id(self, monkeypatch, tmp_path):
+        from gateway.config import Platform
+
+        execution_updates = []
+        monkeypatch.setattr(
+            "cron.scheduler.record_delivery_state",
+            lambda execution_id, **kwargs: execution_updates.append((execution_id, kwargs)),
+        )
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        receipt_path = tmp_path / "delivery-receipts.jsonl"
+        receipt_context = {
+            "execution_id": "execution-native",
+            "job_id": "native-job",
+            "output_path": "/tmp/native-output.md",
+            "output_sha256": "b" * 64,
+            "provider": "provider-a",
+            "model": "model-a",
+            "receipt_path": receipt_path,
+        }
+        job = {
+            "id": "native-job",
+            "deliver": "telegram:123",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": 42})):
+            assert _deliver_result(job, "report", receipt_context=receipt_context) is None
+
+        records = [json.loads(line) for line in receipt_path.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["state"] == "accepted"
+        assert records[0]["message_id"] == "42"
+        assert records[0]["target"] == {"platform": "telegram", "chat_id": "123", "thread_id": None}
+        assert execution_updates == [
+            ("execution-native", {"state": "accepted", "receipt_path": str(receipt_path)})
+        ]
+
+    def test_standalone_delivery_writes_failed_receipt(self, monkeypatch, tmp_path):
+        from gateway.config import Platform
+
+        monkeypatch.setattr("cron.scheduler.record_delivery_state", lambda *_args, **_kwargs: None)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        receipt_path = tmp_path / "delivery-receipts.jsonl"
+        receipt_context = {
+            "execution_id": "execution-failed",
+            "job_id": "failed-job",
+            "output_path": "/tmp/failed-output.md",
+            "output_sha256": "c" * 64,
+            "provider": "provider-a",
+            "model": "model-a",
+            "receipt_path": receipt_path,
+        }
+        job = {"id": "failed-job", "deliver": "telegram:123"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"error": "rejected"})):
+            delivery_error = _deliver_result(job, "report", receipt_context=receipt_context)
+
+        assert delivery_error is not None and "rejected" in delivery_error
+        records = [json.loads(line) for line in receipt_path.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["state"] == "failed"
+        assert "rejected" in records[0]["detail"]
+        assert records[0]["target"] == {"platform": "telegram", "chat_id": "123", "thread_id": None}
+
+    def test_live_inflight_timeout_writes_uncertain_receipt_without_standalone_retry(self, monkeypatch, tmp_path):
+        from gateway.config import Platform
+
+        monkeypatch.setattr("cron.scheduler.record_delivery_state", lambda *_args, **_kwargs: None)
+
+        class InFlightFuture:
+            def result(self, timeout):
+                raise TimeoutError
+
+            def cancel(self):
+                return False
+
+        class FakeRouter:
+            def __init__(self, *_args):
+                pass
+
+            def _deliver_to_platform(self, *_args):
+                return object()
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        receipt_path = tmp_path / "delivery-receipts.jsonl"
+        receipt_context = {
+            "execution_id": "execution-uncertain",
+            "job_id": "uncertain-job",
+            "output_path": "/tmp/uncertain-output.md",
+            "output_sha256": "d" * 64,
+            "provider": "provider-a",
+            "model": "model-a",
+            "receipt_path": receipt_path,
+        }
+        job = {"id": "uncertain-job", "deliver": "telegram:123"}
+        standalone_send = AsyncMock()
+
+        monkeypatch.setattr("gateway.delivery.DeliveryRouter", FakeRouter)
+        monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", lambda *_args, **_kwargs: InFlightFuture())
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", standalone_send):
+            assert _deliver_result(
+                job,
+                "report",
+                adapters={Platform.TELEGRAM: MagicMock()},
+                loop=loop,
+                receipt_context=receipt_context,
+            ) is None
+
+        standalone_send.assert_not_awaited()
+        records = [json.loads(line) for line in receipt_path.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["state"] == "uncertain_in_flight"
+        assert records[0]["target"] == {"platform": "telegram", "chat_id": "123", "thread_id": None}
+
+    def test_live_silence_filter_writes_suppressed_receipt_without_standalone_retry(self, monkeypatch, tmp_path):
+        from gateway.config import Platform
+
+        monkeypatch.setattr("cron.scheduler.record_delivery_state", lambda *_args, **_kwargs: None)
+
+        class DeliveredFalseFuture:
+            def result(self, timeout):
+                return {"success": True, "delivered": False, "filtered": "silence_narration"}
+
+        class FakeRouter:
+            def __init__(self, *_args):
+                pass
+
+            def _deliver_to_platform(self, *_args):
+                return object()
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        receipt_path = tmp_path / "delivery-receipts.jsonl"
+        receipt_context = {
+            "execution_id": "execution-suppressed",
+            "job_id": "suppressed-job",
+            "output_path": "/tmp/suppressed-output.md",
+            "output_sha256": "e" * 64,
+            "provider": "provider-a",
+            "model": "model-a",
+            "receipt_path": receipt_path,
+        }
+        standalone_send = AsyncMock()
+
+        monkeypatch.setattr("gateway.delivery.DeliveryRouter", FakeRouter)
+        monkeypatch.setattr(
+            "agent.async_utils.safe_schedule_threadsafe",
+            lambda *_args, **_kwargs: DeliveredFalseFuture(),
+        )
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", standalone_send):
+            assert _deliver_result(
+                {"id": "suppressed-job", "deliver": "telegram:123"},
+                "report",
+                adapters={Platform.TELEGRAM: MagicMock()},
+                loop=loop,
+                receipt_context=receipt_context,
+            ) is None
+
+        standalone_send.assert_not_awaited()
+        records = [json.loads(line) for line in receipt_path.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        assert records[0]["state"] == "suppressed"
+        assert records[0]["target"] == {"platform": "telegram", "chat_id": "123", "thread_id": None}
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
@@ -3351,6 +3541,39 @@ class TestRunJobWakeGate:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
         agent_cls.assert_called_once()  # Agent DID wake despite the gate-like text
+
+    def test_script_required_failure_stops_before_agent(self):
+        """An explicitly required hybrid pre-run script fails closed."""
+        import cron.scheduler as scheduler
+
+        job = self._make_job()
+        job["script_required"] = True
+        with patch.object(scheduler, "_run_job_script", return_value=(False, "collector timeout")), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, error = scheduler.run_job(job)
+
+        assert success is False
+        assert final == ""
+        assert error == "Required script failed: collector timeout"
+        assert "Status:** FAILED" in doc
+        agent_cls.assert_not_called()
+
+    def test_required_tool_not_invoked_fails_job(self):
+        import cron.scheduler as scheduler
+
+        job = self._make_job(script=None)
+        job.pop("script", None)
+        job["required_tools"] = ["web_search"]
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "looks fine", "messages": []
+        })
+        with patch("run_agent.AIAgent", return_value=agent):
+            success, _doc, final, error = scheduler.run_job(job)
+
+        assert success is False
+        assert final == ""
+        assert error == "RuntimeError: Required tool(s) not invoked: web_search"
 
     def test_no_script_path_runs_agent_normally(self):
         """Regression: jobs without a script still work."""

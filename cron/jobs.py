@@ -1195,6 +1195,40 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _normalize_runtime_policy(
+    *,
+    required_output: Any,
+    required_tools: Any,
+    script_required: Any,
+    script: Optional[str],
+    no_agent: bool,
+) -> tuple[bool, list[str], bool]:
+    """Validate explicit Cron Core runtime policy without changing legacy defaults."""
+    if not isinstance(required_output, bool):
+        raise ValueError("required_output must be a boolean")
+    if not isinstance(script_required, bool):
+        raise ValueError("script_required must be a boolean")
+    if required_tools is None:
+        normalized_tools: list[str] = []
+    elif not isinstance(required_tools, list):
+        raise ValueError("required_tools must be a list of non-empty tool names")
+    else:
+        normalized_tools = []
+        for tool in required_tools:
+            if not isinstance(tool, str) or not tool.strip():
+                raise ValueError("required_tools must contain only non-empty strings")
+            canonical = tool.strip()
+            if canonical not in normalized_tools:
+                normalized_tools.append(canonical)
+    if script_required and not script:
+        raise ValueError("script_required=True requires a script")
+    if no_agent and normalized_tools:
+        raise ValueError("no_agent=True jobs cannot require agent tools")
+    if no_agent and script_required:
+        raise ValueError("no_agent=True jobs cannot set script_required")
+    return required_output, normalized_tools, script_required
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1213,6 +1247,9 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    required_output: bool = False,
+    required_tools: Optional[List[str]] = None,
+    script_required: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1289,6 +1326,13 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_required_output, normalized_required_tools, normalized_script_required = _normalize_runtime_policy(
+        required_output=required_output,
+        required_tools=required_tools,
+        script_required=script_required,
+        script=normalized_script,
+        no_agent=normalized_no_agent,
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1356,6 +1400,9 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "required_output": normalized_required_output,
+        "required_tools": normalized_required_tools,
+        "script_required": normalized_script_required,
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -1484,6 +1531,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            updated_script = updated.get("script")
+            updated["script"] = (
+                updated_script.strip() if isinstance(updated_script, str) else None
+            ) or None
+            (
+                updated["required_output"],
+                updated["required_tools"],
+                updated["script_required"],
+            ) = _normalize_runtime_policy(
+                required_output=updated.get("required_output", False),
+                required_tools=updated.get("required_tools"),
+                script_required=updated.get("script_required", False),
+                script=updated["script"],
+                no_agent=bool(updated.get("no_agent")),
+            )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

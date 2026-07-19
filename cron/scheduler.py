@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -278,7 +279,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+    record_delivery_state,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1459,7 +1465,134 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _record_local_only_receipt(job: dict, execution_id: str, output_file: Path) -> None:
+    """Persist generation evidence for a local-only cron result.
+
+    Receipt-write failures are observable but never retroactively erase a saved
+    artifact or change the job's execution outcome; the watchdog will surface a
+    missing receipt as an observability gap.
+    """
+    try:
+        output_bytes = output_file.read_bytes()
+        from cron.delivery_receipts import append_receipt
+
+        receipt_path = _get_hermes_home() / "cron" / "delivery-receipts.jsonl"
+        append_receipt(
+            receipt_path,
+            {
+                "execution_id": execution_id,
+                "job_id": str(job["id"]),
+                "mode": "local_only",
+                "state": "generated",
+                "target": {
+                    "platform": "local",
+                    "chat_id": str(job["id"]),
+                    "thread_id": None,
+                },
+                "output_path": str(output_file),
+                "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+                "provider": str(job.get("provider") or ""),
+                "model": str(job.get("model") or ""),
+            },
+        )
+        record_delivery_state(
+            execution_id,
+            state="generated",
+            receipt_path=str(receipt_path),
+        )
+    except Exception as exc:
+        logger.error(
+            "Job '%s': failed to write local-only delivery receipt: %s",
+            job.get("id", "?"),
+            exc,
+        )
+
+
+def _record_suppressed_delivery_receipts(
+    job: dict,
+    receipt_context: Optional[dict[str, Any]],
+) -> None:
+    """Persist intentional semantic-silence outcomes without calling a platform."""
+    for target in _resolve_delivery_targets(job):
+        _record_delivery_receipt(receipt_context, target=target, state="suppressed")
+
+
+def _record_delivery_receipt(
+    receipt_context: Optional[dict[str, Any]],
+    *,
+    target: dict[str, Any],
+    state: str,
+    message_id: object | None = None,
+    detail: str | None = None,
+) -> None:
+    """Append terminal native-delivery evidence without changing send behavior."""
+    if not receipt_context:
+        return
+    try:
+        from cron.delivery_receipts import aggregate_execution_state, append_receipt
+
+        receipt_path = Path(receipt_context.get("receipt_path") or _get_hermes_home() / "cron" / "delivery-receipts.jsonl")
+        receipt = {
+            "execution_id": str(receipt_context["execution_id"]),
+            "job_id": str(receipt_context["job_id"]),
+            "mode": "native",
+            "state": state,
+            "target": {
+                "platform": str(target["platform"]),
+                "chat_id": str(target["chat_id"]),
+                "thread_id": target.get("thread_id"),
+            },
+            "output_path": str(receipt_context["output_path"]),
+            "output_sha256": str(receipt_context["output_sha256"]),
+            "provider": str(receipt_context.get("provider") or ""),
+            "model": str(receipt_context.get("model") or ""),
+        }
+        if message_id is not None:
+            receipt["message_id"] = str(message_id)
+        if detail:
+            receipt["detail"] = detail
+        append_receipt(receipt_path, receipt)
+        aggregate_state = aggregate_execution_state(
+            receipt_path,
+            str(receipt_context["execution_id"]),
+        )
+        if aggregate_state is not None:
+            record_delivery_state(
+                str(receipt_context["execution_id"]),
+                state=aggregate_state,
+                receipt_path=str(receipt_path),
+            )
+    except Exception as exc:
+        logger.error(
+            "Job '%s': failed to write delivery receipt: %s",
+            receipt_context.get("job_id", "?") if receipt_context else "?",
+            exc,
+        )
+
+
+def _extract_delivery_message_id(result: object) -> object | None:
+    """Read a platform message identifier from standalone or adapter responses."""
+    if isinstance(result, dict):
+        if result.get("message_id") is not None:
+            return result["message_id"]
+        raw = result.get("raw_response")
+    else:
+        message_id = getattr(result, "message_id", None)
+        if message_id is not None:
+            return message_id
+        raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        return raw.get("message_id") or raw.get("id")
+    return None
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    receipt_context: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1795,6 +1928,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                delivery_suppressed = False
+                send_result = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1919,6 +2054,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
+                            elif isinstance(send_result, dict) and not bool(send_result.get("delivered", True)):
+                                # The narration filter intentionally suppresses this
+                                # send. It is terminal for retry purposes, but it is
+                                # not a platform acceptance and must not be mirrored.
+                                delivery_suppressed = True
                             elif (
                                 send_raw_response
                                 and thread_id
@@ -1971,6 +2111,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    receipt_target = {"platform": platform_name, "chat_id": chat_id, "thread_id": thread_id}
+                    if timed_out:
+                        _record_delivery_receipt(
+                            receipt_context,
+                            target=receipt_target,
+                            state="uncertain_in_flight",
+                            detail="live adapter confirmation timed out after dispatch",
+                        )
+                    elif delivery_suppressed:
+                        _record_delivery_receipt(
+                            receipt_context,
+                            target=receipt_target,
+                            state="suppressed",
+                            detail="live adapter narration filter suppressed delivery",
+                        )
+                        continue
+                    else:
+                        _record_delivery_receipt(
+                            receipt_context,
+                            target=receipt_target,
+                            state="accepted",
+                            message_id=_extract_delivery_message_id(send_result),
+                        )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -2089,11 +2252,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
+                _record_delivery_receipt(
+                    receipt_context,
+                    target={"platform": platform_name, "chat_id": chat_id, "thread_id": thread_id},
+                    state="failed",
+                    detail=msg,
+                )
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _record_delivery_receipt(
+                receipt_context,
+                target={"platform": platform_name, "chat_id": chat_id, "thread_id": thread_id},
+                state="accepted",
+                message_id=_extract_delivery_message_id(result),
+            )
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
@@ -2762,6 +2937,46 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _invoked_cron_tool_names(messages: object) -> set[str]:
+    """Return canonical tool names invoked in an agent conversation transcript."""
+    if not isinstance(messages, list):
+        return set()
+    invoked: set[str] = set()
+    for message in messages:
+        tool_calls = (
+            message.get("tool_calls") if isinstance(message, dict)
+            else getattr(message, "tool_calls", None)
+        )
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            function = (
+                tool_call.get("function") if isinstance(tool_call, dict)
+                else getattr(tool_call, "function", None)
+            )
+            if isinstance(function, dict):
+                name = function.get("name")
+                arguments = function.get("arguments") or {}
+            else:
+                name = getattr(function, "name", None)
+                arguments = getattr(function, "arguments", None) or {}
+            if not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()
+            if name == "tool_call" and isinstance(arguments, dict):
+                try:
+                    from tools.tool_search import resolve_underlying_call
+
+                    underlying, _underlying_args, error = resolve_underlying_call(arguments)
+                    if not error and underlying:
+                        invoked.add(underlying)
+                except Exception:
+                    continue
+            else:
+                invoked.add(name)
+    return invoked
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2969,9 +3184,29 @@ def run_job(
     # the script is only executed once.
     prerun_script = None
     script_path = job.get("script")
+    if job.get("script_required", False) and not script_path:
+        error = "Required script failed: job has no script"
+        failed_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "**Status:** FAILED\n\n"
+            f"{error}\n"
+        )
+        return False, failed_doc, "", error
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
         _ran_ok, _script_output = prerun_script
+        if job.get("script_required", False) and not _ran_ok:
+            error = f"Required script failed: {_script_output or 'no script output'}"
+            failed_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** FAILED\n\n"
+                f"{error}\n"
+            )
+            return False, failed_doc, "", error
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3653,6 +3888,15 @@ def run_job(
                 job_name,
             )
 
+        required_tools = {
+            tool.strip() for tool in job.get("required_tools", [])
+            if isinstance(tool, str) and tool.strip()
+        }
+        if required_tools:
+            missing_tools = sorted(required_tools - _invoked_cron_tool_names(result.get("messages")))
+            if missing_tools:
+                raise RuntimeError(f"Required tool(s) not invoked: {', '.join(missing_tools)}")
+
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
@@ -3946,6 +4190,45 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             output_file = save_job_output(job["id"], output)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
+            if success and job.get("required_output", False):
+                artifact_path = Path(output_file) if output_file is not None else None
+                if not isinstance(final_response, str) or not final_response.strip():
+                    success = False
+                    error = "Required output policy violated: final response is empty"
+                elif _is_cron_silence_response(final_response):
+                    success = False
+                    error = "Required output policy violated: final response is [SILENT]"
+                elif (
+                    artifact_path is None
+                    or not artifact_path.is_file()
+                    or artifact_path.stat().st_size <= 0
+                ):
+                    success = False
+                    error = "Required output policy violated: canonical output artifact is missing or empty"
+            delivery_mode = _normalize_deliver_value(job.get("deliver", "local"))
+            receipt_context: Optional[dict[str, Any]] = None
+            if delivery_mode == "local":
+                if output_file is None:
+                    logger.error("Job '%s': cannot prepare local-only receipt: output path is missing", job["id"])
+                else:
+                    _record_local_only_receipt(job, execution_id, Path(output_file))
+            else:
+                try:
+                    artifact_path = Path(output_file)
+                    receipt_context = {
+                        "execution_id": str(execution_id),
+                        "job_id": str(job["id"]),
+                        "output_path": str(artifact_path),
+                        "output_sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                        "provider": str(job.get("provider") or ""),
+                        "model": str(job.get("model") or ""),
+                    }
+                except (OSError, TypeError) as receipt_exc:
+                    logger.error(
+                        "Job '%s': cannot prepare delivery receipt context: %s",
+                        job["id"],
+                        receipt_exc,
+                    )
 
             # If the gateway shutdown killed this job's tool subprocess
             # mid-flight (#60432), the agent may still have produced a
@@ -3977,11 +4260,21 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # tolerance the cron contract relies on.
             if should_deliver and success and _is_cron_silence_response(deliver_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                _record_suppressed_delivery_receipts(job, receipt_context)
                 should_deliver = False
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    if receipt_context is None:
+                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    else:
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                            receipt_context=receipt_context,
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4165,7 +4458,17 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception as ledger_error:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                logger.error(
+                    "Job '%s' not dispatched: execution ledger creation failed: %s",
+                    job.get("name", job_id),
+                    ledger_error,
+                )
+                return None
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 

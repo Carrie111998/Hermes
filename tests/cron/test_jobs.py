@@ -2163,3 +2163,41 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["ctrlbom01"]
         assert "newline" in loaded[0]["name"]
+
+
+def test_create_job_round_trips_explicit_runtime_policy(tmp_cron_dir):
+    job = create_job(
+        prompt="required report",
+        schedule="every 1h",
+        deliver="local",
+        script="collect.py",
+        required_output=True,
+        required_tools=["web_search", "web_search", " terminal "],
+        script_required=True,
+    )
+
+    assert job["required_output"] is True
+    assert job["required_tools"] == ["web_search", "terminal"]
+    assert job["script_required"] is True
+    persisted = get_job(job["id"])
+    assert persisted is not None
+    assert persisted["required_output"] is True
+    assert persisted["required_tools"] == ["web_search", "terminal"]
+    assert persisted["script_required"] is True
+
+
+def test_update_job_rejects_script_required_without_effective_script(tmp_cron_dir):
+    job = create_job(
+        prompt="hybrid report",
+        schedule="every 1h",
+        script="collect.py",
+        script_required=True,
+    )
+
+    with pytest.raises(ValueError, match="script_required=True requires a script"):
+        update_job(job["id"], {"script": None})
+
+    persisted = get_job(job["id"])
+    assert persisted is not None
+    assert persisted["script"] == "collect.py"
+    assert persisted["script_required"] is True

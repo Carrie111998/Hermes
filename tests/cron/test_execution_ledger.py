@@ -39,6 +39,26 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert persisted == [completed]
 
 
+def test_execution_records_delivery_state_and_receipt_reference(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("delivery-job", source="builtin")
+    executions.mark_execution_running(record["id"])
+
+    updated = executions.record_delivery_state(
+        record["id"],
+        state="accepted",
+        receipt_path="/tmp/delivery-receipts.jsonl",
+    )
+    assert updated is not None
+    assert updated["delivery_state"] == "accepted"
+    assert updated["receipt_path"] == "/tmp/delivery-receipts.jsonl"
+
+    completed = executions.finish_execution(record["id"], success=True)
+    assert completed is not None
+    assert completed["delivery_state"] == "accepted"
+    assert completed["receipt_path"] == "/tmp/delivery-receipts.jsonl"
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
