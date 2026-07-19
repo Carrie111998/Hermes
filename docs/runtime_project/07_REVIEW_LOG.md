@@ -949,7 +949,7 @@ Task 17 locks the 11-record Phase 1 manual source-of-truth chain and adds regres
 ## Task 17.1 — Clarify Phase 1 Terminal Semantics and Guard Idempotent SoT (2026-07-19)
 
 **Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed)  
+**Status:** ✅ Accepted (checkpointed `8fea4daa0`)  
 **Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **1273 passed**  
 **Builds on:** Task 17 checkpoint `939e8b606` (Phase 1 final verification **1271 passed**)
 
@@ -969,6 +969,38 @@ Phase 1 freezes the 11-record chain semantics without expanding automation or ad
 - No new lifecycle record/event types; no Phase 1 chain change
 - No global post-closure task/attempt hard lock
 - No Runtime/delegate_task/scheduler/queue/database/browser/HTTP/subprocess automation
-- Phase 2 not started; Task 18 not started
 
-**Phase 2:** not started.
+**Phase 1 closed** at this checkpoint. Phase 2 planning follows as Task 18.
+
+---
+
+## Task 18 — Phase 2 Runtime Boundary Planning (2026-07-19)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — planning only (awaiting Architect acceptance — not checkpointed)  
+**Tests:** n/a (docs only)  
+**Depends on:** Phase 1 closed at Task 17.1 `8fea4daa0`
+
+### Delivered
+
+- `docs/runtime_project/09_PHASE2_RUNTIME_BOUNDARY.md` — may/may-not rules for runtime integration
+- `03_PHASE_PLAN.md` updated: Phase 1 closed; Phase 2 = runtime boundary planning; Domain Reliability deferred to Phase 3
+- Task queue + context summary status cleanup (Task 17.1 checkpointed; Phase 2 planning started; implementation not started)
+
+### Planning decisions (provisional)
+
+- Closure remains chain-terminal by default; whole-run hard lock optional/gated (separate go/no-go)
+- Runtime MVP read-oriented; no direct SoT writes; no direct event append
+- Later writes only via approved lifecycle APIs + human checkpoint (if enabled)
+- Integrity fail-closed; no silent heal; manual repair proposals deferred/open
+- Artifact/link inspection must not auto-advance lifecycle state
+- Human checkpoint required for any state-changing / write / hard-lock adoption
+
+### Non-goals confirmed
+
+- No runtime/daemon/scheduler/queue/database/browser/silent-heal/unattended pipeline implementation
+- No automatic delegate_task/HEAL loops; no changes to the frozen 11-record chain
+- No new lifecycle record/event types; no `htr/events.py` / `htr/schemas.py` changes in this task
+- Phase 2 **planning** started; Phase 2 **implementation** not started
+
+**Awaiting:** Architect acceptance of open decisions in `09_PHASE2_RUNTIME_BOUNDARY.md` §11 before any Phase 2 code.

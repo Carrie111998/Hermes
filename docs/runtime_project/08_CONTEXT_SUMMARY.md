@@ -1,14 +1,14 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-19  
-**Task:** Task 17.1 — clarify Phase 1 terminal semantics and guard idempotent SoT  
-**Status:** Accepted — checkpointed (builds on Task 17 at `939e8b606`)
+**Task:** Task 18 — Phase 2 runtime boundary planning (docs only)  
+**Status:** Phase 2 **planning** started — awaiting Architect acceptance; **no implementation**
 
 ---
 
 ## 1. One-paragraph state
 
-Task 17 **freezes Phase 1** without adding lifecycle behavior. It introduces discoverable boundary constants (`PHASE1_MANUAL_WORKFLOW_RECORD_CHAIN`, terminal record/event markers, `PHASE1_BOUNDARY_STATUS`), end-to-end manual workflow regression tests, and documentation freeze. The 11-record manual chain through `run_final_closure_record` is locked. Task 17.1 clarifies terminal semantics (chain-terminal, not a global task/attempt hard lock) and fails closed when idempotent replay finds a matching audit event but the JSON source-of-truth file is missing. **No new lifecycle record type, event type, or automation integration was added.**
+Phase 1 implementation and post-review hardening are **closed** at Task 17.1 `8fea4daa0` (on Task 17 `939e8b606`). Task 18 is **planning only**: `09_PHASE2_RUNTIME_BOUNDARY.md` defines a read-oriented runtime MVP, no direct SoT/event writes, fail-closed integrity, human checkpoints for any later writes, and explicit non-goals (no daemon/scheduler/queue/database/browser/silent heal/unattended pipeline). Hard lock and advisory artifact inspection remain Architect open decisions. **Phase 2 implementation has not started.**
 
 ---
 
@@ -45,7 +45,7 @@ run_completion_record
 
 ---
 
-## 4. Phase 1 principles (frozen)
+## 4. Phase 1 principles (frozen / closed)
 
 - JSON records are source-of-truth; event log is audit-only
 - Manual-only lifecycle APIs; no automatic execution/verification/rerun/repair
@@ -62,12 +62,20 @@ run_completion_record
 
 ## 5. Non-goals (confirmed)
 
-- No new lifecycle record or event type for boundary freeze
+- No new lifecycle record or event type for Phase 1 boundary freeze
 - No `record_phase1_boundary`, `make_phase1_boundary_record`, or `phase1_boundary_record.json`
-- No Phase 2 automation/integration implementation
+- No Phase 2 automation/integration **implementation** (Task 18 is planning only)
 - No global post-closure task/attempt hard lock in Phase 1
-- Task 18 not started
+- Phase 2 non-goals (planning): no daemon, scheduler, queue, database, browser automation, silent self-healing, unattended long-running pipeline, automatic delegate_task/HEAL loops, no changes to the frozen 11-record chain
 
 ---
 
-Task 17 checkpointed at `939e8b606de09532006887c637684cf8baa49d40` (short `939e8b606`). Phase 1 final verification: **1271 passed**. Task 17.1 checkpointed. Phase 1 frozen. Phase 2 not started.
+## 6. Phase 2 planning pointer
+
+See `09_PHASE2_RUNTIME_BOUNDARY.md` for may/may-not rules, open decisions, and proposed task sequence (P2-T0…P2-T6).
+
+**Boundary decisions (provisional):** runtime MVP read-oriented; no direct event append; no direct JSON SoT writes; later writes only via approved lifecycle APIs + human checkpoint; integrity fail-closed; no silent heal; hard lock and repair-proposal shape are open; artifact/link inspection must not auto-advance lifecycle state.
+
+---
+
+Task 17 checkpointed at `939e8b606`. Task 17.1 checkpointed at `8fea4daa0258184f409e61307eed1d3513cd50de` (short `8fea4daa0`). Phase 1 closed. Phase 2 **planning started; implementation not started**.

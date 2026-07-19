@@ -1,20 +1,35 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-19 (Task 17.1 completed by Cursor)
+**Last updated:** 2026-07-19 (Task 18 planning cleanup; Phase 1 closed at `8fea4daa0`)
 
 ---
 
 ## Active Task
 
-None — Phase 1 frozen (Task 17.1 checkpointed). Phase 2 not started.
+None — Phase 2 **planning** started (Task 18); awaiting Architect acceptance of `09_PHASE2_RUNTIME_BOUNDARY.md`. Phase 2 **implementation** not started.
 
 ---
 
 ## Completed
 
+### Task 18 — Phase 2 Runtime Boundary Planning (docs only)
+
+**Status:** ✅ Complete (planning only — awaiting Architect acceptance — not checkpointed)  
+**Tests:** n/a (docs only; no code/schema/events changes)  
+**Depends on:** Phase 1 closed at Task 17.1 `8fea4daa0`
+
+Changes:
+
+- Added `docs/runtime_project/09_PHASE2_RUNTIME_BOUNDARY.md`
+- Updated `03_PHASE_PLAN.md` to reflect Phase 1 actual freeze + Phase 2 = runtime boundary planning
+- Deferred former “Domain Reliability” content to Phase 3
+- Status cleanup: Task 17.1 checkpointed; Phase 1 implementation/post-review hardening closed; Phase 2 planning started; Phase 2 implementation not started
+- **No implementation** — no runtime, scheduler, queue, database, delegate_task, browser automation
+- **No** new lifecycle record/event types; **no** edits to `htr/events.py` / `htr/schemas.py`
+
 ### Task 17.1 — Clarify Phase 1 Terminal Semantics and Guard Idempotent SoT
 
-**Status:** ✅ Accepted (checkpointed)  
+**Status:** ✅ Accepted (checkpointed `8fea4daa0`)  
 **Tests:** `uv run --extra dev pytest tests/htr/ -v` — **1273 passed**  
 **Builds on:** Task 17 checkpoint `939e8b606de09532006887c637684cf8baa49d40`
 
@@ -25,7 +40,8 @@ Changes:
 - Docs: Phase 1 does **not** install a global hard lock on later task/attempt APIs; operators treat `run_final_closure_record.json` as the boundary; Phase 2 may add a hard lock later
 - `htr/events.py`: idempotent replay of manual run-record APIs requires JSON SoT file; event-present / JSON-missing → `InvalidTransition` (no silent heal)
 - Tests: rename overclaiming “terminal” wording; add event-present / JSON-missing regression tests
-- No new record/event types; no Phase 1 chain change; no global post-closure hard lock; Phase 2 not started
+- No new record/event types; no Phase 1 chain change; no global post-closure hard lock
+- Closes Phase 1 implementation / post-review hardening
 
 ### Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze
 
@@ -142,10 +158,14 @@ Changes:
 
 ## Next Task (Architect)
 
-Phase 2 planning — not started. Task 17/17.1 complete Phase 1 freeze clarifications; no Phase 2 implementation.
+Phase 1 is closed (`8fea4daa0`). Phase 2 planning has started; Phase 2 implementation has **not** started.
+
+1. Accept or amend `09_PHASE2_RUNTIME_BOUNDARY.md` (especially open decisions in §11).
+2. Assign Phase 2 MVP slice (recommended: P2-T0 → P2-T1 → P2-T4 → P2-T6) **or** defer implementation.
+3. Do **not** start runtime code until P2-T0 acceptance.
 
 ---
 
 ## Backlog
 
-See `03_PHASE_PLAN.md`.
+See `03_PHASE_PLAN.md` and `09_PHASE2_RUNTIME_BOUNDARY.md`.
