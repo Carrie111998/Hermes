@@ -19848,12 +19848,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 else None
             )
+            import logging as _gw_log
+            _gw_log.warning(
+                "[newton-debug] tool_progress_callback set=%s needs_progress_queue=%s log_mode=%s live_status=%s status_adapter=%s",
+                agent.tool_progress_callback is not None,
+                needs_progress_queue, log_mode_enabled,
+                _live_status_adapter is not None,
+                _status_adapter is not None,
+            )
             # Always wire the progress_callback for reaction swapping even when
             # tool progress messages are off. The callback's on_tool_call_start
             # hook fires before the progress_queue guard and is independent of
             # chat progress visibility.
             if agent.tool_progress_callback is None and _status_adapter is not None:
                 agent.tool_progress_callback = progress_callback
+                _gw_log.warning("[newton-debug] tool_progress_callback FALLBACK WIRED")
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
