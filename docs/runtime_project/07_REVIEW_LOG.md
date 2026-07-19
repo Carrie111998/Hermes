@@ -858,8 +858,8 @@ No artifact/result/verification_result/docs inspection; no automatic execution o
 ## Task 15 — Manual Post-Verification Execution Verification Recording (2026-07-19)
 
 **Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
-**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+**Status:** ✅ Accepted (checkpointed `5011ad44c`)  
+**Tests:** full HTR suite — **1078 passed** at Task 16 pre-checkpoint baseline
 
 ### Delivered
 
@@ -884,3 +884,36 @@ No artifact/result/verification_result/docs/test-output inspection; no automatic
 - Task 16 not started
 
 **Awaiting:** Architect acceptance before checkpoint / Task 16.
+
+---
+
+## Task 16 — Run Final Closure Record (2026-07-19)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+
+### Delivered
+
+- `run_final_closure_record` schema + factory + fingerprint
+- `validate_run_final_closure_sources_correspond()` — correspondence to post-verification execution verification items
+- `compute_run_final_closure_status()` — deterministic status from explicit closure item decisions
+- `record_run_final_closure()` — after full workflow chain through post-verification execution verification
+- `run_final_closure_recorded` event + replay-only semantics
+- Final closure statuses: `closed_verified`, `closed_rejected`, `closed_needs_more_work`, `closed_no_action`
+- Item decisions: `accepted`, `rejected`, `needs_more_work`, `no_action`
+
+### Design principle
+
+Final closure based only on the full manual workflow chain through post-verification execution verification JSON records.
+No artifact/result/verification_result/docs/test-output inspection; no automatic validation; terminal for Phase 1.
+
+### Non-goals confirmed
+
+- No automatic final closure, verification, test execution, rerun, repair, task/attempt creation, or lifecycle mutation
+- No new followup loop
+- No prior record mutation
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
+- Task 17 not started
+
+**Awaiting:** Architect acceptance before checkpoint / Task 17.

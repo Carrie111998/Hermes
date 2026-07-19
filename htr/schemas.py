@@ -26,6 +26,7 @@ SchemaName = Literal[
     "run_post_verification_execution_request_record",
     "run_post_verification_execution_result_record",
     "run_post_verification_execution_verification_record",
+    "run_final_closure_record",
 ]
 
 
@@ -348,6 +349,27 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_final_closure_record": (
+        "schema_version",
+        "run_id",
+        "source_run_completion_fingerprint",
+        "source_run_review_fingerprint",
+        "source_run_followup_plan_fingerprint",
+        "source_run_execution_request_fingerprint",
+        "source_run_execution_result_fingerprint",
+        "source_run_execution_verification_fingerprint",
+        "source_post_verification_followup_plan_fingerprint",
+        "source_post_verification_execution_request_fingerprint",
+        "source_post_verification_execution_result_fingerprint",
+        "source_post_verification_execution_verification_fingerprint",
+        "closer",
+        "final_closure_status",
+        "closure_reason",
+        "closure_items",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -407,6 +429,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_post_verification_execution_result_record(data)
     elif schema_name == "run_post_verification_execution_verification_record":
         _validate_run_post_verification_execution_verification_record(data)
+    elif schema_name == "run_final_closure_record":
+        _validate_run_final_closure_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -1500,3 +1524,104 @@ def _validate_run_post_verification_execution_verification_record(
             "dict"
         )
     _validate_post_verification_execution_verification_status_consistency(data)
+
+
+def _validate_run_final_closure_record(data: dict[str, Any]) -> None:
+    from htr.contracts import (
+        RUN_FINAL_CLOSURE_ITEM_DECISIONS,
+        RUN_FINAL_CLOSURE_STATUSES,
+        _validate_run_final_closure_status_consistency,
+    )
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError("run_final_closure_record: schema_version must be an int")
+    _require_str(data, "run_id", "run_final_closure_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError("run_final_closure_record: run_id must be a valid run id")
+    for field in (
+        "source_run_completion_fingerprint",
+        "source_run_review_fingerprint",
+        "source_run_followup_plan_fingerprint",
+        "source_run_execution_request_fingerprint",
+        "source_run_execution_result_fingerprint",
+        "source_run_execution_verification_fingerprint",
+        "source_post_verification_followup_plan_fingerprint",
+        "source_post_verification_execution_request_fingerprint",
+        "source_post_verification_execution_result_fingerprint",
+        "source_post_verification_execution_verification_fingerprint",
+    ):
+        _require_str(data, field, "run_final_closure_record")
+    _require_str(data, "closer", "run_final_closure_record")
+    _require_str(data, "final_closure_status", "run_final_closure_record")
+    if data["final_closure_status"] not in RUN_FINAL_CLOSURE_STATUSES:
+        raise ValueError(
+            "run_final_closure_record: final_closure_status must be one of "
+            "closed_verified, closed_rejected, closed_needs_more_work, closed_no_action"
+        )
+    _require_str(data, "closure_reason", "run_final_closure_record")
+    _require_str(data, "created_at", "run_final_closure_record")
+    if "notes" not in data:
+        raise ValueError("run_final_closure_record: missing fields: notes")
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError("run_final_closure_record: notes must be a string or null")
+    closure_items = data.get("closure_items")
+    if not isinstance(closure_items, list):
+        raise ValueError("run_final_closure_record: closure_items must be a list")
+    for item in closure_items:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_final_closure_record: closure_items entries must be dicts"
+            )
+        _require_str(item, "closure_item_id", "run_final_closure_record")
+        _require_str_or_null(
+            item,
+            "source_post_verification_execution_verification_item_id",
+            "run_final_closure_record",
+        )
+        _require_str_or_null(
+            item,
+            "source_post_verification_execution_result_item_id",
+            "run_final_closure_record",
+        )
+        _require_str_or_null(
+            item,
+            "source_post_verification_execution_request_item_id",
+            "run_final_closure_record",
+        )
+        _require_str_or_null(
+            item,
+            "source_post_verification_followup_item_id",
+            "run_final_closure_record",
+        )
+        _require_str_or_null(
+            item, "source_execution_item_id", "run_final_closure_record"
+        )
+        _require_str_or_null(
+            item, "source_followup_item_id", "run_final_closure_record"
+        )
+        _require_str_or_null(
+            item,
+            "verification_decision_after_result",
+            "run_final_closure_record",
+        )
+        _require_str(item, "closure_decision", "run_final_closure_record")
+        if item["closure_decision"] not in RUN_FINAL_CLOSURE_ITEM_DECISIONS:
+            raise ValueError(
+                "run_final_closure_record: closure_decision must be one of "
+                "accepted, rejected, needs_more_work, no_action"
+            )
+        _require_str_or_null(item, "reason", "run_final_closure_record")
+        if "evidence" not in item or not isinstance(item["evidence"], dict):
+            raise ValueError(
+                "run_final_closure_record: closure item evidence must be a dict"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_final_closure_record: closure item metadata must be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError("run_final_closure_record: metadata must be a dict")
+    _validate_run_final_closure_status_consistency(data)

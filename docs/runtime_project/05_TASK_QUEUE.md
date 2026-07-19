@@ -1,20 +1,38 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-19 (Task 15 completed by Cursor)
+**Last updated:** 2026-07-19 (Task 16 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect review of Task 15.
+None — awaiting Architect review of Task 16.
 
 ---
 
 ## Completed
 
-### Task 15 — Manual Post-Verification Execution Verification Recording
+### Task 16 — Run Final Closure Record
 
 **Status:** ✅ Complete (awaiting Architect review — not checkpointed)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v`
+
+Changes:
+
+- `run_final_closure_record` contract + schema validation
+- `make_run_final_closure_record`, `run_final_closure_fingerprint`
+- `validate_run_final_closure_sources_correspond`, `compute_run_final_closure_status`
+- `record_run_final_closure()` — manual final closure after full Phase 1 workflow chain
+- Fingerprints must match all 10 prior run-level records
+- `closure_items` must correspond to post-verification execution verification items (or be global/manual)
+- Writes `run_final_closure_record.json`, appends `run_final_closure_recorded` event
+- **Terminal for Phase 1** — no new followup loop, no automatic validation/test execution, no prior record mutation
+- Final closure statuses: `closed_verified`, `closed_rejected`, `closed_needs_more_work`, `closed_no_action`
+- No artifact/result/verification_result/docs/test-output inspection
+
+### Task 15 — Manual Post-Verification Execution Verification Recording
+
+**Status:** ✅ Accepted (checkpointed `5011ad44c`)  
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -92,7 +110,7 @@ Changes:
 
 ## Next Task (Architect)
 
-Task 16 — not started. Await scope assignment.
+Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze (not started). Await scope assignment.
 
 ---
 

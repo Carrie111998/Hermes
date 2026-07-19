@@ -1956,3 +1956,331 @@ def run_post_verification_execution_verification_fingerprint(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+RUN_FINAL_CLOSURE_STATUS_CLOSED_VERIFIED = "closed_verified"
+RUN_FINAL_CLOSURE_STATUS_CLOSED_REJECTED = "closed_rejected"
+RUN_FINAL_CLOSURE_STATUS_CLOSED_NEEDS_MORE_WORK = "closed_needs_more_work"
+RUN_FINAL_CLOSURE_STATUS_CLOSED_NO_ACTION = "closed_no_action"
+
+RUN_FINAL_CLOSURE_STATUSES: frozenset[str] = frozenset(
+    {
+        RUN_FINAL_CLOSURE_STATUS_CLOSED_VERIFIED,
+        RUN_FINAL_CLOSURE_STATUS_CLOSED_REJECTED,
+        RUN_FINAL_CLOSURE_STATUS_CLOSED_NEEDS_MORE_WORK,
+        RUN_FINAL_CLOSURE_STATUS_CLOSED_NO_ACTION,
+    }
+)
+
+RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED = "accepted"
+RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED = "rejected"
+RUN_FINAL_CLOSURE_ITEM_DECISION_NEEDS_MORE_WORK = "needs_more_work"
+RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION = "no_action"
+
+RUN_FINAL_CLOSURE_ITEM_DECISIONS: frozenset[str] = frozenset(
+    {
+        RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED,
+        RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED,
+        RUN_FINAL_CLOSURE_ITEM_DECISION_NEEDS_MORE_WORK,
+        RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+    }
+)
+
+
+def run_final_closure_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON run final closure record path for *run_id*."""
+    return paths.run_root(run_id, base_dir) / "run_final_closure_record.json"
+
+
+def _normalize_run_final_closure_items(
+    closure_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in closure_items:
+        normalized.append(
+            {
+                "closure_item_id": item["closure_item_id"],
+                "source_post_verification_execution_verification_item_id": item.get(
+                    "source_post_verification_execution_verification_item_id"
+                ),
+                "source_post_verification_execution_result_item_id": item.get(
+                    "source_post_verification_execution_result_item_id"
+                ),
+                "source_post_verification_execution_request_item_id": item.get(
+                    "source_post_verification_execution_request_item_id"
+                ),
+                "source_post_verification_followup_item_id": item.get(
+                    "source_post_verification_followup_item_id"
+                ),
+                "source_execution_item_id": item.get("source_execution_item_id"),
+                "source_followup_item_id": item.get("source_followup_item_id"),
+                "verification_decision_after_result": item.get(
+                    "verification_decision_after_result"
+                ),
+                "closure_decision": item["closure_decision"],
+                "reason": item.get("reason"),
+                "evidence": item["evidence"] if item.get("evidence") is not None else {},
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def compute_run_final_closure_status(
+    closure_items: list[dict[str, Any]],
+) -> str:
+    """Derive aggregate final closure status from explicit closure item decisions."""
+    if not closure_items:
+        return RUN_FINAL_CLOSURE_STATUS_CLOSED_NO_ACTION
+    decisions = [item["closure_decision"] for item in closure_items]
+    if any(
+        decision == RUN_FINAL_CLOSURE_ITEM_DECISION_NEEDS_MORE_WORK
+        for decision in decisions
+    ):
+        return RUN_FINAL_CLOSURE_STATUS_CLOSED_NEEDS_MORE_WORK
+    if all(
+        decision
+        in (
+            RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED,
+            RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+        )
+        for decision in decisions
+    ) and any(
+        decision == RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED for decision in decisions
+    ):
+        return RUN_FINAL_CLOSURE_STATUS_CLOSED_VERIFIED
+    if all(
+        decision
+        in (
+            RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED,
+            RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+        )
+        for decision in decisions
+    ) and any(
+        decision == RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED for decision in decisions
+    ):
+        return RUN_FINAL_CLOSURE_STATUS_CLOSED_REJECTED
+    return RUN_FINAL_CLOSURE_STATUS_CLOSED_NEEDS_MORE_WORK
+
+
+def _validate_run_final_closure_status_consistency(
+    closure_record: dict[str, Any],
+) -> None:
+    final_closure_status = closure_record["final_closure_status"]
+    closure_items = closure_record["closure_items"]
+    if final_closure_status == RUN_FINAL_CLOSURE_STATUS_CLOSED_NO_ACTION:
+        if closure_items:
+            raise ValueError(
+                "run_final_closure_record: closed_no_action final_closure_status "
+                "requires closure_items to be empty"
+            )
+        return
+    if not closure_items:
+        raise ValueError(
+            "run_final_closure_record: "
+            f"{final_closure_status} final_closure_status requires non-empty "
+            "closure_items"
+        )
+    decisions = [item["closure_decision"] for item in closure_items]
+    if all(
+        decision == RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION for decision in decisions
+    ):
+        raise ValueError(
+            "run_final_closure_record: closure_items cannot all be no_action"
+        )
+    if final_closure_status == RUN_FINAL_CLOSURE_STATUS_CLOSED_VERIFIED:
+        if not all(
+            decision
+            in (
+                RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED,
+                RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+            )
+            for decision in decisions
+        ):
+            raise ValueError(
+                "run_final_closure_record: closed_verified final_closure_status "
+                "requires all closure_decision values to be accepted or no_action"
+            )
+        if not any(
+            decision == RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED for decision in decisions
+        ):
+            raise ValueError(
+                "run_final_closure_record: closed_verified final_closure_status "
+                "requires at least one accepted item"
+            )
+    elif final_closure_status == RUN_FINAL_CLOSURE_STATUS_CLOSED_REJECTED:
+        if not all(
+            decision
+            in (
+                RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED,
+                RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+            )
+            for decision in decisions
+        ):
+            raise ValueError(
+                "run_final_closure_record: closed_rejected final_closure_status "
+                "requires all closure_decision values to be rejected or no_action"
+            )
+        if not any(
+            decision == RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED for decision in decisions
+        ):
+            raise ValueError(
+                "run_final_closure_record: closed_rejected final_closure_status "
+                "requires at least one rejected item"
+            )
+    elif final_closure_status == RUN_FINAL_CLOSURE_STATUS_CLOSED_NEEDS_MORE_WORK:
+        has_needs_more_work = any(
+            decision == RUN_FINAL_CLOSURE_ITEM_DECISION_NEEDS_MORE_WORK
+            for decision in decisions
+        )
+        all_accepted_or_na = all(
+            decision
+            in (
+                RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED,
+                RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+            )
+            for decision in decisions
+        ) and any(
+            decision == RUN_FINAL_CLOSURE_ITEM_DECISION_ACCEPTED for decision in decisions
+        )
+        all_rejected_or_na = all(
+            decision
+            in (
+                RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED,
+                RUN_FINAL_CLOSURE_ITEM_DECISION_NO_ACTION,
+            )
+            for decision in decisions
+        ) and any(
+            decision == RUN_FINAL_CLOSURE_ITEM_DECISION_REJECTED for decision in decisions
+        )
+        if not has_needs_more_work and (all_accepted_or_na or all_rejected_or_na):
+            raise ValueError(
+                "run_final_closure_record: closed_needs_more_work "
+                "final_closure_status requires a mix of item decisions or a "
+                "needs_more_work item"
+            )
+
+
+def validate_run_final_closure_sources_correspond(
+    closure_items: list[dict[str, Any]],
+    verification_record: dict[str, Any],
+) -> None:
+    """Ensure closure items align with post-verification execution verification items."""
+    verification_by_id = {
+        item["verification_item_id"]: item
+        for item in verification_record["verification_items"]
+    }
+
+    for closure_item in closure_items:
+        source_verification_item_id = closure_item.get(
+            "source_post_verification_execution_verification_item_id"
+        )
+        if source_verification_item_id is None:
+            continue
+        if source_verification_item_id not in verification_by_id:
+            raise ValueError(
+                "closure item references unknown "
+                "source_post_verification_execution_verification_item_id "
+                f"{source_verification_item_id!r}"
+            )
+        verification_item = verification_by_id[source_verification_item_id]
+        field_map = {
+            "source_post_verification_execution_result_item_id": "source_result_item_id",
+            "source_post_verification_execution_request_item_id": "source_request_item_id",
+            "source_post_verification_followup_item_id": (
+                "source_post_verification_followup_item_id"
+            ),
+            "source_execution_item_id": "source_execution_item_id",
+            "source_followup_item_id": "source_followup_item_id",
+            "verification_decision_after_result": "verification_decision_after_result",
+        }
+        for closure_field, verification_field in field_map.items():
+            if closure_item.get(closure_field) != verification_item.get(
+                verification_field
+            ):
+                raise ValueError(
+                    f"closure item {closure_field} does not match verification item "
+                    f"for {source_verification_item_id!r}"
+                )
+
+
+def make_run_final_closure_record(
+    *,
+    run_id: str,
+    source_run_completion_fingerprint: str,
+    source_run_review_fingerprint: str,
+    source_run_followup_plan_fingerprint: str,
+    source_run_execution_request_fingerprint: str,
+    source_run_execution_result_fingerprint: str,
+    source_run_execution_verification_fingerprint: str,
+    source_post_verification_followup_plan_fingerprint: str,
+    source_post_verification_execution_request_fingerprint: str,
+    source_post_verification_execution_result_fingerprint: str,
+    source_post_verification_execution_verification_fingerprint: str,
+    closure_reason: str,
+    closure_items: list[dict[str, Any]],
+    closer: str = "human",
+    final_closure_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated run final closure record envelope."""
+    normalized_items = _normalize_run_final_closure_items(closure_items)
+    resolved_final_closure_status = final_closure_status
+    if resolved_final_closure_status is None:
+        resolved_final_closure_status = compute_run_final_closure_status(
+            normalized_items
+        )
+    closure_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_run_completion_fingerprint": source_run_completion_fingerprint,
+        "source_run_review_fingerprint": source_run_review_fingerprint,
+        "source_run_followup_plan_fingerprint": source_run_followup_plan_fingerprint,
+        "source_run_execution_request_fingerprint": (
+            source_run_execution_request_fingerprint
+        ),
+        "source_run_execution_result_fingerprint": (
+            source_run_execution_result_fingerprint
+        ),
+        "source_run_execution_verification_fingerprint": (
+            source_run_execution_verification_fingerprint
+        ),
+        "source_post_verification_followup_plan_fingerprint": (
+            source_post_verification_followup_plan_fingerprint
+        ),
+        "source_post_verification_execution_request_fingerprint": (
+            source_post_verification_execution_request_fingerprint
+        ),
+        "source_post_verification_execution_result_fingerprint": (
+            source_post_verification_execution_result_fingerprint
+        ),
+        "source_post_verification_execution_verification_fingerprint": (
+            source_post_verification_execution_verification_fingerprint
+        ),
+        "closer": closer,
+        "final_closure_status": resolved_final_closure_status,
+        "closure_reason": closure_reason,
+        "closure_items": normalized_items,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(closure_record, "run_final_closure_record")
+    return closure_record
+
+
+def run_final_closure_fingerprint(closure_record: dict[str, Any]) -> str:
+    """Return a stable semantic fingerprint for a run final closure record."""
+    validate_schema(closure_record, "run_final_closure_record")
+    return json.dumps(
+        closure_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
