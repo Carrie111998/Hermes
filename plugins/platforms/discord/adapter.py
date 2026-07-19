@@ -2777,12 +2777,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Retries once after a short delay to handle the race condition where
         the reaction was just added and Discord hasn't processed it yet.
+        Falls back to ``clear_reaction`` when the bot user object isn't
+        available yet (not fully cached on startup).
         """
-        if not message or not hasattr(message, "remove_reaction") or not self._client or not self._client.user:
+        if not message:
             return False
         for attempt in range(2):
             try:
-                await message.remove_reaction(emoji, self._client.user)
+                if self._client and self._client.user:
+                    await message.remove_reaction(emoji, self._client.user)
+                elif hasattr(message, "clear_reaction"):
+                    await message.clear_reaction(emoji)
+                else:
+                    return False
                 return True
             except Exception as e:
                 if attempt == 0:
