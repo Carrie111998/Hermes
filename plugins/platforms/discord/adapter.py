@@ -936,6 +936,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Per-message active reaction tracking for persona/tool emoji swapping.
         # Key: message.id (int), Value: currently active reaction emoji (str).
         self._active_tool_reactions: Dict[int, str] = {}
+        # Cached bot user ID, set in on_ready. Used by _remove_reaction to
+        # avoid relying on self._client.user which may not be cached yet.
+        self._bot_user_id: Optional[int] = None
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 2000-char preview
         # cap, every subsequent progressive edit truncates to the SAME text;
@@ -1159,6 +1162,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+                # Cache the bot user ID so _remove_reaction can use it even
+                # before self._client.user is fully cached.
+                if adapter_self._client and adapter_self._client.user:
+                    adapter_self._bot_user_id = adapter_self._client.user.id
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -2777,15 +2784,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Retries once after a short delay to handle the race condition where
         the reaction was just added and Discord hasn't processed it yet.
-        Falls back to ``clear_reaction`` when the bot user object isn't
-        available yet (not fully cached on startup).
+        Uses a cached bot user ID (set in on_ready) to avoid relying on
+        ``self._client.user`` which may not be available yet.
         """
         if not message:
             return False
         for attempt in range(2):
             try:
-                if self._client and self._client.user:
-                    await message.remove_reaction(emoji, self._client.user)
+                # Resolve the bot user from the cached ID if available.
+                bot_user = None
+                if self._bot_user_id is not None and self._client:
+                    bot_user = self._client.get_user(self._bot_user_id)
+                if bot_user is not None and hasattr(message, "remove_reaction"):
+                    await message.remove_reaction(emoji, bot_user)
                 elif hasattr(message, "clear_reaction"):
                     await message.clear_reaction(emoji)
                 else:
@@ -2793,7 +2804,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 return True
             except Exception as e:
                 if attempt == 0:
-                    # Reaction may not be cached yet — wait and retry once.
                     await asyncio.sleep(0.5)
                     continue
                 logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
