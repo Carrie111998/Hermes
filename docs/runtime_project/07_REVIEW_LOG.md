@@ -1004,3 +1004,41 @@ Phase 1 freezes the 11-record chain semantics without expanding automation or ad
 - Phase 2 **planning** started; Phase 2 **implementation** not started
 
 **Awaiting:** Architect acceptance of open decisions in `09_PHASE2_RUNTIME_BOUNDARY.md` §11 before any Phase 2 code.
+
+---
+
+## Task 18.5 — Reconcile Phase 1 Tracked Baseline (2026-07-20)
+
+**Implementer:** Cursor  
+**Status:** ✅ Baseline reconciliation checkpoint (additive; parent `f7e291ff7`)  
+**Tests (candidate Git-only workspace before staging):** import smoke (`htr`, `htr.contracts`, `htr.events`, `htr.artifacts`) OK; foundation tests **143 passed**; Phase 1 workflow tests **1078 passed**; full candidate `tests/htr/` **1221 passed** (20 files)  
+**Builds on:** Task 18 checkpoint `f7e291ff7`
+
+### Problem
+
+A read-only dependency audit confirmed the tracked HTR baseline was **non-reproducible from Git alone** since the first tracked HTR commit: five Phase 1 foundation modules and eight foundation tests existed locally and were exercised by passing tests, but were omitted from every prior checkpoint.
+
+### Delivered (byte-for-byte; no semantic edits)
+
+**Production:** `htr/paths.py`, `htr/ids.py`, `htr/io.py`, `htr/state.py`, `htr/artifacts.py`
+
+**Tests:** `tests/htr/test_paths.py`, `test_ids.py`, `test_io.py`, `test_state.py`, `test_artifacts.py`, `test_contracts.py`, `test_events.py`, `test_schemas.py`
+
+### Explicit exclusions (deferred)
+
+- `htr/audit.py` — adjacent functionality + development HMAC secret; separate review
+- `tests/htr/test_verification.py` — ownership/scope not established by audit
+- `tests/htr/test_run_completion.py` — provenance/overlap with `test_completion.py` unresolved
+- All Task 19 paths (`htr/observe.py`, CLI wiring, Task 19 tests)
+
+### Design principle
+
+Baseline reconciliation only — restore Git-only reproducibility for the existing Phase 1 implementation. No lifecycle redesign, no new record/event types, no schema changes, no edits to frozen workflow tests or the 11-record chain.
+
+### Non-goals confirmed
+
+- No rewrite of prior checkpoints
+- No Task 19 staging or commit
+- No admission of excluded untracked modules
+
+**Task 19** remains the first Phase 2 **implementation** task and is out of scope for this checkpoint.

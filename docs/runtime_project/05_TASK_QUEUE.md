@@ -1,20 +1,39 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-19 (Task 18 planning cleanup; Phase 1 closed at `8fea4daa0`)
+**Last updated:** 2026-07-20 (Task 18.5 baseline reconciliation; parent Task 18 `f7e291ff7`)
 
 ---
 
 ## Active Task
 
-None — Phase 2 **planning** started (Task 18); awaiting Architect acceptance of `09_PHASE2_RUNTIME_BOUNDARY.md`. Phase 2 **implementation** not started.
+**Task 19 — Phase 2 read-only observe MVP** — implementation complete locally; **not** part of Task 18.5; awaits separate review/commit after Task 18.5 checkpoint.
 
 ---
 
 ## Completed
 
+### Task 18.5 — Reconcile Phase 1 Tracked Baseline
+
+**Status:** ✅ Baseline reconciliation checkpoint (additive only; parent `f7e291ff7`)  
+**Tests (candidate Git-only workspace):** `tests/htr/` — **1221 passed** (20 files: 8 foundation + 12 Phase 1 workflow)  
+**Depends on:** Task 18 `f7e291ff7`
+
+**Problem:** Phase 1 workflow semantics were closed and tested locally, but Git reproducibility was broken from the first tracked HTR commit: five foundation modules and eight foundation tests were never checkpointed.
+
+**Changes (byte-for-byte admission; no semantic edits):**
+
+- Production: `htr/paths.py`, `htr/ids.py`, `htr/io.py`, `htr/state.py`, `htr/artifacts.py`
+- Tests: `tests/htr/test_paths.py`, `test_ids.py`, `test_io.py`, `test_state.py`, `test_artifacts.py`, `test_contracts.py`, `test_events.py`, `test_schemas.py`
+
+**Explicitly excluded (deferred):** `htr/audit.py`, `tests/htr/test_verification.py`, `tests/htr/test_run_completion.py`, all Task 19 paths.
+
+**Frozen / unchanged:** Phase 1 lifecycle, 11-record chain, `htr/contracts.py`, `htr/events.py`, `htr/schemas.py`, frozen workflow tests. Prior checkpoints not rewritten.
+
+**Note:** Semantic closure predated Git reproducibility; Task 18.5 restores Git-only reproducibility without redesign.
+
 ### Task 18 — Phase 2 Runtime Boundary Planning (docs only)
 
-**Status:** ✅ Complete (planning only — awaiting Architect acceptance — not checkpointed)  
+**Status:** ✅ Complete (checkpointed `f7e291ff7`)  
 **Tests:** n/a (docs only; no code/schema/events changes)  
 **Depends on:** Phase 1 closed at Task 17.1 `8fea4daa0`
 
@@ -158,11 +177,10 @@ Changes:
 
 ## Next Task (Architect)
 
-Phase 1 is closed (`8fea4daa0`). Phase 2 planning has started; Phase 2 implementation has **not** started.
+Phase 1 baseline is Git-reproducible after Task 18.5 (parent `f7e291ff7`). Task 19 (Phase 2 read-only observe) is implemented locally but **not** checkpointed.
 
-1. Accept or amend `09_PHASE2_RUNTIME_BOUNDARY.md` (especially open decisions in §11).
-2. Assign Phase 2 MVP slice (recommended: P2-T0 → P2-T1 → P2-T4 → P2-T6) **or** defer implementation.
-3. Do **not** start runtime code until P2-T0 acceptance.
+1. Review/commit Task 19 separately (first Phase 2 **implementation** checkpoint).
+2. Continue Phase 2 per `09_PHASE2_RUNTIME_BOUNDARY.md` after Task 19 acceptance.
 
 ---
 
