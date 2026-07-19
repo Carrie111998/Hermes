@@ -1,20 +1,36 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-19 (Task 16 completed by Cursor)
+**Last updated:** 2026-07-19 (Task 17 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect review of Task 16.
+None — awaiting Architect review of Task 17.
 
 ---
 
 ## Completed
 
-### Task 16 — Run Final Closure Record
+### Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze
 
 **Status:** ✅ Complete (awaiting Architect review — not checkpointed)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v`
+
+Changes:
+
+- Phase 1 boundary constants: `PHASE1_MANUAL_WORKFLOW_RECORD_CHAIN`, `PHASE1_TERMINAL_RECORD_TYPE`, `PHASE1_TERMINAL_EVENT_TYPE`, `PHASE1_BOUNDARY_STATUS`
+- `PHASE1_BOUNDARY_STATUS` is a constant/documentation marker only — **not** a lifecycle event
+- End-to-end manual workflow regression test through final closure
+- Boundary regression tests: no new record/event type, no boundary record file, AST import guards
+- **No lifecycle behavior changes** — tests/docs/constants only
+- Phase 1 terminal record: `run_final_closure_record`; terminal event: `run_final_closure_recorded`
+- 11-record manual chain frozen; JSON records are source-of-truth; event log is audit-only
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO; no automation in Phase 1
+
+### Task 16 — Run Final Closure Record
+
+**Status:** ✅ Accepted (checkpointed `1650b9e73`)  
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -110,7 +126,7 @@ Changes:
 
 ## Next Task (Architect)
 
-Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze (not started). Await scope assignment.
+Phase 2 planning — not started. Task 17 completes Phase 1; no Phase 2 implementation in Task 17.
 
 ---
 

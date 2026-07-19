@@ -2284,3 +2284,22 @@ def run_final_closure_fingerprint(closure_record: dict[str, Any]) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+PHASE1_MANUAL_WORKFLOW_RECORD_CHAIN: tuple[str, ...] = (
+    "run_completion_record",
+    "run_review_record",
+    "run_followup_plan_record",
+    "run_execution_request_record",
+    "run_execution_result_record",
+    "run_execution_verification_record",
+    "run_post_verification_followup_plan_record",
+    "run_post_verification_execution_request_record",
+    "run_post_verification_execution_result_record",
+    "run_post_verification_execution_verification_record",
+    "run_final_closure_record",
+)
+
+PHASE1_TERMINAL_RECORD_TYPE = "run_final_closure_record"
+PHASE1_TERMINAL_EVENT_TYPE = "run_final_closure_recorded"
+PHASE1_BOUNDARY_STATUS = "phase1_manual_workflow_frozen"

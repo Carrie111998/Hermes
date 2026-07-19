@@ -890,8 +890,8 @@ No artifact/result/verification_result/docs/test-output inspection; no automatic
 ## Task 16 — Run Final Closure Record (2026-07-19)
 
 **Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
-**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+**Status:** ✅ Accepted (checkpointed `1650b9e73`)  
+**Tests:** full HTR suite — **1250 passed** at Task 17 pre-checkpoint baseline
 
 ### Delivered
 
@@ -917,3 +917,31 @@ No artifact/result/verification_result/docs/test-output inspection; no automatic
 - Task 17 not started
 
 **Awaiting:** Architect acceptance before checkpoint / Task 17.
+
+---
+
+## Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze (2026-07-19)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+
+### Delivered
+
+- Phase 1 boundary constants in `contracts.py` + exports from `__init__.py`
+- `tests/htr/test_phase1_manual_workflow_boundary.py` — E2E manual workflow, boundary regression, AST guards
+- Documentation freeze for Phase 1 terminal chain and principles
+- **No new lifecycle record type, event type, or lifecycle behavior changes**
+
+### Design principle
+
+Task 17 locks the 11-record Phase 1 manual source-of-truth chain and adds regression protection.
+`PHASE1_BOUNDARY_STATUS` is constant-only; no boundary lifecycle event or record is created.
+
+### Non-goals confirmed
+
+- No new record/event type, no `phase1_boundary_record.json`, no boundary lifecycle API
+- No automation, Runtime/delegate_task/scheduler/queue/database/HEAL/DECO integration
+- No Phase 2 implementation; Task 18 not started
+
+**Awaiting:** Architect acceptance before checkpoint. Phase 2 not started.
