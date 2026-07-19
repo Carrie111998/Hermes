@@ -448,21 +448,39 @@ def _sanitize_node(node: Any, path: str) -> Any:
 # Reactive strip — only invoked when llama.cpp rejects a schema
 # =============================================================================
 
-_STRIP_ON_RECOVERY_KEYS = frozenset({"pattern", "format"})
+# Keywords llama.cpp's json-schema-to-grammar converter can't express and
+# that make it reject the whole request. Two families:
+#   * regex/format: ``pattern`` (escape classes ``\d``/``\w``/``\s``) and
+#     ``format`` (``date-time``, ``email``, ...).
+#   * bounded repetition: ``maxLength``/``minLength`` on strings and
+#     ``maxItems``/``minItems`` on arrays. A large bound (e.g. an MCP tool's
+#     ``"maxLength": 2000`` on array-item strings) is expanded literally into
+#     the GBNF — the generated grammar is too large / malformed and llama.cpp
+#     returns 400 "failed to parse grammar" / "unable to generate parser".
+_STRIP_ON_RECOVERY_KEYS = frozenset(
+    {"pattern", "format", "maxLength", "minLength", "maxItems", "minItems"}
+)
 
 
 def strip_pattern_and_format(tools: list[dict]) -> tuple[list[dict], int]:
-    """Strip ``pattern`` and ``format`` JSON Schema keywords from tool schemas.
+    """Strip grammar-hostile JSON Schema keywords from tool schemas.
 
     This is a *reactive* sanitizer invoked only when llama.cpp's
     ``json-schema-to-grammar`` converter has rejected a tool schema with an
-    HTTP 400 grammar-parse error.  llama.cpp's regex engine supports only a
-    small subset of ECMAScript regex (literals, ``.``, ``[...]``, ``|``,
-    ``*``, ``+``, ``?``, ``{n,m}``) — it rejects escape classes like ``\\d``,
-    ``\\w``, ``\\s`` and most ``format`` values.  Cloud providers (OpenAI,
-    Anthropic, OpenRouter, Gemini) accept these keywords fine and rely on
-    them as prompting hints, so we keep them in the default schema and only
-    strip on demand.
+    HTTP 400 grammar-parse error.  It removes two families of keywords the
+    converter can't handle (see :data:`_STRIP_ON_RECOVERY_KEYS`):
+
+    * ``pattern`` / ``format`` — llama.cpp's regex engine supports only a
+      small subset of ECMAScript regex (literals, ``.``, ``[...]``, ``|``,
+      ``*``, ``+``, ``?``, ``{n,m}``) and rejects escape classes like ``\\d``,
+      ``\\w``, ``\\s`` and most ``format`` values.
+    * ``maxLength`` / ``minLength`` / ``maxItems`` / ``minItems`` — bounded
+      repetition expanded literally into GBNF; large bounds (an MCP tool's
+      ``"maxLength": 2000`` on array items) overflow the grammar parser.
+
+    Cloud providers (OpenAI, Anthropic, OpenRouter, Gemini) accept these
+    keywords fine and rely on them as prompting hints, so we keep them in the
+    default schema and only strip on demand.
 
     The strip operates on a sibling of ``type`` (so schema keywords are
     removed) — a property literally *named* ``pattern`` (e.g. the first arg
@@ -521,7 +539,8 @@ def strip_pattern_and_format(tools: list[dict]) -> tuple[list[dict], int]:
 
     if stripped:
         logger.info(
-            "schema_sanitizer: stripped %d pattern/format keyword(s) from "
+            "schema_sanitizer: stripped %d grammar-hostile keyword(s) "
+            "(pattern/format/maxLength/minLength/maxItems/minItems) from "
             "tool schemas (llama.cpp grammar-parse recovery)",
             stripped,
         )
