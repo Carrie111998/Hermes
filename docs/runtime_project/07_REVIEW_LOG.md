@@ -1042,3 +1042,31 @@ Baseline reconciliation only — restore Git-only reproducibility for the existi
 - No admission of excluded untracked modules
 
 **Task 19** remains the first Phase 2 **implementation** task and is out of scope for this checkpoint.
+
+---
+
+## Task 19 — Read-Only Runtime Observability (2026-07-20)
+
+**Implementer:** Cursor  
+**Status:** ✅ Checkpointed (first Phase 2 **implementation**; builds on Task 18.5 `04b11bc4d`)  
+**Tests (candidate Git-only workspace before staging):** import smoke OK; focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)  
+**Depends on:** Task 18.5 `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e`
+
+### Delivered
+
+- `htr/observe.py` — read-only snapshot builder: frozen Phase 1 chain visibility, task/attempt summaries, integrity findings (JSON SoT, events, fingerprints, correspondence)
+- `hermes_cli/htr.py`, `hermes_cli/subcommands/htr.py`, `hermes_cli/main.py` — `hermes htr observe <run_id>`; JSON-only stdout; `--summary` on stderr; exit 0 / 1 / 2
+- `tests/htr/test_observe.py`, `tests/htr/test_phase2_read_only_boundary.py` — runtime tree-hash read-only proofs + AST mutator guards
+
+### Design principle
+
+Strictly read-only observability foundation for later reliable automation — **not** lifecycle automation, **not** a permanent manual-only direction. Reuses tracked fingerprint/correspondence helpers; no parallel state machine.
+
+### Non-goals confirmed
+
+- No lifecycle writes, event append, JSON SoT writes, repair execution, auto-heal, artifact inspection, run listing, snapshot persistence, hard-lock enforcement
+- No new lifecycle schemas, record types, or event types; no edits to `htr/events.py` / `htr/schemas.py`
+- Final closure terminal only for Phase 1 manual chain; post-closure activity advisory only
+- Artifact observation and transition replay deferred
+
+**Next:** Architect acceptance; assign subsequent Phase 2 slice per `09_PHASE2_RUNTIME_BOUNDARY.md`.

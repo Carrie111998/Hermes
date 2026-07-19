@@ -1,20 +1,38 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-20 (Task 18.5 baseline reconciliation; parent Task 18 `f7e291ff7`)
+**Last updated:** 2026-07-20 (Task 19 Phase 2 read-only observe; parent Task 18.5 `04b11bc4d`)
 
 ---
 
 ## Active Task
 
-**Task 19 — Phase 2 read-only observe MVP** — implementation complete locally; **not** part of Task 18.5; awaits separate review/commit after Task 18.5 checkpoint.
+None — Task 19 checkpointed; next Phase 2 work awaits Architect assignment (see `09_PHASE2_RUNTIME_BOUNDARY.md`).
 
 ---
 
 ## Completed
 
+### Task 19 — Read-Only Runtime Observability (Phase 2 first implementation)
+
+**Status:** ✅ Checkpointed (first Phase 2 **implementation** task; builds on Task 18.5 `04b11bc4d`)  
+**Tests (candidate Git-only workspace):** focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)  
+**Depends on:** Task 18.5 `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e`
+
+**Scope:** Strictly read-only single-run observation and integrity reporting — foundation for later reliable, traceable, recoverable, human-gated automation; **not** a manual-only or permanent read-only architecture.
+
+**Delivered:**
+
+- `htr/observe.py` — deterministic machine-readable snapshot, Phase 1 chain visibility, task/attempt summaries, integrity findings
+- `hermes htr observe <run_id>` — JSON-only stdout; `--summary` on stderr; exit 0/1/2 fail-closed contract
+- Read-only boundary tests (AST + runtime tree-hash proofs)
+
+**Explicitly excluded:** artifact observation, transition replay, repair/auto-heal, run listing, snapshot persistence, hard-lock enforcement, new lifecycle schemas/records/events; **no** edits to `htr/events.py` / `htr/schemas.py`.
+
+**Frozen semantics preserved:** final closure terminal only for the Phase 1 manual record chain; post-closure activity is advisory (no global hard lock).
+
 ### Task 18.5 — Reconcile Phase 1 Tracked Baseline
 
-**Status:** ✅ Baseline reconciliation checkpoint (additive only; parent `f7e291ff7`)  
+**Status:** ✅ Checkpointed `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e` (additive only; parent `f7e291ff7`)  
 **Tests (candidate Git-only workspace):** `tests/htr/` — **1221 passed** (20 files: 8 foundation + 12 Phase 1 workflow)  
 **Depends on:** Task 18 `f7e291ff7`
 
@@ -177,10 +195,11 @@ Changes:
 
 ## Next Task (Architect)
 
-Phase 1 baseline is Git-reproducible after Task 18.5 (parent `f7e291ff7`). Task 19 (Phase 2 read-only observe) is implemented locally but **not** checkpointed.
+Phase 1 baseline Git-reproducible at Task 18.5 (`04b11bc4d`). Task 19 read-only observe checkpointed.
 
-1. Review/commit Task 19 separately (first Phase 2 **implementation** checkpoint).
-2. Continue Phase 2 per `09_PHASE2_RUNTIME_BOUNDARY.md` after Task 19 acceptance.
+1. Accept Task 19 or request amendments.
+2. Assign next Phase 2 slice per `09_PHASE2_RUNTIME_BOUNDARY.md` (e.g. human checkpoint wiring, repair **proposal** shape — not execution).
+3. Deferred: artifact observation, transition replay, `htr/audit.py`, unclear-provenance tests.
 
 ---
 

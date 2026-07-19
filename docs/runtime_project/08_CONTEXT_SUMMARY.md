@@ -1,14 +1,14 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-20  
-**Task:** Task 18.5 — Phase 1 tracked baseline reconciliation  
-**Status:** Phase 1 semantics frozen; Git reproducibility restored via additive checkpoint (parent Task 18 `f7e291ff7`). Task 19 implemented locally, not checkpointed.
+**Task:** Task 19 — Phase 2 read-only runtime observability  
+**Status:** Task 18.5 checkpointed at `04b11bc4d`; Task 19 checkpointed (first Phase 2 **implementation**)
 
 ---
 
 ## 1. One-paragraph state
 
-Phase 1 implementation and post-review hardening remain **semantically closed** at Task 17.1 `8fea4daa0`. Task 18 checkpointed Phase 2 **planning** at `f7e291ff7`. **Task 18.5** adds five omitted foundation modules and eight foundation tests byte-for-byte so the existing Phase 1 HTR baseline is **Git-reproducible** without changing lifecycle, schemas, events, or the frozen 11-record chain. Prior checkpoints were not rewritten. Task 19 (Phase 2 read-only observe) is complete in the working tree but excluded from Task 18.5; it awaits a separate commit. Deferred: `htr/audit.py`, unclear-provenance tests (`test_verification.py`, `test_run_completion.py`).
+Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 18.5 (`04b11bc4d`) restored **Git-only** Phase 1 reproducibility. **Task 19** adds strictly **read-only** single-run observation (`htr/observe.py`, `hermes htr observe`): Phase 1 chain visibility, task/attempt summaries, JSON SoT / event / fingerprint / correspondence integrity findings, deterministic JSON snapshot, optional human summary on stderr, fail-closed exit codes. **Zero lifecycle writes** — no event append, SoT write, repair, artifact inspection, hard lock, or new record/event types. This is a **foundation for later automation**, not a manual-only or permanent read-only product direction. Final closure stays terminal only for the frozen Phase 1 manual chain; post-closure activity is **advisory**. Deferred: artifact observation, transition replay, `htr/audit.py`, unclear-provenance tests.
 
 ---
 
@@ -78,4 +78,4 @@ See `09_PHASE2_RUNTIME_BOUNDARY.md` for may/may-not rules, open decisions, and p
 
 ---
 
-Task 17 checkpointed at `939e8b606`. Task 17.1 checkpointed at `8fea4daa0258184f409e61307eed1d3513cd50de` (short `8fea4daa0`). Task 18 checkpointed at `f7e291ff7`. Task 18.5 restores Git-only reproducibility for Phase 1 foundation modules (parent `f7e291ff7`). Task 19 (Phase 2 observe) implemented locally; not checkpointed.
+Task 17 checkpointed at `939e8b606`. Task 17.1 at `8fea4daa0`. Task 18 at `f7e291ff7`. Task 18.5 at `04b11bc4d`. Task 19 checkpointed (Phase 2 first implementation — read-only observe).
