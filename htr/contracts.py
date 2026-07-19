@@ -1337,3 +1337,276 @@ def run_post_verification_execution_request_fingerprint(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+POST_VERIFICATION_EXECUTION_RESULT_STATUS_COMPLETED = "completed"
+POST_VERIFICATION_EXECUTION_RESULT_STATUS_FAILED = "failed"
+POST_VERIFICATION_EXECUTION_RESULT_STATUS_PARTIAL = "partial"
+POST_VERIFICATION_EXECUTION_RESULT_STATUS_EMPTY = "empty"
+
+POST_VERIFICATION_EXECUTION_RESULT_STATUSES: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_EXECUTION_RESULT_STATUS_COMPLETED,
+        POST_VERIFICATION_EXECUTION_RESULT_STATUS_FAILED,
+        POST_VERIFICATION_EXECUTION_RESULT_STATUS_PARTIAL,
+        POST_VERIFICATION_EXECUTION_RESULT_STATUS_EMPTY,
+    }
+)
+
+POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_COMPLETED = "completed"
+POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_FAILED = "failed"
+POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_SKIPPED = "skipped"
+POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE = "not_applicable"
+
+POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUSES: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_COMPLETED,
+        POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_FAILED,
+        POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_SKIPPED,
+        POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+    }
+)
+
+
+def run_post_verification_execution_result_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON post-verification execution result record path for *run_id*."""
+    return (
+        paths.run_root(run_id, base_dir)
+        / "run_post_verification_execution_result_record.json"
+    )
+
+
+def _normalize_post_verification_execution_result_items(
+    result_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in result_items:
+        normalized.append(
+            {
+                "result_item_id": item["result_item_id"],
+                "source_request_item_id": item.get("source_request_item_id"),
+                "source_post_verification_followup_item_id": item.get(
+                    "source_post_verification_followup_item_id"
+                ),
+                "source_execution_item_id": item.get("source_execution_item_id"),
+                "source_followup_item_id": item.get("source_followup_item_id"),
+                "request_kind": item.get("request_kind"),
+                "execution_kind": item.get("execution_kind"),
+                "item_status": item.get("item_status"),
+                "verification_decision": item.get("verification_decision"),
+                "followup_kind": item.get("followup_kind"),
+                "result_item_status": item["result_item_status"],
+                "outcome": item.get("outcome"),
+                "evidence": item["evidence"] if item.get("evidence") is not None else {},
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def compute_post_verification_execution_result_status(
+    result_items: list[dict[str, Any]],
+) -> str:
+    """Derive aggregate post-verification execution result status from item results."""
+    if not result_items:
+        return POST_VERIFICATION_EXECUTION_RESULT_STATUS_EMPTY
+    item_statuses = [item["result_item_status"] for item in result_items]
+    if any(
+        status == POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_SKIPPED
+        for status in item_statuses
+    ):
+        return POST_VERIFICATION_EXECUTION_RESULT_STATUS_PARTIAL
+    if all(
+        status
+        in (
+            POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_COMPLETED,
+            POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+        )
+        for status in item_statuses
+    ):
+        return POST_VERIFICATION_EXECUTION_RESULT_STATUS_COMPLETED
+    if all(
+        status
+        in (
+            POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_FAILED,
+            POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+        )
+        for status in item_statuses
+    ):
+        return POST_VERIFICATION_EXECUTION_RESULT_STATUS_FAILED
+    return POST_VERIFICATION_EXECUTION_RESULT_STATUS_PARTIAL
+
+
+def _validate_post_verification_execution_result_status_consistency(
+    result_record: dict[str, Any],
+) -> None:
+    result_status = result_record["result_status"]
+    result_items = result_record["result_items"]
+    if result_status == POST_VERIFICATION_EXECUTION_RESULT_STATUS_EMPTY:
+        if result_items:
+            raise ValueError(
+                "run_post_verification_execution_result_record: empty result_status "
+                "requires result_items to be empty"
+            )
+        return
+    if not result_items:
+        raise ValueError(
+            "run_post_verification_execution_result_record: "
+            f"{result_status} result_status requires non-empty result_items"
+        )
+    item_statuses = [item["result_item_status"] for item in result_items]
+    if result_status == POST_VERIFICATION_EXECUTION_RESULT_STATUS_COMPLETED:
+        if not all(
+            status
+            in (
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_COMPLETED,
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+            )
+            for status in item_statuses
+        ):
+            raise ValueError(
+                "run_post_verification_execution_result_record: completed "
+                "result_status requires all result_item_status values to be "
+                "completed or not_applicable"
+            )
+    elif result_status == POST_VERIFICATION_EXECUTION_RESULT_STATUS_FAILED:
+        if not all(
+            status
+            in (
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_FAILED,
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+            )
+            for status in item_statuses
+        ):
+            raise ValueError(
+                "run_post_verification_execution_result_record: failed "
+                "result_status requires all result_item_status values to be "
+                "failed or not_applicable"
+            )
+    elif result_status == POST_VERIFICATION_EXECUTION_RESULT_STATUS_PARTIAL:
+        has_skipped = any(
+            status == POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_SKIPPED
+            for status in item_statuses
+        )
+        all_completed_or_na = all(
+            status
+            in (
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_COMPLETED,
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+            )
+            for status in item_statuses
+        )
+        all_failed_or_na = all(
+            status
+            in (
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_FAILED,
+                POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUS_NOT_APPLICABLE,
+            )
+            for status in item_statuses
+        )
+        if not has_skipped and (all_completed_or_na or all_failed_or_na):
+            raise ValueError(
+                "run_post_verification_execution_result_record: partial "
+                "result_status requires a mix of item outcomes or a skipped item"
+            )
+
+
+def validate_post_verification_execution_result_items_correspond(
+    result_items: list[dict[str, Any]],
+    execution_request_record: dict[str, Any],
+) -> None:
+    """Ensure result items align with post-verification execution request items."""
+    request_by_id = {
+        item["request_item_id"]: item
+        for item in execution_request_record["request_items"]
+    }
+
+    for result_item in result_items:
+        source_request_item_id = result_item.get("source_request_item_id")
+        if source_request_item_id is None:
+            continue
+        if source_request_item_id not in request_by_id:
+            raise ValueError(
+                "result item references unknown source_request_item_id "
+                f"{source_request_item_id!r}"
+            )
+        request_item = request_by_id[source_request_item_id]
+        for field in (
+            "source_post_verification_followup_item_id",
+            "source_execution_item_id",
+            "source_followup_item_id",
+            "request_kind",
+            "execution_kind",
+            "item_status",
+            "verification_decision",
+            "followup_kind",
+        ):
+            if result_item.get(field) != request_item.get(field):
+                raise ValueError(
+                    f"result item {field} does not match execution request for "
+                    f"{source_request_item_id!r}"
+                )
+
+
+def make_run_post_verification_execution_result_record(
+    *,
+    run_id: str,
+    source_execution_result_fingerprint: str,
+    source_execution_verification_fingerprint: str,
+    source_post_verification_followup_plan_fingerprint: str,
+    source_post_verification_execution_request_fingerprint: str,
+    result_items: list[dict[str, Any]],
+    executor: str = "human",
+    result_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated post-verification execution result record envelope."""
+    normalized_items = _normalize_post_verification_execution_result_items(
+        result_items
+    )
+    resolved_result_status = result_status
+    if resolved_result_status is None:
+        resolved_result_status = compute_post_verification_execution_result_status(
+            normalized_items
+        )
+    result_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_execution_result_fingerprint": source_execution_result_fingerprint,
+        "source_execution_verification_fingerprint": (
+            source_execution_verification_fingerprint
+        ),
+        "source_post_verification_followup_plan_fingerprint": (
+            source_post_verification_followup_plan_fingerprint
+        ),
+        "source_post_verification_execution_request_fingerprint": (
+            source_post_verification_execution_request_fingerprint
+        ),
+        "executor": executor,
+        "result_status": resolved_result_status,
+        "result_items": normalized_items,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(result_record, "run_post_verification_execution_result_record")
+    return result_record
+
+
+def run_post_verification_execution_result_fingerprint(
+    result_record: dict[str, Any],
+) -> str:
+    """Return a stable semantic fingerprint for a post-verification execution result."""
+    validate_schema(result_record, "run_post_verification_execution_result_record")
+    return json.dumps(
+        result_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

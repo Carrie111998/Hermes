@@ -821,3 +821,34 @@ No artifact/result/verification_result inspection; no automatic execution.
 - Task 14 not started
 
 **Awaiting:** Architect scope assignment for Task 14.
+
+---
+
+## Task 14 — Manual Post-Verification Execution Result Recording (2026-07-19)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+
+### Delivered
+
+- `run_post_verification_execution_result_record` schema + factory + fingerprint
+- `validate_post_verification_execution_result_items_correspond()` — correspondence to post-verification execution request items
+- `record_post_verification_execution_result()` — after full post-verification execution request chain
+- `run_post_verification_execution_result_recorded` event + replay-only semantics
+- Result statuses: `completed`, `failed`, `partial`, `empty`
+- Result item statuses: `completed`, `failed`, `skipped`, `not_applicable`
+
+### Design principle
+
+Result recording based only on execution result + execution verification + post-verification follow-up plan + post-verification execution request JSON records.
+No artifact/result/verification_result/docs inspection; no automatic execution or rerun.
+
+### Non-goals confirmed
+
+- No execution, rerun, repair, task/attempt creation, or lifecycle mutation
+- No prior record mutation
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
+- Task 15 not started
+
+**Awaiting:** Architect acceptance before checkpoint / Task 15.

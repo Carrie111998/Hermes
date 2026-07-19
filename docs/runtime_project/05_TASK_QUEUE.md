@@ -1,16 +1,34 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-18 (Task 13 completed by Cursor)
+**Last updated:** 2026-07-19 (Task 14 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect Task 14 assignment.
+None — awaiting Architect review of Task 14.
 
 ---
 
 ## Completed
+
+### Task 14 — Manual Post-Verification Execution Result Recording
+
+**Status:** ✅ Complete (awaiting Architect review — not checkpointed)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v`
+
+Changes:
+
+- `run_post_verification_execution_result_record` contract + schema validation
+- `make_run_post_verification_execution_result_record`, `run_post_verification_execution_result_fingerprint`
+- `validate_post_verification_execution_result_items_correspond`
+- `record_post_verification_execution_result()` — manual result recording after post-verification execution request exists
+- Fingerprints must match on-disk result + verification + post-verification follow-up plan + post-verification execution request records
+- `result_items` must correspond to post-verification execution request items (or be global/manual)
+- Writes `run_post_verification_execution_result_record.json`, appends `run_post_verification_execution_result_recorded` event
+- **Recording only** — no execution, no prior record mutation, no task/attempt creation
+- Empty post-verification execution request normally produces `empty` result; requested request may produce `completed`/`failed`/`partial` result
+- No artifact/result/verification_result/docs inspection
 
 ### Task 13 — Manual Post-Verification Execution Request Planning
 
@@ -56,7 +74,7 @@ Changes:
 
 ## Next Task (Architect)
 
-Task 14 — not started. Await scope assignment.
+Task 15 — not started. Await scope assignment.
 
 ---
 

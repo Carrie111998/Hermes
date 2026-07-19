@@ -24,6 +24,7 @@ SchemaName = Literal[
     "run_execution_verification_record",
     "run_post_verification_followup_plan_record",
     "run_post_verification_execution_request_record",
+    "run_post_verification_execution_result_record",
 ]
 
 
@@ -317,6 +318,20 @@ _REQUIRED_FIELDS: dict[SchemaName, tuple[str, ...]] = {
         "metadata",
         "created_at",
     ),
+    "run_post_verification_execution_result_record": (
+        "schema_version",
+        "run_id",
+        "source_execution_result_fingerprint",
+        "source_execution_verification_fingerprint",
+        "source_post_verification_followup_plan_fingerprint",
+        "source_post_verification_execution_request_fingerprint",
+        "executor",
+        "result_status",
+        "result_items",
+        "notes",
+        "metadata",
+        "created_at",
+    ),
 }
 
 
@@ -372,6 +387,8 @@ def validate(data: Any, schema_name: SchemaName) -> None:
         _validate_run_post_verification_followup_plan_record(data)
     elif schema_name == "run_post_verification_execution_request_record":
         _validate_run_post_verification_execution_request_record(data)
+    elif schema_name == "run_post_verification_execution_result_record":
+        _validate_run_post_verification_execution_result_record(data)
 
 
 def _require_str(data: dict[str, Any], field: str, schema_name: str) -> None:
@@ -1157,3 +1174,133 @@ def _validate_run_post_verification_execution_request_record(
             "run_post_verification_execution_request_record: metadata must be a dict"
         )
     _validate_post_verification_execution_request_status_consistency(data)
+
+
+def _validate_run_post_verification_execution_result_record(
+    data: dict[str, Any],
+) -> None:
+    from htr.contracts import (
+        POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUSES,
+        POST_VERIFICATION_EXECUTION_RESULT_STATUSES,
+        _validate_post_verification_execution_result_status_consistency,
+    )
+    from htr.ids import validate_id
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError(
+            "run_post_verification_execution_result_record: schema_version must be an int"
+        )
+    _require_str(data, "run_id", "run_post_verification_execution_result_record")
+    if not validate_id(data["run_id"], "run"):
+        raise ValueError(
+            "run_post_verification_execution_result_record: run_id must be a valid run id"
+        )
+    _require_str(
+        data,
+        "source_execution_result_fingerprint",
+        "run_post_verification_execution_result_record",
+    )
+    _require_str(
+        data,
+        "source_execution_verification_fingerprint",
+        "run_post_verification_execution_result_record",
+    )
+    _require_str(
+        data,
+        "source_post_verification_followup_plan_fingerprint",
+        "run_post_verification_execution_result_record",
+    )
+    _require_str(
+        data,
+        "source_post_verification_execution_request_fingerprint",
+        "run_post_verification_execution_result_record",
+    )
+    _require_str(data, "executor", "run_post_verification_execution_result_record")
+    _require_str(data, "result_status", "run_post_verification_execution_result_record")
+    if data["result_status"] not in POST_VERIFICATION_EXECUTION_RESULT_STATUSES:
+        raise ValueError(
+            "run_post_verification_execution_result_record: result_status must be one of "
+            "completed, failed, partial, empty"
+        )
+    _require_str(
+        data, "created_at", "run_post_verification_execution_result_record"
+    )
+    if "notes" not in data:
+        raise ValueError(
+            "run_post_verification_execution_result_record: missing fields: notes"
+        )
+    notes = data["notes"]
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError(
+            "run_post_verification_execution_result_record: notes must be a string or null"
+        )
+    result_items = data.get("result_items")
+    if not isinstance(result_items, list):
+        raise ValueError(
+            "run_post_verification_execution_result_record: result_items must be a list"
+        )
+    for item in result_items:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "run_post_verification_execution_result_record: result_items "
+                "entries must be dicts"
+            )
+        _require_str(
+            item, "result_item_id", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "source_request_item_id", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item,
+            "source_post_verification_followup_item_id",
+            "run_post_verification_execution_result_record",
+        )
+        _require_str_or_null(
+            item, "source_execution_item_id", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "source_followup_item_id", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "request_kind", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "execution_kind", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "item_status", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "verification_decision", "run_post_verification_execution_result_record"
+        )
+        _require_str_or_null(
+            item, "followup_kind", "run_post_verification_execution_result_record"
+        )
+        _require_str(
+            item, "result_item_status", "run_post_verification_execution_result_record"
+        )
+        if item["result_item_status"] not in POST_VERIFICATION_EXECUTION_RESULT_ITEM_STATUSES:
+            raise ValueError(
+                "run_post_verification_execution_result_record: result_item_status "
+                "must be one of completed, failed, skipped, not_applicable"
+            )
+        _require_str_or_null(
+            item, "outcome", "run_post_verification_execution_result_record"
+        )
+        if "evidence" not in item or not isinstance(item["evidence"], dict):
+            raise ValueError(
+                "run_post_verification_execution_result_record: result item evidence "
+                "must be a dict"
+            )
+        if "metadata" not in item or not isinstance(item["metadata"], dict):
+            raise ValueError(
+                "run_post_verification_execution_result_record: result item metadata "
+                "must be a dict"
+            )
+    if not isinstance(data["metadata"], dict):
+        raise ValueError(
+            "run_post_verification_execution_result_record: metadata must be a dict"
+        )
+    _validate_post_verification_execution_result_status_consistency(data)
