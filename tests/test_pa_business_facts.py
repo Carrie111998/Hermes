@@ -111,6 +111,78 @@ def test_local_command_operation_returns_json():
     assert result == {"ok": True, "payload": {"amount": 42}}
 
 
+@pytest.mark.parametrize(
+    ("legacy_name", "canonical_name"),
+    [
+        ("tgg_clarification_request", "tgg_clarification_raise"),
+        ("tgg_message_history_search", "message_search"),
+        ("tgg_case_update_state", "tgg_case_update"),
+    ],
+)
+def test_legacy_operation_name_resolves_to_canonical_when_registry_is_canonical(
+    legacy_name, canonical_name
+):
+    config = {
+        "pa_business": {
+            "operations": {
+                canonical_name: {
+                    "type": "command",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        "import json,sys; print(json.dumps(json.load(sys.stdin)))",
+                    ],
+                }
+            }
+        }
+    }
+
+    assert execute_business_operation(config, legacy_name, {"ok": True}) == {
+        "ok": True
+    }
+
+
+def test_generic_observation_injects_current_turn_source_refs(monkeypatch):
+    import tools.pa_business_tools as pbt
+
+    bridge = load_business_bridge_config(
+        {
+            "pa_business": {
+                "operations": {
+                    "tgg_case_observation": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/observations",
+                        "method": "POST",
+                    }
+                }
+            }
+        }
+    )
+    captured = {}
+    monkeypatch.setenv(
+        "HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-current-generic"]'
+    )
+    monkeypatch.setattr(pbt, "_load_runtime_bridge_config", lambda: bridge)
+
+    def fake_execute(_bridge, *, operation, payload):
+        captured.update(operation=operation, payload=payload)
+        return {"ok": True}
+
+    monkeypatch.setattr(pbt, "execute_business_operation", fake_execute)
+
+    result = json.loads(
+        pbt._handle_business_call(
+            {
+                "operation": "tgg_case_observation",
+                "payload": {"jobNo": "AM/JOB/2601/1018"},
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["payload"]["sourceRefs"] == ["wa-current-generic"]
+
+
 def test_tgg_production_config_exposes_searchable_case_operations():
     config = yaml.safe_load(TGG_PRODUCTION_CONFIG.read_text(encoding="utf-8"))
     pa_context = SimpleNamespace(
@@ -118,13 +190,14 @@ def test_tgg_production_config_exposes_searchable_case_operations():
     )
     bridge = load_business_bridge_config(config, pa_context=pa_context)
 
-    assert "case_search" in bridge.operations
     assert "tgg_case_search" in bridge.operations
     assert "job_work_costings" in bridge.operations
     assert "work_costing_lookup" in bridge.operations
     assert "work_costing_ingest_ilinked" in bridge.operations
-    assert bridge.operations["case_search"].url.endswith("/api/operator/cases")
     assert bridge.operations["tgg_case_search"].method == "GET"
+    assert "tgg_message_history_search" not in bridge.operations
+    assert "tgg_clarification_request" not in bridge.operations
+    assert "tgg_case_update_state" not in bridge.operations
     assert bridge.operations["job_work_costings"].url.endswith("/api/operator/cases/{jobNo}/work-costings")
 
 
@@ -1204,9 +1277,9 @@ def test_case_update_state_operation_in_production_config():
         constitution=SimpleNamespace(client=raw["pa"]["overlay"]["client"])
     )
     bridge = load_business_bridge_config(raw, pa_context=pa_context)
-    op = bridge.operations["tgg_case_update_state"]
-    assert op.method == "POST"
-    assert op.url.endswith("/api/operator/cases/state")
+    op = bridge.operations["tgg_case_update"]
+    assert op.method == "PATCH"
+    assert op.url.endswith("/api/operator/cases/{jobNo}/state")
 
 
 class TestCaseCreateJobNoContract:

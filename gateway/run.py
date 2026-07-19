@@ -8421,7 +8421,7 @@ class GatewayRunner:
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(context, event=event)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -11383,19 +11383,7 @@ class GatewayRunner:
         # raw_message.sourceMessageIds; single message_id). Record them so
         # pa_turns.message_refs_json is populated at source, never
         # reconstructed from content downstream.
-        _src_msg_ids: list = []
-        try:
-            _raw = getattr(event, "raw_message", None)
-            if isinstance(_raw, dict):
-                _ids = _raw.get("sourceMessageIds")
-                if isinstance(_ids, list):
-                    _src_msg_ids = [str(i) for i in _ids if i]
-            if not _src_msg_ids:
-                _mid = getattr(event, "message_id", None)
-                if _mid:
-                    _src_msg_ids = [m for m in str(_mid).split("+") if m]
-        except Exception:
-            _src_msg_ids = []
+        _src_msg_ids = self._event_source_message_ids(event)
         if _src_msg_ids and isinstance(_pa_record_result, dict):
             _pa_record_result.setdefault("turn_source_message_ids", _src_msg_ids)
         _pa_final_text = ""
@@ -14945,7 +14933,25 @@ class GatewayRunner:
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    @staticmethod
+    def _event_source_message_ids(event: Any) -> list[str]:
+        """Return exact inbound message ids for the current turn."""
+        try:
+            raw = getattr(event, "raw_message", None)
+            if isinstance(raw, dict):
+                ids = raw.get("sourceMessageIds")
+                if isinstance(ids, list):
+                    refs = [str(item) for item in ids if item]
+                    if refs:
+                        return refs
+            message_id = getattr(event, "message_id", None)
+            if message_id:
+                return [item for item in str(message_id).split("+") if item]
+        except Exception:
+            pass
+        return []
+
+    def _set_session_env(self, context: SessionContext, event: Any = None) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -14954,7 +14960,11 @@ class GatewayRunner:
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
+        import json
+
         from gateway.session_context import set_session_vars
+
+        source_message_refs = self._event_source_message_ids(event)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -14964,6 +14974,7 @@ class GatewayRunner:
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             session_id=context.session_id,
+            source_message_refs=json.dumps(source_message_refs),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

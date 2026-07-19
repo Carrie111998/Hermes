@@ -19,6 +19,7 @@ gpt-5.6-luna at reasoning_effort low.
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 import yaml
@@ -54,7 +55,45 @@ EVENT_LABELS_NEW = (
 )
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
-NEW_INSTRUCTION_COUNT = 7
+NEW_INSTRUCTION_COUNT = 10
+
+# Exact runtime registry for the PA business bridge. Constitution prose may
+# mention only these names after the word "operation"; aliases otherwise fail
+# at runtime even when the model recovers later in the same turn.
+CANONICAL_OPERATIONS = {
+    "agent_action_record",
+    "agent_config_read",
+    "ilinked_lookup",
+    "ilinked_status",
+    "ilinked_wc_lookup",
+    "job_work_costings",
+    "message_search",
+    "tgg_attention_raise",
+    "tgg_case_create",
+    "tgg_case_list",
+    "tgg_case_lookup",
+    "tgg_case_observation",
+    "tgg_case_search",
+    "tgg_case_update",
+    "tgg_case_wc_attach",
+    "tgg_clarification_raise",
+    "work_costing_ingest_ilinked",
+    "work_costing_lookup",
+    "work_costing_upsert",
+}
+OPERATION_REFERENCE_RE = re.compile(
+    r"\boperation\s+([a-z][a-z0-9]*_[a-z0-9_]+)\b"
+)
+
+MOFEX_OPERATION_OLD = (
+    "    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup\n"
+    "      and report inability if the tool blocks it.\n"
+)
+MOFEX_OPERATION_NEW = (
+    "    - If a TGG chat asks for a Mofex fact, route it out of TGG scope and report that\n"
+    "      Christopher's configured TGG operations cannot retrieve Mofex data. Do not invent\n"
+    "      or call a cross-client operation.\n"
+)
 
 # The single universal jobNo/create policy replaces the June create instruction
 # 1-for-1 — no other instruction anywhere in the constitution may permit a
@@ -157,6 +196,15 @@ def _constitution(source: str, slot: dict) -> str:
         EVENT_LABELS_NEW,
         label="ops-ingest event label list",
     )
+    # The June baseline names a cross-client operation that is not present in
+    # Christopher's runtime registry (once in each job brief). Keep the existing
+    # out-of-scope behavior, but remove the impossible tool call.
+    if rendered.count(MOFEX_OPERATION_OLD) != 2:
+        raise RuntimeError(
+            "expected two legacy Mofex operation instructions, found "
+            f"{rendered.count(MOFEX_OPERATION_OLD)}"
+        )
+    rendered = rendered.replace(MOFEX_OPERATION_OLD, MOFEX_OPERATION_NEW)
     if model != BASELINE_MODEL:
         replaced = rendered.replace(BASELINE_MODEL, model)
         if replaced == rendered:
@@ -195,6 +243,10 @@ def _validate(
         assert config["agent"]["reasoning_effort"] == effort
 
     operations = config["pa"]["overlay"]["client"]["business_bridge"]["operations"]
+    assert set(operations) == CANONICAL_OPERATIONS, (
+        sorted(set(operations) - CANONICAL_OPERATIONS),
+        sorted(CANONICAL_OPERATIONS - set(operations)),
+    )
     for name in NEW_OPERATIONS:
         assert name in operations, name
         assert operations[name]["type"] == "http"
@@ -220,12 +272,37 @@ def _validate(
     assert "tgg_clarification_raise" in joined
     assert "tgg_case_wc_attach" in joined
     assert "attention_raised" in joined
+    all_instructions = "\n".join(
+        instruction
+        for job in constitution["job_briefs"].values()
+        for instruction in job["instructions"]
+    )
+    referenced_operations = set(OPERATION_REFERENCE_RE.findall(all_instructions))
+    assert referenced_operations <= CANONICAL_OPERATIONS, sorted(
+        referenced_operations - CANONICAL_OPERATIONS
+    )
+    assert "`tgg_clarification_request`" in joined
+    assert "`tgg_message_history_search`" in joined
+    assert "`tgg_case_update_state`" in joined
+    assert "mofex_lookup" not in all_instructions
+    assert "thread it arrived in is" in joined
+    assert "the strongest signal" in joined
+    assert "timing against active work" in joined
+    assert "Doubt with no named rival never triggers a clarification" in joined
+    assert "message_search for the same chat_jid with limit 10" in joined
+    assert "LOW confidence" in joined
+    assert "runtime supplies" in joined
+    assert "current-turn refs when they are omitted" in joined
+    assert "pure social acknowledgement" in joined
     # Exactly one create policy: the consolidated rule is present, the broader
     # June create instruction is gone, and no other instruction names the
     # create operation.
     assert "tgg_case_create has exactly one trigger" in joined
     assert "before any state update" not in joined
-    assert sum("tgg_case_create" in item for item in instructions) == 1
+    create_mentions = [item for item in instructions if "tgg_case_create" in item]
+    assert len(create_mentions) == 2
+    assert sum("has exactly one trigger" in item for item in create_mentions) == 1
+    assert sum("exact closed vocabulary" in item for item in create_mentions) == 1
 
 
 def main() -> int:

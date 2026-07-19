@@ -532,6 +532,19 @@ def execute_business_operation(
         else load_business_bridge_config(config, pa_context=pa_context)
     )
     op = bridge_config.operations.get(operation)
+    # Older convenience tools can still emit pre-registry names. If the
+    # requested legacy name is not explicitly configured, resolve it to the
+    # canonical operation before validation/execution. The registry remains
+    # canonical-only; legacy configs and fixtures still win when explicit.
+    if op is None:
+        canonical_operation = {
+            "tgg_clarification_request": "tgg_clarification_raise",
+            "tgg_message_history_search": "message_search",
+            "tgg_case_update_state": "tgg_case_update",
+        }.get(operation)
+        if canonical_operation:
+            operation = canonical_operation
+            op = bridge_config.operations.get(operation)
     if op is None:
         known = ", ".join(sorted(bridge_config.operations)) or "none configured"
         raise ValueError(f"unknown PA business operation {operation!r}; known: {known}")
@@ -1179,11 +1192,13 @@ def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str
             fields[field_key] = raw.get(source_key)
     source_refs = _string_list(fields.get("source_refs") or raw.get("sourceRefs"))
     if not source_refs:
-        return tool_error(
-            "tgg_case_observation requires non-empty sourceRefs. Cite the "
-            "WhatsApp message id(s) that support this observation; photos are "
-            "attached server-side from those source refs."
-        )
+        source_refs = _current_turn_source_refs()
+        if not source_refs:
+            return tool_error(
+                "tgg_case_observation requires non-empty sourceRefs. Cite the "
+                "WhatsApp message id(s) that support this observation; photos are "
+                "attached server-side from those source refs."
+            )
     fields["source_refs"] = source_refs
     # Media attachment is mechanical. Christopher cites source messages; the
     # systems API derives media_refs/photo_count from message_ledger. Strip any
@@ -1276,14 +1291,49 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
         )
     payload = _strip_control_payload_keys(payload)
     try:
+        bridge = _load_runtime_bridge_config()
+        configured = bridge.operations.get(operation)
+        canonical = None
+        if configured is None:
+            canonical = {
+                "tgg_clarification_request": "tgg_clarification_raise",
+                "tgg_message_history_search": "message_search",
+                "tgg_case_update_state": "tgg_case_update",
+            }.get(operation)
+            configured = bridge.operations.get(canonical) if canonical else None
+        effective_operation = canonical or operation
+        if effective_operation == "tgg_case_observation" and not (
+            payload.get("sourceRefs") or payload.get("source_refs")
+        ):
+            source_refs = _current_turn_source_refs()
+            if source_refs:
+                payload["sourceRefs"] = source_refs
+        # Recover only declared path params accidentally placed beside the
+        # generic payload object; arbitrary top-level args never cross over.
+        if configured is not None:
+            for key in configured.path_params:
+                if payload.get(key) is None and args.get(key) is not None:
+                    payload[key] = args.get(key)
         result = execute_business_operation(
-            _load_runtime_bridge_config(),
+            bridge,
             operation=operation,
             payload=payload,
         )
     except Exception as exc:
         return tool_error(exc)
     return tool_result(result)
+
+
+def _current_turn_source_refs() -> list[str]:
+    """Exact inbound refs bound by the gateway for this concurrent turn."""
+    try:
+        from gateway.session_context import get_session_env
+
+        encoded_refs = get_session_env("HERMES_SESSION_SOURCE_MESSAGE_REFS", "")
+        decoded_refs = json.loads(encoded_refs) if encoded_refs else []
+        return _string_list(decoded_refs)
+    except Exception:
+        return []
 
 
 _PA_BUSINESS_PAYLOAD_SCHEMA = {

@@ -205,6 +205,7 @@ def test_observation_does_not_override_backend_provided_state(monkeypatch):
 
 
 def test_observation_requires_source_refs_before_backend_write(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", raising=False)
     calls = _patch_backend(
         monkeypatch,
         {
@@ -220,6 +221,30 @@ def test_observation_requires_source_refs_before_backend_write(monkeypatch):
     assert data["error"]
     assert "sourceRefs" in data["error"]
     assert calls == []
+
+
+def test_observation_injects_current_turn_source_refs(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-current-1", "wa-current-2"]'
+    )
+    calls = _patch_backend(
+        monkeypatch,
+        {
+            "tgg_case_observation": {
+                "ok": True,
+                "data": {"observationId": 101},
+                "status_code": 200,
+            }
+        },
+    )
+
+    raw = pbt._handle_tgg_case_observation({"jobNo": "AM/JOB/2601/1018"})
+
+    assert json.loads(raw)["ok"] is True
+    assert calls[0][1]["fields"]["source_refs"] == [
+        "wa-current-1",
+        "wa-current-2",
+    ]
 
 
 def test_observation_strips_model_supplied_media_and_photo_fields(monkeypatch):

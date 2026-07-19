@@ -56,8 +56,9 @@ job_briefs:
       chat_name, observed_at, photo_count, media_refs, and extracted case facts.
     - For case-state updates, call pa_business_write with operation tgg_case_update
       before replying.
-    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
-      and report inability if the tool blocks it.
+    - If a TGG chat asks for a Mofex fact, route it out of TGG scope and report that
+      Christopher's configured TGG operations cannot retrieve Mofex data. Do not invent
+      or call a cross-client operation.
     - Route management questions out of ops ingest instead of answering them inline.
     - 'If an officer or worker states an intent to close a job that is still open
       (for example "ok noted, will close this job"), record it as a tgg_case_observation
@@ -74,14 +75,70 @@ job_briefs:
       more than one candidate remains genuinely plausible after weighing context.
 
       '
-    - 'For uncaptioned photos or photo albums, attach them to a case by conversational
-      adjacency: same chat, sent within minutes of a related message, same subject
-      or unit. Record the observation with why the attachment was made (the adjacent
-      message, the timing, the subject match) and a confidence level. Ask for clarification
-      only when more than one case is genuinely plausible. If no plausible case exists
-      at all, raise an attention item with pa_business_write operation tgg_attention_raise
-      (kind unmatched_evidence) instead of guessing or creating. Never silently drop
-      photo evidence.
+    - 'Attaching photo/album evidence: weigh three things. The thread it arrived in is
+      the strongest signal; also weigh timing against active work and identifying details
+      in the evidence itself — units, addresses, and job numbers in captions or visible
+      in the photos. Record why the attachment was made and its confidence.
+
+      When a detail points to a different case than context suggests, judge whether it is
+      an incidental mention or whether the evidence actually belongs there: do the photos
+      match work happening at that other unit? If the other named case cannot be ruled out,
+      attach to the context-supported case at LOW confidence and call pa_business_write
+      with operation tgg_clarification_raise, naming both cases and candidateJobNos when
+      available. Raise an album-specific clarification even when an earlier turn clarified
+      different evidence. Doubt with no named rival never triggers a clarification: attach
+      at whatever confidence the evidence supports.
+
+      When the immediately preceding evidence introduced a named rival and the current
+      album has no identifying detail of its own, carry that named rival into this judgment.
+      Do not replace it with a different historical same-unit case unless the current album
+      independently points to that case. In particular, a visible unit/address in the
+      immediately preceding evidence remains a named rival even when more than one case
+      matches it: the clarification must name that visible location and its candidate cases,
+      not substitute a historical case from the context-supported case''s own location.
+      An unresolved standalone evidence item does not become the default thread anchor for
+      the next album by adjacency alone. It remains the named rival; the default remains
+      the last established active case whose work scope matches the album, unless the album
+      independently identifies the rival location or case. When the album has no identifiers
+      of its own, that immediately preceding named rival cannot be ruled out: the attachment
+      MUST be LOW confidence and the album-specific clarification MUST name the rival location
+      and its candidate cases.
+
+      For a multi-photo album with no job number, unit, or address in the album itself,
+      explicitly inspect the immediately preceding inbound messages and photos in the same
+      chat. If needed to make those anchors visible, call pa_business_read with operation
+      message_search for the same chat_jid with limit 10 and no text query. If no plausible
+      case exists at all, raise tgg_attention_raise with kind unmatched_evidence instead
+      of guessing or creating. Never silently drop photo evidence.
+
+      '
+    - 'PA business operation names are an exact closed vocabulary. Use only these configured
+      names: agent_action_record, agent_config_read, ilinked_lookup, ilinked_status,
+      ilinked_wc_lookup, job_work_costings, message_search, tgg_attention_raise,
+      tgg_case_create, tgg_case_list, tgg_case_lookup, tgg_case_observation,
+      tgg_case_search, tgg_case_update, tgg_case_wc_attach, tgg_clarification_raise,
+      work_costing_ingest_ilinked, work_costing_lookup, work_costing_upsert. Never invent,
+      paraphrase, or suffix an operation name. In particular: clarification always uses
+      tgg_clarification_raise; case/candidate/history lookup uses tgg_case_search; raw
+      message-text lookup uses message_search; and a case state change uses tgg_case_update.
+      The aliases `tgg_clarification_request`, `tgg_message_history_search`, and
+      `tgg_case_update_state` DO NOT EXIST and must never be called.
+
+      '
+    - 'Every tgg_case_observation is bound to the CURRENT turn''s exact WhatsApp/import
+      message ids. Pass those ids in top-level sourceRefs when visible. The runtime supplies
+      the current-turn refs when they are omitted, so never skip a required observation
+      merely because the ids are not shown in the prompt. Do not search message history for
+      the current source id; call the observation and let the runtime bind it. Do not put earlier-turn ids in
+      sourceRefs, and do not use fields.evidence_refs as a substitute.
+
+      '
+    - 'A pure social acknowledgement (for example "thank you", "noted", "ok", or a
+      combination) with no new operational fact, decision, evidence, scope, status, or
+      closure intent is read-only/quiet. Do not write a tgg_case_observation, do not repeat
+      the prior work item, and do not record an event for the acknowledgement. This does
+      not apply when the message itself states a material intent such as "will close this
+      job" — that is an observation.
 
       '
     - 'If a message or photo shows a legible unit, block, or address that matches
@@ -301,8 +358,9 @@ job_briefs:
       update questions, call pa_business_read with operation ilinked_status before
       summarizing and include source_system_requested=true in the payload. Include
       the result in Facts.
-    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
-      and report inability if the tool blocks it.
+    - If a TGG chat asks for a Mofex fact, route it out of TGG scope and report that
+      Christopher's configured TGG operations cannot retrieve Mofex data. Do not invent
+      or call a cross-client operation.
     - 'Honor shortness signals. If the operator says "short", "brief", "tldr", "quick",
       "just", "simple", "summary", "short answer", or similar, match that register:
       answer plainly, with no exhaustive sectioning, no exhaustive enumeration, and
