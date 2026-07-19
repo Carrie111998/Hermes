@@ -1069,4 +1069,39 @@ Strictly read-only observability foundation for later reliable automation — **
 - Final closure terminal only for Phase 1 manual chain; post-closure activity advisory only
 - Artifact observation and transition replay deferred
 
-**Next:** Architect acceptance; assign subsequent Phase 2 slice per `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Next:** Task 20 Policy C architecture; Task 21 derived action plan (read-only).
+
+---
+
+## Task 20 — Immutable Finalization and Safe Automation Control Boundary (2026-07-20)
+
+**Implementer:** Cursor  
+**Status:** ✅ Architecture checkpoint (docs only; Policy C accepted; parent Task 19 `57a1ed651`)  
+**Tests:** n/a (documentation only)  
+**Depends on:** Task 19 `57a1ed651d622b3af82939d970b9c7f235ea1764`
+
+### Policy C accepted
+
+1. **Immutable finalization (finalized-run seal):** future Task 22 — original run with valid `run_final_closure_record` sealed against all normal HTR mutation; enforcement at canonical shared mutation boundaries; read-only observe allowed.
+2. **Recovery/Successor Run:** future Task 27+ — separate linked run for remediation; **never** reopen, unlock, edit, or roll back the original run via normal paths.
+
+### Write-path gate
+
+No Phase 2 lifecycle write or invoke before Task 22. Task 21 (read-only action plan) may proceed first.
+
+### Task 18 §11 resolved
+
+Hard lock → immutable seal + successor recovery; read-only MVP complete; artifact deferred; derived repair/recovery proposals (non-SoT); no new lifecycle types for Tasks 21–26.
+
+### Historical compatibility
+
+Task 17.1 accurately documented implemented behavior (chain-terminal, no global hard lock). Task 20 does **not** claim current APIs enforce Policy C or rewrite Phase 1 code semantics.
+
+### Non-goals confirmed
+
+- No runtime implementation in Task 20
+- No bypass/unlock/force mechanisms approved
+- No Recovery/Successor schema, approval storage, lock, invoke, or self-healing
+- No in-place recovery of finalized original runs
+
+**Next implementation:** Task 21 — Derived Action Plan Generation (read-only only).

@@ -1,81 +1,70 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-20  
-**Task:** Task 19 — Phase 2 read-only runtime observability  
-**Status:** Task 18.5 checkpointed at `04b11bc4d`; Task 19 checkpointed (first Phase 2 **implementation**)
+**Task:** Task 20 — Immutable finalization and safe automation control boundary (Policy C)  
+**Status:** Task 19 checkpointed `57a1ed651`; Task 20 architecture checkpoint (docs only); **Task 21 next** (read-only action plan)
 
 ---
 
 ## 1. One-paragraph state
 
-Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 18.5 (`04b11bc4d`) restored **Git-only** Phase 1 reproducibility. **Task 19** adds strictly **read-only** single-run observation (`htr/observe.py`, `hermes htr observe`): Phase 1 chain visibility, task/attempt summaries, JSON SoT / event / fingerprint / correspondence integrity findings, deterministic JSON snapshot, optional human summary on stderr, fail-closed exit codes. **Zero lifecycle writes** — no event append, SoT write, repair, artifact inspection, hard lock, or new record/event types. This is a **foundation for later automation**, not a manual-only or permanent read-only product direction. Final closure stays terminal only for the frozen Phase 1 manual chain; post-closure activity is **advisory**. Deferred: artifact observation, transition replay, `htr/audit.py`, unclear-provenance tests.
+Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0` (chain-terminal closure; **no global API hard lock in implemented code**). Task 18.5 restored Git reproducibility; **Task 19** (`57a1ed651`) delivered read-only observe. **Task 20** accepts **Policy C** (docs only): future **immutable finalized-run seal** (Task 22) + **Recovery/Successor Run** (Task 27+) — never reopen/unlock/edit the original run for normal recovery. **No Phase 2 write/invoke path is enabled.** Task 21 (derived action plan, read-only) is the next implementation. Neither seal nor recovery protocol exists in code yet.
 
 ---
 
-## 2. Task 17 deliverables
+## 2. Policy C (Task 20 — architecture only)
 
-| Area | Deliverable |
-|------|-------------|
-| `contracts.py` | `PHASE1_MANUAL_WORKFLOW_RECORD_CHAIN`, `PHASE1_TERMINAL_RECORD_TYPE`, `PHASE1_TERMINAL_EVENT_TYPE`, `PHASE1_BOUNDARY_STATUS` |
-| `__init__.py` | Phase 1 boundary constant exports |
-| Tests | `tests/htr/test_phase1_manual_workflow_boundary.py` — E2E workflow, boundary regression, AST import guards |
-| Docs | Phase 1 freeze documented in task queue, review log, context summary |
+| Principle | Meaning |
+|-----------|---------|
+| **Immutable finalization** | Valid `run_final_closure_record` → original run sealed against all normal mutation (Task 22) |
+| **Recovery/Successor Run** | Remediation in a **separate linked run**; original preserved as evidence (Task 27+) |
+| **Write-path gate** | No lifecycle invoke/write before Task 22 |
+| **No bypass** | No `force`/`unlock`/env override/direct SoT edit/delete closure for normal ops |
+
+Read-only observation remains allowed on finalized runs.
 
 ---
 
 ## 3. Phase 1 frozen manual chain (11 records)
 
-```
-run_completion_record
-→ run_review_record
-→ run_followup_plan_record
-→ run_execution_request_record
-→ run_execution_result_record
-→ run_execution_verification_record
-→ run_post_verification_followup_plan_record
-→ run_post_verification_execution_request_record
-→ run_post_verification_execution_result_record
-→ run_post_verification_execution_verification_record
-→ run_final_closure_record
-```
+Unchanged — see prior context. Terminal: `run_final_closure_record` / `run_final_closure_recorded`.
 
-**Terminal record:** `run_final_closure_record`  
-**Terminal event:** `run_final_closure_recorded`  
-**Boundary marker (constant only):** `phase1_manual_workflow_frozen`
+**Task 17.1 historical:** closure terminal for manual **chain** only; task/attempt APIs still callable until Task 22.
 
 ---
 
 ## 4. Phase 1 principles (frozen / closed)
 
-- JSON records are source-of-truth; event log is audit-only
-- Manual-only lifecycle APIs; no automatic execution/verification/rerun/repair
-- No artifact/result/verification_result/docs/test-output inspection in lifecycle APIs
-- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO integration
-- Final closure is terminal for the Phase 1 **manual run-record chain** (no new followup loop after closure)
-- `record_run_final_closure` itself preserves `run_manifest` / `task_status` / `attempt_status` snapshots (does not mutate them)
-- Phase 1 does **not** install a global hard lock that blocks later task/attempt APIs after closure
-- Callers/operators must treat `run_final_closure_record.json` as the Phase 1 terminal boundary
-- Phase 2 may decide whether to add a hard lock; Phase 1 does not
-- Idempotent replay of manual run-record APIs requires the JSON SoT file to exist; event-present / JSON-missing raises `InvalidTransition` (no silent heal)
+- JSON records are SoT; event log audit-only
+- Manual lifecycle APIs; no Phase 1 automation
+- Final closure terminal for **manual run-record chain** (Task 17.1 implemented semantics)
+- Phase 1 did **not** install global post-closure API hard lock
+- Policy C (Task 20) is **future Phase 2 enforcement** — does not rewrite Phase 1 checkpoints
 
 ---
 
-## 5. Non-goals (confirmed)
+## 5. Accepted Phase 2 progression (Tasks 19–31)
 
-- No new lifecycle record or event type for Phase 1 boundary freeze
-- No `record_phase1_boundary`, `make_phase1_boundary_record`, or `phase1_boundary_record.json`
-- No Phase 2 automation/integration **implementation** (Task 18 is planning only)
-- No global post-closure task/attempt hard lock in Phase 1
-- Phase 2 non-goals (planning): no daemon, scheduler, queue, database, browser automation, silent self-healing, unattended long-running pipeline, automatic delegate_task/HEAL loops, no changes to the frozen 11-record chain
-
----
-
-## 6. Phase 2 planning pointer
-
-See `09_PHASE2_RUNTIME_BOUNDARY.md` for may/may-not rules, open decisions, and proposed task sequence (P2-T0…P2-T6).
-
-**Boundary decisions (provisional):** runtime MVP read-oriented; no direct event append; no direct JSON SoT writes; later writes only via approved lifecycle APIs + human checkpoint; integrity fail-closed; no silent heal; hard lock and repair-proposal shape are open; artifact/link inspection must not auto-advance lifecycle state.
+```
+19 observe ✅ → 21 action plan → 22 immutable seal → 23 lock → 24 approval
+→ 25 human-gated invoke → 26 reconciliation → 27 Recovery/Successor
+→ 28 bounded repair → 29 artifact inspect → 30 multi-project → 31 learning
+```
 
 ---
 
-Task 17 checkpointed at `939e8b606`. Task 17.1 at `8fea4daa0`. Task 18 at `f7e291ff7`. Task 18.5 at `04b11bc4d`. Task 19 checkpointed (Phase 2 first implementation — read-only observe).
+## 6. Task 18 §11 (resolved at Task 20)
+
+| # | Resolution |
+|---|------------|
+| 1 | Immutable seal required before write/invoke; recovery successor-based |
+| 2 | Read-only MVP done (Task 19); invoke deferred |
+| 3 | Artifact inspection deferred (Task 29) |
+| 4 | Derived plan = library/stdout JSON; recovery proposal format = Task 27 |
+| 5 | No new lifecycle types for Tasks 21–26 |
+
+Full detail: `09_PHASE2_RUNTIME_BOUNDARY.md`.
+
+---
+
+Task 17 `939e8b606`. Task 17.1 `8fea4daa0`. Task 18 `f7e291ff7`. Task 18.5 `04b11bc4d`. Task 19 `57a1ed651`. Task 20 docs checkpoint (Policy C). **Next: Task 21** (read-only).

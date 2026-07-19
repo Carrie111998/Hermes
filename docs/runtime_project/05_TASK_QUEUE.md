@@ -1,20 +1,37 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-20 (Task 19 Phase 2 read-only observe; parent Task 18.5 `04b11bc4d`)
+**Last updated:** 2026-07-20 (Task 20 Policy C architecture checkpoint; parent Task 19 `57a1ed651`)
 
 ---
 
 ## Active Task
 
-None — Task 19 checkpointed; next Phase 2 work awaits Architect assignment (see `09_PHASE2_RUNTIME_BOUNDARY.md`).
+**Task 21 — Derived Action Plan Generation** — strictly read-only; **recommended next implementation** (may proceed before Task 22). See `09_PHASE2_RUNTIME_BOUNDARY.md`.
 
 ---
 
 ## Completed
 
+### Task 20 — Immutable Finalization and Safe Automation Control Boundary
+
+**Status:** ✅ Architecture checkpoint (docs only; Policy C accepted; parent Task 19 `57a1ed651`)  
+**Tests:** n/a (documentation only)  
+**Depends on:** Task 19 `57a1ed651d622b3af82939d970b9c7f235ea1764`
+
+**Delivered (documentation only — no runtime code):**
+
+- Accepted **Policy C:** immutable **finalized-run seal** (future Task 22) + **Recovery/Successor Run** (future Task 27) — no in-place reopen/unlock of original runs
+- Resolved Task 18 §11 decisions; corrected stale Phase 2 status in `09_PHASE2_RUNTIME_BOUNDARY.md`
+- Write-path gate: **no Phase 2 lifecycle write/invoke before Task 22**
+- Accepted task sequence Tasks 21–31; Task 21 next (read-only action plan)
+
+**Explicitly not implemented:** finalized-run enforcement, approval storage, lock/lease, invoke, recovery protocol, bypass/unlock mechanisms.
+
+**Historical compatibility:** Task 17.1 semantics preserved — Phase 1 closure was chain-terminal only; Policy C is future Phase 2 enforcement, not retroactive code change.
+
 ### Task 19 — Read-Only Runtime Observability (Phase 2 first implementation)
 
-**Status:** ✅ Checkpointed (first Phase 2 **implementation** task; builds on Task 18.5 `04b11bc4d`)  
+**Status:** ✅ Checkpointed `57a1ed651d622b3af82939d970b9c7f235ea1764` (first Phase 2 **implementation**; builds on Task 18.5 `04b11bc4d`)  
 **Tests (candidate Git-only workspace):** focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)  
 **Depends on:** Task 18.5 `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e`
 
@@ -28,7 +45,7 @@ None — Task 19 checkpointed; next Phase 2 work awaits Architect assignment (se
 
 **Explicitly excluded:** artifact observation, transition replay, repair/auto-heal, run listing, snapshot persistence, hard-lock enforcement, new lifecycle schemas/records/events; **no** edits to `htr/events.py` / `htr/schemas.py`.
 
-**Frozen semantics preserved:** final closure terminal only for the Phase 1 manual record chain; post-closure activity is advisory (no global hard lock).
+**Frozen semantics preserved (Task 17.1 historical):** final closure terminal for Phase 1 manual chain; post-closure activity advisory; **current APIs do not yet enforce Policy C immutable seal** (Task 22).
 
 ### Task 18.5 — Reconcile Phase 1 Tracked Baseline
 
@@ -193,13 +210,13 @@ Changes:
 
 ---
 
-## Next Task (Architect)
+## Next Task (Implementer)
 
-Phase 1 baseline Git-reproducible at Task 18.5 (`04b11bc4d`). Task 19 read-only observe checkpointed.
+**Task 21 — Derived Action Plan Generation** (read-only). Must not include: enforcement, approval, lock, invoke, recovery schema, persistence in run tree, new lifecycle types.
 
-1. Accept Task 19 or request amendments.
-2. Assign next Phase 2 slice per `09_PHASE2_RUNTIME_BOUNDARY.md` (e.g. human checkpoint wiring, repair **proposal** shape — not execution).
-3. Deferred: artifact observation, transition replay, `htr/audit.py`, unclear-provenance tests.
+**Blocked until Task 22:** any Phase 2 lifecycle write or invoke path.
+
+See `09_PHASE2_RUNTIME_BOUNDARY.md` for Tasks 22–31.
 
 ---
 

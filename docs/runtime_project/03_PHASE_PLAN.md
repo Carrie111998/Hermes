@@ -2,7 +2,7 @@
 
 **Baseline:** Architecture Baseline v1.0  
 **Date:** 2026-07-18  
-**Updated:** 2026-07-19 (Phase 1 closed at `8fea4daa0`; Phase 2 planning started)
+**Updated:** 2026-07-20 (Task 20 Policy C; Phase 2 implementation started at Task 19)
 
 ---
 
@@ -47,23 +47,20 @@ Phase 1 as delivered is the **manual 11-record run-level workflow** ending at `r
 
 ## Phase 2: Runtime Integration Boundary
 
-**Status:** Planning started (Task 18) — implementation not started — see `09_PHASE2_RUNTIME_BOUNDARY.md`
+**Status:** **Implementation started** (Task 19 `57a1ed651` read-only observe); architecture checkpoint Task 20 (Policy C) — see `09_PHASE2_RUNTIME_BOUNDARY.md`
 
-Phase 2 defines what a controlled runtime integration **may and may not** do before implementation.
+Phase 2 defines controlled runtime integration and safe-automation progression.
 
-**Planning focus:**
+**Policy C (Task 20 — architecture only, not yet enforced):**
 
-1. Closure = chain terminality vs optional whole-run hard lock (hard lock is separate go/no-go)
-2. Post-closure task/attempt mutation policy
-3. Integrity: fail closed (required); no silent heal; manual repair proposals deferred/open
-4. Runtime read/write permissions (MVP: read-oriented)
-5. No direct event append / no direct JSON SoT writes by runtime
-6. Later writes only through approved lifecycle APIs + human checkpoint (if enabled)
-7. Human checkpoint requirements
-8. Optional advisory artifact/link inspection (open) — must not auto-advance lifecycle state
-9. Explicit non-goals: no daemon, scheduler, queue, database, browser automation, silent self-healing, unattended long-running pipeline, automatic delegate_task/HEAL loops, no changes to the frozen 11-record chain
+1. **Immutable finalization:** valid `run_final_closure_record` → original run sealed against all normal mutation (Task 22).
+2. **Recovery/Successor Run:** remediation via linked successor run; original never reopened/unlocked/edited (Task 27+).
 
-**Implementation:** not started. Architect must accept `09_PHASE2_RUNTIME_BOUNDARY.md` before any Phase 2 code task.
+**Write-path gate:** no lifecycle write/invoke before Task 22 finalized-run enforcement.
+
+**Accepted progression:** observe (✅) → action plan (Task 21) → immutable seal (Task 22) → lock → approval → human-gated invoke → reconciliation → Recovery/Successor protocol → bounded repair → …
+
+**Historical note:** Phase 1 (Task 17.1) documented chain-terminal closure without global API hard lock; Policy C is forward-looking Phase 2 enforcement.
 
 ---
 
