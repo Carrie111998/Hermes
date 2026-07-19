@@ -12634,6 +12634,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                _event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18196,6 +18197,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        _event: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18214,6 +18216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                _event=_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18225,6 +18228,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                _event=_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -18346,6 +18350,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        _event: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -18619,7 +18624,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     asyncio.run_coroutine_threadsafe(
                         _status_adapter._run_processing_hook(
-                            "on_tool_call_start", source, tool_name
+                            "on_tool_call_start", _event, tool_name
                         ),
                         _loop_for_step,
                     )
@@ -18652,19 +18657,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _live_status_adapter.set_status_text(source.chat_id, None)
                 except Exception as _ls_err:
                     logger.debug("live status update failed: %s", _ls_err)
-
-            # Fire on_tool_call_start hook before the progress_queue guard so
-            # reaction swapping works even when tool progress messages are off.
-            if event_type == "tool.started" and tool_name and _status_adapter and _loop_for_step and _run_still_current():
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _status_adapter._run_processing_hook(
-                            "on_tool_call_start", source, tool_name
-                        ),
-                        _loop_for_step,
-                    )
-                except Exception:
-                    pass
 
             if not progress_queue or not _run_still_current():
                 return
@@ -19848,21 +19840,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 else None
             )
-            import logging as _gw_log
-            _gw_log.warning(
-                "[newton-debug] tool_progress_callback set=%s needs_progress_queue=%s log_mode=%s live_status=%s status_adapter=%s",
-                agent.tool_progress_callback is not None,
-                needs_progress_queue, log_mode_enabled,
-                _live_status_adapter is not None,
-                _status_adapter is not None,
-            )
             # Always wire the progress_callback for reaction swapping even when
             # tool progress messages are off. The callback's on_tool_call_start
             # hook fires before the progress_queue guard and is independent of
             # chat progress visibility.
             if agent.tool_progress_callback is None and _status_adapter is not None:
                 agent.tool_progress_callback = progress_callback
-                _gw_log.warning("[newton-debug] tool_progress_callback FALLBACK WIRED")
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (

@@ -2840,23 +2840,14 @@ class DiscordAdapter(BasePlatformAdapter):
         adds the emoji that represents the current tool, so the message
         always shows exactly one reaction reflecting what the agent is doing.
         """
-        import logging
-        _log = logging.getLogger(__name__)
-        _log.warning("[%s] on_tool_call_start CALLED tool=%s", self.name, tool_name)
         if not self._dynamic_reactions_enabled():
-            _log.warning("[%s] on_tool_call_start skipped: dynamic_reactions disabled", self.name)
             return
         message = event.raw_message
         if not hasattr(message, "add_reaction"):
-            _log.warning("[%s] on_tool_call_start skipped: message has no add_reaction", self.name)
             return
         from agent.display import get_tool_emoji
         tool_emoji = get_tool_emoji(tool_name, default="⚙️")
         current = self._active_tool_reactions.get(message.id)
-        _log.warning(
-            "[%s] on_tool_call_start: tool=%s emoji=%s current=%s",
-            self.name, tool_name, tool_emoji, current,
-        )
         if current and current != tool_emoji:
             await self._remove_reaction(message, current)
         await self._add_reaction(message, tool_emoji)
