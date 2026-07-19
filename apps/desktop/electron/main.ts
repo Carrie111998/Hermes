@@ -78,8 +78,8 @@ import {
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
-import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { extractHermesDeepLink, type HermesDeepLinkPayload, parseHermesDeepLink } from './deep-link'
+import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
