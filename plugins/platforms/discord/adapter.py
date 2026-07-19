@@ -2773,17 +2773,22 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
     async def _remove_reaction(self, message: Any, emoji: str) -> bool:
-        """Remove the bot's own emoji reaction from a Discord message."""
-        if not message or not hasattr(message, "remove_reaction"):
+        """Remove the bot's own emoji reaction from a Discord message.
+
+        Uses ``clear_reaction`` (removes all reactions of that emoji) as the
+        primary method because it doesn't require the bot user object to be
+        cached and doesn't have the race condition where a freshly-added
+        reaction hasn't been processed by Discord yet. Since the bot is the
+        only user adding these emojis, clearing all of that emoji is safe.
+        """
+        if not message:
             return False
         try:
-            # Try remove_reaction first (only removes bot's own reaction)
-            if self._client and self._client.user:
-                await message.remove_reaction(emoji, self._client.user)
-                return True
-            # Fallback: clear_reaction removes all of that emoji (needs Manage Messages)
             if hasattr(message, "clear_reaction"):
                 await message.clear_reaction(emoji)
+                return True
+            if hasattr(message, "remove_reaction") and self._client and self._client.user:
+                await message.remove_reaction(emoji, self._client.user)
                 return True
             return False
         except Exception as e:
