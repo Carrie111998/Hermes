@@ -827,8 +827,8 @@ No artifact/result/verification_result inspection; no automatic execution.
 ## Task 14 — Manual Post-Verification Execution Result Recording (2026-07-19)
 
 **Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
-**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+**Status:** ✅ Accepted (checkpointed `ea8dbda40`)  
+**Tests:** full HTR suite — **913 passed** at checkpoint
 
 ### Delivered
 
@@ -852,3 +852,35 @@ No artifact/result/verification_result/docs inspection; no automatic execution o
 - Task 15 not started
 
 **Awaiting:** Architect acceptance before checkpoint / Task 15.
+
+---
+
+## Task 15 — Manual Post-Verification Execution Verification Recording (2026-07-19)
+
+**Implementer:** Cursor  
+**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+
+### Delivered
+
+- `run_post_verification_execution_verification_record` schema + factory + fingerprint
+- `validate_post_verification_execution_verification_items_correspond()` — correspondence to post-verification execution result items
+- `compute_post_verification_execution_verification_status()` — deterministic status from explicit item decisions
+- `record_post_verification_execution_verification()` — after full post-verification execution result chain
+- `run_post_verification_execution_verification_recorded` event + replay-only semantics
+- Verification statuses: `verified`, `rejected`, `needs_changes`, `empty`
+- Item decisions: `verified`, `rejected`, `needs_changes`, `not_applicable`
+
+### Design principle
+
+Verification recording based only on execution result + execution verification + post-verification follow-up plan + post-verification execution request + post-verification execution result JSON records.
+No artifact/result/verification_result/docs/test-output inspection; no automatic verification or test execution.
+
+### Non-goals confirmed
+
+- No automatic verification, test execution, rerun, repair, task/attempt creation, or lifecycle mutation
+- No prior record mutation
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
+- Task 16 not started
+
+**Awaiting:** Architect acceptance before checkpoint / Task 16.

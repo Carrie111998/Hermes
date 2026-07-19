@@ -1610,3 +1610,349 @@ def run_post_verification_execution_result_fingerprint(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_VERIFIED = "verified"
+POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_REJECTED = "rejected"
+POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_NEEDS_CHANGES = "needs_changes"
+POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_EMPTY = "empty"
+
+POST_VERIFICATION_EXECUTION_VERIFICATION_STATUSES: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_VERIFIED,
+        POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_REJECTED,
+        POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_NEEDS_CHANGES,
+        POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_EMPTY,
+    }
+)
+
+POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED = "verified"
+POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED = "rejected"
+POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NEEDS_CHANGES = "needs_changes"
+POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE = (
+    "not_applicable"
+)
+
+POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISIONS: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED,
+        POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED,
+        POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NEEDS_CHANGES,
+        POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+    }
+)
+
+
+def run_post_verification_execution_verification_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON post-verification execution verification record path."""
+    return (
+        paths.run_root(run_id, base_dir)
+        / "run_post_verification_execution_verification_record.json"
+    )
+
+
+def _normalize_post_verification_execution_verification_items(
+    verification_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in verification_items:
+        normalized.append(
+            {
+                "verification_item_id": item["verification_item_id"],
+                "source_result_item_id": item.get("source_result_item_id"),
+                "source_request_item_id": item.get("source_request_item_id"),
+                "source_post_verification_followup_item_id": item.get(
+                    "source_post_verification_followup_item_id"
+                ),
+                "source_execution_item_id": item.get("source_execution_item_id"),
+                "source_followup_item_id": item.get("source_followup_item_id"),
+                "request_kind": item.get("request_kind"),
+                "execution_kind": item.get("execution_kind"),
+                "item_status": item.get("item_status"),
+                "verification_decision": item.get("verification_decision"),
+                "followup_kind": item.get("followup_kind"),
+                "result_item_status": item.get("result_item_status"),
+                "verification_decision_after_result": item[
+                    "verification_decision_after_result"
+                ],
+                "reason": item.get("reason"),
+                "evidence": item["evidence"] if item.get("evidence") is not None else {},
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def compute_post_verification_execution_verification_status(
+    verification_items: list[dict[str, Any]],
+) -> str:
+    """Derive aggregate verification status from explicit item decisions."""
+    if not verification_items:
+        return POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_EMPTY
+    decisions = [
+        item["verification_decision_after_result"] for item in verification_items
+    ]
+    if any(
+        decision
+        == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NEEDS_CHANGES
+        for decision in decisions
+    ):
+        return POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_NEEDS_CHANGES
+    if all(
+        decision
+        in (
+            POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED,
+            POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+        )
+        for decision in decisions
+    ) and any(
+        decision == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED
+        for decision in decisions
+    ):
+        return POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_VERIFIED
+    if all(
+        decision
+        in (
+            POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED,
+            POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+        )
+        for decision in decisions
+    ) and any(
+        decision == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED
+        for decision in decisions
+    ):
+        return POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_REJECTED
+    return POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_NEEDS_CHANGES
+
+
+def _validate_post_verification_execution_verification_status_consistency(
+    verification_record: dict[str, Any],
+) -> None:
+    verification_status = verification_record["verification_status"]
+    verification_items = verification_record["verification_items"]
+    if verification_status == POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_EMPTY:
+        if verification_items:
+            raise ValueError(
+                "run_post_verification_execution_verification_record: empty "
+                "verification_status requires verification_items to be empty"
+            )
+        return
+    if not verification_items:
+        raise ValueError(
+            "run_post_verification_execution_verification_record: "
+            f"{verification_status} verification_status requires non-empty "
+            "verification_items"
+        )
+    decisions = [
+        item["verification_decision_after_result"] for item in verification_items
+    ]
+    if all(
+        decision
+        == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE
+        for decision in decisions
+    ):
+        raise ValueError(
+            "run_post_verification_execution_verification_record: "
+            "verification_items cannot all be not_applicable"
+        )
+    if verification_status == POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_VERIFIED:
+        if not all(
+            decision
+            in (
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED,
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+            )
+            for decision in decisions
+        ):
+            raise ValueError(
+                "run_post_verification_execution_verification_record: verified "
+                "verification_status requires all "
+                "verification_decision_after_result values to be verified or "
+                "not_applicable"
+            )
+        if not any(
+            decision
+            == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED
+            for decision in decisions
+        ):
+            raise ValueError(
+                "run_post_verification_execution_verification_record: verified "
+                "verification_status requires at least one verified item"
+            )
+    elif (
+        verification_status
+        == POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_REJECTED
+    ):
+        if not all(
+            decision
+            in (
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED,
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+            )
+            for decision in decisions
+        ):
+            raise ValueError(
+                "run_post_verification_execution_verification_record: rejected "
+                "verification_status requires all "
+                "verification_decision_after_result values to be rejected or "
+                "not_applicable"
+            )
+        if not any(
+            decision
+            == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED
+            for decision in decisions
+        ):
+            raise ValueError(
+                "run_post_verification_execution_verification_record: rejected "
+                "verification_status requires at least one rejected item"
+            )
+    elif (
+        verification_status
+        == POST_VERIFICATION_EXECUTION_VERIFICATION_STATUS_NEEDS_CHANGES
+    ):
+        has_needs_changes = any(
+            decision
+            == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NEEDS_CHANGES
+            for decision in decisions
+        )
+        all_verified_or_na = all(
+            decision
+            in (
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED,
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+            )
+            for decision in decisions
+        ) and any(
+            decision
+            == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_VERIFIED
+            for decision in decisions
+        )
+        all_rejected_or_na = all(
+            decision
+            in (
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED,
+                POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_NOT_APPLICABLE,
+            )
+            for decision in decisions
+        ) and any(
+            decision
+            == POST_VERIFICATION_EXECUTION_VERIFICATION_ITEM_DECISION_REJECTED
+            for decision in decisions
+        )
+        if not has_needs_changes and (all_verified_or_na or all_rejected_or_na):
+            raise ValueError(
+                "run_post_verification_execution_verification_record: "
+                "needs_changes verification_status requires a mix of item "
+                "decisions or a needs_changes item"
+            )
+
+
+def validate_post_verification_execution_verification_items_correspond(
+    verification_items: list[dict[str, Any]],
+    execution_result_record: dict[str, Any],
+) -> None:
+    """Ensure verification items align with post-verification execution result items."""
+    result_by_id = {
+        item["result_item_id"]: item
+        for item in execution_result_record["result_items"]
+    }
+
+    for verification_item in verification_items:
+        source_result_item_id = verification_item.get("source_result_item_id")
+        if source_result_item_id is None:
+            continue
+        if source_result_item_id not in result_by_id:
+            raise ValueError(
+                "verification item references unknown source_result_item_id "
+                f"{source_result_item_id!r}"
+            )
+        result_item = result_by_id[source_result_item_id]
+        for field in (
+            "source_request_item_id",
+            "source_post_verification_followup_item_id",
+            "source_execution_item_id",
+            "source_followup_item_id",
+            "request_kind",
+            "execution_kind",
+            "item_status",
+            "verification_decision",
+            "followup_kind",
+            "result_item_status",
+        ):
+            if verification_item.get(field) != result_item.get(field):
+                raise ValueError(
+                    f"verification item {field} does not match execution result for "
+                    f"{source_result_item_id!r}"
+                )
+
+
+def make_run_post_verification_execution_verification_record(
+    *,
+    run_id: str,
+    source_execution_result_fingerprint: str,
+    source_execution_verification_fingerprint: str,
+    source_post_verification_followup_plan_fingerprint: str,
+    source_post_verification_execution_request_fingerprint: str,
+    source_post_verification_execution_result_fingerprint: str,
+    verification_items: list[dict[str, Any]],
+    verifier: str = "human",
+    verification_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated post-verification execution verification record envelope."""
+    normalized_items = _normalize_post_verification_execution_verification_items(
+        verification_items
+    )
+    resolved_verification_status = verification_status
+    if resolved_verification_status is None:
+        resolved_verification_status = (
+            compute_post_verification_execution_verification_status(normalized_items)
+        )
+    verification_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_execution_result_fingerprint": source_execution_result_fingerprint,
+        "source_execution_verification_fingerprint": (
+            source_execution_verification_fingerprint
+        ),
+        "source_post_verification_followup_plan_fingerprint": (
+            source_post_verification_followup_plan_fingerprint
+        ),
+        "source_post_verification_execution_request_fingerprint": (
+            source_post_verification_execution_request_fingerprint
+        ),
+        "source_post_verification_execution_result_fingerprint": (
+            source_post_verification_execution_result_fingerprint
+        ),
+        "verifier": verifier,
+        "verification_status": resolved_verification_status,
+        "verification_items": normalized_items,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(
+        verification_record, "run_post_verification_execution_verification_record"
+    )
+    return verification_record
+
+
+def run_post_verification_execution_verification_fingerprint(
+    verification_record: dict[str, Any],
+) -> str:
+    """Return a stable semantic fingerprint for post-verification execution verification."""
+    validate_schema(
+        verification_record, "run_post_verification_execution_verification_record"
+    )
+    return json.dumps(
+        verification_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

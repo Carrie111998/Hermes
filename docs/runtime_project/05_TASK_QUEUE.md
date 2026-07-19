@@ -1,20 +1,38 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-19 (Task 14 completed by Cursor)
+**Last updated:** 2026-07-19 (Task 15 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect review of Task 14.
+None — awaiting Architect review of Task 15.
 
 ---
 
 ## Completed
 
-### Task 14 — Manual Post-Verification Execution Result Recording
+### Task 15 — Manual Post-Verification Execution Verification Recording
 
 **Status:** ✅ Complete (awaiting Architect review — not checkpointed)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v`
+
+Changes:
+
+- `run_post_verification_execution_verification_record` contract + schema validation
+- `make_run_post_verification_execution_verification_record`, `run_post_verification_execution_verification_fingerprint`
+- `validate_post_verification_execution_verification_items_correspond`, `compute_post_verification_execution_verification_status`
+- `record_post_verification_execution_verification()` — manual verification recording after post-verification execution result exists
+- Fingerprints must match on-disk result + verification + post-verification follow-up plan + post-verification execution request + post-verification execution result records
+- `verification_items` must correspond to post-verification execution result items (or be global/manual)
+- Writes `run_post_verification_execution_verification_record.json`, appends `run_post_verification_execution_verification_recorded` event
+- **Recording only** — no automatic verification, no test execution, no prior record mutation, no task/attempt creation
+- Empty post-verification execution result normally produces `empty` verification; completed/failed/partial result may produce `verified`/`rejected`/`needs_changes` verification
+- No artifact/result/verification_result/docs/test-output inspection
+
+### Task 14 — Manual Post-Verification Execution Result Recording
+
+**Status:** ✅ Accepted (checkpointed)  
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -74,7 +92,7 @@ Changes:
 
 ## Next Task (Architect)
 
-Task 15 — not started. Await scope assignment.
+Task 16 — not started. Await scope assignment.
 
 ---
 
