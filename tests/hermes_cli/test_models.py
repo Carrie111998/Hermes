@@ -82,6 +82,8 @@ class TestFetchOpenRouterModels:
 
     def test_falls_back_to_static_snapshot_when_catalogs_unavailable(self, monkeypatch):
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        # Pin the remote manifest out too — otherwise the fallback silently
+        # depends on whatever the deployed catalog currently contains.
         with (
             patch(
                 "hermes_cli.model_catalog.get_curated_openrouter_models",
