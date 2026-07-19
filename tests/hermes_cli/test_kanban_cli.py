@@ -40,6 +40,32 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 
+def test_kanban_create_help_explains_scheduled_dispatch_hold(kanban_home):
+    output = kc.run_slash("create --help")
+
+    assert "scheduled" in output
+    assert "outside the dispatcher" in output
+    assert "explicit release" in output
+
+
+def test_run_slash_create_scheduled_stays_outside_dispatch_queue(kanban_home):
+    payload = json.loads(
+        kc.run_slash(
+            "create 'route before dispatch' --assignee ops "
+            "--initial-status scheduled --json"
+        )
+    )
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, payload["id"])
+        promoted = kb.recompute_ready(conn)
+
+        assert task is not None
+        assert task.status == "scheduled"
+        assert kb.claim_task(conn, payload["id"]) is None
+        assert promoted == 0
+
+
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
