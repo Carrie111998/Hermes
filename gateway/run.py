@@ -1977,28 +1977,6 @@ def _wrap_current_message_with_observed_context(message: Any, observed_context: 
     return message
 
 
-def _append_ephemeral_user_context(message: Any, user_context: Optional[str]) -> Any:
-    """Append volatile context to the API-only current user turn."""
-
-    context = (user_context or "").strip()
-    if not context:
-        return message
-
-    suffix = f"\n\n{context}"
-    if isinstance(message, str):
-        return f"{message}{suffix}"
-
-    if isinstance(message, list):
-        wrapped = [dict(part) if isinstance(part, dict) else part for part in message]
-        for part in wrapped:
-            if isinstance(part, dict) and part.get("type") == "text":
-                part["text"] = f"{part.get('text', '')}{suffix}"
-                return wrapped
-        return wrapped + [{"type": "text", "text": context}]
-
-    return message
-
-
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -2022,6 +2000,12 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
         # Returning None lets the caller fall through to the legacy-fresh path.
         return None
     return None
+
+
+def _event_has_ephemeral_user_context(event: "MessageEvent") -> bool:
+    """Whether an event carries volatile context that needs a turn boundary."""
+    context = getattr(event, "ephemeral_user_context", None)
+    return isinstance(context, str) and bool(context.strip())
 
 
 # Tool results can contain literal MEDIA: examples in docs, logs, or other
@@ -6815,8 +6799,6 @@ class TurnRunner:
         # message so stale guidance never replays as user-authored text.
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
-        if ctx.ephemeral_user_context and _persist_user_message_override is None:
-            _persist_user_message_override = ctx.message
 
         # Prepend pending model switch note so the model knows about the switch
         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
@@ -6989,12 +6971,8 @@ class TurnRunner:
             else:
                 _run_message = ctx.message
 
-            _api_run_message = _append_ephemeral_user_context(
-                _run_message,
-                ctx.ephemeral_user_context,
-            )
             _api_run_message = _wrap_current_message_with_observed_context(
-                _api_run_message,
+                _run_message,
                 observed_group_context,
             )
             _conversation_kwargs = {
@@ -7025,6 +7003,13 @@ class TurnRunner:
             # inbound id (NOT event_message_id, which is the reply anchor).
             if ctx.inbound_message_id is not None:
                 _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            if (
+                isinstance(ctx.ephemeral_user_context, str)
+                and ctx.ephemeral_user_context.strip()
+            ):
+                _conversation_kwargs["ephemeral_user_context"] = (
+                    ctx.ephemeral_user_context
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -11236,6 +11221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             can_steer = (
                 steer_text
+                and not _event_has_ephemeral_user_context(event)
                 and (
                     (
                         event.message_type == MessageType.TEXT
@@ -11254,6 +11240,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
+            elif _event_has_ephemeral_user_context(event):
+                logger.debug(
+                    "Queueing steer-mode follow-up with API-only context for %s",
+                    session_key,
+                )
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -18207,6 +18198,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
+        if _event_has_ephemeral_user_context(event):
+            # steer() stores its text inside the live turn. Volatile platform
+            # context must travel through the next turn's API-only path.
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                queued_event = MessageEvent(
+                    text=steer_text,
+                    message_type=MessageType.TEXT,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                    channel_context=event.channel_context,
+                    ephemeral_user_context=event.ephemeral_user_context,
+                )
+                self._enqueue_fifo(quick_key, queued_event, adapter)
+            return "Location context requires a new turn — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
                 accepted = running_agent.steer(steer_text)
@@ -19000,6 +19007,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not event.media_urls
                     and not event.media_types
                     and steer_text
+                    and not _event_has_ephemeral_user_context(event)
                     and hasattr(running_agent, "steer")
                 ):
                     try:
