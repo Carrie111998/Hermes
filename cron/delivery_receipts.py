@@ -117,3 +117,39 @@ def aggregate_execution_state(path: Path, execution_id: str) -> str | None:
         if state in states:
             return state
     return None
+
+
+def get_delivery_trace(
+    receipt_path: Path,
+    execution_id: str,
+) -> list[dict[str, Any]]:
+    """Return the full delivery trace for an execution.
+
+    Each entry is a receipt record with execution_id, state, target,
+    message_id (if captured), and recorded_at.  Empty list means no
+    receipts found for this execution.
+
+    The returned list is ordered by insertion order (ledger append order).
+    """
+    result: list[dict[str, Any]] = []
+    if not receipt_path.exists():
+        return result
+
+    with receipt_path.open("r", encoding="utf-8") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        try:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    receipt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(receipt.get("execution_id") or "") == execution_id:
+                    result.append(receipt)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    return result
