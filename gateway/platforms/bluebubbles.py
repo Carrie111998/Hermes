@@ -221,6 +221,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
         self._recent_message_texts: OrderedDict[str, str] = OrderedDict()
+        self._recent_update_event_keys: OrderedDict[
+            tuple[Any, ...], tuple[Any, ...]
+        ] = OrderedDict()
 
     # ------------------------------------------------------------------
     # API helpers
@@ -937,6 +940,72 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         while len(self._recent_message_texts) > _UPDATED_MESSAGE_CACHE_LIMIT:
             self._recent_message_texts.popitem(last=False)
 
+    def _update_event_key(
+        self,
+        event_type: str,
+        record: Dict[str, Any],
+        message_id: Optional[str],
+        text: str,
+        *,
+        is_tapback: bool,
+    ) -> Optional[tuple[Any, ...]]:
+        """Return a bounded-cache key for a dispatchable update/reaction event."""
+        if not message_id:
+            return None
+        sender = self._value(
+            record.get("handle", {}).get("address")
+            if isinstance(record.get("handle"), dict)
+            else None,
+            record.get("sender"),
+            record.get("from"),
+            record.get("address"),
+        )
+        if is_tapback:
+            return (
+                "tapback",
+                message_id,
+                sender,
+                text,
+            )
+        if event_type != "updated-message":
+            return None
+        if self._is_set(
+            record.get("dateRetracted")
+            or record.get("date_retracted")
+            or record.get("retractedAt")
+            or record.get("retracted_at")
+        ):
+            return ("retraction", message_id, sender)
+        if self._is_set(
+            record.get("dateEdited")
+            or record.get("date_edited")
+            or record.get("editedAt")
+            or record.get("edited_at")
+        ):
+            return ("edit", message_id, sender, text)
+        return None
+
+    def _has_seen_update_event(self, key: Optional[tuple[Any, ...]]) -> bool:
+        if key is None:
+            return False
+        identity = key[:3]
+        if self._recent_update_event_keys.get(identity) != key:
+            return False
+        self._recent_update_event_keys.move_to_end(identity)
+        return True
+
+    def _remember_update_event(self, key: Optional[tuple[Any, ...]]) -> None:
+        if key is None:
+            return
+        # Keep only the latest semantic state for each event identity. This
+        # suppresses webhook retries without hiding legitimate A→B→A edits or
+        # reaction remove/re-add sequences that revisit an earlier state.
+        identity = key[:3]
+        self._recent_update_event_keys[identity] = key
+        self._recent_update_event_keys.move_to_end(identity)
+        while len(self._recent_update_event_keys) > _UPDATED_MESSAGE_CACHE_LIMIT:
+            self._recent_update_event_keys.popitem(last=False)
+
     @staticmethod
     def _canonical_dm_handle(raw: Optional[str]) -> Optional[str]:
         if not raw:
@@ -1020,7 +1089,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         )
         if is_retraction:
             if previous:
-                self._recent_message_texts.pop(message_id, None)
                 return f"Message retracted/unsent.\nOriginal text: {previous}"
             return "Message retracted/unsent.\nOriginal text: (unknown)"
 
@@ -1033,9 +1101,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not is_edit or not text or previous == text:
             return None
         if previous:
-            self._remember_message_text(message_id, text)
             return f"Message edited.\nBefore: {previous}\nAfter: {text}"
-        self._remember_message_text(message_id, text)
         return f"Message edited.\nNew text: {text}"
 
     async def _handle_webhook(self, request):
@@ -1090,58 +1156,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             )
             or ""
         )
+        inbound_text = text
 
-        tapback_text = self._classify_tapback_record(record, text)
-        is_tapback = tapback_text is not None
-        if is_tapback:
-            text = tapback_text
-
-        # --- Inbound attachment handling ---
-        attachments = record.get("attachments") or []
-        media_urls: List[str] = []
-        media_types: List[str] = []
-        msg_type = MessageType.TEXT
-
-        for att in attachments:
-            att_guid = att.get("guid", "")
-            if not att_guid:
-                continue
-            cached = await self._download_attachment(att_guid, att)
-            if cached:
-                mime = (att.get("mimeType") or "").lower()
-                media_urls.append(cached)
-                media_types.append(mime)
-                if mime.startswith("image/"):
-                    msg_type = MessageType.PHOTO
-                elif mime.startswith("audio/") or (att.get("uti") or "").endswith(
-                    "caf"
-                ):
-                    msg_type = MessageType.VOICE
-                elif mime.startswith("video/"):
-                    msg_type = MessageType.VIDEO
-                else:
-                    msg_type = MessageType.DOCUMENT
-
-        # With multiple attachments, prefer PHOTO if any images present
-        if len(media_urls) > 1:
-            mime_prefixes = {(m or "").split("/")[0] for m in media_types}
-            if "image" in mime_prefixes:
-                msg_type = MessageType.PHOTO
-
-        if not text and media_urls:
-            text = "(attachment)"
-        # --- End attachment handling ---
-
-        message_id = self._message_id_for_record(record)
-        is_update_notification = False
-        if event_type == "updated-message" and not is_tapback:
-            text = self._classify_updated_message(record, message_id, text) or ""
-            if not text:
-                return web.Response(text="ok")
-            is_update_notification = True
-        elif not is_tapback:
-            self._remember_message_text(message_id, text)
-
+        # Validate routing before update classification mutates semantic state.
+        # A malformed first delivery must not poison the dedupe/text caches and
+        # suppress a later valid webhook retry.
         chat_guid = self._value(
             record.get("chatGuid"),
             payload.get("chatGuid"),
@@ -1153,8 +1172,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         # the chat GUID is nested under data.chats[0].guid instead.
         if not chat_guid:
             _chats = record.get("chats") or []
-            if _chats and isinstance(_chats[0], dict):
-                chat_guid = _chats[0].get("guid") or _chats[0].get("chatGuid")
+            if (
+                isinstance(_chats, list)
+                and _chats
+                and isinstance(_chats[0], dict)
+            ):
+                chat_guid = self._value(
+                    _chats[0].get("guid"),
+                    _chats[0].get("chatGuid"),
+                )
         chat_identifier = self._value(
             record.get("chatIdentifier"),
             record.get("identifier"),
@@ -1180,8 +1206,99 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         session_chat_id = self._canonical_chat_id(
             chat_guid, chat_identifier, sender, is_group
         )
-        if not sender or not session_chat_id or not text:
+        if not sender or not session_chat_id:
             return web.json_response({"error": "missing message fields"}, status=400)
+
+        tapback_text = self._classify_tapback_record(record, text)
+        is_tapback = tapback_text is not None
+        message_id = self._message_id_for_record(record)
+        update_event_key = self._update_event_key(
+            event_type,
+            record,
+            message_id,
+            tapback_text or text,
+            is_tapback=is_tapback,
+        )
+        if self._has_seen_update_event(update_event_key):
+            return web.Response(text="ok")
+
+        if is_tapback:
+            text = tapback_text
+
+        is_update_notification = False
+        if event_type == "updated-message" and not is_tapback:
+            text = self._classify_updated_message(record, message_id, text) or ""
+            if not text:
+                return web.Response(text="ok")
+            is_update_notification = True
+
+        # Routing and classified text are now valid. Commit the semantic key
+        # before the first attachment await so concurrent webhook retries
+        # cannot both pass duplicate suppression and dispatch.
+        if is_update_notification:
+            is_retraction = self._is_set(
+                record.get("dateRetracted")
+                or record.get("date_retracted")
+                or record.get("retractedAt")
+                or record.get("retracted_at")
+            )
+            if is_retraction and message_id:
+                self._recent_message_texts.pop(message_id, None)
+            else:
+                self._remember_message_text(message_id, inbound_text)
+            self._remember_update_event(update_event_key)
+        elif is_tapback:
+            self._remember_update_event(update_event_key)
+
+        # --- Inbound attachment handling ---
+        attachments = record.get("attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        msg_type = MessageType.TEXT
+
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            att_guid = self._value(att.get("guid"))
+            if not att_guid:
+                continue
+            cached = await self._download_attachment(att_guid, att)
+            if cached:
+                raw_mime = att.get("mimeType")
+                mime = raw_mime.lower() if isinstance(raw_mime, str) else ""
+                uti = att.get("uti")
+                media_urls.append(cached)
+                media_types.append(mime)
+                if mime.startswith("image/"):
+                    msg_type = MessageType.PHOTO
+                elif mime.startswith("audio/") or (
+                    isinstance(uti, str) and uti.endswith("caf")
+                ):
+                    msg_type = MessageType.VOICE
+                elif mime.startswith("video/"):
+                    msg_type = MessageType.VIDEO
+                else:
+                    msg_type = MessageType.DOCUMENT
+
+        # With multiple attachments, prefer PHOTO if any images present
+        if len(media_urls) > 1:
+            mime_prefixes = {(m or "").split("/")[0] for m in media_types}
+            if "image" in mime_prefixes:
+                msg_type = MessageType.PHOTO
+
+        if not text and media_urls:
+            text = "(attachment)"
+        # --- End attachment handling ---
+
+        if not text:
+            return web.json_response({"error": "missing message fields"}, status=400)
+
+        # Keep ordinary message text even when mention gating suppresses its
+        # dispatch so a later edit/retraction can still include prior context.
+        if event_type != "updated-message" and not is_tapback:
+            self._remember_message_text(message_id, text)
 
         if (
             is_group
