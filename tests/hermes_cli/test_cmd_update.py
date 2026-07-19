@@ -438,6 +438,26 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
 
+    @patch("subprocess.run")
+    def test_diverged_maintained_fork_keeps_origin_authoritative(
+        self, mock_run, capsys
+    ):
+        """Upstream drift is advisory when origin carries a maintained patch stack."""
+        from hermes_cli import main as hm
+
+        mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch.object(hm, "_has_upstream_remote", return_value=True), patch.object(
+            hm, "_count_commits_between", side_effect=[1089, 5]
+        ), patch.object(hm, "_sync_fork_with_upstream") as sync_mock:
+            hm._sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        commands = [" ".join(str(a) for a in call.args[0]) for call in mock_run.call_args_list]
+        assert commands == ["git fetch upstream main --quiet"]
+        sync_mock.assert_not_called()
+        captured = capsys.readouterr()
+        assert "Leaving the fork/local patch stack intact" in captured.out
+        assert "track origin/main" in captured.out
+
     @patch("shutil.which")
     @patch("subprocess.run")
     def test_update_refreshes_repo_and_tui_node_dependencies(

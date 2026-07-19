@@ -2718,12 +2718,21 @@ def run_job(
         # agent TERMINAL_CWD bridge).
         _job_workdir = (job.get("workdir") or "").strip() or None
         _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
+        if _job_workdir:
+            if Path(_job_workdir).is_dir():
+                _prior_cwd = os.getcwd()
+                try:
+                    os.chdir(_job_workdir)
+                except OSError:
+                    _prior_cwd = None
+            else:
+                logger.warning(
+                    "Job '%s': workdir %r no longer exists; running script "
+                    "without a workdir override",
+                    job_id,
+                    _job_workdir,
+                )
+                _job_workdir = None
 
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
