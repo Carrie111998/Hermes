@@ -1841,7 +1841,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._active_tool_reactions[message.id] = tool_emoji
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Replace the active reaction with ✅ (success) or ❌ (failure).
+        """Replace the active reaction with ✅ (success) or ❌ (failure),
+        then restore the persona emoji so the agent's identity is visible.
 
         Persona emoji identifies the agent during work; the terminal
         reaction is a status indicator independent of identity.
@@ -1857,6 +1858,10 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
             # CANCELLED: remove active reaction, leave nothing
+            # Restore persona emoji after the terminal reaction so the
+            # agent's identity is still visible on the message.
+            if outcome in (ProcessingOutcome.SUCCESS, ProcessingOutcome.FAILURE):
+                await self._add_reaction(message, self._persona_emoji())
 
     async def send(
         self,

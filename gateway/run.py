@@ -16459,6 +16459,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # None callback — so _thinking scratch bubbles never relayed even
             # though the progress queue was created for them.
             agent.tool_progress_callback = progress_callback if needs_progress_queue else None
+            # Always wire the progress_callback for reaction swapping even when
+            # tool progress messages are off. The callback's on_tool_call_start
+            # hook fires before the progress_queue guard and is independent of
+            # chat progress visibility.
+            if agent.tool_progress_callback is None and _status_adapter is not None:
+                agent.tool_progress_callback = progress_callback
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
