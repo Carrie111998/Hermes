@@ -936,6 +936,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Per-message active reaction tracking for persona/tool emoji swapping.
         # Key: message.id (int), Value: currently active reaction emoji (str).
         self._active_tool_reactions: Dict[int, str] = {}
+        # Per-message persona emoji that was added on processing start.
+        # The persona emoji is never removed by tool call swapping.
+        self._persona_emoji_on_message: Dict[int, str] = {}
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 2000-char preview
         # cap, every subsequent progressive edit truncates to the SAME text;
@@ -2773,24 +2776,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
     async def _remove_reaction(self, message: Any, emoji: str) -> bool:
-        """Remove the bot's own emoji reaction from a Discord message.
-
-        Uses ``clear_reaction`` (removes all reactions of that emoji) as the
-        primary method because it doesn't require the bot user object to be
-        cached and doesn't have the race condition where a freshly-added
-        reaction hasn't been processed by Discord yet. Since the bot is the
-        only user adding these emojis, clearing all of that emoji is safe.
-        """
-        if not message:
+        """Remove the bot's own emoji reaction from a Discord message."""
+        if not message or not hasattr(message, "remove_reaction") or not self._client or not self._client.user:
             return False
         try:
-            if hasattr(message, "clear_reaction"):
-                await message.clear_reaction(emoji)
-                return True
-            if hasattr(message, "remove_reaction") and self._client and self._client.user:
-                await message.remove_reaction(emoji, self._client.user)
-                return True
-            return False
+            await message.remove_reaction(emoji, self._client.user)
+            return True
         except Exception as e:
             logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
             return False
@@ -2831,13 +2822,20 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add the agent's persona emoji when processing begins,
-        and record durable handling state."""
+        and record durable handling state.
+
+        The persona emoji stays on the message permanently — it is never
+        removed by tool call swapping. Only the tool emoji is swapped.
+        """
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
             emoji = self._persona_emoji()
             acked = await self._add_reaction(message, emoji)
+            # Track the persona emoji separately so on_tool_call_start
+            # knows not to remove it.
             self._active_tool_reactions[message.id] = emoji
+            self._persona_emoji_on_message[message.id] = emoji
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
@@ -2851,6 +2849,9 @@ class DiscordAdapter(BasePlatformAdapter):
         event. Adds the new tool emoji *before* removing the previous one so
         the message never has a gap with no reaction (which causes the
         message to visually jump in Discord).
+
+        The persona emoji is never removed — it stays on the message
+        permanently. Only the tool emoji is swapped.
         """
         if not self._dynamic_reactions_enabled():
             return
@@ -2860,10 +2861,12 @@ class DiscordAdapter(BasePlatformAdapter):
         from agent.display import get_tool_emoji
         tool_emoji = get_tool_emoji(tool_name, default="⚙️")
         current = self._active_tool_reactions.get(message.id)
+        persona = self._persona_emoji_on_message.get(message.id)
         # Add new emoji first, then remove old one — avoids a gap with no
         # reaction that makes the message visually jump in Discord.
         await self._add_reaction(message, tool_emoji)
-        if current and current != tool_emoji:
+        # Only remove the previous tool emoji, never the persona emoji.
+        if current and current != tool_emoji and current != persona:
             await self._remove_reaction(message, current)
         self._active_tool_reactions[message.id] = tool_emoji
 
@@ -2876,11 +2879,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._reactions_enabled():
             message = event.raw_message
             if hasattr(message, "add_reaction"):
-                current = self._active_tool_reactions.pop(message.id, self._persona_emoji())
-                await self._remove_reaction(message, current)
-                # Restore the persona emoji so the agent's identity is
-                # always visible on the message.
-                await self._add_reaction(message, self._persona_emoji())
+                current = self._active_tool_reactions.pop(message.id, None)
+                persona = self._persona_emoji_on_message.pop(message.id, None)
+                # Remove the tool emoji if it's different from the persona emoji.
+                if current and current != persona:
+                    await self._remove_reaction(message, current)
+                # The persona emoji is already on the message from
+                # on_processing_start — no need to re-add it.
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
