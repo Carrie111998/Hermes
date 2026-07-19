@@ -42,6 +42,7 @@ import { $sessionTiles } from '@/store/session-states'
 import { canOpenSessionWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
+import { ContinueOnPhoneDialog } from '../continue-on-phone-dialog'
 
 // Rename a session, preferring the gateway's session.title RPC over REST.
 //
@@ -148,6 +149,7 @@ function useSessionActions({
 }: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
+  const [continueOnPhoneOpen, setContinueOnPhoneOpen] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
   const tiles = useStore($sessionTiles)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
@@ -189,7 +191,16 @@ function useSessionActions({
             }
           })
         ]
-      : [])
+      : []),
+    spec({
+      disabled: !sessionId,
+      icon: 'device-mobile',
+      label: r.continueOnPhone,
+      onSelect: () => {
+        triggerHaptic('selection')
+        setContinueOnPhoneOpen(true)
+      }
+    })
   ]
 
   // IDENTITY — name/mark/reference the session.
@@ -377,7 +388,16 @@ function useSessionActions({
     />
   )
 
-  return { renameDialog, renderItems }
+  const continueOnPhoneDialog = (
+    <ContinueOnPhoneDialog
+      onOpenChange={setContinueOnPhoneOpen}
+      open={continueOnPhoneOpen}
+      profile={profile}
+      sessionId={sessionId}
+    />
+  )
+
+  return { continueOnPhoneDialog, renameDialog, renderItems }
 }
 
 interface SessionActionsMenuProps
@@ -387,7 +407,7 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { renameDialog, renderItems } = useSessionActions(actions)
+  const { continueOnPhoneDialog, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
@@ -400,6 +420,7 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
       >
         {children}
       </ActionsMenu>
+      {continueOnPhoneDialog}
       {renameDialog}
     </>
   )
@@ -411,13 +432,14 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { renameDialog, renderItems } = useSessionActions(actions)
+  const { continueOnPhoneDialog, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
       <ActionsContextMenu ariaLabel={t.sidebar.row.sessionActions} contentClassName="w-40" items={renderItems}>
         {children}
       </ActionsContextMenu>
+      {continueOnPhoneDialog}
       {renameDialog}
     </>
   )

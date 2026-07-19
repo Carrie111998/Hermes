@@ -16384,6 +16384,25 @@ async def get_dashboard_themes():
     return {"themes": themes, "active": active}
 
 
+@app.get("/api/dashboard/remote-access")
+async def get_dashboard_remote_access(profile: Optional[str] = None):
+    """Return the configured public URL used for authenticated remote access.
+
+    This route stays behind the normal dashboard authentication middleware.
+    The URL is configuration, not a credential. Desktop separately probes the
+    public target before presenting a session handoff so a stale or insecure
+    value never becomes a scannable link.
+    """
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    with _config_profile_scope(profile):
+        return {"public_url": resolve_public_url()}
+
+
+class ThemeSetBody(BaseModel):
+    name: str
+
+
 @app.put("/api/dashboard/theme")
 async def set_dashboard_theme(body: ThemeSetBody):
     """Set the active dashboard theme (persists to config.yaml)."""

@@ -463,9 +463,28 @@ class TestWebServerEndpoints:
             200
         ] * len(paths)
 
+    def test_dashboard_remote_access_returns_resolved_public_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+            lambda: "https://hermes.example.com/agent",
+        )
 
+        resp = self.client.get("/api/dashboard/remote-access")
 
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "public_url": "https://hermes.example.com/agent",
+        }
 
+    def test_dashboard_remote_access_is_not_public(self):
+        from starlette.testclient import TestClient
+
+        from hermes_cli.web_server import app
+
+        with TestClient(app) as unauthenticated:
+            resp = unauthenticated.get("/api/dashboard/remote-access")
+
+        assert resp.status_code == 401
 
     def test_messaging_platforms_profile_scopes_gateway_reads(self, monkeypatch):
         """?profile=<name> must resolve liveness from the profile's own home.
