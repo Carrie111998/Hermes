@@ -37,6 +37,9 @@ from htr.contracts import (
     run_execution_verification_record_json_path,
     run_post_verification_followup_plan_fingerprint,
     run_post_verification_followup_plan_record_json_path,
+    run_post_verification_execution_request_fingerprint,
+    run_post_verification_execution_request_record_json_path,
+    validate_post_verification_execution_request_items_correspond,
     run_followup_plan_fingerprint,
     run_followup_plan_record_json_path,
     run_review_fingerprint,
@@ -81,6 +84,9 @@ EVENT_TYPE_RUN_EXECUTION_NEEDS_CHANGES = "run_execution_needs_changes"
 EVENT_TYPE_RUN_POST_VERIFICATION_FOLLOWUP_PLANNED = (
     "run_post_verification_followup_planned"
 )
+EVENT_TYPE_RUN_POST_VERIFICATION_EXECUTION_REQUESTED = (
+    "run_post_verification_execution_requested"
+)
 
 _EXECUTION_VERIFICATION_EVENT_TYPES: dict[str, str] = {
     EXECUTION_VERIFICATION_ACCEPTED: EVENT_TYPE_RUN_EXECUTION_VERIFIED,
@@ -105,6 +111,7 @@ EVENT_TYPES = frozenset(
         EVENT_TYPE_RUN_EXECUTION_REJECTED,
         EVENT_TYPE_RUN_EXECUTION_NEEDS_CHANGES,
         EVENT_TYPE_RUN_POST_VERIFICATION_FOLLOWUP_PLANNED,
+        EVENT_TYPE_RUN_POST_VERIFICATION_EXECUTION_REQUESTED,
     }
 )
 
@@ -1917,3 +1924,271 @@ def plan_post_verification_followup(
     atomic_write_json(plan_record_path, plan_record)
     append_run_event(run_id, candidate, base_dir)
     return plan_record
+
+
+def _matches_run_post_verification_execution_requested_replay(
+    existing: dict[str, Any],
+    *,
+    run_id: str,
+    actor: str,
+    request_record: dict[str, Any],
+) -> bool:
+    """Return True when *existing* matches a successful execution request replay."""
+    payload = existing.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return (
+        existing.get("event_type") == EVENT_TYPE_RUN_POST_VERIFICATION_EXECUTION_REQUESTED
+        and existing.get("run_id") == run_id
+        and existing.get("actor") == actor
+        and payload.get("run_id") == run_id
+        and payload.get("requester") == request_record["requester"]
+        and payload.get("request_status") == request_record["request_status"]
+        and payload.get("source_execution_result_fingerprint")
+        == request_record["source_execution_result_fingerprint"]
+        and payload.get("source_execution_verification_fingerprint")
+        == request_record["source_execution_verification_fingerprint"]
+        and payload.get("source_post_verification_followup_plan_fingerprint")
+        == request_record["source_post_verification_followup_plan_fingerprint"]
+        and payload.get("run_post_verification_execution_request_fingerprint")
+        == run_post_verification_execution_request_fingerprint(request_record)
+    )
+
+
+def request_post_verification_execution(
+    project_dir: Path | str,
+    run_id: str,
+    run_post_verification_execution_request_record: dict[str, Any],
+    actor: str,
+    *,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Record a manual post-verification execution request for a verified run.
+
+    The request is based only on execution result, verification, and
+    post-verification follow-up plan records. This API stores and audits the
+    request; it does not execute work.
+    """
+    validate_id(run_id, "run")
+    validate_schema(
+        run_post_verification_execution_request_record,
+        "run_post_verification_execution_request_record",
+    )
+    if run_post_verification_execution_request_record["run_id"] != run_id:
+        raise ValueError("request record run_id does not match submission target")
+    if not isinstance(actor, str) or not actor:
+        raise ValueError("actor must be a non-empty string")
+
+    submitted_fingerprint = run_post_verification_execution_request_fingerprint(
+        run_post_verification_execution_request_record
+    )
+    base_dir = Path(project_dir)
+    request_record_path = run_post_verification_execution_request_record_json_path(
+        run_id, base_dir
+    )
+    post_verification_followup_plan_record_path = (
+        run_post_verification_followup_plan_record_json_path(run_id, base_dir)
+    )
+    verification_record_path = run_execution_verification_record_json_path(
+        run_id, base_dir
+    )
+    execution_result_record_path = run_execution_result_record_json_path(
+        run_id, base_dir
+    )
+    execution_request_record_path = run_execution_request_record_json_path(
+        run_id, base_dir
+    )
+    run_followup_plan_record_path = run_followup_plan_record_json_path(run_id, base_dir)
+    completion_record_path = run_completion_record_json_path(run_id, base_dir)
+    review_record_path = run_review_record_json_path(run_id, base_dir)
+    manifest_path = paths.run_manifest_path(run_id, base_dir)
+
+    if not manifest_path.exists():
+        raise InvalidTransition(f"run {run_id!r} is not completed")
+
+    current_run_manifest = read_json(manifest_path)
+    if current_run_manifest["status"] != RUN_COMPLETED:
+        raise InvalidTransition(
+            f"run {run_id!r} is not completed; "
+            f"status is {current_run_manifest['status']!r}"
+        )
+
+    if not completion_record_path.exists():
+        raise InvalidTransition("run_completion_record.json is missing")
+
+    if not review_record_path.exists():
+        raise InvalidTransition("run_review_record.json is missing")
+
+    if not run_followup_plan_record_path.exists():
+        raise InvalidTransition("run_followup_plan_record.json is missing")
+
+    if not execution_request_record_path.exists():
+        raise InvalidTransition("run_execution_request_record.json is missing")
+
+    if not execution_result_record_path.exists():
+        raise InvalidTransition("run_execution_result_record.json is missing")
+
+    if not verification_record_path.exists():
+        raise InvalidTransition("run_execution_verification_record.json is missing")
+
+    if not post_verification_followup_plan_record_path.exists():
+        raise InvalidTransition("run_post_verification_followup_plan_record.json is missing")
+
+    stored_execution_result_record = read_json(execution_result_record_path)
+    validate_schema(stored_execution_result_record, "run_execution_result_record")
+    expected_result_fingerprint = run_execution_result_fingerprint(
+        stored_execution_result_record
+    )
+    if (
+        run_post_verification_execution_request_record[
+            "source_execution_result_fingerprint"
+        ]
+        != expected_result_fingerprint
+    ):
+        raise InvalidTransition(
+            "source_execution_result_fingerprint does not match "
+            "run_execution_result_record"
+        )
+
+    stored_verification_record = read_json(verification_record_path)
+    validate_schema(stored_verification_record, "run_execution_verification_record")
+    expected_verification_fingerprint = run_execution_verification_fingerprint(
+        stored_verification_record
+    )
+    if (
+        run_post_verification_execution_request_record[
+            "source_execution_verification_fingerprint"
+        ]
+        != expected_verification_fingerprint
+    ):
+        raise InvalidTransition(
+            "source_execution_verification_fingerprint does not match "
+            "run_execution_verification_record"
+        )
+    if (
+        stored_verification_record["source_execution_result_fingerprint"]
+        != expected_result_fingerprint
+    ):
+        raise InvalidTransition(
+            "run_execution_verification_record source_execution_result_fingerprint "
+            "does not match run_execution_result_record"
+        )
+
+    stored_followup_plan_record = read_json(post_verification_followup_plan_record_path)
+    validate_schema(
+        stored_followup_plan_record, "run_post_verification_followup_plan_record"
+    )
+    expected_followup_plan_fingerprint = run_post_verification_followup_plan_fingerprint(
+        stored_followup_plan_record
+    )
+    if (
+        run_post_verification_execution_request_record[
+            "source_post_verification_followup_plan_fingerprint"
+        ]
+        != expected_followup_plan_fingerprint
+    ):
+        raise InvalidTransition(
+            "source_post_verification_followup_plan_fingerprint does not match "
+            "run_post_verification_followup_plan_record"
+        )
+    if (
+        stored_followup_plan_record["source_execution_result_fingerprint"]
+        != expected_result_fingerprint
+    ):
+        raise InvalidTransition(
+            "run_post_verification_followup_plan_record "
+            "source_execution_result_fingerprint does not match "
+            "run_execution_result_record"
+        )
+    if (
+        stored_followup_plan_record["source_execution_verification_fingerprint"]
+        != expected_verification_fingerprint
+    ):
+        raise InvalidTransition(
+            "run_post_verification_followup_plan_record "
+            "source_execution_verification_fingerprint does not match "
+            "run_execution_verification_record"
+        )
+
+    try:
+        validate_post_verification_execution_request_items_correspond(
+            run_post_verification_execution_request_record["request_items"],
+            stored_followup_plan_record,
+        )
+    except ValueError as exc:
+        raise InvalidTransition(str(exc)) from exc
+
+    if request_record_path.exists():
+        existing_request_record = read_json(request_record_path)
+        validate_schema(
+            existing_request_record, "run_post_verification_execution_request_record"
+        )
+        if event_id is None:
+            raise InvalidTransition(
+                "run_post_verification_execution_request_record.json already exists"
+            )
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise InvalidTransition(
+                "run_post_verification_execution_request_record.json already exists"
+            )
+        if _matches_run_post_verification_execution_requested_replay(
+            existing_event,
+            run_id=run_id,
+            actor=actor,
+            request_record=run_post_verification_execution_request_record,
+        ):
+            return existing_request_record
+        if (
+            existing_event.get("event_type")
+            == EVENT_TYPE_RUN_POST_VERIFICATION_EXECUTION_REQUESTED
+        ):
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise InvalidTransition(
+            "run_post_verification_execution_request_record.json already exists"
+        )
+
+    candidate = make_run_event(
+        event_type=EVENT_TYPE_RUN_POST_VERIFICATION_EXECUTION_REQUESTED,
+        run_id=run_id,
+        actor=actor,
+        payload={
+            "run_id": run_id,
+            "requester": run_post_verification_execution_request_record["requester"],
+            "request_status": run_post_verification_execution_request_record[
+                "request_status"
+            ],
+            "source_execution_result_fingerprint": (
+                run_post_verification_execution_request_record[
+                    "source_execution_result_fingerprint"
+                ]
+            ),
+            "source_execution_verification_fingerprint": (
+                run_post_verification_execution_request_record[
+                    "source_execution_verification_fingerprint"
+                ]
+            ),
+            "source_post_verification_followup_plan_fingerprint": (
+                run_post_verification_execution_request_record[
+                    "source_post_verification_followup_plan_fingerprint"
+                ]
+            ),
+            "run_post_verification_execution_request_fingerprint": submitted_fingerprint,
+            "run_post_verification_execution_request_record_path": str(
+                request_record_path
+            ),
+        },
+        event_id=event_id,
+    )
+    existing = _resolve_idempotent_event(run_id, candidate, base_dir)
+    if existing is not None:
+        return run_post_verification_execution_request_record
+
+    ensure_dir(request_record_path.parent)
+    atomic_write_json(
+        request_record_path, run_post_verification_execution_request_record
+    )
+    append_run_event(run_id, candidate, base_dir)
+    return run_post_verification_execution_request_record

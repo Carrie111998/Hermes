@@ -790,3 +790,34 @@ No artifact/result/verification_result inspection; no automatic execution.
 - Task 13 not started
 
 **Awaiting:** Architect acceptance before checkpoint / Task 13.
+
+---
+
+## Task 13 — Manual Post-Verification Execution Request Planning (2026-07-18)
+
+**Implementer:** Cursor  
+**Status:** ✅ Accepted — checkpointed  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **768 passed**
+
+### Delivered
+
+- `run_post_verification_execution_request_record` schema + factory + fingerprint
+- `derive_post_verification_execution_request_items()` — deterministic derivation from follow-up plan items
+- `request_post_verification_execution()` — after full post-verification follow-up plan chain
+- `run_post_verification_execution_requested` event + replay-only semantics
+- Request statuses: `requested`, `empty`
+- Post-verification execution request kinds mapped from follow-up kinds
+
+### Design principle
+
+Request planning based only on execution result + execution verification + post-verification follow-up plan JSON records.
+No artifact/result/verification_result inspection; no automatic execution.
+
+### Non-goals confirmed
+
+- No execution, rerun, repair, task/attempt creation, or lifecycle mutation
+- No prior record mutation
+- No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
+- Task 14 not started
+
+**Awaiting:** Architect scope assignment for Task 14.

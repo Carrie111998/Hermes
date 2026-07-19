@@ -1087,3 +1087,253 @@ def run_post_verification_followup_plan_fingerprint(
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+POST_VERIFICATION_EXECUTION_REQUEST_STATUS_REQUESTED = "requested"
+POST_VERIFICATION_EXECUTION_REQUEST_STATUS_EMPTY = "empty"
+
+POST_VERIFICATION_EXECUTION_REQUEST_STATUSES: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_EXECUTION_REQUEST_STATUS_REQUESTED,
+        POST_VERIFICATION_EXECUTION_REQUEST_STATUS_EMPTY,
+    }
+)
+
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_REOPEN_LINK_MANUALLY = "reopen_link_manually"
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_UPDATE_DOCUMENTATION_MANUALLY = (
+    "update_documentation_manually"
+)
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_PREPARE_NEW_EXECUTION_REQUEST = (
+    "prepare_new_execution_request"
+)
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_REJECTED_ITEM = "review_rejected_item"
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_NEEDS_CHANGES_ITEM = (
+    "review_needs_changes_item"
+)
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_NOT_REVIEWED_ITEM = (
+    "review_not_reviewed_item"
+)
+POST_VERIFICATION_EXECUTION_REQUEST_KIND_OTHER = "other"
+
+POST_VERIFICATION_EXECUTION_REQUEST_KINDS: frozenset[str] = frozenset(
+    {
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REOPEN_LINK_MANUALLY,
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_UPDATE_DOCUMENTATION_MANUALLY,
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_PREPARE_NEW_EXECUTION_REQUEST,
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_REJECTED_ITEM,
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_NEEDS_CHANGES_ITEM,
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_NOT_REVIEWED_ITEM,
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_OTHER,
+    }
+)
+
+_FOLLOWUP_TO_EXECUTION_REQUEST_KIND: dict[str, str] = {
+    POST_VERIFICATION_FOLLOWUP_KIND_REOPEN_LINK_MANUALLY: (
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REOPEN_LINK_MANUALLY
+    ),
+    POST_VERIFICATION_FOLLOWUP_KIND_UPDATE_DOCUMENTATION_MANUALLY: (
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_UPDATE_DOCUMENTATION_MANUALLY
+    ),
+    POST_VERIFICATION_FOLLOWUP_KIND_PREPARE_NEW_EXECUTION_REQUEST: (
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_PREPARE_NEW_EXECUTION_REQUEST
+    ),
+    POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_REJECTED_ITEM: (
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_REJECTED_ITEM
+    ),
+    POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NEEDS_CHANGES_ITEM: (
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_NEEDS_CHANGES_ITEM
+    ),
+    POST_VERIFICATION_FOLLOWUP_KIND_REVIEW_NOT_REVIEWED_ITEM: (
+        POST_VERIFICATION_EXECUTION_REQUEST_KIND_REVIEW_NOT_REVIEWED_ITEM
+    ),
+    POST_VERIFICATION_FOLLOWUP_KIND_OTHER: POST_VERIFICATION_EXECUTION_REQUEST_KIND_OTHER,
+}
+
+
+def run_post_verification_execution_request_record_json_path(
+    run_id: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Return the JSON post-verification execution request record path for *run_id*."""
+    return (
+        paths.run_root(run_id, base_dir)
+        / "run_post_verification_execution_request_record.json"
+    )
+
+
+def _normalize_post_verification_execution_request_items(
+    request_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in request_items:
+        normalized.append(
+            {
+                "request_item_id": item["request_item_id"],
+                "source_post_verification_followup_item_id": item.get(
+                    "source_post_verification_followup_item_id"
+                ),
+                "source_execution_item_id": item.get("source_execution_item_id"),
+                "source_followup_item_id": item.get("source_followup_item_id"),
+                "execution_kind": item.get("execution_kind"),
+                "item_status": item.get("item_status"),
+                "verification_decision": item.get("verification_decision"),
+                "followup_kind": item.get("followup_kind"),
+                "request_kind": item["request_kind"],
+                "instructions": item.get("instructions"),
+                "command": item["command"] if item.get("command") is not None else {},
+                "metadata": item["metadata"] if item.get("metadata") is not None else {},
+            }
+        )
+    return normalized
+
+
+def _validate_post_verification_execution_request_status_consistency(
+    request_record: dict[str, Any],
+) -> None:
+    request_status = request_record["request_status"]
+    request_items = request_record["request_items"]
+    if request_status == POST_VERIFICATION_EXECUTION_REQUEST_STATUS_EMPTY:
+        if request_items:
+            raise ValueError(
+                "run_post_verification_execution_request_record: empty request_status "
+                "requires request_items to be empty"
+            )
+    elif request_status == POST_VERIFICATION_EXECUTION_REQUEST_STATUS_REQUESTED:
+        if not request_items:
+            raise ValueError(
+                "run_post_verification_execution_request_record: requested "
+                "request_status requires non-empty request_items"
+            )
+
+
+def derive_post_verification_execution_request_items(
+    followup_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Derive deterministic execution request items from follow-up plan items."""
+    if not followup_items:
+        return []
+
+    request_items: list[dict[str, Any]] = []
+    for followup_item in followup_items:
+        followup_kind = followup_item["followup_kind"]
+        request_kind = _FOLLOWUP_TO_EXECUTION_REQUEST_KIND.get(
+            followup_kind, POST_VERIFICATION_EXECUTION_REQUEST_KIND_OTHER
+        )
+        request_items.append(
+            {
+                "request_item_id": f"pver-{followup_item['followup_item_id']}",
+                "source_post_verification_followup_item_id": followup_item[
+                    "followup_item_id"
+                ],
+                "source_execution_item_id": followup_item.get(
+                    "source_execution_item_id"
+                ),
+                "source_followup_item_id": followup_item.get("source_followup_item_id"),
+                "execution_kind": followup_item.get("execution_kind"),
+                "item_status": followup_item.get("item_status"),
+                "verification_decision": followup_item.get("verification_decision"),
+                "followup_kind": followup_item.get("followup_kind"),
+                "request_kind": request_kind,
+                "instructions": followup_item.get("instructions"),
+                "command": dict(followup_item.get("command") or {}),
+                "metadata": dict(followup_item.get("metadata") or {}),
+            }
+        )
+    return request_items
+
+
+def validate_post_verification_execution_request_items_correspond(
+    request_items: list[dict[str, Any]],
+    followup_plan_record: dict[str, Any],
+) -> None:
+    """Ensure request items align with post-verification follow-up plan items."""
+    followup_by_id = {
+        item["followup_item_id"]: item
+        for item in followup_plan_record["followup_items"]
+    }
+
+    for request_item in request_items:
+        source_followup_item_id = request_item.get(
+            "source_post_verification_followup_item_id"
+        )
+        if source_followup_item_id is None:
+            continue
+        if source_followup_item_id not in followup_by_id:
+            raise ValueError(
+                "request item references unknown "
+                f"source_post_verification_followup_item_id "
+                f"{source_followup_item_id!r}"
+            )
+        followup_item = followup_by_id[source_followup_item_id]
+        for field in (
+            "source_execution_item_id",
+            "source_followup_item_id",
+            "execution_kind",
+            "item_status",
+            "verification_decision",
+            "followup_kind",
+        ):
+            if request_item.get(field) != followup_item.get(field):
+                raise ValueError(
+                    f"request item {field} does not match followup plan for "
+                    f"{source_followup_item_id!r}"
+                )
+
+
+def make_run_post_verification_execution_request_record(
+    *,
+    run_id: str,
+    source_execution_result_fingerprint: str,
+    source_execution_verification_fingerprint: str,
+    source_post_verification_followup_plan_fingerprint: str,
+    request_items: list[dict[str, Any]],
+    requester: str = "human",
+    request_status: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    schema_version: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a validated post-verification execution request record envelope."""
+    normalized_items = _normalize_post_verification_execution_request_items(
+        request_items
+    )
+    resolved_request_status = request_status
+    if resolved_request_status is None:
+        resolved_request_status = (
+            POST_VERIFICATION_EXECUTION_REQUEST_STATUS_EMPTY
+            if not normalized_items
+            else POST_VERIFICATION_EXECUTION_REQUEST_STATUS_REQUESTED
+        )
+    request_record: dict[str, Any] = {
+        "schema_version": schema_version,
+        "run_id": run_id,
+        "source_execution_result_fingerprint": source_execution_result_fingerprint,
+        "source_execution_verification_fingerprint": (
+            source_execution_verification_fingerprint
+        ),
+        "source_post_verification_followup_plan_fingerprint": (
+            source_post_verification_followup_plan_fingerprint
+        ),
+        "requester": requester,
+        "request_status": resolved_request_status,
+        "request_items": normalized_items,
+        "notes": notes,
+        "metadata": metadata if metadata is not None else {},
+        "created_at": created_at or _utc_now_iso(),
+    }
+    validate_schema(request_record, "run_post_verification_execution_request_record")
+    return request_record
+
+
+def run_post_verification_execution_request_fingerprint(
+    request_record: dict[str, Any],
+) -> str:
+    """Return a stable semantic fingerprint for a post-verification execution request."""
+    validate_schema(request_record, "run_post_verification_execution_request_record")
+    return json.dumps(
+        request_record,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )

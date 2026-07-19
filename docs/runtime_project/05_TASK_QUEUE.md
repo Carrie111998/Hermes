@@ -1,16 +1,34 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-18 (Task 12 completed by Cursor)
+**Last updated:** 2026-07-18 (Task 13 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect acceptance for Task 12.
+None — awaiting Architect Task 14 assignment.
 
 ---
 
 ## Completed
+
+### Task 13 — Manual Post-Verification Execution Request Planning
+
+**Status:** ✅ Accepted (checkpointed)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v`
+
+Changes:
+
+- `run_post_verification_execution_request_record` contract + schema validation
+- `make_run_post_verification_execution_request_record`, `run_post_verification_execution_request_fingerprint`
+- `derive_post_verification_execution_request_items`, `validate_post_verification_execution_request_items_correspond`
+- `request_post_verification_execution()` — planning after post-verification follow-up plan exists
+- Fingerprints must match on-disk result + verification + post-verification follow-up plan records
+- `request_items` must correspond to post-verification follow-up plan items (or be global/manual)
+- Writes `run_post_verification_execution_request_record.json`, appends `run_post_verification_execution_requested` event
+- **Planning only** — no execution, no prior record mutation, no task/attempt creation
+- Empty post-verification follow-up plan normally produces `empty` request; planned follow-up items may produce `requested` items
+- No artifact/result/verification_result inspection
 
 ### Task 12 — Verification-Driven Follow-up Planning
 
@@ -38,7 +56,7 @@ Changes:
 
 ## Next Task (Architect)
 
-Task 13 — not started. Await scope assignment.
+Task 14 — not started. Await scope assignment.
 
 ---
 
