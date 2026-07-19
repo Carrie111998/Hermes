@@ -65,6 +65,23 @@ def test_fixed_temperature_sibling_arcee_models_unaffected() -> None:
     assert _fixed_temperature_for_model("trinity-mini") is None
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "jarvis-nemotron",
+        "nvidia/nemotron-3-super",
+        "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    ],
+)
+def test_fixed_temperature_for_nemotron_3_super_tool_calling(model: str) -> None:
+    assert _fixed_temperature_for_model(model) == 1.0
+
+
+def test_fixed_temperature_other_nemotron_models_unaffected() -> None:
+    assert _fixed_temperature_for_model("nemotron-nano") is None
+    assert _fixed_temperature_for_model("nemotron-4-super") is None
+
+
 def test_compression_threshold_for_trinity_thinking() -> None:
     assert _compression_threshold_for_model("trinity-large-thinking") == 0.75
     assert _compression_threshold_for_model("arcee-ai/trinity-large-thinking") == 0.75

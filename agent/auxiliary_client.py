@@ -342,6 +342,15 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     return bare == "trinity-large-thinking"
 
 
+def _is_nemotron_3_super(model: Optional[str]) -> bool:
+    """True for NVIDIA Nemotron 3 Super and the estate's Jarvis alias."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return (
+        bare in {"jarvis-nemotron", "nemotron-3-super"}
+        or bare.startswith("nvidia-nemotron-3-super-")
+    )
+
+
 # Context window enforced by ChatGPT's Codex OAuth backend for the
 # gpt-5.4 / gpt-5.5 / gpt-5.6 families. The raw OpenAI API and OpenRouter
 # expose 1.05M for the same slugs, but the Codex backend hard-caps at 272K
@@ -429,6 +438,8 @@ def _fixed_temperature_for_model(
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
         return 0.5
+    if _is_nemotron_3_super(model):
+        return 1.0
     return None
 
 
