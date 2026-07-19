@@ -2856,6 +2856,9 @@ class DiscordAdapter(BasePlatformAdapter):
         event. Adds the new tool emoji *before* removing the previous one so
         the message never has a gap with no reaction (which causes the
         message to visually jump in Discord).
+
+        A small delay is added between add and remove to avoid hitting
+        Discord's per-message reaction rate limit bucket.
         """
         if not self._dynamic_reactions_enabled():
             return
@@ -2869,6 +2872,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # reaction that makes the message visually jump in Discord.
         await self._add_reaction(message, tool_emoji)
         if current and current != tool_emoji:
+            # Small delay to let Discord process the add before the remove,
+            # avoiding the per-message reaction rate limit bucket.
+            await asyncio.sleep(0.3)
             await self._remove_reaction(message, current)
         self._active_tool_reactions[message.id] = tool_emoji
 
