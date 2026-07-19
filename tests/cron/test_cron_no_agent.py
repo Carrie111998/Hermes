@@ -210,6 +210,37 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+def test_run_job_no_agent_ignores_stale_workdir(hermes_env, tmp_path):
+    """A deleted project directory must not be forwarded as subprocess cwd."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    script_path = hermes_env / "scripts" / "alert.sh"
+    script_path.write_text("#!/bin/bash\necho alert\n")
+    stale_workdir = tmp_path / "deleted-project"
+    stale_workdir.mkdir()
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="alert.sh",
+        no_agent=True,
+        deliver="local",
+        workdir=str(stale_workdir),
+    )
+    stale_workdir.rmdir()
+
+    with patch(
+        "cron.scheduler._run_job_script_with_claim_heartbeat",
+        return_value=(True, "alert"),
+    ) as run_script:
+        success, _doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert final_response == "alert"
+    assert error is None
+    run_script.assert_called_once_with(job, "alert.sh", cwd=None)
+
+
 def test_run_job_no_agent_empty_output_is_silent(hermes_env):
     """Empty stdout → SILENT_MARKER, which suppresses delivery downstream."""
     from cron.jobs import create_job
