@@ -153,3 +153,36 @@ def get_delivery_trace(
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     return result
+
+
+def execution_delivery_summary(
+    receipt_path: Path,
+    execution_id: str,
+) -> dict[str, Any]:
+    """Return a concise delivery summary for a single execution.
+
+    Combines the trace with aggregate state into a dictionary suitable
+    for display or further processing::
+
+        {
+            "execution_id": "...",
+            "aggregate": "accepted",
+            "targets": [
+                {"platform": "telegram", "chat_id": "...", "state": "accepted", "message_id": "52757"},
+                ...
+            ]
+        }
+    """
+    trace = get_delivery_trace(receipt_path, execution_id)
+    targets = [{
+        "platform": r["target"].get("platform", "?"),
+        "chat_id": r["target"].get("chat_id", "?"),
+        "thread_id": r["target"].get("thread_id"),
+        "state": r["state"],
+        "message_id": r.get("message_id"),
+    } for r in trace]
+    return {
+        "execution_id": execution_id,
+        "aggregate": aggregate_execution_state(receipt_path, execution_id) or "unknown",
+        "targets": targets,
+    }

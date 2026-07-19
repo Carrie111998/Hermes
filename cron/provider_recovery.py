@@ -368,3 +368,53 @@ def execute_rollback(job_id: str) -> RecoveryRecord | None:
         reason_category="rollback",
         recovery_triggered_at=datetime.now(timezone.utc).isoformat(),
     )
+
+
+# ── Error audit for Cron Failover consumption ──────────────────────────────
+
+def audit_recent_errors(
+    *,
+    window_minutes: int = 60,
+    max_results: int = 30,
+) -> list[dict[str, Any]]:
+    """Classify recent cron execution errors into structured report.
+
+    Returns a list of error records sorted by recency (newest first),
+    with provider/model resolved from the parent job.  Designed as
+    structured input for the Cron Failover agent so it can make
+    informed retry/skip decisions per error category.
+    """
+    from cron.executions import list_executions
+    from cron.jobs import get_job
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_minutes)
+
+    results: list[dict[str, Any]] = []
+    for row in list_executions(limit=max_results):
+        claimed = row.get("claimed_at", "")
+        if claimed < cutoff.isoformat():
+            continue
+        if row.get("status") != "failed":
+            continue
+        error = row.get("error")
+        if not error:
+            continue
+
+        category = classify_cron_error(error)
+        job = get_job(row.get("job_id", "")) or {}
+        provider = str(job.get("provider") or "unknown")
+        model = str(job.get("model") or "?")
+
+        results.append({
+            "execution_id": row["id"],
+            "job_id": row["job_id"],
+            "job_name": str(job.get("name", row["job_id"])),
+            "provider": provider,
+            "model": model,
+            "category": category.value,
+            "error_preview": error[:200],
+            "finished_at": row.get("finished_at", ""),
+        })
+
+    return results

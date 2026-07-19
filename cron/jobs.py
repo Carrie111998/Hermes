@@ -1199,10 +1199,11 @@ def _normalize_runtime_policy(
     *,
     required_output: Any,
     required_tools: Any,
+    required_tool_results: Any,
     script_required: Any,
     script: Optional[str],
     no_agent: bool,
-) -> tuple[bool, list[str], bool]:
+) -> tuple[bool, list[str], dict[str, int], bool]:
     """Validate explicit Cron Core runtime policy without changing legacy defaults."""
     if not isinstance(required_output, bool):
         raise ValueError("required_output must be a boolean")
@@ -1220,13 +1221,27 @@ def _normalize_runtime_policy(
             canonical = tool.strip()
             if canonical not in normalized_tools:
                 normalized_tools.append(canonical)
+    if required_tool_results is None:
+        normalized_tool_results: dict[str, int] = {}
+    elif not isinstance(required_tool_results, dict):
+        raise ValueError("required_tool_results must be a dict of tool_name → min_success_count")
+    else:
+        normalized_tool_results = {}
+        for tool_name, min_ok in required_tool_results.items():
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise ValueError("required_tool_results keys must be non-empty strings")
+            if not isinstance(min_ok, int) or min_ok < 1:
+                raise ValueError(
+                    f"required_tool_results['{tool_name}'] must be a positive integer, got {min_ok!r}"
+                )
+            normalized_tool_results[tool_name.strip()] = min_ok
     if script_required and not script:
         raise ValueError("script_required=True requires a script")
     if no_agent and normalized_tools:
         raise ValueError("no_agent=True jobs cannot require agent tools")
     if no_agent and script_required:
         raise ValueError("no_agent=True jobs cannot set script_required")
-    return required_output, normalized_tools, script_required
+    return required_output, normalized_tools, normalized_tool_results, script_required
 
 
 def create_job(
@@ -1249,6 +1264,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     required_output: bool = False,
     required_tools: Optional[List[str]] = None,
+    required_tool_results: Optional[Dict[str, int]] = None,
     script_required: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -1326,9 +1342,10 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
-    normalized_required_output, normalized_required_tools, normalized_script_required = _normalize_runtime_policy(
+    normalized_required_output, normalized_required_tools, normalized_required_tool_results, normalized_script_required = _normalize_runtime_policy(
         required_output=required_output,
         required_tools=required_tools,
+        required_tool_results=required_tool_results,
         script_required=script_required,
         script=normalized_script,
         no_agent=normalized_no_agent,
@@ -1402,6 +1419,7 @@ def create_job(
         "no_agent": normalized_no_agent,
         "required_output": normalized_required_output,
         "required_tools": normalized_required_tools,
+        "required_tool_results": normalized_required_tool_results,
         "script_required": normalized_script_required,
         "context_from": context_from,
         "schedule": parsed_schedule,
@@ -1538,10 +1556,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             (
                 updated["required_output"],
                 updated["required_tools"],
+                updated["required_tool_results"],
                 updated["script_required"],
             ) = _normalize_runtime_policy(
                 required_output=updated.get("required_output", False),
                 required_tools=updated.get("required_tools"),
+                required_tool_results=updated.get("required_tool_results"),
                 script_required=updated.get("script_required", False),
                 script=updated["script"],
                 no_agent=bool(updated.get("no_agent")),

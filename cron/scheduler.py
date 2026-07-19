@@ -2937,6 +2937,105 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _successful_cron_tool_names(messages: object) -> dict[str, int]:
+    """Return canonical tool names with successful invocation counts from a
+    cron agent conversation transcript.
+
+    A tool invocation counts as successful when the transcript contains a
+    matching tool_result (role=\"tool\" or role=\"function\") whose content is
+    non-empty and does not match known error patterns.  Unlike
+    _invoked_cron_tool_names (which only checks for tool_call entries), this
+    function validates that the tool actually returned usable output.
+    """
+    import re
+
+    if not isinstance(messages, list):
+        return {}
+
+    # Map tool_call_id → tool name from assistant tool_call entries
+    call_map: dict[str, str] = {}
+    for message in messages:
+        tool_calls = (
+            message.get("tool_calls") if isinstance(message, dict)
+            else getattr(message, "tool_calls", None)
+        )
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            tc_id = (
+                tool_call.get("id") if isinstance(tool_call, dict)
+                else getattr(tool_call, "id", None)
+            )
+            if not tc_id:
+                continue
+            function = (
+                tool_call.get("function") if isinstance(tool_call, dict)
+                else getattr(tool_call, "function", None)
+            )
+            if isinstance(function, dict):
+                name = function.get("name")
+                arguments = function.get("arguments") or {}
+            else:
+                name = getattr(function, "name", None)
+                arguments = getattr(function, "arguments", None) or {}
+            if not isinstance(name, str) or not name.strip():
+                continue
+            name = name.strip()
+            if name == "tool_call" and isinstance(arguments, dict):
+                try:
+                    from tools.tool_search import resolve_underlying_call
+                    underlying, _underlying_args, err = resolve_underlying_call(arguments)
+                    if not err and underlying:
+                        name = underlying
+                except Exception:
+                    continue
+            call_map[str(tc_id)] = name
+
+    # Count successful tool_result messages
+    success_counts: dict[str, int] = {}
+    _error_pattern = re.compile(
+        r"^\s*error[: ]|^failed[: ]|\berror\b.*\boccurred\b|"
+        r"^\[error\]|^traceback|^exception[: ]|"
+        r"^⚠️ no reply[: ]",
+        re.IGNORECASE,
+    )
+
+    for message in messages:
+        role = (
+            message.get("role") if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role not in ("tool", "function"):
+            continue
+
+        tc_id = (
+            message.get("tool_call_id") if isinstance(message, dict)
+            else getattr(message, "tool_call_id", None)
+        )
+        if not tc_id:
+            continue
+
+        name = call_map.get(str(tc_id))
+        if not name:
+            continue
+
+        content = (
+            message.get("content") if isinstance(message, dict)
+            else getattr(message, "content", None)
+        )
+        if content is None:
+            continue
+        content_str = str(content).strip()
+        if not content_str:
+            continue  # empty output = not a meaningful success
+        if _error_pattern.search(content_str):
+            continue  # error output = not a success
+
+        success_counts[name] = success_counts.get(name, 0) + 1
+
+    return success_counts
+
+
 def _invoked_cron_tool_names(messages: object) -> set[str]:
     """Return canonical tool names invoked in an agent conversation transcript."""
     if not isinstance(messages, list):
@@ -3896,6 +3995,17 @@ def run_job(
             missing_tools = sorted(required_tools - _invoked_cron_tool_names(result.get("messages")))
             if missing_tools:
                 raise RuntimeError(f"Required tool(s) not invoked: {', '.join(missing_tools)}")
+
+        required_tool_results = job.get("required_tool_results")
+        if isinstance(required_tool_results, dict):
+            success_counts = _successful_cron_tool_names(result.get("messages"))
+            for tool_name, min_ok in required_tool_results.items():
+                actual = success_counts.get(tool_name, 0)
+                if actual < min_ok:
+                    raise RuntimeError(
+                        f"Required tool '{tool_name}' must succeed at least {min_ok} time(s); "
+                        f"only {actual} successful invocation(s) found"
+                    )
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
