@@ -218,14 +218,15 @@ class TestFetchApiModels:
             probe = probe_api_models(
                 "key",
                 "https://inference.example.com/v1",
+                request_headers={"X-Catalog-Token": "catalog-token"},
                 models_url="https://catalog.example.com/api/v1/models",
             )
 
         assert mock_urlopen.call_count == 1
-        assert (
-            mock_urlopen.call_args[0][0].full_url
-            == "https://catalog.example.com/api/v1/models"
-        )
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "https://catalog.example.com/api/v1/models"
+        assert request.get_header("Authorization") == "Bearer key"
+        assert request.get_header("X-catalog-token") == "catalog-token"
         assert probe["models"] == ["loaded-chat"]
         assert probe["resolved_base_url"] == "https://inference.example.com/v1"
         assert probe["suggested_base_url"] is None
@@ -390,6 +391,31 @@ class TestValidateFormatChecks:
 
 # -- validate — API found ----------------------------------------------------
 
+class TestValidateApiFound:
+    def test_named_provider_uses_explicit_catalog_url_and_headers(self):
+        headers = {"X-Catalog-Token": "catalog-token"}
+        with patch(
+            "hermes_cli.models.fetch_api_models",
+            return_value=["catalog-model"],
+        ) as mock_fetch:
+            result = validate_requested_model(
+                "catalog-model",
+                "private-gateway",
+                api_key="gateway-key",
+                base_url="https://inference.example.com/v1",
+                models_url="https://catalog.example.com/models",
+                headers=headers,
+            )
+
+        assert result["accepted"] is True
+        assert result["recognized"] is True
+        mock_fetch.assert_called_once_with(
+            "gateway-key",
+            "https://inference.example.com/v1",
+            headers=headers,
+            models_url="https://catalog.example.com/models",
+        )
+
 
 # -- validate — API not found ------------------------------------------------
 
@@ -552,5 +578,4 @@ class TestProbeApiModelsUserAgent:
         assert ua and ua.startswith("hermes-cli/")
         # No Authorization was set, but UA must still be present.
         assert req.get_header("Authorization") is None
-
 

@@ -4824,19 +4824,23 @@ def cached_fetch_api_models(
     """
     normalized_url = str(base_url or "").strip().rstrip("/").lower()
     normalized_models_url = str(models_url or "").strip().rstrip("/").lower()
+
+    def _fetch_live() -> Optional[list[str]]:
+        fetch_options: dict[str, Any] = {
+            "timeout": timeout,
+            "api_mode": api_mode,
+            "headers": headers,
+        }
+        if models_url:
+            fetch_options["models_url"] = models_url
+        return fetch_api_models(api_key, base_url, **fetch_options)
+
     if not normalized_url and not normalized_models_url:
         if cache_only:
             return None
         # No base_url means nothing to key the cache on — fall through to a
         # live call so callers keep getting fetch_api_models' own behavior.
-        return fetch_api_models(
-            api_key,
-            base_url,
-            timeout=timeout,
-            api_mode=api_mode,
-            headers=headers,
-            models_url=models_url,
-        )
+        return _fetch_live()
 
     cache_key = f"custom:{normalized_url}"
     if normalized_models_url:
@@ -4867,11 +4871,7 @@ def cached_fetch_api_models(
             # (#72762's stall class, which a plain TTL would reintroduce an
             # hour into the session); refresh off-thread for the next open.
             def _refresh_custom():
-                live = fetch_api_models(
-                    api_key, base_url,
-                    timeout=timeout, api_mode=api_mode, headers=headers,
-                    models_url=models_url,
-                )
+                live = _fetch_live()
                 if not live:
                     return None
                 return {"fp": fp, "at": time.time(), "models": list(live)}
@@ -4879,14 +4879,7 @@ def cached_fetch_api_models(
             _spawn_swr_refresh(cache_key, _refresh_custom)
             return list(entry["models"])
 
-    live = fetch_api_models(
-        api_key,
-        base_url,
-        timeout=timeout,
-        api_mode=api_mode,
-        headers=headers,
-        models_url=models_url,
-    )
+    live = _fetch_live()
     if live:
         cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}
         _save_provider_models_cache(cache)
@@ -5040,6 +5033,7 @@ def validate_requested_model(
     base_url: Optional[str] = None,
     api_mode: Optional[str] = None,
     models_url: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """
     Validate a ``/model`` value for the active provider.
@@ -5134,15 +5128,16 @@ def validate_requested_model(
 
     if normalized == "custom" or normalized.startswith("custom:"):
         # Try probing with correct auth for the api_mode.
+        probe_options: dict[str, Any] = {}
+        if headers:
+            probe_options["request_headers"] = headers
+        if models_url:
+            probe_options["models_url"] = models_url
         if api_mode == "anthropic_messages":
-            probe = probe_api_models(
-                api_key,
-                base_url,
-                api_mode=api_mode,
-                models_url=models_url,
-            )
+            probe_options["api_mode"] = api_mode
+            probe = probe_api_models(api_key, base_url, **probe_options)
         else:
-            probe = probe_api_models(api_key, base_url, models_url=models_url)
+            probe = probe_api_models(api_key, base_url, **probe_options)
         api_models = probe.get("models")
         if api_models is not None:
             if requested_for_lookup in set(api_models):
@@ -5373,7 +5368,12 @@ def validate_requested_model(
     # Anthropic Messages API: many proxies don't implement /v1/models.
     # Try probing with correct auth; if it fails, accept with a warning.
     if api_mode == "anthropic_messages":
-        api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
+        fetch_options: dict[str, Any] = {"api_mode": api_mode}
+        if headers:
+            fetch_options["headers"] = headers
+        if models_url:
+            fetch_options["models_url"] = models_url
+        api_models = fetch_api_models(api_key, base_url, **fetch_options)
         if api_models is not None:
             if requested_for_lookup in set(api_models):
                 return {
@@ -5406,7 +5406,12 @@ def validate_requested_model(
         }
 
     # Probe the live API to check if the model actually exists
-    api_models = fetch_api_models(api_key, base_url)
+    fetch_options = {}
+    if headers:
+        fetch_options["headers"] = headers
+    if models_url:
+        fetch_options["models_url"] = models_url
+    api_models = fetch_api_models(api_key, base_url, **fetch_options)
 
     if api_models is not None:
         # Gemini's OpenAI-compat /v1beta/openai/models endpoint returns IDs
