@@ -936,9 +936,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # Per-message active reaction tracking for persona/tool emoji swapping.
         # Key: message.id (int), Value: currently active reaction emoji (str).
         self._active_tool_reactions: Dict[int, str] = {}
-        # Per-message persona emoji that was added on processing start.
-        # The persona emoji is never removed by tool call swapping.
-        self._persona_emoji_on_message: Dict[int, str] = {}
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 2000-char preview
         # cap, every subsequent progressive edit truncates to the SAME text;
@@ -2776,15 +2773,25 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
     async def _remove_reaction(self, message: Any, emoji: str) -> bool:
-        """Remove the bot's own emoji reaction from a Discord message."""
+        """Remove the bot's own emoji reaction from a Discord message.
+
+        Retries once after a short delay to handle the race condition where
+        the reaction was just added and Discord hasn't processed it yet.
+        """
         if not message or not hasattr(message, "remove_reaction") or not self._client or not self._client.user:
             return False
-        try:
-            await message.remove_reaction(emoji, self._client.user)
-            return True
-        except Exception as e:
-            logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
-            return False
+        for attempt in range(2):
+            try:
+                await message.remove_reaction(emoji, self._client.user)
+                return True
+            except Exception as e:
+                if attempt == 0:
+                    # Reaction may not be cached yet — wait and retry once.
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.debug("[%s] remove_reaction failed (%s): %s", self.name, emoji, e)
+                return False
+        return False
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
@@ -2822,20 +2829,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add the agent's persona emoji when processing begins,
-        and record durable handling state.
-
-        The persona emoji stays on the message permanently — it is never
-        removed by tool call swapping. Only the tool emoji is swapped.
-        """
+        and record durable handling state."""
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
             emoji = self._persona_emoji()
             acked = await self._add_reaction(message, emoji)
-            # Track the persona emoji separately so on_tool_call_start
-            # knows not to remove it.
             self._active_tool_reactions[message.id] = emoji
-            self._persona_emoji_on_message[message.id] = emoji
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
@@ -2849,9 +2849,6 @@ class DiscordAdapter(BasePlatformAdapter):
         event. Adds the new tool emoji *before* removing the previous one so
         the message never has a gap with no reaction (which causes the
         message to visually jump in Discord).
-
-        The persona emoji is never removed — it stays on the message
-        permanently. Only the tool emoji is swapped.
         """
         if not self._dynamic_reactions_enabled():
             return
@@ -2861,12 +2858,10 @@ class DiscordAdapter(BasePlatformAdapter):
         from agent.display import get_tool_emoji
         tool_emoji = get_tool_emoji(tool_name, default="⚙️")
         current = self._active_tool_reactions.get(message.id)
-        persona = self._persona_emoji_on_message.get(message.id)
         # Add new emoji first, then remove old one — avoids a gap with no
         # reaction that makes the message visually jump in Discord.
         await self._add_reaction(message, tool_emoji)
-        # Only remove the previous tool emoji, never the persona emoji.
-        if current and current != tool_emoji and current != persona:
+        if current and current != tool_emoji:
             await self._remove_reaction(message, current)
         self._active_tool_reactions[message.id] = tool_emoji
 
@@ -2879,13 +2874,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._reactions_enabled():
             message = event.raw_message
             if hasattr(message, "add_reaction"):
-                current = self._active_tool_reactions.pop(message.id, None)
-                persona = self._persona_emoji_on_message.pop(message.id, None)
-                # Remove the tool emoji if it's different from the persona emoji.
-                if current and current != persona:
-                    await self._remove_reaction(message, current)
-                # The persona emoji is already on the message from
-                # on_processing_start — no need to re-add it.
+                current = self._active_tool_reactions.pop(message.id, self._persona_emoji())
+                await self._remove_reaction(message, current)
+                # Restore the persona emoji so the agent's identity is
+                # always visible on the message.
+                await self._add_reaction(message, self._persona_emoji())
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
@@ -3250,71 +3243,6 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
-    async def delete_message(self, chat_id: str, message_id: str) -> bool:
-        """Delete a previously sent Discord message.
-
-        Used by the gateway's post-delivery cleanup path to remove transient
-        progress / status / "Still working…" bubbles after the final response
-        lands on this channel.
-
-        **Category filtering** — if ``cleanup_categories`` is configured in
-        this adapter's platform ``extra`` (e.g.
-        ``extra: {cleanup_categories: ["progress", "status"]}``), only
-        messages whose content matches one of the listed categories are
-        deleted.  ``"all"`` (default) deletes every tracked message ID.
-
-        Bots can only delete their own messages; permission errors and
-        missing messages are swallowed at debug level.
-        """
-        if not self._client:
-            return False
-
-        # --- category filtering ------------------------------------------------
-        _categories = self.config.extra.get("cleanup_categories", "all")
-        if _categories not in {"all", True}:
-            import re as _re  # noqa: F811  – local-only alias
-            _cat_patterns: dict[str, _re.Pattern | None] = {
-                "progress": _re.compile(r"🔍|⏳|Still working|Running\s+\w+", _re.IGNORECASE),
-                "status":   _re.compile(r"[⚠️❌✅🔄]|rate\s+limit|fallback|gateway\s+restart", _re.IGNORECASE),
-                "error":    _re.compile(r"❌|error|failed|timeout|unavailable", _re.IGNORECASE),
-            }
-            if isinstance(_categories, str):
-                _categories = [_categories]
-            try:
-                _channel = self._client.get_channel(int(chat_id))
-                if not _channel:
-                    _channel = await self._client.fetch_channel(int(chat_id))
-                _msg = await _channel.fetch_message(int(message_id))
-                _text = _msg.content or ""
-                _match_found = False
-                for _cat, _pat in _cat_patterns.items():
-                    if _cat in _categories and _pat and _pat.search(_text):
-                        _match_found = True
-                        break
-                if not _match_found:
-                    return False  # category filter says: keep this one
-            except Exception:
-                pass  # if fetch fails, fall through and attempt delete anyway
-        # ----------------------------------------------------------------------
-
-        try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            msg = await channel.fetch_message(int(message_id))
-            await msg.delete()
-            logger.debug(
-                "[%s] Deleted message %s in channel %s",
-                self.name, message_id, chat_id,
-            )
-            return True
-        except Exception as e:  # pragma: no cover
-            logger.debug(
-                "[%s] Failed to delete message %s: %s",
-                self.name, message_id, e,
-            )
-            return False
-
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
         """True when a Discord edit/send failed because text exceeded 2,000.
@@ -3431,7 +3359,6 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=last_id,
             continuation_message_ids=tuple(continuation_ids),
         )
-
 
     async def _send_file_attachment(
         self,
