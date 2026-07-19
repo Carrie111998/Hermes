@@ -431,3 +431,76 @@ def test_external_silence_records_suppressed_receipt_without_sending(monkeypatch
         ("quiet-execution", {"state": "suppressed", "receipt_path": str(tmp_path / "cron" / "delivery-receipts.jsonl")})
     ]
     assert delivered == []
+
+
+def test_e2e_accepted_delivery_chains_receipt_aggregate_watchdog_no_anomaly(monkeypatch, tmp_path):
+    """Representative end-to-end: run_one_job with external Telegram delivery
+    writes an accepted receipt, produces correct aggregate, and watchdog
+    classifies it as healthy — all without live platform sends.
+    
+    _deliver_result is mocked to write receipts directly (bypassing gateway
+    config), mirroring the real _deliver_result behaviour end-to-end.
+    """
+    import json
+
+    from cron.delivery_receipts import aggregate_execution_state, append_receipt
+    from cron.delivery_watchdog import classify_delivery_events
+
+    def fake_deliver(job, content, adapters=None, loop=None, receipt_context=None):
+        if receipt_context:
+            receipt_path = tmp_path / "cron" / "delivery-receipts.jsonl"
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            append_receipt(receipt_path, {
+                "execution_id": receipt_context["execution_id"],
+                "state": "accepted",
+                "mode": "native",
+                "target": {"platform": "telegram", "chat_id": "1092516733", "thread_id": None},
+            })
+        return None
+
+    artifact = tmp_path / "real-output.md"
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(s, "create_execution", lambda *_args, **_kwargs: {"id": "e2e-accepted-exec"})
+    monkeypatch.setattr(s, "mark_execution_running", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "run_job", lambda *_args, **_kwargs: (True, "real report body", "📊 Cron Core E2E — delivery accepted", None))
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+
+    def save_output(_job_id, output):
+        artifact.write_text(output, encoding="utf-8")
+        return artifact
+
+    monkeypatch.setattr(s, "save_job_output", save_output)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    # --- Act: run_one_job with external delivery ---
+    assert s.run_one_job({
+        "id": "e2e-cron-core",
+        "name": "e2e",
+        "deliver": "telegram:1092516733",
+    }) is True
+
+    # --- Assert: receipt ledger ---
+    receipt_path = tmp_path / "cron" / "delivery-receipts.jsonl"
+    receipts = [
+        json.loads(line)
+        for line in receipt_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["execution_id"] == "e2e-accepted-exec"
+    assert receipts[0]["state"] == "accepted"
+    assert receipts[0]["target"] == {"platform": "telegram", "chat_id": "1092516733", "thread_id": None}
+
+    # --- Assert: execution aggregate ---
+    aggregate = aggregate_execution_state(receipt_path, "e2e-accepted-exec")
+    assert aggregate == "accepted"
+
+    # --- Assert: watchdog healthy (latest execution has accepted receipt) ---
+    watchdog_events = classify_delivery_events(
+        [{"id": "e2e-cron-core", "deliver": "telegram:1092516733", "enabled": True}],
+        [{"id": "e2e-accepted-exec", "job_id": "e2e-cron-core", "status": "completed", "delivery_state": "accepted"}],
+    )
+    assert watchdog_events == []
+
+    # --- Assert: output artifact exists ---
+    assert "real report body" in artifact.read_text(encoding="utf-8")
