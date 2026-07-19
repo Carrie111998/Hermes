@@ -532,7 +532,8 @@ This is the same trust model that applies to everything the agent reads: web pag
 - Ensure the secret in your route config exactly matches the secret configured in the webhook source
 - For GitHub, the secret is HMAC-based — check `X-Hub-Signature-256`
 - For GitLab, the secret is a plain token match — check `X-Gitlab-Token`
-- For generic HMAC integrations, prefer `X-Webhook-Signature-V2` with `X-Webhook-Timestamp`; legacy senders may use `X-Webhook-Signature`
+- For generic HMAC V2 integrations, check both `X-Webhook-Signature-V2` and `X-Webhook-Timestamp`
+- For legacy generic HMAC V1 integrations, check `X-Webhook-Signature`
 - For bearer-token integrations, check the `Authorization` header and Bearer scheme
 - Check gateway logs for `Invalid signature` warnings
 
