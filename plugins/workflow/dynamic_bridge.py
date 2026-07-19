@@ -86,11 +86,14 @@ def _hermes_binary() -> str:
 # ── Kanban helpers ────────────────────────────────────────────────
 
 
-def _kanban_create_card(node: dict, workflow_id: str, context: str = "") -> str | None:
+def _kanban_create_card(node: dict, workflow_id: str, context: str = "", board: str = "") -> str | None:
     """Create a kanban card for a worker node.  Returns the card ID
     on success, None on failure.
 
     Follows the pattern from engine.py's ``create_kanban_card`` method.
+
+    ``board`` overrides the kanban board.  When empty, uses the
+    module-level ``KANBAN_BOARD`` constant.
     """
     node_id = node.get("node_id", "")
     goal = node.get("goal", "")
@@ -100,11 +103,12 @@ def _kanban_create_card(node: dict, workflow_id: str, context: str = "") -> str 
     if context:
         body += f"\n\nContext: {context}"
 
+    kanban_board = board if board else KANBAN_BOARD
     _default_assignee = get_config().get("default_assignee", "")
     cmd = [
         _hermes_binary(), "kanban", "create",
         title,
-        "--tenant", KANBAN_BOARD,
+        "--tenant", kanban_board,
         "--body", body,
         "--goal",
         "--priority", "2",
@@ -112,7 +116,7 @@ def _kanban_create_card(node: dict, workflow_id: str, context: str = "") -> str 
     if _default_assignee:
         cmd.extend(["--assignee", _default_assignee])
     run_env = dict(os.environ)
-    run_env["HERMES_KANBAN_BOARD"] = KANBAN_BOARD
+    run_env["HERMES_KANBAN_BOARD"] = kanban_board
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30, env=run_env,
@@ -394,6 +398,7 @@ def run_dynamic_workflow(
     single_flight: bool = False,
     dispatch_ready: bool = True,
     delivery_target: str = "",
+    board: str = "",
 ) -> dict:
     """Create and optionally dispatch a dynamic workflow with fleet integration.
 
@@ -406,6 +411,8 @@ def run_dynamic_workflow(
         single_flight: If True, refuse creation when a same-id run is active.
         dispatch_ready: If True, dispatch ready nodes immediately.
         delivery_target: Delivery target string (e.g. "discord:CHANNEL_ID").
+        board: Kanban board override. When empty, uses the bridge default
+               ("dynamic-workflows").
 
     Returns:
         The workflow result dict from the engine (parsed from JSON).
@@ -462,7 +469,7 @@ def run_dynamic_workflow(
         wf_nodes = wf_view.get("nodes", [])
         card_map: dict[str, str] = {}
         for node in wf_nodes:
-            card_id = _kanban_create_card(node, actual_id, context)
+            card_id = _kanban_create_card(node, actual_id, context, board)
             if card_id:
                 card_map[node["node_id"]] = card_id
                 node["kanban_card_id"] = card_id

@@ -89,7 +89,6 @@ def _err(message: str, **extra: Any) -> str:
     """Wrap an error result; ``message`` is a short agent-readable string."""
     return json.dumps({"ok": False, "error": message, **extra}, indent=2, default=str)
 
-
 def handle_workflow_start(
     workflow: str,
     context: Optional[Dict[str, Any]] = None,
@@ -101,6 +100,7 @@ def handle_workflow_start(
     single_flight: bool = False,
     delivery_target: str = "",
     inputs: Optional[Dict[str, Any]] = None,
+    board: str = "",
     **kwargs: Any,
 ) -> str:
     """Start a pipeline in the given mode.
@@ -116,6 +116,10 @@ def handle_workflow_start(
         creates an ad-hoc DAG at runtime from the objective and node
         list passed in *context*.
 
+    ``board`` overrides the kanban board for this run.  When empty,
+    the engine uses the YAML ``kanban_board`` field or auto-creates
+    ``wf_<workflow_name>``.
+
     See ``workflow_list`` for available pipelines, ``workflow_show`` to
     inspect structure, and ``workflow_status`` to check a running run.
     """
@@ -130,6 +134,7 @@ def handle_workflow_start(
             single_flight=single_flight,
             delivery_target=delivery_target,
             dry_run=dry_run,
+            board=board,
             **kwargs,
         )
 
@@ -142,9 +147,8 @@ def handle_workflow_start(
         resume=resume,
         single_flight=single_flight,
         inputs=inputs,
+        board=board,
     )
-
-
 def _handle_workflow_start_predefined(
     workflow: str,
     context: Optional[Dict[str, Any]] = None,
@@ -153,6 +157,7 @@ def _handle_workflow_start_predefined(
     resume: bool = False,
     single_flight: bool = False,
     inputs: Optional[Dict[str, Any]] = None,
+    board: str = "",
 ) -> str:
     """Predefined mode: look up YAML in docs/fleet-pipelines/, validate,
     dispatch via engine."""
@@ -187,6 +192,7 @@ def _handle_workflow_start_predefined(
             dry_run=dry_run,
             resume=resume,
             inputs=inputs,
+            board=board,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))
@@ -204,6 +210,7 @@ def _handle_workflow_start_dynamic(
     single_flight: bool = False,
     delivery_target: str = "",
     dry_run: bool = False,
+    board: str = "",
     **kwargs: Any,
 ) -> str:
     """Dynamic mode: delegate to dynamic_bridge.run_dynamic_workflow().
@@ -212,6 +219,9 @@ def _handle_workflow_start_dynamic(
     definitions, this creates an ad-hoc DAG at runtime.  The
     ``workflow`` parameter is the workflow_id to create (or reuse), and
     ``context`` carries the objective and nodes from the calling agent.
+
+    ``board`` overrides the kanban board for project-scope cards.
+    When empty, the bridge uses its default ``"dynamic-workflows"``.
 
     Scope controls fleet integration:
       - ``project`` (default): creates kanban cards for worker nodes
@@ -252,6 +262,7 @@ def _handle_workflow_start_dynamic(
             "scope": scope,
             "single_flight": single_flight,
             "delivery_target": delivery_target,
+            "board": board,
         })
 
     try:
@@ -264,6 +275,7 @@ def _handle_workflow_start_dynamic(
             single_flight=single_flight,
             dispatch_ready=True,
             delivery_target=delivery_target,
+            board=board,
         )
     except Exception as exc:
         logger.exception("dynamic_workflow_start failed for %s", workflow)
