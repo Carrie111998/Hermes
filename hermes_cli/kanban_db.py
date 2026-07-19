@@ -7599,14 +7599,13 @@ def _record_task_failure(
          value from ``kanban.failure_limit``; tests pass fixed values)
       3. ``DEFAULT_FAILURE_LIMIT``
 
-    ``force_trip=True`` trips the breaker unconditionally, skipping the
-    counter-vs-threshold comparison (the resolution order above is then
-    only reported in the ``gave_up`` payload, not re-evaluated). Callers
-    use it when they have already applied their own bounded-retry policy
-    — e.g. the clean-exit protocol-violation streak in
-    ``detect_crashed_workers``, which resolves the per-task
-    ``max_retries`` override against the violation streak itself. The
-    failure is still counted into ``consecutive_failures``.
+    ``force_trip=True`` trips the breaker unconditionally after saturating
+    ``consecutive_failures`` to at least the resolved threshold.  Saturation
+    keeps the generic ``recompute_ready`` circuit-breaker guard authoritative
+    on the next dispatcher cycle.  Callers use this mode when they have
+    already applied their own bounded-retry policy — e.g. the clean-exit
+    protocol-violation streak in ``detect_crashed_workers``, which resolves
+    the per-task ``max_retries`` override against the violation streak itself.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -7632,6 +7631,14 @@ def _record_task_failure(
         else:
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
+
+        if force_trip:
+            # ``recompute_ready`` protects circuit-breaker blocks by comparing
+            # this counter with the same effective limit.  A caller-owned
+            # retry budget may trip before the unified counter naturally
+            # reaches that threshold, so saturate it to preserve the terminal
+            # block across the next dispatcher cycle.
+            failures = max(failures, effective_limit)
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.

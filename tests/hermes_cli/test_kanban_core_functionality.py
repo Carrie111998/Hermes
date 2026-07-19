@@ -4579,6 +4579,39 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         conn.close()
 
 
+def test_protocol_violation_block_survives_next_dispatch_cycle(
+    kanban_home, all_assignees_spawnable
+):
+    """A protocol-violation terminal block must not be promoted or respawned."""
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    spawned = []
+
+    def _record_spawn(task, workspace):
+        spawned.append(task.id)
+        return 970999
+
+    try:
+        tid = kb.create_task(conn, title="protocol terminal block", assignee="worker")
+        for index in range(_kb._PROTOCOL_VIOLATION_FAILURE_LIMIT):
+            _drive_protocol_violation(conn, tid, 970100 + index)
+
+        blocked_task = kb.get_task(conn, tid)
+        assert blocked_task is not None
+        assert blocked_task.status == "blocked"
+        assert blocked_task.consecutive_failures >= _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+
+        kb.dispatch_once(conn, spawn_fn=_record_spawn)
+
+        after_dispatch = kb.get_task(conn, tid)
+        assert after_dispatch is not None
+        assert after_dispatch.status == "blocked"
+        assert spawned == []
+    finally:
+        conn.close()
+
+
 def test_protocol_violation_streak_resets_on_other_failure_kind(kanban_home):
     """A non-violation failure between violations resets the streak.
 
