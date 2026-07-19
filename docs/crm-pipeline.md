@@ -108,9 +108,36 @@ delivered to any platform, with no per-day limits.
 - **Open and scriptable.** `crm export` gives you the full JSON; the pipeline
   functions are importable for custom automations.
 
+## Running alongside a full CRM pipeline (vault-backed digest)
+
+If you also run a dedicated CRM system that *automatically* ingests your
+channels (the reference setup is
+[dizhaky/crm-pipeline](https://github.com/dizhaky/crm-pipeline): an
+Obsidian-vault pipeline sweeping mail, calendars, iMessage/SMS, Teams, Slack,
+LinkedIn, Beeper-bridged chats, and phone calls into per-person
+`last_contact`/Activity records), **treat that system as the source of truth
+and Hermes as the delivery + chat surface**. Don't maintain a parallel
+hand-entered contact store — point the daily nudge at the pipeline's own
+going-cold detector, which derives cadence from real interaction history
+instead of manually set intervals:
+
+```bash
+printf '#!/bin/sh\nexec crm-cadence --digest --silent-if-empty\n' > ~/.hermes/scripts/crm-digest.sh
+chmod +x ~/.hermes/scripts/crm-digest.sh
+hermes cron create "0 9 * * *" --script crm-digest.sh --no-agent \
+  --name "Keep in touch" --deliver telegram
+```
+
+`crm-cadence --digest` honors the same `[SILENT]` no-spam convention as
+`hermes crm digest`, so the wiring is drop-in. The `crm` plugin remains the
+right tool when Hermes is your only CRM (standalone, manual-entry), or as a
+lightweight side-store for a small personal circle you keep out of the main
+pipeline.
+
 ## Not yet built (future work)
 
 - Automatic ingestion from Gmail/Calendar to auto-populate the timeline (Dex's
-  passive auto-sync). The building blocks exist in the `google-workspace` skill.
+  passive auto-sync). The building blocks exist in the `google-workspace`
+  skill — or run the full crm-pipeline setup above, which already does this.
 - A `crm import` subcommand to bulk-load from vCard/CSV/exported JSON.
 - Model tools (vs. CLI-only) so the agent can query the CRM without shelling out.
