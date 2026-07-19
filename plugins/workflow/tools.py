@@ -568,6 +568,15 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                     "Use this instead of context for workflow-specific parameters."
                 ),
             },
+            "board": {
+                "type": "string",
+                "description": (
+                    "Optional kanban board name override. When set, all kanban cards for this "
+                    "workflow run are created on the specified board. When empty, the engine "
+                    "uses the YAML 'kanban_board' field or auto-creates 'wf_<workflow_name>'."
+                ),
+                "default": "",
+            },
         },
         "required": ["workflow"],
     },
