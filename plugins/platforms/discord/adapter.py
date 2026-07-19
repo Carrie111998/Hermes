@@ -936,6 +936,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Per-message active reaction tracking for persona/tool emoji swapping.
         # Key: message.id (int), Value: currently active reaction emoji (str).
         self._active_tool_reactions: Dict[int, str] = {}
+        # Per-message cooldown timestamp for reaction changes (monotonic time).
+        # Prevents hitting Discord's rate limit when tool calls fire rapidly.
+        self._last_reaction_change: Dict[int, float] = {}
         # Cached bot user ID, set in on_ready. Used by _remove_reaction to
         # avoid relying on self._client.user which may not be cached yet.
         self._bot_user_id: Optional[int] = None
@@ -2867,8 +2870,8 @@ class DiscordAdapter(BasePlatformAdapter):
         the message never has a gap with no reaction (which causes the
         message to visually jump in Discord).
 
-        A small delay is added between add and remove to avoid hitting
-        Discord's per-message reaction rate limit bucket.
+        A per-message cooldown prevents hitting Discord's reaction rate
+        limit when multiple tool calls fire in rapid succession.
         """
         if not self._dynamic_reactions_enabled():
             return
@@ -2878,12 +2881,21 @@ class DiscordAdapter(BasePlatformAdapter):
         from agent.display import get_tool_emoji
         tool_emoji = get_tool_emoji(tool_name, default="⚙️")
         current = self._active_tool_reactions.get(message.id)
+        if tool_emoji == current:
+            return  # Already showing this emoji, nothing to do
+        # Per-message cooldown: skip if we changed reactions recently.
+        now = time.monotonic()
+        last = self._last_reaction_change.get(message.id, 0.0)
+        if now - last < 1.0:
+            # Still within cooldown — just update the tracking so the
+            # next call knows what emoji to swap to.
+            self._active_tool_reactions[message.id] = tool_emoji
+            return
+        self._last_reaction_change[message.id] = now
         # Add new emoji first, then remove old one — avoids a gap with no
         # reaction that makes the message visually jump in Discord.
         await self._add_reaction(message, tool_emoji)
         if current and current != tool_emoji:
-            # Small delay to let Discord process the add before the remove,
-            # avoiding the per-message reaction rate limit bucket.
             await asyncio.sleep(0.3)
             await self._remove_reaction(message, current)
         self._active_tool_reactions[message.id] = tool_emoji
