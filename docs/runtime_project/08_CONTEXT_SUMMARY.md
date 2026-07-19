@@ -1,14 +1,14 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-19  
-**Task:** Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze  
-**Status:** Complete — awaiting Architect review (not checkpointed)
+**Task:** Task 17.1 — clarify Phase 1 terminal semantics and guard idempotent SoT  
+**Status:** Accepted — checkpointed (builds on Task 17 at `939e8b606`)
 
 ---
 
 ## 1. One-paragraph state
 
-Task 17 **freezes Phase 1** without adding lifecycle behavior. It introduces discoverable boundary constants (`PHASE1_MANUAL_WORKFLOW_RECORD_CHAIN`, terminal record/event markers, `PHASE1_BOUNDARY_STATUS`), end-to-end manual workflow regression tests, and documentation freeze. The 11-record manual chain through `run_final_closure_record` is locked. **No new lifecycle record type, event type, or automation integration was added.**
+Task 17 **freezes Phase 1** without adding lifecycle behavior. It introduces discoverable boundary constants (`PHASE1_MANUAL_WORKFLOW_RECORD_CHAIN`, terminal record/event markers, `PHASE1_BOUNDARY_STATUS`), end-to-end manual workflow regression tests, and documentation freeze. The 11-record manual chain through `run_final_closure_record` is locked. Task 17.1 clarifies terminal semantics (chain-terminal, not a global task/attempt hard lock) and fails closed when idempotent replay finds a matching audit event but the JSON source-of-truth file is missing. **No new lifecycle record type, event type, or automation integration was added.**
 
 ---
 
@@ -51,8 +51,12 @@ run_completion_record
 - Manual-only lifecycle APIs; no automatic execution/verification/rerun/repair
 - No artifact/result/verification_result/docs/test-output inspection in lifecycle APIs
 - No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO integration
-- Final closure is terminal; no new followup loop after closure
-- No task/attempt lifecycle mutation after final closure
+- Final closure is terminal for the Phase 1 **manual run-record chain** (no new followup loop after closure)
+- `record_run_final_closure` itself preserves `run_manifest` / `task_status` / `attempt_status` snapshots (does not mutate them)
+- Phase 1 does **not** install a global hard lock that blocks later task/attempt APIs after closure
+- Callers/operators must treat `run_final_closure_record.json` as the Phase 1 terminal boundary
+- Phase 2 may decide whether to add a hard lock; Phase 1 does not
+- Idempotent replay of manual run-record APIs requires the JSON SoT file to exist; event-present / JSON-missing raises `InvalidTransition` (no silent heal)
 
 ---
 
@@ -61,8 +65,9 @@ run_completion_record
 - No new lifecycle record or event type for boundary freeze
 - No `record_phase1_boundary`, `make_phase1_boundary_record`, or `phase1_boundary_record.json`
 - No Phase 2 automation/integration implementation
+- No global post-closure task/attempt hard lock in Phase 1
 - Task 18 not started
 
 ---
 
-Task 17 complete for review. **Not checkpointed.** Phase 2 not started.
+Task 17 checkpointed at `939e8b606de09532006887c637684cf8baa49d40` (short `939e8b606`). Phase 1 final verification: **1271 passed**. Task 17.1 checkpointed. Phase 1 frozen. Phase 2 not started.

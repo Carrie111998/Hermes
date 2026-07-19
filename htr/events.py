@@ -322,6 +322,14 @@ def _resolve_idempotent_event(
     )
 
 
+def _require_record_json_for_idempotent_replay(record_path: Path) -> None:
+    """Fail closed when a matching audit event exists but JSON SoT is missing."""
+    if not record_path.exists():
+        raise InvalidTransition(
+            f"{record_path.name} missing while matching audit event exists"
+        )
+
+
 def _ensure_run_and_task_workspace(
     run_id: str,
     task_id: str,
@@ -1023,6 +1031,7 @@ def complete_run_manually(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(completion_record_path)
         return existing
 
     ensure_dir(completion_record_path.parent)
@@ -1125,6 +1134,7 @@ def review_run_manually(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(review_record_path)
         return existing
 
     ensure_dir(review_record_path.parent)
@@ -1246,6 +1256,7 @@ def plan_run_followup(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(followup_plan_record_path)
         return followup_plan_record
 
     ensure_dir(followup_plan_record_path.parent)
@@ -1387,6 +1398,7 @@ def request_run_execution(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(execution_request_record_path)
         return execution_request_record
 
     ensure_dir(execution_request_record_path.parent)
@@ -1563,6 +1575,7 @@ def execute_run_execution_request(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(execution_result_record_path)
         return execution_result_record
 
     ensure_dir(execution_result_record_path.parent)
@@ -1740,6 +1753,7 @@ def verify_run_execution_result(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(verification_record_path)
         return verification_record
 
     ensure_dir(verification_record_path.parent)
@@ -1937,6 +1951,7 @@ def plan_post_verification_followup(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(plan_record_path)
         return plan_record
 
     ensure_dir(plan_record_path.parent)
@@ -2203,6 +2218,7 @@ def request_post_verification_execution(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(request_record_path)
         return run_post_verification_execution_request_record
 
     ensure_dir(request_record_path.parent)
@@ -2537,6 +2553,7 @@ def record_post_verification_execution_result(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(result_record_path)
         return run_post_verification_execution_result_record
 
     ensure_dir(result_record_path.parent)
@@ -2969,6 +2986,7 @@ def record_post_verification_execution_verification(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(verification_record_path)
         return run_post_verification_execution_verification_record
 
     ensure_dir(verification_record_path.parent)
@@ -3557,6 +3575,7 @@ def record_run_final_closure(
     )
     existing = _resolve_idempotent_event(run_id, candidate, base_dir)
     if existing is not None:
+        _require_record_json_for_idempotent_replay(closure_record_path)
         return run_final_closure_record
 
     ensure_dir(closure_record_path.parent)

@@ -765,8 +765,8 @@ Records reviewer decision as source-of-truth JSON; event log is audit-only.
 ## Task 12 — Verification-Driven Follow-up Planning (2026-07-18)
 
 **Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance (not checkpointed)  
-**Tests:** full HTR suite (`python3 -m pytest tests/htr/ -v`)
+**Status:** ✅ Accepted (checkpointed `16d81a65f`)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`)
 
 ### Delivered
 
@@ -787,9 +787,7 @@ No artifact/result/verification_result inspection; no automatic execution.
 - No execution, rerun, repair, task/attempt creation, or lifecycle mutation
 - No prior record mutation
 - No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO
-- Task 13 not started
-
-**Awaiting:** Architect acceptance before checkpoint / Task 13.
+- Task 13 not started at Task 12 delivery time (subsequently checkpointed in chain)
 
 ---
 
@@ -923,8 +921,8 @@ No artifact/result/verification_result/docs/test-output inspection; no automatic
 ## Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze (2026-07-19)
 
 **Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect review (not checkpointed)  
-**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — pending architect re-run confirmation
+**Status:** ✅ Accepted (checkpointed `939e8b606`)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **1271 passed** at checkpoint
 
 ### Delivered
 
@@ -944,4 +942,33 @@ Task 17 locks the 11-record Phase 1 manual source-of-truth chain and adds regres
 - No automation, Runtime/delegate_task/scheduler/queue/database/HEAL/DECO integration
 - No Phase 2 implementation; Task 18 not started
 
-**Awaiting:** Architect acceptance before checkpoint. Phase 2 not started.
+**Phase 2:** not started.
+
+---
+
+## Task 17.1 — Clarify Phase 1 Terminal Semantics and Guard Idempotent SoT (2026-07-19)
+
+**Implementer:** Cursor  
+**Status:** ✅ Accepted (checkpointed)  
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **1273 passed**  
+**Builds on:** Task 17 checkpoint `939e8b606` (Phase 1 final verification **1271 passed**)
+
+### Delivered
+
+- Docs clarify: final closure is terminal for the Phase 1 manual run-record chain; `record_run_final_closure` preserves run/task/attempt snapshots; Phase 1 does not install a global post-closure hard lock; operators treat `run_final_closure_record.json` as the boundary; Phase 2 may add a hard lock later
+- Idempotent SoT guard on manual run-record APIs: matching audit event + missing JSON → `InvalidTransition` (no silent heal)
+- Boundary test renamed to avoid overclaiming a global lifecycle lock
+- Regression tests for event-present / JSON-missing on final closure and `plan_run_followup`
+
+### Design principle
+
+Phase 1 freezes the 11-record chain semantics without expanding automation or adding a global hard lock.
+
+### Non-goals confirmed
+
+- No new lifecycle record/event types; no Phase 1 chain change
+- No global post-closure task/attempt hard lock
+- No Runtime/delegate_task/scheduler/queue/database/browser/HTTP/subprocess automation
+- Phase 2 not started; Task 18 not started
+
+**Phase 2:** not started.

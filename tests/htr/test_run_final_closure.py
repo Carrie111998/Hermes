@@ -3511,6 +3511,32 @@ def test_idempotent_same_event_id_same_semantic(tmp_path):
         tmp_path, run_id, record, actor="human", event_id=event_id
     )
     assert second == first
+    assert contracts.run_final_closure_record_json_path(run_id, tmp_path).exists()
+
+
+def test_idempotent_replay_fails_when_event_exists_but_json_missing(tmp_path):
+    run_id, _, _, completion, review, plan, request, result, verification, pvfp, pver, pve_result, pve_verification = (
+        _run_with_post_verification_execution_verification(tmp_path)
+    )
+    record = _run_final_closure_record(
+        run_id, completion, review, plan, request, result, verification, pvfp, pver, pve_result, pve_verification
+    )
+    event_id = new_event_id()
+    events.record_run_final_closure(
+        tmp_path, run_id, record, actor="human", event_id=event_id
+    )
+    closure_path = contracts.run_final_closure_record_json_path(run_id, tmp_path)
+    assert closure_path.exists()
+    closure_path.unlink()
+    assert not closure_path.exists()
+    with pytest.raises(
+        InvalidTransition,
+        match="run_final_closure_record.json missing while matching audit event exists",
+    ):
+        events.record_run_final_closure(
+            tmp_path, run_id, record, actor="human", event_id=event_id
+        )
+    assert not closure_path.exists()
 
 
 def test_same_event_id_different_semantic_raises_conflict(tmp_path):

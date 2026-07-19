@@ -310,7 +310,12 @@ def test_phase1_end_to_end_closure_fingerprints_match_source_of_truth_records(tm
     )
 
 
-def test_phase1_final_closure_is_terminal_and_preserves_prior_state(tmp_path):
+def test_phase1_final_closure_preserves_prior_run_task_attempt_snapshots(tmp_path):
+    """Closure itself must not mutate prior snapshots.
+
+    This does not claim a global hard lock on later task/attempt APIs.
+    Phase 1 treats run_final_closure_record.json as the manual-chain boundary.
+    """
     workflow = _run_full_phase1_manual_workflow(tmp_path)
     before = workflow["before_closure"]
     after = workflow["after_closure"]

@@ -1,21 +1,36 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-19 (Task 17 completed by Cursor)
+**Last updated:** 2026-07-19 (Task 17.1 completed by Cursor)
 
 ---
 
 ## Active Task
 
-None — awaiting Architect review of Task 17.
+None — Phase 1 frozen (Task 17.1 checkpointed). Phase 2 not started.
 
 ---
 
 ## Completed
 
+### Task 17.1 — Clarify Phase 1 Terminal Semantics and Guard Idempotent SoT
+
+**Status:** ✅ Accepted (checkpointed)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v` — **1273 passed**  
+**Builds on:** Task 17 checkpoint `939e8b606de09532006887c637684cf8baa49d40`
+
+Changes:
+
+- Docs: final closure is terminal for the Phase 1 **manual run-record chain** only
+- Docs: `record_run_final_closure` preserves `run_manifest` / `task_status` / `attempt_status` snapshots
+- Docs: Phase 1 does **not** install a global hard lock on later task/attempt APIs; operators treat `run_final_closure_record.json` as the boundary; Phase 2 may add a hard lock later
+- `htr/events.py`: idempotent replay of manual run-record APIs requires JSON SoT file; event-present / JSON-missing → `InvalidTransition` (no silent heal)
+- Tests: rename overclaiming “terminal” wording; add event-present / JSON-missing regression tests
+- No new record/event types; no Phase 1 chain change; no global post-closure hard lock; Phase 2 not started
+
 ### Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze
 
-**Status:** ✅ Complete (awaiting Architect review — not checkpointed)  
-**Tests:** `uv run --extra dev pytest tests/htr/ -v`
+**Status:** ✅ Accepted (checkpointed `939e8b606`)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v` — **1271 passed** at Phase 1 final verification
 
 Changes:
 
@@ -23,9 +38,9 @@ Changes:
 - `PHASE1_BOUNDARY_STATUS` is a constant/documentation marker only — **not** a lifecycle event
 - End-to-end manual workflow regression test through final closure
 - Boundary regression tests: no new record/event type, no boundary record file, AST import guards
-- **No lifecycle behavior changes** — tests/docs/constants only
 - Phase 1 terminal record: `run_final_closure_record`; terminal event: `run_final_closure_recorded`
 - 11-record manual chain frozen; JSON records are source-of-truth; event log is audit-only
+- Final closure is terminal for the manual run-record chain (not a global task/attempt hard lock)
 - No Runtime/delegate_task/scheduler/queue/database/HEAL/DECO; no automation in Phase 1
 
 ### Task 16 — Run Final Closure Record
@@ -42,7 +57,8 @@ Changes:
 - Fingerprints must match all 10 prior run-level records
 - `closure_items` must correspond to post-verification execution verification items (or be global/manual)
 - Writes `run_final_closure_record.json`, appends `run_final_closure_recorded` event
-- **Terminal for Phase 1** — no new followup loop, no automatic validation/test execution, no prior record mutation
+- **Terminal for Phase 1 manual run-record chain** — no new followup loop, no automatic validation/test execution, no prior record mutation by this API
+- Does not install a global hard lock on later task/attempt APIs (Phase 1)
 - Final closure statuses: `closed_verified`, `closed_rejected`, `closed_needs_more_work`, `closed_no_action`
 - No artifact/result/verification_result/docs/test-output inspection
 
@@ -102,8 +118,8 @@ Changes:
 
 ### Task 12 — Verification-Driven Follow-up Planning
 
-**Status:** ✅ Completed (awaiting Architect review — not checkpointed)  
-**Tests:** `python3 -m pytest tests/htr/ -v`
+**Status:** ✅ Accepted (checkpointed `16d81a65f`)  
+**Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
 
@@ -126,7 +142,7 @@ Changes:
 
 ## Next Task (Architect)
 
-Phase 2 planning — not started. Task 17 completes Phase 1; no Phase 2 implementation in Task 17.
+Phase 2 planning — not started. Task 17/17.1 complete Phase 1 freeze clarifications; no Phase 2 implementation.
 
 ---
 

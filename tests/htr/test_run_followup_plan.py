@@ -631,6 +631,24 @@ def test_idempotent_same_event_id_same_semantic(tmp_path):
         run_id, record, event_id=event_id, base_dir=tmp_path
     )
     assert second == first
+    assert contracts.run_followup_plan_record_json_path(run_id, tmp_path).exists()
+
+
+def test_idempotent_replay_fails_when_event_exists_but_json_missing(tmp_path):
+    run_id, _, _, _, _ = _run_with_reviewed_run(tmp_path)
+    record = _plan_record(run_id)
+    event_id = new_event_id()
+    events.plan_run_followup(run_id, record, event_id=event_id, base_dir=tmp_path)
+    plan_path = contracts.run_followup_plan_record_json_path(run_id, tmp_path)
+    assert plan_path.exists()
+    plan_path.unlink()
+    assert not plan_path.exists()
+    with pytest.raises(
+        InvalidTransition,
+        match="run_followup_plan_record.json missing while matching audit event exists",
+    ):
+        events.plan_run_followup(run_id, record, event_id=event_id, base_dir=tmp_path)
+    assert not plan_path.exists()
 
 
 def test_same_event_id_different_semantic_raises_conflict(tmp_path):
