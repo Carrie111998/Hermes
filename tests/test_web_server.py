@@ -144,6 +144,15 @@ def test_start_server_accepts_base64_desktop_attachments_above_preview_limit(mon
     assert captured["ws_max_size"] > base64_bytes
 
 
+def test_start_server_prints_bracketed_ipv6_dashboard_url(monkeypatch, capsys):
+    """The no-browser startup banner must still show a valid IPv6 URL."""
+    _stub_uvicorn(monkeypatch)
+
+    web_server.start_server(host="::1", port=9119, open_browser=False)
+
+    assert "Hermes Web UI → http://[::1]:9119" in capsys.readouterr().out
+
+
 def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     """Non-loopback (public) binds MUST keep the ws ping enabled so half-open
     connections (reverse-proxy 524, dropped Cloudflare Tunnel) raise
