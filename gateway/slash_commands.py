@@ -1352,6 +1352,94 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _handle_claude_command(self, event: MessageEvent) -> str:
+        """Handle /claude — one-shot delegation to Anthropic Claude Code CLI.
+
+        Usage (mirrors the CLI handler in cli.py):
+            /claude <task>              one-shot `claude -p "<task>" --dangerously-skip-permissions`
+            /claude --bare <task>       minimal mode (no CLAUDE.md/plugins/hooks)
+            /claude --json <task>       JSON output with cost/tokens
+            /claude --model NAME <task> override model
+            /claude status              show claude CLI version + auth ping
+            /claude help                quick reference
+        Aliases: /cc
+        """
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        raw_args = event.get_command_args().strip() if event else ""
+
+        if raw_args in {"", "status"}:
+            cli = _shutil.which("claude")
+            if not cli:
+                return "❌ `claude` CLI not found in PATH. Install: https://docs.anthropic.com/en/docs/claude-code"
+            try:
+                ver = _subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=10)
+                auth = _subprocess.run([cli, "-p", "Reply with exactly: pong", "--dangerously-skip-permissions"],
+                                       capture_output=True, text=True, timeout=60)
+            except Exception as exc:
+                return f"❌ claude check failed: {exc}"
+            return (
+                f"✓ claude CLI: {cli}\n"
+                f"✓ version: {(ver.stdout or ver.stderr).strip()}\n"
+                f"✓ auth: {(auth.stdout or auth.stderr).strip()[:80] or 'empty'}"
+            )
+
+        if raw_args == "help":
+            return (
+                "/claude <task>                one-shot `claude -p`\n"
+                "/claude --bare <task>         minimal mode\n"
+                "/claude --json <task>         JSON output w/ cost+tokens\n"
+                "/claude --model NAME <task>   override model\n"
+                "/claude status                CLI version + auth check\n"
+                "/claude help                  this help"
+            )
+
+        bare = json_out = False
+        model = None
+        words = raw_args.split()
+        task_words = []
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "--bare":
+                bare = True
+            elif w == "--json":
+                json_out = True
+            elif w == "--model" and i + 1 < len(words):
+                model = words[i + 1]
+                i += 1
+            else:
+                task_words.append(w)
+            i += 1
+        task = " ".join(task_words).strip()
+        if not task:
+            return "❌ Usage: /claude <task>. Try /claude help."
+
+        if not _shutil.which("claude"):
+            return "❌ `claude` CLI not found in PATH."
+
+        flags = ["-p", task, "--dangerously-skip-permissions"]
+        if bare:
+            flags.append("--bare")
+        if json_out:
+            flags.extend(["--output-format", "json"])
+        if model:
+            flags.extend(["--model", model])
+
+        try:
+            res = _subprocess.run(["claude", *flags], capture_output=True, text=True, timeout=600)
+            out = (res.stdout or res.stderr).strip()
+        except _subprocess.TimeoutExpired:
+            return "❌ claude timed out after 600s. Try a smaller task or run interactively in tmux."
+        except Exception as exc:
+            return f"❌ claude failed: {exc}"
+
+        if not out:
+            return f"❌ claude returned empty (exit {res.returncode})."
+        # Telegram 4096-char limit — truncate to be safe
+        return out[:3800] + ("\n…(truncated)" if len(out) > 3800 else "")
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 

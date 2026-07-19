@@ -6934,6 +6934,99 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         else:
             _cprint("    (session only — add --global to persist)")
 
+    def _handle_claude(self, cmd_original: str) -> None:
+        """Handle /claude — one-shot delegation to Anthropic Claude Code CLI.
+
+        Usage:
+            /claude <task>              # runs `claude -p "<task>" --dangerously-skip-permissions`
+            /claude --bare <task>       # minimal mode (no CLAUDE.md/hooks/plugins)
+            /claude --json <task>       # JSON output with cost/tokens
+            /claude --model NAME <task> # override model (e.g. claude-sonnet-4)
+            /claude status              # show Claude Code CLI version + auth status
+            /claude help                # quick reference
+        Aliases: /cc
+        """
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        parts = cmd_original.split(None, 1)
+        raw = parts[1].strip() if len(parts) > 1 else ""
+
+        # Utility subcommands
+        if raw in {"status", ""}:
+            cli = _shutil.which("claude")
+            if not cli:
+                _cprint("  ❌ `claude` CLI not found in PATH. Install: https://docs.anthropic.com/en/docs/claude-code")
+                return
+            ver = _subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=10)
+            auth = _subprocess.run([cli, "-p", "Reply with exactly: pong", "--dangerously-skip-permissions"],
+                                   capture_output=True, text=True, timeout=60)
+            _cprint(f"  ✓ claude CLI: {cli}")
+            _cprint(f"  ✓ version: {ver.stdout.strip() or ver.stderr.strip()}")
+            _cprint(f"  ✓ auth check: {auth.stdout.strip()[:60] or auth.stderr.strip()[:60]}")
+            return
+
+        if raw == "help":
+            _cprint("  /claude <task>                # one-shot `claude -p`")
+            _cprint("  /claude --bare <task>         # minimal mode, no CLAUDE.md/plugins")
+            _cprint("  /claude --json <task>         # JSON output with cost/tokens")
+            _cprint("  /claude --model NAME <task>   # override model")
+            _cprint("  /claude status                # version + auth check")
+            _cprint("  /claude help                  # this help")
+            _cprint("  Load skill: /skill claude-code-cli (or Hermes will auto-load on mention)")
+            return
+
+        # Parse flags
+        bare = False
+        json_out = False
+        model = None
+        task_parts = raw.split()
+        task_words = []
+        i = 0
+        while i < len(task_parts):
+            w = task_parts[i]
+            if w == "--bare":
+                bare = True
+            elif w == "--json":
+                json_out = True
+            elif w == "--model" and i + 1 < len(task_parts):
+                model = task_parts[i + 1]
+                i += 1
+            else:
+                task_words.append(w)
+            i += 1
+        task = " ".join(task_words).strip()
+        if not task:
+            _cprint("  ❌ Usage: /claude <task>. Try /claude help.")
+            return
+
+        if not _shutil.which("claude"):
+            _cprint("  ❌ `claude` CLI not found in PATH.")
+            return
+
+        flags = ["-p", task, "--dangerously-skip-permissions"]
+        if bare:
+            flags.append("--bare")
+        if json_out:
+            flags.append("--output-format")
+            flags.append("json")
+        if model:
+            flags.extend(["--model", model])
+
+        _cprint(f"  ⏳ handing to claude ({len(task)} chars)…")
+        try:
+            res = _subprocess.run(["claude", *flags], capture_output=True, text=True, timeout=600)
+            out = (res.stdout or res.stderr).strip()
+            if not out:
+                _cprint(f"  ❌ claude returned empty (exit {res.returncode}).")
+                return
+            # Print verbatim — caller (Claude Code / user) already authored the format
+            print(out)
+        except _subprocess.TimeoutExpired:
+            _cprint("  ❌ claude timed out after 600s. Try /claude with a smaller task, or run interactively in tmux.")
+        except Exception as exc:
+            _cprint(f"  ❌ claude failed: {exc}")
+
     def _handle_codex_runtime(self, cmd_original: str) -> None:
         """Handle /codex-runtime — toggle the codex app-server runtime opt-in.
 
@@ -7301,6 +7394,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
+        elif canonical == "claude":
+            self._handle_claude(cmd_original)
         elif canonical == "gquota":
             self._handle_gquota_command(cmd_original)
 
