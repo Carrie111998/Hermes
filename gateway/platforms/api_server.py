@@ -3043,7 +3043,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_model_lock": True,
-                "run_session_continuation": True,
+                "run_session_continuation": bool(self._api_key),
                 "run_session_continuation_version": RUN_SESSION_CONTINUATION_VERSION,
                 "run_session_continuation_exact_revision": True,
                 "run_session_continuation_stoppable": True,
@@ -3466,6 +3466,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if not self._api_key:
+            return web.json_response(
+                _openai_error(
+                    "Session continuation requires API key authentication",
+                    code="session_continuation_auth_required",
+                ),
+                status=403,
+            )
 
         session_id = request.match_info["session_id"]
         db = await self._ensure_session_db_async()
@@ -6423,6 +6431,17 @@ class APIServerAdapter(BasePlatformAdapter):
         continuation_claim_key: Optional[tuple[Optional[str], str]] = None
         raw_continuation = body.get("continuation")
         if raw_continuation is not None:
+            auth_err = self._check_auth(request)
+            if auth_err:
+                return auth_err
+            if not self._api_key:
+                return web.json_response(
+                    _openai_error(
+                        "Session continuation requires API key authentication",
+                        code="session_continuation_auth_required",
+                    ),
+                    status=403,
+                )
             if not isinstance(raw_continuation, dict):
                 return web.json_response(
                     _openai_error(
@@ -6625,7 +6644,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or stored_session_id
+        session_id = continued_session_id or body.get("session_id") or stored_session_id
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6636,14 +6655,21 @@ class APIServerAdapter(BasePlatformAdapter):
             route=route,
         )
         if selection_error:
+            if (
+                continued_session_id is not None
+                and self._active_continuation_sessions.get(
+                    continuation_claim_key
+                )
+                == continuation_claim_id
+            ):
+                self._active_continuation_sessions.pop(
+                    continuation_claim_key,
+                    None,
+                )
             return web.json_response(_openai_error(selection_error), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = (
-            continued_session_id
-            or session_id
-            or run_id
-        )
+        session_id = session_id or run_id
         if continued_session_id is not None:
             # The verification reservation remains owned, and no await occurs
             # while it is transferred to the newly allocated run ID.

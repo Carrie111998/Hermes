@@ -164,6 +164,16 @@ class TestStartRun:
 
 
 class TestExactSessionContinuation:
+    @pytest.fixture(autouse=True)
+    def _configured_key_for_continuation_logic(self, adapter):
+        """Exercise continuation state logic with its required key configured.
+
+        The HTTP bearer gate itself has dedicated coverage below; these tests
+        focus on descriptor binding, races, and lifecycle behavior.
+        """
+        adapter._api_key = "sk-secret"
+        adapter._check_auth = lambda _request: None
+
     @pytest.mark.asyncio
     async def test_verified_continuation_loads_history_into_stoppable_run(
         self,
@@ -215,6 +225,126 @@ class TestExactSessionContinuation:
                 ("user", "earlier question"),
                 ("assistant", "earlier answer"),
             ]
+            assert adapter._active_continuation_sessions == {}
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_continuation_submission_refuses_an_unkeyed_api_server(
+        self, tmp_path
+    ):
+        adapter = _make_adapter()
+        db = SessionDB(tmp_path / "unkeyed-continuation.db")
+        adapter._session_db = db
+        try:
+            session_id = db.create_session("private-session", "api_server")
+            db.append_message(session_id, "user", "private history")
+            descriptor = _continuation_descriptor(db, session_id)
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "continue", "continuation": descriptor},
+                )
+                payload = await response.json()
+
+            assert response.status == 403
+            assert payload["error"]["code"] == "session_continuation_auth_required"
+            assert "private" not in str(payload)
+            assert adapter._run_statuses == {}
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_continuation_requires_configured_bearer_before_allocation(
+        self,
+        tmp_path,
+    ):
+        adapter = _make_adapter(api_key="sk-secret")
+        db = SessionDB(tmp_path / "authenticated-continuation.db")
+        adapter._session_db = db
+        try:
+            session_id = db.create_session("private-session", "api_server")
+            db.append_message(session_id, "user", "private history")
+            descriptor = _continuation_descriptor(db, session_id)
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "continued"
+            }
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+
+            app = _create_runs_app(adapter)
+            with patch.object(
+                adapter,
+                "_create_agent",
+                return_value=mock_agent,
+            ) as create_agent:
+                async with TestClient(TestServer(app)) as cli:
+                    unauthorized = await cli.post(
+                        "/v1/runs",
+                        json={"input": "continue", "continuation": descriptor},
+                    )
+                    unauthorized_payload = await unauthorized.json()
+
+                    assert unauthorized.status == 401
+                    assert (
+                        unauthorized_payload["error"]["code"]
+                        == "gateway_auth_failed"
+                    )
+                    create_agent.assert_not_called()
+                    assert adapter._run_statuses == {}
+                    assert adapter._run_streams == {}
+                    assert adapter._active_run_tasks == {}
+                    assert adapter._active_continuation_sessions == {}
+
+                    authorized = await cli.post(
+                        "/v1/runs",
+                        json={"input": "continue", "continuation": descriptor},
+                        headers={"Authorization": "Bearer sk-secret"},
+                    )
+                    assert authorized.status == 202, await authorized.text()
+
+            create_agent.assert_called_once()
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_route_conflict_releases_verified_continuation_claim(
+        self,
+        adapter,
+        tmp_path,
+    ):
+        db = SessionDB(tmp_path / "route-conflict-continuation.db")
+        adapter._session_db = db
+        adapter._model_routes = {
+            "locked-route": {
+                "model": "route/model",
+                "provider": "openrouter",
+            }
+        }
+        try:
+            session_id = db.create_session("route-session", "api_server")
+            db.append_message(session_id, "user", "private history")
+            descriptor = _continuation_descriptor(db, session_id)
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "continue",
+                        "continuation": descriptor,
+                        "model": "locked-route",
+                        "provider": "anthropic",
+                    },
+                )
+                payload = await response.json()
+
+            assert response.status == 400
+            assert payload["error"]["type"] == "invalid_request_error"
+            assert adapter._run_statuses == {}
+            assert adapter._run_streams == {}
             assert adapter._active_continuation_sessions == {}
         finally:
             db.close()
