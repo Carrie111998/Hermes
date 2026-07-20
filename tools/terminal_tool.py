@@ -1375,10 +1375,10 @@ def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
     over ``ssh ... bash -c``). Expanding ``~`` locally would rewrite it to the
     Hermes host HOME (often ``/opt/data`` under Docker) and inject a
     nonexistent path into the remote session. Only ``~`` / ``~/...`` on the
-    ``ssh`` backend qualify; absolute remote paths still pass through
-    unchanged, and every other backend keeps expanding locally.
+    ``ssh`` / ``ssh_pwsh`` backends qualify; absolute remote paths still pass
+    through unchanged, and every other backend keeps expanding locally.
     """
-    if (backend or "").strip().lower() != "ssh":
+    if (backend or "").strip().lower() not in ("ssh", "ssh_pwsh"):
         return False
     return cwd == "~" or cwd.startswith("~/")
 
@@ -1500,7 +1500,7 @@ def _get_env_config() -> Dict[str, Any]:
     # else starts in the backend's default root-like cwd.
     if env_type == "local":
         default_cwd = _safe_getcwd()
-    elif env_type == "ssh":
+    elif env_type in ("ssh", "ssh_pwsh"):
         default_cwd = "~"
     elif env_type == "vercel_sandbox":
         default_cwd = _VERCEL_SANDBOX_DEFAULT_CWD
@@ -1760,10 +1760,25 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "ssh_pwsh":
+        if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
+            raise ValueError("ssh_pwsh requires ssh_host and ssh_user to be configured")
+        # Lazy import to avoid breaking tests with mock package structures
+        from tools.environments.ssh_pwsh import SSHPwshEnvironment as _SSHPwshEnvironment
+        return _SSHPwshEnvironment(
+            host=ssh_config["host"],
+            user=ssh_config["user"],
+            port=ssh_config.get("port", 22),
+            key_path=ssh_config.get("key", ""),
+            cwd=cwd,
+            timeout=timeout,
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', 'ssh', "
+            f"or 'ssh_pwsh'"
         )
 
 
@@ -2423,7 +2438,7 @@ def terminal_tool(
                     logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
                     try:
                         ssh_config = None
-                        if env_type == "ssh":
+                        if env_type in ("ssh", "ssh_pwsh"):
                             ssh_config = {
                                 "host": config.get("ssh_host", ""),
                                 "user": config.get("ssh_user", ""),
@@ -3208,7 +3223,7 @@ def check_terminal_requirements() -> bool:
                 return result.returncode == 0
             return False
 
-        elif env_type == "ssh":
+        elif env_type in ("ssh", "ssh_pwsh"):
             if not config.get("ssh_host") or not config.get("ssh_user"):
                 logger.error(
                     "SSH backend selected but TERMINAL_SSH_HOST and TERMINAL_SSH_USER "
