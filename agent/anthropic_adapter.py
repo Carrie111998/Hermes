@@ -67,7 +67,15 @@ def _get_anthropic_sdk():
 
 logger = logging.getLogger(__name__)
 
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+# [CORE-PATCH] H-11 (hermes-v2, 2026-07-20): added "ultra" tier.
+# Hermes operators using ``reasoning_effort: ultra`` (Basti's default,
+# ~/.hermes/config.yaml:50) previously silently fell through to 8000 tokens
+# (= medium) because this dict had no "ultra" key and ``dict.get("ultra")``
+# returned None — the budget allocation path would then default to medium.
+# MiniMax-style agents driving extended multi-step tool chains lose most
+# reasoning headroom at 8k; 49152 matches Anthropic's documented 4.7+ max
+# tier ceiling (see comment block above ADAPTIVE_EFFORT_MAP).
+THINKING_BUDGET = {"ultra": 49152, "xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
 # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
 # Opus/Sonnet 4.6 only expose 4 levels: low, medium, high, max — no xhigh.
