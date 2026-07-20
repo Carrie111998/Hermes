@@ -458,8 +458,19 @@ class GatewaySlashCommandsMixin:
 
         is_create = action == "create"
 
+        # Arm the ephemeral, process-local control-plane capability ONLY for
+        # the duration of this root-gateway /kanban dispatch. Privileged board
+        # mutations (continuation review/authorize/operator-override claim)
+        # additionally require proof that THIS process owns the retained
+        # gateway runtime lock, so a forged helper can satisfy neither gate.
+        # asyncio.to_thread propagates the current context into the worker
+        # thread, and the context manager resets the token on exit — the
+        # capability can never leak beyond this call.
+        from gateway.status import gateway_control_plane_context
+
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            with gateway_control_plane_context():
+                output = await asyncio.to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 

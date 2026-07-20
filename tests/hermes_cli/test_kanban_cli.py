@@ -697,3 +697,38 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# Privileged audit-reason visibility (Unicode-invisible rejection)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("invisible", ["\u200b", "\ufeff", "\u2060", " \u200b\ufeff \u2060 "])
+def test_run_slash_continuation_review_rejects_invisible_reason(kanban_home, invisible):
+    import re
+
+    out = kc.run_slash("create 'invisible review' --assignee engineer")
+    task_id = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    out = kc.run_slash(
+        f"continuation review {task_id} --verdict fix-required --reason '{invisible}'"
+    )
+
+    assert "review reason required" in out
+    with kb.connect() as conn:
+        events = kb.list_events(conn, task_id)
+        assert not [e for e in events if e.kind == "continuation_reviewed"]
+
+
+@pytest.mark.parametrize("invisible", ["\u200b", "\ufeff", "\u2060"])
+def test_run_slash_claim_operator_override_rejects_invisible_reason(kanban_home, invisible):
+    import re
+
+    out = kc.run_slash("create 'invisible override' --assignee engineer")
+    task_id = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    out = kc.run_slash(f"claim {task_id} --operator-override-reason '{invisible}'")
+
+    assert "operator override reason required" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"

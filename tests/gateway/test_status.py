@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway import status
 
 
@@ -1721,3 +1723,89 @@ class TestLaunchdPlistRespawnGovernance:
         assert "<key>ThrottleInterval</key>" in plist
         assert "<key>ExitTimeOut</key>" in plist
         assert "<key>KeepAlive</key>" in plist
+
+
+class TestGatewayControlPlaneAuthority:
+    """Fail-closed control-plane capability + retained-lock ownership proof."""
+
+    @pytest.fixture(autouse=True)
+    def _release_lock(self):
+        yield
+        status.release_gateway_runtime_lock()
+
+    def test_control_plane_context_defaults_inactive(self):
+        assert status.gateway_control_plane_active() is False
+
+    def test_control_plane_context_arms_and_resets(self):
+        with status.gateway_control_plane_context():
+            assert status.gateway_control_plane_active() is True
+        assert status.gateway_control_plane_active() is False
+
+    def test_control_plane_context_resets_on_exception(self):
+        with pytest.raises(RuntimeError):
+            with status.gateway_control_plane_context():
+                raise RuntimeError("boom")
+        assert status.gateway_control_plane_active() is False
+
+    def test_control_plane_context_propagates_through_to_thread(self):
+        import asyncio
+
+        async def probe():
+            with status.gateway_control_plane_context():
+                return await asyncio.to_thread(status.gateway_control_plane_active)
+
+        assert asyncio.run(probe()) is True
+        assert status.gateway_control_plane_active() is False
+
+    def test_lock_proof_denied_without_retained_handle(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.process_owns_gateway_runtime_lock() is False
+        assert status.process_owns_gateway_runtime_lock(tmp_path) is False
+
+    def test_lock_proof_accepted_for_retained_owner(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        assert status.process_owns_gateway_runtime_lock() is True
+        assert status.process_owns_gateway_runtime_lock(tmp_path) is True
+
+    def test_lock_proof_denied_for_foreign_authority_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home-a"))
+        assert status.acquire_gateway_runtime_lock() is True
+        assert status.process_owns_gateway_runtime_lock(tmp_path / "home-b") is False
+        assert status.process_owns_gateway_runtime_lock(tmp_path / "home-a") is True
+
+    def test_lock_proof_denied_after_lock_path_replacement(self, tmp_path, monkeypatch):
+        """Replacing gateway.lock with a fresh inode (forged record naming
+        this PID, gateway-looking argv) fails descriptor identity."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        lock_path = tmp_path / "gateway.lock"
+        lock_path.unlink()
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "kind": "hermes-gateway",
+                    "argv": [sys.executable, "gateway/run.py"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert status.process_owns_gateway_runtime_lock() is False
+
+    def test_lock_proof_denied_when_retained_record_clobbered(self, tmp_path, monkeypatch):
+        """A same-inode rewrite naming a foreign PID cannot prove ownership."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        lock_path = tmp_path / "gateway.lock"
+        with open(lock_path, "r+", encoding="utf-8") as handle:
+            handle.seek(0)
+            handle.truncate()
+            json.dump({"pid": 424242, "kind": "hermes-gateway", "argv": ["x"]}, handle)
+        assert status.process_owns_gateway_runtime_lock() is False
+
+    def test_lock_proof_denied_after_release(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        status.release_gateway_runtime_lock()
+        assert status.process_owns_gateway_runtime_lock() is False

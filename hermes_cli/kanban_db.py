@@ -84,6 +84,7 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3770,7 +3771,7 @@ def claim_task(
     override_reason: Optional[str] = None
     operator_authorizer: Optional[str] = None
     if operator_override_reason is not None:
-        override_reason = str(operator_override_reason).strip()
+        override_reason = _normalize_visible_audit_reason(operator_override_reason)
         denial: Optional[str] = None
         operator_profiles: tuple[str, ...] = ()
         worker_task_id: Optional[str] = None
@@ -3905,6 +3906,28 @@ def claim_task(
                         authorization_id=authorization_id,
                     )
                     return None
+                if continuation_authorization is not None:
+                    # Post-lock remote revalidation (TOCTOU fence). The
+                    # pre-lock guard evaluation verified GitHub state/head,
+                    # but the PR owner can close or force-push while this
+                    # writer was queued on BEGIN IMMEDIATE. Re-run the bounded
+                    # exact URL/state/head verification INSIDE the writer
+                    # transaction, immediately before the ready -> running CAS
+                    # and one-shot consume. Any drift records an audited
+                    # claim_race denial, leaves the task ready, and leaves the
+                    # grant unconsumed.
+                    remote_denial = _verify_continuation_prs(
+                        continuation_authorization.prs
+                    )
+                    if remote_denial is not None:
+                        _record_continuation_denial(
+                            conn,
+                            task_id,
+                            remote_denial,
+                            phase="claim_race",
+                            authorization_id=authorization_id,
+                        )
+                        return None
             elif guard_decision.continuation_authorization_id is not None:
                 # The exact active set changed after the external head check.
                 # Do not consume a grant for a different local state.
@@ -7111,6 +7134,33 @@ def _continuation_operator_denial(
     return None
 
 
+# Unicode general categories whose characters carry no visible ink:
+# separators (Zs/Zl/Zp), control (Cc), format (Cf — includes U+200B ZERO
+# WIDTH SPACE, U+FEFF ZERO WIDTH NO-BREAK SPACE, U+2060 WORD JOINER), and
+# surrogates (Cs).
+_INVISIBLE_REASON_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Zs"})
+
+
+def _normalize_visible_audit_reason(value: Any) -> str:
+    """Return the stripped reason only when it carries visible text.
+
+    Shared by every privileged audit-reason gate (continuation review,
+    authorization, and operator claim override). A reason composed solely of
+    whitespace, control, surrogate, separator, or format characters — e.g.
+    U+200B, U+FEFF, U+2060 alone or in any combination with whitespace — is
+    invisible in audit readback and therefore rejected (returns ``""``).
+    Accepted normal Unicode text is returned stripped, unchanged.
+    """
+    text = str(value or "").strip()
+    for char in text:
+        if char.isspace():
+            continue
+        if unicodedata.category(char) in _INVISIBLE_REASON_CATEGORIES:
+            continue
+        return text
+    return ""
+
+
 def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
     """Resolve authority only from the opened board's canonical SQLite path.
 
@@ -7143,17 +7193,35 @@ def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
         return None
 
 
-def _trusted_operator_gateway_pid(authority_root: Path) -> Optional[int]:
-    """Return the live gateway PID rooted beside this board, fail closed."""
-    try:
-        from gateway.status import get_running_pid
+def _operator_control_plane_active() -> bool:
+    """True only inside the root gateway's ephemeral control-plane context.
 
-        return get_running_pid(
-            authority_root / "gateway.pid",
-            cleanup_stale=False,
-        )
+    The capability is a process-local ContextVar armed solely by the root
+    gateway around its ``/kanban`` dispatch. It is never persisted, never
+    read from the environment, and never inferred from argv — a forked or
+    reparented worker process cannot observe or reconstruct it.
+    """
+    try:
+        from gateway.status import gateway_control_plane_active
+
+        return bool(gateway_control_plane_active())
     except Exception:
-        return None
+        return False
+
+
+def _operator_gateway_lock_owned(authority_root: Path) -> bool:
+    """True only when THIS process owns the retained gateway lock for root.
+
+    Proof is by retained file-description identity (fstat vs canonical stat),
+    never by the separately writable ``gateway.pid`` record, gateway-looking
+    argv, or the contents of the advisory lock file alone.
+    """
+    try:
+        from gateway.status import process_owns_gateway_runtime_lock
+
+        return bool(process_owns_gateway_runtime_lock(authority_root))
+    except Exception:
+        return False
 
 
 def _continuation_operator_profiles(
@@ -7212,12 +7280,21 @@ def _continuation_operator_context(
     authority_root = _continuation_authority_root(conn)
     if authority_root is None:
         raise ContinuationAuthorizationError("operator_authority_root_unresolved")
-    gateway_pid = _trusted_operator_gateway_pid(authority_root)
-    if gateway_pid is None or gateway_pid != os.getpid():
-        # Authorization is a control-plane mutation and therefore executes only
-        # inside the root gateway itself — never in a descendant CLI/worker
-        # process. A worker cannot acquire the live gateway's PID by scrubbing
-        # env, changing SID/PGID, double-forking, or being reparented.
+    if not _operator_control_plane_active():
+        # Authorization is a control-plane mutation and therefore executes
+        # only inside the root gateway's ephemeral ``/kanban`` dispatch
+        # context — never in a descendant CLI/worker process. The capability
+        # is a process-local ContextVar that is never persisted, never read
+        # from the environment, and never derived from argv, so a worker
+        # cannot acquire it by scrubbing env, changing SID/PGID,
+        # double-forking, or being reparented.
+        raise ContinuationAuthorizationError("operator_gateway_context_required")
+    if not _operator_gateway_lock_owned(authority_root):
+        # The process must also prove it owns the retained gateway runtime
+        # lock for this board's authority root. Proof is by retained
+        # file-description identity, never by the separately writable
+        # gateway.pid record — replacing that record while the real gateway
+        # holds the lock no longer confers authority.
         raise ContinuationAuthorizationError("operator_gateway_process_required")
     profile = str(get_active_profile_name() or "").strip().casefold()
     if not profile or profile == "custom":
@@ -7240,7 +7317,7 @@ def record_continuation_review(
     normalized_verdict = str(verdict or "").strip().casefold().replace("-", "_")
     if normalized_verdict not in {"fix_required", "resolved"}:
         raise ContinuationAuthorizationError("invalid_review_verdict")
-    normalized_reason = str(reason or "").strip()
+    normalized_reason = _normalize_visible_audit_reason(reason)
     if not normalized_reason:
         raise ContinuationAuthorizationError("review_reason_required")
 
@@ -7329,7 +7406,7 @@ def authorize_continuation(
     ttl_seconds: int = DEFAULT_CONTINUATION_AUTH_TTL_SECONDS,
 ) -> ContinuationAuthorization:
     """Create an exact, auditable, one-shot active-PR continuation grant."""
-    normalized_reason = str(reason or "").strip()
+    normalized_reason = _normalize_visible_audit_reason(reason)
     profile = str(authorized_profile or "").strip().casefold()
     provider = str(authorized_provider or "").strip().casefold()
     try:
@@ -7424,8 +7501,10 @@ def authorize_continuation(
                 )
         # Re-check all local state under SQLite's single-writer lock. GitHub is
         # intentionally checked immediately before this transaction so no
-        # database transaction is held across network I/O; dispatch verifies
-        # the exact live head again before the eventual claim.
+        # database transaction is held across network I/O; claim_task
+        # re-verifies the exact live URL/state/head inside its own writer
+        # transaction immediately before the ready -> running CAS and one-shot
+        # consume, closing the lock-queue TOCTOU gap.
         if raced_denial is None:
             raced_denial = _continuation_local_denial(
                 conn,

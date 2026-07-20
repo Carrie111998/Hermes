@@ -11,6 +11,8 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import contextlib
+import contextvars
 import hashlib
 import json
 import logging
@@ -845,6 +847,120 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             handle.close()
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Control-plane authority (privileged board mutations)
+#
+# Privileged kanban mutations (continuation reviews, one-shot grants, manual
+# claim overrides) must only execute inside the live root gateway process.
+# Authority is proven from two capabilities that cannot be forged by a
+# reparented/double-forked worker:
+#
+#   1. An ephemeral, process-local ContextVar armed ONLY around the root
+#      gateway's ``/kanban`` handler. It is never persisted, never read from
+#      the environment, and never derived from argv.
+#   2. Proof that THIS process owns the retained ``_gateway_lock_handle``
+#      file description for the expected authority root — verified by
+#      descriptor identity (``fstat`` vs canonical on-disk ``stat``), NOT by
+#      the separately writable ``gateway.pid`` record, lock-file contents
+#      alone, or another process merely holding a lock.
+# ---------------------------------------------------------------------------
+
+_GATEWAY_CONTROL_PLANE_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_gateway_control_plane_active",
+    default=False,
+)
+
+
+@contextlib.contextmanager
+def gateway_control_plane_context():
+    """Arm the ephemeral control-plane capability for the current context.
+
+    The capability is process-local and context-local: ``asyncio.to_thread``
+    inherits the arming (``to_thread`` runs the callable in a copy of the
+    current context), while the reset on exit guarantees the capability never
+    leaks beyond the handler that armed it. A worker process — including a
+    double-forked, setsid, reparented one with a gateway-looking argv — has
+    no way to observe or reconstruct this token.
+    """
+    token = _GATEWAY_CONTROL_PLANE_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _GATEWAY_CONTROL_PLANE_ACTIVE.reset(token)
+
+
+def gateway_control_plane_active() -> bool:
+    """Return True only inside an armed gateway control-plane context."""
+    try:
+        return bool(_GATEWAY_CONTROL_PLANE_ACTIVE.get())
+    except Exception:
+        return False
+
+
+def process_owns_gateway_runtime_lock(authority_root: Optional[Path] = None) -> bool:
+    """Fail-closed proof that THIS process owns the retained gateway lock.
+
+    Every check must pass; any failure or inconsistency denies:
+
+    - the retained ``_gateway_lock_handle`` exists and is open;
+    - when ``authority_root`` is given, this process's lock path matches the
+      root's canonical ``gateway.lock``;
+    - descriptor identity (``os.fstat`` of the retained handle) equals the
+      canonical on-disk ``gateway.lock`` (``os.stat``), so replacing the
+      file at the path after acquisition fails closed;
+    - the retained lock record still names the current process PID, and the
+      persisted start-time matches the live process start-time when both are
+      readable (PID-reuse guard).
+
+    ``gateway.pid``, argv shape, and lock-file contents alone are NEVER
+    treated as proof of lock ownership.
+    """
+    handle = _gateway_lock_handle
+    if handle is None:
+        return False
+    try:
+        if handle.closed:
+            return False
+    except Exception:
+        return False
+    try:
+        own_lock_path = _get_gateway_lock_path()
+        if authority_root is not None:
+            expected_lock_path = Path(authority_root) / _GATEWAY_LOCK_FILENAME
+            try:
+                if expected_lock_path.resolve() != own_lock_path.resolve():
+                    return False
+            except OSError:
+                return False
+        # Descriptor identity: the file we hold open must still be the file
+        # currently published at the canonical lock path. If an attacker (or
+        # a racing re-install) replaced the path with a new inode, fstat and
+        # stat diverge and authority is denied.
+        fd_stat = os.fstat(handle.fileno())
+        path_stat = os.stat(own_lock_path)
+        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            return False
+        # The lock record we retained must still describe this live process.
+        # A clobbered/rewritten record cannot prove ownership, so it denies.
+        record = _read_gateway_lock_record(own_lock_path)
+        if record is None:
+            return False
+        recorded_pid = _pid_from_record(record)
+        if recorded_pid is None or recorded_pid != os.getpid():
+            return False
+        recorded_start = record.get("start_time")
+        current_start = _get_process_start_time(os.getpid())
+        if (
+            recorded_start is not None
+            and current_start is not None
+            and recorded_start != current_start
+        ):
+            return False
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def write_pid_file() -> None:
