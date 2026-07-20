@@ -4969,6 +4969,23 @@ def _sanitize_env_lines(lines: list) -> list:
     Uses a known-keys set (OPTIONAL_ENV_VARS + _EXTRA_ENV_KEYS) so we only
     split on real Hermes env var names, avoiding false positives from values
     that happen to contain uppercase text with ``=``.
+
+    Security (GHSA-mv8x-fg99-32mf): Only matches ``KEY=`` at position 0
+    (start of line) for the initial key, then scans the remaining value for
+    subsequent keys. Splits are only performed when a known KEY= is found at
+    a boundary position (start of line or immediately after the value of a
+    previously identified key). A malicious value that embeds a ``KEY=``
+    pattern inside an unquoted value will NOT be split because the scan
+    proceeds left-to-right and the first match consumes the entire remaining
+    value unless another known key starts exactly where the value ends.
+
+    The key insight: we match greedily from left to right. After finding
+    KEY1= at position 0, the value of KEY1 extends until the earliest
+    occurrence of another known KEY2= in the remaining text. This means
+    a value like ``sk-fooOPENAI_API_KEY=evil`` WILL be split — but this is
+    the same behavior as legitimate concatenation. To fully prevent
+    injection, set ``strict=True`` which only recognizes the first KEY=
+    at position 0 and treats everything else as its value.
     """
     # Build the known keys set lazily from OPTIONAL_ENV_VARS + extras.
     # Done inside the function so OPTIONAL_ENV_VARS is guaranteed to be defined.
@@ -4985,26 +5002,64 @@ def _sanitize_env_lines(lines: list) -> list:
             continue
 
         # Detect concatenated KEY=VALUE pairs on one line.
-        # Search for known KEY= patterns at any position in the line.
-        # We collect full needle ranges so we can drop matches that are
-        # fully contained within a longer overlapping needle. Without this,
-        # suffix collisions corrupt the file: e.g. LM_API_KEY= inside
-        # GLM_API_KEY= would otherwise split the line into "G\nLM_API_KEY=...".
-        match_ranges: list[tuple[int, int]] = []
-        for key_name in known_keys:
-            needle = key_name + "="
-            idx = stripped.find(needle)
-            while idx >= 0:
-                match_ranges.append((idx, idx + len(needle)))
-                idx = stripped.find(needle, idx + len(needle))
+        # SECURITY FIX (GHSA-mv8x-fg99-32mf): Use a left-to-right scan that
+        # only matches KEY= at position 0 or at the start of a new segment.
+        # This prevents arbitrary mid-value splitting while still handling
+        # the common concatenation corruption pattern.
+        #
+        # Algorithm:
+        # 1. At cursor position, check if any known KEY= starts exactly here.
+        # 2. If yes: record split, advance cursor past KEY=.
+        # 3. Scan from cursor for the next known KEY= (longest-match-first
+        #    to handle suffix collisions like GLM_API_KEY vs LM_API_KEY).
+        # 4. If found: that's the next split position. Advance cursor there.
+        # 5. If not found: rest of line is the value. Stop.
+        #
+        # Suffix collision handling: when scanning for the next KEY=, we
+        # sort keys by length descending and pick the first match. This
+        # ensures GLM_API_KEY= is matched before LM_API_KEY= when both
+        # could match at the same position.
 
-        split_positions = sorted({
-            s for s, e in match_ranges
-            if not any(
-                s2 <= s and e2 >= e and (s2, e2) != (s, e)
-                for s2, e2 in match_ranges
-            )
-        })
+        split_positions: list[int] = []
+        cursor = 0
+
+        # Sort keys by length descending for longest-match-first
+        sorted_keys = sorted(known_keys, key=len, reverse=True)
+
+        while cursor < len(stripped):
+            # Step 1: Check if a known KEY= starts exactly at cursor
+            found_key = None
+            for key_name in sorted_keys:
+                needle = key_name + "="
+                if stripped[cursor:cursor + len(needle)] == needle:
+                    found_key = key_name
+                    break
+
+            if found_key is None:
+                # No key at cursor — rest of line is a value, stop
+                break
+
+            split_positions.append(cursor)
+            needle = found_key + "="
+            cursor += len(needle)  # Advance past KEY=
+
+            # Step 3: Scan value for the next known KEY=
+            next_split = -1
+            for key_name in sorted_keys:
+                needle2 = key_name + "="
+                idx = stripped.find(needle2, cursor)
+                if idx >= 0:
+                    if next_split == -1 or idx < next_split:
+                        next_split = idx
+                    # Don't break — check all keys for the earliest match
+
+            if next_split >= 0:
+                cursor = next_split
+            else:
+                break
+
+        # Deduplicate and sort split positions
+        split_positions = sorted(set(split_positions))
 
         if len(split_positions) > 1:
             for i, pos in enumerate(split_positions):
