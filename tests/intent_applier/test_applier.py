@@ -697,6 +697,19 @@ class TestReapConvergedPartials:
                           "b_APPROVAL_INTENT_main.rd5.json": "reaped"}
         assert canonical.call_count == 1
 
+    def test_gate_a_pass_but_job_absent_from_canonical_not_reaped(self, tmp_path, mailbox, pipeline_path):
+        # Gate A passes (PG at materials_ready) but the canonical map is wired
+        # and non-empty yet lacks this job_id -> canonical.get(...) is None ->
+        # fail-closed "not_converged" (distinct branch from unwired-reader).
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(
+                              canonical_state_reader=lambda: {"some-other-job": "materials_ready"}))
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
     def test_non_capped_partial_is_ignored(self, tmp_path, mailbox, pipeline_path):
         a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
         # rd1 < give_up=5 -> not capped -> reaper leaves it entirely.
