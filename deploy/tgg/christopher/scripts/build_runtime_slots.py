@@ -55,7 +55,7 @@ EVENT_LABELS_NEW = (
 )
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
-NEW_INSTRUCTION_COUNT = 10
+NEW_INSTRUCTION_COUNT = 11
 
 # Exact runtime registry for the PA business bridge. Constitution prose may
 # mention only these names after the word "operation"; aliases otherwise fail
@@ -289,6 +289,8 @@ def _validate(
     assert "the strongest signal" in joined
     assert "timing against active work" in joined
     assert "Doubt with no named rival never triggers a clarification" in joined
+    assert "resolves ONLY to dormant or completed cases" in joined
+    assert "never an attach target" in joined
     assert "message_search for the same chat_jid with limit 10" in joined
     assert "LOW confidence" in joined
     assert "runtime supplies" in joined

@@ -75,6 +75,22 @@ job_briefs:
       more than one candidate remains genuinely plausible after weighing context.
 
       '
+    - 'An explicit identifier — a unit, block, address, or job number in the message, its
+      caption, or an immediately preceding worker update — that resolves ONLY to dormant or
+      completed cases, with no open or recently active case for that identifier, does NOT make
+      any case a valid attachment target. Completion or photo evidence carrying only such an
+      identifier is off-book, unknown-job work: there is no live case for it. HOLD it with
+      pa_business_write operation tgg_attention_raise — kind unmatched_completion for completion
+      evidence, otherwise unmatched_evidence — naming the identifier and the dormant or completed
+      case(s) as context, and write to no case. This overrides every attach path for this
+      situation: do not attach the evidence to the dormant or completed case, do not raise a
+      clarification that would route it there, and do not fall back to attaching it at LOW
+      confidence to an unrelated active case or to the last active case by adjacency. A dormant
+      or completed case is never a rival and never an attach target. The competing-candidate,
+      named-rival, and album-clarification rules below apply only when an open or recently active
+      case that the evidence genuinely matches also exists.
+
+      '
     - 'Attaching photo/album evidence: weigh three things. The thread it arrived in is
       the strongest signal; also weigh timing against active work and identifying details
       in the evidence itself — units, addresses, and job numbers in captions or visible
@@ -87,7 +103,9 @@ job_briefs:
       with operation tgg_clarification_raise, naming both cases and candidateJobNos when
       available. Raise an album-specific clarification even when an earlier turn clarified
       different evidence. Doubt with no named rival never triggers a clarification: attach
-      at whatever confidence the evidence supports.
+      at whatever confidence the evidence supports — unless the only case the evidence resolves
+      to is dormant or completed, in which case it is not an attach target and must be held as
+      an attention item, not attached (see the dormant-only-resolution rule above).
 
       When the immediately preceding evidence introduced a named rival and the current
       album has no identifying detail of its own, carry that named rival into this judgment.
@@ -160,7 +178,10 @@ job_briefs:
 
       '
     - 'Completion evidence (after-photos, "done" or "completed" messages) that cannot
-      be matched to any known case is an attention item, not a new case: call pa_business_write
+      be matched to an open or recently active case is an attention item, not a new case —
+      and a match only to a completed or dormant case does NOT count as a match for attachment;
+      that is off-book work, so hold it and do not attach it to the completed case. Call
+      pa_business_write
       with operation tgg_attention_raise with kind unmatched_completion, a title
       naming the unit and subject, and context citing the evidence messages. Never
       create a case from completion evidence.
