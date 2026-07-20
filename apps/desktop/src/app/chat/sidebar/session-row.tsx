@@ -16,14 +16,17 @@ import { triggerHaptic } from '@/lib/haptics'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { $attentionSessionIds } from '@/store/session-states'
-
-import { SessionStatusDot } from '../session-status-dot'
+import { $sessionListDensity } from '@/store/session-list-density'
+import { $attentionSessionIds, $stalledSessionIds, openSessionTile } from '@/store/session-states'
+import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
-import { sessionShowsRunningArc } from './session-row-state'
+import { sessionRowDetails } from './session-row-details'
+import { type SessionDotState, sessionDotState, sessionShowsRunningArc } from './session-row-state'
 import { useProfilePrewarm } from './use-profile-prewarm'
+
+import { SessionStatusDot } from '../session-status-dot'
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
@@ -79,6 +82,12 @@ function SidebarSessionRowImpl({
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
   const title = sessionTitle(session)
+  const density = useStore($sessionListDensity)
+  const fmt = t.sidebar
+  const details = sessionRowDetails(session, {
+    messageCount: fmt.messageCount,
+    toolCallCount: fmt.toolCallCount
+  })
   const age = formatAge(session.last_active || session.started_at, r)
   const handleLabel = `Reorder ${title}`
   // A handed-off session's live source is local, but it originated on a
@@ -131,6 +140,8 @@ function SidebarSessionRowImpl({
         }
         className={cn(
           'group row-hover relative',
+          density !== 'compact' && 'min-h-[2.75rem]',
+          density === 'detailed' && 'min-h-[3.875rem]',
           isSelected && 'bg-(--ui-row-active-background)',
           isWorking && 'text-foreground',
           // Opaque surface while lifted so the dragged row erases what's under
@@ -243,9 +254,21 @@ function SidebarSessionRowImpl({
               />
             </Tip>
           ) : null}
-          <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
-            {title}
-          </SidebarRowLabel>
+          <span className="min-w-0 flex-1 self-center">
+            <SidebarRowLabel className="block font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
+              {title}
+            </SidebarRowLabel>
+            {density !== 'compact' && details.metadata && (
+              <span className="mt-0.5 block truncate text-[0.625rem] leading-none text-(--ui-text-tertiary)">
+                {details.metadata}
+              </span>
+            )}
+            {density === 'detailed' && details.preview && (
+              <span className="mt-1 block truncate text-[0.625rem] leading-none text-(--ui-text-quaternary)">
+                {details.preview}
+              </span>
+            )}
+          </span>
           {showProfile && <ProfileTag profile={session.profile} />}
         </SidebarRowBody>
       </SidebarRowShell>
