@@ -149,6 +149,37 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
+          tgg_attention_list:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/attention-items
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_attention_read:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/attention-items/{id}
+            path_params:
+            - id
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_attention_annotate:
+            type: http
+            tenant: tgg
+            method: PATCH
+            url: https://systems.papercut-labs.com/api/operator/attention-items/{id}
+            path_params:
+            - id
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
           tgg_case_wc_attach:
             type: http
             tenant: tgg

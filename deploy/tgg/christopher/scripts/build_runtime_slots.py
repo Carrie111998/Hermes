@@ -97,7 +97,31 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 12
-MGMT_NEW_INSTRUCTION_COUNT = 5
+MGMT_NEW_INSTRUCTION_COUNT = 6
+
+# The ingest brief is unscoped (no `business_operations` block at all), which
+# grants it the full registry — that is exactly what makes it reachable for
+# tgg_attention_list/tgg_attention_read. Annotate is a management-only write:
+# ingest's chats never operate on an existing attention item, and unscoped
+# would otherwise hand it that write for free. A denied-only block subtracts
+# just that one name; with `allowed` empty the allow-filter is skipped
+# entirely (`_scope_operations_to_job_brief`), so every other operation ingest
+# has today — including the new reads — survives untouched.
+INGEST_TOOLSETS_ANCHOR = (
+    "    enabled_toolsets:\n"
+    "    - memory\n"
+    "    - file\n"
+    "    - custom\n"
+    "    - pa-observability\n"
+    "    disabled_toolsets:\n"
+    "    - web\n"
+    "    - shell\n"
+)
+INGEST_DENIED_OPERATIONS_SNIPPET = (
+    "    business_operations:\n"
+    "      denied:\n"
+    "      - tgg_attention_annotate\n"
+)
 
 # The management brief is the only brief with a `web` toolset, so this block is
 # unique to it in the baseline — the ingest brief disables web.
@@ -145,7 +169,10 @@ CANONICAL_OPERATIONS = {
     "ilinked_wc_lookup",
     "job_work_costings",
     "message_search",
+    "tgg_attention_annotate",
+    "tgg_attention_list",
     "tgg_attention_raise",
+    "tgg_attention_read",
     "tgg_case_create",
     "tgg_case_list",
     "tgg_case_lookup",
@@ -299,6 +326,12 @@ def _constitution(source: str, slot: dict) -> str:
         EVENT_LABELS_OLD,
         EVENT_LABELS_NEW,
         label="ops-ingest event label list",
+    )
+    rendered = _replace_once(
+        rendered,
+        INGEST_TOOLSETS_ANCHOR,
+        INGEST_TOOLSETS_ANCHOR + INGEST_DENIED_OPERATIONS_SNIPPET,
+        label="ops-ingest toolsets block",
     )
     mgmt_behavior_snippet = (PATCHES_ROOT / "mgmt-chat-behavior.snippet.yaml").read_text(
         encoding="utf-8"
@@ -476,12 +509,20 @@ def _validate(
     assert "Push attention items unprompted" in mgmt_joined
     assert "one wave into ONE message" in mgmt_joined
     assert "only thing you raise unprompted" in mgmt_joined
+    # Open-ended attention-queue question: live read this turn, not recall.
+    assert "request to read the OPEN attention queue" in mgmt_joined
+    assert "tgg_attention_list" in mgmt_joined
+    assert "nothing outstanding right now" in mgmt_joined
+    assert "do not fill the gap with" in mgmt_joined
     # Bounded reply-action experiment.
     assert "annotate an attention item with a status note" in mgmt_joined
     assert "promise-then-track a chase" in mgmt_joined
     assert "may not create, close, or modify a case on chat instruction" in mgmt_joined
     assert "attach evidence to a case" in mgmt_joined
     assert "attention-note alternative" in mgmt_joined
+    # Annotate targets an existing item by id, never a new tgg_attention_raise.
+    assert "THAT existing item by its id" in mgmt_joined
+    assert "never raise a new attention item to record a reply to an old one" in mgmt_joined
     # Refusals.
     assert "Never relay site-group content wholesale" in mgmt_joined
     assert "not a courtesy" in mgmt_joined
@@ -502,8 +543,13 @@ def _validate(
     # The single permitted write, plus observability.
     assert "tgg_attention_raise" in permitted
     assert "agent_action_record" in permitted
-    # The ingest brief stays unscoped so its behavior is unchanged.
-    assert "business_operations" not in ingest_brief
+    # The ingest brief stays unscoped except for a single denied-only
+    # subtraction: it keeps every operation it had (including the new reads)
+    # and loses only the management-only annotate write. `allowed` absent
+    # means the allow-filter is skipped entirely — this narrows, never widens.
+    ingest_scope = ingest_brief["business_operations"]
+    assert set(ingest_scope) == {"denied"}, sorted(ingest_scope)
+    assert ingest_scope["denied"] == ["tgg_attention_annotate"], ingest_scope["denied"]
 
     # Prose and mechanism must agree: no management instruction may tell
     # Christopher to call an operation the scope denies him, or he is being

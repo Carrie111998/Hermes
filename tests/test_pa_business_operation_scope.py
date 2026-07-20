@@ -179,12 +179,42 @@ def test_management_chat_keeps_attention_write_and_observability():
     assert "agent_action_record" in bridge.operations
 
 
-def test_ingest_chat_is_unscoped():
-    """The ingest brief declares no scope, so its registry is untouched."""
+def test_management_chat_resolves_the_new_attention_operations():
+    """Management gains the read/annotate mechanism the eval fix depends on."""
+    bridge = _bridge(MGMT_CHAT_ID)
+    for operation in ("tgg_attention_list", "tgg_attention_read", "tgg_attention_annotate"):
+        assert operation in bridge.operations, operation
+
+
+def test_management_chat_still_denies_ingest_write_operations():
+    """Regression guard: the new ops must not widen management's write surface."""
+    bridge = _bridge(MGMT_CHAT_ID)
+    for operation in INGEST_WRITE_OPERATIONS:
+        assert operation not in bridge.operations, operation
+        assert operation in bridge.denied_operations, operation
+
+
+def test_management_operation_count_is_sixteen():
+    bridge = _bridge(MGMT_CHAT_ID)
+    assert len(bridge.operations) == 16, sorted(bridge.operations)
+
+
+def test_ingest_chat_resolves_the_new_attention_reads():
     ingest = _bridge(INGEST_CHAT_ID)
-    unscoped = _unscoped_bridge()
-    assert set(ingest.operations) == set(unscoped.operations)
-    assert ingest.denied_operations == frozenset()
+    for operation in ("tgg_attention_list", "tgg_attention_read"):
+        assert operation in ingest.operations, operation
+
+
+def test_ingest_chat_does_not_resolve_attention_annotate():
+    """Ingest is unscoped-by-default but explicitly denies the mgmt-only write."""
+    ingest = _bridge(INGEST_CHAT_ID)
+    assert "tgg_attention_annotate" not in ingest.operations
+    assert "tgg_attention_annotate" in ingest.denied_operations
+
+
+def test_ingest_chat_still_resolves_its_write_operations():
+    """Proof the denied-only block did not accidentally allow-filter the brief."""
+    ingest = _bridge(INGEST_CHAT_ID)
     for operation in INGEST_WRITE_OPERATIONS:
         assert operation in ingest.operations, operation
 
@@ -195,6 +225,8 @@ def test_scoping_does_not_invent_operations():
     unscoped = _unscoped_bridge()
     assert set(mgmt.operations) <= set(unscoped.operations)
     assert set(mgmt.operations) | mgmt.denied_operations == set(unscoped.operations)
+    for operation in ("tgg_attention_list", "tgg_attention_read", "tgg_attention_annotate"):
+        assert operation in unscoped.operations, operation
 
 
 # ── execution refusal ────────────────────────────────────────────────────────
