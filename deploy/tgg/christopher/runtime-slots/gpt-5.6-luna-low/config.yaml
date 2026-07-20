@@ -234,7 +234,9 @@ platforms:
       - 6591132954
       - 6580913349
       - 244809512038554
-      group_policy: open
+      group_policy: allowlist
+      group_allow_from:
+      - 120363426509183563@g.us
       outbound_allowed_chats:
       - 120363409954029949@g.us
       - 120363427363740087@g.us
@@ -254,7 +256,9 @@ whatsapp:
   - 6591132954
   - 6580913349
   - 244809512038554
-  group_policy: open
+  group_policy: allowlist
+  group_allow_from:
+  - 120363426509183563@g.us
   outbound_allowed_chats:
   - 120363409954029949@g.us
   - 120363427363740087@g.us

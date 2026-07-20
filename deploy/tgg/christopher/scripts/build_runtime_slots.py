@@ -46,6 +46,41 @@ SLOTS: dict[str, dict] = {
 
 MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
 
+# Chat-scoped inbound allowlist (2026-07-20, teren-ratified; WB 0cd5698b).
+# STAGED, NOT ACTIVATED: this only NARROWS which chats inbound processing would
+# ever consider. Processing itself stays shut by pa.enabled=false +
+# platforms.whatsapp.enabled=false + the runtime processing gate; none of those
+# are touched here. The gate this feeds — whatsapp.py _is_group_allowed, called
+# from _should_process_message as the FIRST statement of _build_message_event —
+# can only return False for more chats than before, never True for more.
+# Under `open` every group passes; under `allowlist` only this JID passes.
+#
+# The JID is rung 3a's authorized group, matching the deployed independent
+# verifier table (VERIFIED_RUNG_JIDS['3a'] in
+# /opt/tgg-capture/whatsapp-bridge/rung-authority.js), so staged inbound scope
+# and outbound scope name the SAME chat.
+#
+# Both blocks must carry the keys. The top-level `whatsapp:` block is bridged
+# into platforms.whatsapp.extra and WINS (gateway/config.py: `extra.update(bridged)`),
+# and `_group_allow_from` reads config.extra with NO env fallback — so setting
+# only one block would leave the allowlist empty and block every group.
+#
+# DM policy is deliberately untouched (teren: keep DMs on).
+GROUP_ALLOWLIST_JIDS = ("120363426509183563@g.us",)  # TGG Christopher Mgmt Live Test 20260528
+
+def _group_allowlist_block(indent: str) -> str:
+    lines = [f"{indent}group_policy: allowlist\n", f"{indent}group_allow_from:\n"]
+    lines += [f"{indent}- {jid}\n" for jid in GROUP_ALLOWLIST_JIDS]
+    return "".join(lines)
+
+# Anchored on the leading newline: the 2-space top-level form is otherwise a
+# substring of the 6-space platforms.whatsapp.extra form, which would make the
+# exactly-once replacement count 2 and silently patch the wrong block.
+GROUP_POLICY_EXTRA_OLD = "\n      group_policy: open\n"
+GROUP_POLICY_EXTRA_NEW = "\n" + _group_allowlist_block("      ")
+GROUP_POLICY_ROOT_OLD = "\n  group_policy: open\n"
+GROUP_POLICY_ROOT_NEW = "\n" + _group_allowlist_block("  ")
+
 # Insertion anchors — each must appear exactly once in its baseline file.
 OPERATIONS_ANCHOR = "          agent_config_read:\n"
 AGENT_SECTION = "agent:\n  profile: pa\n  max_turns: 12\n"
@@ -209,6 +244,18 @@ def _safe_config(source: str, slot: dict) -> str:
         operations_snippet + OPERATIONS_ANCHOR,
         label="business-bridge operations",
     )
+    rendered = _replace_once(
+        rendered,
+        GROUP_POLICY_EXTRA_OLD,
+        GROUP_POLICY_EXTRA_NEW,
+        label="platforms.whatsapp.extra group_policy",
+    )
+    rendered = _replace_once(
+        rendered,
+        GROUP_POLICY_ROOT_OLD,
+        GROUP_POLICY_ROOT_NEW,
+        label="top-level whatsapp group_policy",
+    )
     if not rendered.endswith("group_sessions_per_user: false\n"):
         raise RuntimeError("config baseline no longer ends at group_sessions_per_user")
     rendered += MEMORY_OFF_BLOCK
@@ -313,6 +360,19 @@ def _validate(
         "memory_enabled": False,
         "user_profile_enabled": False,
     }
+
+    # Chat-scoped inbound allowlist, staged in BOTH blocks (the top-level block
+    # bridges into extra and wins; extra has no env fallback for the allowlist).
+    expected_jids = list(GROUP_ALLOWLIST_JIDS)
+    for block in (config["whatsapp"], config["platforms"]["whatsapp"]["extra"]):
+        assert block["group_policy"] == "allowlist", block["group_policy"]
+        assert block["group_allow_from"] == expected_jids, block["group_allow_from"]
+        # Staging must not widen anything: the allowlist is a strict subset of
+        # the already-authorized outbound chats, so inbound can never reach a
+        # chat outbound was not already scoped to.
+        assert set(expected_jids) <= set(block["outbound_allowed_chats"]), expected_jids
+        # DM policy is explicitly out of scope for this change.
+        assert block["dm_policy"] == "allowlist", block["dm_policy"]
     if effort is None:
         assert "reasoning_effort" not in config["agent"]
     else:
