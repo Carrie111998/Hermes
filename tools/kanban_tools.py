@@ -1909,8 +1909,13 @@ KANBAN_CREATE_SCHEMA = {
         "one (pass the current task id in ``parents``). Used by "
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "then complete your own task. Auto-dispatch is board-gated: "
+        "the dispatcher only picks up tasks on boards marked "
+        "dispatchable (``dispatchable: true`` in board metadata; "
+        "default false, fail-closed). On a non-dispatchable board the "
+        "task is created but never auto-spawned — a human works it "
+        "manually or enables dispatch via "
+        "``hermes kanban boards set-dispatch <slug> on``."
     ),
     "parameters": {
         "type": "object",
@@ -1924,8 +1929,11 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Profile name that should execute this task "
                     "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Required. Do not rely on omission to park a task: "
+                    "on dispatchable boards the dispatcher routes "
+                    "unassigned ready tasks to ``kanban.default_assignee`` "
+                    "when that config is set — always name the intended "
+                    "profile explicitly."
                 ),
             },
             "body": {

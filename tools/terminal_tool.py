@@ -3344,7 +3344,7 @@ TERMINAL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute on the VM"
+                "description": "The shell command to execute (bash). Runs in the persistent session of the configured backend (local, docker, or ssh)."
             },
             "background": {
                 "type": "boolean",
