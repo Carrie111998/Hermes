@@ -66,7 +66,35 @@ MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: fa
 # only one block would leave the allowlist empty and block every group.
 #
 # DM policy is deliberately untouched (teren: keep DMs on).
-GROUP_ALLOWLIST_JIDS = ("120363426509183563@g.us",)  # TGG Christopher Mgmt Live Test 20260528
+# ACTIVATION SET (2026-07-21 go-live, teren-authorized "all maintenance" in-pane
+# session f59ecb85 2026-07-21 00:04 SGT; WB 288cdaa2). Enumerated from the WA
+# bridge's own store (capture history-metadata.jsonl group names cross-checked
+# against tgg-chat-map.md). INCLUDED: the four maintenance site/zone work
+# groups + the rung-3a mgmt live-test group + the PcL-internal deployment-
+# verification group ("Boss of Christopher" — NOT a client maintenance group;
+# included deliberately, coordinator-approved 2026-07-21, so the stock
+# verify_runtime deploy smoke, whose fixture chat this is, stays green).
+# EXCLUDED (fail-closed, zero pre-model cost): the real client management
+# group (120363407903158826, rung 3b only), both mgmt simulators, all
+# sprucing-scope groups (teren-ruled out of christopher case-ledger scope
+# 2026-06-11), vendor/photos/escalation/general groups not positively
+# identifiable as maintenance site groups — full excluded list in the
+# 2026-07-21-activation run archive.
+GROUP_ALLOWLIST_JIDS = (
+    "120363421424519051@g.us",  # MM1A Maintenance (AMK, SRG)
+    "120363422582425366@g.us",  # MM1B Maintenance (HG, Bedok Resv)
+    "120363423568509280@g.us",  # MM2 Maintenance (PG)
+    "120363403845802098@g.us",  # MM2 Maintenance (SK)
+    "120363426509183563@g.us",  # TGG Christopher Mgmt Live Test 20260528 (rung-3a mgmt selector)
+    "120363409954029949@g.us",  # Boss of Christopher — PcL deployment-verification (deploy-gate infra)
+)
+
+# Partition of the inbound allowlist for the outbound-boundary invariant:
+# site groups are ops-ingest scope (reply-suppressed) and must NEVER carry
+# outbound authorization; mgmt/verification chats are the only inbound entries
+# allowed to also appear in outbound_allowed_chats.
+SITE_GROUP_JIDS = frozenset(GROUP_ALLOWLIST_JIDS[:4])
+MGMT_INBOUND_JIDS = frozenset(GROUP_ALLOWLIST_JIDS[4:])
 
 def _group_allowlist_block(indent: str) -> str:
     lines = [f"{indent}group_policy: allowlist\n", f"{indent}group_allow_from:\n"]
@@ -398,10 +426,15 @@ def _validate(
     for block in (config["whatsapp"], config["platforms"]["whatsapp"]["extra"]):
         assert block["group_policy"] == "allowlist", block["group_policy"]
         assert block["group_allow_from"] == expected_jids, block["group_allow_from"]
-        # Staging must not widen anything: the allowlist is a strict subset of
-        # the already-authorized outbound chats, so inbound can never reach a
-        # chat outbound was not already scoped to.
-        assert set(expected_jids) <= set(block["outbound_allowed_chats"]), expected_jids
+        # Activation (2026-07-21) flips the staging-era subset invariant:
+        # inbound scope now includes the reply-suppressed maintenance site
+        # groups, which must NEVER be outbound-authorized. Outbound stays
+        # governed solely by outbound_allowed_chats + the bridge trust stack;
+        # inbound membership must not imply outbound. Assert the boundary in
+        # both directions instead:
+        outbound = set(block["outbound_allowed_chats"])
+        assert MGMT_INBOUND_JIDS <= outbound, sorted(MGMT_INBOUND_JIDS - outbound)
+        assert not (SITE_GROUP_JIDS & outbound), sorted(SITE_GROUP_JIDS & outbound)
         # DM policy is explicitly out of scope for this change.
         assert block["dm_policy"] == "allowlist", block["dm_policy"]
     if effort is None:
