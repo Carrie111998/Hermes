@@ -11883,6 +11883,568 @@ def _resolve_name(name: str) -> str:
         return name
 
 
+@method("command.dispatch")
+def _(rid, params: dict) -> dict:
+    name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
+    resolved = _resolve_name(name)
+    if resolved != name:
+        name = resolved
+    session = _sessions.get(params.get("session_id", ""))
+
+    qcmds = _load_cfg().get("quick_commands", {})
+    if name in qcmds:
+        qc = qcmds[name]
+        if qc.get("type") == "exec":
+            # Sanitize env to prevent credential leakage —
+            # quick commands run in the TUI server process which
+            # has all API keys in os.environ.
+            from tools.environments.local import _sanitize_subprocess_env
+            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+            r = subprocess.run(
+                qc.get("command", ""),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                env=sanitized_env,
+            )
+            output = (
+                (r.stdout or "")
+                + ("\n" if r.stdout and r.stderr else "")
+                + (r.stderr or "")
+            ).strip()[:4000]
+            if output:
+                from agent.redact import redact_sensitive_text
+                output = redact_sensitive_text(output)
+            if r.returncode != 0:
+                return _err(
+                    rid,
+                    4018,
+                    output or f"quick command failed with exit code {r.returncode}",
+                )
+            return _ok(rid, {"type": "exec", "output": output})
+        if qc.get("type") == "alias":
+            return _ok(rid, {"type": "alias", "target": qc.get("target", "")})
+
+    try:
+        from hermes_cli.plugins import (
+            get_plugin_command_handler,
+            invoke_plugin_command_handler,
+            resolve_plugin_command_result,
+        )
+
+        handler = get_plugin_command_handler(name)
+        if handler:
+            # Plugin state uses the persistent session key, not the UI-side
+            # lookup sid. If no session record exists, use the request id as
+            # the last-resort command context.
+            _plugin_session_id = (
+                str(session.get("session_key") or "")
+                if session is not None
+                else str(rid or "")
+            )
+            result = resolve_plugin_command_result(
+                invoke_plugin_command_handler(
+                    handler,
+                    arg,
+                    session_id=_plugin_session_id,
+                )
+            )
+            return _ok(rid, {"type": "plugin", "output": str(result or "")})
+    except Exception:
+        pass
+
+    try:
+        from agent.skill_bundles import (
+            build_bundle_invocation_message,
+            get_skill_bundles,
+            resolve_bundle_command_key,
+        )
+
+        from hermes_cli.commands import resolve_command
+
+        bundle_key = (
+            resolve_bundle_command_key(name)
+            if resolve_command(name) is None
+            else None
+        )
+    except Exception:
+        bundle_key = None
+
+    if bundle_key is not None:
+        try:
+            bundle_result = build_bundle_invocation_message(
+                bundle_key,
+                arg,
+                task_id=session.get("session_key", "") if session else "",
+                platform=_resolve_session_platform(),
+            )
+        except Exception as exc:
+            return _err(rid, 4018, f"bundle dispatch failed: {exc}")
+
+        if not bundle_result:
+            return _err(rid, 4018, f"failed to load bundle: {bundle_key}")
+
+        msg, loaded_names, missing = bundle_result
+        bundle_info = get_skill_bundles().get(bundle_key, {})
+        bundle_name = bundle_info.get("name", bundle_key.lstrip("/"))
+        notice = f"⚡ Loading bundle: {bundle_name} ({len(loaded_names)} skills)"
+        if missing:
+            notice += f"\nSkipped missing skills: {', '.join(missing)}"
+        return _ok(
+            rid,
+            {
+                "type": "send",
+                "message": msg,
+                "notice": notice,
+            },
+        )
+
+    try:
+        from agent.skill_commands import (
+            scan_skill_commands,
+            build_skill_invocation_message,
+        )
+
+        cmds = scan_skill_commands()
+        key = f"/{name}"
+        if key in cmds:
+            msg = build_skill_invocation_message(
+                key, arg, task_id=session.get("session_key", "") if session else ""
+            )
+            if msg:
+                return _ok(
+                    rid,
+                    {
+                        "type": "skill",
+                        "message": msg,
+                        "name": cmds[key].get("name", name),
+                    },
+                )
+    except Exception:
+        pass
+
+    # ── Commands that queue messages onto _pending_input in the CLI ───
+    # In the TUI the slash worker subprocess has no reader for that queue,
+    # so we handle them here and return a structured payload.
+
+    if name in {"queue", "q"}:
+        if not arg:
+            return _err(rid, 4004, "usage: /queue <prompt>")
+        return _ok(rid, {"type": "send", "message": arg})
+
+    if name == "learn":
+        # Open-ended: build the standards-guided prompt and submit it as a
+        # normal agent turn. The live agent gathers whatever the user
+        # described (dirs, URLs, this conversation, pasted text) with its own
+        # tools and authors the skill via skill_manage. Works on any backend.
+        from agent.learn_prompt import build_learn_prompt
+
+        return _ok(rid, {"type": "send", "message": build_learn_prompt(arg)})
+    if name == "moa":
+        # /moa is one-shot sugar only: run a single prompt through the default
+        # MoA preset, then restore the prior model. To *switch* to a MoA preset
+        # for the rest of the session, pick it from the model picker (MoA
+        # presets surface as a virtual "Mixture of Agents" provider).
+        try:
+            from hermes_cli.moa_config import moa_usage, normalize_moa_config
+
+            if not arg:
+                return _err(rid, 4004, moa_usage())
+            if not session:
+                return _err(rid, 4001, "no active session")
+            sid = params.get("session_id", "")
+            moa_cfg = normalize_moa_config(_load_cfg().get("moa") or {})
+            preset = moa_cfg["default_preset"]
+            # Record the live model identity so it can be restored after the
+            # one-shot turn, then swap the agent's client in place (#53444:
+            # setting session["model_override"] alone never switched the
+            # already-built agent, so the turn silently ran on the old model).
+            agent = session.get("agent")
+            session["moa_one_shot_restore"] = {
+                "override": session.get("model_override"),
+                "model": getattr(agent, "model", None) if agent else None,
+                "provider": getattr(agent, "provider", None) if agent else None,
+            }
+            if agent is not None:
+                # Live agent: swap its client in place so THIS turn runs MoA.
+                try:
+                    _apply_model_switch(
+                        sid,
+                        session,
+                        f"{preset} --provider moa",
+                        confirm_expensive_model=False,
+                        pin_session_override=True,
+                        # One-shot turn-scoped swap — never persist the MoA
+                        # virtual provider to config.yaml.
+                        persist_override=False,
+                    )
+                except Exception as exc:
+                    session.pop("moa_one_shot_restore", None)
+                    return _err(rid, 5030, f"moa unavailable: {exc}")
+            else:
+                # No agent built yet (lazy/fresh session): the override is
+                # consumed by the first build, so the turn runs MoA without an
+                # in-place switch.
+                session["model_override"] = {
+                    "provider": "moa",
+                    "model": preset,
+                    "base_url": "moa://local",
+                    "api_key": "moa-virtual-provider",
+                    "api_mode": "chat_completions",
+                }
+            return _ok(
+                rid,
+                {
+                    "type": "send",
+                    "notice": f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn.",
+                    "message": arg,
+                },
+            )
+        except Exception as exc:
+            return _err(rid, 5030, f"moa unavailable: {exc}")
+
+    if name == "retry":
+        if not session:
+            return _err(rid, 4001, "no active session to retry")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /retry"
+            )
+        history = session.get("history", [])
+        if not history:
+            return _err(rid, 4018, "no previous user message to retry")
+        # Walk backwards to find the last user message
+        last_user_idx = None
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None:
+            return _err(rid, 4018, "no previous user message to retry")
+        content = history[last_user_idx].get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if not content:
+            return _err(rid, 4018, "last user message is empty")
+        # Truncate history: remove everything from the last user message onward
+        # (mirrors CLI retry_last() which strips the failed exchange)
+        with session["history_lock"]:
+            session["history"] = history[:last_user_idx]
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        return _ok(rid, {"type": "send", "message": content})
+
+    if name == "steer":
+        if not arg:
+            return _err(rid, 4004, "usage: /steer <prompt>")
+        agent = session.get("agent") if session else None
+        if agent and hasattr(agent, "steer"):
+            try:
+                accepted = agent.steer(arg)
+                if accepted:
+                    return _ok(
+                        rid,
+                        {
+                            "type": "exec",
+                            "output": f"⏩ Steer queued — arrives after the next tool call: {arg[:80]}{'...' if len(arg) > 80 else ''}",
+                        },
+                    )
+            except Exception:
+                pass
+        # Fallback: no active run, treat as next-turn message
+        return _ok(rid, {"type": "send", "message": arg})
+
+    if name == "goal":
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            return _err(rid, 5030, f"goals unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        try:
+            goals_cfg = _load_cfg().get("goals") or {}
+            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+        mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+
+        lower = arg.strip().lower()
+        if not arg.strip() or lower == "status":
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
+            return _ok(rid, {"type": "exec", "output": out})
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        f"▶ Goal resumed: {state.goal}\n"
+                        "Send any message to continue, or wait — I'll take the next step on the next turn."
+                    ),
+                },
+            )
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": "✓ Goal cleared." if had else "No active goal.",
+                },
+            )
+
+        # Otherwise — treat the remaining text as the new goal.
+        try:
+            state = mgr.set(arg)
+        except ValueError as exc:
+            return _err(rid, 4004, f"invalid goal: {exc}")
+
+        notice = (
+            f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
+            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
+            "Controls: /goal status · /goal pause · /goal resume · /goal clear"
+        )
+        # Send the goal text as the kickoff prompt. The TUI client sees
+        # {type: send, notice, message} → renders `notice` as a sys line,
+        # then submits `message` as a user turn. The post-turn judge
+        # wired in _run_prompt_submit takes over from there.
+        return _ok(
+            rid,
+            {"type": "send", "notice": notice, "message": state.goal},
+        )
+
+    if name == "undo":
+        # /undo [N]: back up N user turns (default 1), soft-delete the
+        # truncated rows on disk, and prefill the composer with the text
+        # of the user message we backed up to so it can be edited and
+        # resubmitted. N=1 is the Claude-Code-style single-step undo;
+        # /undo 3 backs up three user turns at once. See issue #21910.
+        if not session:
+            return _err(rid, 4001, "no active session to undo")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /undo"
+            )
+        db = _get_db()
+        if db is None:
+            return _db_unavailable_error(rid, code=5008)
+        session_key = session.get("session_key", "")
+        if not session_key:
+            return _err(rid, 4001, "no session key for undo")
+        # Parse the optional count argument (e.g. "/undo 3" → 3).
+        n = 1
+        arg_str = (arg or "").strip()
+        if arg_str:
+            try:
+                n = int(arg_str.split()[0])
+            except (ValueError, IndexError):
+                return _err(rid, 4004, f"undo: invalid count {arg_str!r} — use /undo or /undo N")
+        if n < 1:
+            n = 1
+        try:
+            recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
+        except Exception as e:
+            return _err(rid, 5008, f"undo: failed to load history: {e}")
+        if not recents:
+            return _err(rid, 4018, "no user messages to undo")
+        # recents[0] is the most-recent user turn; pick the Nth-from-last.
+        # If N exceeds the number of user turns, back up to the oldest.
+        target_idx = min(n - 1, len(recents) - 1)
+        target_id = recents[target_idx]["id"]
+        try:
+            result = db.rewind_to_message(session_key, target_id)
+        except ValueError as e:
+            return _err(rid, 4004, f"undo: {e}")
+        except Exception as e:
+            return _err(rid, 5008, f"undo: {e}")
+        # Reload the active-only transcript into the in-memory session
+        # history so subsequent turns see the truncated view.
+        # repair_alternation: this reload feeds LIVE REPLAY — session["history"]
+        # is the working conversation for subsequent turns, and a rewind that
+        # lands on a durable user;user pair would otherwise re-fire the
+        # pre-request repair on every request from here on.
+        try:
+            active = db.get_messages_as_conversation(session_key, repair_alternation=True)
+        except Exception:
+            active = []
+        with session["history_lock"]:
+            session["history"] = list(active)
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        # Notify memory providers — same hook /branch fires, plus the
+        # rewound flag so providers caching per-turn document state
+        # know to invalidate. See #6672 + #21910.
+        agent = session.get("agent")
+        if agent is not None:
+            mm = getattr(agent, "_memory_manager", None)
+            if mm is not None:
+                try:
+                    mm.on_session_switch(
+                        session_key,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=True,
+                    )
+                except Exception:
+                    pass
+            if hasattr(agent, "_invalidate_system_prompt"):
+                try:
+                    agent._invalidate_system_prompt()
+                except Exception:
+                    pass
+            if hasattr(agent, "_last_flushed_db_idx"):
+                try:
+                    agent._last_flushed_db_idx = len(active)
+                except Exception:
+                    pass
+        target_msg = result.get("target_message") or {}
+        target_text = target_msg.get("content") or ""
+        if isinstance(target_text, list):
+            parts = [
+                p.get("text", "") for p in target_text
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            target_text = "\n".join(t for t in parts if t)
+        if not isinstance(target_text, str):
+            target_text = ""
+        rewound_count = result.get("rewound_count", 0)
+        turns_undone = target_idx + 1
+        turn_word = "turn" if turns_undone == 1 else "turns"
+        notice = (
+            f"↶ Undid {turns_undone} {turn_word} ({rewound_count} message(s)). "
+            "Edit and resubmit, or send a new message."
+        )
+        return _ok(
+            rid,
+            {"type": "prefill", "message": target_text, "notice": notice},
+        )
+
+    if name in {"snapshot", "snap"}:
+        subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""
+        if subcommand in {"restore", "rewind"}:
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        "/snapshot restore is blocked in the TUI because it changes "
+                        "config/state on disk while the live agent has cached settings. "
+                        "Run it in the classic CLI, then restart the TUI."
+                    ),
+                },
+            )
+
+    if name in {"compress", "compact"}:
+        if not session:
+            return _err(rid, 4001, "no active session to compress")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /compress"
+            )
+        sid = params.get("session_id", "")
+        if _session_uses_compute_host(session):
+            command = f"/{name}" + (f" {arg}" if arg else "")
+            try:
+                ack = _send_compute_host_control(
+                    sid,
+                    route_name="slash.compress",
+                    command=command,
+                    wait=True,
+                )
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host slash.compress failed: {exc}")
+            if ack.get("type") in {"control.error", "error"}:
+                return _err(
+                    rid,
+                    4009,
+                    str(ack.get("message") or "compute-host slash.compress failed"),
+                )
+            _apply_compute_host_metadata_mirror(session, ack)
+            return _ok(
+                rid,
+                {"type": "exec", "output": str(ack.get("output") or "")},
+            )
+        try:
+            from agent.manual_compression_feedback import summarize_manual_compression
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            with session["history_lock"]:
+                before_messages = list(session.get("history", []))
+                history_version = int(session.get("history_version", 0))
+            before_count = len(before_messages)
+            _agent = session["agent"]
+            _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
+            _tools = getattr(_agent, "tools", None) or None
+            before_tokens = (
+                estimate_request_tokens_rough(
+                    before_messages, system_prompt=_sys_prompt, tools=_tools
+                )
+                if before_count
+                else 0
+            )
+            removed, usage = _compress_session_history(
+                session,
+                arg.strip() or None,
+                approx_tokens=before_tokens,
+                before_messages=before_messages,
+                history_version=history_version,
+            )
+            with session["history_lock"]:
+                after_messages = list(session.get("history", []))
+            after_count = len(after_messages)
+            _sys_prompt_after = (
+                getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
+            )
+            _tools_after = getattr(_agent, "tools", None) or _tools
+            after_tokens = (
+                estimate_request_tokens_rough(
+                    after_messages,
+                    system_prompt=_sys_prompt_after,
+                    tools=_tools_after,
+                )
+                if after_count
+                else 0
+            )
+            _sync_session_key_after_compress(sid, session)
+            summary = summarize_manual_compression(
+                before_messages,
+                after_messages,
+                before_tokens,
+                after_tokens,
+                compression_state=getattr(_agent, "context_compressor", None),
+            )
+            _emit("session.info", sid, _session_info(session.get("agent"), session))
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": "\n".join(
+                        filter(None, [summary["headline"], summary["token_line"], summary.get("note")])
+                    ),
+                },
+            )
+        except Exception as exc:
+            return _err(rid, 5009, f"compress failed: {exc}")
+
+    return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
+
+
 # ── Methods: paste ────────────────────────────────────────────────────
 
 _paste_counter = 0
@@ -12614,6 +13176,152 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             )
         return f"live session sync failed: {e}"
     return ""
+
+
+@method("slash.exec")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+
+    cmd = params.get("command", "").strip()
+    if not cmd:
+        return _err(rid, 4004, "empty command")
+
+    # Skill and bundle slash commands plus _pending_input commands must NOT go
+    # through the slash worker — see _PENDING_INPUT_COMMANDS definition above.
+    # Plugin commands must also avoid the worker, but unlike skills and
+    # pending-input commands they still return normal slash.exec output so the
+    # TUI keeps the pager path.
+    _cmd_text = cmd.lstrip("/") if cmd.startswith("/") else cmd
+    _cmd_parts = _cmd_text.split(maxsplit=1)
+    _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
+    _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
+
+    live_output = _live_slash_command_output(
+        params.get("session_id", ""), session, _cmd_base, _cmd_arg
+    )
+    if live_output is not None:
+        return _ok(rid, {"output": live_output or "(no output)"})
+
+    if _cmd_base in _PENDING_INPUT_COMMANDS:
+        # Route directly to command.dispatch instead of returning an error
+        # that requires the frontend to retry.  Some TUI clients fail the
+        # fallback, leaving the command empty and showing "empty command".
+        return _methods["command.dispatch"](
+            rid,
+            {
+                "name": _cmd_base,
+                "arg": _cmd_arg,
+                "session_id": params.get("session_id", ""),
+            },
+        )
+
+    if _cmd_base in _WORKER_BLOCKED_COMMANDS:
+        subcommand = _cmd_arg.split(maxsplit=1)[0].lower() if _cmd_arg else ""
+        if subcommand in {"restore", "rewind"}:
+            return _err(
+                rid,
+                4018,
+                "snapshot restore mutates live config/state; use command.dispatch for /snapshot restore",
+            )
+
+    try:
+        from agent.skill_bundles import resolve_bundle_command_key
+        from hermes_cli.commands import resolve_command
+
+        _bundle_key = (
+            resolve_bundle_command_key(_cmd_base)
+            if resolve_command(_cmd_base) is None
+            else None
+        )
+        if _bundle_key is not None:
+            return _methods["command.dispatch"](
+                rid,
+                {
+                    "name": _bundle_key.lstrip("/"),
+                    "arg": _cmd_arg,
+                    "session_id": params.get("session_id", ""),
+                },
+            )
+    except Exception:
+        pass
+
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        _cmd_key = f"/{_cmd_base}"
+        if _cmd_key in get_skill_commands():
+            return _err(
+                rid, 4018, f"skill command: use command.dispatch for {_cmd_key}"
+            )
+    except Exception:
+        pass
+
+    plugin_handler = None
+    resolve_plugin_command_result = None
+    if _cmd_base:
+        try:
+            from hermes_cli.plugins import (
+                get_plugin_command_handler,
+                invoke_plugin_command_handler,
+                resolve_plugin_command_result,
+            )
+
+            plugin_handler = get_plugin_command_handler(_cmd_base)
+        except Exception:
+            plugin_handler = None
+            resolve_plugin_command_result = None
+
+    if plugin_handler and resolve_plugin_command_result:
+        try:
+            # P0 [hermes-v2]: persistent session_key wins over the
+            # transient UI ``sid``. The session dict is already
+            # resolved by ``_sess_nowait`` above; we use the same
+            # record here so the plugin handler sees the durable id
+            # used by hooks + state stores.
+            _plugin_session_id = (
+                str(session.get("session_key") or "")
+                if session is not None
+                else str(rid or "")
+            )
+            result = resolve_plugin_command_result(
+                invoke_plugin_command_handler(
+                    plugin_handler,
+                    _cmd_arg,
+                    session_id=_plugin_session_id,
+                )
+            )
+            return _ok(rid, {"output": str(result or "(no output)")})
+        except Exception as e:
+            return _ok(rid, {"output": f"Plugin command error: {e}"})
+
+    worker = session.get("slash_worker")
+    if not worker:
+        try:
+            worker = _SlashWorker(
+                session["session_key"],
+                getattr(session.get("agent"), "model", _resolve_model()),
+                profile_home=session.get("profile_home"),
+            )
+            _attach_worker(params.get("session_id", ""), session, worker)
+        except Exception as e:
+            return _err(rid, 5030, f"slash worker start failed: {e}")
+
+    try:
+        output = worker.run(cmd)
+        warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
+        payload = {"output": output or "(no output)"}
+        if warning:
+            payload["warning"] = warning
+        return _ok(rid, payload)
+    except Exception as e:
+        try:
+            worker.close()
+        except Exception:
+            pass
+        session["slash_worker"] = None
+        return _err(rid, 5030, str(e))
 
 
 # ── Methods: voice ───────────────────────────────────────────────────

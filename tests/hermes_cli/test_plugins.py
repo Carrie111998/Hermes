@@ -906,6 +906,101 @@ class TestPluginCommands:
 
 
 
+    def test_register_command_default_description(self):
+        """Missing description defaults to 'Plugin command'."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command("status-cmd", lambda a: a)
+        assert mgr._plugin_commands["status-cmd"]["description"] == "Plugin command"
+
+    def test_get_plugin_command_handler_found(self):
+        """get_plugin_command_handler() returns the handler for a registered command."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        handler = lambda args: f"result: {args}"
+        ctx.register_command("mycmd", handler, description="test")
+
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            result = get_plugin_command_handler("mycmd")
+            assert result is handler
+
+    def test_get_plugin_command_handler_not_found(self):
+        """get_plugin_command_handler() returns None for unregistered commands."""
+        mgr = PluginManager()
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            assert get_plugin_command_handler("nonexistent") is None
+
+    def test_invoke_plugin_command_handler_passes_session_context(self):
+        from hermes_cli.plugins import invoke_plugin_command_handler
+
+        def handler(args, *, session_id=""):
+            return f"{session_id}:{args}"
+
+        assert (
+            invoke_plugin_command_handler(handler, "status", session_id="session-42")
+            == "session-42:status"
+        )
+
+    def test_invoke_plugin_command_handler_preserves_legacy_contract(self):
+        from hermes_cli.plugins import invoke_plugin_command_handler
+
+        handler = lambda args: f"legacy:{args}"
+        assert (
+            invoke_plugin_command_handler(handler, "status", session_id="ignored")
+            == "legacy:status"
+        )
+
+    def test_get_plugin_commands_returns_dict(self):
+        """get_plugin_commands() returns the full commands dict."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+        ctx.register_command("cmd-a", lambda a: a, description="A")
+        ctx.register_command("cmd-b", lambda a: a, description="B")
+
+        with patch("hermes_cli.plugins._plugin_manager", mgr):
+            cmds = get_plugin_commands()
+            assert "cmd-a" in cmds
+            assert "cmd-b" in cmds
+            assert cmds["cmd-a"]["description"] == "A"
+
+    def test_get_plugin_command_handler_discovers_plugins_lazily(self, tmp_path, monkeypatch):
+        """Handler lookup should work before any explicit discover_plugins() call."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "cmd-plugin",
+            register_body='ctx.register_command("lazycmd", lambda a: f"ok:{a}", description="Lazy")',
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        import hermes_cli.plugins as plugins_mod
+
+        with patch.object(plugins_mod, "_plugin_manager", None):
+            handler = get_plugin_command_handler("lazycmd")
+            assert handler is not None
+            assert handler("x") == "ok:x"
+
+    def test_get_plugin_commands_discovers_plugins_lazily(self, tmp_path, monkeypatch):
+        """Command listing should trigger plugin discovery on first access."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "cmd-plugin",
+            register_body='ctx.register_command("lazycmd", lambda a: a, description="Lazy")',
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        import hermes_cli.plugins as plugins_mod
+
+        with patch.object(plugins_mod, "_plugin_manager", None):
+            cmds = get_plugin_commands()
+            assert "lazycmd" in cmds
+            assert cmds["lazycmd"]["description"] == "Lazy"
 
     def test_get_plugin_context_engine_discovers_plugins_lazily(self, tmp_path, monkeypatch):
         """Context engine lookup should work before any explicit discover_plugins() call."""

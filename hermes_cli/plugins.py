@@ -2367,6 +2367,34 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     return entry["handler"] if entry else None
 
 
+def invoke_plugin_command_handler(
+    handler: Callable,
+    raw_args: str,
+    *,
+    session_id: str = "",
+) -> Any:
+    """Invoke a slash-command handler with optional session context.
+
+    The historical plugin contract is ``handler(raw_args)``. Newer handlers may
+    declare a keyword-only ``session_id`` parameter (or ``**kwargs``) to keep
+    command-side state aligned with hook-side state in CLI, gateway, and TUI
+    sessions. Legacy handlers continue to receive exactly one argument.
+    """
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+    except (TypeError, ValueError):
+        return handler(raw_args)
+
+    accepts_session_id = any(
+        parameter.name == "session_id"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if accepts_session_id:
+        return handler(raw_args, session_id=session_id)
+    return handler(raw_args)
+
+
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
 
 
