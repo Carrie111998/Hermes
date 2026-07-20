@@ -240,8 +240,15 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
-    async def test_busy_text_mode_queue_delegates_to_adapter_handle_message(self):
-        """busy_text_mode=queue lets the adapter debounce text silently."""
+    async def test_busy_text_mode_queue_sends_ack_by_default(self, monkeypatch):
+        """busy_text_mode=queue now sends a short 'Queued' ACK on the first
+        follow-up so users know the message landed. Subsequent follow-ups
+        within the 30s debounce window stay silent."""
+        import gateway.run as _gr
+
+        monkeypatch.delenv("HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED", raising=False)
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+
         runner, sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         runner._busy_text_mode = "queue"
@@ -263,6 +270,63 @@ class TestBusySessionAck:
         assert result2 is False
         assert sk not in adapter._pending_messages
         agent.interrupt.assert_not_called()
+
+        # First call fires ACK, second is debounced (within 30s window).
+        adapter._send_with_retry.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued" in content, f"expected queue ACK marker, got: {content!r}"
+
+    @pytest.mark.asyncio
+    async def test_busy_text_mode_queue_silent_when_ack_disabled(self, monkeypatch):
+        """Opt-out: HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED=false restores the
+        pre-fix silent behavior."""
+        import gateway.run as _gr
+
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED", "false")
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+
+        event = _make_event(text="hush now")
+        sk = build_session_key(event.source)
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is False
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_busy_text_mode_queue_ack_respects_master_switch(self, monkeypatch):
+        """Master HERMES_GATEWAY_BUSY_ACK_ENABLED=false suppresses queue ACK
+        alongside interrupt/steer ACKs."""
+        import gateway.run as _gr
+
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+
+        event = _make_event(text="also hush")
+        sk = build_session_key(event.source)
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is False
         adapter._send_with_retry.assert_not_called()
 
     @pytest.mark.asyncio

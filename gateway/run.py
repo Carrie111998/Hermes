@@ -1614,6 +1614,13 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED"] = str(
                     _display_cfg["busy_steer_ack_enabled"]
                 )
+            if (
+                "busy_queue_ack_enabled" in _display_cfg
+                and "HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED" not in os.environ
+            ):
+                os.environ["HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED"] = str(
+                    _display_cfg["busy_queue_ack_enabled"]
+                )
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str):
@@ -5271,6 +5278,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    async def _maybe_send_queue_ack(
+        self, event: "MessageEvent", session_key: str
+    ) -> None:
+        """Send a short ACK when a message is queued during a busy session.
+
+        Called from the queue branch of ``_handle_active_session_busy_message``
+        (see nearby ``if busy_text_mode == "queue"`` block). Applies:
+
+          * ``HERMES_GATEWAY_BUSY_ACK_ENABLED`` — master ACK gate (default true).
+          * ``HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED`` or per-platform
+            ``display.platforms.<platform>.busy_queue_ack_enabled`` (default true).
+          * Shared ``_busy_ack_ts`` 30s debounce so rapid follow-ups do not
+            spam. Interrupt/steer ACKs use the same window — one ACK per
+            session per 30s regardless of mode.
+
+        Delivery failures are swallowed (best-effort UX hint; the queue path
+        below still runs and the message still gets processed).
+        """
+        try:
+            busy_ack_enabled = os.environ.get(
+                "HERMES_GATEWAY_BUSY_ACK_ENABLED", "true"
+            ).strip().lower() == "true"
+            if not busy_ack_enabled:
+                return
+
+            now = time.time()
+            _BUSY_ACK_COOLDOWN = 30
+            last_ack = self._busy_ack_ts.get(session_key, 0)
+            if now - last_ack < _BUSY_ACK_COOLDOWN:
+                return
+
+            from gateway.display_config import resolve_display_setting
+
+            platform_key = _platform_config_key(event.source.platform)
+            queue_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED")
+            if queue_ack_env is not None:
+                queue_ack_enabled = queue_ack_env.strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            else:
+                queue_ack_enabled = bool(
+                    resolve_display_setting(
+                        _load_gateway_config(),
+                        platform_key,
+                        "busy_queue_ack_enabled",
+                        True,
+                    )
+                )
+            if not queue_ack_enabled:
+                logger.debug("Queue-mode ack suppressed for session %s", session_key)
+                return
+
+            adapter = self._adapter_for_source(event.source)
+            if not adapter:
+                return
+
+            reply_anchor = self._reply_anchor_for_event(event)
+            self._busy_ack_ts[session_key] = now
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content="📥 Queued (排队中)",
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            )
+        except Exception:
+            logger.debug(
+                "Queue-mode ack send failed (non-fatal) for session %s",
+                session_key,
+                exc_info=True,
+            )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -5419,6 +5497,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
+            # Queue mode is normally silent (message just gets queued for
+            # the drain loop). But silence == "did the bot receive it?"
+            # uncertainty on chat platforms. Send a short ACK so the user
+            # knows the message landed. Master ``busy_ack_enabled`` gate,
+            # per-platform ``busy_queue_ack_enabled`` toggle, and the shared
+            # 30s ``_busy_ack_ts`` debounce all apply (one ACK per session
+            # per window, regardless of interrupt/steer/queue mode).
+            await self._maybe_send_queue_ack(event, session_key)
             return False
 
         # Steer mode: inject mid-run via running_agent.steer() instead of

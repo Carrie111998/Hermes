@@ -35,6 +35,7 @@ uv run pytest \
     tests/gateway/test_queue_drain_ftest.py \
     tests/gateway/test_pending_drain_no_recursion.py \
     tests/gateway/test_queue_consumption.py \
+    tests/gateway/test_busy_session_ack.py \
     -v --tb=short 2>&1 | tee /tmp/queue-ftest-output.log | tail -40
 exit_code=${PIPESTATUS[0]}
 set -e
