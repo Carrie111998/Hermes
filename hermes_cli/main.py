@@ -845,7 +845,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_termux_startup_environment(env: dict[str, str] | None = None) -> bool:
-    """Безопасная при импорте проверка Termux и размещённого в нём PRoot."""
+    """Import-safe detection for native Termux and Termux-hosted PRoot."""
     check = env or os.environ
     prefix = str(check.get("PREFIX", ""))
     if (
@@ -855,7 +855,7 @@ def _is_termux_startup_environment(env: dict[str, str] | None = None) -> bool:
     ):
         return True
 
-    # В proot-distro ядро сообщает PRoot, а каталог хостового Termux доступен.
+    # proot-distro reports PRoot through uname while exposing the Termux host dir.
     try:
         uts = os.uname()
         if ("PRoot" in uts.release or "PRoot" in uts.version) and os.path.isdir(
@@ -4912,6 +4912,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_park_stashed_changes",
         "_ensure_acp_launcher",
         "_ensure_fhs_path_guard",
+        "_ensure_pip_for_update",
         "_ensure_uv_for_termux",
         "_finish_dashboard_update_cleanup",
         "_for_each_systemd_gateway_unit",
@@ -4924,6 +4925,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_gateway_prompt",
         "_get_origin_url",
         "_has_upstream_remote",
+        "_install_checkout_python_dependencies_for_update",
         "_install_psutil_android_compat",
         "_invalidate_update_cache",
         "_is_android_python",
@@ -8732,22 +8734,7 @@ def _recover_core_update_marker_locked() -> None:
         _repair_venv_via_import_probes(install_prefix, env=install_env)
 
     try:
-        from hermes_cli import _install_repair as _ir
-
-        # ensure_uv bootstraps the installer itself when missing (the early
-        # pass's stdlib-only lookup cannot); keeping it here means the late
-        # path still self-heals a venv whose uv vanished mid-update.
-        from hermes_cli.managed_uv import ensure_uv
-
-        ensure_uv()
-
-        # Delegate the install itself to the shared stdlib executor so both
-        # this late path and the pre-import early pass run exactly the same
-        # reinstall.  Called inside the same stdout→stderr redirect already
-        # established by _recover_from_interrupted_install, so
-        # run_core_install's own redirect nests harmlessly.
-        _ir.run_core_install(PROJECT_ROOT)
-
+        _install_checkout_python_dependencies_for_update()
         _clear_update_incomplete_marker()
         print("✓ Dependency installation recovered — your install is healthy again.")
     except Exception as exc:
@@ -9637,6 +9624,7 @@ def _install_python_dependencies_with_optional_fallback(
     *,
     env: dict[str, str] | None = None,
     group: str = "all",
+    raise_on_failed_extras: bool = False,
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
@@ -9727,6 +9715,12 @@ def _install_python_dependencies_with_optional_fallback(
         print(
             f"  ⚠ Skipped optional extras that still failed: {', '.join(failed_extras)}"
         )
+        if raise_on_failed_extras:
+            raise subprocess.CalledProcessError(
+                1,
+                install_cmd_prefix
+                + ["install", "-e", f".[{','.join(failed_extras)}]"],
+            )
 
     # Belt-and-suspenders: verify every declared core dependency from
     # pyproject.toml's [project.dependencies] is actually importable in the
