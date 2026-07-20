@@ -416,6 +416,13 @@ markers = [
     "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
     "no_isolate: opt out of per-file subprocess isolation (tests share mutable module-level state)",
     "ssh: marks tests requiring a reachable SSH server (skipped in normal CI)",
+    # [hermes-v2] H-61: regression markers for the H-10/H-11/H-12 Core-Patches.
+    # The single-command invocation `pytest -m h61_regression` runs all
+    # hermes-v2 patch regressions so a `git pull` can be vetted in one shot.
+    "h61_regression: MiniMax + thinking-budget + provider-profile regressions; H-10/H-11/H-12 core patches",
+    "h10_regression: MiniMax-Interleaved-Thinking (H-10)",
+    "h11_regression: THINKING_BUDGET ultra tier (H-11)",
+    "h12_regression: top_p passthrough on chat_completions (H-12)",
 ]
 # integration tests take way too long to run in the normal CI environments
 addopts = "-m 'not integration'"

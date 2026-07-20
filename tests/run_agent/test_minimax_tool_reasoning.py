@@ -25,6 +25,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# [hermes-v2] H-61: regression marker for Core-Patch verification
+pytestmark = pytest.mark.h61_regression
+
 from run_agent import AIAgent
 
 

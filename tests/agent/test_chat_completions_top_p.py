@@ -21,6 +21,9 @@ from typing import Any
 
 import pytest
 
+# [hermes-v2] H-61: regression marker for Core-Patch verification
+pytestmark = [pytest.mark.h61_regression, pytest.mark.h12_regression]
+
 
 # ── helpers ────────────────────────────────────────────────────────────
 

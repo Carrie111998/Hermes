@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import pytest
 
+# [hermes-v2] H-61: regression marker for Core-Patch verification
+pytestmark = [pytest.mark.h61_regression, pytest.mark.h10_regression]
+
 
 class TestMiniMaxAnthropicPreservesThinking:
     """convert_messages_to_anthropic must replay MiniMax thinking blocks."""
