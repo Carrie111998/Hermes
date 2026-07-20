@@ -5,23 +5,17 @@ the hermes-v2 plan). Given a plan file path, this module:
 
 1. Reads the plan body.
 2. If it follows the v2 contract (defined in
-   :mod:`hermes_cli.plan_parser`), creates a structured tree: one root
-   task (with the plan file attached) plus one child task per
-   ``- [ ] T<n>`` line in the ``tasks`` block, with parent/depends
-   links reconstructed.
-3. If it is NOT a v2 plan (free-form prose only), creates a single
-   triage task whose body is the plan text, leaving promotion /
-   decomposition to the operator.
+   :mod:`hermes_cli.plan_parser`), creates a structured tree: one blocked
+   root task (with the plan file attached) plus linked todo child tasks.
+3. If it has no frontmatter, creates one unassigned triage task and leaves
+   decomposition to the operator unless explicitly requested by the caller.
 
-All tasks are created **without an assignee** and in ``initial_status``
-``todo`` — the dispatcher guard at ``kanban_db.py:8188`` refuses to
-spawn workers for unassigned tasks, so the seeded board is inert
-until Basti (or a supervised session) explicitly assigns a worker to
-the next task to work on. This is the H-00-incident guard.
+Structured tasks remain unassigned so the dispatcher cannot start them before
+an operator routes the work. This is the H-00 incident guard.
 
-Idempotency: the slug + task-id (``H-XX`` or ``T<n>``) form the
-``idempotency_key`` for each created task. Re-approving the same plan
-is a no-op.
+The slug plus task ID forms each structured task's idempotency key. Replays
+reuse tasks and attachment rows, refresh the attachment blob and size metadata,
+and avoid duplicate links or events.
 
 Refs: H-20 (parser contract), H-22 (this integration), H-00 (the
 incident that motivated the unassigned guard).
@@ -58,7 +52,10 @@ class SeedResult:
     root_task_id: str
     child_task_ids: List[str] = field(default_factory=list)
     fallback: bool = False  # True iff free-form fallback was used
-    idempotent_replay: bool = False  # True iff re-approval skipped creation
+    idempotent_replay: bool = False  # True iff the root already existed
+    decomposition_attempted: bool = False
+    decomposition_ok: bool = False
+    decomposition_message: Optional[str] = None
 
 
 class PlanSeedError(ValueError):
@@ -131,7 +128,65 @@ def _build_child_body(plan: ParsedPlan, task: PlanTask) -> str:
         parts.append(f"\n**Parent:** `{task.parent}`")
     if task.depends:
         parts.append(f"\n**Depends on:** {', '.join(task.depends)}")
+    if task.paths:
+        parts.append(f"\n**Paths:** {', '.join(f'`{path}`' for path in task.paths)}")
     return "\n".join(parts)
+
+
+def _existing_task_id(conn: Any, idempotency_key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
+def _sync_attachment(
+    kb: Any,
+    conn: Any,
+    task_id: str,
+    *,
+    path: Path,
+    body: str,
+    board: Optional[str],
+    uploaded_by: Optional[str],
+) -> None:
+    """Keep one plan attachment blob and its size metadata in sync."""
+    existing = next(
+        (item for item in kb.list_attachments(conn, task_id) if item.filename == path.name),
+        None,
+    )
+    if existing is not None:
+        stored = Path(existing.stored_path)
+    else:
+        attachments_dir = kb.task_attachments_dir(task_id, board=board)
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        stored = attachments_dir / path.name
+    payload = body.encode("utf-8")
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(payload)
+    if existing is None:
+        kb.add_attachment(
+            conn,
+            task_id,
+            filename=path.name,
+            stored_path=str(stored),
+            size=len(payload),
+            uploaded_by=uploaded_by,
+        )
+    elif existing.size != len(payload):
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_attachments SET size = ? WHERE id = ?",
+                (len(payload), existing.id),
+            )
+
+
+def _ensure_link(kb: Any, conn: Any, parent_id: str, child_id: str) -> None:
+    """Create one dependency edge and event only when it is absent."""
+    if parent_id not in kb.parent_ids(conn, child_id):
+        kb.link_tasks(conn, parent_id, child_id)
 
 
 # ── Public entry points ───────────────────────────────────────────────
@@ -140,35 +195,15 @@ def _build_child_body(plan: ParsedPlan, task: PlanTask) -> str:
 def seed_plan_to_kanban(
     plan_path: str | os.PathLike[str],
     board: Optional[str] = None,
+    *,
+    decompose_freeform: bool = False,
 ) -> SeedResult:
     """Read a plan file and seed it into the named Kanban board.
 
-    Strategy:
-
-    - **v2 plan + validates** → create root task + per-line child
-      tasks with parent/depends links; attach the plan file to the
-      root.
-    - **v2 plan + validation fails** → raise :class:`PlanSeedError`
-      carrying the list of issues. Callers should surface them to
-      the user.
-    - **Free-form plan** → create a single triage task whose body is
-      the plan text; flag ``fallback=True`` in the result.
-
-    All tasks are created **unassigned**, ``initial_status="todo"``.
-    The dispatcher will not pick them up until someone assigns a
-    worker — see the module docstring for the rationale.
-
-    Args:
-        plan_path: Filesystem path to the plan markdown file.
-        board: Optional Kanban board slug. Defaults to whatever the
-            operator's CLI context resolves to (typically the
-            current board). Pass explicitly when called from a
-            non-interactive context (cron, plugin, automation).
-
-    Returns:
-        A :class:`SeedResult` describing what was created. Callers
-        should report the ``root_task_id`` (and, for v2 plans, the
-        child count) to the user.
+    Structured plans create one blocked root and todo children. Free-form plans
+    create one unassigned triage task; callers may request immediate auxiliary
+    decomposition with ``decompose_freeform=True``. Replays refresh the stored
+    plan blob but do not duplicate tasks, links, attachment rows, or events.
     """
     path = Path(plan_path)
     if not path.exists():
@@ -176,16 +211,32 @@ def seed_plan_to_kanban(
 
     body = path.read_text(encoding="utf-8")
 
-    # Lazy import: kanban_db pulls in sqlite3 + the full kanban
-    # module graph, which we don't want at import time for callers
-    # that only need the parser (e.g. webui). H-22's plugin is the
-    # primary caller, so this is fine in practice.
+    # Lazy import: kanban_db pulls in sqlite3 + the full kanban module graph.
     from hermes_cli import kanban_db as kb
 
     if not is_v2_plan(body):
-        return _seed_freeform_fallback(kb, body, path, board)
+        return _seed_freeform_fallback(
+            kb,
+            body,
+            path,
+            board,
+            decompose_freeform=decompose_freeform,
+        )
 
-    plan = parse_plan(body)
+    try:
+        plan = parse_plan(body)
+    except ValueError as exc:
+        raise PlanSeedError([
+            PlanValidationError("frontmatter_invalid", str(exc)),
+        ]) from exc
+    # [hermes-v2] H-22: validate BEFORE any board mutation. The
+    # ``dependency_cycle`` detector lives in :func:`validate` so a
+    # cyclic plan raises ``PlanSeedError`` before ``kb.connect_closing``
+    # even opens a transaction — the previous code path created the
+    # root task, then crashed inside ``link_tasks`` when the cycle was
+    # only detected at link-insert time, leaving a half-seeded board
+    # (root committed, edges absent, seeder raises ``ValueError`` not
+    # ``PlanSeedError`` so the CLI cannot cleanly recover).
     errors = validate(plan)
     if errors:
         raise PlanSeedError(errors)
@@ -199,30 +250,13 @@ def _seed_v2_plan(
     path: Path,
     board: Optional[str],
 ) -> SeedResult:
-    """Internal: seed a validated v2 plan into a Kanban board.
-
-    Status choices:
-
-    - **Root task**: ``initial_status="blocked"``. The kanban
-      ``create_task`` API only accepts ``{"blocked", "running"}`` for
-      initial status; ``todo`` is not directly creatable. Children of
-      ``root`` auto-promote to ``todo`` when the parent is in
-      ``blocked`` (see the parent-status logic in ``kanban_db.py``),
-      so the whole board stays dispatcher-inert until the operator
-      promotes the root.
-    - **Child tasks** with parents: default initial status. Parent
-      not-yet-done → child lands in ``todo``. This matches the
-      plan-level intent ("Status todo, ohne Assignee").
-    - **Unassigned across the board**: dispatcher guard at
-      ``kanban_db.py:8188`` blocks spawning even if the root is
-      manually promoted.
-    """
+    """Seed a validated plan as one blocked root and linked todo tasks."""
     root_idem = f"{plan.slug}:root"
     child_idem_prefix = f"{plan.slug}:task"
 
-    with kb.connect_closing() as conn:
+    with kb.connect_closing(board=board) as conn:
+        idempotent_replay = _existing_task_id(conn, root_idem) is not None
         root_body = _build_root_body(plan, str(path))
-        # Scope-tier letter drives priority: A > B > C.
         priority = max(
             (_priority_for_tier(tier) for tier in plan.scope_tiers.keys()),
             default=0,
@@ -239,41 +273,27 @@ def _seed_v2_plan(
             skills=None,
             board=board,
         )
-        # Attach the plan file to the root task. The attachment API
-        # expects the blob to already be at ``stored_path``; copy the
-        # file into the board's attachments dir.
-        if root_task_id:
-            attachments_dir = kb.task_attachments_dir(root_task_id, board=board)
-            attachments_dir.mkdir(parents=True, exist_ok=True)
-            stored = attachments_dir / path.name
-            stored.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-            kb.add_attachment(
-                conn,
-                root_task_id,
-                filename=path.name,
-                stored_path=str(stored),
-                uploaded_by=plan.created_by,
-            )
+        _sync_attachment(
+            kb,
+            conn,
+            root_task_id,
+            path=path,
+            body=path.read_text(encoding="utf-8"),
+            board=board,
+            uploaded_by=plan.created_by,
+        )
 
-        # Second pass: create all child tasks with parent/depends
-        # resolved. Tasks referencing ``root`` are linked under the
-        # root task; tasks referencing another ``T<n>`` get a
-        # depends-link.
-        task_id_map: Dict[str, str] = {}  # raw_id -> kanban task id
+        task_id_map: Dict[str, str] = {}
         child_task_ids: List[str] = []
 
         for plan_task in plan.tasks:
             child_idem = f"{child_idem_prefix}:{plan_task.raw_id}"
             child_body = _build_child_body(plan, plan_task)
-            # Children inherit the parent's priority (one tier per
-            # child isn't tracked — the plan level already encodes
-            # tier membership in the frontmatter).
+            # Every top-level task belongs to the plan root even when the
+            # optional ``parent: root`` segment was omitted.
             parents: List[str] = []
-            if plan_task.parent == "root":
+            if plan_task.parent in (None, "root"):
                 parents.append(root_task_id)
-            elif plan_task.parent:
-                # Parent T<n> — defer to a second link_tasks pass.
-                pass
             skills = (
                 [s.strip() for s in plan_task.skill.split(",") if s.strip()]
                 if plan_task.skill
@@ -288,31 +308,28 @@ def _seed_v2_plan(
                 parents=tuple(parents),
                 idempotency_key=child_idem,
                 priority=priority,
-                # Omit initial_status — default "running" falls through
-                # to the parent-aware branch, which sets the task to
-                # ``todo`` because its parent isn't done yet.
                 skills=skills,
                 board=board,
             )
             task_id_map[plan_task.raw_id] = child_task_id
             child_task_ids.append(child_task_id)
 
-        # Third pass: link non-root parents and depends.
         for plan_task in plan.tasks:
             child_task_id = task_id_map[plan_task.raw_id]
             if plan_task.parent and plan_task.parent != "root":
                 parent_id = task_id_map.get(plan_task.parent)
                 if parent_id:
-                    kb.link_tasks(conn, parent_id, child_task_id)
+                    _ensure_link(kb, conn, parent_id, child_task_id)
             for dep_raw_id in plan_task.depends:
                 dep_id = task_id_map.get(dep_raw_id)
                 if dep_id:
-                    kb.link_tasks(conn, dep_id, child_task_id)
+                    _ensure_link(kb, conn, dep_id, child_task_id)
 
     return SeedResult(
         root_task_id=root_task_id,
         child_task_ids=child_task_ids,
         fallback=False,
+        idempotent_replay=idempotent_replay,
     )
 
 
@@ -321,11 +338,14 @@ def _seed_freeform_fallback(
     body: str,
     path: Path,
     board: Optional[str],
+    *,
+    decompose_freeform: bool,
 ) -> SeedResult:
-    """Free-form plan: seed a single triage task with the full text."""
+    """Seed free-form prose as triage and optionally run the decomposer."""
     title = path.stem.replace("-", " ").replace("_", " ").strip() or "Free-form plan"
     idem = f"freeform:{path.stem}"
-    with kb.connect_closing() as conn:
+    with kb.connect_closing(board=board) as conn:
+        idempotent_replay = _existing_task_id(conn, idem) is not None
         root_task_id = kb.create_task(
             conn,
             title=f"Decompose: {title}",
@@ -334,25 +354,54 @@ def _seed_freeform_fallback(
             created_by="kimi-mode",
             idempotency_key=idem,
             priority=0,
-            # No parent → falls into ready branch. Assignee is None so
-            # the dispatcher guard at ``kanban_db.py:8188`` blocks
-            # spawning until someone explicitly assigns it.
+            triage=True,
             board=board,
         )
-        if root_task_id:
-            attachments_dir = kb.task_attachments_dir(root_task_id, board=board)
-            attachments_dir.mkdir(parents=True, exist_ok=True)
-            stored = attachments_dir / path.name
-            stored.write_text(body, encoding="utf-8")
-            kb.add_attachment(
-                conn,
-                root_task_id,
-                filename=path.name,
-                stored_path=str(stored),
-                uploaded_by="kimi-mode",
-            )
+        _sync_attachment(
+            kb,
+            conn,
+            root_task_id,
+            path=path,
+            body=body,
+            board=board,
+            uploaded_by="kimi-mode",
+        )
+
+    child_task_ids: List[str] = []
+    decomposition_attempted = False
+    decomposition_ok = False
+    decomposition_message: Optional[str] = None
+    with kb.connect_closing(board=board) as conn:
+        child_rows = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY rowid",
+            (root_task_id,),
+        ).fetchall()
+    child_task_ids = [str(row["child_id"]) for row in child_rows]
+
+    if child_task_ids:
+        # A successful prior decomposition is durable in the child links. Do
+        # not call the decomposer again: the root is now todo/non-triage and
+        # that retry would only report a misleading status failure.
+        decomposition_ok = True
+        decomposition_message = (
+            "already decomposed; reused "
+            f"{len(child_task_ids)} existing child task(s)"
+        )
+    elif decompose_freeform:
+        from hermes_cli.kanban_decompose import decompose_task
+
+        decomposition_attempted = True
+        outcome = decompose_task(root_task_id, author="kimi-mode", board=board)
+        decomposition_ok = outcome.ok
+        decomposition_message = outcome.reason
+        child_task_ids = list(outcome.child_ids or [])
+
     return SeedResult(
         root_task_id=root_task_id,
-        child_task_ids=[],
+        child_task_ids=child_task_ids,
         fallback=True,
+        idempotent_replay=idempotent_replay,
+        decomposition_attempted=decomposition_attempted,
+        decomposition_ok=decomposition_ok,
+        decomposition_message=decomposition_message,
     )

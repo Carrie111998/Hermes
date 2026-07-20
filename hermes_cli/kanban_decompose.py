@@ -273,21 +273,55 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> DecomposeOutcome:
-    """Decompose a triage task into a graph of child tasks.
+    """Decompose a triage task in the selected board into child tasks.
 
     Returns an outcome describing what happened. Never raises for
     expected failure modes (task not in triage, no aux client
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
+
+    [hermes-v2] H-22: idempotent freeform replay. A triage root that
+    ALREADY has child links (``child_ids`` is non-empty) is considered
+    a successful decomposition from a prior call. We do NOT re-run
+    the LLM — that would burn tokens, race the dispatcher if a worker
+    is mid-claim on an existing child, and produce a divergent
+    child-id list that breaks downstream ``/agents`` / kanban lookups
+    keyed on the existing IDs. Instead we return the existing child
+    IDs with ``ok=True`` and a "already decomposed" message so the
+    seeder / CLI can surface a useful replay message.
+
+    A root with NO children (e.g. a prior attempt returned
+    ``ok=False`` for malformed JSON / LLM error / fanout=true with
+    empty list) is allowed to retry: the dispatcher loop relies on
+    that retry to eventually surface a successful decomposition.
     """
-    with kb.connect_closing() as conn:
+    with kb.connect_closing(board=board) as conn:
         task = kb.get_task(conn, task_id)
+        existing_children = kb.child_ids(conn, task_id) if task else []
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    # Idempotent replay short-circuit: only when children already
+    # exist AND the root is still in ``triage``. If the root has
+    # already promoted to ``todo`` (children were routed) the prior
+    # branch (status != triage) already returned above, so this
+    # branch is reached exactly when the root is still triage-with-
+    # children — the classic "fresh /plan approve replay" case.
+    if existing_children:
+        return DecomposeOutcome(
+            task_id,
+            True,
+            (
+                f"already decomposed: {len(existing_children)} existing "
+                "child task(s); skipping re-decompose to preserve child ids"
+            ),
+            fanout=True,
+            child_ids=list(existing_children),
         )
 
     cfg = _load_config()
@@ -361,7 +395,7 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect_closing() as conn:
+        with kb.connect_closing(board=board) as conn:
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
@@ -430,7 +464,7 @@ def decompose_task(
         })
 
     try:
-        with kb.connect_closing() as conn:
+        with kb.connect_closing(board=board) as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -456,9 +490,13 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
-    with kb.connect_closing() as conn:
+def list_triage_ids(
+    *,
+    tenant: Optional[str] = None,
+    board: Optional[str] = None,
+) -> list[str]:
+    """Return triage task IDs from the selected board."""
+    with kb.connect_closing(board=board) as conn:
         rows = kb.list_tasks(
             conn,
             status="triage",
