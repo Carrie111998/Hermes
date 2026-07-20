@@ -160,8 +160,9 @@ function useSessionActions({
 
   const spec = (partial: Omit<ActionItemSpec, 'onSelect'> & { onSelect: () => void }): ActionItemSpec => partial
 
-  // OPEN — where else this session can go. A tab surface IS a tab already,
-  // so it only offers the window hop (and its own Close, below).
+  // OPEN — where else this session can go. A tab surface IS a tab already, so
+  // it only offers the window hop (and its own Close, below). Continue on
+  // phone is orthogonal to tab-vs-window, so every surface always offers it.
   const openItems: ActionItemSpec[] = [
     ...(surface === 'row' && !alreadyTabbed
       ? [
