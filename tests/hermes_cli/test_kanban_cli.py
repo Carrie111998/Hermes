@@ -703,7 +703,24 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
 # Privileged audit-reason visibility (Unicode-invisible rejection)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("invisible", ["\u200b", "\ufeff", "\u2060", " \u200b\ufeff \u2060 "])
+_INVISIBLE_CLI_AUDIT_REASONS = [
+    "\u200b",
+    "\ufeff",
+    "\u2060",
+    "\u034f",
+    "\ufe00",
+    "\U000e0100",
+    "\u115f",
+    "\u1160",
+    "\u3164",
+    "\uffa0",
+    "\u2800",
+    "\u0301",
+    " \u034f \ufe00 \U000e0100 ",
+]
+
+
+@pytest.mark.parametrize("invisible", _INVISIBLE_CLI_AUDIT_REASONS)
 def test_run_slash_continuation_review_rejects_invisible_reason(kanban_home, invisible):
     import re
 
@@ -720,7 +737,7 @@ def test_run_slash_continuation_review_rejects_invisible_reason(kanban_home, inv
         assert not [e for e in events if e.kind == "continuation_reviewed"]
 
 
-@pytest.mark.parametrize("invisible", ["\u200b", "\ufeff", "\u2060"])
+@pytest.mark.parametrize("invisible", _INVISIBLE_CLI_AUDIT_REASONS)
 def test_run_slash_claim_operator_override_rejects_invisible_reason(kanban_home, invisible):
     import re
 

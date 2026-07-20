@@ -7134,30 +7134,69 @@ def _continuation_operator_denial(
     return None
 
 
-# Unicode general categories whose characters carry no visible ink:
-# separators (Zs/Zl/Zp), control (Cc), format (Cf — includes U+200B ZERO
-# WIDTH SPACE, U+FEFF ZERO WIDTH NO-BREAK SPACE, U+2060 WORD JOINER), and
-# surrogates (Cs).
-_INVISIBLE_REASON_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Zs"})
+# Unicode Default_Ignorable_Code_Point ranges (Unicode 14+, inclusive).  The
+# stdlib's ``unicodedata`` module does not expose derived properties, and a
+# category-only check is insufficient: variation selectors and COMBINING
+# GRAPHEME JOINER are Mn, while Hangul fillers are Lo.  Keep the derived
+# property explicit so audit validation does not depend on an optional regex
+# package or on the host's Unicode database version.
+_DEFAULT_IGNORABLE_REASON_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+# Characters outside Default_Ignorable_Code_Point that render as an empty
+# advance under common terminal/browser fonts.  U+2800 is a symbol (So), so
+# neither whitespace nor general-category checks catch it.
+_BLANK_REASON_CODEPOINTS = frozenset({0x2800})
+
+
+def _is_default_ignorable_reason_char(char: str) -> bool:
+    codepoint = ord(char)
+    return any(
+        first <= codepoint <= last
+        for first, last in _DEFAULT_IGNORABLE_REASON_RANGES
+    )
 
 
 def _normalize_visible_audit_reason(value: Any) -> str:
-    """Return the stripped reason only when it carries visible text.
+    """Return the stripped reason only when it contains visible base ink.
 
     Shared by every privileged audit-reason gate (continuation review,
-    authorization, and operator claim override). A reason composed solely of
-    whitespace, control, surrogate, separator, or format characters — e.g.
-    U+200B, U+FEFF, U+2060 alone or in any combination with whitespace — is
-    invisible in audit readback and therefore rejected (returns ``""``).
-    Accepted normal Unicode text is returned stripped, unchanged.
+    authorization, and operator claim override).  A reason composed solely of
+    separators, controls, combining marks, Unicode default-ignorables, or
+    known blank glyphs is not reliable audit text and is rejected.  Requiring
+    one L/N/P/S base character preserves ordinary CJK, accented text, emoji,
+    and punctuation while rejecting isolated marks/fillers/selectors.  Once a
+    visible base exists, the accepted original Unicode text is returned
+    stripped but otherwise unchanged (so valid emoji/combining sequences are
+    preserved).
     """
     text = str(value or "").strip()
     for char in text:
-        if char.isspace():
+        codepoint = ord(char)
+        if codepoint in _BLANK_REASON_CODEPOINTS:
             continue
-        if unicodedata.category(char) in _INVISIBLE_REASON_CATEGORIES:
+        if _is_default_ignorable_reason_char(char):
             continue
-        return text
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N", "P", "S"}:
+            return text
     return ""
 
 

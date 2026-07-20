@@ -2863,18 +2863,27 @@ def test_claim_consumes_grant_when_remote_state_stable_under_writer_lock(
         assert verifier_calls["count"] >= 2
 
 
-@pytest.mark.parametrize(
-    "invisible",
-    [
-        "\u200b",                    # ZERO WIDTH SPACE alone
-        "\ufeff",                    # ZERO WIDTH NO-BREAK SPACE alone
-        "\u2060",                    # WORD JOINER alone
-        "\u200b\ufeff\u2060",        # the exact review-probe combination
-        " \u200b \ufeff \u2060 ",    # mixed with plain whitespace
-        "\t\n \u200b",               # mixed whitespace + format
-        "\u00a0\u200b",              # NBSP (Zs) + format
-    ],
-)
+_INVISIBLE_AUDIT_REASONS = [
+    "\u200b",                    # ZERO WIDTH SPACE alone
+    "\ufeff",                    # ZERO WIDTH NO-BREAK SPACE alone
+    "\u2060",                    # WORD JOINER alone
+    "\u034f",                    # COMBINING GRAPHEME JOINER (Mn)
+    "\ufe00",                    # VARIATION SELECTOR-1 (Mn)
+    "\U000e0100",                # VARIATION SELECTOR-17 (Mn)
+    "\u115f",                    # HANGUL CHOSEONG FILLER (Lo)
+    "\u1160",                    # HANGUL JUNGSEONG FILLER (Lo)
+    "\u3164",                    # HANGUL FILLER (Lo)
+    "\uffa0",                    # HALFWIDTH HANGUL FILLER (Lo)
+    "\u2800",                    # BRAILLE PATTERN BLANK (So)
+    "\u0301",                    # isolated COMBINING ACUTE ACCENT (Mn)
+    "\u200b\ufeff\u2060",        # the exact original review-probe combination
+    " \u034f \ufe00 \U000e0100 ", # mixed residual default-ignorables + whitespace
+    "\t\n \u200b",               # mixed whitespace + format
+    "\u00a0\u200b",              # NBSP (Zs) + format
+]
+
+
+@pytest.mark.parametrize("invisible", _INVISIBLE_AUDIT_REASONS)
 def test_continuation_review_rejects_invisible_reasons(kanban_home, invisible):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="invisible review", assignee="engineer")
@@ -2888,7 +2897,7 @@ def test_continuation_review_rejects_invisible_reasons(kanban_home, invisible):
         assert exc_info.value.code == "review_reason_required"
 
 
-@pytest.mark.parametrize("invisible", ["\u200b", "\ufeff", "\u2060", " \u200b\ufeff \u2060 "])
+@pytest.mark.parametrize("invisible", _INVISIBLE_AUDIT_REASONS)
 def test_authorize_continuation_rejects_invisible_reasons(kanban_home, invisible):
     pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
     with kb.connect() as conn:
@@ -2911,7 +2920,7 @@ def test_authorize_continuation_rejects_invisible_reasons(kanban_home, invisible
         assert denial["reason"] == "reason_required"
 
 
-@pytest.mark.parametrize("invisible", ["\u200b", "\ufeff", "\u2060", " \u200b\ufeff \u2060 "])
+@pytest.mark.parametrize("invisible", _INVISIBLE_AUDIT_REASONS)
 def test_operator_override_rejects_invisible_reasons(kanban_home, invisible):
     pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
     with kb.connect() as conn:
@@ -2930,7 +2939,7 @@ def test_operator_override_rejects_invisible_reasons(kanban_home, invisible):
 
 def test_visible_unicode_reasons_are_accepted_and_stored(kanban_home):
     """Normal Unicode text (CJK, accented Latin, emoji) stays intact."""
-    reason = "修复 active PR — réparation ✓"
+    reason = "修复 active PR — re\u0301paration 👩\u200d💻 ✓"
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="unicode review", assignee="engineer")
         event_id = kb.record_continuation_review(
