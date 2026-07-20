@@ -2915,6 +2915,16 @@ def create_task(
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
 
+    Passing ``initial_status='blocked'`` parks the task in ``blocked``
+    and, in addition to the standard ``created`` event, emits a
+    ``blocked`` event so the sticky-block guards in
+    :func:`_has_sticky_block` and :func:`recompute_ready` recognise this
+    as an operator-initiated park and refuse to auto-promote an
+    elternlosen root. Direct status writes outside this path (e.g.
+    ``_record_task_failure`` flipping ``status='blocked'`` below the
+    circuit-breaker limit) do NOT emit the event, so the auto-recover
+    behaviour for transient blocks is preserved (#28712 / #35072).
+
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
     creating a duplicate. Useful for retried webhooks / automation that
@@ -3123,13 +3133,53 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
-            return row["id"]
+            existing_id = str(row["id"])
+            # [hermes-v2] H-22/H-31: sticky-block backfill. A task
+            # created with ``initial_status='blocked'`` that is being
+            # re-created with the same ``idempotency_key`` (typical
+            # for ``/plan approve`` replays and pipeline-root re-seeds)
+            # MUST stay sticky across the replay — otherwise the
+            # dispatcher would auto-promote the parentless root back to
+            # ``ready`` on the next ``recompute_ready`` tick. The
+            # ``_has_sticky_block`` discriminator looks at the most
+            # recent of ``{blocked, unblocked}``: if that row is
+            # missing (e.g. a legacy DB where the original
+            # ``create_task``-time event was never written, or a row
+            # whose ``unblocked`` row came AFTER the original
+            # ``blocked`` and the operator then re-blocked by hand),
+            # we backfill exactly ONE blocked event with a
+            # ``create_task.initial_status_replay`` source. This is
+            # idempotent:
+            #  * Sticky tasks (most-recent event already ``blocked``)
+            #    are untouched — no double event.
+            #  * Tasks the operator explicitly transitioned to ready /
+            #    done / etc. are NOT re-blocked: status is left alone,
+            #    only the event row is appended when the status is
+            #    ``blocked`` AND the sticky guard does not already
+            #    fire.
+            if (
+                initial_status == "blocked"
+                and row["status"] == "blocked"
+                and not _has_sticky_block(conn, existing_id)
+            ):
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        existing_id,
+                        "blocked",
+                        {
+                            "reason": None,
+                            "kind": None,
+                            "source": "create_task.initial_status_replay",
+                        },
+                    )
+            return existing_id
 
     now = int(time.time())
 
@@ -3251,6 +3301,15 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                # [CORE-PATCH] H-22/H-31: a task created with
+                # ``initial_status='blocked'`` is explicitly parked by
+                # the caller (plan-approval seed, pipeline root). Emit a
+                # ``blocked`` event AFTER ``created`` so ``_has_sticky_block``
+                # / ``recompute_ready`` recognise the task as operator-initiated
+                # and refuse to auto-promote a parentless root back to
+                # ``ready``. Direct DB-/circuit-breaker-driven ``status='blocked'``
+                # writes (no event row) keep the auto-recover semantics
+                # intact — see ``_has_sticky_block`` for the discriminator.
                 _append_event(
                     conn,
                     task_id,
@@ -3271,6 +3330,17 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if initial_status == "blocked" and task_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": None,
+                            "kind": None,
+                            "source": "create_task.initial_status",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
