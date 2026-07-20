@@ -6,12 +6,14 @@ command**:
 
 ```bash
 cd ~/.hermes/hermes-agent
-./venv/bin/pytest -m h61_regression -v
+./scripts/run_tests.sh -m h61_regression -v
 ```
 
-Expected: all tests pass (currently 46 passed, 2 skipped — the
-skipped ones are tagged `real_concurrent_gate` / `real_agent_prewarm`
-which are env-dependent).
+Expected: all tests pass (currently 46 passed across four files —
+`tests/agent/test_minimax_anthropic_thinking.py`,
+`tests/agent/test_chat_completions_top_p.py`,
+`tests/run_agent/test_minimax_tool_reasoning.py`,
+`tests/run_agent/test_thinking_budget_ultra.py`).
 
 ## What's covered
 
@@ -21,17 +23,30 @@ narrow to a single patch if you suspect a specific regression:
 | Marker | Patch | Tests |
 |---|---|---|
 | `h61_regression` | All hermes-v2 Core-Patches | 46 (auto-collected) |
-| `h10_regression` | MiniMax-Interleaved-Thinking (H-10) | ~28 |
-| `h11_regression` | `THINKING_BUDGET` ultra tier (H-11) | ~10 |
-| `h12_regression` | `top_p` passthrough (H-12) | ~6 |
+| `h10_regression` | MiniMax-Interleaved-Thinking (H-10) | 30 |
+| `h11_regression` | `THINKING_BUDGET` ultra tier (H-11) | 10 |
+| `h12_regression` | `top_p` passthrough (H-12) | 6 |
 
 To run only one patch:
 
 ```bash
-./venv/bin/pytest -m h10_regression -v   # H-10 only
-./venv/bin/pytest -m h11_regression -v   # H-11 only
-./venv/bin/pytest -m h12_regression -v   # H-12 only
+./scripts/run_tests.sh -m h10_regression -v   # H-10 only
+./scripts/run_tests.sh -m h11_regression -v   # H-11 only
+./scripts/run_tests.sh -m h12_regression -v   # H-12 only
 ```
+
+> **H-10 marker coverage:** `tests/run_agent/test_minimax_tool_reasoning.py`
+> is double-marked with both `h61_regression` and `h10_regression`
+> so the standard `-m h10_regression` lane picks up the
+> `_needs_thinking_reasoning_pad()` regression alongside its H-10
+> siblings (`tests/agent/test_minimax_anthropic_thinking.py`).
+> Without the dual marker a `-m h10_regression` invocation would
+> only see 8 tests instead of 30 and silently miss the
+> `_needs_thinking_reasoning_pad()` regression. Tests are
+> collected/verified via the four-marker-file command, not direct
+> `pytest` calls — the count above is the live
+> `pytest --collect-only -q` total of those four files filtered by
+> the corresponding marker.
 
 ## If a regression appears
 
@@ -46,8 +61,8 @@ To run only one patch:
 4. **Rollback option B — full rollback:** `git reset --hard
    pre-hermes-v2` resets the whole branch to the H-01 baseline
    anchor.
-5. **Verify:** re-run `pytest -m h61_regression`. If green, the
-   rollback worked.
+5. **Verify:** re-run `./scripts/run_tests.sh -m h61_regression`.
+   If green, the rollback worked.
 
 ## Pre-pull baseline tag
 
@@ -82,7 +97,7 @@ The same command is CI-ready:
 ```yaml
 # .github/workflows/hermes-v2-regression.yml
 - name: H-61 regression
-  run: ./venv/bin/pytest -m h61_regression -v --tb=short
+  run: ./scripts/run_tests.sh -m h61_regression -v --tb=short
 ```
 
 Not currently wired into the project's CI — manual invocation is

@@ -25,8 +25,16 @@ from types import SimpleNamespace
 
 import pytest
 
-# [hermes-v2] H-61: regression marker for Core-Patch verification
-pytestmark = pytest.mark.h61_regression
+# [hermes-v2] H-61: regression marker for Core-Patch verification.
+# ``h10_regression`` keeps the file reachable from the standard
+# hermes-v2 regression marker set (the four marker files collected by
+# ``scripts/run_tests.sh`` use ``-m h10_regression``) so a downstream
+# CI lane that only filters by ``h10_regression`` still picks up the
+# MiniMax thinking-mode pad regression alongside its H-10 siblings.
+pytestmark = [
+    pytest.mark.h10_regression,
+    pytest.mark.h61_regression,
+]
 
 from run_agent import AIAgent
 
@@ -73,19 +81,18 @@ class TestNeedsMiniMaxToolReasoning:
         assert agent._needs_minimax_tool_reasoning() is True
 
     @pytest.mark.parametrize(
-        "base_url",
+        ("base_url", "expected"),
         [
-            "https://api.minimax.io/v1",
-            "https://api.minimax.io/anthropic",
-            "https://api.minimaxi.com/v1",
-            "https://api.minimaxi.com/anthropic",
-            "https://api.minimax.io/",
-            "http://127.0.0.1:11434/v1",  # not MiniMax, negative
+            ("https://api.minimax.io/v1", True),
+            ("https://api.minimax.io/anthropic", True),
+            ("https://api.minimaxi.com/v1", True),
+            ("https://api.minimaxi.com/anthropic", True),
+            ("https://api.minimax.io/", True),
+            ("http://127.0.0.1:11434/v1", False),
         ],
     )
-    def test_base_url_host(self, base_url: str) -> None:
+    def test_base_url_host(self, base_url: str, expected: bool) -> None:
         agent = _make_agent(provider="custom", model="", base_url=base_url)
-        expected = "minimax" in base_url.lower() and "127.0.0.1" not in base_url
         assert agent._needs_minimax_tool_reasoning() is expected
 
     def test_non_minimax_provider(self) -> None:
