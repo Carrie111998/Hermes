@@ -1337,6 +1337,36 @@ class TestFindThread:
 
 
 class TestProjection:
+    def test_projection_uses_inventory_preview_when_full_read_times_out(self) -> None:
+        summary = CodexThreadSummary(
+            native_id="oversized-catalog-thread",
+            title="Long-running catalog task",
+            cwd="C:/work/catalog",
+            started_at=100,
+            last_active=300,
+            archived=False,
+            revision="state-db-revision",
+            git_branch="codex/catalog",
+            git_head="deadbeef",
+            source_kind="vscode",
+            preview="Keep this meaningful session discoverable",
+            native_path="C:/codex/sessions/oversized-catalog-thread.jsonl",
+        )
+        client = FakeInitializingClient({
+            "thread/read": [TimeoutError("synthetic oversized thread")]
+        })
+
+        projection = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).project_thread(summary)
+
+        assert projection.native_id == summary.native_id
+        assert projection.native_path == summary.native_path
+        assert projection.native_cursor == summary.revision
+        assert [(message.role, message.content) for message in projection.messages] == [
+            ("user", summary.preview)
+        ]
+
     def test_thread_read_projects_turn_items_and_diagnostic_path(self) -> None:
         client = FakeInitializingClient({"thread/read": [_fixture("thread-read.json")]})
         projection = CodexSourceAdapter(client, marker_secret=SECRET).project_thread(

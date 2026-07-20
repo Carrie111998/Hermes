@@ -766,11 +766,16 @@ class CodexSourceAdapter:
     ) -> SessionProjection:
         self._ensure_initialized()
         if response is None:
-            response = self._client.request(
-                "thread/read",
-                {"threadId": summary.native_id, "includeTurns": True},
-                timeout=_REQUEST_TIMEOUT,
-            )
+            try:
+                response = self._client.request(
+                    "thread/read",
+                    {"threadId": summary.native_id, "includeTurns": True},
+                    timeout=_REQUEST_TIMEOUT,
+                )
+            except TimeoutError:
+                if summary.preview is None:
+                    raise
+                return self._project_state_db_summary(summary)
         thread = _thread_from_response(response)
         response_native_id = _nonempty_string(
             _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
