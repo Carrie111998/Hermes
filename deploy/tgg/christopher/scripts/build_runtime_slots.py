@@ -55,7 +55,7 @@ EVENT_LABELS_NEW = (
 )
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
-NEW_INSTRUCTION_COUNT = 11
+NEW_INSTRUCTION_COUNT = 12
 
 # Exact runtime registry for the PA business bridge. Constitution prose may
 # mention only these names after the word "operation"; aliases otherwise fail
@@ -314,6 +314,18 @@ def _validate(
     assert "LOW confidence" in joined
     assert "runtime supplies" in joined
     assert "current-turn refs when they are omitted" in joined
+    # Stage-1 roll-forward (2026-07-20): placeholder sourceRefs ban + the
+    # evidence-attach justification contract with refs-preserving retry.
+    assert "Never write a placeholder token" in joined
+    assert "current_turn" in joined
+    assert "Evidence-attach justification contract" in joined
+    assert "ATTACH_UNJUSTIFIED" in joined
+    assert "identifier_match" in joined
+    assert "thread_continuation" in joined
+    assert "operator_directive" in joined
+    assert "block_unit" in joined
+    assert "retry with the SAME sourceRefs" in joined
+    assert "never remove photo or media" in joined
     assert "pure social acknowledgement" in joined
     # Exactly one create policy: the consolidated rule is present, the broader
     # June create instruction is gone, and no other instruction names the

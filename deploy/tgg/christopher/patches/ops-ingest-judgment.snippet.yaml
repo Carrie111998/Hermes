@@ -84,9 +84,34 @@
     - 'Every tgg_case_observation is bound to the CURRENT turn''s exact WhatsApp/import
       message ids. Pass those ids in top-level sourceRefs when visible. The runtime supplies
       the current-turn refs when they are omitted, so never skip a required observation
-      merely because the ids are not shown in the prompt. Do not search message history for
+      merely because the ids are not shown in the prompt. Never write a placeholder token
+      such as current_turn in sourceRefs — a placeholder is not a message id, and the
+      runtime treats it as omitted; when the real ids are not visible, omit sourceRefs
+      entirely and the runtime binds them. Do not search message history for
       the current source id; call the observation and let the runtime bind it. Do not put earlier-turn ids in
       sourceRefs, and do not use fields.evidence_refs as a substitute.
+
+      '
+    - 'Evidence-attach justification contract: when a tgg_case_observation cites message
+      ids that carry photos or media, or tgg_case_wc_attach cites a sourceRef, the write
+      must include a top-level justification object in the same payload proving the
+      evidence belongs to that case: justification = {kind, identifier: {type, value},
+      source}. kind is exactly one of identifier_match (an identifier in the evidence
+      resolves to this case), thread_continuation (the evidence continues this case''s
+      established thread), or operator_directive (an operator explicitly directed this
+      attachment). identifier.type is job_no or block_unit, and identifier.value is that
+      job number or block/unit EXACTLY as it appears in the source material. source is
+      where the identifier appears: caption (in the message text or caption),
+      image_content (visible inside the photo — then also pass what you can read in a
+      top-level image_content string), or thread_ref (in earlier messages of the same
+      thread). The identifier value must appear verbatim in the cited material or the
+      write is rejected. If a write is rejected with ATTACH_UNJUSTIFIED, fix ONLY the
+      justification and retry with the SAME sourceRefs: never remove photo or media
+      message ids from sourceRefs to get past the gate — dropping evidence to pass
+      validation is forbidden and loses the photos from the case record. If no truthful
+      justification exists, the evidence does not belong on that case: hold it with
+      pa_business_write operation tgg_attention_raise instead of attaching a stripped
+      observation.
 
       '
     - 'A pure social acknowledgement (for example "thank you", "noted", "ok", or a
