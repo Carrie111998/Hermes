@@ -704,6 +704,14 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "project_id": None,
         "created_at": None,
         "archived": False,
+        # [hermes-v2 P-71] Board-scoped dispatch guard. FAIL-CLOSED: a
+        # board that has never opted in (no ``dispatchable`` key in
+        # board.json) is NOT auto-dispatched by the gateway. Only boards
+        # explicitly set ``dispatchable: true`` (coding / worker / swarm
+        # boards) fan out workers. Checklist / planning boards stay false
+        # so the 2026-07-20 spawn-storm (default_assignee auto-assigned a
+        # planning board's ready tasks) cannot recur.
+        "dispatchable": False,
     }
     try:
         p = board_metadata_path(slug)
@@ -730,6 +738,7 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    dispatchable: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -760,6 +769,9 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if dispatchable is not None:
+        # [hermes-v2 P-71] Persist the per-board dispatch opt-in.
+        meta["dispatchable"] = bool(dispatchable)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -770,6 +782,23 @@ def write_board_metadata(
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+def board_is_dispatchable(board: Optional[str] = None) -> bool:
+    """Return whether the gateway dispatcher may fan out workers on ``board``.
+
+    [hermes-v2 P-71] Single source of truth for the board-scoped dispatch
+    guard. FAIL-CLOSED: any board whose ``board.json`` lacks an explicit
+    ``dispatchable: true`` (including a missing / malformed file) returns
+    ``False``. Callers in :mod:`gateway.kanban_watchers` consult this
+    BEFORE reclaim / auto-promote / spawn so a planning or checklist board
+    is never touched by the embedded dispatcher — regardless of
+    ``kanban.default_assignee`` auto-assigning its ready tasks.
+    """
+    try:
+        return bool(read_board_metadata(board).get("dispatchable"))
+    except Exception:
+        return False
 
 
 def create_board(
@@ -8284,6 +8313,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    respect_dispatchable: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8318,6 +8348,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            respect_dispatchable=respect_dispatchable,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8334,6 +8365,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            respect_dispatchable=respect_dispatchable,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8354,6 +8386,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    respect_dispatchable: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8382,7 +8415,17 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+
+    ``respect_dispatchable`` (default ``False`` to keep every existing
+    caller/test behaving as before) opts this tick into the P-71
+    board-scoped dispatch guard: when set, a board that is not explicitly
+    ``dispatchable: true`` returns an empty result with NO reclaim, promote
+    or spawn. The gateway dispatcher passes ``True`` so a planning /
+    checklist board can never be worked automatically — the fix for the
+    2026-07-20 spawn storm.
     """
+    if respect_dispatchable and not board_is_dispatchable(board):
+        return DispatchResult()
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
