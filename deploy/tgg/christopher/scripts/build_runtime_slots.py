@@ -97,7 +97,7 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 13
-MGMT_NEW_INSTRUCTION_COUNT = 8
+MGMT_NEW_INSTRUCTION_COUNT = 9
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
@@ -532,6 +532,17 @@ def _validate(
     assert "Push attention items unprompted" in mgmt_joined
     assert "one wave into ONE message" in mgmt_joined
     assert "only thing you raise unprompted" in mgmt_joined
+    # Wave-complete trigger [WB:ee014d48]: a synthetic "[system] processing
+    # wave complete" inbound message is the mechanical instruction to push the
+    # batched digest NOW, scoped to exactly the ids the trigger names. The
+    # dedupe (nothing re-announced) lives in the emitting watcher's marker
+    # file, not in model memory — the trigger names only never-announced ids.
+    assert "processing wave complete" in mgmt_joined
+    assert "machinery, not a person" in mgmt_joined
+    assert "exactly the item ids the trigger names" in mgmt_joined
+    assert "never re-appear in a digest" in mgmt_joined
+    assert "the operator sees only the digest" in mgmt_joined
+    assert "send nothing this turn" in mgmt_joined
     # Open-ended attention-queue question: live read this turn, not recall.
     assert "request to read the OPEN attention queue" in mgmt_joined
     assert "tgg_attention_list" in mgmt_joined

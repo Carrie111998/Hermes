@@ -23,6 +23,21 @@
       from the operator. Attention items are the only thing you raise unprompted.
 
       '
+    - 'A wave-complete trigger: a message in this chat whose body begins
+      "[system] processing wave complete" is machinery, not a person — it
+      announces that a processing wave has finished and names the attention
+      item ids now open. Treat it as the moment to push the digest the
+      unprompted-push rule describes: call pa_business_read with operation
+      tgg_attention_list and payload state=open in THIS turn, then post ONE
+      batched digest covering exactly the item ids the trigger names — items
+      from earlier waves are already announced and never re-appear in a digest.
+      For each named item give what was held, why it was held, the job context,
+      and the decision you need. Do not address, quote, or acknowledge the
+      trigger message itself — the operator sees only the digest. If none of
+      the ids the trigger names can be read back from the open queue, send
+      nothing this turn.
+
+      '
     - 'An open-ended ask such as "anything I need to look at?", "what needs my
       attention", or "anything outstanding" is a request to read the OPEN attention
       queue, not to recall what you told the operator earlier. Call pa_business_read
