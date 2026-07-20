@@ -148,6 +148,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-root", required=True)
     parser.add_argument("--slot-file", required=True)
     parser.add_argument("--report", required=True)
+    # Optional fixture overrides. The defaults are the deploy-verification
+    # probe (a management chat asked to reply READY); overriding them lets the
+    # same isolated rig exercise a real turn shape — e.g. a management Q&A —
+    # without touching the live service.
+    parser.add_argument("--chat-id", default="120363409954029949@g.us")
+    parser.add_argument("--chat-name", default="Christopher Deployment Verification")
+    parser.add_argument(
+        "--body",
+        default="Synthetic deployment verification. Reply with exactly READY.",
+    )
     return parser
 
 
@@ -187,12 +197,12 @@ def main() -> int:
         )
         fixture = {
             "messageId": f"synthetic-{uuid.uuid4().hex}",
-            "chatId": "120363409954029949@g.us",
+            "chatId": args.chat_id,
             "senderId": "synthetic-verifier",
             "senderName": "Synthetic Verifier",
-            "chatName": "Christopher Deployment Verification",
+            "chatName": args.chat_name,
             "isGroup": True,
-            "body": "Synthetic deployment verification. Reply with exactly READY.",
+            "body": args.body,
             "hasMedia": False,
             "mediaType": None,
             "mediaUrls": [],

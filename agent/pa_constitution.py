@@ -27,6 +27,14 @@ class PAJobBrief:
     disabled_toolsets: tuple[str, ...] = field(default_factory=tuple)
     fact_operations: Mapping[str, Any] = field(default_factory=dict)
     response_policy: Mapping[str, Any] = field(default_factory=dict)
+    # Optional per-brief PA business-operation scoping. Shape:
+    #   business_operations:
+    #     allowed: [op, ...]   # allowlist — every other operation is denied
+    #     denied:  [op, ...]   # subtractive denylist
+    # An empty mapping (the default) means "this brief does not scope business
+    # operations" and the full configured registry stays available, so briefs
+    # that predate this field keep today's behaviour exactly.
+    business_operations: Mapping[str, Any] = field(default_factory=dict)
     # Optional per-chat gate / debounce overrides. ``None`` means "not set by
     # this brief" — the caller falls back to global config / universal default
     # so today's behaviour is preserved when a brief sets nothing.
@@ -232,6 +240,19 @@ def render_job_prompt(resolved: PAResolvedContext) -> str:
     if brief.disabled_toolsets:
         lines.extend(["", "## Disabled Toolsets"])
         lines.extend(f"- {toolset}" for toolset in brief.disabled_toolsets)
+    if brief.business_operations:
+        allowed = tuple(brief.business_operations.get("allowed", ()) or ())
+        denied = tuple(brief.business_operations.get("denied", ()) or ())
+        lines.extend(["", "## Business Operations"])
+        if allowed:
+            lines.append(
+                "These are the ONLY business operations available in this chat. "
+                "Any other operation is refused by the runtime, not just discouraged:"
+            )
+            lines.extend(f"- {name}" for name in allowed)
+        if denied:
+            lines.append("These business operations are refused by the runtime in this chat:")
+            lines.extend(f"- {name}" for name in denied)
     if brief.fact_operations:
         lines.extend(["", "## Fact Operations"])
         lines.extend(_render_mapping(brief.fact_operations))
@@ -262,6 +283,10 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
     runtime = _optional_mapping(raw_brief.get("runtime", {}), f"{source}.job_briefs.{job_type}.runtime")
     fact_operations = _optional_mapping(raw_brief.get("fact_operations", {}), f"{source}.job_briefs.{job_type}.fact_operations")
     response_policy = _optional_mapping(raw_brief.get("response_policy", {}), f"{source}.job_briefs.{job_type}.response_policy")
+    business_operations = _load_business_operations(
+        raw_brief.get("business_operations", {}),
+        f"{source}.job_briefs.{job_type}.business_operations",
+    )
     enabled_toolsets = _string_tuple(
         raw_brief.get("enabled_toolsets", ()),
         f"{source}.job_briefs.{job_type}.enabled_toolsets",
@@ -292,6 +317,7 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         "disabled_toolsets": disabled_toolsets,
         "fact_operations": fact_operations,
         "response_policy": response_policy,
+        "business_operations": business_operations,
         "require_mention": require_mention,
         "debounce_passive_ms": debounce_passive_ms,
         "debounce_addressed_ms": debounce_addressed_ms,
@@ -306,6 +332,7 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         disabled_toolsets=disabled_toolsets,
         fact_operations=dict(fact_operations),
         response_policy=dict(response_policy),
+        business_operations=dict(business_operations),
         require_mention=require_mention,
         debounce_passive_ms=debounce_passive_ms,
         debounce_addressed_ms=debounce_addressed_ms,
@@ -496,6 +523,48 @@ def _optional_mapping(value: Any, source: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{source}: must be a mapping")
     return value
+
+
+_BUSINESS_OPERATION_KEYS = ("allowed", "denied")
+
+
+def _load_business_operations(value: Any, source: str) -> Mapping[str, Any]:
+    """Validate a job brief's ``business_operations`` scoping block.
+
+    Returns a normalized mapping with only the recognised keys present, each a
+    tuple of operation names. An empty result means "unscoped" — the caller
+    leaves the configured operation registry untouched.
+    """
+    mapping = _optional_mapping(value, source)
+    if not mapping:
+        return {}
+    unknown = sorted(set(mapping) - set(_BUSINESS_OPERATION_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{source}: unknown keys {unknown}; expected any of "
+            f"{list(_BUSINESS_OPERATION_KEYS)}"
+        )
+    normalized: dict[str, tuple[str, ...]] = {}
+    for key in _BUSINESS_OPERATION_KEYS:
+        if key not in mapping:
+            continue
+        names = _string_tuple(mapping.get(key), f"{source}.{key}")
+        # Preserve author order but drop duplicates so the rendered prompt and
+        # the behavior hash stay stable across cosmetic edits.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for name in names:
+            text = name.strip()
+            if text and text not in seen:
+                seen.add(text)
+                deduped.append(text)
+        normalized[key] = tuple(deduped)
+    if normalized.get("allowed") == ():
+        raise ValueError(
+            f"{source}.allowed: must not be empty — omit the key to leave "
+            "business operations unscoped rather than denying every operation"
+        )
+    return normalized
 
 
 def _string_tuple(value: Any, source: str) -> tuple[str, ...]:

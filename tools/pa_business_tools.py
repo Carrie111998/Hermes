@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -53,6 +53,33 @@ class PABusinessBridgeConfig:
     operations: Mapping[str, PABusinessOperation]
     tenant: str | None = None
     auth: Mapping[str, Any] | None = None
+    # Operations that ARE configured for this client but are scoped out of the
+    # resolved job brief (per-chat toolset scoping). They are absent from
+    # ``operations`` so they can never execute; kept here only so the refusal
+    # can say "not permitted in this chat" instead of "unknown operation".
+    denied_operations: frozenset[str] = frozenset()
+
+
+class OperationNotPermitted(ValueError):
+    """Raised when a configured operation is scoped out of the active job brief.
+
+    This is the per-chat tool-scoping guarantee: the mgmt chat and the ingest
+    chats share one process and one client operation registry, so the brief's
+    ``business_operations`` block is what mechanically separates them.
+    """
+
+    code = "OPERATION_NOT_PERMITTED"
+
+    def __init__(self, *, operation: str, job_type: str | None, permitted: Iterable[str]):
+        self.operation = operation
+        self.job_type = job_type
+        self.permitted = tuple(sorted(permitted))
+        scope = f"job brief {job_type!r}" if job_type else "the active job brief"
+        super().__init__(
+            "OPERATION_NOT_PERMITTED: "
+            f"operation {operation!r} is not available in this chat ({scope}). "
+            f"Permitted operations: {', '.join(self.permitted) or 'none'}"
+        )
 
 
 class TenantScopeMismatch(ValueError):
@@ -194,11 +221,58 @@ def load_business_bridge_config(
             timeout=timeout,
         )
 
+    permitted, denied = _scope_operations_to_job_brief(operations, pa_context)
+
     return PABusinessBridgeConfig(
-        operations=operations,
+        operations=permitted,
         tenant=tenant,
         auth=dict(auth) if isinstance(auth, Mapping) else None,
+        denied_operations=denied,
     )
+
+
+def _job_brief_business_operations(pa_context: Any | None) -> Mapping[str, Any]:
+    """Return the resolved job brief's ``business_operations`` scoping block."""
+    job_brief = getattr(pa_context, "job_brief", None)
+    if job_brief is None:
+        return {}
+    scoping = getattr(job_brief, "business_operations", None)
+    return scoping if isinstance(scoping, Mapping) else {}
+
+
+def _scope_operations_to_job_brief(
+    operations: Mapping[str, PABusinessOperation],
+    pa_context: Any | None,
+) -> tuple[dict[str, PABusinessOperation], frozenset[str]]:
+    """Restrict the configured operation registry to the active job brief.
+
+    This is the enforcement half of per-chat tool scoping. Christopher runs one
+    process across the ingest chats and the management chats; the selector picks
+    the job brief, and this drops every operation that brief does not permit
+    from the registry entirely. A dropped operation cannot execute by any path —
+    the generic ``pa_business_read``/``pa_business_write`` tools and every
+    dedicated tool (``tgg_case_create`` and friends) all resolve through this
+    same registry.
+
+    Briefs that declare no ``business_operations`` block are left unscoped, so
+    existing deployments are unaffected.
+    """
+    scoping = _job_brief_business_operations(pa_context)
+    if not scoping:
+        return dict(operations), frozenset()
+
+    allowed = tuple(scoping.get("allowed", ()) or ())
+    denied = tuple(scoping.get("denied", ()) or ())
+
+    permitted: dict[str, PABusinessOperation] = {}
+    for name, op in operations.items():
+        if allowed and name not in allowed:
+            continue
+        if name in denied:
+            continue
+        permitted[name] = op
+
+    return permitted, frozenset(set(operations) - set(permitted))
 
 
 def _client_business_bridge(pa_context: Any | None) -> Mapping[str, Any]:
@@ -545,6 +619,15 @@ def execute_business_operation(
         if canonical_operation:
             operation = canonical_operation
             op = bridge_config.operations.get(operation)
+    if op is None and operation in bridge_config.denied_operations:
+        # Configured for this client, but scoped out of the active job brief.
+        # Distinguish this from a genuine typo so the model can self-correct
+        # towards what it IS allowed to do here instead of retrying blindly.
+        raise OperationNotPermitted(
+            operation=operation,
+            job_type=getattr(pa_context, "job_type", None),
+            permitted=bridge_config.operations,
+        )
     if op is None:
         known = ", ".join(sorted(bridge_config.operations)) or "none configured"
         raise ValueError(f"unknown PA business operation {operation!r}; known: {known}")
