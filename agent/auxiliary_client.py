@@ -1350,6 +1350,8 @@ class _CodexCompletionsAdapter:
         total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
         deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
+        timeout_close_lock = threading.Lock()
+        timeout_close_claimed = False
         timeout_timer: Optional[threading.Timer] = None
         # A protected provider call may outlive its owning compression attempt:
         # the owner returns promptly on hard cancellation while this adapter is
@@ -1366,19 +1368,24 @@ class _CodexCompletionsAdapter:
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
         def _close_client_on_timeout() -> None:
-            begin_timeout_cleanup = getattr(
-                protected_cancel_check, "begin_timeout_cleanup", None
-            )
-            if callable(begin_timeout_cleanup):
-                timeout_won = bool(begin_timeout_cleanup())
-            else:
-                timeout_won = not (
-                    callable(protected_cancel_check)
-                    and _captured_aux_cancel_requested(protected_cancel_check)
+            nonlocal timeout_close_claimed
+            with timeout_close_lock:
+                if timeout_close_claimed:
+                    return
+                timeout_close_claimed = True
+                begin_timeout_cleanup = getattr(
+                    protected_cancel_check, "begin_timeout_cleanup", None
                 )
-            # Publish transport timeout only after the attempt-local decision is
-            # fixed, so owner polling cannot observe completion in between.
-            timed_out.set()
+                if callable(begin_timeout_cleanup):
+                    timeout_won = bool(begin_timeout_cleanup())
+                else:
+                    timeout_won = not (
+                        callable(protected_cancel_check)
+                        and _captured_aux_cancel_requested(protected_cancel_check)
+                    )
+                # Publish transport timeout only after the attempt-local decision
+                # is fixed, so owner polling cannot observe completion in between.
+                timed_out.set()
             if not timeout_won:
                 # The request owner already hard-cancelled this attempt. The
                 # OpenAI client is process-shared, so closing/evicting it here
@@ -4262,6 +4269,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    use_cache: bool = True,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -4279,6 +4287,7 @@ def _retry_same_provider_sync(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            use_cache=use_cache,
         )
     if retry_client is None:
         raise RuntimeError(
@@ -4306,15 +4315,19 @@ def _retry_same_provider_sync(
         retry_kwargs["extra_headers"] = dict(extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        _relay_sync_completion(
-            retry_client,
-            retry_kwargs,
-            provider=resolved_provider,
-            api_mode=resolved_api_mode,
-        ),
-        task,
-    )
+    try:
+        return _validate_llm_response(
+            _relay_sync_completion(
+                retry_client,
+                retry_kwargs,
+                provider=resolved_provider,
+                api_mode=resolved_api_mode,
+            ),
+            task,
+        )
+    finally:
+        if not use_cache:
+            _close_aux_client_quietly(retry_client)
 
 
 async def _retry_same_provider_async(
@@ -6993,8 +7006,9 @@ def _refresh_nous_auxiliary_client(
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
+    use_cache: bool = True,
 ) -> Tuple[Optional[Any], Optional[str]]:
-    """Refresh Nous runtime creds, rebuild the client, and replace the cache entry."""
+    """Refresh Nous runtime creds, rebuild the client, and optionally replace the cache entry."""
     runtime = _resolve_nous_runtime_api(force_refresh=True)
     if runtime is None:
         return None, model
@@ -7024,7 +7038,8 @@ def _refresh_nous_auxiliary_client(
         is_vision=is_vision,
         model=final_model,
     )
-    _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
+    if use_cache:
+        _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
     return client, final_model
 
 
@@ -7081,17 +7096,23 @@ def _force_close_async_httpx(client: Any) -> None:
         pass
 
 
-def _close_cached_client(client: Any) -> None:
-    """Apply the canonical best-effort close policy to one cached client."""
+def _close_aux_client_quietly(client: Any) -> None:
+    """Best-effort close for one-off auxiliary clients."""
     if client is None:
         return
-    _force_close_async_httpx(client)
     try:
         close_fn = getattr(client, "close", None)
         if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
             close_fn()
+        else:
+            _force_close_async_httpx(client)
     except Exception:
         pass
+
+
+def _close_cached_client(client: Any) -> None:
+    """Apply the canonical best-effort close policy to one cached client."""
+    _close_aux_client_quietly(client)
 
 
 def shutdown_cached_clients() -> None:
@@ -7162,6 +7183,7 @@ def _get_cached_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    use_cache: bool = True,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Get or create a cached client for the given provider.
 
@@ -7202,27 +7224,28 @@ def _get_cached_client(
         task=task,
         model=model,
     )
-    with _client_cache_lock:
-        if cache_key in _client_cache:
-            cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
-                # Validate: the cached client must be bound to the CURRENT,
-                # OPEN loop.  If the loop changed or was closed, the httpx
-                # transport inside is dead — force-close and replace.
-                loop_ok = (
-                    cached_loop is not None
-                    and cached_loop is current_loop
-                    and not cached_loop.is_closed()
-                )
-                if loop_ok:
+    if use_cache:
+        with _client_cache_lock:
+            if cache_key in _client_cache:
+                cached_client, cached_default, cached_loop = _client_cache[cache_key]
+                if async_mode:
+                    # Validate: the cached client must be bound to the CURRENT,
+                    # OPEN loop.  If the loop changed or was closed, the httpx
+                    # transport inside is dead — force-close and replace.
+                    loop_ok = (
+                        cached_loop is not None
+                        and cached_loop is current_loop
+                        and not cached_loop.is_closed()
+                    )
+                    if loop_ok:
+                        effective = _compat_model(cached_client, model, cached_default)
+                        return cached_client, effective
+                    # Stale — evict and fall through to create a new client.
+                    _force_close_async_httpx(cached_client)
+                    del _client_cache[cache_key]
+                else:
                     effective = _compat_model(cached_client, model, cached_default)
                     return cached_client, effective
-                # Stale — evict and fall through to create a new client.
-                _force_close_async_httpx(cached_client)
-                del _client_cache[cache_key]
-            else:
-                effective = _compat_model(cached_client, model, cached_default)
-                return cached_client, effective
     # Build outside the lock.
     # For pool-backed api_key providers, derive the active API key from the
     # pool entry rather than from env vars.  resolve_api_key_provider_credentials
@@ -7247,7 +7270,7 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
     )
-    if client is not None:
+    if client is not None and use_cache:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
@@ -8455,6 +8478,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    use_cache: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -8506,6 +8530,12 @@ def call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
+    effective_use_cache = use_cache
+    if task == "title_generation":
+        # Auto-title runs in a background thread and should not share transient
+        # auxiliary clients across attempts or across auth-refresh retries.
+        effective_use_cache = False
+
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
@@ -8540,6 +8570,7 @@ def call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            use_cache=effective_use_cache,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -8569,7 +8600,7 @@ def call_llm(
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
-                client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
+                client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task, use_cache=effective_use_cache)
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -8841,6 +8872,7 @@ def call_llm(
                 api_mode=resolved_api_mode,
                 main_runtime=main_runtime,
                 is_vision=(task == "vision"),
+                use_cache=effective_use_cache,
             )
             if refreshed_client is not None:
                 logger.info(
@@ -8877,6 +8909,7 @@ def call_llm(
                 api_mode=resolved_api_mode,
                 main_runtime=main_runtime,
                 is_vision=(task == "vision"),
+                use_cache=effective_use_cache,
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
@@ -8923,6 +8956,7 @@ def call_llm(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     extra_headers=extra_headers,
+                    use_cache=effective_use_cache,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -8972,6 +9006,7 @@ def call_llm(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
+                        use_cache=effective_use_cache,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
