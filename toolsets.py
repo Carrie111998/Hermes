@@ -59,6 +59,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # Per-chat tool preset management (read/create/edit presets)
+    "manage_presets",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -219,6 +221,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "tool_presets": {
+        "description": "Read and edit the user's reusable per-chat tool/MCP/skill presets",
+        "tools": ["manage_presets"],
+        "includes": []
+    },
+
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
@@ -360,6 +368,7 @@ TOOLSETS = {
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
+            "manage_presets",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,

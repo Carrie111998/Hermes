@@ -2342,6 +2342,99 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             )
 
 
+_TOOLSET_UNSET = object()
+
+
+def rebuild_agent_toolsets(
+    agent,
+    *,
+    enabled=_TOOLSET_UNSET,
+    disabled=_TOOLSET_UNSET,
+    allowed=None,
+    denied=None,
+    disabled_skills=None,
+    tool_preset=_TOOLSET_UNSET,
+    quiet_mode: bool = True,
+) -> None:
+    """Rebuild a live agent's tool surface + system prompt for a new posture.
+
+    Sibling of :func:`switch_model` — the mid-chat plumbing for per-chat tool
+    presets. Callers (the ``tools.session_configure`` RPC) MUST only invoke this
+    at a turn boundary (``session["running"] is False``); swapping ``agent.tools``
+    mid-turn breaks the provider prompt cache.
+
+    Wraps :func:`tools.mcp_tool.refresh_agent_mcp_tools` (which recomputes
+    ``agent.tools`` / ``agent.valid_tool_names``, re-injects the post-build
+    memory/context-engine tool families, and republishes atomically under its
+    lock) then invalidates the cached system prompt so the per-tool guidance
+    blocks and the ``<available_skills>`` index shrink to match.
+
+    Empty-list-vs-None invariant: ``enabled=[]`` is a real posture (chat-only,
+    zero non-core tools) and must NOT be treated as "unset". A module-level
+    sentinel distinguishes "caller passed a value" (including ``[]`` / ``None``)
+    from "caller omitted it". ``allowed`` / ``denied`` / ``disabled_skills``
+    default to ``None`` (no filter) because that is the natural "no override"
+    value for those axes and every caller passes them explicitly.
+
+    Does NOT rely on ``refresh_agent_mcp_tools``'s return value (added names
+    only) — the caller always re-emits ``session.info`` after a user-initiated
+    rebuild.
+    """
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    # Resolve enabled/disabled against the sentinel so an explicit [] survives.
+    enabled_override = (
+        getattr(agent, "enabled_toolsets", None)
+        if enabled is _TOOLSET_UNSET
+        else enabled
+    )
+    disabled_override = (
+        getattr(agent, "disabled_toolsets", None)
+        if disabled is _TOOLSET_UNSET
+        else disabled
+    )
+
+    # refresh_agent_mcp_tools ignores enabled_override/disabled_override when
+    # BOTH are None (its "automatic refresh" path reuses the stored selection),
+    # which would silently skip a deliberate Full→(enabled=None) rebuild. Set
+    # the attributes directly first so the recompute always sees the target
+    # posture even in the all-None case.
+    agent.enabled_toolsets = enabled_override
+    agent.disabled_toolsets = disabled_override
+    agent.allowed_tool_names = allowed
+    agent.denied_tool_names = denied
+    agent.disabled_skills = disabled_skills
+    if tool_preset is not _TOOLSET_UNSET:
+        agent.tool_preset = tool_preset
+
+    refresh_agent_mcp_tools(
+        agent,
+        enabled_override=enabled_override,
+        disabled_override=disabled_override,
+        allowed_override=allowed,
+        denied_override=denied,
+        quiet_mode=quiet_mode,
+    )
+
+    # Shrink (or regrow) the system prompt: per-tool guidance + the skills
+    # index are gated on agent.valid_tool_names / disabled_skills, so this is
+    # what actually reclaims the token budget.
+    try:
+        agent._invalidate_system_prompt()
+    except Exception:
+        logger.debug("rebuild_agent_toolsets: system prompt invalidation failed", exc_info=True)
+
+    # Kanban lifecycle guidance is toolset-gated and cached once at build; keep
+    # it consistent with the new surface (cheap membership test).
+    try:
+        from agent.prompt_builder import KANBAN_GUIDANCE
+        agent._kanban_worker_guidance = (
+            KANBAN_GUIDANCE if "kanban_show" in getattr(agent, "valid_tool_names", set()) else ""
+        )
+    except Exception:
+        logger.debug("rebuild_agent_toolsets: kanban guidance refresh failed", exc_info=True)
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,

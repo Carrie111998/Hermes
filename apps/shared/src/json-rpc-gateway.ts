@@ -60,6 +60,106 @@ export interface GatewayClientOptions {
   notConnectedErrorMessage?: string
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Per-chat tool / MCP / skill preset types (see
+// .plans/per-chat-tools-contract.md §§5–7). Empty-list-vs-None invariant: an
+// `enabled_toolsets` of `[]` means chat-only (zero non-core tools); `null`
+// means "no per-session override / profile default (Full)". Never coalesce a
+// `[]` to a default on the client either.
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Per-chat tool posture fields added to the `session.info` payload (contract
+ * §6). The canonical, fuller `SessionInfo` lives in the Desktop app; UI code
+ * should treat these as the tool-preset extension of that payload.
+ */
+export interface SessionToolInfo {
+  /** Resolved snapshot: `[]` = chat-only, `[...]` = subset, `null` = Full. */
+  enabled_toolsets?: string[] | null
+  disabled_toolsets?: string[] | null
+  /** Display label only: "Chat-only" | "Full" | "Custom" | <preset name> | null. */
+  tool_preset?: string | null
+  /** `len(agent.tools)` of the live surface. */
+  tool_count?: number
+  /** Estimated token cost (chars/4) of the current tool schemas. */
+  tools_est_tokens?: number
+}
+
+/** A single tool entry in the `tools.catalog` payload. */
+export interface ToolCatalogItem {
+  name: string
+  est_tokens: number
+}
+
+export interface ToolCatalogToolset {
+  name: string
+  description: string
+  est_tokens: number
+  tools: ToolCatalogItem[]
+}
+
+export interface ToolCatalogMcpServer {
+  name: string
+  toolset: string
+  est_tokens: number
+  tools: ToolCatalogItem[]
+}
+
+export interface ToolCatalogSkill {
+  name: string
+  category: string
+  est_tokens: number
+}
+
+/** Return shape of `tools.catalog`. */
+export interface ToolCatalog {
+  /** Always-present baseline (core tools, never removable). */
+  core_tokens: number
+  toolsets: ToolCatalogToolset[]
+  mcp_servers: ToolCatalogMcpServer[]
+  skills: ToolCatalogSkill[]
+}
+
+/**
+ * A tool preset as stored/returned by the preset CRUD RPCs. Config-scoped
+ * fields (`disabled_tools` / `allowed_tools`) mirror config.yaml §1; the two
+ * virtual built-ins ("Chat-only", "Full") carry `builtin: true`.
+ */
+export interface ToolPreset {
+  name: string
+  enabled_toolsets?: string[] | null
+  disabled_tools?: string[] | null
+  allowed_tools?: string[] | null
+  disabled_skills?: string[] | null
+  builtin?: boolean
+}
+
+/** Params for `tools.session_configure`. */
+export interface ToolsSessionConfigureParams {
+  session_id: string
+  /** When a known preset name, backend resolves it and ignores the list fields. */
+  preset?: string | null
+  enabled_toolsets?: string[] | null
+  disabled_toolsets?: string[] | null
+  allowed_tool_names?: string[] | null
+  denied_tool_names?: string[] | null
+  disabled_skills?: string[] | null
+}
+
+/** Return shape of `tools.session_configure`. */
+export interface ToolsSessionConfigureResult<S = SessionToolInfo & Record<string, unknown>> {
+  ok: boolean
+  /** Present when `ok === false` (e.g. "busy" — the session is generating). */
+  reason?: string
+  /** The emitted `session.info` payload; present when `ok === true`. */
+  session?: S
+}
+
+/** Return shape of `tools.presets_list` / `tools.preset_save` / `tools.preset_delete`. */
+export interface ToolPresetsResult {
+  presets: ToolPreset[]
+}
+
 const ANY = '*'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 // A reconnect after sleep/wake must not hang forever in 'connecting' (which
@@ -314,6 +414,47 @@ export class JsonRpcGatewayClient {
         reject(error instanceof Error ? error : new Error(String(error)))
       }
     })
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Per-chat tool / MCP / skill preset RPCs (contract §5). Thin typed wrappers
+  // over `request`; the UI (per-chat selector + preset manager) calls these.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Set a live session's tool posture (mid-chat) and persist it. Turn-boundary
+   * gated server-side: resolves with `{ ok: false, reason: 'busy' }` when the
+   * session is generating.
+   */
+  toolsSessionConfigure<S = SessionToolInfo & Record<string, unknown>>(
+    params: ToolsSessionConfigureParams
+  ): Promise<ToolsSessionConfigureResult<S>> {
+    return this.request<ToolsSessionConfigureResult<S>>(
+      'tools.session_configure',
+      params as unknown as Record<string, unknown>
+    )
+  }
+
+  /** Fetch the full selectable catalog with per-item token estimates. */
+  toolsCatalog(profile?: string): Promise<ToolCatalog> {
+    return this.request<ToolCatalog>('tools.catalog', profile ? { profile } : {})
+  }
+
+  /** List all selectable presets (2 virtual built-ins + user presets). */
+  toolsPresetsList(): Promise<ToolPresetsResult> {
+    return this.request<ToolPresetsResult>('tools.presets_list', {})
+  }
+
+  /** Upsert a user preset by name. Rejects reserved names ("Chat-only"/"Full"). */
+  toolsPresetSave(preset: ToolPreset): Promise<ToolPresetsResult> {
+    return this.request<ToolPresetsResult>('tools.preset_save', {
+      preset: preset as unknown as Record<string, unknown>
+    })
+  }
+
+  /** Delete a user preset by name. */
+  toolsPresetDelete(name: string): Promise<ToolPresetsResult> {
+    return this.request<ToolPresetsResult>('tools.preset_delete', { name })
   }
 
   private handleMessage(raw: unknown): void {

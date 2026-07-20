@@ -299,6 +299,18 @@ export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
 // Persistence lives in the backend config (approvals.mode), so this is a plain
 // reflection of the truth the gateway reports rather than its own store.
 export const $yoloActive = atom(false)
+// Live per-chat tool posture, mirrored from the active session's session.info
+// (contract §6). Null = unknown/not yet reported (e.g. a fresh draft). The
+// tool-posture pill reads this the same way the model pill reads $currentModel.
+// `enabledToolsets` keeps the [] vs null distinction (chat-only vs no-override),
+// so consumers must test `=== null` / `.length`, never a falsy coalesce.
+export interface ToolPostureState {
+  preset: string | null
+  enabledToolsets: string[] | null
+  toolCount: number | null
+  toolsEstTokens: number | null
+}
+export const $currentToolPosture = atom<ToolPostureState | null>(null)
 export const $currentCwd = atom(getRememberedWorkspaceCwd())
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
@@ -408,6 +420,8 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
 }
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
+
+export const setCurrentToolPosture = (next: Updater<ToolPostureState | null>) => updateAtom($currentToolPosture, next)
 
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)

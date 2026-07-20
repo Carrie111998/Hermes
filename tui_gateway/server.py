@@ -2636,6 +2636,22 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     elif service_tier:
         overrides["service_tier_override"] = service_tier
 
+    # Per-chat tool/skill posture. Restore ONLY keys the stored blob actually
+    # has (``in`` check, never truthiness) so a chat-only session's persisted
+    # ``enabled_toolsets: []`` round-trips as a real override instead of being
+    # dropped and re-expanded to full tools. ``_make_agent`` consumes these
+    # ``*_override`` keys via an _UNSET sentinel.
+    for _cfg_key, _ovr_key in (
+        ("enabled_toolsets", "enabled_toolsets_override"),
+        ("disabled_toolsets", "disabled_toolsets_override"),
+        ("allowed_tool_names", "allowed_tool_names_override"),
+        ("denied_tool_names", "denied_tool_names_override"),
+        ("disabled_skills", "disabled_skills_override"),
+        ("tool_preset", "tool_preset_override"),
+    ):
+        if _cfg_key in model_config:
+            overrides[_ovr_key] = model_config[_cfg_key]
+
     return overrides
 
 
@@ -2693,6 +2709,29 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+
+    # Per-chat tool/skill posture snapshot (per-chat tool presets). CRITICAL:
+    # use explicit ``is not None`` so an empty list ([] = chat-only) survives
+    # the round-trip — a truthiness check would drop it and silently re-expand
+    # the chat to full tools on the next resume. ``None`` = no override, so the
+    # key is removed to keep the blob terse.
+    for _attr, _key in (
+        ("enabled_toolsets", "enabled_toolsets"),
+        ("disabled_toolsets", "disabled_toolsets"),
+        ("allowed_tool_names", "allowed_tool_names"),
+        ("denied_tool_names", "denied_tool_names"),
+        ("disabled_skills", "disabled_skills"),
+    ):
+        _val = getattr(agent, _attr, None)
+        if _val is not None:
+            config[_key] = list(_val)
+        else:
+            config.pop(_key, None)
+    _preset = getattr(agent, "tool_preset", None)
+    if _preset is not None:
+        config["tool_preset"] = _preset
+    else:
+        config.pop("tool_preset", None)
 
     return config
 
@@ -3896,6 +3935,32 @@ def _session_info(agent, session: dict | None = None) -> dict:
         warn = _probe_credentials(agent)
         if warn:
             info["credential_warning"] = warn
+
+    # Per-chat tool posture (per-chat tool presets). Report the raw selection so
+    # the desktop can distinguish chat-only ([]) from Full (null). tool_count /
+    # tools_est_tokens summarize the live surface for the header badge.
+    if agent is not None:
+        info["enabled_toolsets"] = getattr(agent, "enabled_toolsets", None)
+        info["disabled_toolsets"] = getattr(agent, "disabled_toolsets", None)
+        info["tool_preset"] = getattr(agent, "tool_preset", None)
+        _agent_tools = getattr(agent, "tools", None) or []
+        info["tool_count"] = len(_agent_tools)
+        try:
+            import json as _json
+
+            _chars = sum(
+                len(_json.dumps(_t, ensure_ascii=False, separators=(",", ":")))
+                for _t in _agent_tools
+            )
+            info["tools_est_tokens"] = int(_chars / 4)
+        except Exception:
+            info["tools_est_tokens"] = 0
+    else:
+        info["enabled_toolsets"] = None
+        info["disabled_toolsets"] = None
+        info["tool_preset"] = None
+        info["tool_count"] = 0
+        info["tools_est_tokens"] = 0
     return info
 
 
@@ -4645,8 +4710,18 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
-        "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        # Empty-list-vs-None: a chat-only parent (enabled_toolsets == []) must
+        # NOT re-expand to full tools here. Only fall back to the platform
+        # default when the parent has genuinely no per-session selection.
+        "enabled_toolsets": (
+            getattr(agent, "enabled_toolsets", None)
+            if getattr(agent, "enabled_toolsets", None) is not None
+            else _load_enabled_toolsets()
+        ),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
+        "allowed_tool_names": getattr(agent, "allowed_tool_names", None),
+        "denied_tool_names": getattr(agent, "denied_tool_names", None),
+        "disabled_skills": getattr(agent, "disabled_skills", None),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -4676,6 +4751,12 @@ def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     kwargs.update(
         {
             "enabled_toolsets": ["terminal", "file"],
+            # The preview agent has its own fixed toolset — don't inherit the
+            # parent chat's per-tool/skill filters (they may deny terminal/file).
+            "disabled_toolsets": None,
+            "allowed_tool_names": None,
+            "denied_tool_names": None,
+            "disabled_skills": None,
             "session_db": None,
             "skip_memory": True,
         }
@@ -4801,22 +4882,39 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 def _reset_session_agent(sid: str, session: dict) -> dict:
     tokens = _set_session_context(session["session_key"])
     try:
-        # /new is a full conversation boundary: session-scoped runtime
-        # overrides (/model, /reasoning, /fast) do NOT carry forward — the
-        # fresh agent re-derives model/provider, reasoning, and service tier
-        # from config.yaml (#48055, #23131). Session pins are cleared below so
-        # a rebuild can't resurrect them. (Global process state is still never
-        # touched — see the cross-session-contamination note in
-        # _apply_model_switch.)
+        # /new is a full conversation boundary: transient runtime overrides
+        # (/model, /reasoning, /fast) do NOT carry forward — the fresh agent
+        # re-derives model/provider, reasoning, and service tier from
+        # config.yaml (#48055, #23131). Session pins are cleared so a rebuild
+        # can't resurrect them. (Global process state is still never touched —
+        # see the cross-session-contamination note in _apply_model_switch.)
         session.pop("model_override", None)
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        # The chat's tool/skill posture is NOT a transient runtime override: per
+        # the per-chat tool presets contract it is a persistent per-chat
+        # property (resolved snapshot stored in model_config, read on resume).
+        # Preserve it across /new so a reset doesn't silently revert a chat-only
+        # chat to full tools — and so the subsequent model_config persist can't
+        # overwrite the stored posture with the profile default. Read the live
+        # agent's resolved selection and forward it as explicit overrides (the
+        # _UNSET sentinel keeps [] / None distinguishable from "not provided").
+        reset_kw: dict = {}
+        old_agent = session.get("agent")
+        if old_agent is not None:
+            reset_kw["enabled_toolsets_override"] = getattr(old_agent, "enabled_toolsets", None)
+            reset_kw["disabled_toolsets_override"] = getattr(old_agent, "disabled_toolsets", None)
+            reset_kw["allowed_tool_names_override"] = getattr(old_agent, "allowed_tool_names", None)
+            reset_kw["denied_tool_names_override"] = getattr(old_agent, "denied_tool_names", None)
+            reset_kw["disabled_skills_override"] = getattr(old_agent, "disabled_skills", None)
+            reset_kw["tool_preset_override"] = getattr(old_agent, "tool_preset", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            **reset_kw,
         )
     finally:
         _clear_session_context(tokens)
@@ -4912,6 +5010,12 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     ).start()
 
 
+# Sentinel distinguishing "no per-session tool override supplied" from a real
+# override value of ``None`` or ``[]`` (chat-only). Never use ``x or default``
+# on these axes — an empty list is a meaningful posture, not a missing one.
+_UNSET = object()
+
+
 class _RuntimeFallbackResolution(NamedTuple):
     runtime: dict
     selected_model: str | None
@@ -4984,6 +5088,12 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    enabled_toolsets_override=_UNSET,
+    disabled_toolsets_override=_UNSET,
+    allowed_tool_names_override=_UNSET,
+    denied_tool_names_override=_UNSET,
+    disabled_skills_override=_UNSET,
+    tool_preset_override=_UNSET,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5110,6 +5220,30 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    # Resolve the tool posture with the contract precedence:
+    #   per-session stored override  >  platform/coding-posture  >  profile.
+    # The ``_UNSET`` sentinel keeps an override of ``None`` (Full) or ``[]``
+    # (chat-only) distinguishable from "no override" — a truthiness check here
+    # would silently re-expand a chat-only session to full tools.
+    if enabled_toolsets_override is _UNSET:
+        _enabled_toolsets = _load_enabled_toolsets()
+    else:
+        _enabled_toolsets = enabled_toolsets_override
+    _disabled_toolsets = (
+        None if disabled_toolsets_override is _UNSET else disabled_toolsets_override
+    )
+    _allowed_tool_names = (
+        None if allowed_tool_names_override is _UNSET else allowed_tool_names_override
+    )
+    _denied_tool_names = (
+        None if denied_tool_names_override is _UNSET else denied_tool_names_override
+    )
+    _disabled_skills = (
+        None if disabled_skills_override is _UNSET else disabled_skills_override
+    )
+    _tool_preset = (
+        None if tool_preset_override is _UNSET else tool_preset_override
+    )
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
@@ -5136,7 +5270,12 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_enabled_toolsets,
+        disabled_toolsets=_disabled_toolsets,
+        allowed_tool_names=_allowed_tool_names,
+        denied_tool_names=_denied_tool_names,
+        disabled_skills=_disabled_skills,
+        tool_preset=_tool_preset,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -15456,11 +15595,15 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
+        # Empty-list-vs-None: a chat-only session (enabled_toolsets == []) must
+        # report every toolset as DISABLED, not fall through to "all enabled".
+        # Track the raw selection separately from the truthiness of the set.
+        if session:
+            _raw_enabled = getattr(session["agent"], "enabled_toolsets", None)
+        else:
+            _raw_enabled = _load_enabled_toolsets()
+        _has_selection = _raw_enabled is not None
+        enabled = set(_raw_enabled or [])
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
@@ -15472,7 +15615,7 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": (name in enabled) if _has_selection else True,
                     "tools": info["resolved_tools"],
                 }
             )
@@ -15487,12 +15630,25 @@ def _(rid, params: dict) -> dict:
         from model_tools import get_toolset_for_tool, get_tool_definitions
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            getattr(session["agent"], "enabled_toolsets", None)
-            if session
-            else _load_enabled_toolsets()
+        # ``getattr(..., None)`` returns the raw selection, so a chat-only []
+        # is passed through verbatim (never re-expanded). Also honor the
+        # session's per-tool filters so the shown set matches the live agent.
+        if session:
+            _agent = session["agent"]
+            enabled = getattr(_agent, "enabled_toolsets", None)
+            disabled = getattr(_agent, "disabled_toolsets", None)
+            allowed = getattr(_agent, "allowed_tool_names", None)
+            denied = getattr(_agent, "denied_tool_names", None)
+        else:
+            enabled = _load_enabled_toolsets()
+            disabled = allowed = denied = None
+        tools = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            allowed_tool_names=allowed,
+            denied_tool_names=denied,
         )
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):
@@ -15590,17 +15746,147 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5035, str(e))
 
 
+@method("tools.session_configure")
+def _(rid, params: dict) -> dict:
+    """Set a live session's per-chat tool posture (mid-chat) and persist it.
+
+    Turn-boundary gated: refuses while the session is generating (changing
+    ``agent.tools`` mid-turn breaks the provider prompt cache). Resolves a
+    named preset to lists (ignoring the explicit list fields) or applies the
+    explicit lists verbatim as "Custom". Persists into ``model_config`` and
+    emits ``session.info``. Does NOT write config.yaml or reset the agent.
+    """
+    sid = str(params.get("session_id", "") or "")
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4004, "unknown session")
+    if session.get("running"):
+        # Busy — the caller retries at the next turn boundary.
+        return _ok(rid, {"ok": False, "reason": "busy"})
+    agent = session.get("agent")
+    if agent is None:
+        return _err(rid, 4004, "session agent not built")
+
+    try:
+        import tool_presets
+        from agent.agent_runtime_helpers import rebuild_agent_toolsets
+
+        preset_name = params.get("preset")
+        resolved = tool_presets.resolve_preset(preset_name)
+        if resolved is not None:
+            # Known preset (built-in or config) — its resolved lists win; the
+            # explicit list fields in params are ignored.
+            enabled = resolved["enabled_toolsets"]
+            disabled = resolved["disabled_toolsets"]
+            allowed = resolved["allowed_tool_names"]
+            denied = resolved["denied_tool_names"]
+            disabled_skills = resolved["disabled_skills"]
+            tool_preset = resolved["tool_preset"]
+        else:
+            # "Custom" / null — use the explicit lists as given.
+            enabled = params.get("enabled_toolsets")
+            disabled = params.get("disabled_toolsets")
+            allowed = params.get("allowed_tool_names")
+            denied = params.get("denied_tool_names")
+            disabled_skills = params.get("disabled_skills")
+            tool_preset = preset_name if preset_name else None
+
+        tokens = _set_session_context(session.get("session_key"))
+        try:
+            rebuild_agent_toolsets(
+                agent,
+                enabled=enabled,
+                disabled=disabled,
+                allowed=allowed,
+                denied=denied,
+                disabled_skills=disabled_skills,
+                tool_preset=tool_preset,
+                quiet_mode=True,
+            )
+        finally:
+            _clear_session_context(tokens)
+
+        # Persist the new resolved posture into model_config so a resume
+        # rebuilds the same surface, then refresh the stored system prompt.
+        _persist_live_session_runtime(session)
+        _persist_live_session_system_prompt(session)
+
+        info = _session_info(agent, session)
+        _emit("session.info", sid, info)
+        return _ok(rid, {"ok": True, "session": info})
+    except Exception as e:
+        return _err(rid, 5036, str(e))
+
+
+@method("tools.catalog")
+def _(rid, params: dict) -> dict:
+    """Return the full selectable catalog with per-item token estimates."""
+    try:
+        import tool_catalog
+
+        profile = params.get("profile") if isinstance(params, dict) else None
+        return _ok(rid, tool_catalog.build_catalog(profile=profile))
+    except Exception as e:
+        return _err(rid, 5037, str(e))
+
+
+@method("tools.presets_list")
+def _(rid, params: dict) -> dict:
+    """List all selectable presets (2 virtual built-ins + user presets)."""
+    try:
+        import tool_presets
+
+        return _ok(rid, {"presets": tool_presets.list_presets()})
+    except Exception as e:
+        return _err(rid, 5038, str(e))
+
+
+@method("tools.preset_save")
+def _(rid, params: dict) -> dict:
+    """Upsert a user preset by name. Rejects reserved names. Persists presets."""
+    try:
+        import tool_presets
+
+        preset = params.get("preset") if isinstance(params, dict) else None
+        if not isinstance(preset, dict):
+            return _err(rid, 4019, "preset object required")
+        presets = tool_presets.save_preset(preset)
+        return _ok(rid, {"presets": presets})
+    except ValueError as e:
+        return _err(rid, 4020, str(e))
+    except Exception as e:
+        return _err(rid, 5039, str(e))
+
+
+@method("tools.preset_delete")
+def _(rid, params: dict) -> dict:
+    """Delete a user preset by name. Persists presets."""
+    try:
+        import tool_presets
+
+        name = str(params.get("name", "") or "").strip()
+        if not name:
+            return _err(rid, 4021, "name required")
+        presets = tool_presets.delete_preset(name)
+        return _ok(rid, {"presets": presets})
+    except Exception as e:
+        return _err(rid, 5040, str(e))
+
+
 @method("toolsets.list")
 def _(rid, params: dict) -> dict:
     try:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
+        # Empty-list-vs-None (see tools.list): a chat-only [] must report all
+        # toolsets disabled, not fall through to "all enabled".
+        if session:
+            _raw_enabled = getattr(session["agent"], "enabled_toolsets", None)
+        else:
+            _raw_enabled = _load_enabled_toolsets()
+        _has_selection = _raw_enabled is not None
+        enabled = set(_raw_enabled or [])
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
@@ -15612,7 +15898,7 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": (name in enabled) if _has_selection else True,
                 }
             )
         return _ok(rid, {"toolsets": items})
