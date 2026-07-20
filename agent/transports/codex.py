@@ -162,7 +162,11 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
-        _effort_clamp = {"minimal": "low"}
+        # Clamp provider-unsupported effort values. "minimal" is not a valid
+        # Responses API effort; "max" is a Kimi-only effort (see
+        # ensure-kimi-max-effort.sh) that OpenAI rejects with HTTP 400 —
+        # map it to "xhigh", the highest Responses API effort.
+        _effort_clamp = {"minimal": "low", "max": "xhigh"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
