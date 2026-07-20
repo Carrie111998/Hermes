@@ -233,6 +233,18 @@ class MailboxWatcher:
                     )
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning("Failed to read mailbox message %s: %s", msg_file, e)
+            except Exception:
+                # Defense in depth: one malformed message (e.g. a payload field
+                # of an unexpected type that trips _summarize) must never abort
+                # the whole scan — that would silently drop every message after
+                # it in this pass, and propagate up to _subscriber_poll_loop as
+                # "Mailbox scan failed". Skip just this file and keep scanning.
+                # The file is already recorded in self._seen above, so it will
+                # not be retried indefinitely on subsequent polls.
+                logger.exception(
+                    "MailboxWatcher: skipping message %s after unexpected processing error",
+                    msg_file,
+                )
 
         return count
 
@@ -266,7 +278,9 @@ class MailboxWatcher:
             title = payload.get("title", "?")
             return f"{msg_type.lower().replace('_', ' ')}: {company} / {title}"
         if msg_type == "BLOCKED_QUESTION":
-            return (payload.get("question") or "Blocked question")[:200]
+            # Coerce to str: some producers send a structured/dict question,
+            # and dict[:200] raises TypeError (see NOTIFICATION/ERROR below).
+            return str(payload.get("question") or "Blocked question")[:200]
         if msg_type == "PIPELINE_UPDATE":
             previous_stage, new_stage, job_ref = _pipeline_update_aliases(payload)
             return f"{previous_stage} -> {new_stage} ({job_ref})"
