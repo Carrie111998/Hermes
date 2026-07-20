@@ -2560,6 +2560,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # the pre-computed pass above landed on the default and the user did
         # not pin api_mode explicitly. An explicit fb.api_mode (even
         # "chat_completions") must never be overridden here.
+        try:
+            from agent.vertex_adapter import (
+                is_anthropic_vertex_model as _fb_is_anthropic_vertex_model,
+            )
+        except Exception:
+            def _fb_is_anthropic_vertex_model(_m):  # noqa: ANN001
+                return False
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
 
@@ -2574,6 +2581,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 from hermes_cli.providers import nous_api_mode
 
                 fb_api_mode = nous_api_mode(fb_model)
+            elif fb_provider in (
+                "vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"
+            ) and _fb_is_anthropic_vertex_model(fb_model):
+                # Vertex is a mixed surface: Claude speaks anthropic_messages via
+                # the AnthropicVertex SDK, Gemini/MaaS speak chat_completions via
+                # the OpenAI-compat endpoint. The host is aiplatform.googleapis.com
+                # for both, so the hostname/suffix checks below can't tell them
+                # apart — without this, a Claude-on-Vertex fallback defaults to
+                # chat_completions, skips the anthropic_messages client build, and
+                # every request 404s. Mirrors determine_api_mode()'s vertex split
+                # on the primary path.
+                fb_api_mode = "anthropic_messages"
             elif (
                 fb_base_url.rstrip("/").lower().endswith("/anthropic")
                 or base_url_hostname(fb_base_url) == "api.anthropic.com"
