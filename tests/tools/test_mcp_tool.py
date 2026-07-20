@@ -326,6 +326,59 @@ class TestSchemaConversion:
         assert "$defs" not in schema["parameters"]
         assert "definitions" not in schema["parameters"]
 
+    def test_multitype_array_is_collapsed_to_anyof(self):
+        """A multi-type ``type`` array must become an ``anyOf`` of single-type schemas.
+
+        Anthropic's tool ``input_schema`` validator rejects an array-valued ``type``
+        with "JSON schema is invalid. It must match JSON Schema draft 2020-12", 400ing
+        every Claude-backed provider. This is not hypothetical: GitHub's hosted MCP ships
+        ``issue_write`` with ``issue_fields[].value`` typed exactly this way. Before this
+        fix the array survived ingestion untouched (``_strip_nullable_union`` only handles
+        the ``[X, "null"]`` two-element case), and the tool 400d on first use.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "value": {"type": ["string", "number", "boolean"]},
+            },
+        })
+
+        value = schema["properties"]["value"]
+        assert "type" not in value or not isinstance(value["type"], list)
+        assert value["anyOf"] == [
+            {"type": "string"},
+            {"type": "number"},
+            {"type": "boolean"},
+        ]
+
+    def test_nested_multitype_array_under_array_items_is_collapsed(self):
+        """The real GitHub ``issue_write`` shape: the array type is nested two levels deep
+        under ``properties.<field>.items.properties.<sub>``. The sanitizer must recurse."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "issue_fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": ["string", "number", "boolean"]},
+                        },
+                    },
+                },
+            },
+        })
+
+        value = schema["properties"]["issue_fields"]["items"]["properties"]["value"]
+        assert value["anyOf"] == [
+            {"type": "string"},
+            {"type": "number"},
+            {"type": "boolean"},
+        ]
 
     def test_optional_nullable_field_is_collapsed_to_non_null_schema(self):
         """Anthropic rejects MCP/Pydantic anyOf-null optional parameter schemas."""
