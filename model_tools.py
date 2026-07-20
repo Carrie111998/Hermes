@@ -23,6 +23,7 @@ Public API (signatures preserved from the original 2,400-line version):
 import os
 import json
 import re
+import ast
 import asyncio
 import logging
 import threading
@@ -775,8 +776,25 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                     args[key] = coerced
                     continue
                 # If the string looks like a JSON array but _coerce_value
-                # failed to parse it, warn clearly instead of silently wrapping.
+                # failed to parse it, the model may have emitted a Python
+                # repr-style list (single quotes, e.g. "['a','b']") instead
+                # of valid JSON. ast.literal_eval safely parses Python
+                # literals without executing code — try it before falling
+                # back to wrapping the whole broken string in a list.
                 if value.strip().startswith("["):
+                    try:
+                        literal = ast.literal_eval(value)
+                    except (ValueError, SyntaxError, TypeError):
+                        literal = None
+                    if isinstance(literal, (list, tuple)):
+                        args[key] = list(literal)
+                        logger.info(
+                            "coerce_tool_args: parsed %s.%s as a Python-repr "
+                            "list via ast.literal_eval (model emitted "
+                            "single-quoted list instead of JSON)",
+                            tool_name, key,
+                        )
+                        continue
                     logger.warning(
                         "coerce_tool_args: %s.%s looks like a JSON array string "
                         "but could not be parsed — model may have emitted a "
