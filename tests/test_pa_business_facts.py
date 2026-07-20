@@ -183,6 +183,149 @@ def test_generic_observation_injects_current_turn_source_refs(monkeypatch):
     assert captured["payload"]["sourceRefs"] == ["wa-current-generic"]
 
 
+def _observation_bridge():
+    return load_business_bridge_config(
+        {
+            "pa_business": {
+                "operations": {
+                    "tgg_case_observation": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/observations",
+                        "method": "POST",
+                    }
+                }
+            }
+        }
+    )
+
+
+def _run_generic_observation(monkeypatch, payload, backend_result=None):
+    import tools.pa_business_tools as pbt
+
+    captured = {}
+    monkeypatch.setattr(pbt, "_load_runtime_bridge_config", _observation_bridge)
+
+    def fake_execute(_bridge, *, operation, payload):
+        captured.update(operation=operation, payload=payload)
+        return backend_result if backend_result is not None else {"ok": True}
+
+    monkeypatch.setattr(pbt, "execute_business_operation", fake_execute)
+    result = json.loads(
+        pbt._handle_business_call(
+            {"operation": "tgg_case_observation", "payload": payload}
+        )
+    )
+    return result, captured
+
+
+def test_generic_observation_placeholder_source_refs_bind_real_turn_ids(monkeypatch):
+    """Literal "current_turn" is a placeholder, not a citable id — the tool
+    layer must treat it as omitted and bind the gateway's real turn refs
+    (stage-1 backprocess finding 1, 2026-07-20)."""
+    monkeypatch.setenv(
+        "HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-1", "wa-real-2"]'
+    )
+    _, captured = _run_generic_observation(
+        monkeypatch,
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["current_turn"]},
+    )
+    assert captured["payload"]["sourceRefs"] == ["wa-real-1", "wa-real-2"]
+    assert "source_refs" not in captured["payload"]
+
+
+def test_generic_observation_mixed_placeholder_keeps_real_refs(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-1"]')
+    _, captured = _run_generic_observation(
+        monkeypatch,
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["Current_Turn", "wa-cited-9"]},
+    )
+    assert captured["payload"]["sourceRefs"] == ["wa-cited-9"]
+
+
+def test_generic_observation_placeholder_inside_fields_bind_real_turn_ids(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-1"]')
+    _, captured = _run_generic_observation(
+        monkeypatch,
+        {
+            "jobNo": "AM/JOB/2601/1018",
+            "fields": {"source_refs": ["current_turn"], "note_key": "kept"},
+        },
+    )
+    assert captured["payload"]["sourceRefs"] == ["wa-real-1"]
+    assert captured["payload"]["fields"] == {"note_key": "kept"}
+
+
+def test_generic_observation_real_refs_pass_through_untouched(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-1"]')
+    _, captured = _run_generic_observation(
+        monkeypatch,
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["wa-cited-1", "wa-cited-2"]},
+    )
+    assert captured["payload"]["sourceRefs"] == ["wa-cited-1", "wa-cited-2"]
+
+
+def test_attach_unjustified_error_carries_recovery_guidance(monkeypatch):
+    """ATTACH_UNJUSTIFIED rejections must teach the retry: keep ALL sourceRefs
+    and supply the justification contract — the observed failure mode is the
+    model dropping photo message ids to pass the gate (stage-1 finding 2)."""
+    result, _ = _run_generic_observation(
+        monkeypatch,
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["wa-cited-1"]},
+        backend_result={
+            "ok": False,
+            "error": {
+                "code": "ATTACH_UNJUSTIFIED",
+                "message": "justification is required for evidence attachment.",
+            },
+            "status_code": 400,
+        },
+    )
+    recovery = result.get("recovery") or ""
+    assert "keeping ALL cited sourceRefs" in recovery
+    assert "identifier_match" in recovery
+    assert "thread_continuation" in recovery
+    assert "operator_directive" in recovery
+    assert "block_unit" in recovery
+    assert "image_content" in recovery
+    assert "tgg_attention_raise" in recovery
+
+
+def test_non_attach_errors_get_no_recovery_field(monkeypatch):
+    result, _ = _run_generic_observation(
+        monkeypatch,
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["wa-cited-1"]},
+        backend_result={
+            "ok": False,
+            "error": {"code": "CASE_NOT_FOUND", "message": "No case."},
+            "status_code": 404,
+        },
+    )
+    assert "recovery" not in result
+
+
+def test_direct_observation_placeholder_source_refs_bind_real_turn_ids(monkeypatch):
+    import tools.pa_business_tools as pbt
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_MESSAGE_REFS", '["wa-real-7"]')
+    captured = {}
+    monkeypatch.setattr(pbt, "_load_runtime_bridge_config", _observation_bridge)
+
+    def fake_execute(_bridge, *, operation, payload):
+        captured.update(operation=operation, payload=payload)
+        return {"ok": True, "data": {"observationId": 99}}
+
+    monkeypatch.setattr(pbt, "execute_business_operation", fake_execute)
+    raw = pbt._handle_tgg_case_observation(
+        {
+            "jobNo": "AM/JOB/2601/1018",
+            "notes": "worker photos",
+            "sourceRefs": ["current_turn"],
+        }
+    )
+    assert json.loads(raw)["ok"] is True
+    assert captured["payload"]["fields"]["source_refs"] == ["wa-real-7"]
+
+
 def test_tgg_production_config_exposes_searchable_case_operations():
     config = yaml.safe_load(TGG_PRODUCTION_CONFIG.read_text(encoding="utf-8"))
     pa_context = SimpleNamespace(

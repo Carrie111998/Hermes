@@ -966,7 +966,7 @@ def _handle_tgg_write(operation: str, payload: Mapping[str, Any]) -> str:
     except Exception as exc:
         return tool_error(exc)
     _harvest_case_states(result)
-    return tool_result(result)
+    return tool_result(_shape_attach_unjustified_result(result))
 
 
 def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
@@ -1190,7 +1190,9 @@ def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str
     ):
         if raw.get(source_key) is not None and field_key not in fields:
             fields[field_key] = raw.get(source_key)
-    source_refs = _string_list(fields.get("source_refs") or raw.get("sourceRefs"))
+    source_refs = _filter_placeholder_source_refs(
+        _string_list(fields.get("source_refs") or raw.get("sourceRefs"))
+    )
     if not source_refs:
         source_refs = _current_turn_source_refs()
         if not source_refs:
@@ -1302,12 +1304,8 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
             }.get(operation)
             configured = bridge.operations.get(canonical) if canonical else None
         effective_operation = canonical or operation
-        if effective_operation == "tgg_case_observation" and not (
-            payload.get("sourceRefs") or payload.get("source_refs")
-        ):
-            source_refs = _current_turn_source_refs()
-            if source_refs:
-                payload["sourceRefs"] = source_refs
+        if effective_operation == "tgg_case_observation":
+            payload = _bind_observation_source_refs(payload)
         # Recover only declared path params accidentally placed beside the
         # generic payload object; arbitrary top-level args never cross over.
         if configured is not None:
@@ -1321,7 +1319,7 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
         )
     except Exception as exc:
         return tool_error(exc)
-    return tool_result(result)
+    return tool_result(_shape_attach_unjustified_result(result))
 
 
 def _current_turn_source_refs() -> list[str]:
@@ -1334,6 +1332,97 @@ def _current_turn_source_refs() -> list[str]:
         return _string_list(decoded_refs)
     except Exception:
         return []
+
+
+# The constitution instructs the model to OMIT sourceRefs so the runtime binds
+# the current turn's real message ids. Some models instead pass the literal
+# placeholder string "current_turn"; a stored placeholder resolves no WhatsApp
+# excerpt and can never derive media (stage-1 backprocess finding, 2026-07-20).
+# A placeholder is not a citable id — treat it exactly like an omitted field.
+_SOURCE_REF_PLACEHOLDERS = frozenset({"current_turn"})
+
+
+def _filter_placeholder_source_refs(refs: list[str]) -> list[str]:
+    """Drop placeholder tokens the model emits instead of real message ids."""
+    return [
+        ref for ref in refs if ref.strip().lower() not in _SOURCE_REF_PLACEHOLDERS
+    ]
+
+
+def _bind_observation_source_refs(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize observation sourceRefs: strip placeholders, bind turn refs.
+
+    Collects refs from every location the backend honors (top-level
+    sourceRefs/source_refs and the same keys inside fields), drops placeholder
+    and empty entries, and when nothing real remains binds the gateway's
+    current-turn message ids — exactly as when the field was omitted.
+    Payloads that already carry only real ids pass through untouched.
+    """
+    fields = payload.get("fields")
+    fields = fields if isinstance(fields, Mapping) else None
+    collected: list[str] = []
+    for container in (payload, fields or {}):
+        for key in ("sourceRefs", "source_refs"):
+            collected.extend(_string_list(container.get(key)))
+    cleaned: list[str] = []
+    for ref in _filter_placeholder_source_refs(collected):
+        if ref not in cleaned:
+            cleaned.append(ref)
+    if cleaned and len(cleaned) == len(collected):
+        return payload
+    payload = dict(payload)
+    payload.pop("source_refs", None)
+    if fields is not None and ("sourceRefs" in fields or "source_refs" in fields):
+        fields = dict(fields)
+        fields.pop("sourceRefs", None)
+        fields.pop("source_refs", None)
+        payload["fields"] = fields
+    bound = cleaned or _current_turn_source_refs()
+    if bound:
+        payload["sourceRefs"] = bound
+    else:
+        payload.pop("sourceRefs", None)
+    return payload
+
+
+# Recovery contract for the backend's evidence-attach gate. Mirrors
+# validateEvidenceAttachJustification in systems (routes: observations with
+# media-bearing sourceRefs, work-costing attach with a sourceRef). Without
+# this in-face guidance the model's observed failure mode is dropping the
+# photo-bearing message ids to get past the gate (stage-1 finding 2, 2026-07-20).
+_ATTACH_UNJUSTIFIED_RECOVERY = (
+    "Retry the SAME write keeping ALL cited sourceRefs — never drop photo or "
+    "media message ids to get past this gate; dropping evidence to pass "
+    "validation is forbidden. Add or fix a top-level justification object in "
+    "the same payload: {\"kind\": one of identifier_match | thread_continuation "
+    "| operator_directive, \"identifier\": {\"type\": job_no | block_unit, "
+    "\"value\": the job number or block/unit EXACTLY as it appears in the "
+    "source material}, \"source\": one of caption | image_content | "
+    "thread_ref}. The identifier value must appear verbatim in the cited "
+    "message text/caption/thread; for source=image_content also pass what is "
+    "visible in a top-level image_content string. If no truthful justification "
+    "exists, the evidence does not belong on this case — hold it via operation "
+    "tgg_attention_raise instead of attaching without it."
+)
+
+
+def _shape_attach_unjustified_result(result: Any) -> Any:
+    """Append recovery guidance to ATTACH_UNJUSTIFIED backend rejections."""
+    try:
+        if not isinstance(result, dict):
+            return result
+        error = result.get("error")
+        if isinstance(error, Mapping):
+            code = str(error.get("code") or "")
+        else:
+            code = str(error or "")
+        if "ATTACH_UNJUSTIFIED" not in code:
+            return result
+        shaped = dict(result)
+        shaped["recovery"] = _ATTACH_UNJUSTIFIED_RECOVERY
+        return shaped
+    except Exception:
+        return result
 
 
 _PA_BUSINESS_PAYLOAD_SCHEMA = {
