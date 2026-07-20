@@ -6,7 +6,7 @@ import {
   useAuiState,
   useMessageRuntime
 } from '@assistant-ui/react'
-import { useStore } from '@nanostores/react'
+import { useStore as useNanostore } from '@nanostores/react'
 import { type FC, useCallback, useMemo, useState } from 'react'
 
 import { ChangedFilesCard } from '@/components/assistant-ui/thread/changed-files-card'
@@ -21,6 +21,7 @@ import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/ass
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
+import { MessageAvatar } from '@/components/chat/message-avatar'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -33,6 +34,7 @@ import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notifyError } from '@/store/notifications'
+import { $avatarNames, DEFAULT_NAMES } from '@/store/avatar'
 import { $voicePlayback } from '@/store/voice-playback'
 
 // Stable empty identity for the settled-parts selector — a fresh [] per render
@@ -116,15 +118,27 @@ export const AssistantMessage: FC<{
   // are off, so the root carries no listener at all.
   const onDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
 
+  const assistantName = useNanostore($avatarNames).assistant || DEFAULT_NAMES.assistant
+
+  if (isPlaceholder) {
+    return null
+  }
+
   return (
-    <MessagePrimitive.Root
-      className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
-      data-role="assistant"
-      data-slot="aui_assistant-message-root"
-      data-streaming={isRunning ? 'true' : undefined}
-      onDoubleClick={onDoubleClick}
-      ref={enterRef}
-    >
+    <div className="message-row message-row-assistant flex w-full min-w-0 items-start justify-start gap-2" data-slot="message-row">
+      <MessageAvatar clickToEdit role="assistant" />
+      <div className="flex min-w-0 flex-1 flex-col items-start">
+        <span className="message-name-label mb-0.5 ml-1 text-[0.6875rem] leading-4 text-(--ui-text-tertiary) select-none">
+          {assistantName}
+        </span>
+        <MessagePrimitive.Root
+          className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
+          data-role="assistant"
+          data-slot="aui_assistant-message-root"
+          data-streaming={isRunning ? 'true' : undefined}
+          onDoubleClick={onDoubleClick}
+          ref={enterRef}
+        >
       <div
         className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground"
         data-slot="aui_assistant-message-content"
@@ -165,6 +179,8 @@ export const AssistantMessage: FC<{
           turn on its summary rather than burying it above the controls. */}
       <ChangedFilesCard parts={settledParts} />
     </MessagePrimitive.Root>
+      </div>
+    </div>
   )
 }
 
@@ -261,7 +277,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
 const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ getText, messageId }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
-  const voicePlayback = useStore($voicePlayback)
+  const voicePlayback = useNanostore($voicePlayback)
 
   const readAloudStatus =
     voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
