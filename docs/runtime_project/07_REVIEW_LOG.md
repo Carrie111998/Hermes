@@ -1105,3 +1105,41 @@ Task 17.1 accurately documented implemented behavior (chain-terminal, no global 
 - No in-place recovery of finalized original runs
 
 **Next implementation:** Task 21 — Derived Action Plan Generation (read-only only).
+
+---
+
+## Task 21 — Derived Action Plan Generation (2026-07-20)
+
+**Implementer:** Cursor  
+**Status:** ✅ Checkpointed (second Phase 2 **implementation**; parent Task 20 `2fa580b5`)  
+**Tests (candidate Git-only workspace):** focused Task 21 **60 passed**; full tracked `tests/htr/` **1304 passed** (23 files)  
+**Depends on:** Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`
+
+### Delivered
+
+- `htr/action_plan.py` — Hybrid D planner: structural next-slot hint; explicit `--action` + inputs for proposals; eleven frozen Phase 1 API catalog; observation digest `htr.observe.semantic.v1`; plan digest `htr.action_plan.digest.v1`; eight canonical plan states with deterministic precedence
+- `hermes_cli/htr.py`, `hermes_cli/subcommands/htr.py` — `hermes htr plan <run_id>`; JSON stdout; `--summary` stderr; exit 0/1/2
+- `tests/htr/test_action_plan.py`, `tests/htr/test_phase2_read_only_boundary.py` — digest vectors, Policy C, `project_dir` path contract, idempotency, runtime no-write proofs
+
+### Read-only boundary confirmed
+
+No lifecycle invocation, event append, JSON SoT write, workspace/task/attempt/artifact mutation, lock/lease, approval persistence, recovery/successor creation, subprocess, or network.
+
+### Policy C (planning layer)
+
+Trustworthy finalized original run + normal mutation request → `blocked_finalized`. Explicit `--remediation-intent` + mutation → `recovery_protocol_required`. Integrity failure precedes recovery classification. Recovery/Successor protocol **not implemented**.
+
+### Path semantics (audited)
+
+Committed Phase 1 `project_dir` = HTR **runs-storage root** (identical path role to observer `base_dir` and CLI `--runs-root`). Run workspace = runs-root + run_id. `project_repository_checkpoint` is separate opaque identity. Plans bind directory via semantic `project_dir_binding` (not unnecessary absolute paths in output).
+
+### Proposable clarification
+
+`proposable` = semantically complete under Task 21 planning contract only. Does **not** authorize execution. Omitted `event_id` → invoke-time allocation prerequisite; exact event identity not bound until supplied. Future approval must bind execution-ready identity (Tasks 22–25), not treat Task 21 digest alone as sufficient when idempotency remains unbound.
+
+### Non-goals confirmed
+
+- No Task 22 seal, Task 23 lock, Task 24 approval, Task 25 invoke, Recovery/Successor Run creation
+- No new lifecycle schemas/records/events; no edits to `htr/events.py`, `htr/schemas.py`, `htr/observe.py`
+
+**Next implementation:** Task 22 — Immutable finalized-run enforcement.

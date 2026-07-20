@@ -1,7 +1,7 @@
 # Phase 2 — Runtime Integration Boundary
 
-**Status:** Phase 2 **implementation started** (Task 19 `57a1ed651`); architecture checkpoint Task 20 (Policy C)  
-**Date:** 2026-07-19 (planning); **updated** 2026-07-20 (Task 19 + Task 20)  
+**Status:** Phase 2 **implementation in progress** (Task 19 `57a1ed651`; Task 21 action plan checkpointed); architecture checkpoint Task 20 (Policy C)  
+**Date:** 2026-07-19 (planning); **updated** 2026-07-20 (Tasks 19–21)  
 **Depends on:** Phase 1 closed — Task 17.1 `8fea4daa0`; baseline Git-reproducible at Task 18.5 `04b11bc4d`  
 **Audience:** Architect + Cursor implementer
 
@@ -77,7 +77,7 @@ Exceptional legal/security/data-governance correction of a finalized original ru
 | Work | Allowed before Task 22? |
 |------|-------------------------|
 | Read-only observability (Task 19) | ✅ Done |
-| Derived action plan (Task 21) | ✅ Yes (read-only) |
+| Derived action plan (Task 21) | ✅ Done (read-only) |
 | Approval persistence (Task 24) | ❌ No (operational control; still no invoke) |
 | Human-gated lifecycle invoke (Task 25) | ❌ No |
 | Bounded repair / unattended automation | ❌ No |
@@ -93,7 +93,7 @@ Bounded self-healing of finalized-run problems requires the Recovery/Successor R
 |-------|--------|
 | **Fail closed** | Required default (Task 19 observe + future invoke) |
 | **Silent auto-heal** | Forbidden |
-| **Derived action plan** | Task 21: library/stdout JSON; non-authoritative; not persisted in run tree |
+| **Derived action plan** | Task 21 ✅: library/stdout JSON; non-authoritative; not persisted; Hybrid D; eleven-action catalog; digests bind machine-readable state/risk/confidence/prerequisites/idempotency; `proposable` ≠ executable |
 | **Observation digest** | Canonical **semantic projection** of snapshot (exclude `observed_at`, presentation-only fields); deterministic JSON |
 | **Confidence** | Deterministic classes: `high` / `medium` / `low` / `indeterminate` + reason codes; integrity errors → non-actionable |
 | **Persisted approval** | Authoritative execution-control data (Task 24); schema task required; not lifecycle events |

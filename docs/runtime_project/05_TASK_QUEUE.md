@@ -1,16 +1,37 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-20 (Task 20 Policy C architecture checkpoint; parent Task 19 `57a1ed651`)
+**Last updated:** 2026-07-20 (Task 21 read-only derived action plan checkpoint; parent Task 20 `2fa580b5`)
 
 ---
 
 ## Active Task
 
-**Task 21 — Derived Action Plan Generation** — strictly read-only; **recommended next implementation** (may proceed before Task 22). See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Task 22 — Immutable Finalized-Run Enforcement** — mandatory before any Phase 2 lifecycle write/invoke path. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
 
 ---
 
 ## Completed
+
+### Task 21 — Derived Action Plan Generation (read-only)
+
+**Status:** ✅ Checkpointed (second Phase 2 **implementation**; parent Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`)  
+**Tests (candidate Git-only workspace):** focused Task 21 **60 passed**; full tracked `tests/htr/` **1304 passed** (23 files)  
+**Depends on:** Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`
+
+**Delivered:**
+
+- `htr/action_plan.py` — Hybrid D derived planner on Task 19 snapshots; semantic observation projection + digests; eleven-action frozen Phase 1 catalog; Policy C planning states; no lifecycle import
+- `hermes htr plan <run_id>` — JSON stdout; `--summary` stderr; exit 0/1/2; `--runs-root` supplies canonical `project_dir` binding where required
+- `tests/htr/test_action_plan.py`, extended `test_phase2_read_only_boundary.py` — contract, digest, Policy C, path-binding, idempotency, runtime tree-hash proofs
+
+**Contract preserved:**
+
+- Strictly read-only — no invoke, append, SoT write, lock, approval, recovery, subprocess, or network
+- `proposable` = semantically complete planning proposal only — **not** executable or currently authorized; event identity may remain unbound until invoke
+- Policy C at planning layer: finalized original-run mutation → `blocked_finalized`; explicit remediation intent → `recovery_protocol_required`
+- Committed `project_dir` = HTR runs-storage root (same role as observer `base_dir` / `--runs-root`); not project repository or run workspace
+
+**Explicitly not implemented:** Task 22 seal, Task 23 lock, Task 24 approval, Task 25 invoke, Recovery/Successor Run (Task 27+), execution authorization.
 
 ### Task 20 — Immutable Finalization and Safe Automation Control Boundary
 
@@ -212,7 +233,7 @@ Changes:
 
 ## Next Task (Implementer)
 
-**Task 21 — Derived Action Plan Generation** (read-only). Must not include: enforcement, approval, lock, invoke, recovery schema, persistence in run tree, new lifecycle types.
+**Task 22 — Immutable Finalized-Run Enforcement.** Mandatory before any Phase 2 lifecycle write or invoke path.
 
 **Blocked until Task 22:** any Phase 2 lifecycle write or invoke path.
 
