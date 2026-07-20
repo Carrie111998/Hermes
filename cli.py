@@ -4560,9 +4560,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             model_short = f"{model_short[:23]}..."
 
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
+        cwd_full = os.getcwd()
+        cwd_parts = cwd_full.rstrip("/").split("/")
+        # Show last 1-2 path components to keep it compact
+        if len(cwd_parts) >= 2:
+            cwd_short = "/".join(cwd_parts[-2:])
+        else:
+            cwd_short = cwd_parts[-1] if cwd_parts else cwd_full
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "cwd_full": cwd_full,
+            "cwd_short": cwd_short,
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -5071,13 +5080,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             duration_label = snapshot["duration"]
 
             yolo_active = self._is_session_yolo_active()
+            cwd_label = snapshot.get("cwd_short", "")
             if width < 52:
-                text = f"⚕ {snapshot['model_short']} · {duration_label}"
+                text = f"⚕ {snapshot['model_short']} · {cwd_label} · {duration_label}" if cwd_label else f"⚕ {snapshot['model_short']} · {duration_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if cwd_label:
+                    parts.append(cwd_label)
+                parts.append(percent_label)
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -5103,7 +5116,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {snapshot['model_short']}"]
+            if cwd_label:
+                parts.append(cwd_label)
+            parts.extend([context_label, percent_label])
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -5141,14 +5157,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             width = self._get_tui_terminal_width()
             duration_label = snapshot["duration"]
             yolo_active = self._is_session_yolo_active()
+            cwd_label = snapshot.get("cwd_short", "")
 
             if width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                ]
+                if cwd_label:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-cwd", f"📁 {cwd_label}"))
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
-                ]
+                ])
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -5164,9 +5186,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if cwd_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-cwd", f"📁 {cwd_label}"))
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -5203,13 +5230,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if cwd_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-cwd", f"📁 {cwd_label}"))
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -14975,6 +15007,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             'status-bar': 'bg:#1a1a2e #C0C0C0',
             'status-bar-strong': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-dim': 'bg:#1a1a2e #8B8682',
+            'status-bar-cwd': 'bg:#1a1a2e #87CEEB',
             'status-bar-good': 'bg:#1a1a2e #8FBC8F bold',
             'status-bar-warn': 'bg:#1a1a2e #FFD700 bold',
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
