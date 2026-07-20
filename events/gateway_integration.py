@@ -912,5 +912,13 @@ def _applier_poll_loop() -> None:
                 _applier_subscriber.redrive_partials()
             except Exception:
                 logger.exception("tracker-intent-applier redrive failed")
+            # Reap capped partials PG+canonical both show converged (own flag,
+            # default off). Runs after redrive so it mops up exactly what redrive
+            # just classified capped. Single-writer thread; own try/except so a
+            # reap failure never stalls the loop.
+            try:
+                _applier_subscriber.reap_converged_partials()
+            except Exception:
+                logger.exception("tracker-intent-applier reap failed")
             last_redrive = now
         _stop_event.wait(timeout=interval)
