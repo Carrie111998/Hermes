@@ -219,6 +219,46 @@ class TestSafeCommand:
             assert desc is None
 
 
+class TestCrontabRemovePattern:
+    """Tests for crontab -r / --remove detection (deletes all crontab entries)."""
+
+    def test_crontab_r_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command("crontab -r")
+        assert is_dangerous is True
+        assert key is not None
+        assert desc == "delete all crontab entries"
+
+    def test_crontab_remove_long_flag(self):
+        is_dangerous, key, desc = detect_dangerous_command("crontab --remove")
+        assert is_dangerous is True
+        assert key is not None
+        assert desc == "delete all crontab entries"
+
+    def test_crontab_r_with_user(self):
+        is_dangerous, key, desc = detect_dangerous_command("crontab -r -u root")
+        assert is_dangerous is True
+        assert key is not None
+        assert desc == "delete all crontab entries"
+
+    def test_crontab_list_safe(self):
+        is_dangerous, key, desc = detect_dangerous_command("crontab -l")
+        assert is_dangerous is False
+        assert key is None
+        assert desc is None
+
+    def test_crontab_edit_safe(self):
+        is_dangerous, key, desc = detect_dangerous_command("crontab -e")
+        assert is_dangerous is False
+        assert key is None
+        assert desc is None
+
+    def test_later_command_r_flag_does_not_trigger(self):
+        is_dangerous, key, desc = detect_dangerous_command("crontab -e; echo -r")
+        assert is_dangerous is False
+        assert key is None
+        assert desc is None
+
+
 def _clear_session(key):
     """Replace for removed clear_session() — directly clear internal state."""
     approval_module._session_approved.pop(key, None)

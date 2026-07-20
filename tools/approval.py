@@ -737,6 +737,10 @@ DANGEROUS_PATTERNS = [
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
+    # crontab -r / --remove removes ALL scheduled crontab entries for a user
+    # (or for another user when combined with -u). Bound matching to one command
+    # segment so a later shell command containing -r cannot trigger this guard.
+    (r'\bcrontab\b[^;|&\n]*?\s(?:-[^\s]*r|--remove)\b', "delete all crontab entries"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (parallel to pkill -9). Catches -9 / -KILL /
