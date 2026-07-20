@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import inspect
 import os
 import sqlite3
 import subprocess
@@ -26,6 +28,21 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+@pytest.fixture(autouse=True)
+def continuation_runtime_stubs(monkeypatch):
+    """Keep continuation tests hermetic while production APIs own verifiers."""
+    monkeypatch.setattr(kb, "_default_github_pr_verifier", _open_draft_pr)
+    monkeypatch.setattr(
+        kb,
+        "_default_profile_provider_resolver",
+        lambda _profile: "openai-codex",
+    )
+    # Production requires the caller to remain under the board root's live
+    # gateway. Tests model pytest as that control plane; the double-fork
+    # regression deliberately escapes this ancestry.
+    monkeypatch.setattr(kb, "_trusted_operator_gateway_pid", lambda _root: os.getpid())
 
 
 def _init_git_repo(repo: Path) -> None:
@@ -1809,6 +1826,55 @@ def test_dispatch_reclaims_stale_before_spawning(kanban_home):
 # Respawn guard (check_respawn_guard + dispatch_once integration)
 # ---------------------------------------------------------------------------
 
+_CONTINUATION_SHA_A = "a" * 40
+_CONTINUATION_SHA_B = "b" * 40
+
+
+def _continuation_tuple(owner: str, repo: str, number: int, sha: str) -> str:
+    return f"{owner}/{repo}#{number}@{sha}"
+
+
+def _open_draft_pr(pr: kb.ContinuationPR) -> kb.GitHubPRState:
+    return kb.GitHubPRState(
+        canonical_url=pr.canonical_url,
+        state="OPEN",
+        is_draft=True,
+        head_sha=pr.head_sha,
+    )
+
+
+def _create_continuation_task(
+    conn: sqlite3.Connection,
+    *pr_tuples: str,
+    assignee: str = "engineer",
+) -> str:
+    task_id = kb.create_task(conn, title="repair active PR", assignee=assignee)
+    for raw in pr_tuples:
+        pr = kb.parse_continuation_pr_tuple(raw)
+        kb.add_comment(conn, task_id, "worker", f"Opened {pr.canonical_url}")
+    kb.record_continuation_review(
+        conn,
+        task_id,
+        verdict="fix-required",
+        reason="repair the existing PR",
+    )
+    return task_id
+
+
+def _authorize_continuation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *pr_tuples: str,
+) -> kb.ContinuationAuthorization:
+    return kb.authorize_continuation(
+        conn,
+        task_id,
+        pr_tuples,
+        reason="address unresolved review findings",
+        authorized_profile="engineer",
+        authorized_provider="openai-codex",
+    )
+
 def test_respawn_guard_none_on_fresh_task(kanban_home):
     """A fresh task with no failures or runs is not guarded."""
     with kb.connect() as conn:
@@ -1929,6 +1995,1175 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_continuation_exact_authorization_consumes_atomically_and_passes_once(
+    kanban_home, all_assignees_spawnable
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+
+        assert result.spawned and result.spawned[0][0] == task_id
+        assert spawned == [task_id]
+        consumed = kb.get_continuation_authorization(conn, authorization.id)
+        assert consumed is not None
+        assert consumed.status() == "consumed"
+        assert consumed.consumed_run_id == kb.get_task(conn, task_id).current_run_id
+        events = kb.list_events(conn, task_id)
+        assert [event.kind for event in events].count("continuation_authorized") == 1
+        assert [event.kind for event in events].count("continuation_consumed") == 1
+
+        assert kb.reclaim_task(conn, task_id, reason="simulate completed worker process")
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        assert (task_id, "active_pr") in second.respawn_guarded
+        assert spawned == [task_id]
+        denial = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial.payload["reason"] == "authorization_consumed"
+        before = len(
+            [
+                event
+                for event in kb.list_events(conn, task_id)
+                if event.kind == "continuation_denied"
+            ]
+        )
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        after = len(
+            [
+                event
+                for event in kb.list_events(conn, task_id)
+                if event.kind == "continuation_denied"
+            ]
+        )
+        assert after == before
+
+
+def test_continuation_changed_head_fails_closed_with_audit_event(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+
+    def changed_head(pr: kb.ContinuationPR) -> kb.GitHubPRState:
+        return kb.GitHubPRState(
+            canonical_url=pr.canonical_url,
+            state="OPEN",
+            is_draft=True,
+            head_sha=_CONTINUATION_SHA_B,
+        )
+
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+        monkeypatch.setattr(kb, "_default_github_pr_verifier", changed_head)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (task_id, "active_pr") in result.respawn_guarded
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.get_continuation_authorization(conn, authorization.id).status() == "active"
+        denial = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial.payload == {
+            "authorization_id": authorization.id,
+            "phase": "dispatch",
+            "reason": "head_mismatch",
+        }
+
+
+@pytest.mark.parametrize(
+    ("state", "is_draft", "verifier_raises", "expected_reason"),
+    [
+        ("CLOSED", True, False, "pr_not_open"),
+        ("OPEN", True, True, "verifier_failure"),
+    ],
+)
+def test_continuation_live_pr_verification_failures_are_closed(
+    kanban_home,
+    all_assignees_spawnable,
+    state,
+    is_draft,
+    verifier_raises,
+    expected_reason,
+    monkeypatch,
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+
+    def verifier(pr: kb.ContinuationPR) -> kb.GitHubPRState:
+        if verifier_raises:
+            raise RuntimeError("github unavailable")
+        return kb.GitHubPRState(
+            canonical_url=pr.canonical_url,
+            state=state,
+            is_draft=is_draft,
+            head_sha=pr.head_sha,
+        )
+
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        _authorize_continuation(conn, task_id, pr_tuple)
+        monkeypatch.setattr(kb, "_default_github_pr_verifier", verifier)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (task_id, "active_pr") in result.respawn_guarded
+        denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == expected_reason
+
+
+def test_continuation_accepts_open_non_draft_pr(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+
+    def open_non_draft(pr: kb.ContinuationPR) -> kb.GitHubPRState:
+        return kb.GitHubPRState(
+            canonical_url=pr.canonical_url,
+            state="OPEN",
+            is_draft=False,
+            head_sha=pr.head_sha,
+        )
+
+    monkeypatch.setattr(kb, "_default_github_pr_verifier", open_non_draft)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = kb.authorize_continuation(
+            conn,
+            task_id,
+            [pr_tuple],
+            reason="repair regular PR",
+            authorized_profile="engineer",
+            authorized_provider="openai-codex",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert result.spawned and result.spawned[0][0] == task_id
+        assert kb.get_continuation_authorization(conn, authorization.id).status() == "consumed"
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "gave_up"])
+def test_continuation_accepts_budget_and_breaker_run_evidence(
+    kanban_home, outcome
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    now = int(time.time())
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="capped repair", assignee="engineer")
+        pr = kb.parse_continuation_pr_tuple(pr_tuple)
+        kb.add_comment(conn, task_id, "engineer", f"Opened {pr.canonical_url}")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, outcome, outcome, now - 30, now - 1),
+        )
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+        assert authorization.status() == "active"
+
+
+def test_continuation_operator_gate_and_trusted_comment_author(
+    kanban_home, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="operator gate", assignee="engineer")
+        pr = kb.parse_continuation_pr_tuple(pr_tuple)
+        kb.add_comment(conn, task_id, "engineer", f"Opened {pr.canonical_url}")
+        kb.add_comment(conn, task_id, "engineer", "FIX-REQUIRED: self-labelled")
+
+        common = dict(
+            reason="repair",
+            authorized_profile="engineer",
+            authorized_provider="openai-codex",
+        )
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("engineer", ("engineer",), None),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as self_auth:
+            kb.authorize_continuation(
+                conn,
+                task_id,
+                [pr_tuple],
+                **common,
+            )
+        assert self_auth.value.code == "self_authorization_forbidden"
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("reviewer", ("fable",), None),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as not_allowed:
+            kb.authorize_continuation(
+                conn,
+                task_id,
+                [pr_tuple],
+                **common,
+            )
+        assert not_allowed.value.code == "authorizer_not_allowed"
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), "t_worker"),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as worker:
+            kb.authorize_continuation(
+                conn,
+                task_id,
+                [pr_tuple],
+                **common,
+            )
+        assert worker.value.code == "worker_authorization_forbidden"
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("default", ("default",), None),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as evidence:
+            kb.authorize_continuation(
+                conn,
+                task_id,
+                [pr_tuple],
+                **common,
+            )
+        assert evidence.value.code == "repair_evidence_missing"
+        denial_reasons = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ]
+        assert {
+            "self_authorization_forbidden",
+            "authorizer_not_allowed",
+            "worker_authorization_forbidden",
+            "repair_evidence_missing",
+        } <= set(denial_reasons)
+
+
+def test_continuation_worker_ancestry_cannot_be_hidden_by_env(
+    kanban_home, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="operator gate", assignee="engineer")
+        pr = kb.parse_continuation_pr_tuple(pr_tuple)
+        kb.add_comment(conn, task_id, "engineer", f"Opened {pr.canonical_url}")
+        kb.add_comment(conn, task_id, "fable", "FIX-REQUIRED: repair")
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), None),
+        )
+        monkeypatch.setattr(
+            kb,
+            "_current_process_ancestry_pids",
+            lambda: (os.getpid(), 424242),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, worker_pid, started_at) "
+            "VALUES ('t_worker', 'running', 424242, ?)",
+            (int(time.time()),),
+        )
+
+        with pytest.raises(kb.ContinuationAuthorizationError) as denied:
+            kb.authorize_continuation(
+                conn,
+                task_id,
+                [pr_tuple],
+                reason="repair",
+                authorized_profile="engineer",
+                authorized_provider="openai-codex",
+            )
+
+        assert denied.value.code == "worker_authorization_forbidden"
+
+
+def test_continuation_runtime_api_has_no_verifier_injection_surface():
+    for func in (
+        kb.authorize_continuation,
+        kb.evaluate_respawn_guard,
+        kb.claim_task,
+        kb.dispatch_once,
+    ):
+        parameters = inspect.signature(func).parameters
+        assert "github_pr_verifier" not in parameters
+        assert "profile_provider_resolver" not in parameters
+
+
+def test_continuation_review_events_are_authoritative_across_operators(
+    kanban_home, monkeypatch
+):
+    first = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    second = _continuation_tuple("o269", "omnia", 569, _CONTINUATION_SHA_B)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="cross-review", assignee="engineer")
+        pr = kb.parse_continuation_pr_tuple(first)
+        kb.add_comment(conn, task_id, "worker", f"Opened {pr.canonical_url}")
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), None),
+        )
+        review_id = kb.record_continuation_review(
+            conn,
+            task_id,
+            verdict="fix-required",
+            reason="independent security review found a defect",
+        )
+
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("default", ("default",), None),
+        )
+        authorization = _authorize_continuation(conn, task_id, first)
+        assert authorization.status() == "active"
+        evidence = kb._continuation_evidence(conn, task_id)
+        assert evidence == {
+            "kind": "fix_required",
+            "at": evidence["at"],
+            "event_id": review_id,
+        }
+
+        resolved_id = kb.create_task(
+            conn,
+            title="cross-review resolved",
+            assignee="engineer",
+        )
+        resolved_pr = kb.parse_continuation_pr_tuple(second)
+        kb.add_comment(
+            conn,
+            resolved_id,
+            "worker",
+            f"Opened {resolved_pr.canonical_url}",
+        )
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("fable", ("fable",), None),
+        )
+        kb.record_continuation_review(
+            conn,
+            resolved_id,
+            verdict="fix-required",
+            reason="first reviewer found a defect",
+        )
+        monkeypatch.setattr(
+            kb,
+            "_continuation_operator_context",
+            lambda _conn: ("security", ("security",), None),
+        )
+        kb.record_continuation_review(
+            conn,
+            resolved_id,
+            verdict="resolved",
+            reason="second allowlisted reviewer verified the repair",
+        )
+        assert kb._continuation_evidence(conn, resolved_id) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX process lineage test")
+def test_continuation_double_fork_reparent_cannot_authorize(
+    kanban_home, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+    db_path = kb.kanban_db_path()
+    trusted_gateway_pid = os.getpid()
+    monkeypatch.setattr(
+        kb,
+        "_trusted_operator_gateway_pid",
+        lambda _root: trusted_gateway_pid,
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    read_fd, write_fd = os.pipe()
+    first_child = os.fork()
+    if first_child == 0:  # pragma: no cover - assertions happen in parent
+        os.close(read_fd)
+        try:
+            os.setsid()
+            second_child = os.fork()
+            if second_child > 0:
+                os._exit(0)
+            deadline = time.monotonic() + 3
+            while os.getppid() == first_child and time.monotonic() < deadline:
+                time.sleep(0.01)
+            try:
+                with kb.connect(db_path) as child_conn:
+                    kb.authorize_continuation(
+                        child_conn,
+                        task_id,
+                        [pr_tuple],
+                        reason="attempt from reparented worker",
+                        authorized_profile="engineer",
+                        authorized_provider="openai-codex",
+                    )
+            except kb.ContinuationAuthorizationError as exc:
+                result = exc.code
+            except BaseException as exc:
+                result = f"unexpected:{type(exc).__name__}:{exc}"
+            else:
+                result = "authorized"
+            os.write(write_fd, result.encode("utf-8", "replace"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+
+    os.close(write_fd)
+    os.waitpid(first_child, 0)
+    child_result = os.read(read_fd, 4096).decode("utf-8", "replace")
+    os.close(read_fd)
+    assert child_result == "operator_gateway_process_required"
+    with kb.connect(db_path) as conn:
+        assert kb.list_continuation_authorizations(conn, task_id) == []
+        denials = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ]
+        assert denials[-1] == "operator_gateway_process_required"
+
+
+def test_continuation_ttl_starts_after_writer_lock_acquisition(
+    kanban_home, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        clock = {"now": 1_000}
+        original_write_txn = kb.write_txn
+
+        @contextlib.contextmanager
+        def acquire_then_advance(connection):
+            with original_write_txn(connection):
+                clock["now"] = 2_000
+                yield
+
+        monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(kb, "write_txn", acquire_then_advance)
+        authorization = kb.authorize_continuation(
+            conn,
+            task_id,
+            [pr_tuple],
+            reason="writer lock expiry regression",
+            authorized_profile="engineer",
+            authorized_provider="openai-codex",
+            ttl_seconds=60,
+        )
+
+        assert authorization.created_at == 2_000
+        assert authorization.expires_at == 2_060
+
+
+def test_claim_rechecks_late_active_pr_under_writer_lock(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="late PR", assignee="engineer")
+        calls = 0
+
+        def active_after_precheck(_conn, _task_id, *, cutoff):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return ()
+            return ("https://github.com/o269/omnia/pull/568",)
+
+        monkeypatch.setattr(
+            kb,
+            "_canonical_pr_urls_from_comments",
+            active_after_precheck,
+        )
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        denial = [
+            event.payload
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == {
+            "authorization_id": None,
+            "phase": "claim_race",
+            "reason": "missing_authorization",
+        }
+
+
+def test_operator_override_revalidates_identity_under_writer_lock(
+    kanban_home, monkeypatch
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="override race", assignee="engineer")
+        original_write_txn = kb.write_txn
+
+        @contextlib.contextmanager
+        def reassign_after_lock(connection):
+            with original_write_txn(connection):
+                connection.execute(
+                    "UPDATE tasks SET assignee = 'default' WHERE id = ?",
+                    (task_id,),
+                )
+                yield
+
+        monkeypatch.setattr(kb, "write_txn", reassign_after_lock)
+        claimed = kb.claim_task(
+            conn,
+            task_id,
+            operator_override_reason="operator-approved follow-up",
+        )
+        assert claimed is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        denied = [
+            event.payload
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "operator_claim_denied"
+        ][-1]
+        assert denied["reason"] == "self_authorization_forbidden"
+
+
+def test_worker_process_identity_is_persisted_on_spawn(kanban_home):
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="kernel identity", assignee="engineer")
+            assert kb.claim_task(conn, task_id) is not None
+            kb._set_worker_pid(conn, task_id, child.pid)
+            run = conn.execute(
+                "SELECT worker_pid, worker_pid_started, worker_boot_id, "
+                "worker_sid, worker_pgid "
+                "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            assert run["worker_pid"] == child.pid
+            assert run["worker_pid_started"] is not None
+            assert run["worker_boot_id"]
+            assert run["worker_sid"] == child.pid
+            assert run["worker_pgid"] == child.pid
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def test_delete_task_removes_continuation_and_pr_ownership_rows(kanban_home):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+        assert conn.execute(
+            "SELECT 1 FROM task_pr_ownership WHERE task_id = ?",
+            (task_id,),
+        ).fetchone() is not None
+
+        assert kb.delete_task(conn, task_id)
+        assert kb.get_continuation_authorization(conn, authorization.id) is None
+        assert conn.execute(
+            "SELECT 1 FROM task_pr_ownership WHERE task_id = ?",
+            (task_id,),
+        ).fetchone() is None
+
+
+def test_continuation_supersede_revokes_with_explicit_audit_event(kanban_home):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        first = _authorize_continuation(conn, task_id, pr_tuple)
+        second = _authorize_continuation(conn, task_id, pr_tuple)
+
+        first_readback = kb.get_continuation_authorization(conn, first.id)
+        second_readback = kb.get_continuation_authorization(conn, second.id)
+        assert first_readback is not None and first_readback.status() == "revoked"
+        assert first_readback.revoked_at is not None
+        assert second_readback is not None and second_readback.status() == "active"
+        revoked = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_revoked"
+        ]
+        assert revoked[-1].payload == {
+            "authorization_id": first.id,
+            "reason": "superseded",
+            "revoked_at": first_readback.revoked_at,
+        }
+        assert revoked[-1].created_at >= first_readback.revoked_at
+
+
+@pytest.mark.parametrize(
+    ("pr_mode", "overrides", "expected"),
+    [
+        ("none", {}, "pr_required"),
+        ("duplicate", {}, "duplicate_pr_tuple"),
+        ("valid", {"reason": ""}, "reason_required"),
+        ("valid", {"authorized_profile": ""}, "profile_required"),
+        ("valid", {"authorized_provider": ""}, "provider_required"),
+        ("valid", {"ttl_seconds": 1}, "invalid_expiry"),
+        ("valid", {"ttl_seconds": "soon"}, "invalid_expiry"),
+    ],
+)
+def test_continuation_authorize_input_validation_fails_closed(
+    kanban_home, pr_mode, overrides, expected
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        prs = {
+            "none": [],
+            "duplicate": [pr_tuple, pr_tuple],
+            "valid": [pr_tuple],
+        }[pr_mode]
+        kwargs = {
+            "reason": "repair",
+            "authorized_profile": "engineer",
+            "authorized_provider": "openai-codex",
+            "ttl_seconds": kb.DEFAULT_CONTINUATION_AUTH_TTL_SECONDS,
+        }
+        kwargs.update(overrides)
+
+        with pytest.raises(kb.ContinuationAuthorizationError) as denied:
+            kb.authorize_continuation(conn, task_id, prs, **kwargs)
+
+        assert denied.value.code == expected
+        assert any(
+            event.kind == "continuation_denied"
+            and event.payload["reason"] == expected
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_continuation_task_and_provider_state_fail_closed(kanban_home, monkeypatch):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        blocked_task = _create_continuation_task(conn, pr_tuple)
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' WHERE id = ?",
+            (blocked_task,),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as not_ready:
+            _authorize_continuation(conn, blocked_task, pr_tuple)
+        assert not_ready.value.code == "task_not_ready"
+
+        unresolved_task = _create_continuation_task(conn, pr_tuple)
+        monkeypatch.setattr(
+            kb,
+            "_default_profile_provider_resolver",
+            lambda _profile: None,
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as unresolved:
+            kb.authorize_continuation(
+                conn,
+                unresolved_task,
+                [pr_tuple],
+                reason="repair",
+                authorized_profile="engineer",
+                authorized_provider="openai-codex",
+            )
+        assert unresolved.value.code == "provider_unresolved"
+
+        verifier_failure_task = _create_continuation_task(conn, pr_tuple)
+
+        def fail_provider_lookup(_profile):
+            raise RuntimeError("profile config unavailable")
+
+        monkeypatch.setattr(
+            kb,
+            "_default_profile_provider_resolver",
+            fail_provider_lookup,
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as verifier_failure:
+            kb.authorize_continuation(
+                conn,
+                verifier_failure_task,
+                [pr_tuple],
+                reason="repair",
+                authorized_profile="engineer",
+                authorized_provider="openai-codex",
+            )
+        assert verifier_failure.value.code == "provider_verifier_failure"
+
+
+def test_continuation_active_set_and_verifier_identity_fail_closed(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    first = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    second = _continuation_tuple("o269", "omnia-v2", 198, _CONTINUATION_SHA_B)
+    identity_tuple = _continuation_tuple(
+        "o269", "omnia", 569, _CONTINUATION_SHA_B
+    )
+    with kb.connect() as conn:
+        changed_task = _create_continuation_task(conn, first)
+        _authorize_continuation(conn, changed_task, first)
+        second_pr = kb.parse_continuation_pr_tuple(second)
+        kb.add_comment(
+            conn,
+            changed_task,
+            "engineer",
+            f"Also opened {second_pr.canonical_url}",
+        )
+        changed = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (changed_task, "active_pr") in changed.respawn_guarded
+        changed_denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, changed_task)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert changed_denial == "active_pr_set_mismatch"
+
+        identity_task = _create_continuation_task(conn, identity_tuple)
+        _authorize_continuation(conn, identity_task, identity_tuple)
+
+        def wrong_identity(pr):
+            return kb.GitHubPRState(
+                canonical_url="https://github.com/o269/other/pull/569",
+                state="OPEN",
+                is_draft=True,
+                head_sha=pr.head_sha,
+            )
+
+        monkeypatch.setattr(kb, "_default_github_pr_verifier", wrong_identity)
+        identity = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (identity_task, "active_pr") in identity.respawn_guarded
+        identity_denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, identity_task)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert identity_denial == "verifier_identity_mismatch"
+
+
+def test_continuation_claim_race_expiry_fails_closed_without_consuming(
+    kanban_home, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+        original_get = kb.get_continuation_authorization
+
+        def expire_during_claim(connection, authorization_id):
+            readback = original_get(connection, authorization_id)
+            assert readback is not None
+            readback.expires_at = 0
+            return readback
+
+        monkeypatch.setattr(
+            kb,
+            "get_continuation_authorization",
+            expire_during_claim,
+        )
+        claimed = kb.claim_task(
+            conn,
+            task_id,
+        )
+
+        assert claimed is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        stored = conn.execute(
+            "SELECT consumed_at FROM continuation_authorizations WHERE id = ?",
+            (authorization.id,),
+        ).fetchone()
+        assert stored["consumed_at"] is None
+        denial = [
+            event.payload
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == {
+            "authorization_id": authorization.id,
+            "phase": "claim_race",
+            "reason": "authorization_expired",
+        }
+
+
+def test_operator_manual_claim_override_is_gated_and_audited(kanban_home):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        assert kb.claim_task(conn, task_id) is None
+        claimed = kb.claim_task(
+            conn,
+            task_id,
+            operator_override_reason="PR merged; run follow-up verification",
+        )
+        assert claimed is not None
+        bypass = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "respawn_guard_bypassed"
+        ][-1]
+        assert bypass.payload == {
+            "operator": "default",
+            "reason": "PR merged; run follow-up verification",
+            "guard_reason": "active_pr",
+        }
+
+
+def test_rate_limited_active_pr_retries_after_cooldown(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = int(time.time())
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="quota retry", assignee="engineer")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'rate_limited', 'rate_limited', ?, ?)",
+            (task_id, now - 700, now - 600),
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("provider quota rate limit", task_id),
+        )
+        kb.add_comment(
+            conn,
+            task_id,
+            "engineer",
+            "Opened https://github.com/o269/omnia/pull/568",
+        )
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_continuation_authorization_bypasses_prior_recent_success(
+    kanban_home, all_assignees_spawnable
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    now = int(time.time())
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (task_id, now - 120, now - 60),
+        )
+        assert kb.check_respawn_guard(conn, task_id) == "recent_success"
+        authorization = _authorize_continuation(conn, task_id, pr_tuple)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert result.spawned and result.spawned[0][0] == task_id
+        consumed = kb.get_continuation_authorization(conn, authorization.id)
+        assert consumed is not None and consumed.status() == "consumed"
+
+
+def test_spawn_failure_is_fresh_evidence_for_reauthorization(
+    kanban_home, all_assignees_spawnable
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        first = _authorize_continuation(conn, task_id, pr_tuple)
+
+        def fail_spawn(_task, _workspace):
+            raise RuntimeError("launcher unavailable")
+
+        kb.dispatch_once(
+            conn,
+            spawn_fn=fail_spawn,
+            failure_limit=2,
+        )
+        assert kb.get_continuation_authorization(conn, first.id).status() == "consumed"
+        assert kb.get_task(conn, task_id).status == "ready"
+        second = _authorize_continuation(conn, task_id, pr_tuple)
+        assert second.status() == "active"
+
+
+def test_historic_nonterminal_card_still_owns_pr(kanban_home):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        old_owner = kb.create_task(conn, title="historic tracker", assignee="security")
+        pr = kb.parse_continuation_pr_tuple(pr_tuple)
+        kb.add_comment(conn, old_owner, "security", f"Tracked {pr.canonical_url}")
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 1, old_owner),
+        )
+        with pytest.raises(kb.ContinuationAuthorizationError) as denied:
+            _authorize_continuation(conn, task_id, pr_tuple)
+        assert denied.value.code == f"duplicate_pr_owner:{old_owner}"
+
+
+def test_continuation_live_writer_fails_closed(
+    kanban_home, all_assignees_spawnable
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        _authorize_continuation(conn, task_id, pr_tuple)
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at) "
+            "VALUES (?, 'other-writer', 'running', ?)",
+            (task_id, int(time.time())),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (task_id, "active_pr") in result.respawn_guarded
+        denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ]
+        assert "live_writer" in denial
+
+
+def test_continuation_duplicate_card_pr_owner_fails_closed(
+    kanban_home, all_assignees_spawnable
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        _authorize_continuation(conn, task_id, pr_tuple)
+        duplicate_id = kb.create_task(conn, title="duplicate", assignee="security")
+        pr = kb.parse_continuation_pr_tuple(pr_tuple)
+        kb.add_comment(conn, duplicate_id, "worker", f"Also owns {pr.canonical_url}")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (task_id, "active_pr") in result.respawn_guarded
+        denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == f"duplicate_pr_owner:{duplicate_id}"
+
+
+def test_continuation_multi_pr_ordered_exact_tuple_works(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    first = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    second = _continuation_tuple("o269", "omnia-v2", 198, _CONTINUATION_SHA_B)
+    verified: list[str] = []
+
+    def verifier(pr: kb.ContinuationPR) -> kb.GitHubPRState:
+        verified.append(pr.canonical_url)
+        return _open_draft_pr(pr)
+
+    monkeypatch.setattr(kb, "_default_github_pr_verifier", verifier)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, first, second)
+        authorization = kb.authorize_continuation(
+            conn,
+            task_id,
+            [first, second],
+            reason="repair both exact draft heads",
+            authorized_profile="engineer",
+            authorized_provider="openai-codex",
+        )
+        assert [pr.tuple_text for pr in authorization.prs] == [first, second]
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert result.spawned and result.spawned[0][0] == task_id
+        assert verified == [
+            kb.parse_continuation_pr_tuple(first).canonical_url,
+            kb.parse_continuation_pr_tuple(second).canonical_url,
+        ] * 3  # authorize, dispatch guard, claim re-verification
+
+
+def test_continuation_provider_mismatch_fails_closed(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+        _authorize_continuation(conn, task_id, pr_tuple)
+        monkeypatch.setattr(
+            kb,
+            "_default_profile_provider_resolver",
+            lambda _profile: "deepseek",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (task_id, "active_pr") in result.respawn_guarded
+        denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == "provider_mismatch"
+
+        conn.execute(
+            "UPDATE tasks SET assignee = 'security' WHERE id = ?",
+            (task_id,),
+        )
+        reassigned = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (task_id, "active_pr") in reassigned.respawn_guarded
+        reassigned_denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert reassigned_denial == "assignee_mismatch"
+
+
+def test_continuation_timeout_evidence_must_still_be_unresolved(kanban_home):
+    now = int(time.time())
+    active_tuple = _continuation_tuple(
+        "o269", "omnia", 568, _CONTINUATION_SHA_A
+    )
+    resolved_tuple = _continuation_tuple(
+        "o269", "omnia", 569, _CONTINUATION_SHA_B
+    )
+    with kb.connect() as conn:
+        active_task = kb.create_task(
+            conn, title="timed out repair", assignee="engineer"
+        )
+        active_pr = kb.parse_continuation_pr_tuple(active_tuple)
+        kb.add_comment(
+            conn, active_task, "worker", f"Opened {active_pr.canonical_url}"
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'timed_out', 'timed_out', ?, ?)",
+            (active_task, now - 60, now - 30),
+        )
+        authorization = _authorize_continuation(conn, active_task, active_tuple)
+        assert authorization.status() == "active"
+
+        resolved_task = kb.create_task(
+            conn, title="resolved timeout", assignee="engineer"
+        )
+        resolved_pr = kb.parse_continuation_pr_tuple(resolved_tuple)
+        kb.add_comment(
+            conn, resolved_task, "worker", f"Opened {resolved_pr.canonical_url}"
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'timed_out', 'timed_out', ?, ?)",
+            (resolved_task, now - 60, now - 30),
+        )
+        kb.record_continuation_review(
+            conn,
+            resolved_task,
+            verdict="resolved",
+            reason="security review passed",
+        )
+        with pytest.raises(
+            kb.ContinuationAuthorizationError,
+            match="repair evidence missing",
+        ):
+            _authorize_continuation(conn, resolved_task, resolved_tuple)
+
+
+def test_continuation_expired_or_missing_exact_head_fails_closed(
+    kanban_home, all_assignees_spawnable
+):
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        expired_task = _create_continuation_task(conn, pr_tuple)
+        expired = _authorize_continuation(conn, expired_task, pr_tuple)
+        conn.execute(
+            "UPDATE continuation_authorizations SET expires_at = ? WHERE id = ?",
+            (int(time.time()) - 1, expired.id),
+        )
+        expired_result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (expired_task, "active_pr") in expired_result.respawn_guarded
+
+    with pytest.raises(kb.ContinuationAuthorizationError, match="PR tuples must"):
+        kb.parse_continuation_pr_tuple("o269/omnia#568")
+
+    with kb.connect() as conn:
+        corrupt_tuple = _continuation_tuple(
+            "o269", "omnia", 569, _CONTINUATION_SHA_B
+        )
+        corrupt_task = _create_continuation_task(conn, corrupt_tuple)
+        corrupt = _authorize_continuation(conn, corrupt_task, corrupt_tuple)
+        conn.execute(
+            "UPDATE continuation_authorizations SET pr_tuples = ? WHERE id = ?",
+            ('["o269/omnia#568"]', corrupt.id),
+        )
+        corrupt_result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+        )
+        assert (corrupt_task, "active_pr") in corrupt_result.respawn_guarded
+        denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, corrupt_task)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == "missing_exact_head"
+
+
+def test_continuation_schema_upgrade_is_idempotent(tmp_path):
+    db_path = tmp_path / "pre-continuation-kanban.db"
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(conn, title="preserved", assignee="engineer")
+        conn.execute("DROP INDEX idx_continuation_auth_one_live")
+        conn.execute("DROP INDEX idx_continuation_auth_task")
+        conn.execute("DROP TABLE continuation_authorizations")
+
+    kb.init_db(db_path)
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'continuation_authorizations'"
+        ).fetchone()
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        assert table is not None
+        assert kb.get_task(conn, task_id).title == "preserved"
+        assert {
+            "idx_continuation_auth_task",
+            "idx_continuation_auth_one_live",
+            "idx_comments_created_at",
+        } <= indexes
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
@@ -2037,6 +3272,12 @@ def test_dispatch_respawn_guard_skips_active_pr(
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+        denial = [
+            event.payload["reason"]
+            for event in kb.list_events(conn, t)
+            if event.kind == "continuation_denied"
+        ][-1]
+        assert denial == "missing_authorization"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(

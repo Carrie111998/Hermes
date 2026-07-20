@@ -2903,6 +2903,17 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Profiles allowed to mint active-PR continuation grants or use the
+        # audited manual-claim guard override. The guarded DB/API layer reads
+        # this list from the DEFAULT Hermes root config (not the invoking
+        # lane's profile config), derives the caller from HERMES_HOME, rejects
+        # worker subprocesses (environment + live process ancestry), and
+        # refuses self-authorization of an assigned task.
+        # Named operator profiles must be explicitly opted in by the operator.
+        # Comma-delimited string so `hermes config set ... default,fable`
+        # remains a supported, typed config mutation (the reader also accepts
+        # YAML lists for hand-authored config files).
+        "continuation_operator_profiles": "default",
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -3327,9 +3338,6 @@ DEFAULT_CONFIG = {
         # recommended default; any Grok model with x_search tool
         # access works.
         "model": "grok-4.5",
-        # Optional reasoning effort sent to xAI Responses API models that
-        # support it. Leave null to preserve the selected model's default.
-        "reasoning_effort": None,
         # Request timeout in seconds (minimum 30). x_search can take
         # 60-120s for complex queries — the default is generous.
         "timeout_seconds": 180,
