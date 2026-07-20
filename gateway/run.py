@@ -5334,11 +5334,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not adapter:
                 return
 
+            # Position of THIS message in the queue: current depth counts
+            # everything already queued; this message hasn't been enqueued
+            # yet (the caller does that after _handle_active_session_busy_message
+            # returns False), so +1 gives the slot this message will land in.
+            try:
+                position = self._queue_depth(session_key, adapter=adapter) + 1
+            except Exception:
+                position = None
+
+            if position is not None:
+                content = f"📥 Queued #{position} (排队中)"
+            else:
+                content = "📥 Queued (排队中)"
+
             reply_anchor = self._reply_anchor_for_event(event)
             self._busy_ack_ts[session_key] = now
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
-                content="📥 Queued (排队中)",
+                content=content,
                 reply_to=reply_anchor,
                 metadata=self._thread_metadata_for_source(event.source, reply_anchor),
             )

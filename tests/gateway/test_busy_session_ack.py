@@ -3,6 +3,7 @@
 Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
+import re
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -275,6 +276,11 @@ class TestBusySessionAck:
         adapter._send_with_retry.assert_called_once()
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
         assert "Queued" in content, f"expected queue ACK marker, got: {content!r}"
+        # ACK identifies position of the queued message so the user can
+        # match subsequent responses back to their inputs.
+        assert re.search(r"Queued #\d+", content), (
+            f"expected position marker like 'Queued #N', got: {content!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_busy_text_mode_queue_silent_when_ack_disabled(self, monkeypatch):
