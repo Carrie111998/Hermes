@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ import html as _html
 import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, NamedTuple, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,110 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace
+
+
+# ---------------------------------------------------------------------------
+# Outbound destination allowlist (fail-closed)
+#
+# WhatsApp sends traverse the Node bridge, where `outboundPolicyDecision()`
+# (scripts/whatsapp-bridge-v2/bridge.js) refuses any destination that is not
+# explicitly allowed, and refuses *everything* when the filter is unconfigured.
+# Telegram traverses none of that: the adapter talks to the Bot API directly.
+# These pieces give Telegram the same mechanical floor, with the same
+# fail-closed semantics and the same reason codes.
+#
+# Note the deliberate inversion versus the *inbound* `allowed_chats`, where an
+# empty set means "no restriction". For outbound, unset or empty means NO SENDS.
+# A misconfiguration must silence the agent, never open it.
+# ---------------------------------------------------------------------------
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Bot API calls that read state rather than emit into a chat. Everything else
+# that carries a resolvable chat_id is gated, so a newly added `send_*` helper
+# is fail-closed by default instead of by the author remembering to add a check.
+_OUTBOUND_EXEMPT_METHODS = frozenset({
+    "get_chat",
+    "get_chat_member",
+    "get_chat_member_count",
+    "get_chat_administrators",
+    "get_file",
+    "get_me",
+    "get_updates",
+    "get_my_commands",
+    "set_my_commands",
+    "delete_my_commands",
+})
+
+
+class TelegramOutboundBlocked(RuntimeError):
+    """Raised when a Telegram API call is refused by the outbound allowlist."""
+
+    def __init__(self, chat_id: Any, reason: str) -> None:
+        self.chat_id = chat_id
+        self.reason = reason
+        super().__init__(
+            f"Telegram outbound blocked for chat {chat_id!r}: {reason}"
+        )
+
+
+class OutboundDecision(NamedTuple):
+    allowed: bool
+    reason: str
+
+
+def _normalize_chat_id(value: Any) -> str:
+    return str(value).strip()
+
+
+def _extract_chat_id(args: tuple, kwargs: dict) -> Optional[Any]:
+    """Resolve the destination chat of a Bot API call, if it targets one."""
+    if "chat_id" in kwargs:
+        return kwargs["chat_id"]
+    if args and isinstance(args[0], (str, int)):
+        # python-telegram-bot puts chat_id first on every chat-targeted method.
+        return args[0]
+    return None
+
+
+class _OutboundGuardedBot:
+    """Wraps a telegram ``Bot`` so every chat-targeted call clears the allowlist.
+
+    This is the single structural chokepoint. ``TelegramAdapter`` reaches the
+    Bot API only through ``self._bot`` (assigned exactly once, in ``connect()``;
+    the adapter has no ``reply_text``/``context.bot`` call sites, and the three
+    ``self._app.bot`` uses are ``get_me`` and transport internals). Gating the
+    proxy therefore gates every send path at once, including bound methods
+    handed to retry helpers such as ``_call_with_retry(self._bot.send_voice, ...)``.
+    """
+
+    __slots__ = ("_wrapped_bot", "_decide")
+
+    def __init__(self, bot: Any, decide) -> None:
+        object.__setattr__(self, "_wrapped_bot", bot)
+        object.__setattr__(self, "_decide", decide)
+
+    def __getattr__(self, name: str) -> Any:
+        bot = object.__getattribute__(self, "_wrapped_bot")
+        attr = getattr(bot, name)
+        if name in _OUTBOUND_EXEMPT_METHODS or not callable(attr):
+            return attr
+        decide = object.__getattribute__(self, "_decide")
+
+        @functools.wraps(attr)
+        def _guarded(*args: Any, **kwargs: Any) -> Any:
+            chat_id = _extract_chat_id(args, kwargs)
+            if chat_id is not None:
+                decision = decide(chat_id)
+                if not decision.allowed:
+                    logger.error(
+                        "Telegram outbound REFUSED: method=%s chat_id=%s reason=%s",
+                        name, chat_id, decision.reason,
+                    )
+                    raise TelegramOutboundBlocked(chat_id, decision.reason)
+            return attr(*args, **kwargs)
+
+        return _guarded
 
 
 def _first_present(mapping: Dict[str, Any], *keys: str) -> Any:
@@ -1297,8 +1402,23 @@ class TelegramAdapter(BasePlatformAdapter):
 
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
-            self._bot = self._app.bot
-            
+            # Every Bot API call the adapter makes goes through this proxy, so
+            # the outbound destination allowlist cannot be routed around.
+            self._bot = _OutboundGuardedBot(self._app.bot, self._outbound_policy_decision)
+            _oc_configured, _oc_allowed = self._telegram_outbound_allowed_chats()
+            if self._telegram_outbound_disabled():
+                logger.warning("[%s] Telegram outbound DISABLED (kill switch)", self.name)
+            elif not _oc_configured:
+                logger.warning(
+                    "[%s] Telegram outbound allowlist UNCONFIGURED - all sends refused",
+                    self.name,
+                )
+            else:
+                logger.info(
+                    "[%s] Telegram outbound allowlist active: %d chat(s)",
+                    self.name, len(_oc_allowed),
+                )
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -1531,7 +1651,24 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        # Explicit check on the primary path so a refusal surfaces as a clean
+        # SendResult rather than an exception. The _OutboundGuardedBot proxy is
+        # the structural backstop covering every other send path.
+        _decision = self._outbound_policy_decision(chat_id)
+        if not _decision.allowed:
+            logger.error(
+                "[%s] Telegram outbound REFUSED: chat_id=%s reason=%s",
+                self.name, chat_id, _decision.reason,
+            )
+            return SendResult(
+                success=False,
+                error=(
+                    f"Telegram outbound blocked: destination {chat_id} is not "
+                    f"in the outbound allowlist (reason: {_decision.reason})"
+                ),
+            )
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -3806,6 +3943,44 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_outbound_disabled(self) -> bool:
+        """Kill switch, mirroring bridge.js's ``WHATSAPP_OUTBOUND_DISABLED``."""
+        configured = self.config.extra.get("outbound_disabled")
+        if configured is None:
+            configured = os.getenv("TELEGRAM_OUTBOUND_DISABLED")
+        if configured is None:
+            return False
+        if isinstance(configured, str):
+            return configured.strip().lower() in _TRUTHY
+        return bool(configured)
+
+    def _telegram_outbound_allowed_chats(self) -> tuple[bool, set[str]]:
+        """Return ``(configured, chat_ids)`` for the outbound destination filter.
+
+        ``configured`` distinguishes "operator never set this" from "operator set
+        it to an empty list". Both refuse every send; the flag exists so the
+        refusal reason is honest about which case fired.
+        """
+        raw = self.config.extra.get("outbound_allowed_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_OUTBOUND_ALLOWED_CHATS")
+        if raw is None:
+            return False, set()
+        if isinstance(raw, list):
+            return True, {str(part).strip() for part in raw if str(part).strip()}
+        return True, {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _outbound_policy_decision(self, chat_id: Any) -> OutboundDecision:
+        """Fail-closed destination policy. Mirrors bridge.js ``outboundPolicyDecision``."""
+        if self._telegram_outbound_disabled():
+            return OutboundDecision(False, "global_disabled")
+        configured, allowed = self._telegram_outbound_allowed_chats()
+        if not configured:
+            return OutboundDecision(False, "filter_unconfigured")
+        if _normalize_chat_id(chat_id) in {_normalize_chat_id(c) for c in allowed}:
+            return OutboundDecision(True, "explicitly_allowed")
+        return OutboundDecision(False, "not_in_outbound_allowlist")
 
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")

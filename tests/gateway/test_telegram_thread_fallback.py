@@ -25,6 +25,25 @@ from gateway.platforms.base import (
 from gateway.session import build_session_key
 
 
+@pytest.fixture(autouse=True)
+def _allow_telegram_outbound(monkeypatch):
+    """This module exercises send mechanics, not the outbound destination policy.
+
+    ``TelegramAdapter`` is fail-closed on outbound destinations (see
+    ``tests/gateway/test_telegram_outbound_allowlist.py``), so tests that only
+    care about formatting/threading/media routing must opt in explicitly rather
+    than relying on an allowlist that production must never have.
+    """
+    from gateway.platforms.telegram import OutboundDecision, TelegramAdapter
+
+    monkeypatch.setattr(
+        TelegramAdapter,
+        "_outbound_policy_decision",
+        lambda self, chat_id: OutboundDecision(True, "test_override"),
+    )
+
+
+
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
 # Mirrors the real python-telegram-bot hierarchy:
 #   BadRequest → NetworkError → TelegramError → Exception

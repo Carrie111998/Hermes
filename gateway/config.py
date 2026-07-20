@@ -1060,6 +1060,28 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(group_allowed_chats, list):
                         group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
                     os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
+                # outbound_allowed_chats: destination allowlist for SENDS.
+                # Unlike inbound allowed_chats (empty = no restriction), this is
+                # fail-closed: unset or empty means the adapter refuses every
+                # send. Mirrors whatsapp.outbound_allowed_chats / bridge.js.
+                t_oac = telegram_cfg.get("outbound_allowed_chats")
+                if t_oac is not None and not os.getenv("TELEGRAM_OUTBOUND_ALLOWED_CHATS"):
+                    if isinstance(t_oac, list):
+                        t_oac = ",".join(str(v) for v in t_oac)
+                    os.environ["TELEGRAM_OUTBOUND_ALLOWED_CHATS"] = str(t_oac)
+                if t_oac is not None:
+                    plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
+                    if not isinstance(plat_data, dict):
+                        plat_data = {}
+                        platforms_data[Platform.TELEGRAM.value] = plat_data
+                    extra = plat_data.setdefault("extra", {})
+                    if not isinstance(extra, dict):
+                        extra = {}
+                        plat_data["extra"] = extra
+                    extra["outbound_allowed_chats"] = telegram_cfg.get("outbound_allowed_chats")
+                if "outbound_disabled" in telegram_cfg and not os.getenv("TELEGRAM_OUTBOUND_DISABLED"):
+                    os.environ["TELEGRAM_OUTBOUND_DISABLED"] = str(telegram_cfg["outbound_disabled"]).lower()
+
                 for _telegram_extra_key in ("guest_mode", "disable_link_previews"):
                     if _telegram_extra_key in telegram_cfg:
                         plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
