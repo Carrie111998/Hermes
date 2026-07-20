@@ -601,6 +601,7 @@ class TelegramNotifier(BaseSubscriber):
         *,
         event: Optional[Event] = None,
         topic_key: Optional[str] = None,
+        batch_count: Optional[int] = None,
     ) -> None:
         """Send a message to a Telegram chat/thread.
 
@@ -611,10 +612,15 @@ class TelegramNotifier(BaseSubscriber):
         their own exceptions, so a bus-side failure (transient SQLite
         lock, schema mismatch) NEVER breaks the upstream delivery path.
 
-        Batched flushes (_flush_stale_batches) call this without an
-        event so per-event reverse signals don't double the LOW-priority
+        Batched flushes (_flush_batch_key) call this without an event
+        so per-event reverse signals don't double the LOW-priority
         firehose volume — Phase 1 scoping per the design doc at
         docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+        They pass ``batch_count`` instead, and a successful flush emits
+        ONE synthetic NOTIFICATION_DELIVERED with
+        original_event_type="batch_flush" (routing-v3 observability gap,
+        2026-07-20: without it a "Batched (N events)" chat message left
+        zero ledger rows, so per-topic delivery audits undercounted).
         """
         t0 = time.monotonic()
         try:
@@ -636,6 +642,10 @@ class TelegramNotifier(BaseSubscriber):
             if event is not None:
                 self._safe_emit_delivered(
                     event, chat_id, thread_id, topic_key, latency_ms,
+                )
+            elif batch_count is not None:
+                self._safe_emit_batch_delivered(
+                    chat_id, thread_id, topic_key, latency_ms, batch_count,
                 )
         except Exception as exc:
             latency_ms = int((time.monotonic() - t0) * 1000)
@@ -678,6 +688,45 @@ class TelegramNotifier(BaseSubscriber):
             logger.exception(
                 "TelegramNotifier: failed to emit NOTIFICATION_DELIVERED "
                 "for event %s", event.event_id,
+            )
+
+    def _safe_emit_batch_delivered(
+        self,
+        chat_id: str,
+        thread_id: str,
+        topic_key: Optional[str],
+        latency_ms: int,
+        batch_count: int,
+    ) -> None:
+        """Emit ONE synthetic NOTIFICATION_DELIVERED for a successful
+        batch flush (original_event_type="batch_flush", no
+        original_event_id — the send aggregates many events). Same
+        swallow contract as _safe_emit_delivered. Loop-safe: both this
+        subscriber and WhatsAppEscalator skip NOTIFICATION_DELIVERED via
+        their _NEVER_CONSUME early-return, so the synthetic event is
+        ledger-only."""
+        try:
+            self.bus.emit(
+                event_type=EventType.NOTIFICATION_DELIVERED,
+                source="telegram-notifier",
+                payload={
+                    "original_event_type": "batch_flush",
+                    "batch_count": batch_count,
+                    "platform": "telegram",
+                    "target": {
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                        "topic_key": topic_key or "",
+                    },
+                    "latency_ms": latency_ms,
+                },
+                priority=Priority.LOW,
+                tags=["delivery", "telegram", "batch"],
+            )
+        except Exception:
+            logger.exception(
+                "TelegramNotifier: failed to emit batch-flush "
+                "NOTIFICATION_DELIVERED for %s:%s", chat_id, thread_id,
             )
 
     def _safe_emit_failed(
@@ -744,7 +793,11 @@ class TelegramNotifier(BaseSubscriber):
         parts = key.split(":", 1)
         chat_id, thread_id = parts[0], parts[1] if len(parts) > 1 else ""
         combined = f"Batched ({len(messages)} events):\n\n" + "\n---\n".join(messages)
-        self._deliver(chat_id, thread_id, combined)
+        self._deliver(
+            chat_id, thread_id, combined,
+            topic_key=self._thread_id_to_key(thread_id),
+            batch_count=len(messages),
+        )
 
     def _persist_batch_buffer(self) -> None:
         """Write current batch state to disk so it survives restart."""

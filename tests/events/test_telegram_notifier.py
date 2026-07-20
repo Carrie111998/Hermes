@@ -740,6 +740,77 @@ class TestLowPriorityBatching:
         assert len(sent) == 1
         assert "Batched (2 events)" in sent[0]
 
+    def test_batch_flush_emits_synthetic_delivered_event(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Routing-v3 observability gap (2026-07-20): batch flushes call
+        _deliver() without event=, so hourly "Batched (N events)" sends
+        left ZERO notification_delivered rows — per-topic delivery audits
+        (routing_v3_24h_verify) undercount actual chat messages and can't
+        verify batch cadence. Fix: one synthetic NOTIFICATION_DELIVERED
+        per flush with original_event_type="batch_flush" + batch_count,
+        NOT one per constituent event (Phase 1 volume scoping stands).
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: None,
+        )
+        # Titles differ by LETTERS (RepeatGuard collapses digit runs).
+        for title in ("Alpha Analyst", "Beta Engineer"):
+            notifier.handle(Event.create(
+                EventType.JOB_DISCOVERED, "scout",
+                {"title": title, "company": "Acme", "source": "Indeed"},
+                priority=Priority.LOW,
+            ))
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+        notifier._flush_stale_batches(max_age=0)
+
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 1, (
+            f"expected exactly one synthetic NOTIFICATION_DELIVERED per "
+            f"batch flush, got {len(delivered)}"
+        )
+        evt = delivered[0]
+        assert evt.priority == Priority.LOW
+        assert evt.payload["original_event_type"] == "batch_flush"
+        assert evt.payload["batch_count"] == 2
+        assert evt.payload["platform"] == "telegram"
+        assert evt.payload["target"]["chat_id"] == "-1001234567890"
+        assert evt.payload["target"]["thread_id"] == "101"  # jobflow_firehose
+        assert evt.payload["target"]["topic_key"] == "jobflow_firehose"
+        assert evt.payload["latency_ms"] >= 0
+        # No single originating event — the field must not point anywhere.
+        assert "original_event_id" not in evt.payload
+
+    def test_batch_flush_send_failure_emits_no_delivered_event(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """A failed flush send must NOT claim delivery — the synthetic
+        event fires only on the success path, so the ledger never counts
+        a batch the chat never saw."""
+        calls = {"n": 0}
+
+        def flaky_send(chat_id, thread_id, msg):
+            calls["n"] += 1
+            raise RuntimeError("Bad Gateway")
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=flaky_send,
+        )
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+        assert calls["n"] == 0  # buffered, send not attempted yet
+
+        notifier._flush_stale_batches(max_age=0)
+
+        assert calls["n"] == 1, "flush must have attempted the send"
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
     def test_shutdown_flushes_all_batches(self, bus, topics_config, verbosity_config):
         sent = []
         notifier = TelegramNotifier(
