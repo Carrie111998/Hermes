@@ -352,6 +352,77 @@ function Write-BrowserEnv {
     Add-Content -Path $envFile -Value "AGENT_BROWSER_EXECUTABLE_PATH=$BrowserPath" -Encoding UTF8
 }
 
+# Read the toolset names the user has suppressed via agent.disabled_toolsets
+# in config.yaml and return them as a set (hashtable) so callers can test
+# membership with -in / .ContainsKey().  Empty (never $null) when the file
+# is absent or the field is unset.  The runtime toolset resolver
+# (hermes_cli/tools_config.py:2146-2154) consults the same field as a final
+# user override that runs LAST and takes precedence over every per-platform
+# setting -- the install flow should honor the same override so a desktop
+# Update does not reinstall a toolset the user explicitly turned off.
+#
+# install.ps1 runs under Windows PowerShell, which has no built-in YAML
+# parser, and pulling one in (a python -c subprocess to import yaml, or
+# shipping a parser module) would widen the install bootstrap's dependency
+# footprint for the sake of one scalar config key.  This helper parses just
+# the structural shape it needs -- the agent: mapping's disabled_toolsets
+# list, in either inline [a, b] or block-sequence - a YAML form -- with a
+# small line-oriented state machine.  If config.yaml ever grows a shape this
+# parser can't handle, this function is the single seam to swap; callers are
+# insulated by the set-of-toolset-names contract.
+function Get-HermesConfigDisabledToolsets {
+    $set = @{}
+    if (-not $HermesHome) { return $set }
+    $configPath = Join-Path $HermesHome "config.yaml"
+    if (-not (Test-Path $configPath)) { return $set }
+    $raw = Get-Content $configPath -Raw -ErrorAction SilentlyContinue
+    if (-not $raw) { return $set }
+
+    $inAgent = $false
+    $inList  = $false
+    foreach ($line in ($raw -split "`r?`n")) {
+        if (-not $line.Trim() -or $line.TrimStart().StartsWith('#')) { continue }
+
+        if ($line -and -not $line.StartsWith(' ') -and -not $line.StartsWith("`t")) {
+            if ($line.Trim() -match '^(\S+):') {
+                $inAgent = ($line.Trim() -eq 'agent:')
+                $inList  = $false
+                continue
+            }
+        }
+
+        if (-not $inAgent) { continue }
+
+        if (-not $inList -and ($line.Trim() -match '^disabled_toolsets:\s*(.*)$')) {
+            $rest = $matches[1]
+            if ($rest -match '\[(.+)\]') {
+                foreach ($item in ($matches[1] -split ',')) {
+                    $v = $item.Trim().Trim('"').Trim("'")
+                    if ($v) { $set[$v] = $true }
+                }
+                continue
+            }
+            if ($rest.Trim()) {
+                $v = $rest.Trim().Trim('"').Trim("'")
+                if ($v) { $set[$v] = $true }
+                continue
+            }
+            $inList = $true
+            continue
+        }
+
+        if ($inList -and ($line.Trim() -match '^-\s+(.+)$')) {
+            $v = $matches[1].Trim().Trim('"').Trim("'")
+            if ($v) { $set[$v] = $true }
+            continue
+        }
+        if ($inList -and ($line.Trim() -match '^(\S+):')) {
+            $inList = $false
+        }
+    }
+    return $set
+}
+
 function Install-AgentBrowser {
     param([switch]$SkipChromium)
     $npm = Resolve-NpmCmd
@@ -3515,6 +3586,21 @@ if ($IncludeDesktop) {
     # (Hermes-Setup.exe), never via the irm|iex CLI one-liner.
     $InstallStages += @{ Name = "desktop"; Title = "Building desktop app"; Category = "install"; NeedsUserInput = $false; Worker = "Stage-Desktop" }
 }
+# browser is added AFTER desktop (if enabled) for two reasons:
+#   1. Install-AgentBrowser (L355) runs `npm install -g --prefix` against a
+#      separate prefix ($HERMES_HOME\node) -- it has no dependency on the
+#      per-repo apps/desktop/node_modules Stage-NodeDeps / Stage-Desktop produce.
+#      So the ordering choice is not a hard dependency, only a stable one.
+#   2. Running after Stage-Desktop means a freshly-built Hermes.exe (if
+#      -IncludeDesktop was passed) picks up the freshly-installed
+#      agent-browser on its first relaunch, instead of inheriting a stale
+#      bare-PATH agent-browser from NVM. This is the same upgrade ordering
+#      install.sh's ensure_browser() achieves on Linux/macOS (L2550-2600).
+#   The stage also runs for non-desktop installs (the irm|iex one-liner) --
+#   browser tools are a general Hermes capability, not a desktop-only feature.
+#   Soft-skip when Node is unavailable (browser tools degrade gracefully);
+#   see the Stage-Node note at L3548-3558 for the same pattern.
+$InstallStages += @{ Name = "browser"; Title = "Installing agent-browser"; Category = "install"; NeedsUserInput = $false; Worker = "Stage-Browser" }
 $InstallStages += @(
     @{ Name = "path";             Title = "Adding Hermes to PATH";                Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-Path" }
     @{ Name = "config-templates"; Title = "Writing configuration templates";      Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-ConfigTemplates" }
@@ -3562,6 +3648,52 @@ function Stage-Venv             { Resolve-UvCmd; Install-Venv }
 function Stage-Dependencies     { Resolve-UvCmd; Install-Dependencies }
 function Stage-NodeDeps         { Install-NodeDeps }
 function Stage-Desktop          { Install-Desktop }
+# Stage-Browser installs agent-browser into the Hermes-bundled npm prefix
+# ($HERMES_HOME\node) via `npm install -g --prefix`.  Idempotent: a second
+# invocation with agent-browser already at ^0.26.0 is a near-no-op (npm
+# install -g is idempotent against a satisfied version range; cold installs
+# take ~5-15s on Windows, warm reinstalls are much faster).
+#
+# Soft-skip paths (all surface $script:_StageSkippedReason so the JSON
+# frame emits skipped=true / ok=true rather than ok=false -- matching
+# Stage-Node at L3548-3558 so the desktop Update flow never aborts on an
+# optional capability):
+#   1. Node.js unavailable  -- browser tools degrade gracefully.
+#   2. agent.disabled_toolsets contains "browser" in config.yaml -- the
+#      runtime toolset resolver (hermes_cli/tools_config.py:2146-2154)
+#      applies that field as a final user override; honoring it here
+#      prevents a desktop Update from reinstalling a toolset the user
+#      explicitly turned off.
+#   3. Install-AgentBrowser throws (npm non-zero exit, network failure,
+#      etc.) -- browser tooling is optional, so a failed install is
+#      converted to a skip rather than aborting the bootstrap pipeline
+#      (bootstrap-runner.ts:973-976 aborts on any stage that re-throws).
+#
+# SkipChromium: Install-AgentBrowser's own parameter (L356) gates the
+# bundled Chromium download behind `agent-browser install`.  When the
+# caller's $SkipChromium is set (e.g. system browser override at L384-386
+# via Find-SystemBrowser), it is forwarded so the post-install step is
+# skipped.  install.ps1 has no top-level -SkipChromium param today, so
+# $SkipChromium here is normally $false; Install-AgentBrowser's body also
+# re-checks Find-SystemBrowser internally, so the semantics are preserved
+# regardless of how this worker is invoked.
+function Stage-Browser          {
+    [void](Test-Node)
+    if (-not $script:HasNode) {
+        $script:_StageSkippedReason = 'Node.js not available; agent-browser install skipped (browser tools will be unavailable)'
+        return
+    }
+    $disabled = Get-HermesConfigDisabledToolsets
+    if ($disabled.ContainsKey('browser')) {
+        $script:_StageSkippedReason = 'browser toolset is disabled in config.yaml (agent.disabled_toolsets); agent-browser install skipped'
+        return
+    }
+    try {
+        Install-AgentBrowser -SkipChromium:$SkipChromium
+    } catch {
+        $script:_StageSkippedReason = "agent-browser install failed: $_"
+    }
+}
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
 function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }
