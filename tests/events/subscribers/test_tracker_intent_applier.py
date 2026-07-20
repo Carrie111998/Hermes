@@ -12,6 +12,7 @@ import pytest
 from events.bus import EventBus
 from events.subscribers.tracker_intent_applier import (
     TrackerIntentApplierSubscriber,
+    _reap_enabled_from_env,
     _redrive_enabled_from_env,
     tracker_partial_dir,
 )
@@ -60,6 +61,46 @@ class TestRedriveDelegation:
         subscriber._redrive_enabled = True
         subscriber._applier = None
         assert subscriber.redrive_partials() == 0
+
+
+class TestReapEnabledFromEnv:
+    def test_default_is_disabled(self, monkeypatch):
+        monkeypatch.delenv("TRACKER_APPLIER_REAP_CONVERGED_ENABLED", raising=False)
+        assert _reap_enabled_from_env() is False
+
+    @pytest.mark.parametrize("val", ["1", "true", "yes", "on"])
+    def test_truthy_values_enable(self, monkeypatch, val):
+        monkeypatch.setenv("TRACKER_APPLIER_REAP_CONVERGED_ENABLED", val)
+        assert _reap_enabled_from_env() is True
+
+    @pytest.mark.parametrize("val", ["0", "off", "no", ""])
+    def test_other_values_stay_disabled(self, monkeypatch, val):
+        monkeypatch.setenv("TRACKER_APPLIER_REAP_CONVERGED_ENABLED", val)
+        assert _reap_enabled_from_env() is False
+
+
+class TestSubscriberReap:
+    def test_flag_off_is_noop(self, subscriber):
+        subscriber._reap_enabled = False
+        subscriber._applier = MagicMock()
+        assert subscriber.reap_converged_partials() == 0
+        subscriber._applier.reap_converged_partials.assert_not_called()
+
+    def test_flag_on_calls_applier_and_counts_reaped(self, subscriber):
+        subscriber._reap_enabled = True
+        subscriber._applier = MagicMock()
+        subscriber._applier.reap_converged_partials.return_value = {
+            "a.rd5.json": "reaped",
+            "b.rd5.json": "not_converged",
+            "c.rd5.json": "reaped",
+        }
+        assert subscriber.reap_converged_partials() == 2
+        subscriber._applier.reap_converged_partials.assert_called_once()
+
+    def test_flag_on_but_applier_not_built_is_noop(self, subscriber):
+        subscriber._reap_enabled = True
+        subscriber._applier = None
+        assert subscriber.reap_converged_partials() == 0
 
 
 class TestTrackerPartialDir:
