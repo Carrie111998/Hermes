@@ -212,6 +212,26 @@ class TestCheckSensitivePathMacOSBypass:
         from tools.file_tools import _check_sensitive_path
         assert _check_sensitive_path("/tmp/safe_file.txt") is None
 
+    def test_private_var_log_blocked(self):
+        from tools.file_tools import _check_sensitive_path
+        assert _check_sensitive_path("/private/var/log/system.log") is not None
+
+    def test_private_var_root_blocked(self):
+        from tools.file_tools import _check_sensitive_path
+        assert _check_sensitive_path("/private/var/root/.bashrc") is not None
+
+    def test_private_var_folders_allowed(self):
+        from tools.file_tools import _check_sensitive_path
+        assert _check_sensitive_path("/private/var/folders/xx/T/pytest-of-user/test_x/data.txt") is None
+
+    def test_var_db_symlink_blocked(self):
+        from tools.file_tools import _check_sensitive_path
+        assert _check_sensitive_path("/var/db/dslocal/nodes/Default/users.plist") is not None
+
+    def test_private_var_tmp_allowed(self):
+        from tools.file_tools import _check_sensitive_path
+        assert _check_sensitive_path("/private/var/tmp/workdir/scratch.txt") is None
+
 
 class TestAtomicWrite:
     """write_file / patch land via a temp-file + atomic rename.
