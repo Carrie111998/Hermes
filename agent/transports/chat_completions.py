@@ -626,6 +626,19 @@ class ChatCompletionsTransport(ProviderTransport):
             if temp is not None:
                 api_kwargs["temperature"] = temp
 
+        # [hermes-v2] H-12: top_p passthrough for openai-compat routes.
+        # The standard chat_completions transport previously dropped top_p
+        # silently — only temperature was forwarded from caller config.
+        # M3 (and most openai-compat providers: ollama-9b, step-flash,
+        # local 9B) accept top_p as a top-level field on chat.completions.
+        # Pass it through if the caller provided one. Profiles that need to
+        # override or ignore top_p (e.g. Anthropic where it conflicts with
+        # adaptive thinking) can override build_api_kwargs_extras to strip
+        # or remap it; this is the openai-compat default.
+        top_p = params.get("top_p")
+        if top_p is not None:
+            api_kwargs["top_p"] = top_p
+
         # Timeout
         timeout = params.get("timeout")
         if timeout is not None:
