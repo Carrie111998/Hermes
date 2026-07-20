@@ -173,6 +173,23 @@ class TestThresholdGate:
         # default threshold is 5%
         assert ToolSearchConfig.from_raw(None).threshold_pct == 5.0
 
+    def test_defer_always_core_bypasses_auto_threshold(self):
+        """defer_always_core should force activation even when auto threshold is not met."""
+        from tools.tool_search import ToolSearchConfig, should_activate
+        cfg = ToolSearchConfig.from_raw(
+            {"enabled": "auto", "threshold_pct": 90, "defer_always_core": True}
+        )
+        # Way below 90% of context, but should still activate in always mode.
+        assert should_activate(cfg, deferrable_tokens=1_000, context_length=200_000)
+
+    def test_defer_always_core_still_respects_enabled_off(self):
+        """Explicit off remains authoritative even with defer_always_core set."""
+        from tools.tool_search import ToolSearchConfig, should_activate
+        cfg = ToolSearchConfig.from_raw(
+            {"enabled": "off", "defer_always_core": True}
+        )
+        assert not should_activate(cfg, deferrable_tokens=100_000, context_length=200_000)
+
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
         small = [_td("a", "x")]
