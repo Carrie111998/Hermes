@@ -11,10 +11,10 @@ baseline + the authored patch layer:
   - ops-ingest judgment rules + structured work_items extraction —
     patches/ops-ingest-judgment.snippet.yaml
   - management-chat behavior (register, grounded answers, proactive attention
-    push, bounded reply-actions, refusals) —
+    push, write authority + three-flow, provenance, hold-framing, refusals) —
     patches/mgmt-chat-behavior.snippet.yaml
-  - management-chat business-operation scope (reads + attention only; every
-    ingest write refused by the runtime) —
+  - management-chat business-operation scope (full case-shaped registry;
+    config/routing/purge asks refused by registry absence) —
     patches/mgmt-business-operations.snippet.yaml
   - per-slot engine: model + optional agent.reasoning_effort
 
@@ -97,7 +97,7 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 13
-MGMT_NEW_INSTRUCTION_COUNT = 6
+MGMT_NEW_INSTRUCTION_COUNT = 8
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
@@ -144,19 +144,16 @@ MGMT_OBSERVABILITY_ANCHOR = (
     "      or decision. This is part of finishing a turn, not optional. Record an event\n"
 )
 
-# Management chats are read-plus-attention only. Every case-mutating operation is
-# absent from this list, which means the runtime drops it from the operation
-# registry for those chats entirely (agent/pa_constitution.py business_operations
-# -> tools/pa_business_tools.py _scope_operations_to_job_brief). Prose backs the
-# mechanism; the mechanism is the guarantee.
-MGMT_FORBIDDEN_OPERATIONS = (
-    "tgg_case_create",
-    "tgg_case_observation",
-    "tgg_case_update",
-    "tgg_case_wc_attach",
-    "tgg_clarification_raise",
-    "work_costing_upsert",
-)
+# Management chat is the client authority channel (teren, 2026-07-20: "any
+# instruction on management chat, christopher should accept"). Every case-shaped
+# operation in the registry is permitted here — the prior read-plus-attention
+# scoping is REVERSED for case operations. What stays out — christopher's own
+# config, chat routing/allowlists, data purges — has no operation in the
+# registry at all, so refusal-by-absence still holds via the same mechanism
+# (agent/pa_constitution.py business_operations ->
+# tools/pa_business_tools.py _scope_operations_to_job_brief). The explicit
+# `allowed` list is kept as a pin: a future registry addition does not reach
+# the management chat without a deliberate widening here.
 
 # Exact runtime registry for the PA business bridge. Constitution prose may
 # mention only these names after the word "operation"; aliases otherwise fail
@@ -539,35 +536,65 @@ def _validate(
     assert "tgg_attention_list" in mgmt_joined
     assert "nothing outstanding right now" in mgmt_joined
     assert "do not fill the gap with" in mgmt_joined
-    # Bounded reply-action experiment.
-    assert "annotate an attention item with a status note" in mgmt_joined
+    # Write authority + three-flow (teren 2026-07-20: management chat is the
+    # client authority channel; explicit-instruction-only).
+    assert "Management instructions are authoritative" in mgmt_joined
+    assert "attach evidence or photos" in mgmt_joined
+    assert "closing" in mgmt_joined and "marking it submitted" in mgmt_joined
+    assert "confirm what changed" in mgmt_joined
+    assert "exactly ONE clarifying question" in mgmt_joined
+    assert "write nothing until the operator says yes" in mgmt_joined
+    assert "Never infer an instruction" in mgmt_joined
+    assert "explicit say-so" in mgmt_joined
+    # Provenance: operator-directed writes are audit-distinguishable.
+    assert "Operator-directed writes carry provenance" in mgmt_joined
+    assert "instructing message's id in sourceRefs" in mgmt_joined
+    assert "operator-directed via management chat" in mgmt_joined
+    assert "operator_directive" in mgmt_joined
+    assert "the observation is the audit trail" in mgmt_joined
+    # Hold-framing (teren rule: the operator must learn they are the blocker).
+    assert "Lead with the hold" in mgmt_joined
+    assert "the FIRST thing you say is the pending decision" in mgmt_joined
+    assert "I need your call on" in mgmt_joined
+    assert "the operator must learn the decision is waiting on them" in mgmt_joined
+    # Reply-action substance retained.
     assert "promise-then-track a chase" in mgmt_joined
-    assert "may not create, close, or modify a case on chat instruction" in mgmt_joined
-    assert "attach evidence to a case" in mgmt_joined
-    assert "attention-note alternative" in mgmt_joined
     # Annotate targets an existing item by id, never a new tgg_attention_raise.
     assert "THAT existing item by its id" in mgmt_joined
     assert "never raise a new attention item to record a reply to an old one" in mgmt_joined
-    # Refusals.
+    # Refusals: config/routing/allowlist/purge stay out, by absence.
+    assert "your own configuration" in mgmt_joined
+    assert "group allowlists" in mgmt_joined
+    assert "deleting or purging data" in mgmt_joined
+    assert "Nothing you send goes to anyone outside this chat" in mgmt_joined
     assert "Never relay site-group content wholesale" in mgmt_joined
     assert "not a courtesy" in mgmt_joined
 
-    # The scope block is the mechanism the prose above describes. Reads plus the
-    # attention write only; every case-mutating operation must be absent, and
-    # every permitted name must be a real configured operation.
+    # The scope block is the mechanism the prose above describes. The management
+    # chat now carries the FULL case-shaped registry — permitted must equal the
+    # canonical operation set exactly, so nothing case-shaped is missing and
+    # nothing outside the registry is named. Refusal-by-absence for config/
+    # routing/purge asks holds because no such operation exists in the registry.
     scope = mgmt_brief["business_operations"]
     assert set(scope) == {"allowed"}, sorted(scope)
     permitted = set(scope["allowed"])
-    assert permitted <= CANONICAL_OPERATIONS, sorted(permitted - CANONICAL_OPERATIONS)
-    assert permitted <= set(operations), sorted(permitted - set(operations))
-    for forbidden in MGMT_FORBIDDEN_OPERATIONS:
-        assert forbidden not in permitted, forbidden
-    # The reads the management brief's own instructions depend on.
-    for required in ("tgg_case_lookup", "tgg_case_search", "message_search"):
+    assert permitted == CANONICAL_OPERATIONS, (
+        sorted(permitted - CANONICAL_OPERATIONS),
+        sorted(CANONICAL_OPERATIONS - permitted),
+    )
+    assert permitted == set(operations), sorted(permitted ^ set(operations))
+    # The writes the rulings name, spelled out for the reader.
+    for required in (
+        "tgg_case_observation",  # attach evidence / notes
+        "tgg_case_update",  # state changes incl. close / submitted
+        "tgg_case_create",
+        "tgg_case_wc_attach",  # work items
+        "tgg_clarification_raise",
+        "tgg_attention_annotate",
+        "tgg_attention_raise",
+        "agent_action_record",
+    ):
         assert required in permitted, required
-    # The single permitted write, plus observability.
-    assert "tgg_attention_raise" in permitted
-    assert "agent_action_record" in permitted
     # The ingest brief stays unscoped except for a single denied-only
     # subtraction: it keeps every operation it had (including the new reads)
     # and loses only the management-only annotate write. `allowed` absent
@@ -581,8 +608,6 @@ def _validate(
     # instructed to do something the runtime will refuse.
     mgmt_referenced = set(OPERATION_REFERENCE_RE.findall(mgmt_joined))
     assert mgmt_referenced <= permitted, sorted(mgmt_referenced - permitted)
-    for forbidden in MGMT_FORBIDDEN_OPERATIONS:
-        assert forbidden not in mgmt_joined, forbidden
 
 
 def main() -> int:

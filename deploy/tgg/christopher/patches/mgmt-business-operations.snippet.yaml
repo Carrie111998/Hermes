@@ -11,8 +11,14 @@
       - tgg_attention_list
       - tgg_attention_raise
       - tgg_attention_read
+      - tgg_case_create
       - tgg_case_list
       - tgg_case_lookup
+      - tgg_case_observation
       - tgg_case_search
+      - tgg_case_update
+      - tgg_case_wc_attach
+      - tgg_clarification_raise
       - work_costing_ingest_ilinked
       - work_costing_lookup
+      - work_costing_upsert
