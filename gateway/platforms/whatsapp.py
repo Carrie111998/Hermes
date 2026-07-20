@@ -894,22 +894,82 @@ class WhatsAppAdapter(BasePlatformAdapter):
     # window accumulates into one mega-bundle spanning hours of real time
     # (observed: a 22-message bundle covering ~2h) — a shape no live turn
     # would ever see. Spillover starts the NEXT turn.
+    # Live has NO message cap (trailing-quiet debounce only), so the cap
+    # itself is a replay/live divergence: it splits bundles live would never
+    # split. Evals that must judge live grouping semantics (e.g. a long
+    # passive window bundling an album with its late caption) override via
+    # config extra ``replay_bundle_message_cap`` (0 = uncapped); default
+    # stays 10 for ordinary replay hygiene.
     REPLAY_BUNDLE_MESSAGE_CAP = 10
+
+    def _replay_bundle_cap(self) -> int:
+        raw = self._config_extra().get("replay_bundle_message_cap")
+        if raw is None:
+            return self.REPLAY_BUNDLE_MESSAGE_CAP
+        try:
+            cap = int(raw)
+        except (TypeError, ValueError):
+            return self.REPLAY_BUNDLE_MESSAGE_CAP
+        return max(0, cap)
+
+    def _explicit_debounce_window_ms(self, chat_id: Optional[str], addressed: bool) -> Optional[int]:
+        """Like ``_debounce_window_ms`` but WITHOUT the universal-default
+        fallback: returns a window only when the brief, config extra, or env
+        explicitly sets one. None = nothing explicitly configured."""
+        brief = self._brief_settings_for_chat(chat_id)
+        key = "debounce_addressed_ms" if addressed else "debounce_passive_ms"
+        env_key = "WHATSAPP_DEBOUNCE_ADDRESSED_MS" if addressed else "WHATSAPP_DEBOUNCE_PASSIVE_MS"
+        ms = self._coerce_window_ms(brief.get(key)) if brief else None
+        if ms is None:
+            ms = self._coerce_window_ms(self._config_extra().get(key))
+        if ms is None:
+            ms = self._coerce_window_ms(os.getenv(env_key))
+        return ms
+
+    def _replay_debounce_seconds(self, chat_id: str, event: MessageEvent) -> float:
+        """Resolve the replay gap-split window like live resolves its turn window.
+
+        Explicit per-chat ``turn_policy`` wins (replay test rigs set it);
+        otherwise an EXPLICIT brief/config/env addressed-passive window — the
+        window live turns actually run on (``_debounce_window_ms``) — governs
+        the timestamp-gap split; the legacy ``turn_debounce_ms`` switch comes
+        last. Without the brief-window layer, replay grouped at the 1.5s
+        legacy default while live grouped at the constitution's
+        ``debounce_passive_ms``, so evals judged bundle shapes live would
+        never produce (2026-07-20: 76-msg TGG corpus replayed as 38 turns —
+        exactly the 1.5s split — under a 10s constitution window). Known
+        residual divergence: when NOTHING is explicitly configured, replay
+        keeps the legacy 1.5s fallback while live falls to the universal 10s
+        passive default — preserved so existing turn_debounce_ms replay rigs
+        keep their golden groupings.
+        """
+        policy = self._turn_policy_for_chat(chat_id) if chat_id else {}
+        if any(key in policy for key in ("debounce_seconds", "quiet_seconds", "debounce_ms")):
+            return self._debounce_seconds_for_event(event)
+        burst = (getattr(self, "_turn_buffers", None) or {}).get(chat_id) or []
+        if burst:
+            burst_addressed = any(getattr(buffered, "addressed", False) for buffered in burst)
+        else:
+            burst_addressed = bool(getattr(event, "addressed", False))
+        window_ms = self._explicit_debounce_window_ms(chat_id, burst_addressed)
+        if window_ms is not None and window_ms > 0:
+            return window_ms / 1000.0
+        return self._debounce_seconds_for_event(event)
 
     async def _queue_or_handle_replay_event(self, event: MessageEvent) -> None:
         """Apply WhatsApp turn policy using message timestamps, not wall-clock sleeps.
 
         Turn bundles split on ORIGINAL message timestamp gaps (gap >=
-        debounce_seconds => new turn) and are hard-capped at
-        REPLAY_BUNDLE_MESSAGE_CAP messages (spillover => next turn).
+        the resolved turn window => new turn) and are hard-capped at
+        ``_replay_bundle_cap()`` messages (spillover => next turn; 0 = uncapped).
         """
-        debounce_s = self._debounce_seconds_for_event(event)
+        source = event.source
+        chat_id = source.chat_id if source else ""
+        debounce_s = self._replay_debounce_seconds(chat_id, event)
         if debounce_s <= 0:
             await self.handle_message(event)
             return
 
-        source = event.source
-        chat_id = source.chat_id if source else ""
         if not chat_id:
             await self.handle_message(event)
             return
@@ -928,7 +988,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 current = []
 
         buffers.setdefault(chat_id, []).append(event)
-        if len(buffers.get(chat_id) or []) >= self.REPLAY_BUNDLE_MESSAGE_CAP:
+        cap = self._replay_bundle_cap()
+        if cap > 0 and len(buffers.get(chat_id) or []) >= cap:
             await self._flush_turn(chat_id)
             return
         if self._should_flush_turn_immediately(event):

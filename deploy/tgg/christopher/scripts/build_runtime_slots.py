@@ -95,6 +95,15 @@ MOFEX_OPERATION_NEW = (
     "      or call a cross-client operation.\n"
 )
 
+# Corpus finding (2026-07-20, teren-ratified): workers send photo albums FIRST
+# and describe them 7s–2m14s LATER. The June 10s passive window splits every
+# album from its caption, so caption-borne identifiers (unit numbers, job
+# sheets) never reach the turn holding the media and low-confidence attaches
+# follow. 5 minutes bundles album + caption into one turn. Addressed window
+# stays 1500ms — patience applies only while passively observing.
+DEBOUNCE_PASSIVE_OLD = "    debounce_passive_ms: 10000\n"
+DEBOUNCE_PASSIVE_NEW = "    debounce_passive_ms: 300000\n"
+
 # The single universal jobNo/create policy replaces the June create instruction
 # 1-for-1 — no other instruction anywhere in the constitution may permit a
 # broader create path (codex 2026-07-19 finding 1: two rules of differing
@@ -180,6 +189,12 @@ def _constitution(source: str, slot: dict) -> str:
     )
     rendered = _replace_once(
         source,
+        DEBOUNCE_PASSIVE_OLD,
+        DEBOUNCE_PASSIVE_NEW,
+        label="ops-ingest passive debounce",
+    )
+    rendered = _replace_once(
+        rendered,
         CREATE_POLICY_OLD,
         CREATE_POLICY_NEW,
         label="ops-ingest create policy",
@@ -262,6 +277,10 @@ def _validate(
             "model": model,
             "provider": "openai-direct-primary",
         }
+    ingest_brief = constitution["job_briefs"]["tgg_ops_ingest"]
+    assert ingest_brief["debounce_passive_ms"] == 300000
+    assert ingest_brief["debounce_addressed_ms"] == 1500
+
     instructions = constitution["job_briefs"]["tgg_ops_ingest"]["instructions"]
     assert (
         len(instructions) == baseline_instruction_count + NEW_INSTRUCTION_COUNT

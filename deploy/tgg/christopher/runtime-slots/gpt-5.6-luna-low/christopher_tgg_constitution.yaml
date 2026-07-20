@@ -27,7 +27,7 @@ job_briefs:
     purpose: Turn inbound operational messages into structured facts and follow-up
       actions.
     require_mention: false
-    debounce_passive_ms: 10000
+    debounce_passive_ms: 300000
     debounce_addressed_ms: 1500
     runtime:
       model: gpt-5.6-luna
