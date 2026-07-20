@@ -126,6 +126,7 @@ class IntentApplier:
         circuit_breaker: Optional[SimpleCircuitBreaker] = None,
         resume_full: Optional[Callable[[str, dict], object]] = None,
         job_state_reader: Optional[Callable[[str], Optional[str]]] = None,
+        canonical_state_reader: Optional[Callable[[], dict[str, str]]] = None,
         redrive_base_backoff: float = 120.0,
         redrive_multiplier: float = 2.0,
         redrive_max_backoff: float = 1800.0,
@@ -147,6 +148,10 @@ class IntentApplier:
         # business_state (or None if unknown / read failed). None => pre-flight
         # disabled (every intent takes the normal dual-write path).
         self.job_state_reader = job_state_reader
+        # Reaper gate B: zero-arg callable -> {job_id: currentBusinessState} from
+        # the tracker canonical pipeline.json. None => gate B unsatisfiable =>
+        # reaper never reaps (fail-closed).
+        self.canonical_state_reader = canonical_state_reader
         self.redrive_base_backoff = redrive_base_backoff
         self.redrive_multiplier = redrive_multiplier
         self.redrive_max_backoff = redrive_max_backoff
@@ -514,4 +519,92 @@ class IntentApplier:
                 "intent-applier: re-driving partial %s -> inbox/%s (attempt %d)",
                 path.name, new_name, n + 1,
             )
+        return results
+
+    def _is_capped(self, path: Path) -> bool:
+        """True iff this partial has reached the re-drive give-up cap.
+
+        Mirrors redrive_partials()'s capping predicate: capping is opt-in via
+        redrive_give_up_attempts (0 => never capped, so the reaper is a no-op).
+        """
+        if not self.redrive_give_up_attempts:
+            return False
+        return self._parse_redrive_attempt(path) >= self.redrive_give_up_attempts
+
+    def reap_converged_partials(self) -> dict[str, str]:
+        """Auto-clear CAPPED partials already converged at/past their target stage.
+
+        A capped partial is one redrive_partials() has given up on
+        (redrive_give_up_attempts > 0 and attempt N >= it): it is never re-driven
+        again, so the Fix A pre-flight never re-runs on it. If Postgres later
+        catches up (the 2026-07-18 backlog), it alerts forever. This sweep closes
+        that gap with a two-gate, FAIL-CLOSED convergence check:
+
+          * Gate A (native Postgres): _already_satisfied(msg) -- current_business_state
+            in _STAGE_SATISFIED_BY[requested_stage].
+          * Gate B (tracker canonical pipeline.json): currentBusinessState for the
+            job is ALSO in that same set.
+
+        Both must pass. Anything ambiguous (reader off/None, stage unmapped, job
+        absent from canonical, canonical reader unwired, parse error) => NOT
+        reaped: the file stays capped and keeps alerting. A reap mirrors the
+        'satisfied' path -- mark_applied (burn key immediately) + move to
+        processed/ -- and NEVER moves to inbox/ (re-driving a past-stage intent
+        regresses state).
+
+        Cost: gate B parses the (large) canonical pipeline.json AT MOST ONCE per
+        sweep, and only when >= 1 capped partial has already passed gate A. MUST
+        run on the single-writer applier thread (shares _move_to/glob/idempotency
+        with scan_inbox).
+
+        Returns {filename: "reaped" | "not_converged" | "skipped"}.
+        """
+        results: dict[str, str] = {}
+        # First pass: gate A over capped partials only. Never touch the big
+        # canonical file yet.
+        a_pass: list[tuple[Path, IntentMessage]] = []
+        for path in sorted(self.partial_dir.glob("*_INTENT_*.json")):
+            if not self._is_capped(path):
+                continue  # non-capped -> handled by redrive + pre-flight
+            try:
+                msg = parse_intent_file(path)
+            except IntentParseError:
+                results[path.name] = "skipped"
+                continue
+            if self._already_satisfied(msg):
+                a_pass.append((path, msg))
+            else:
+                results[path.name] = "not_converged"
+        if not a_pass:
+            return results
+
+        # Second gate: parse the canonical pipeline.json ONCE. Unwired reader or a
+        # failed/empty parse => fail closed (nothing reaps).
+        canonical: dict[str, str] = {}
+        if self.canonical_state_reader is not None:
+            try:
+                canonical = self.canonical_state_reader() or {}
+            except Exception:
+                logger.debug(
+                    "reaper: canonical pipeline read failed; fail-closed",
+                    exc_info=True,
+                )
+                canonical = {}
+
+        for path, msg in a_pass:
+            satisfied_by = _STAGE_SATISFIED_BY.get(msg.requested_stage)
+            canonical_state = canonical.get(msg.job_id)
+            if satisfied_by and canonical_state and canonical_state in satisfied_by:
+                self.idempotency.mark_applied(
+                    msg.idempotency_key, message_id=msg.message_id
+                )
+                self._move_to(path, self.processed_dir)
+                results[path.name] = "reaped"
+                logger.info(
+                    "intent-applier: reaped converged capped partial %s "
+                    "(job=%s stage=%s canonical=%s; PG+canonical agree) — auto-cleared",
+                    path.name, msg.job_id, msg.requested_stage, canonical_state,
+                )
+            else:
+                results[path.name] = "not_converged"
         return results

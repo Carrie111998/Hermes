@@ -631,3 +631,111 @@ class TestPreflightSatisfied:
         f = write_intent(mailbox["inbox"], "intent.json", _stage_payload("scored"))
         assert a.apply_one(f) == "applied"
         a._jobops_mock.post_legacy_stage.assert_called_once()
+
+
+class TestReapConvergedPartials:
+    """Convergence-reaper: auto-clear CAPPED partials PG+canonical both show done."""
+
+    def _capped_kwargs(self, **extra):
+        # give_up=5 so a .rd5 partial is "capped"; both readers wired.
+        base = dict(redrive_give_up_attempts=5,
+                    job_state_reader=lambda jid: "materials_ready",
+                    canonical_state_reader=lambda: {"linkedin-1": "materials_ready"})
+        base.update(extra)
+        return base
+
+    def test_capped_and_both_gates_converged_is_reaped(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        result = a.reap_converged_partials()
+        assert result == {"x_APPROVAL_INTENT_main.rd5.json": "reaped"}
+        # Moved to processed (never inbox), key burned.
+        assert (mailbox["processed"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not (mailbox["inbox"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_gate_b_disagrees_is_not_reaped(self, tmp_path, mailbox, pipeline_path):
+        # PG says materials_ready (gate A pass) but canonical still shows scored.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(
+                              canonical_state_reader=lambda: {"linkedin-1": "scored"}))
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_gate_a_behind_never_parses_canonical(self, tmp_path, mailbox, pipeline_path):
+        from unittest.mock import MagicMock
+        canonical = MagicMock(return_value={"linkedin-1": "materials_ready"})
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(
+                              job_state_reader=lambda jid: "scored",   # gate A fails
+                              canonical_state_reader=canonical))
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+        canonical.assert_not_called()  # gate B never touched
+
+    def test_canonical_parsed_once_per_sweep(self, tmp_path, mailbox, pipeline_path):
+        from unittest.mock import MagicMock
+        canonical = MagicMock(return_value={"linkedin-1": "materials_ready",
+                                            "linkedin-2": "materials_ready"})
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(canonical_state_reader=canonical))
+        p2 = json.loads(json.dumps(VALID_INTENT_PAYLOAD))
+        p2["job_id"] = "linkedin-2"
+        p2["idempotency_key"] = "tracker-intent:it:linkedin-2:approved"
+        _write_partial(mailbox["partial"], "a_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        _write_partial(mailbox["partial"], "b_APPROVAL_INTENT_main.rd5.json",
+                       p2, age_seconds=1)
+        result = a.reap_converged_partials()
+        assert result == {"a_APPROVAL_INTENT_main.rd5.json": "reaped",
+                          "b_APPROVAL_INTENT_main.rd5.json": "reaped"}
+        assert canonical.call_count == 1
+
+    def test_non_capped_partial_is_ignored(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
+        # rd1 < give_up=5 -> not capped -> reaper leaves it entirely.
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd1.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd1.json").exists()
+
+    def test_give_up_zero_reaps_nothing(self, tmp_path, mailbox, pipeline_path):
+        # Default give_up=0 => nothing is ever capped => reaper is a no-op.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "materials_ready",
+                          canonical_state_reader=lambda: {"linkedin-1": "materials_ready"})
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {}
+
+    def test_archived_incident_case_reaped(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          redrive_give_up_attempts=5,
+                          job_state_reader=lambda jid: "archived",
+                          canonical_state_reader=lambda: {"linkedin-1": "archived"})
+        _write_partial(mailbox["partial"], "z_STATE_TRANSITION_INTENT_main.rd5.json",
+                       _stage_payload("archived"), age_seconds=1)
+        assert a.reap_converged_partials() == {"z_STATE_TRANSITION_INTENT_main.rd5.json": "reaped"}
+
+    def test_canonical_reader_unwired_fails_closed(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          redrive_give_up_attempts=5,
+                          job_state_reader=lambda jid: "materials_ready",
+                          canonical_state_reader=None)
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+
+    def test_corrupt_capped_file_is_skipped(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
+        mailbox["partial"].mkdir(parents=True, exist_ok=True)
+        bad = mailbox["partial"] / "bad_APPROVAL_INTENT_main.rd5.json"
+        bad.write_text("{not valid", encoding="utf-8")
+        assert a.reap_converged_partials() == {"bad_APPROVAL_INTENT_main.rd5.json": "skipped"}
+        assert bad.exists()
