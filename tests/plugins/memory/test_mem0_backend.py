@@ -18,6 +18,10 @@ from plugins.memory.mem0._backend import (
     SelfHostedBackend,
 )
 
+# Sentinel: distinguishes "custom_instructions key absent" from an explicit
+# None/"" (both of which must NOT be forwarded) in the OSSBackend constructor.
+_UNSET = object()
+
 
 class FakePlatformClient:
     """Fake MemoryClient for PlatformBackend tests."""
@@ -616,6 +620,65 @@ class TestOSSBackend:
         assert "hermes_openai" not in factory.provider_to_class
         assert state.clients == []
         assert raw == before
+
+    # ── regression: custom_instructions forwarding (PR #54739) ──────────
+
+    def _spy_from_config(self, monkeypatch):
+        """Install the shared fake mem0 and wrap Memory.from_config so tests
+        can assert exactly what config dict reaches it."""
+        state, Memory, _ = _install_fake_mem0(monkeypatch)
+        captured: dict = {}
+        original = Memory.from_config.__func__
+
+        def spy(cls, config):
+            captured.update(config)
+            return original(Memory, config)
+
+        monkeypatch.setattr(Memory, "from_config", classmethod(spy))
+        return captured
+
+    def _oss_raw(self, custom_instructions=_UNSET, *, provider="ollama"):
+        raw = {
+            "llm": {"provider": provider, "config": {"model": "llama3.1:8b"}},
+            "embedder": {"provider": "ollama", "config": {"model": "nomic-embed-text"}},
+            "vector_store": {"provider": "qdrant", "config": {}},
+        }
+        if custom_instructions is not _UNSET:
+            raw["custom_instructions"] = custom_instructions
+        return raw
+
+    def test_constructor_forwards_custom_instructions(self, monkeypatch):
+        """When custom_instructions is present in oss_config, it must be
+        passed through to Memory.from_config()."""
+        captured = self._spy_from_config(monkeypatch)
+        OSSBackend(
+            self._oss_raw(custom_instructions="Remember: the user prefers pasta.")
+        )
+        assert (
+            captured.get("custom_instructions")
+            == "Remember: the user prefers pasta."
+        )
+
+    def test_constructor_omits_custom_instructions_when_absent(self, monkeypatch):
+        """When custom_instructions is NOT in oss_config, the key must be
+        absent from the config passed to Memory.from_config()."""
+        captured = self._spy_from_config(monkeypatch)
+        OSSBackend(self._oss_raw())
+        assert "custom_instructions" not in captured
+
+    def test_constructor_omits_custom_instructions_when_none(self, monkeypatch):
+        """custom_instructions=None must be treated as absent — not forwarded."""
+        captured = self._spy_from_config(monkeypatch)
+        OSSBackend(self._oss_raw(custom_instructions=None))
+        assert "custom_instructions" not in captured
+
+    def test_constructor_omits_custom_instructions_when_empty_string(
+        self, monkeypatch
+    ):
+        """custom_instructions='' must be treated as absent — not forwarded."""
+        captured = self._spy_from_config(monkeypatch)
+        OSSBackend(self._oss_raw(custom_instructions=""))
+        assert "custom_instructions" not in captured
 
 
 httpx = pytest.importorskip("httpx")
