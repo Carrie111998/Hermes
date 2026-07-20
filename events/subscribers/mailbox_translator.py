@@ -18,6 +18,8 @@ which only saw failures that surfaced as cron exit codes.
 import json
 import logging
 import re
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
@@ -31,6 +33,21 @@ from pipeline_state.manager import PIPELINE_PATH
 logger = logging.getLogger(__name__)
 
 HIGH_SCORE_THRESHOLD = 8.75
+
+# The matcher reports every scored job through BOTH a per-job SCORE_RESULT
+# file and the run's SCORE_BATCH_SUMMARY results[] (and may add a
+# HIGH_SCORE_ALERT), so translating each message independently double-emits
+# JOB_SCORED / JOB_HIGH_SCORE for the same job — the batch rows carry no
+# `dimensions`, which is the dimensions:null twin seen on the live bus
+# 2026-07-10..07-18. Either lane can also arrive alone (07-15 runs were
+# SCORE_RESULT-only, 07-10 00:14 batch-only), so neither message type can
+# simply be dropped: dedupe at emission by job identity + score instead.
+# Window matches the notifier RepeatGuard (30 min): wide enough for the
+# observed 3-minute straggler (Transamerica 07-11), narrow enough that a
+# genuine rescore in a later matcher run (>= 2 h apart) still emits.
+SCORE_DEDUP_WINDOW_SECONDS = 1800.0
+_SCORE_DEDUP_MAX_ENTRIES = 512
+_SCORE_EVENT_TYPES = (EventType.JOB_SCORED, EventType.JOB_HIGH_SCORE)
 
 _INTERVIEW_PATTERNS = [
     re.compile(r"\binterview\s+(?:scheduled|invitation|request|invite)", re.I),
@@ -111,6 +128,10 @@ class MailboxTranslator(BaseSubscriber):
         # burst of PIPELINE_UPDATE events (matcher scores/archives many jobs at
         # once) rebuilds the index at most once per pipeline.json write.
         self._pipeline_index_cache: Optional[Tuple[float, Dict[str, Dict[str, str]]]] = None
+        # (event_type, job identity, score) -> last-emit monotonic time.
+        # First emission within the window wins; in-memory only (duplicates
+        # arrive seconds-to-minutes apart, so restart loss is harmless).
+        self._recent_score_emissions: "OrderedDict[Tuple[str, str, str], float]" = OrderedDict()
 
     def _pipeline_metadata(self, job_ref: Optional[str]) -> Dict[str, str]:
         """Best-effort {title, company} lookup by job id/key from pipeline
@@ -163,6 +184,17 @@ class MailboxTranslator(BaseSubscriber):
 
         emissions = self._translate(message_type, inner, payload.get("from"))
         for et, out_payload, priority in emissions:
+            if et in _SCORE_EVENT_TYPES and self._is_duplicate_score_emission(
+                et, out_payload
+            ):
+                logger.info(
+                    "MailboxTranslator: suppressed duplicate %s for %s (%s @ %s)",
+                    et.type_string,
+                    out_payload.get("job_id") or out_payload.get("job_key"),
+                    out_payload.get("title"),
+                    out_payload.get("company"),
+                )
+                continue
             try:
                 self.bus.emit(
                     event_type=et,
@@ -182,6 +214,34 @@ class MailboxTranslator(BaseSubscriber):
         # 'source' (which is the transport label).
         if message_type == "ERROR":
             self._record_error_for_clustering(payload, inner, correlation_id)
+
+    def _is_duplicate_score_emission(
+        self,
+        et: EventType,
+        payload: Dict[str, Any],
+        now: Optional[float] = None,
+    ) -> bool:
+        """Record-and-decide (RepeatGuard shape): True → suppress.
+
+        Identity is job_id/job_key when the message carries one, else
+        company|title. Score is part of the key so a changed score is
+        never suppressed — only literal repeats of the same fact are.
+        The window slides on repeats (a fact that keeps arriving stays
+        suppressed); a re-emission after the window is a fresh fact.
+        """
+        now = time.monotonic() if now is None else now
+        ident = payload.get("job_id") or payload.get("job_key")
+        if not ident:
+            ident = f"{payload.get('company')}|{payload.get('title')}"
+        key = (et.type_string, str(ident), str(payload.get("score")))
+        seen = self._recent_score_emissions
+        last = seen.get(key)
+        duplicate = last is not None and (now - last) < SCORE_DEDUP_WINDOW_SECONDS
+        seen[key] = now
+        seen.move_to_end(key)
+        while len(seen) > _SCORE_DEDUP_MAX_ENTRIES:
+            seen.popitem(last=False)
+        return duplicate
 
     def _record_error_for_clustering(
         self,
@@ -325,13 +385,19 @@ class MailboxTranslator(BaseSubscriber):
 
 
 def _score_payload(d: Dict[str, Any]) -> Dict[str, Any]:
+    # The matcher's score messages identify jobs by `job_id`, not `job_key`
+    # (every score event on the live bus had job_key=None and an empty bus
+    # job_id column). Carry both, backfilling job_key, so the emit path's
+    # job_id column and the dedup guard have an identity to key on.
+    job_id = d.get("job_id")
     return {
         "score": d.get("score", 0),
         "recommendation": d.get("recommendation"),
         "company": d.get("company"),
         "title": d.get("title"),
         "dimensions": d.get("dimensions"),
-        "job_key": d.get("job_key"),
+        "job_key": d.get("job_key") or job_id,
+        "job_id": job_id,
     }
 
 

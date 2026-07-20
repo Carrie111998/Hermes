@@ -446,6 +446,140 @@ class TestMailboxErrorFeedsClusterDetector:
         assert clusters[0].source == "applier"
 
 
+class TestScoreEventDedup:
+    """The matcher writes BOTH a per-job SCORE_RESULT file AND a
+    SCORE_BATCH_SUMMARY whose results[] repeats the same job, so every
+    scored job produced two JOB_SCORED (and two JOB_HIGH_SCORE when
+    >= threshold) bus events ~60ms apart — one full payload, one with
+    dimensions:null (the batch rows carry no dimensions). Observed on
+    the live bus 2026-07-10..07-18 (e.g. Amex 'Director – Treasury
+    Deposits' 2026-07-12 14:14:03.98 + 14:14:04.04). The translator —
+    the sole producer of these event types — must dedupe by job
+    identity + score within a window.
+    """
+
+    def test_score_result_then_batch_summary_same_job_emits_once(self, bus):
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "4388377347", "score": 9.2, "recommendation": "PROCEED",
+            "company": "JPMC", "title": "FRM Lead",
+            "dimensions": {"title_match": {"raw": 10.0}},
+        })
+        _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+            "results": [
+                {"job_id": "4388377347", "score": 9.2,
+                 "recommendation": "PROCEED", "company": "JPMC",
+                 "title": "FRM Lead"},
+            ],
+        }, correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        scored = [p for et, p in events if et == EventType.JOB_SCORED]
+        high = [p for et, p in events if et == EventType.JOB_HIGH_SCORE]
+        assert len(scored) == 1
+        assert len(high) == 1
+        # First (full) emission wins — dimensions survive.
+        assert high[0]["dimensions"] is not None
+
+    def test_batch_summary_then_score_result_same_job_emits_once(self, bus):
+        """Real 2026-07-18 14:12 order: the batch summary lands first."""
+        _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+            "results": [
+                {"job_id": "b3760968", "score": 8.8, "company": "JPMC",
+                 "title": "Quant Treasury"},
+            ],
+        })
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "b3760968", "score": 8.8, "company": "JPMC",
+            "title": "Quant Treasury",
+            "dimensions": {"title_match": {"raw": 9.0}},
+        }, correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_SCORED]) == 1
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 1
+
+    def test_dedup_spans_polls_of_same_translator(self, bus):
+        """The straggler shape (Transamerica 2026-07-11: third duplicate
+        3 minutes after the pair) arrives in a LATER poll cycle."""
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.1, "company": "A", "title": "T"})
+        t = MailboxTranslator(bus)
+        bus._execute(
+            "INSERT OR REPLACE INTO subscriber_cursors "
+            "(subscriber_id, last_rowid, updated_at) VALUES (?, 0, datetime('now'))",
+            (t.subscriber_id,),
+        )
+        t.poll()
+        _mailbox_event(bus, "HIGH_SCORE_ALERT", {
+            "job_id": "j1", "score": 9.1, "company": "A", "title": "T"},
+            correlation_id="corr-2")
+        t.poll()
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 1
+
+    def test_different_jobs_same_score_both_emit(self, bus):
+        _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+            "results": [
+                {"job_id": "j1", "score": 9.0, "company": "Central Bank", "title": "ALM"},
+                {"job_id": "j2", "score": 9.0, "company": "BlackRock", "title": "Head of AI"},
+            ],
+        })
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 2
+
+    def test_rescore_with_different_score_still_emits(self, bus):
+        """A changed score is new information, never suppressed."""
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.0, "company": "A", "title": "T"})
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.3, "company": "A", "title": "T"},
+            correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 2
+
+    def test_dedup_falls_back_to_company_title_without_ids(self, bus):
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "score": 9.0, "company": "Acme", "title": "VP"})
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "score": 9.0, "company": "Acme", "title": "VP"},
+            correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 1
+
+    def test_window_expiry_allows_reemission(self, bus, monkeypatch):
+        """A genuine rescore in a later matcher run (observed 2h apart)
+        must emit again once the window has passed."""
+        import events.subscribers.mailbox_translator as mt
+        monkeypatch.setattr(mt, "SCORE_DEDUP_WINDOW_SECONDS", 0.0)
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.0, "company": "A", "title": "T"})
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.0, "company": "A", "title": "T"},
+            correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 2
+
+
+def test_score_payload_carries_job_id_and_backfills_job_key(bus):
+    """The matcher sends `job_id`, not `job_key` — every score event on the
+    live bus had job_key=None and an empty bus job_id column, defeating any
+    downstream keying. The payload must carry job_id and backfill job_key."""
+    _mailbox_event(bus, "SCORE_RESULT", {
+        "job_id": "4388377347", "score": 7.0, "company": "JPMC", "title": "Lead"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    p = next(p for et, p in events if et == EventType.JOB_SCORED)
+    assert p["job_id"] == "4388377347"
+    assert p["job_key"] == "4388377347"
+    row = next(e for e in bus.query()
+               if e.event_type == EventType.JOB_SCORED)
+    assert row.job_id == "4388377347"
+
+
 def test_unknown_message_type_produces_no_domain_event(bus):
     _mailbox_event(bus, "SOME_RANDOM_TYPE", {"foo": "bar"})
     _translate(bus)
