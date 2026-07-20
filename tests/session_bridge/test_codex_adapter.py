@@ -386,6 +386,46 @@ class TestInventory:
             assert params["useStateDbOnly"] is True
             assert "cursor" not in params
 
+    def test_continuous_visibility_uses_preview_when_full_read_times_out(
+        self,
+    ) -> None:
+        row = {
+            "id": "oversized-thread",
+            "name": "Long-running bridge rollout",
+            "preview": "Finish the cross-harness session bridge rollout",
+            "path": "C:/codex/sessions/oversized-thread.jsonl",
+            "cwd": "C:/work/session-bridge",
+            "createdAt": 100,
+            "updatedAt": 300,
+            "source": "vscode",
+            "gitInfo": {
+                "branch": "codex/session-bridge-ship",
+                "sha": "abc123",
+            },
+        }
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [row]},
+                {"data": []},
+            ],
+            "thread/read": [TimeoutError("synthetic oversized thread")],
+        })
+
+        [source] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=250, state_db_only=True)
+
+        assert source.source_session_id == "codex:oversized-thread"
+        assert source.projection.title == "Long-running bridge rollout"
+        assert source.projection.native_path == row["path"]
+        assert source.projection.git_branch == "codex/session-bridge-ship"
+        assert [(message.role, message.content) for message in source.projection.messages] == [
+            ("user", "Finish the cross-harness session bridge rollout")
+        ]
+        assert source.git_head == "abc123"
+        assert source.automation_only is False
+        assert source.subagent_only is False
+
     def test_claude_visibility_inventory_preserves_normal_automation_and_subagent_kinds(
         self,
     ) -> None:

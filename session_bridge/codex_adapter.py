@@ -78,6 +78,8 @@ class CodexThreadSummary:
     source_kind: str | None = None
     automation_only: bool = False
     subagent_only: bool = False
+    preview: str | None = None
+    native_path: str | None = None
 
 
 class CodexInventoryProtocolError(ValueError):
@@ -692,9 +694,15 @@ class CodexSourceAdapter:
 
         sources: list[SidebarSource] = []
         for summary in summaries:
-            projection, reconciled = self._read_sidebar_thread_details(
-                summary, deadline=None
-            )
+            try:
+                projection, reconciled = self._read_sidebar_thread_details(
+                    summary, deadline=None
+                )
+            except TimeoutError:
+                if not state_db_only:
+                    raise
+                projection = self._project_state_db_summary(summary)
+                reconciled = summary
             if reconciled.source_kind is None:
                 raise ValueError("Codex thread source kind is missing")
             sources.append(
@@ -714,6 +722,41 @@ class CodexSourceAdapter:
                 )
             )
         return tuple(sources)
+
+    def _project_state_db_summary(
+        self, summary: CodexThreadSummary
+    ) -> SessionProjection:
+        messages: list[ProjectedMessage] = []
+        if summary.preview is not None:
+            messages.append(
+                ProjectedMessage(
+                    native_event_id=f"state-db-preview:{summary.native_id}",
+                    ordinal=0,
+                    role="user",
+                    content=summary.preview,
+                    timestamp=summary.started_at,
+                )
+            )
+        origin_kind, origin_bridge_id = _detect_origin(
+            messages, marker_secret=self._marker_secret
+        )
+        return SessionProjection(
+            provider=Provider.CODEX,
+            native_id=summary.native_id,
+            title=summary.title,
+            cwd=summary.cwd,
+            started_at=summary.started_at,
+            last_active=summary.last_active,
+            messages=messages,
+            native_path=summary.native_path,
+            native_status="archived" if summary.archived else "active",
+            native_cursor=summary.revision,
+            native_hash=_projection_hash(summary, messages),
+            parser_version=_PARSER_VERSION,
+            origin_kind=origin_kind,
+            origin_bridge_id=origin_bridge_id,
+            git_branch=summary.git_branch,
+        )
 
     def project_thread(
         self,
@@ -1778,6 +1821,10 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         raise ValueError("Codex inventory entry has no thread ID")
 
     title = _optional_string(_first(entry, "title", "name", "preview"))
+    preview = _optional_string(_first(entry, "preview"))
+    native_path = _optional_string(
+        _first(entry, "path", "rolloutPath", "rollout_path")
+    )
     cwd = _cwd_alias_metadata(entry)
     started_at = _inventory_timestamp(
         entry,
@@ -1859,6 +1906,8 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         source_kind=source_kind,
         automation_only=automation_only,
         subagent_only=subagent_only,
+        preview=preview,
+        native_path=native_path,
     )
 
 
