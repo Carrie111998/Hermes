@@ -137,6 +137,95 @@ async def test_inbound_frame_reaches_handler(server):
         await t.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_outbound_round_trips_with_correlation(server):
+    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    await t.connect()
+    try:
+        await t.handshake()
+        result = await t.send_outbound({"op": "send", "chat_id": "chan1", "content": "hi"})
+        assert result["success"] is True
+        assert result["message_id"] == "srv-send"
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_edit_outbound_round_trips_with_full_wire_action(server):
+    """Prove the edit operation crosses the production WebSocket transport."""
+    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    await t.connect()
+    try:
+        await t.handshake()
+        action = {
+            "op": "edit",
+            "chat_id": "chan1",
+            "message_id": "msg1",
+            "content": "final text",
+            "finalize": True,
+            "metadata": {"scope_id": "guildA"},
+        }
+        result = await t.send_outbound(action, platform="discord")
+
+        assert result == {"success": True, "message_id": "srv-edit"}
+        outbound = next(f for f in server.received if f["type"] == "outbound")
+        assert outbound["action"] == action
+        assert outbound["platform"] == "discord"
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_round_trips(server):
+    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    await t.connect()
+    try:
+        await t.handshake()
+        result = await t.send_follow_up(
+            {"op": "follow_up", "session_key": "s1", "kind": "discord.interaction_token", "content": "fu"}
+        )
+        assert result["success"] is True
+        assert result["message_id"] == "srv-follow_up"
+        # The follow_up rode an outbound frame the connector saw.
+        outbound = [f for f in server.received if f["type"] == "outbound"]
+        assert any(f["action"]["op"] == "follow_up" for f in outbound)
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_fails_pending_waiters_cleanly(server):
+    t = WebSocketRelayTransport(server.url, "discord", "appShared", outbound_timeout_s=5)
+    await t.connect()
+    await t.handshake()
+    await t.disconnect()
+    # After disconnect, an outbound returns a structured failure rather than hanging.
+    result = await t.send_outbound({"op": "send", "chat_id": "c", "content": "x"})
+    assert result["success"] is False
+
+
+def test_https_url_normalized_to_wss():
+    """The relay URL is configured once as the http(s):// BASE (for the provision
+    POST), but websockets.connect needs ws(s):// and the connector mounts its WS
+    server at /relay. The transport must convert scheme AND ensure the /relay
+    path. Regression for the live staging failures 'scheme isn't ws or wss' then
+    'server rejected WebSocket connection: HTTP 400' (wrong path)."""
+    t = WebSocketRelayTransport("https://connector.example", "discord", "b")
+    assert t._url == "wss://connector.example/relay"
+    t2 = WebSocketRelayTransport("http://connector.local:8080", "discord", "b")
+    assert t2._url == "ws://connector.local:8080/relay"
+
+
+def test_ws_dial_url_idempotent_with_scheme_and_path():
+    # Already ws(s):// and/or already ending in /relay -> unchanged (no double append).
+    t = WebSocketRelayTransport("wss://connector.example/relay", "discord", "b")
+    assert t._url == "wss://connector.example/relay"
+    t2 = WebSocketRelayTransport("https://connector.example/relay/", "discord", "b")
+    assert t2._url == "wss://connector.example/relay"
+    t3 = WebSocketRelayTransport("ws://127.0.0.1:9", "discord", "b")
+    assert t3._url == "ws://127.0.0.1:9/relay"
+
+
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────
 
 
