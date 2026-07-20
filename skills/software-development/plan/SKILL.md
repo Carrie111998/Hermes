@@ -207,6 +207,76 @@ If not, create a sensible timestamped filename yourself under `.hermes/plans/`.
 - If it is genuinely underspecified, ask a brief clarifying question instead of guessing.
 - After saving the plan, reply briefly with what you planned and the saved path.
 
+## Trivial-task bypass (hermes-v2, H-23)
+
+Plan mode is **opt-out for trivial work**. The default activation
+rule is:
+
+> **If a request is unambiguously trivial, skip `/plan` entirely and
+> just do the work.**
+
+A task is unambiguously trivial when ALL of these hold:
+
+- One file edit, OR one shell command, OR one read+reply.
+- No multi-step coordination (no subagents, no kanban, no
+  pipelines).
+- No design tradeoffs that benefit from being written down.
+- Output fits in one short message.
+
+Examples of trivial tasks (skip plan mode):
+
+- "What's the exit code of grep when no match?" → read + reply.
+- "Add a docstring to this function." → one file edit.
+- "Restart the gateway service." → one shell command.
+- "Convert this JSON to YAML." → one file edit.
+
+Examples that MUST use plan mode (do not bypass):
+
+- "Refactor the auth flow." → multi-file, design tradeoffs.
+- "Add a new pipeline for X." → multi-step coordination.
+- "Investigate why Y is slow." → requires discovery + plan.
+- "Implement feature Z end-to-end." → multi-file, multi-step.
+
+When auto-activation is enabled (via
+`config.auto_activation.enabled` in `plugin.yaml`), the
+heuristic-trigger classifier in `hermes_auto_detect.py` already
+skips low-confidence cases. The trivial-task bypass here is the
+explicit operator rule for manual `/plan` calls: when in doubt,
+**err on the side of doing the work directly** for single-step
+tasks rather than writing a plan file the work doesn't need.
+
+The plan-mode write-fence (`hermes_plan_mode.py:policy_hook`) is
+still active when plan mode IS on — no need to relax it for trivial
+work, because plan mode isn't activated for trivial work in the
+first place.
+
+## Auto-activation tuning (hermes-v2, H-23)
+
+When auto-activation is on, the `confidence_threshold` controls how
+often the heuristic promotes ambiguous requests to plan mode.
+Defaults from `plugin.yaml`:
+
+```yaml
+auto_activation:
+  enabled: false                  # opt-in only; flip to true after testing
+  confidence_threshold: 0.25     # lower = more eager activation
+  plan_mode: true                 # which modes auto-activation can flip
+  swarm_mode: true
+```
+
+After the 1-week soak period (per the hermes-v2 plan, Phase 2), tune:
+
+- **Raise threshold to 0.4** if too many trivial requests are getting
+  plan mode and forcing plan-write turns.
+- **Lower threshold to 0.15** if multi-step requests are slipping
+  through and ending up as inline TODOs without structure.
+- **Disable entirely** (`enabled: false`) if the false-positive rate
+  outweighs the false-negative cost.
+
+The threshold tunes the **classifier's eagerness**; the trivial-task
+bypass above tunes the **operator's manual-call behavior**. Both
+levers exist because they target different decisions.
+
 ---
 
 # Writing the Plan Well
