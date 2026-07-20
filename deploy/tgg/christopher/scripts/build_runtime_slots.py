@@ -445,6 +445,14 @@ def _validate(
     # The ingest brief stays unscoped so its behavior is unchanged.
     assert "business_operations" not in ingest_brief
 
+    # Prose and mechanism must agree: no management instruction may tell
+    # Christopher to call an operation the scope denies him, or he is being
+    # instructed to do something the runtime will refuse.
+    mgmt_referenced = set(OPERATION_REFERENCE_RE.findall(mgmt_joined))
+    assert mgmt_referenced <= permitted, sorted(mgmt_referenced - permitted)
+    for forbidden in MGMT_FORBIDDEN_OPERATIONS:
+        assert forbidden not in mgmt_joined, forbidden
+
 
 def main() -> int:
     baseline_config = (BASELINE_ROOT / "config.live-2026-06-19.yaml").read_text(
