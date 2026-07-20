@@ -10,8 +10,10 @@ Refs: H-20 (hermes-v2 plan, 2026-07-20).
 from __future__ import annotations
 
 import pytest
+import yaml
 
 from hermes_cli.plan_parser import (
+    MalformedTaskLine,
     ParsedPlan,
     PlanTask,
     PlanValidationError,
@@ -95,9 +97,11 @@ class TestIsV2Plan:
     def test_rejects_empty_string(self) -> None:
         assert is_v2_plan("") is False
 
-    def test_rejects_text_starting_with_dashes_but_no_yaml(self) -> None:
-        # ``--`` alone is not frontmatter.
-        assert is_v2_plan("---\nnot a yaml mapping\n---\n") is False
+    def test_detects_non_mapping_frontmatter_envelope(self) -> None:
+        assert is_v2_plan("---\nnot a yaml mapping\n---\n") is True
+
+    def test_detects_invalid_yaml_frontmatter_envelope(self) -> None:
+        assert is_v2_plan("---\nslug: [unterminated\n---\n") is True
 
 
 # ── parse_plan ─────────────────────────────────────────────────────────
@@ -175,22 +179,36 @@ class TestParsePlanErrors:
         with pytest.raises(ValueError, match="no YAML frontmatter"):
             parse_plan("# Title\n\nNo frontmatter.")
 
-    def test_missing_required_key_raises(self) -> None:
-        bad = """\
----
-title: Only title
-goal: A goal
-scope_tiers:
-  A: []
-risks: []
-verification: []
----
+    @pytest.mark.parametrize(
+        "missing_key",
+        ["slug", "title", "goal", "scope_tiers", "risks", "verification"],
+    )
+    def test_each_required_frontmatter_key_is_required(self, missing_key) -> None:
+        frontmatter = {
+            "slug": "complete-plan",
+            "title": "Complete plan",
+            "goal": "A goal",
+            "scope_tiers": {"A": ["T1"]},
+            "risks": [],
+            "verification": [],
+        }
+        del frontmatter[missing_key]
+        bad = (
+            "---\n"
+            + yaml.safe_dump(frontmatter, sort_keys=False)
+            + "---\n\n```tasks\n- [ ] T1: something\n```\n"
+        )
 
-```tasks
-- [ ] T1: something
-```
-"""
-        with pytest.raises(ValueError, match="missing required frontmatter key: slug"):
+        with pytest.raises(
+            ValueError,
+            match=f"missing required frontmatter key: {missing_key}",
+        ):
+            parse_plan(bad)
+
+    def test_invalid_frontmatter_yaml_raises(self) -> None:
+        bad = "---\nslug: [unterminated\n---\n"
+
+        with pytest.raises(ValueError, match="invalid YAML frontmatter"):
             parse_plan(bad)
 
     def test_frontmatter_not_mapping_raises(self) -> None:
@@ -299,6 +317,43 @@ verification: []
         t3 = next(t for t in plan.tasks if t.raw_id == "T3")
         assert t3.depends == ["T1", "T2"]
 
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        [
+            ("paths", "hermes_cli/plan_parser.py", ["hermes_cli/plan_parser.py"]),
+            (
+                "paths",
+                "hermes_cli/plan_parser.py, tests/hermes_cli/test_plan_parser.py",
+                ["hermes_cli/plan_parser.py", "tests/hermes_cli/test_plan_parser.py"],
+            ),
+            (
+                "paths",
+                "[hermes_cli/plan_parser.py, tests/hermes_cli/test_plan_parser.py]",
+                ["hermes_cli/plan_parser.py", "tests/hermes_cli/test_plan_parser.py"],
+            ),
+            ("path", "hermes_cli/plan_parser.py", ["hermes_cli/plan_parser.py"]),
+            (
+                "files",
+                "[hermes_cli/plan_parser.py, tests/hermes_cli/test_plan_parser.py]",
+                ["hermes_cli/plan_parser.py", "tests/hermes_cli/test_plan_parser.py"],
+            ),
+        ],
+    )
+    def test_paths_fields_accept_canonical_aliases_and_list_forms(
+        self,
+        field,
+        value,
+        expected,
+    ) -> None:
+        text = V2_MINIMAL.replace(
+            " | skill: hermes-v2-helper | verify: pytest -q",
+            f" | {field}: {value}",
+        )
+
+        plan = parse_plan(text)
+
+        assert plan.tasks[0].paths == expected
+
     def test_no_tasks_block_returns_empty(self) -> None:
         text = """\
 ---
@@ -345,13 +400,18 @@ class TestValidate:
         errors = validate(plan)
         assert any(e.code == "goal_empty" for e in errors)
 
-    def test_slug_with_spaces_flagged(self) -> None:
+    @pytest.mark.parametrize(
+        "slug",
+        ["bad slug", "Bad-Slug", "bad_slug", "bad--slug", "-bad", "bad-"],
+    )
+    def test_slug_must_be_lowercase_kebab_case(self, slug) -> None:
         plan = ParsedPlan(
-            slug="bad slug", title="t", goal="g",
+            slug=slug, title="t", goal="g",
             scope_tiers={}, risks=[], verification=[],
         )
         errors = validate(plan)
-        assert any(e.code == "slug_invalid" for e in errors)
+        slug_error = next(e for e in errors if e.code == "slug_invalid")
+        assert "lowercase kebab-case" in slug_error.message
 
     def test_duplicate_task_id_flagged(self) -> None:
         plan = ParsedPlan(
@@ -400,3 +460,222 @@ class TestValidate:
         )
         errors = validate(plan)
         assert any(e.code == "no_tasks" for e in errors)
+
+
+# ── v2 contract: exactly one tasks fence ───────────────────────────────
+
+
+class TestSingleTasksFence:
+    """[hermes-v2] H-22: the v2 contract is "exactly one tasks fence".
+    Multiple fences used to silently take the first — the second fence
+    disappeared without trace, leaving the operator with a half-seeded
+    board. ``parse_plan`` now raises on > 1 fence so the seeder never
+    gets the chance to commit a partial graph."""
+
+    def test_two_fences_raise_value_error(self) -> None:
+        text = """\
+---
+slug: p
+title: t
+goal: g
+scope_tiers: {A: []}
+risks: []
+verification: []
+---
+
+```tasks
+- [ ] T1: first
+```
+
+```tasks
+- [ ] T2: second
+```
+"""
+        with pytest.raises(ValueError, match="2 ```tasks``` fences"):
+            parse_plan(text)
+
+    def test_single_fence_is_still_accepted(self) -> None:
+        plan = parse_plan(V2_MINIMAL)
+        assert len(plan.tasks) == 1
+        assert plan.tasks[0].raw_id == "T1"
+
+
+# ── malformed task lines inside the fence ──────────────────────────────
+
+
+class TestMalformedTaskLines:
+    """[hermes-v2] H-22: ``- [ ]`` lines that don't match the canonical
+    ``T<id>: <title>`` regex used to silently disappear. The parser now
+    records them and ``validate`` surfaces them as structured errors so
+    an operator's typo doesn't slip past the seeder."""
+
+    def test_bare_task_bullet_is_recorded(self) -> None:
+        text = """\
+---
+slug: p
+title: t
+goal: g
+scope_tiers: {A: []}
+risks: []
+verification: []
+---
+
+```tasks
+- [ ] T1: real
+- [ ]
+```
+"""
+        plan = parse_plan(text)
+        assert len(plan.tasks) == 1
+        assert plan.tasks[0].raw_id == "T1"
+        assert len(plan.malformed_task_lines) == 1
+        assert plan.malformed_task_lines[0].line_no == 2
+
+    def test_id_without_title_is_recorded(self) -> None:
+        text = """\
+---
+slug: p
+title: t
+goal: g
+scope_tiers: {A: []}
+risks: []
+verification: []
+---
+
+```tasks
+- [ ] T99
+```
+"""
+        plan = parse_plan(text)
+        # T99 with no title fails the canonical regex; parser records it.
+        assert plan.tasks == []
+        assert len(plan.malformed_task_lines) == 1
+        assert "T99" in plan.malformed_task_lines[0].text
+
+    def test_prose_bullets_are_not_recorded(self) -> None:
+        text = """\
+---
+slug: p
+title: t
+goal: g
+scope_tiers: {A: []}
+risks: []
+verification: []
+---
+
+```tasks
+- This is just prose, not a task.
+- [ ] T1: the only task
+```
+"""
+        plan = parse_plan(text)
+        assert len(plan.tasks) == 1
+        assert plan.malformed_task_lines == []
+
+    def test_validate_surfaces_malformed_lines_as_errors(self) -> None:
+        plan = parse_plan("""\
+---
+slug: p
+title: t
+goal: g
+scope_tiers: {A: []}
+risks: []
+verification: []
+---
+
+```tasks
+- [ ] T1: real
+- [ ]
+```
+""")
+        errors = validate(plan)
+        bad = [e for e in errors if e.code == "malformed_task_line"]
+        assert bad, "validate must surface malformed task lines"
+        assert any(e.line_no == 2 for e in bad)
+
+    def test_validate_flags_empty_title(self) -> None:
+        plan = ParsedPlan(
+            slug="p", title="t", goal="g",
+            scope_tiers={}, risks=[], verification=[],
+            tasks=[PlanTask(raw_id="T1", title="")],
+        )
+        errors = validate(plan)
+        assert any(e.code == "malformed_task_line" for e in errors)
+
+
+# ── dependency cycle detection ─────────────────────────────────────────
+
+
+class TestDependencyCycleDetection:
+    """[hermes-v2] H-22: parent/depends cycles used to crash inside
+    ``link_tasks`` AFTER the root was already committed, leaving a
+    partial board mutation. ``validate`` now detects cycles (including
+    self-cycles) before any kanban row is touched."""
+
+    def test_self_cycle_in_parent_flagged(self) -> None:
+        plan = ParsedPlan(
+            slug="p", title="t", goal="g",
+            scope_tiers={}, risks=[], verification=[],
+            tasks=[PlanTask(raw_id="T1", title="a", parent="T1")],
+        )
+        errors = validate(plan)
+        assert any(e.code == "dependency_cycle" for e in errors)
+        assert any("T1" in e.message and "self" in e.message for e in errors)
+
+    def test_self_cycle_in_depends_flagged(self) -> None:
+        plan = ParsedPlan(
+            slug="p", title="t", goal="g",
+            scope_tiers={}, risks=[], verification=[],
+            tasks=[PlanTask(raw_id="T1", title="a", depends=["T1"])],
+        )
+        errors = validate(plan)
+        assert any(e.code == "dependency_cycle" for e in errors)
+
+    def test_two_node_cycle_flagged(self) -> None:
+        plan = ParsedPlan(
+            slug="p", title="t", goal="g",
+            scope_tiers={}, risks=[], verification=[],
+            tasks=[
+                PlanTask(raw_id="T1", title="a", parent="T2"),
+                PlanTask(raw_id="T2", title="b", parent="T1"),
+            ],
+        )
+        errors = validate(plan)
+        cycles = [e for e in errors if e.code == "dependency_cycle"]
+        assert cycles, "T1<->T2 cycle must be flagged"
+        # The cycle message should mention both nodes.
+        joined = " ".join(c.message for c in cycles)
+        assert "T1" in joined and "T2" in joined
+
+    def test_three_node_cycle_flagged(self) -> None:
+        plan = ParsedPlan(
+            slug="p", title="t", goal="g",
+            scope_tiers={}, risks=[], verification=[],
+            tasks=[
+                PlanTask(raw_id="T1", title="a", depends=["T2"]),
+                PlanTask(raw_id="T2", title="b", depends=["T3"]),
+                PlanTask(raw_id="T3", title="c", depends=["T1"]),
+            ],
+        )
+        errors = validate(plan)
+        cycles = [e for e in errors if e.code == "dependency_cycle"]
+        assert cycles, "T1->T2->T3->T1 cycle must be flagged"
+
+    def test_dag_passes_validation(self) -> None:
+        """A linear chain (T1 -> T2 -> T3) has no cycle and must
+        validate cleanly — the detector must not false-positive on
+        acyclic graphs."""
+        plan = ParsedPlan(
+            slug="p", title="t", goal="g",
+            scope_tiers={}, risks=[], verification=[],
+            tasks=[
+                PlanTask(raw_id="T1", title="a"),
+                PlanTask(raw_id="T2", title="b", parent="T1"),
+                PlanTask(raw_id="T3", title="c", parent="T2"),
+            ],
+        )
+        errors = validate(plan)
+        cycles = [e for e in errors if e.code == "dependency_cycle"]
+        assert cycles == [], (
+            f"DAG must not trip cycle detector, got: {[e.message for e in cycles]}"
+        )

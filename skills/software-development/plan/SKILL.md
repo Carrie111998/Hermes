@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Use when writing an actionable markdown implementation plan with bite-sized tasks.
+description: Write actionable, machine-readable implementation plans.
 version: 3.0.0
 author: Hermes Agent (writing-craft adapted from obra/superpowers)
 license: MIT
@@ -91,7 +91,7 @@ risks:
   - Core-Patches kollidieren mit Upstream → git revert + Branch hermes-v2-work
   - state.db-VACUUM braucht 2× Disk → Freien Platz prüfen
 verification:
-  - pytest tests/run_agent/ -k 'minimax or thinking_budget' grün
+  - ./scripts/run_tests.sh tests/run_agent/ -k 'minimax or thinking_budget' grün
   - Live-Session mit 3 Tool-Runden zeigt Thinking-Blöcke im Replay
 created_by: yuno
 created_at: 2026-07-20
@@ -101,10 +101,10 @@ provider: minimax
 ```
 
 Field semantics:
-- `slug` — lower-kebab-case identifier. Used as the idempotency-key prefix when the plan is approved and seeded to Kanban (so re-approving the same plan is a no-op).
+- `slug` — lower-kebab-case identifier. Used as the idempotency-key prefix when the plan is approved and seeded to Kanban; re-approval reuses task IDs while refreshing the stored plan attachment.
 - `scope_tiers` — explicit A/B/C categorisation. Parsers seed higher tiers first.
-- `risks` — bullet list; each line is preserved as a Kanban-task comment by H-22.
-- `verification` — bullet list of runnable commands. H-22 surfaces them on the root task for fast check.
+- `risks` — bullet list rendered in the root task body by H-22.
+- `verification` — bullet list of runnable commands rendered in the root task body.
 
 ### Required machine-readable task block
 
@@ -112,25 +112,26 @@ After the frontmatter and the human-readable sections, add a single fenced block
 
 ````markdown
 ```tasks
-- [ ] T1: H-04 Secrets-Migration | skill: hermes-v2-helper | verify: bash -n .env
-- [ ] T2: H-05 state.db-Diät | skill: hermes-v2-helper | verify: sqlite3 .backup /tmp/x.db && du -sh state.db
-- [ ] T3: H-10 MiniMax-Interleaved-Thinking | skill: hermes-core-patch | verify: pytest tests/run_agent/test_minimax_tool_reasoning.py
+- [ ] T1: H-04 Secrets-Migration | skill: hermes-v2-helper | paths: [.env] | verify: bash -n .env
+- [ ] T2: H-05 state.db-Diät | skill: hermes-v2-helper | paths: [state.db] | verify: sqlite3 .backup /tmp/x.db && du -sh state.db
+- [ ] T3: H-10 MiniMax-Interleaved-Thinking | skill: hermes-core-patch | paths: [run_agent/, tests/run_agent/test_minimax_tool_reasoning.py] | verify: ./scripts/run_tests.sh tests/run_agent/test_minimax_tool_reasoning.py
 ```
 ````
 
-Line format: `- [ ] T<n>: <Title> | skill: <skill-slug> | verify: <command>`
+Line format: `- [ ] T<n>: <Title> | skill: <skill-slug> | paths: [<path>, ...] | verify: <command>`
 
 - `T<n>` — stable task ID within the plan. Used for parent/child linking.
 - `skill:` — comma-separated list of skill slugs to force-load when the worker picks up this task.
+- `paths:` — canonical file-scope field; use a comma-separated value or bracketed list. The parser also accepts legacy `path:` and `files:` aliases, but new plans must emit `paths:`.
 - `verify:` — shell command the worker must run before completing. H-22 stores it on the task and surfaces it in webui.
 
 Children use `parent:` and `depends:` fields:
 
 ````markdown
 ```tasks
-- [ ] T1: Phase 1 setup | skill: hermes-v2-helper
-- [ ] T1.1: Apply H-10 patch | parent: T1 | skill: hermes-core-patch | verify: pytest tests/run_agent/test_minimax_tool_reasoning.py
-- [ ] T1.2: Apply H-11 patch | parent: T1 | depends: [T1.1] | skill: hermes-core-patch | verify: pytest tests/run_agent/test_thinking_budget_ultra.py
+- [ ] T1: Phase 1 setup | skill: hermes-v2-helper | paths: [run_agent/, tests/run_agent/]
+- [ ] T1.1: Apply H-10 patch | parent: T1 | skill: hermes-core-patch | paths: [run_agent/, tests/run_agent/test_minimax_tool_reasoning.py] | verify: ./scripts/run_tests.sh tests/run_agent/test_minimax_tool_reasoning.py
+- [ ] T1.2: Apply H-11 patch | parent: T1 | depends: [T1.1] | skill: hermes-core-patch | paths: [run_agent/, tests/run_agent/test_thinking_budget_ultra.py] | verify: ./scripts/run_tests.sh tests/run_agent/test_thinking_budget_ultra.py
 ```
 ````
 
@@ -143,7 +144,7 @@ A plan is **approvable** iff:
 4. Every `verify:` value is a non-empty shell line.
 5. The plan file lives under `.hermes/plans/` (resolved against the active workspace).
 
-Free-form plans (no v2 contract) are still usable for human execution; `/plan approve` on a free-form plan falls back to `decompose_task` and seeds a single triage task in Kanban instead of the structured tree.
+Free-form plans without frontmatter remain usable for human execution. Seeding creates one triage task instead of a structured tree; callers may explicitly request auxiliary decomposition.
 
 ### Worked example (hermes-v2 plan, abridged)
 
@@ -160,7 +161,7 @@ risks:
   - Core-Patches kollidieren mit Upstream → git revert
   - state.db-VACUUM braucht 2× Disk → Freien Platz prüfen
 verification:
-  - pytest tests/run_agent/ -k 'minimax or thinking_budget' grün
+  - ./scripts/run_tests.sh tests/run_agent/ -k 'minimax or thinking_budget' grün
 created_by: yuno
 created_at: 2026-07-20
 model: MiniMax-M3
@@ -183,8 +184,8 @@ provider: minimax
 - [ ] T1.1: H-01 Baseline-Snapshot | parent: T1 | skill: hermes-v2-helper | verify: ls ~/hermes-v2-baseline-*
 - [ ] T1.2: H-04 Secrets-Migration | parent: T1 | depends: [T1.1] | skill: hermes-v2-helper | verify: grep -c DASHBOARD ~/.hermes/.env
 - [ ] T2: Phase 1 — Tool-Calling + M3-Tuning | parent: root | skill: hermes-core-patch
-- [ ] T2.1: H-10 MiniMax-Interleaved-Thinking | parent: T2 | skill: hermes-core-patch | verify: pytest tests/run_agent/test_minimax_tool_reasoning.py
-- [ ] T2.2: H-11 ultra in THINKING_BUDGET | parent: T2 | depends: [T2.1] | skill: hermes-core-patch | verify: pytest tests/run_agent/test_thinking_budget_ultra.py
+- [ ] T2.1: H-10 MiniMax-Interleaved-Thinking | parent: T2 | skill: hermes-core-patch | verify: ./scripts/run_tests.sh tests/run_agent/test_minimax_tool_reasoning.py
+- [ ] T2.2: H-11 ultra in THINKING_BUDGET | parent: T2 | depends: [T2.1] | skill: hermes-core-patch | verify: ./scripts/run_tests.sh tests/run_agent/test_thinking_budget_ultra.py
 ```
 ```
 
@@ -320,7 +321,6 @@ Every step is one action:
 [50 lines of code across 5 files]
 ```
 
-set -euo pipefail
 **Right size:**
 ```markdown
 ### Task 1: Create User model with email field
@@ -333,7 +333,6 @@ set -euo pipefail
 [15 lines, 1 file]
 ```
 
-set -euo pipefail
 ## Plan Document Structure
 
 ### Header (Required)
@@ -354,7 +353,6 @@ Every plan MUST start with:
 ---
 ```
 
-set -euo pipefail
 ### Task Structure
 
 Each task follows this format:
@@ -377,10 +375,9 @@ def test_specific_behavior():
     assert result == expected
 ```
 
-set -euo pipefail
 **Step 2: Run test to verify failure**
 
-Run: `pytest tests/path/test.py::test_specific_behavior -v`
+Run: `./scripts/run_tests.sh tests/path/test.py::test_specific_behavior -v`
 Expected: FAIL — "function not defined"
 
 **Step 3: Write minimal implementation**
@@ -390,10 +387,9 @@ def function(input):
     return expected
 ```
 
-set -euo pipefail
 **Step 4: Run test to verify pass**
 
-Run: `pytest tests/path/test.py::test_specific_behavior -v`
+Run: `./scripts/run_tests.sh tests/path/test.py::test_specific_behavior -v`
 Expected: PASS
 
 **Step 5: Commit**
@@ -403,7 +399,6 @@ git add tests/path/test.py src/path/file.py
 git commit -m "feat: add specific feature"
 ```
 
-set -euo pipefail
 ````
 
 ## Writing Process
@@ -434,7 +429,6 @@ search_files("*.py", target="files", path="tests/")
 read_file("src/app.py")
 ```
 
-set -euo pipefail
 ### Step 3: Design Approach
 
 Decide:
@@ -499,7 +493,6 @@ class User:
         self.email = email
 ```
 
-set -euo pipefail
 ### TDD (Test-Driven Development)
 
 Every task that produces code should include the full TDD cycle:
@@ -518,7 +511,6 @@ git add [files]
 git commit -m "type: description"
 ```
 
-set -euo pipefail
 ## Common Mistakes
 
 ### Vague Tasks
@@ -534,7 +526,7 @@ set -euo pipefail
 ### Missing Verification
 
 **Bad:** "Step 3: Test it works"
-**Good:** "Step 3: Run `pytest tests/test_auth.py -v`, expected: 3 passed"
+**Good:** "Step 3: Run `./scripts/run_tests.sh tests/test_auth.py -v`, expected: 3 passed"
 
 ### Missing File Paths
 
