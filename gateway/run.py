@@ -19910,14 +19910,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
-                    next_message = await self._prepare_profile_scoped_inbound_message_text(
+                    prepared = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
                         history=updated_history,
                         session_key=next_session_key,
                     )
-                    if next_message is None:
-                        return result
+                    if prepared is not None:
+                        next_message = prepared
+                    else:
+                        logger.debug(
+                            "Queue drain: prepare returned None for follow-up "
+                            "(e.g. blocked @ context); falling back to raw pending text"
+                        )
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
