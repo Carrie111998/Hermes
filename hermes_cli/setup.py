@@ -1183,11 +1183,12 @@ def setup_terminal_backend(config: dict):
         "Modal - serverless cloud sandbox",
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
+        "Sprites - Omnio-managed paired toolbox",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "sprites"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "sprites": 5}
 
-    next_idx = 5
+    next_idx = 6
     if is_linux:
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
@@ -1451,6 +1452,10 @@ def setup_terminal_backend(config: dict):
             else:
                 print_warning(f"  SSH connection failed: {result.stderr.strip()}")
                 print_info("  Check your SSH key and host settings.")
+
+    elif selected_backend == "sprites":
+        print_success("Terminal backend: Sprites")
+        print_info("Omnio injects the paired toolbox settings when it starts Hermes.")
 
     # Sync terminal backend to .env so terminal_tool picks it up directly.
     # config.yaml is the source of truth, but terminal_tool reads TERMINAL_ENV.
