@@ -426,6 +426,40 @@ class TestInventory:
         assert source.automation_only is False
         assert source.subagent_only is False
 
+    def test_manual_visibility_uses_preview_when_full_read_times_out(self) -> None:
+        row = {
+            "id": "oversized-manual-thread",
+            "name": "Long-running manual rollout",
+            "preview": "Finish the reviewed native visibility rollout",
+            "path": "C:/codex/sessions/oversized-manual-thread.jsonl",
+            "cwd": "C:/work/session-bridge",
+            "createdAt": 100,
+            "updatedAt": 300,
+            "source": "vscode",
+            "gitInfo": {
+                "branch": "codex/session-bridge-ship",
+                "sha": "def456",
+            },
+        }
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [row]},
+                {"data": []},
+            ],
+            "thread/read": [TimeoutError("synthetic oversized thread")],
+        })
+
+        [source] = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(after=250)
+
+        assert source.source_session_id == "codex:oversized-manual-thread"
+        assert source.projection.native_path == row["path"]
+        assert [(message.role, message.content) for message in source.projection.messages] == [
+            ("user", "Finish the reviewed native visibility rollout")
+        ]
+        assert source.git_head == "def456"
+
     def test_claude_visibility_inventory_preserves_normal_automation_and_subagent_kinds(
         self,
     ) -> None:

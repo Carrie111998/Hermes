@@ -699,8 +699,6 @@ class CodexSourceAdapter:
                     summary, deadline=None
                 )
             except TimeoutError:
-                if not state_db_only:
-                    raise
                 projection = self._project_state_db_summary(summary)
                 reconciled = summary
             if reconciled.source_kind is None:
