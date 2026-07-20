@@ -1,0 +1,15 @@
+    business_operations:
+      allowed:
+      - agent_action_record
+      - agent_config_read
+      - ilinked_lookup
+      - ilinked_status
+      - ilinked_wc_lookup
+      - job_work_costings
+      - message_search
+      - tgg_attention_raise
+      - tgg_case_list
+      - tgg_case_lookup
+      - tgg_case_search
+      - work_costing_ingest_ilinked
+      - work_costing_lookup

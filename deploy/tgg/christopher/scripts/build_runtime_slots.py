@@ -10,6 +10,12 @@ baseline + the authored patch layer:
     patches/ops-judgment-operations.snippet.yaml
   - ops-ingest judgment rules + structured work_items extraction —
     patches/ops-ingest-judgment.snippet.yaml
+  - management-chat behavior (register, grounded answers, proactive attention
+    push, bounded reply-actions, refusals) —
+    patches/mgmt-chat-behavior.snippet.yaml
+  - management-chat business-operation scope (reads + attention only; every
+    ingest write refused by the runtime) —
+    patches/mgmt-business-operations.snippet.yaml
   - per-slot engine: model + optional agent.reasoning_effort
 
 Slots are keyed by slot id, not bare model name: gpt-5.6-luna-low runs
@@ -56,6 +62,42 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 12
+MGMT_NEW_INSTRUCTION_COUNT = 5
+
+# The management brief is the only brief with a `web` toolset, so this block is
+# unique to it in the baseline — the ingest brief disables web.
+MGMT_TOOLSETS_ANCHOR = (
+    "    enabled_toolsets:\n"
+    "    - memory\n"
+    "    - file\n"
+    "    - web\n"
+    "    - custom\n"
+    "    - pa-observability\n"
+    "    disabled_toolsets:\n"
+    "    - terminal\n"
+)
+
+# Both briefs carry a "Recording what happened (observability)" instruction; the
+# management one is distinguished by "This is part of finishing a turn".
+MGMT_OBSERVABILITY_ANCHOR = (
+    "    - 'Recording what happened (observability): at the end of each turn, use the record_event\n"
+    "      tool to record the meaningful things you did — one event per distinct action\n"
+    "      or decision. This is part of finishing a turn, not optional. Record an event\n"
+)
+
+# Management chats are read-plus-attention only. Every case-mutating operation is
+# absent from this list, which means the runtime drops it from the operation
+# registry for those chats entirely (agent/pa_constitution.py business_operations
+# -> tools/pa_business_tools.py _scope_operations_to_job_brief). Prose backs the
+# mechanism; the mechanism is the guarantee.
+MGMT_FORBIDDEN_OPERATIONS = (
+    "tgg_case_create",
+    "tgg_case_observation",
+    "tgg_case_update",
+    "tgg_case_wc_attach",
+    "tgg_clarification_raise",
+    "work_costing_upsert",
+)
 
 # Exact runtime registry for the PA business bridge. Constitution prose may
 # mention only these names after the word "operation"; aliases otherwise fail
@@ -211,6 +253,24 @@ def _constitution(source: str, slot: dict) -> str:
         EVENT_LABELS_NEW,
         label="ops-ingest event label list",
     )
+    mgmt_behavior_snippet = (PATCHES_ROOT / "mgmt-chat-behavior.snippet.yaml").read_text(
+        encoding="utf-8"
+    )
+    rendered = _replace_once(
+        rendered,
+        MGMT_OBSERVABILITY_ANCHOR,
+        mgmt_behavior_snippet + MGMT_OBSERVABILITY_ANCHOR,
+        label="management observability instruction",
+    )
+    mgmt_operations_snippet = (
+        PATCHES_ROOT / "mgmt-business-operations.snippet.yaml"
+    ).read_text(encoding="utf-8")
+    rendered = _replace_once(
+        rendered,
+        MGMT_TOOLSETS_ANCHOR,
+        MGMT_TOOLSETS_ANCHOR + mgmt_operations_snippet,
+        label="management toolsets block",
+    )
     # The June baseline names a cross-client operation that is not present in
     # Christopher's runtime registry (once in each job brief). Keep the existing
     # out-of-scope behavior, but remove the impossible tool call.
@@ -234,6 +294,7 @@ def _validate(
     slot: dict,
     *,
     baseline_instruction_count: int,
+    baseline_mgmt_instruction_count: int,
 ) -> None:
     model = slot["model"]
     effort = slot["reasoning_effort"]
@@ -337,6 +398,53 @@ def _validate(
     assert sum("has exactly one trigger" in item for item in create_mentions) == 1
     assert sum("exact closed vocabulary" in item for item in create_mentions) == 1
 
+    # ── Management chat: behavior section + business-operation scope ──────────
+    mgmt_brief = constitution["job_briefs"]["tgg_management"]
+    mgmt_instructions = mgmt_brief["instructions"]
+    assert (
+        len(mgmt_instructions)
+        == baseline_mgmt_instruction_count + MGMT_NEW_INSTRUCTION_COUNT
+    ), len(mgmt_instructions)
+    mgmt_joined = "\n".join(mgmt_instructions)
+    # Register + grounded answers.
+    assert "you are TGG's operations coordinator" in mgmt_joined
+    assert "carries that case's job number" in mgmt_joined
+    assert "Ground every answer in this turn's tool results" in mgmt_joined
+    assert "Re-query rather than recall" in mgmt_joined
+    assert "no case found for" in mgmt_joined
+    # Proactive push, batched one message per wave.
+    assert "Push attention items unprompted" in mgmt_joined
+    assert "one wave into ONE message" in mgmt_joined
+    assert "only thing you raise unprompted" in mgmt_joined
+    # Bounded reply-action experiment.
+    assert "annotate an attention item with a status note" in mgmt_joined
+    assert "promise-then-track a chase" in mgmt_joined
+    assert "may not create, close, or modify a case on chat instruction" in mgmt_joined
+    assert "attach evidence to a case" in mgmt_joined
+    assert "attention-note alternative" in mgmt_joined
+    # Refusals.
+    assert "Never relay site-group content wholesale" in mgmt_joined
+    assert "not a courtesy" in mgmt_joined
+
+    # The scope block is the mechanism the prose above describes. Reads plus the
+    # attention write only; every case-mutating operation must be absent, and
+    # every permitted name must be a real configured operation.
+    scope = mgmt_brief["business_operations"]
+    assert set(scope) == {"allowed"}, sorted(scope)
+    permitted = set(scope["allowed"])
+    assert permitted <= CANONICAL_OPERATIONS, sorted(permitted - CANONICAL_OPERATIONS)
+    assert permitted <= set(operations), sorted(permitted - set(operations))
+    for forbidden in MGMT_FORBIDDEN_OPERATIONS:
+        assert forbidden not in permitted, forbidden
+    # The reads the management brief's own instructions depend on.
+    for required in ("tgg_case_lookup", "tgg_case_search", "message_search"):
+        assert required in permitted, required
+    # The single permitted write, plus observability.
+    assert "tgg_attention_raise" in permitted
+    assert "agent_action_record" in permitted
+    # The ingest brief stays unscoped so its behavior is unchanged.
+    assert "business_operations" not in ingest_brief
+
 
 def main() -> int:
     baseline_config = (BASELINE_ROOT / "config.live-2026-06-19.yaml").read_text(
@@ -345,10 +453,10 @@ def main() -> int:
     baseline_constitution = (
         BASELINE_ROOT / "christopher_tgg_constitution.live-2026-06-19.yaml"
     ).read_text(encoding="utf-8")
-    baseline_instruction_count = len(
-        yaml.safe_load(baseline_constitution)["job_briefs"]["tgg_ops_ingest"][
-            "instructions"
-        ]
+    baseline_briefs = yaml.safe_load(baseline_constitution)["job_briefs"]
+    baseline_instruction_count = len(baseline_briefs["tgg_ops_ingest"]["instructions"])
+    baseline_mgmt_instruction_count = len(
+        baseline_briefs["tgg_management"]["instructions"]
     )
 
     slot_files: list[Path] = []
@@ -366,6 +474,7 @@ def main() -> int:
             constitution_path,
             slot,
             baseline_instruction_count=baseline_instruction_count,
+            baseline_mgmt_instruction_count=baseline_mgmt_instruction_count,
         )
         slot_files.extend((config_path, constitution_path))
 
