@@ -993,3 +993,354 @@ def test_prefetch_sends_contract_safe_memory_context_payload(monkeypatch):
     assert "target_uri" not in payload
 
 
+def test_prefetch_uses_session_search_when_session_id_available(monkeypatch):
+    provider = _make_prefetch_provider()
+
+    captured_calls = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            captured_calls.append((path, payload))
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": "viking://user/peers/hermes/memories/events/mem_1.md",
+                            "score": 0.9,
+                            "abstract": "session-aware memory",
+                        },
+                    ],
+                    "resources": [],
+                    "skills": [],
+                }
+            }
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+
+    result = provider.prefetch("anything", session_id="sid-123")
+
+    assert captured_calls == [
+        (
+            "/api/v1/search/search",
+            {
+                "query": "anything",
+                "limit": 24,
+                "score_threshold": 0,
+                "context_type": "memory",
+                "session_id": "sid-123",
+            },
+        )
+    ]
+    payload = captured_calls[0][1]
+    assert "top_k" not in payload
+    assert "mode" not in payload
+    assert "target_uri" not in payload
+    assert "session-aware memory" in result
+
+
+def test_prefetch_falls_back_to_find_when_session_search_fails(monkeypatch):
+    provider = _make_prefetch_provider()
+
+    captured_calls = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            captured_calls.append((path, payload))
+            if path == "/api/v1/search/search":
+                raise RuntimeError("session unavailable")
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": "viking://user/peers/hermes/memories/events/mem_2.md",
+                            "score": 0.8,
+                            "abstract": "non-session fallback",
+                        },
+                    ],
+                    "resources": [],
+                    "skills": [],
+                }
+            }
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+
+    result = provider.prefetch("anything", session_id="sid-123")
+
+    assert captured_calls == [
+        (
+            "/api/v1/search/search",
+            {
+                "query": "anything",
+                "limit": 24,
+                "score_threshold": 0,
+                "context_type": "memory",
+                "session_id": "sid-123",
+            },
+        ),
+        (
+            "/api/v1/search/find",
+            {
+                "query": "anything",
+                "limit": 24,
+                "score_threshold": 0,
+                "context_type": "memory",
+            },
+        ),
+    ]
+    for _path, payload in captured_calls:
+        assert "top_k" not in payload
+        assert "mode" not in payload
+        assert "target_uri" not in payload
+    assert "non-session fallback" in result
+
+
+def test_prefetch_budget_exhaustion_skips_find_fallback_log(caplog):
+    class StubClient:
+        def post(self, path, payload=None, **kwargs):
+            raise AssertionError("local budget exhaustion should not issue HTTP calls")
+
+    with caplog.at_level("DEBUG", logger=openviking_module.__name__):
+        with pytest.raises(TimeoutError):
+            OpenVikingMemoryProvider._post_prefetch_search(
+                StubClient(),
+                "anything",
+                "sid-123",
+                limit=24,
+                context_type="memory",
+                deadline=time.monotonic() - 1.0,
+                request_timeout=4.0,
+            )
+
+    assert "falling back to search/find" not in caplog.text
+
+
+def test_prefetch_reads_l2_content_and_ignores_skills_by_default(monkeypatch):
+    provider = _make_prefetch_provider()
+
+    captured_reads = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": "viking://user/peers/hermes/memories/events/mem_3.md",
+                            "score": 0.9,
+                            "level": 2,
+                            "category": "events",
+                            "abstract": "short abstract",
+                        },
+                    ],
+                    "resources": [],
+                    "skills": [
+                        {
+                            "uri": "viking://user/skills/release-triage",
+                            "score": 0.7,
+                            "abstract": "skill context",
+                        },
+                    ],
+                }
+            }
+
+        def get(self, path, params=None, **kwargs):
+            captured_reads.append((path, params or {}))
+            return {"result": {"content": "full memory content\nwith useful context"}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+
+    context = provider.prefetch("anything")
+
+    assert captured_reads == [
+        (
+            "/api/v1/content/read",
+            {"uri": "viking://user/peers/hermes/memories/events/mem_3.md"},
+        )
+    ]
+    assert "full memory content" in context
+    assert "short abstract" not in context
+    assert "skill context" not in context
+
+
+def test_prefetch_reads_empty_abstract_content_within_budget(monkeypatch):
+    provider = _make_prefetch_provider()
+
+    captured_reads = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": "viking://user/peers/hermes/memories/one.md",
+                            "score": 0.9,
+                            "abstract": "",
+                        },
+                    ],
+                    "resources": [],
+                    "skills": [],
+                }
+            }
+
+        def get(self, path, params=None, **kwargs):
+            captured_reads.append((path, params or {}))
+            uri = (params or {}).get("uri", "")
+            return {"result": f"content for {uri}"}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+
+    context = provider.prefetch("anything")
+
+    assert [params["uri"] for _path, params in captured_reads] == [
+        "viking://user/peers/hermes/memories/one.md",
+    ]
+    assert (
+        "content for viking://user/peers/hermes/memories/one.md"
+        in context
+    )
+
+
+def test_prefetch_caps_full_content_reads(monkeypatch):
+    provider = _make_prefetch_provider()
+
+    captured_reads = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": f"viking://user/peers/hermes/memories/events/mem_{idx}.md",
+                            "score": 0.9 - (idx * 0.01),
+                            "level": 2,
+                            "category": "events",
+                            "abstract": f"short abstract {idx}",
+                        }
+                        for idx in range(6)
+                    ],
+                    "resources": [],
+                    "skills": [],
+                }
+            }
+
+        def get(self, path, params=None, **kwargs):
+            captured_reads.append((path, params or {}))
+            uri = (params or {}).get("uri", "")
+            return {"result": {"content": f"full content for {uri}"}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+
+    context = provider.prefetch("anything")
+
+    assert len(captured_reads) == 2
+    assert "full content for viking://user/peers/hermes/memories/events/mem_0.md" in context
+    assert "full content for viking://user/peers/hermes/memories/events/mem_1.md" in context
+    assert "short abstract 2" in context
+
+
+def test_prefetch_uses_bounded_http_timeouts(monkeypatch):
+    provider = _make_prefetch_provider()
+
+    captured_post_kwargs = []
+    captured_get_kwargs = []
+
+    class StubClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def post(self, path, payload=None, **kwargs):
+            captured_post_kwargs.append(kwargs)
+            return {
+                "result": {
+                    "memories": [
+                        {
+                            "uri": "viking://user/peers/hermes/memories/events/mem_timeout.md",
+                            "score": 0.9,
+                            "level": 2,
+                            "category": "events",
+                            "abstract": "short abstract",
+                        },
+                    ],
+                    "resources": [],
+                    "skills": [],
+                }
+            }
+
+        def get(self, path, params=None, **kwargs):
+            captured_get_kwargs.append(kwargs)
+            return {"result": {"content": "full memory content"}}
+
+    monkeypatch.setattr(openviking_module, "_VikingClient", StubClient)
+
+    provider.prefetch("anything", session_id="sid-123")
+
+    assert 0 < captured_post_kwargs[0]["timeout"] < openviking_module._TIMEOUT
+    assert 0 < captured_get_kwargs[0]["timeout"] < openviking_module._TIMEOUT
+
+
+def test_resolve_connection_settings_reads_config_yaml_non_secret_fields(monkeypatch):
+    """#68209: non-secret fields saved to config.yaml feed the resolution chain."""
+    _clear_openviking_env(monkeypatch)
+    provider_config = {
+        "endpoint": "http://saved.local:1933",
+        "account": "cfg-account",
+        "user": "cfg-user",
+        "agent": "cfg-agent",
+    }
+
+    settings = openviking_module._resolve_connection_settings(provider_config)
+
+    assert settings["endpoint"] == "http://saved.local:1933"
+    assert settings["account"] == "cfg-account"
+    assert settings["user"] == "cfg-user"
+    assert settings["agent"] == "cfg-agent"
+
+
+def test_env_overrides_config_yaml_non_secret_fields(monkeypatch):
+    """env still wins over config.yaml (env -> ovcli -> config.yaml -> default)."""
+    _clear_openviking_env(monkeypatch)
+    monkeypatch.setenv("OPENVIKING_ENDPOINT", "http://env.local")
+    monkeypatch.setenv("OPENVIKING_AGENT", "env-agent")
+
+    settings = openviking_module._resolve_connection_settings(
+        {"endpoint": "http://saved.local", "agent": "cfg-agent"}
+    )
+
+    assert settings["endpoint"] == "http://env.local"
+    assert settings["agent"] == "env-agent"
+
+
+def test_is_available_true_for_config_yaml_endpoint(monkeypatch):
+    """#68209: a config.yaml endpoint (no env, no ovcli) counts as available."""
+    _clear_openviking_env(monkeypatch)
+    monkeypatch.setattr(
+        openviking_module,
+        "_load_hermes_openviking_config",
+        lambda: {"endpoint": "http://saved.local:1933"},
+    )
+    assert OpenVikingMemoryProvider().is_available() is True
+
+
+def test_is_available_false_without_any_endpoint(monkeypatch):
+    _clear_openviking_env(monkeypatch)
+    monkeypatch.setattr(
+        openviking_module, "_load_hermes_openviking_config", lambda: {}
+    )
+    assert OpenVikingMemoryProvider().is_available() is False
