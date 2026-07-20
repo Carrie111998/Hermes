@@ -1621,6 +1621,13 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED"] = str(
                     _display_cfg["busy_queue_ack_enabled"]
                 )
+            if (
+                "busy_main_ack_enabled" in _display_cfg
+                and "HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED" not in os.environ
+            ):
+                os.environ["HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED"] = str(
+                    _display_cfg["busy_main_ack_enabled"]
+                )
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str):
@@ -5278,6 +5285,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    @staticmethod
+    def _msg_preview_for_ack(event: "MessageEvent", max_chars: int = 25) -> str:
+        """Short quoted preview of the inbound text used in busy/queue ACKs.
+
+        Collapses newlines and truncates at ``max_chars`` chars (rendering an
+        ellipsis when clipped). Falls back to a media-shaped placeholder when
+        the message has no text (voice / photo / doc).
+        """
+        text = (getattr(event, "text", "") or "").strip()
+        if not text:
+            mtype = getattr(event, "message_type", None)
+            label = getattr(mtype, "name", str(mtype)) if mtype is not None else "media"
+            return f"[{label.lower()}]"
+        cleaned = " ".join(text.split())
+        if len(cleaned) > max_chars:
+            cleaned = cleaned[: max_chars].rstrip() + "..."
+        return f'"{cleaned}"'
+
+    async def _maybe_send_main_turn_ack(
+        self, event: "MessageEvent", session_key: str
+    ) -> None:
+        """Send a receipt when an inbound starts the main turn (session was idle).
+
+        Mirrors ``_maybe_send_queue_ack`` — same master ACK gate, same 30s
+        ``_busy_ack_ts`` debounce, same failure semantics — but uses distinct
+        wording (⏳ processing) since the message will be answered directly
+        rather than queued. A separate per-mode toggle
+        ``busy_main_ack_enabled`` / ``HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED``
+        lets platforms opt out (default true).
+
+        Skipped for internal events (background-process completions,
+        goal-continuations, etc.) since those are system-driven and would
+        surprise users.
+        """
+        try:
+            if getattr(event, "internal", False):
+                return
+
+            busy_ack_enabled = os.environ.get(
+                "HERMES_GATEWAY_BUSY_ACK_ENABLED", "true"
+            ).strip().lower() == "true"
+            if not busy_ack_enabled:
+                return
+
+            now = time.time()
+            _BUSY_ACK_COOLDOWN = 30
+            last_ack = self._busy_ack_ts.get(session_key, 0)
+            if now - last_ack < _BUSY_ACK_COOLDOWN:
+                return
+
+            from gateway.display_config import resolve_display_setting
+
+            platform_key = _platform_config_key(event.source.platform)
+            main_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED")
+            if main_ack_env is not None:
+                main_ack_enabled = main_ack_env.strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            else:
+                main_ack_enabled = bool(
+                    resolve_display_setting(
+                        _load_gateway_config(),
+                        platform_key,
+                        "busy_main_ack_enabled",
+                        True,
+                    )
+                )
+            if not main_ack_enabled:
+                logger.debug("Main-turn ack suppressed for session %s", session_key)
+                return
+
+            adapter = self._adapter_for_source(event.source)
+            if not adapter:
+                return
+
+            preview = self._msg_preview_for_ack(event)
+            content = f"⏳ 处理中: {preview} (Working)"
+            reply_anchor = self._reply_anchor_for_event(event)
+            self._busy_ack_ts[session_key] = now
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=content,
+                reply_to=reply_anchor,
+                metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+            )
+        except Exception:
+            logger.debug(
+                "Main-turn ack send failed (non-fatal) for session %s",
+                session_key,
+                exc_info=True,
+            )
+
     async def _maybe_send_queue_ack(
         self, event: "MessageEvent", session_key: str
     ) -> None:
@@ -5343,10 +5442,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 position = None
 
+            preview = self._msg_preview_for_ack(event)
             if position is not None:
-                content = f"📥 Queued #{position} (排队中)"
+                content = f"📥 排队 #{position}: {preview} (Queued)"
             else:
-                content = "📥 Queued (排队中)"
+                content = f"📥 排队: {preview} (Queued)"
 
             reply_anchor = self._reply_anchor_for_event(event)
             self._busy_ack_ts[session_key] = now
@@ -10375,6 +10475,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents_ts[_quick_key] = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+
+        # Main-turn ACK — mirrors busy-queue ACK behaviour but with
+        # "处理中" wording. Same 30s debounce prevents rapid
+        # send/reply/send churn from spamming the user with receipts.
+        try:
+            await self._maybe_send_main_turn_ack(event, _quick_key)
+        except Exception:
+            logger.debug("Main-turn ack invocation failed (non-fatal)", exc_info=True)
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
