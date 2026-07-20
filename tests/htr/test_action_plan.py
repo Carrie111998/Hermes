@@ -76,6 +76,13 @@ def _capture_run_tree(run_root: Path) -> dict[str, str]:
     return digest
 
 
+def _append_task_event_fixture(run_id: str, event: dict, base_dir: Path) -> None:
+    """Test-only corrupt/legacy fixture: bypass guarded public append API."""
+    from htr.io import append_jsonl
+
+    append_jsonl(paths.task_events_path(run_id, base_dir), event)
+
+
 def _plan_read_only(run_id: str, base_dir: Path, intent: PlanningIntent) -> dict:
     run_root = _run_root(run_id, base_dir)
     before = _capture_run_tree(run_root)
@@ -395,7 +402,7 @@ def test_finalized_post_closure_recovery_classification(tmp_path):
         payload={},
     )
     post_event["created_at"] = "2099-01-01T00:00:00+00:00"
-    events.append_task_event(run_id, post_event, base_dir=tmp_path)
+    _append_task_event_fixture(run_id, post_event, tmp_path)
     plan = _plan_read_only(
         run_id,
         tmp_path,
@@ -421,7 +428,7 @@ def test_finalized_post_closure_without_remediation_intent_blocked(tmp_path):
         payload={},
     )
     post_event["created_at"] = "2099-01-01T00:00:00+00:00"
-    events.append_task_event(run_id, post_event, base_dir=tmp_path)
+    _append_task_event_fixture(run_id, post_event, tmp_path)
     plan = _plan_read_only(
         run_id,
         tmp_path,
@@ -457,7 +464,7 @@ def test_warning_only_does_not_block_planning(tmp_path):
         payload={},
     )
     post_event["created_at"] = "2099-01-01T00:00:00+00:00"
-    events.append_task_event(run_id, post_event, base_dir=tmp_path)
+    _append_task_event_fixture(run_id, post_event, tmp_path)
     plan = _plan_read_only(run_id, tmp_path, PlanningIntent())
     assert plan["plan_state"] == STATE_INPUTS_REQUIRED
     assert FINDING_POST_CLOSURE_ACTIVITY in plan["integrity_summary"]["warning_codes"]
@@ -991,7 +998,7 @@ def test_runtime_no_write_recovery_classification(tmp_path):
         payload={},
     )
     post_event["created_at"] = "2099-01-01T00:00:00+00:00"
-    events.append_task_event(run_id, post_event, base_dir=tmp_path)
+    _append_task_event_fixture(run_id, post_event, tmp_path)
     _plan_read_only(
         run_id,
         tmp_path,

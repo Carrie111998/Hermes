@@ -85,6 +85,9 @@ def write_artifact_manifest(
     base_dir: Path | None = None,
 ) -> Path:
     """Atomically write *manifest* to the attempt workspace."""
+    from htr.finalization import assert_run_mutation_allowed
+
+    assert_run_mutation_allowed(run_id, base_dir)
     normalized = _normalize_manifest(
         manifest,
         run_id=run_id,
@@ -120,6 +123,9 @@ def add_artifact(
     base_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Append an artifact entry to the manifest when not already present."""
+    from htr.finalization import assert_run_mutation_allowed
+
+    assert_run_mutation_allowed(run_id, base_dir)
     if metadata is None:
         metadata = {}
     if not isinstance(metadata, dict):

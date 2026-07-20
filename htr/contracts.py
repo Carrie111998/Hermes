@@ -64,6 +64,9 @@ def write_task_card(
     base_dir: Path | None = None,
 ) -> Path:
     """Atomically write *task_card* to the task workspace."""
+    from htr.finalization import assert_run_mutation_allowed
+
+    assert_run_mutation_allowed(run_id, base_dir)
     validate_schema(task_card, "task_card")
     if task_card["run_id"] != run_id or task_card["task_id"] != task_id:
         raise ValueError("task_card run_id/task_id do not match write target")

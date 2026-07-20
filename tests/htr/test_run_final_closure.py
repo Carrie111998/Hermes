@@ -15,6 +15,8 @@ from htr.state import (
     TASK_RUNNING,
     EventConflict,
     InvalidTransition,
+    RunFinalizedError,
+    RunSealBlockedError,
 )
 
 
@@ -3244,7 +3246,7 @@ def test_write_order_record_before_event(tmp_path):
         run_id, completion, review, plan, request, result, verification, pvfp, pver, pve_result, pve_verification
     )
     ops = []
-    real_append = events.append_run_event
+    real_append = events._append_run_event_internal
 
     def track_write(path, data):
         if str(path).endswith("run_final_closure_record.json"):
@@ -3256,7 +3258,7 @@ def test_write_order_record_before_event(tmp_path):
         return real_append(r, e, base_dir)
 
     with patch("htr.events.atomic_write_json", side_effect=track_write), patch(
-        "htr.events.append_run_event", side_effect=track_append
+        "htr.events._append_run_event_internal", side_effect=track_append
     ):
         events.record_run_final_closure(
             tmp_path, run_id, record, actor="human"
@@ -3278,7 +3280,7 @@ def test_existing_run_final_closure_event_id_none_raises(tmp_path):
         tmp_path, run_id, record, actor="human", event_id=new_event_id()
     )
     before = _snapshot(tmp_path, run_id, task_ids, attempt_ids)
-    with pytest.raises(InvalidTransition):
+    with pytest.raises(RunFinalizedError):
         events.record_run_final_closure(
             tmp_path, run_id, record, actor="human"
         )
@@ -3299,7 +3301,7 @@ def test_existing_run_final_closure_missing_event_raises(tmp_path):
         record,
     )
     before = _snapshot(tmp_path, run_id, task_ids, attempt_ids)
-    with pytest.raises(InvalidTransition):
+    with pytest.raises(RunSealBlockedError):
         events.record_run_final_closure(
             tmp_path, run_id, record, actor="human", event_id=new_event_id()
         )
@@ -3309,7 +3311,7 @@ def test_existing_run_final_closure_missing_event_raises(tmp_path):
 @pytest.mark.parametrize(
     "mutator,expected",
     [
-        (lambda e: {**e, "event_type": "task_status_changed"}, InvalidTransition),
+        (lambda e: {**e, "event_type": "task_status_changed"}, RunFinalizedError),
         (lambda e: {**e, "run_id": new_run_id()}, EventConflict),
         (lambda e: {**e, "actor": "other"}, EventConflict),
         (
@@ -3529,10 +3531,7 @@ def test_idempotent_replay_fails_when_event_exists_but_json_missing(tmp_path):
     assert closure_path.exists()
     closure_path.unlink()
     assert not closure_path.exists()
-    with pytest.raises(
-        InvalidTransition,
-        match="run_final_closure_record.json missing while matching audit event exists",
-    ):
+    with pytest.raises(RunSealBlockedError):
         events.record_run_final_closure(
             tmp_path, run_id, record, actor="human", event_id=event_id
         )

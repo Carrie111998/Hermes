@@ -174,6 +174,9 @@ def create_run_workspace(run_id: str, base_dir: Path | None = None) -> Path:
     Idempotent: existing ``run_manifest.json`` and JSONL files are never
     overwritten or truncated. Repeated calls only ensure directories exist.
     """
+    from htr.finalization import assert_run_mutation_allowed
+
+    assert_run_mutation_allowed(run_id, base_dir)
     root = paths.run_root(run_id, base_dir)
     ensure_dir(root)
     ensure_dir(paths.reports_dir(run_id, base_dir))
@@ -207,6 +210,9 @@ def create_task_workspace(
     Reserved path (not created here):
     - ``task_card.yaml`` — created by Task Card schema / task lifecycle (Task 2+).
     """
+    from htr.finalization import assert_run_mutation_allowed
+
+    assert_run_mutation_allowed(run_id, base_dir)
     manifest_path = paths.run_manifest_path(run_id, base_dir)
     if not manifest_path.exists():
         create_run_workspace(run_id, base_dir)
@@ -243,6 +249,9 @@ def create_attempt_workspace(
     - ``output/result.json`` — written by attempt execution, not bootstrap.
     - ``task_card.yaml`` — see :func:`create_task_workspace`.
     """
+    from htr.finalization import assert_run_mutation_allowed
+
+    assert_run_mutation_allowed(run_id, base_dir)
     task_status_path = paths.task_status_path(run_id, task_id, base_dir)
     if not task_status_path.exists():
         create_task_workspace(run_id, task_id, base_dir)

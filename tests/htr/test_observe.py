@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from htr import contracts, events
+from htr import contracts, events, io, paths
 from htr.observe import (
     EXIT_INTEGRITY,
     EXIT_INVOCATION,
@@ -313,7 +313,7 @@ def test_final_closure_semantics_and_post_closure_advisory(tmp_path):
         payload={},
     )
     post_event["created_at"] = "2099-01-01T00:00:00+00:00"
-    events.append_task_event(run_id, post_event, base_dir=tmp_path)
+    io.append_jsonl(paths.task_events_path(run_id, tmp_path), post_event)
     snapshot = build_run_snapshot(run_id, base_dir=tmp_path, observed_at="fixed")
     assert snapshot["phase1_chain"]["terminal_reached"] is True
     assert snapshot["policy_hints"]["global_hard_lock_enforced"] is False

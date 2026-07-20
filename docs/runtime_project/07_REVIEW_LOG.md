@@ -4,12 +4,12 @@
 
 ## 2026-07-18 — Task 3: Task Card + Result Contract + Artifact Manifest
 
-**Implementer:** Cursor  
-**Scope:** `htr/contracts.py`, `htr/artifacts.py`, `htr/schemas.py`, `htr/events.py`, `htr/__init__.py`, tests, docs  
-**Production Runtime modified:** No  
-**DECO / HEAL integrated:** No  
-**Verification pipeline:** No  
-**delegate_task modified:** No  
+**Implementer:** Cursor
+**Scope:** `htr/contracts.py`, `htr/artifacts.py`, `htr/schemas.py`, `htr/events.py`, `htr/__init__.py`, tests, docs
+**Production Runtime modified:** No
+**DECO / HEAL integrated:** No
+**Verification pipeline:** No
+**delegate_task modified:** No
 **SQLite introduced:** No
 
 ### Changes
@@ -71,11 +71,11 @@ python3 -m pytest tests/htr/ -v
 
 ## 2026-07-18 — Task 2.1: State/Event API Idempotency Ordering Fix
 
-**Implementer:** Cursor  
-**Scope:** `htr/events.py`, `tests/htr/test_events.py`, docs  
-**Production Runtime modified:** No  
-**DECO / HEAL:** No  
-**delegate_task modified:** No  
+**Implementer:** Cursor
+**Scope:** `htr/events.py`, `tests/htr/test_events.py`, docs
+**Production Runtime modified:** No
+**DECO / HEAL:** No
+**delegate_task modified:** No
 **SQLite:** No
 
 ### Problem
@@ -122,13 +122,13 @@ python3 -m pytest tests/htr/ -v
 
 ## 2026-07-18 — Task 2: Task/Attempt State Machine + Event Log API
 
-**Implementer:** Cursor  
-**Scope:** `htr/state.py`, `htr/events.py`, `htr/schemas.py`, `htr/__init__.py`, `tests/htr/test_state.py`, `tests/htr/test_events.py`, docs  
-**Production Runtime modified:** No  
-**DECO / HEAL integrated:** No  
-**delegate_task modified:** No  
-**SQLite introduced:** No  
-**Verification pipeline:** No (transitions only)  
+**Implementer:** Cursor
+**Scope:** `htr/state.py`, `htr/events.py`, `htr/schemas.py`, `htr/__init__.py`, `tests/htr/test_state.py`, `tests/htr/test_events.py`, docs
+**Production Runtime modified:** No
+**DECO / HEAL integrated:** No
+**delegate_task modified:** No
+**SQLite introduced:** No
+**Verification pipeline:** No (transitions only)
 **Runtime controller:** No
 
 ### Changes
@@ -189,10 +189,10 @@ python3 -m pytest tests/htr/ -v
 
 ## 2026-07-18 — Task 1.1: HTR Core Foundation Hardening
 
-**Implementer:** Cursor  
-**Scope:** `htr/io.py`, `tests/htr/test_io.py`, docs only  
-**Production Runtime modified:** No  
-**DECO / HEAL integrated:** No  
+**Implementer:** Cursor
+**Scope:** `htr/io.py`, `tests/htr/test_io.py`, docs only
+**Production Runtime modified:** No
+**DECO / HEAL integrated:** No
 **State machine implemented:** No
 
 ### Changes
@@ -239,7 +239,7 @@ python3 -m pytest tests/htr/ -v
 
 ## 2026-07-18 — Owner correction: external component locations (post Task 0)
 
-**Source:** Owner  
+**Source:** Owner
 **Scope:** Documentation alignment only
 
 ### Corrected paths
@@ -265,9 +265,9 @@ Updated: `02_ARCHITECTURE_DECISIONS.md`, `08_CONTEXT_SUMMARY.md`
 
 ## 2026-07-18 — Task 1: HTR Core Foundation
 
-**Implementer:** Cursor  
-**Scope:** New `htr/` + `tests/htr/` only  
-**Production Runtime modified:** No  
+**Implementer:** Cursor
+**Scope:** New `htr/` + `tests/htr/` only
+**Production Runtime modified:** No
 **Risk:** Low
 
 ### Files added
@@ -317,9 +317,9 @@ python3 -m pytest tests/htr/ -v
 
 ## 2026-07-18 — Task 0: Baseline landing + repository reconnaissance
 
-**Implementer:** Cursor  
-**Scope:** Documentation only (`docs/runtime_project/*`)  
-**Production Runtime modified:** No  
+**Implementer:** Cursor
+**Scope:** Documentation only (`docs/runtime_project/*`)
+**Production Runtime modified:** No
 **Tests run:** None (docs-only task; test entry confirmed but not executed)
 
 ### Deliverables
@@ -527,8 +527,8 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 
 ## Task 4 — Manual Verification Record API (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 161 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -556,8 +556,8 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 
 ## Task 5 — Manual Task Completion API (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 194 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -580,8 +580,8 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 
 ## Task 6 — Manual Run Completion API (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 228 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -607,8 +607,8 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 
 ## Task 7 — Manual Run Review API (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 265 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -633,8 +633,8 @@ Task 0 completed within constraints. Recon based on read-only inspection of WSL 
 
 ## Task 8 — Review-Gated Follow-up Planning API (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 331 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -665,8 +665,8 @@ Do not automate execution, scheduling, delegation, or lifecycle mutation.
 
 ## Task 9 — Review-Gated Execution Request API (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** full HTR suite (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -698,8 +698,8 @@ Execution requests prepare controlled automation; they do not execute work.
 
 ## Task 10 — Controlled One-Shot Execution Adapter (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 488 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -732,8 +732,8 @@ Execution requests prepare controlled automation; they do not execute work.
 
 ## Task 11 — Manual Verification Gate for Execution Results (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — awaiting Architect acceptance  
+**Implementer:** Cursor
+**Status:** ✅ Complete — awaiting Architect acceptance
 **Tests:** 559 passed (`python3 -m pytest tests/htr/ -v`)
 
 ### Delivered
@@ -764,8 +764,8 @@ Records reviewer decision as source-of-truth JSON; event log is audit-only.
 
 ## Task 12 — Verification-Driven Follow-up Planning (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed `16d81a65f`)  
+**Implementer:** Cursor
+**Status:** ✅ Accepted (checkpointed `16d81a65f`)
 **Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`)
 
 ### Delivered
@@ -793,8 +793,8 @@ No artifact/result/verification_result inspection; no automatic execution.
 
 ## Task 13 — Manual Post-Verification Execution Request Planning (2026-07-18)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted — checkpointed  
+**Implementer:** Cursor
+**Status:** ✅ Accepted — checkpointed
 **Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **768 passed**
 
 ### Delivered
@@ -824,8 +824,8 @@ No artifact/result/verification_result inspection; no automatic execution.
 
 ## Task 14 — Manual Post-Verification Execution Result Recording (2026-07-19)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed `ea8dbda40`)  
+**Implementer:** Cursor
+**Status:** ✅ Accepted (checkpointed `ea8dbda40`)
 **Tests:** full HTR suite — **913 passed** at checkpoint
 
 ### Delivered
@@ -855,8 +855,8 @@ No artifact/result/verification_result/docs inspection; no automatic execution o
 
 ## Task 15 — Manual Post-Verification Execution Verification Recording (2026-07-19)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed `5011ad44c`)  
+**Implementer:** Cursor
+**Status:** ✅ Accepted (checkpointed `5011ad44c`)
 **Tests:** full HTR suite — **1078 passed** at Task 16 pre-checkpoint baseline
 
 ### Delivered
@@ -887,8 +887,8 @@ No artifact/result/verification_result/docs/test-output inspection; no automatic
 
 ## Task 16 — Run Final Closure Record (2026-07-19)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed `1650b9e73`)  
+**Implementer:** Cursor
+**Status:** ✅ Accepted (checkpointed `1650b9e73`)
 **Tests:** full HTR suite — **1250 passed** at Task 17 pre-checkpoint baseline
 
 ### Delivered
@@ -920,8 +920,8 @@ No artifact/result/verification_result/docs/test-output inspection; no automatic
 
 ## Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze (2026-07-19)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed `939e8b606`)  
+**Implementer:** Cursor
+**Status:** ✅ Accepted (checkpointed `939e8b606`)
 **Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **1271 passed** at checkpoint
 
 ### Delivered
@@ -948,9 +948,9 @@ Task 17 locks the 11-record Phase 1 manual source-of-truth chain and adds regres
 
 ## Task 17.1 — Clarify Phase 1 Terminal Semantics and Guard Idempotent SoT (2026-07-19)
 
-**Implementer:** Cursor  
-**Status:** ✅ Accepted (checkpointed `8fea4daa0`)  
-**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **1273 passed**  
+**Implementer:** Cursor
+**Status:** ✅ Accepted (checkpointed `8fea4daa0`)
+**Tests:** full HTR suite (`uv run --extra dev pytest tests/htr/ -v`) — **1273 passed**
 **Builds on:** Task 17 checkpoint `939e8b606` (Phase 1 final verification **1271 passed**)
 
 ### Delivered
@@ -976,9 +976,9 @@ Phase 1 freezes the 11-record chain semantics without expanding automation or ad
 
 ## Task 18 — Phase 2 Runtime Boundary Planning (2026-07-19)
 
-**Implementer:** Cursor  
-**Status:** ✅ Complete — planning only (awaiting Architect acceptance — not checkpointed)  
-**Tests:** n/a (docs only)  
+**Implementer:** Cursor
+**Status:** ✅ Complete — planning only (awaiting Architect acceptance — not checkpointed)
+**Tests:** n/a (docs only)
 **Depends on:** Phase 1 closed at Task 17.1 `8fea4daa0`
 
 ### Delivered
@@ -1009,9 +1009,9 @@ Phase 1 freezes the 11-record chain semantics without expanding automation or ad
 
 ## Task 18.5 — Reconcile Phase 1 Tracked Baseline (2026-07-20)
 
-**Implementer:** Cursor  
-**Status:** ✅ Baseline reconciliation checkpoint (additive; parent `f7e291ff7`)  
-**Tests (candidate Git-only workspace before staging):** import smoke (`htr`, `htr.contracts`, `htr.events`, `htr.artifacts`) OK; foundation tests **143 passed**; Phase 1 workflow tests **1078 passed**; full candidate `tests/htr/` **1221 passed** (20 files)  
+**Implementer:** Cursor
+**Status:** ✅ Baseline reconciliation checkpoint (additive; parent `f7e291ff7`)
+**Tests (candidate Git-only workspace before staging):** import smoke (`htr`, `htr.contracts`, `htr.events`, `htr.artifacts`) OK; foundation tests **143 passed**; Phase 1 workflow tests **1078 passed**; full candidate `tests/htr/` **1221 passed** (20 files)
 **Builds on:** Task 18 checkpoint `f7e291ff7`
 
 ### Problem
@@ -1047,9 +1047,9 @@ Baseline reconciliation only — restore Git-only reproducibility for the existi
 
 ## Task 19 — Read-Only Runtime Observability (2026-07-20)
 
-**Implementer:** Cursor  
-**Status:** ✅ Checkpointed (first Phase 2 **implementation**; builds on Task 18.5 `04b11bc4d`)  
-**Tests (candidate Git-only workspace before staging):** import smoke OK; focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)  
+**Implementer:** Cursor
+**Status:** ✅ Checkpointed (first Phase 2 **implementation**; builds on Task 18.5 `04b11bc4d`)
+**Tests (candidate Git-only workspace before staging):** import smoke OK; focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)
 **Depends on:** Task 18.5 `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e`
 
 ### Delivered
@@ -1075,9 +1075,9 @@ Strictly read-only observability foundation for later reliable automation — **
 
 ## Task 20 — Immutable Finalization and Safe Automation Control Boundary (2026-07-20)
 
-**Implementer:** Cursor  
-**Status:** ✅ Architecture checkpoint (docs only; Policy C accepted; parent Task 19 `57a1ed651`)  
-**Tests:** n/a (documentation only)  
+**Implementer:** Cursor
+**Status:** ✅ Architecture checkpoint (docs only; Policy C accepted; parent Task 19 `57a1ed651`)
+**Tests:** n/a (documentation only)
 **Depends on:** Task 19 `57a1ed651d622b3af82939d970b9c7f235ea1764`
 
 ### Policy C accepted
@@ -1110,9 +1110,9 @@ Task 17.1 accurately documented implemented behavior (chain-terminal, no global 
 
 ## Task 21 — Derived Action Plan Generation (2026-07-20)
 
-**Implementer:** Cursor  
-**Status:** ✅ Checkpointed (second Phase 2 **implementation**; parent Task 20 `2fa580b5`)  
-**Tests (candidate Git-only workspace):** focused Task 21 **60 passed**; full tracked `tests/htr/` **1304 passed** (23 files)  
+**Implementer:** Cursor
+**Status:** ✅ Checkpointed (second Phase 2 **implementation**; parent Task 20 `2fa580b5`)
+**Tests (candidate Git-only workspace):** focused Task 21 **60 passed**; full tracked `tests/htr/` **1304 passed** (23 files)
 **Depends on:** Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`
 
 ### Delivered
@@ -1143,3 +1143,36 @@ Committed Phase 1 `project_dir` = HTR **runs-storage root** (identical path role
 - No new lifecycle schemas/records/events; no edits to `htr/events.py`, `htr/schemas.py`, `htr/observe.py`
 
 **Next implementation:** Task 22 — Immutable finalized-run enforcement.
+
+---
+
+## Task 22 — Immutable Finalized-Run Enforcement (2026-07-20)
+
+**Implementer:** Cursor
+**Status:** ✅ Checkpointed (third Phase 2 **implementation**; parent Task 21 `798bc1ea`)
+**Tests (candidate Git-only workspace):** focused Task 22 **56 passed**; finalization + Task 19/21 **135 passed**; full tracked `tests/htr/` **1360 passed** (24 files)
+**Depends on:** Task 21 `798bc1ea98b6af8904c9750102c7bfe3917cdfe0`
+
+### Delivered
+
+- `htr/finalization.py` — seal states, read-only closure evaluation, `assert_run_mutation_allowed()`, event/record matcher
+- `htr/state.py` — `RunFinalizedError` (`RUN_FINALIZED`), `RunSealBlockedError` (`RUN_SEAL_BLOCKED`)
+- Guards on 25 public/run-aware mutation APIs: workspace (3), task/attempt (7), artifacts (2), events (2), run-chain (11)
+- First valid closure: JSON before event via private `_append_run_event_internal` (single production call site: `record_run_final_closure`)
+- Public `append_run_event` rejects `run_final_closure_recorded`; exact closure replay is sole read-only replay exception
+- `tests/htr/test_finalization.py` — individual runtime matrix for all mutators; untrusted-state matrix; guard-order proofs
+
+### Contract enforced
+
+- Valid final closure seals original run against all normal committed HTR mutation; observe/plan remain read-only
+- Trusted closure = valid JSON + fingerprint + source correspondence + valid frozen chain + matching final-closure event
+- Untrusted/indeterminate closure states fail closed; no repair or event-to-JSON reconstruction
+- No force/unlock/env-var/bypass; generic `atomic_write_json` / `append_jsonl` / `ensure_dir` / manual edits not claimed protected
+- Cross-process TOCTOU remains explicit limitation (Task 23); Recovery/Successor Run remains Task 27+; Phase 2 invoke disabled
+
+### Non-goals confirmed
+
+- No Task 23 lock/lease, Task 24 approval, Task 25 invoke, Recovery/Successor protocol, self-healing
+- No new lifecycle schemas/records/events; no edits to `htr/schemas.py`, `htr/observe.py`, `htr/action_plan.py`
+
+**Next implementation:** Task 23 — Execution lock/lease.

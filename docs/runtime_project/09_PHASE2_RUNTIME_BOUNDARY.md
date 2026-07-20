@@ -1,17 +1,17 @@
 # Phase 2 — Runtime Integration Boundary
 
-**Status:** Phase 2 **implementation in progress** (Task 19 `57a1ed651`; Task 21 action plan checkpointed); architecture checkpoint Task 20 (Policy C)  
-**Date:** 2026-07-19 (planning); **updated** 2026-07-20 (Tasks 19–21)  
-**Depends on:** Phase 1 closed — Task 17.1 `8fea4daa0`; baseline Git-reproducible at Task 18.5 `04b11bc4d`  
+**Status:** Phase 2 **implementation in progress** (Task 19 `57a1ed651`; Task 21 action plan ✅; Task 22 immutable seal ✅); architecture checkpoint Task 20 (Policy C)
+**Date:** 2026-07-19 (planning); **updated** 2026-07-20 (Tasks 19–22)
+**Depends on:** Phase 1 closed — Task 17.1 `8fea4daa0`; baseline Git-reproducible at Task 18.5 `04b11bc4d`
 **Audience:** Architect + Cursor implementer
 
-This document defines what Phase 2 **may** and **may not** do. Task 20 accepts **Policy C** (immutable finalized-run seal + successor-based recovery). Neither the seal nor the Recovery/Successor Run protocol is **implemented** until their dedicated tasks ship.
+This document defines what Phase 2 **may** and **may not** do. Task 20 accepts **Policy C** (immutable finalized-run seal + successor-based recovery). **Task 22 implements the finalized-run seal.** Recovery/Successor Run protocol remains **not implemented** until Task 27+.
 
 ---
 
 ## 0. Phase 1 baseline (closed — historical)
 
-Phase 1 delivered a manual 11-record run-level chain ending at `run_final_closure_record`.  
+Phase 1 delivered a manual 11-record run-level chain ending at `run_final_closure_record`.
 Closed at Task 17.1 `8fea4daa0`.
 
 - JSON run-records are source-of-truth (SoT); event log is audit-only.
@@ -20,28 +20,28 @@ Closed at Task 17.1 `8fea4daa0`.
 - Task 17.1 did **not** claim or implement a global hard lock; task/attempt APIs remain callable in code today.
 - Idempotent replay with matching audit event but missing JSON SoT **fails closed** (`InvalidTransition`).
 
-**Task 20 does not rewrite Phase 1 history.** It establishes a **future Phase 2 policy** (Policy C) to be enforced at canonical mutation boundaries in Task 22+.
+**Task 20 does not rewrite Phase 1 history.** Task 22 enforces Policy C at canonical mutation boundaries.
 
 ---
 
 ## 1. Policy C — Immutable finalization + Recovery/Successor Run
 
-**Accepted at Task 20 (architecture only; not yet enforced in code).**
+**Accepted at Task 20; finalized-run seal enforced at Task 22.**
 
 ### 1.1 Immutable finalization (finalized-run seal)
 
-Once a run has a valid `run_final_closure_record`, the **original run** will be permanently sealed against **all normal HTR mutation**, including:
+Once a run has a valid `run_final_closure_record`, the **original run** is permanently sealed against **all normal HTR mutation**, including:
 
 - manual, CLI, Cursor, and runtime automation callers;
 - run-level lifecycle mutations; task/attempt mutations; artifact-manifest mutations;
 - workspace bootstrap/mutation targeting an already-finalized run;
 - direct lifecycle-event append or JSON SoT writes on that run.
 
-**Read-only observation** (`hermes htr observe`) remains allowed.
+**Read-only observation** (`hermes htr observe`) and **read-only planning** (`hermes htr plan`) remain allowed.
 
-Enforcement must live at **canonical shared mutation boundaries** (all public mutation APIs), not only in a bypassable runtime wrapper. Applies to runs finalized before or after enforcement ships, when the closure record is valid.
+Enforcement lives at **canonical shared mutation boundaries** (25 public/run-aware mutation APIs). Applies to runs finalized before or after enforcement ships, when the closure record is valid.
 
-**Not implemented until Task 22.**
+**Implemented at Task 22** (`htr/finalization.py` + guards). Valid closure requires trusted JSON/event correspondence and valid preceding frozen chain. Closure-present-but-untrusted and indeterminate states fail closed with no automatic repair. Exact `record_run_final_closure` replay (matching event ID + semantics) is the sole read-only replay exception. Generic filesystem primitives and deliberate manual edits are not claimed protected. Cross-process TOCTOU between seal check and write remains (Task 23 scope).
 
 ### 1.2 Recovery/Successor Run (not in-place recovery)
 
@@ -49,7 +49,7 @@ If a finalized run later requires remediation, the **original run is not reopene
 
 ```
 final closure
-→ original run becomes immutable (future Task 22)
+→ original run becomes immutable (Task 22 ✅)
 → read-only observation remains available
 → a problem may produce a recovery proposal (future)
 → explicit high-risk approval required (future)
@@ -72,12 +72,13 @@ Exceptional legal/security/data-governance correction of a finalized original ru
 
 ## 2. Write-path gate
 
-**No Phase 2 lifecycle write or invoke path may be enabled before immutable finalized-run enforcement (Task 22) is implemented and verified.**
+**No Phase 2 lifecycle write or invoke path may be enabled before execution lock/lease (Task 23) is implemented and verified.** Task 22 immutable finalized-run enforcement is prerequisite ✅.
 
-| Work | Allowed before Task 22? |
+| Work | Allowed before Task 23? |
 |------|-------------------------|
 | Read-only observability (Task 19) | ✅ Done |
 | Derived action plan (Task 21) | ✅ Done (read-only) |
+| Immutable finalized-run seal (Task 22) | ✅ Done |
 | Approval persistence (Task 24) | ❌ No (operational control; still no invoke) |
 | Human-gated lifecycle invoke (Task 25) | ❌ No |
 | Bounded repair / unattended automation | ❌ No |
@@ -105,9 +106,9 @@ Bounded self-healing of finalized-run problems requires the Recovery/Successor R
 
 | Resource | Read | Write (today) | Write (future) |
 |----------|------|---------------|----------------|
-| Phase 1 JSON SoT | Yes (Task 19) | Manual APIs only | Via Task 25+ invoke after Task 22 |
+| Phase 1 JSON SoT | Yes (Task 19) | Manual APIs only | Via Task 25+ invoke after Task 23 |
 | Event log | Yes | Lifecycle APIs only | Same |
-| Finalized original run | Yes | **Phase 1: still callable** | **Task 22: sealed** |
+| Finalized original run | Yes | **Task 22: sealed** | **Task 22: sealed** |
 | Recovery/Successor Run | N/A | N/A | Task 27+ protocol |
 
 Runtime must not append events or write SoT directly. Writes only through allowlisted canonical lifecycle APIs after gates pass.
@@ -158,9 +159,9 @@ Additionally: no in-place finalized-run recovery; no ordinary unlock/bypass; no 
 
 ```
 read-only observability          ← Task 19 ✅
-→ derived action planning        ← Task 21 (next)
-→ immutable finalized-run enforcement ← Task 22 (blocks invoke)
-→ execution lock/lease           ← Task 23
+→ derived action planning        ← Task 21 ✅
+→ immutable finalized-run enforcement ← Task 22 ✅ (blocks invoke until lock)
+→ execution lock/lease           ← Task 23 (next)
 → authoritative scoped approval  ← Task 24
 → human-gated single-API invoke  ← Task 25
 → ambiguous-outcome reconciliation ← Task 26
@@ -179,8 +180,8 @@ Human approval is selective (high-risk, low-confidence, recovery-run creation, r
 
 | # | Question | Resolution (Policy C) |
 |---|----------|------------------------|
-| 1 | Hard lock before write/invoke? | **Immutable finalized-run enforcement (Task 22) required before any Phase 2 lifecycle write/invoke.** Recovery is successor-based; original never reopened via normal path. |
-| 2 | Read-only MVP or invoke? | **Task 19 read-only MVP complete.** Invoke deferred until Task 22+ prerequisites. |
+| 1 | Hard lock before write/invoke? | **Task 22 immutable seal ✅; Task 23 lock required before invoke.** Recovery is successor-based; original never reopened via normal path. |
+| 2 | Read-only MVP or invoke? | **Task 19 read-only MVP complete.** Invoke deferred until Task 23+ prerequisites. |
 | 3 | Artifact inspection in MVP? | **Deferred** (Task 29). |
 | 4 | Repair proposal form? | **Derived library/stdout JSON** (Task 21); no lifecycle record/event; persistence deferred; finalized-run recovery proposal = Task 27. |
 | 5 | New runtime event type? | **Not for Tasks 21–26.** Future approval/recovery/lineage types need separate schema tasks. |
@@ -195,9 +196,9 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 |------|------|--------|
 | 19 | Read-only observability | ✅ `57a1ed651` |
 | 20 | Immutable finalization + safe automation boundary | ✅ Docs checkpoint (Policy C) |
-| 21 | Derived action plan (read-only) | **Next implementation** |
-| 22 | Immutable finalized-run enforcement | Required before invoke |
-| 23 | Execution lock/lease | |
+| 21 | Derived action plan (read-only) | ✅ Task 21 |
+| 22 | Immutable finalized-run enforcement | ✅ Task 22 |
+| 23 | Execution lock/lease | **Next** |
 | 24 | Approval control schema + API | |
 | 25 | Human-gated single-API invoke pilot | Pre-finalization only; mandatory post-verify |
 | 26 | Execution reconciliation / ambiguous outcomes | |
@@ -212,8 +213,8 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 ## 13. Confirmation
 
 - Task 19 checkpointed at `57a1ed651d622b3af82939d970b9c7f235ea1764`.
-- Phase 2 **implementation has started** (read-only foundation).
-- Task 20 records Policy C; **implements no runtime safety mechanism**.
-- Finalized-run seal and Recovery/Successor protocol are **defined, not implemented**.
-- No Phase 2 lifecycle write path is enabled.
+- Phase 2 **implementation has started** (read-only foundation + immutable seal).
+- Task 20 records Policy C; Task 22 **implements finalized-run seal**.
+- Recovery/Successor protocol remains **defined, not implemented** (Task 27+).
+- No Phase 2 lifecycle write/invoke path is enabled (Task 23 lock next).
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

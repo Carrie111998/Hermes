@@ -127,6 +127,42 @@ class EventValidationError(HTRStateError):
     """Raised when an event fails schema validation."""
 
 
+ERROR_CODE_RUN_FINALIZED: Final = "RUN_FINALIZED"
+ERROR_CODE_RUN_SEAL_BLOCKED: Final = "RUN_SEAL_BLOCKED"
+
+
+class RunFinalizedError(HTRStateError):
+    """Raised when a valid final closure seals the run against mutation."""
+
+    def __init__(
+        self,
+        message: str = "Original run is finalized and cannot be modified.",
+        *,
+        run_id: str | None = None,
+        error_code: str = ERROR_CODE_RUN_FINALIZED,
+    ) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.error_code = error_code
+
+
+class RunSealBlockedError(HTRStateError):
+    """Raised when closure state is untrusted or indeterminate for mutation."""
+
+    def __init__(
+        self,
+        message: str = "Run closure state is untrusted; mutation blocked.",
+        *,
+        run_id: str | None = None,
+        error_code: str = ERROR_CODE_RUN_SEAL_BLOCKED,
+        reason_codes: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.error_code = error_code
+        self.reason_codes = reason_codes
+
+
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:
     """Return True when *to_status* is legal from *from_status*."""
     if from_status not in TASK_STATUSES or to_status not in TASK_STATUSES:

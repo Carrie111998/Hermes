@@ -1,21 +1,49 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-20 (Task 21 read-only derived action plan checkpoint; parent Task 20 `2fa580b5`)
+**Last updated:** 2026-07-20 (Task 22 immutable finalized-run enforcement checkpoint; parent Task 21 `798bc1ea`)
 
 ---
 
 ## Active Task
 
-**Task 22 — Immutable Finalized-Run Enforcement** — mandatory before any Phase 2 lifecycle write/invoke path. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Task 23 — Execution Lock/Lease** — mandatory before any Phase 2 lifecycle write/invoke path. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
 
 ---
 
 ## Completed
 
+### Task 22 — Immutable Finalized-Run Enforcement
+
+**Status:** ✅ Checkpointed (third Phase 2 **implementation**; parent Task 21 `798bc1ea98b6af8904c9750102c7bfe3917cdfe0`)
+**Tests (candidate Git-only workspace):** focused Task 22 **56 passed**; finalization + Task 19/21 **135 passed**; full tracked `tests/htr/` **1360 passed** (24 files)
+**Depends on:** Task 21 `798bc1ea98b6af8904c9750102c7bfe3917cdfe0`
+
+**Delivered:**
+
+- `htr/finalization.py` — focused read-only seal evaluator (`not_finalized`, `finalized_valid`, `closure_present_untrusted`, `indeterminate`); `assert_run_mutation_allowed()`; closure event/record matcher; path containment
+- `htr/state.py` — `RunFinalizedError`, `RunSealBlockedError` with stable error codes
+- Guards on all 25 public/run-aware mutation entry points (workspace, task/attempt, artifacts, events, eleven Phase 1 run-chain APIs)
+- `htr/events.py` — JSON-before-event first closure; private `_append_run_event_internal` (validated first-closure path only); public append rejects `run_final_closure_recorded`; exact `record_run_final_closure` replay is sole zero-write replay exception
+- `tests/htr/test_finalization.py` — 25/25 mutation callables individually runtime-tested; untrusted-state matrix; guard-order proofs; import smoke
+
+**Contract (Task 22):**
+
+- Valid final closure permanently seals the original run against all normal committed HTR mutation APIs
+- Read-only observation (`hermes htr observe`) and read-only planning (`hermes htr plan`) remain allowed
+- Valid closure requires trusted JSON/event correspondence and valid preceding frozen chain
+- Closure-present-but-untrusted and indeterminate states fail closed (`RunSealBlockedError`); no automatic repair or event-to-JSON reconstruction
+- No force, unlock, env-var, low-level helper, or ordinary reopening bypass
+- Exact `record_run_final_closure` replay (matching event ID + semantics) returns existing record with zero writes; all other normal mutation/idempotent replay blocked after finalization
+- Generic filesystem primitives (`atomic_write_json`, `append_jsonl`, `ensure_dir`) and deliberate manual edits are **not** claimed protected
+- Cross-process TOCTOU between seal check and write remains (Task 23 scope)
+- Recovery/Successor Run protocol remains Task 27+; Phase 2 lifecycle invoke remains disabled
+
+**Explicitly not implemented:** Task 23 lock/lease, Task 24 approval, Task 25 invoke, Recovery/Successor Run, self-healing, bypass mechanisms.
+
 ### Task 21 — Derived Action Plan Generation (read-only)
 
-**Status:** ✅ Checkpointed (second Phase 2 **implementation**; parent Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`)  
-**Tests (candidate Git-only workspace):** focused Task 21 **60 passed**; full tracked `tests/htr/` **1304 passed** (23 files)  
+**Status:** ✅ Checkpointed (second Phase 2 **implementation**; parent Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`)
+**Tests (candidate Git-only workspace):** focused Task 21 **60 passed**; full tracked `tests/htr/` **1304 passed** (23 files)
 **Depends on:** Task 20 `2fa580b5f8b5d26657af2af5641724515e114c76`
 
 **Delivered:**
@@ -35,8 +63,8 @@
 
 ### Task 20 — Immutable Finalization and Safe Automation Control Boundary
 
-**Status:** ✅ Architecture checkpoint (docs only; Policy C accepted; parent Task 19 `57a1ed651`)  
-**Tests:** n/a (documentation only)  
+**Status:** ✅ Architecture checkpoint (docs only; Policy C accepted; parent Task 19 `57a1ed651`)
+**Tests:** n/a (documentation only)
 **Depends on:** Task 19 `57a1ed651d622b3af82939d970b9c7f235ea1764`
 
 **Delivered (documentation only — no runtime code):**
@@ -52,8 +80,8 @@
 
 ### Task 19 — Read-Only Runtime Observability (Phase 2 first implementation)
 
-**Status:** ✅ Checkpointed `57a1ed651d622b3af82939d970b9c7f235ea1764` (first Phase 2 **implementation**; builds on Task 18.5 `04b11bc4d`)  
-**Tests (candidate Git-only workspace):** focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)  
+**Status:** ✅ Checkpointed `57a1ed651d622b3af82939d970b9c7f235ea1764` (first Phase 2 **implementation**; builds on Task 18.5 `04b11bc4d`)
+**Tests (candidate Git-only workspace):** focused Task 19 **25 passed**; full tracked `tests/htr/` **1246 passed** (22 files)
 **Depends on:** Task 18.5 `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e`
 
 **Scope:** Strictly read-only single-run observation and integrity reporting — foundation for later reliable, traceable, recoverable, human-gated automation; **not** a manual-only or permanent read-only architecture.
@@ -70,8 +98,8 @@
 
 ### Task 18.5 — Reconcile Phase 1 Tracked Baseline
 
-**Status:** ✅ Checkpointed `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e` (additive only; parent `f7e291ff7`)  
-**Tests (candidate Git-only workspace):** `tests/htr/` — **1221 passed** (20 files: 8 foundation + 12 Phase 1 workflow)  
+**Status:** ✅ Checkpointed `04b11bc4df883ee1039c0d10fab1ede7b2fc0e7e` (additive only; parent `f7e291ff7`)
+**Tests (candidate Git-only workspace):** `tests/htr/` — **1221 passed** (20 files: 8 foundation + 12 Phase 1 workflow)
 **Depends on:** Task 18 `f7e291ff7`
 
 **Problem:** Phase 1 workflow semantics were closed and tested locally, but Git reproducibility was broken from the first tracked HTR commit: five foundation modules and eight foundation tests were never checkpointed.
@@ -89,8 +117,8 @@
 
 ### Task 18 — Phase 2 Runtime Boundary Planning (docs only)
 
-**Status:** ✅ Complete (checkpointed `f7e291ff7`)  
-**Tests:** n/a (docs only; no code/schema/events changes)  
+**Status:** ✅ Complete (checkpointed `f7e291ff7`)
+**Tests:** n/a (docs only; no code/schema/events changes)
 **Depends on:** Phase 1 closed at Task 17.1 `8fea4daa0`
 
 Changes:
@@ -104,8 +132,8 @@ Changes:
 
 ### Task 17.1 — Clarify Phase 1 Terminal Semantics and Guard Idempotent SoT
 
-**Status:** ✅ Accepted (checkpointed `8fea4daa0`)  
-**Tests:** `uv run --extra dev pytest tests/htr/ -v` — **1273 passed**  
+**Status:** ✅ Accepted (checkpointed `8fea4daa0`)
+**Tests:** `uv run --extra dev pytest tests/htr/ -v` — **1273 passed**
 **Builds on:** Task 17 checkpoint `939e8b606de09532006887c637684cf8baa49d40`
 
 Changes:
@@ -120,7 +148,7 @@ Changes:
 
 ### Task 17 — Phase 1 Boundary / End-to-End Manual Workflow Freeze
 
-**Status:** ✅ Accepted (checkpointed `939e8b606`)  
+**Status:** ✅ Accepted (checkpointed `939e8b606`)
 **Tests:** `uv run --extra dev pytest tests/htr/ -v` — **1271 passed** at Phase 1 final verification
 
 Changes:
@@ -136,7 +164,7 @@ Changes:
 
 ### Task 16 — Run Final Closure Record
 
-**Status:** ✅ Accepted (checkpointed `1650b9e73`)  
+**Status:** ✅ Accepted (checkpointed `1650b9e73`)
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -155,7 +183,7 @@ Changes:
 
 ### Task 15 — Manual Post-Verification Execution Verification Recording
 
-**Status:** ✅ Accepted (checkpointed `5011ad44c`)  
+**Status:** ✅ Accepted (checkpointed `5011ad44c`)
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -173,7 +201,7 @@ Changes:
 
 ### Task 14 — Manual Post-Verification Execution Result Recording
 
-**Status:** ✅ Accepted (checkpointed)  
+**Status:** ✅ Accepted (checkpointed)
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -191,7 +219,7 @@ Changes:
 
 ### Task 13 — Manual Post-Verification Execution Request Planning
 
-**Status:** ✅ Accepted (checkpointed)  
+**Status:** ✅ Accepted (checkpointed)
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -209,7 +237,7 @@ Changes:
 
 ### Task 12 — Verification-Driven Follow-up Planning
 
-**Status:** ✅ Accepted (checkpointed `16d81a65f`)  
+**Status:** ✅ Accepted (checkpointed `16d81a65f`)
 **Tests:** `uv run --extra dev pytest tests/htr/ -v`
 
 Changes:
@@ -233,11 +261,11 @@ Changes:
 
 ## Next Task (Implementer)
 
-**Task 22 — Immutable Finalized-Run Enforcement.** Mandatory before any Phase 2 lifecycle write or invoke path.
+**Task 23 — Execution Lock/Lease.** Mandatory before any Phase 2 lifecycle write or invoke path.
 
-**Blocked until Task 22:** any Phase 2 lifecycle write or invoke path.
+**Blocked until Task 23:** any Phase 2 lifecycle write or invoke path (Task 22 seal ✅).
 
-See `09_PHASE2_RUNTIME_BOUNDARY.md` for Tasks 22–31.
+See `09_PHASE2_RUNTIME_BOUNDARY.md` for Tasks 23–31.
 
 ---
 

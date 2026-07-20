@@ -1,7 +1,7 @@
 # Phase Plan — HTR
 
-**Baseline:** Architecture Baseline v1.0  
-**Date:** 2026-07-18  
+**Baseline:** Architecture Baseline v1.0
+**Date:** 2026-07-18
 **Updated:** 2026-07-20 (Task 21 read-only action plan checkpointed; parent Task 20 `2fa580b5`)
 
 ---
@@ -23,7 +23,7 @@ Scope:
 
 ## Phase 1: Manual Trusted Run-Record Chain (actual)
 
-**Status:** Closed — Task 17 (`939e8b606`) + Task 17.1 (`8fea4daa0`)  
+**Status:** Closed — Task 17 (`939e8b606`) + Task 17.1 (`8fea4daa0`)
 Phase 1 implementation and post-review hardening are complete. No further Phase 1 lifecycle work.
 
 Phase 1 as delivered is the **manual 11-record run-level workflow** ending at `run_final_closure_record` (JSON SoT + audit events). It is **not** the earlier aspirational “Trusted Task Loop” list below.
@@ -47,18 +47,18 @@ Phase 1 as delivered is the **manual 11-record run-level workflow** ending at `r
 
 ## Phase 2: Runtime Integration Boundary
 
-**Status:** **Implementation in progress** (Task 19 observe ✅; Task 21 action plan ✅); architecture checkpoint Task 20 (Policy C) — see `09_PHASE2_RUNTIME_BOUNDARY.md`
+**Status:** **Implementation in progress** (Task 19 observe ✅; Task 21 action plan ✅; Task 22 immutable seal ✅); architecture checkpoint Task 20 (Policy C) — see `09_PHASE2_RUNTIME_BOUNDARY.md`
 
 Phase 2 defines controlled runtime integration and safe-automation progression.
 
-**Policy C (Task 20 — architecture only, not yet enforced):**
+**Policy C (Task 20 — architecture; Task 22 enforcement ✅):**
 
-1. **Immutable finalization:** valid `run_final_closure_record` → original run sealed against all normal mutation (Task 22).
+1. **Immutable finalization:** valid `run_final_closure_record` → original run sealed against all normal committed HTR mutation APIs (Task 22 ✅).
 2. **Recovery/Successor Run:** remediation via linked successor run; original never reopened/unlocked/edited (Task 27+).
 
-**Write-path gate:** no lifecycle write/invoke before Task 22 finalized-run enforcement.
+**Write-path gate:** no Phase 2 lifecycle write/invoke before Task 23 execution lock/lease (Task 22 seal ✅).
 
-**Accepted progression:** observe (✅) → action plan (✅ Task 21) → immutable seal (Task 22) → lock → approval → human-gated invoke → reconciliation → Recovery/Successor protocol → bounded repair → …
+**Accepted progression:** observe (✅) → action plan (✅ Task 21) → immutable seal (✅ Task 22) → lock (Task 23) → approval → human-gated invoke → reconciliation → Recovery/Successor protocol → bounded repair → …
 
 **Historical note:** Phase 1 (Task 17.1) documented chain-terminal closure without global API hard lock; Policy C is forward-looking Phase 2 enforcement.
 

@@ -60,6 +60,12 @@ from htr.contracts import (
     verification_fingerprint,
     verification_result_json_path,
 )
+from htr.finalization import (
+    SealState,
+    assert_run_mutation_allowed,
+    evaluate_run_seal,
+    matches_run_final_closure_recorded_event,
+)
 from htr.schemas import validate as validate_schema
 from htr.state import (
     ATTEMPT_HEAL_REQUIRED,
@@ -71,6 +77,8 @@ from htr.state import (
     AttemptAlreadyRegistered,
     EventConflict,
     InvalidTransition,
+    RunFinalizedError,
+    RunSealBlockedError,
     assert_valid_attempt_transition,
     assert_valid_run_transition,
     assert_valid_task_transition,
@@ -147,6 +155,26 @@ VERIFICATION_RECORDED_STATUSES: frozenset[str] = frozenset(
         ATTEMPT_HEAL_REQUIRED,
     }
 )
+
+
+def _guard_run_mutation(run_id: str, base_dir: Path | None = None) -> None:
+    """Fail closed when *run_id* is sealed or closure state blocks mutation."""
+    assert_run_mutation_allowed(run_id, base_dir)
+
+
+def _append_run_event_internal(
+    run_id: str,
+    event: dict[str, Any],
+    base_dir: Path | None = None,
+) -> None:
+    """Append a run-level lifecycle event without seal guard (internal only)."""
+    validate_schema(event, "event")
+    _validate_event_ids(event)
+    if event["run_id"] != run_id:
+        raise ValueError("event run_id does not match append target run_id")
+    if "task_id" in event:
+        raise ValueError("run-level event must not include task_id")
+    append_jsonl(paths.task_events_path(run_id, base_dir), event)
 
 
 def _utc_now_iso() -> str:
@@ -272,6 +300,7 @@ def append_task_event(
     _validate_event_ids(event)
     if event["run_id"] != run_id:
         raise ValueError("event run_id does not match append target run_id")
+    _guard_run_mutation(run_id, base_dir)
     append_jsonl(paths.task_events_path(run_id, base_dir), event)
 
 
@@ -287,6 +316,11 @@ def append_run_event(
         raise ValueError("event run_id does not match append target run_id")
     if "task_id" in event:
         raise ValueError("run-level event must not include task_id")
+    if event.get("event_type") == EVENT_TYPE_RUN_FINAL_CLOSURE_RECORDED:
+        raise InvalidTransition(
+            "run_final_closure_recorded events must use record_run_final_closure"
+        )
+    _guard_run_mutation(run_id, base_dir)
     append_jsonl(paths.task_events_path(run_id, base_dir), event)
 
 
@@ -354,6 +388,7 @@ def apply_task_transition(
 ) -> dict[str, Any]:
     """Append a task status event, then update ``task_status.json`` snapshot."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     _ensure_run_and_task_workspace(run_id, task_id, base_dir)
 
@@ -397,6 +432,7 @@ def register_attempt(
 ) -> dict[str, Any]:
     """Bootstrap attempt workspace, append event, then register in task status."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     _ensure_run_and_task_workspace(run_id, task_id, base_dir)
@@ -447,6 +483,7 @@ def apply_attempt_transition(
 ) -> dict[str, Any]:
     """Append an attempt status event, then update ``attempt_status.json``."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     _ensure_run_and_task_workspace(run_id, task_id, base_dir)
@@ -524,6 +561,7 @@ def submit_attempt_result(
 ) -> dict[str, Any]:
     """Write attempt result, append event, and move status to result_submitted."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     validate_schema(result, "attempt_result")
@@ -669,6 +707,9 @@ def submit_manual_verification(
             "verification_result outcome must be one of passed, failed, heal_required"
         )
 
+    validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
+
     submitted_fingerprint = verification_fingerprint(verification_result)
     verification_path = verification_result_json_path(
         run_id, task_id, attempt_id, base_dir
@@ -803,6 +844,7 @@ def complete_task_manually(
 ) -> dict[str, Any]:
     """Manually mark a task completed after *attempt_id* has verification_passed."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     validate_schema(completion_record, "task_completion_record")
@@ -954,6 +996,7 @@ def complete_run_manually(
 ) -> dict[str, Any]:
     """Manually mark a run completed after listed tasks are already completed."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(completion_record, "run_completion_record")
     if completion_record["run_id"] != run_id:
         raise ValueError("completion_record run_id does not match submission target")
@@ -1077,6 +1120,7 @@ def review_run_manually(
 ) -> dict[str, Any]:
     """Manually record a human review decision for a completed run."""
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(review_record, "run_review_record")
     if review_record["run_id"] != run_id:
         raise ValueError("review_record run_id does not match submission target")
@@ -1182,6 +1226,7 @@ def plan_run_followup(
     This API only validates, stores, and audits the plan; it does not execute it.
     """
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(followup_plan_record, "run_followup_plan_record")
     if followup_plan_record["run_id"] != run_id:
         raise ValueError(
@@ -1304,6 +1349,7 @@ def request_run_execution(
     This API prepares controlled automation; it does not execute work.
     """
     validate_id(run_id, "run")
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(execution_request_record, "run_execution_request_record")
     if execution_request_record["run_id"] != run_id:
         raise ValueError(
@@ -1448,10 +1494,11 @@ def execute_run_execution_request(
     event. This adapter is manually triggered and does not mutate lifecycle state.
     """
     validate_id(run_id, "run")
+    base_dir = Path(project_dir)
+    _guard_run_mutation(run_id, base_dir)
     if not isinstance(executor, str) or not executor:
         raise ValueError("executor must be a non-empty string")
 
-    base_dir = Path(project_dir)
     execution_result_record_path = run_execution_result_record_json_path(
         run_id, base_dir
     )
@@ -1632,6 +1679,8 @@ def verify_run_execution_result(
     and audits the decision without executing work or mutating prior records.
     """
     validate_id(run_id, "run")
+    base_dir = Path(project_dir)
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(verification_record, "run_execution_verification_record")
     if verification_record["run_id"] != run_id:
         raise ValueError(
@@ -1641,7 +1690,6 @@ def verify_run_execution_result(
         raise ValueError("actor must be a non-empty string")
 
     submitted_fingerprint = run_execution_verification_fingerprint(verification_record)
-    base_dir = Path(project_dir)
     verification_record_path = run_execution_verification_record_json_path(
         run_id, base_dir
     )
@@ -1803,6 +1851,8 @@ def plan_post_verification_followup(
     This API stores and audits the plan; it does not execute work.
     """
     validate_id(run_id, "run")
+    base_dir = Path(project_dir)
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(plan_record, "run_post_verification_followup_plan_record")
     if plan_record["run_id"] != run_id:
         raise ValueError("plan_record run_id does not match submission target")
@@ -1810,7 +1860,6 @@ def plan_post_verification_followup(
         raise ValueError("actor must be a non-empty string")
 
     submitted_fingerprint = run_post_verification_followup_plan_fingerprint(plan_record)
-    base_dir = Path(project_dir)
     plan_record_path = run_post_verification_followup_plan_record_json_path(
         run_id, base_dir
     )
@@ -2004,6 +2053,8 @@ def request_post_verification_execution(
     request; it does not execute work.
     """
     validate_id(run_id, "run")
+    base_dir = Path(project_dir)
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(
         run_post_verification_execution_request_record,
         "run_post_verification_execution_request_record",
@@ -2016,7 +2067,6 @@ def request_post_verification_execution(
     submitted_fingerprint = run_post_verification_execution_request_fingerprint(
         run_post_verification_execution_request_record
     )
-    base_dir = Path(project_dir)
     request_record_path = run_post_verification_execution_request_record_json_path(
         run_id, base_dir
     )
@@ -2276,6 +2326,8 @@ def record_post_verification_execution_result(
     does not execute work.
     """
     validate_id(run_id, "run")
+    base_dir = Path(project_dir)
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(
         run_post_verification_execution_result_record,
         "run_post_verification_execution_result_record",
@@ -2288,7 +2340,6 @@ def record_post_verification_execution_result(
     submitted_fingerprint = run_post_verification_execution_result_fingerprint(
         run_post_verification_execution_result_record
     )
-    base_dir = Path(project_dir)
     result_record_path = run_post_verification_execution_result_record_json_path(
         run_id, base_dir
     )
@@ -2616,6 +2667,8 @@ def record_post_verification_execution_verification(
     audits the verification; it does not validate work automatically.
     """
     validate_id(run_id, "run")
+    base_dir = Path(project_dir)
+    _guard_run_mutation(run_id, base_dir)
     validate_schema(
         run_post_verification_execution_verification_record,
         "run_post_verification_execution_verification_record",
@@ -2630,7 +2683,6 @@ def record_post_verification_execution_verification(
     submitted_fingerprint = run_post_verification_execution_verification_fingerprint(
         run_post_verification_execution_verification_record
     )
-    base_dir = Path(project_dir)
     verification_record_path = (
         run_post_verification_execution_verification_record_json_path(
             run_id, base_dir
@@ -2998,49 +3050,6 @@ def record_post_verification_execution_verification(
     return run_post_verification_execution_verification_record
 
 
-def _matches_run_final_closure_recorded_replay(
-    existing: dict[str, Any],
-    *,
-    run_id: str,
-    actor: str,
-    closure_record: dict[str, Any],
-) -> bool:
-    """Return True when *existing* matches a successful final closure replay."""
-    payload = existing.get("payload")
-    if not isinstance(payload, dict):
-        return False
-    return (
-        existing.get("event_type") == EVENT_TYPE_RUN_FINAL_CLOSURE_RECORDED
-        and existing.get("run_id") == run_id
-        and existing.get("actor") == actor
-        and payload.get("run_id") == run_id
-        and payload.get("closer") == closure_record["closer"]
-        and payload.get("final_closure_status") == closure_record["final_closure_status"]
-        and payload.get("source_run_completion_fingerprint")
-        == closure_record["source_run_completion_fingerprint"]
-        and payload.get("source_run_review_fingerprint")
-        == closure_record["source_run_review_fingerprint"]
-        and payload.get("source_run_followup_plan_fingerprint")
-        == closure_record["source_run_followup_plan_fingerprint"]
-        and payload.get("source_run_execution_request_fingerprint")
-        == closure_record["source_run_execution_request_fingerprint"]
-        and payload.get("source_run_execution_result_fingerprint")
-        == closure_record["source_run_execution_result_fingerprint"]
-        and payload.get("source_run_execution_verification_fingerprint")
-        == closure_record["source_run_execution_verification_fingerprint"]
-        and payload.get("source_post_verification_followup_plan_fingerprint")
-        == closure_record["source_post_verification_followup_plan_fingerprint"]
-        and payload.get("source_post_verification_execution_request_fingerprint")
-        == closure_record["source_post_verification_execution_request_fingerprint"]
-        and payload.get("source_post_verification_execution_result_fingerprint")
-        == closure_record["source_post_verification_execution_result_fingerprint"]
-        and payload.get("source_post_verification_execution_verification_fingerprint")
-        == closure_record["source_post_verification_execution_verification_fingerprint"]
-        and payload.get("run_final_closure_fingerprint")
-        == run_final_closure_fingerprint(closure_record)
-    )
-
-
 def record_run_final_closure(
     project_dir: Path | str,
     run_id: str,
@@ -3064,6 +3073,37 @@ def record_run_final_closure(
 
     submitted_fingerprint = run_final_closure_fingerprint(run_final_closure_record)
     base_dir = Path(project_dir)
+    seal = evaluate_run_seal(run_id, base_dir)
+    if seal.state == SealState.FINALIZED_VALID:
+        closure_record_path = run_final_closure_record_json_path(run_id, base_dir)
+        existing_closure_record = read_json(closure_record_path)
+        validate_schema(existing_closure_record, "run_final_closure_record")
+        if event_id is None:
+            raise RunFinalizedError(run_id=run_id)
+        existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
+        if existing_event is None:
+            raise RunFinalizedError(run_id=run_id)
+        if matches_run_final_closure_recorded_event(
+            existing_event,
+            run_id=run_id,
+            actor=actor,
+            closure_record=run_final_closure_record,
+        ):
+            return existing_closure_record
+        if existing_event.get("event_type") == EVENT_TYPE_RUN_FINAL_CLOSURE_RECORDED:
+            raise EventConflict(
+                f"event_id {event_id!r} already exists with different semantics"
+            )
+        raise RunFinalizedError(run_id=run_id)
+    if seal.state in (
+        SealState.CLOSURE_PRESENT_UNTRUSTED,
+        SealState.INDETERMINATE,
+    ):
+        raise RunSealBlockedError(
+            run_id=run_id,
+            reason_codes=seal.reason_codes,
+        )
+
     closure_record_path = run_final_closure_record_json_path(run_id, base_dir)
     post_verification_execution_verification_record_path = (
         run_post_verification_execution_verification_record_json_path(run_id, base_dir)
@@ -3509,7 +3549,7 @@ def record_run_final_closure(
         existing_event = _find_run_event_by_id(run_id, event_id, base_dir)
         if existing_event is None:
             raise InvalidTransition("run_final_closure_record.json already exists")
-        if _matches_run_final_closure_recorded_replay(
+        if matches_run_final_closure_recorded_event(
             existing_event,
             run_id=run_id,
             actor=actor,
@@ -3580,5 +3620,5 @@ def record_run_final_closure(
 
     ensure_dir(closure_record_path.parent)
     atomic_write_json(closure_record_path, run_final_closure_record)
-    append_run_event(run_id, candidate, base_dir)
+    _append_run_event_internal(run_id, candidate, base_dir)
     return run_final_closure_record
