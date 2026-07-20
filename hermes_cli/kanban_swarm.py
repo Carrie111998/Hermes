@@ -90,12 +90,24 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    worker_protocol: Optional[str] = None,
+    verifier_protocol: Optional[str] = None,
+    verifier_skills: Optional[Iterable[str]] = None,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
     The returned graph is immediately dispatchable: the planning root is marked
     ``done`` with topology metadata, parallel workers are ``ready``, the verifier
     waits for every worker, and the synthesizer waits for the verifier.
+
+    ``worker_protocol`` / ``verifier_protocol`` are optional text blocks
+    appended to every worker body / the verifier body respectively — the H-41
+    routing layer uses them to inject the H-43 workspace contract and the
+    worker-failure-discipline gate without duplicating this helper. Both
+    default to ``None`` (unchanged bodies). ``verifier_skills`` overrides the
+    verifier's default skill list (``["requesting-code-review"]``) so the
+    router can pin ``worker-failure-discipline`` onto the gate; ``None`` keeps
+    the default.
     """
 
     goal = _require_text(goal, "goal")
@@ -154,12 +166,13 @@ def create_swarm(
     )
 
     context_suffix = _swarm_context(root, goal)
+    worker_suffix = context_suffix + (worker_protocol or "")
     worker_ids: list[str] = []
     for spec in worker_specs:
         worker_id = kb.create_task(
             conn,
             title=spec.title,
-            body=(spec.body or "") + context_suffix,
+            body=(spec.body or "") + worker_suffix,
             assignee=spec.profile,
             created_by=created_by,
             parents=[root],
@@ -177,6 +190,7 @@ def create_swarm(
         "complete only with metadata {\"gate\": \"pass\"} when evidence is "
         "sufficient; otherwise block with exact missing work."
         + context_suffix
+        + (verifier_protocol or "")
     )
     verifier = kb.create_task(
         conn,
@@ -189,7 +203,7 @@ def create_swarm(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["requesting-code-review"],
+        skills=list(verifier_skills) if verifier_skills is not None else ["requesting-code-review"],
     )
 
     synthesizer_body = (
