@@ -104,4 +104,59 @@ class TestDeepSeekAnthropicPreservesThinking:
                 if isinstance(b, dict) and b.get("type") in {"thinking", "redacted_thinking"}:
                     assert "cache_control" not in b
 
+    def test_openai_compat_deepseek_base_is_not_matched(self) -> None:
+        """The OpenAI-compatible ``api.deepseek.com`` base must NOT trigger the
+        DeepSeek /anthropic branch — it never reaches this adapter, but the
+        detector should still fail closed so an accidental misuse doesn't
+        quietly send signed Anthropic blocks to an OpenAI endpoint.
+        """
+        from agent.anthropic_adapter import _is_deepseek_anthropic_endpoint
 
+        assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com") is False
+        assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com/v1") is False
+        assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com/anthropic") is True
+        assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com/anthropic/v1") is True
+
+    def test_non_deepseek_third_party_still_strips_all_thinking(self) -> None:
+        """Generic third-party Anthropic endpoints (NOT DeepSeek, NOT MiniMax)
+        must keep the strip-all behaviour — they reject unsigned blocks
+        outright.
+
+        Note: as of H-10 (hermes-v2, 2026-07-20), ``api.minimax.io/anthropic``
+        is no longer a "generic third-party" — it has its own branch in
+        ``_manage_thinking_signatures`` that preserves unsigned thinking
+        blocks (like DeepSeek). This test now uses an unrelated self-hosted
+        proxy URL to verify the generic strip-all path still works for
+        endpoints that genuinely reject unsigned blocks. MiniMax's carve-out
+        is covered by ``tests/agent/test_minimax_anthropic_thinking.py``.
+        """
+        from agent.anthropic_adapter import convert_messages_to_anthropic
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "reasoning_content": "r1",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        _system, converted = convert_messages_to_anthropic(
+            messages, base_url="https://anthropic-proxy.internal.example.com"
+        )
+        assistant_msg = next(m for m in converted if m["role"] == "assistant")
+        thinking_blocks = [
+            b for b in assistant_msg["content"]
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        assert thinking_blocks == [], (
+            "Generic third-party Anthropic endpoints (not DeepSeek, not "
+            "MiniMax) must keep the strip-all-thinking behaviour — unsigned "
+            "blocks get rejected by providers that can't validate them."
+        )

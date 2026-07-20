@@ -2535,6 +2535,26 @@ def _manage_thinking_signatures(
                     continue
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
+        elif _is_minimax_anthropic_endpoint(base_url):
+            # [CORE-PATCH] H-10: MiniMax via Anthropic-compat.
+            # Same policy as DeepSeek: signed blocks are MiniMax-proprietary
+            # (originated from Anthropic-format emissions that MiniMax re-signed
+            # or doesn't understand) and must be stripped; unsigned thinking
+            # blocks synthesised from reasoning_content MUST be preserved so the
+            # reasoning round-trips on replayed assistant tool-call messages.
+            # Without this branch, MiniMax falls into the third-party catch-all
+            # below which strips ALL thinking blocks — destroying the
+            # interleaved-thinking trace that MiniMax M3 needs for quality.
+            new_content = []
+            for b in m["content"]:
+                if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
+                    new_content.append(b)
+                    continue
+                if b.get("signature") or b.get("data"):
+                    # Signed (or redacted-with-data) — upstream can't validate, strip.
+                    continue
+                new_content.append(b)
+            m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
             # Third-party: strip ALL thinking blocks (signatures are proprietary).
             # Direct Anthropic: strip from non-latest assistant messages only.

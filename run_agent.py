@@ -6984,6 +6984,8 @@ class AIAgent:
         DeepSeek v4 thinking and Kimi / Moonshot thinking both reject replays
         of assistant tool-call messages that omit ``reasoning_content`` (refs
         #15250, #17400). Xiaomi MiMo thinking mode has the same requirement.
+        MiniMax thinking mode (M3, M2.7, …) also requires it on tool-call
+        replays — see hermes-agent H-10 in the hermes-v2 plan.
 
         Result cached on the AIAgent instance keyed by (provider, model,
         base_url); invalidated whenever ``switch_model()`` /
@@ -7001,6 +7003,7 @@ class AIAgent:
             self._needs_deepseek_tool_reasoning()
             or self._needs_kimi_tool_reasoning()
             or self._needs_mimo_tool_reasoning()
+            or self._needs_minimax_tool_reasoning()
         )
         self._thinking_pad_cache = (key, result)
         return result
@@ -7051,6 +7054,29 @@ class AIAgent:
         from agent.message_sanitization import matches_reasoning_echo_family
         return matches_reasoning_echo_family(
             "mimo", (self.provider or "").lower(), self.model, self.base_url
+        )
+
+    def _needs_minimax_tool_reasoning(self) -> bool:
+        """Return True when the current provider is MiniMax thinking mode.
+
+        MiniMax reasoning mode (M3, M2.7, …) requires ``reasoning_content``
+        on every assistant tool-call message when replaying history;
+        omitting it causes HTTP 400 "reasoning_content is required".
+
+        Three detection signals (mirrors ``_needs_deepseek_tool_reasoning``):
+        1. ``provider`` is one of the MiniMax provider slugs
+        2. model name substring matches ``minimax`` (case-insensitive)
+        3. ``base_url`` host matches MiniMax's official endpoints
+        """
+        provider = (self.provider or "").lower()
+        model = (self.model or "").lower()
+        if provider in {"minimax", "minimax-cn", "minimax-oauth"}:
+            return True
+        if "minimax" in model:
+            return True
+        return (
+            base_url_host_matches(self.base_url, "api.minimax.io")
+            or base_url_host_matches(self.base_url, "api.minimaxi.com")
         )
 
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
