@@ -3107,6 +3107,11 @@ DEFAULT_CONFIG = {
             # When true, deferrable core tools (those in
             # _HERMES_DEFERRABLE_CORE_TOOLS) are eligible for deferral too.
             "defer_core": False,
+            # When true, even always-core tools are deferred and only
+            # tool_search/tool_describe/tool_call remain always visible.
+            # This implies defer_core=True in ToolSearchConfig.from_raw().
+            # Default: false.
+            "defer_always_core": False,
         },
     },
 
