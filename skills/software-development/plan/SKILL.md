@@ -1,14 +1,42 @@
 ---
 name: plan
-description: Write a markdown plan to .hermes/plans/; no execution.
-version: 2.0.0
+description: Use when writing an actionable markdown implementation plan with bite-sized tasks.
+version: 3.0.0
 author: Hermes Agent (writing-craft adapted from obra/superpowers)
 license: MIT
-platforms: [linux, macos, windows]
+platforms:
+- linux
+- macos
+- windows
 metadata:
   hermes:
-    tags: [planning, plan-mode, implementation, workflow, design, documentation]
-    related_skills: [subagent-driven-development, test-driven-development, requesting-code-review]
+    tags:
+    - planning
+    - plan-mode
+    - implementation
+    - workflow
+    - design
+    - documentation
+    - hermes-v2
+    related_skills:
+    - subagent-driven-development
+    - test-driven-development
+    - requesting-code-review
+    - writing-plans
+    - hermes-kanban
+lane: koenigin
+reasoning_effort: xhigh
+agent: Engineer
+routing_hint: '**Agent-Scope:** Code-Tasks (build / fix / refactor / debug / review).
+  Off-scope: visual design, long-form copy, data modeling — say ''this is Designer/Writer/Analyst''s
+  territory'' and return to Yuno.
+
+
+  Routing-Spec: `yuno-team-routing`.
+
+  '
+---
+
 ---
 
 # Plan Mode
@@ -40,12 +68,134 @@ Include, when relevant:
 
 If the task is code-related, include exact file paths, likely test targets, and verification steps.
 
+## Plan File v2 Contract (hermes-v2, machine-parseable)
+
+When the user wants the plan to be **approvable via `/plan approve`** — meaning the kimi-mode plugin will parse it and seed a Kanban board (H-22) — write the plan in the v2 contract below. v2 plans are an additive superset of the free-form format: every section that follows is required for approval, and the heading/checkbox conventions are exact so a parser can round-trip them.
+
+### Required YAML frontmatter
+
+The plan MUST start with a YAML frontmatter block. All keys are required.
+
+```markdown
+---
+slug: starman-booster-gold-red-star   # URL-safe identifier; idempotency key
+title: Hermes v2 Verbesserungsplan     # Human-readable title
+goal: |
+  Bring Hermes/Yuno to Claude Code / Kimi Code workflow level.
+  In one sentence.
+scope_tiers:                          # A=Muss, B=Soll, C=Kür
+  A: [H-01, H-10, H-11, H-22]
+  B: [H-12, H-13, H-20, H-50]
+  C: [H-08, H-15, H-64]
+risks:
+  - Core-Patches kollidieren mit Upstream → git revert + Branch hermes-v2-work
+  - state.db-VACUUM braucht 2× Disk → Freien Platz prüfen
+verification:
+  - pytest tests/run_agent/ -k 'minimax or thinking_budget' grün
+  - Live-Session mit 3 Tool-Runden zeigt Thinking-Blöcke im Replay
+created_by: yuno
+created_at: 2026-07-20
+model: MiniMax-M3
+provider: minimax
+---
+```
+
+Field semantics:
+- `slug` — lower-kebab-case identifier. Used as the idempotency-key prefix when the plan is approved and seeded to Kanban (so re-approving the same plan is a no-op).
+- `scope_tiers` — explicit A/B/C categorisation. Parsers seed higher tiers first.
+- `risks` — bullet list; each line is preserved as a Kanban-task comment by H-22.
+- `verification` — bullet list of runnable commands. H-22 surfaces them on the root task for fast check.
+
+### Required machine-readable task block
+
+After the frontmatter and the human-readable sections, add a single fenced block:
+
+````markdown
+```tasks
+- [ ] T1: H-04 Secrets-Migration | skill: hermes-v2-helper | verify: bash -n .env
+- [ ] T2: H-05 state.db-Diät | skill: hermes-v2-helper | verify: sqlite3 .backup /tmp/x.db && du -sh state.db
+- [ ] T3: H-10 MiniMax-Interleaved-Thinking | skill: hermes-core-patch | verify: pytest tests/run_agent/test_minimax_tool_reasoning.py
+```
+````
+
+Line format: `- [ ] T<n>: <Title> | skill: <skill-slug> | verify: <command>`
+
+- `T<n>` — stable task ID within the plan. Used for parent/child linking.
+- `skill:` — comma-separated list of skill slugs to force-load when the worker picks up this task.
+- `verify:` — shell command the worker must run before completing. H-22 stores it on the task and surfaces it in webui.
+
+Children use `parent:` and `depends:` fields:
+
+````markdown
+```tasks
+- [ ] T1: Phase 1 setup | skill: hermes-v2-helper
+- [ ] T1.1: Apply H-10 patch | parent: T1 | skill: hermes-core-patch | verify: pytest tests/run_agent/test_minimax_tool_reasoning.py
+- [ ] T1.2: Apply H-11 patch | parent: T1 | depends: [T1.1] | skill: hermes-core-patch | verify: pytest tests/run_agent/test_thinking_budget_ultra.py
+```
+````
+
+### Parser guarantees (contract for H-22)
+
+A plan is **approvable** iff:
+1. Frontmatter parses as YAML and contains all required keys.
+2. At least one `- [ ]` line exists inside a single `` ```tasks `` fenced block.
+3. Every `T<n>` ID is unique within the plan.
+4. Every `verify:` value is a non-empty shell line.
+5. The plan file lives under `.hermes/plans/` (resolved against the active workspace).
+
+Free-form plans (no v2 contract) are still usable for human execution; `/plan approve` on a free-form plan falls back to `decompose_task` and seeds a single triage task in Kanban instead of the structured tree.
+
+### Worked example (hermes-v2 plan, abridged)
+
+```markdown
+---
+slug: starman-booster-gold-red-star
+title: Hermes v2 Verbesserungsplan
+goal: Hermes/Yuno auf Claude Code / Kimi Code Workflow-Niveau heben.
+scope_tiers:
+  A: [H-01, H-10, H-11, H-22]
+  B: [H-12, H-13, H-20, H-50]
+  C: [H-08, H-15, H-64]
+risks:
+  - Core-Patches kollidieren mit Upstream → git revert
+  - state.db-VACUUM braucht 2× Disk → Freien Platz prüfen
+verification:
+  - pytest tests/run_agent/ -k 'minimax or thinking_budget' grün
+created_by: yuno
+created_at: 2026-07-20
+model: MiniMax-M3
+provider: minimax
+---
+
+# Hermes v2 Verbesserungsplan
+
+> Plan-file: this very document. Goals, risks, and verification above.
+> Phase ordering and rationale in §Phases below.
+
+## Phases
+
+[free-form prose — phases 0..6 with H-task summaries]
+
+## Tasks
+
+```tasks
+- [ ] T1: Phase 0 — Hygiene | parent: root | skill: hermes-v2-helper
+- [ ] T1.1: H-01 Baseline-Snapshot | parent: T1 | skill: hermes-v2-helper | verify: ls ~/hermes-v2-baseline-*
+- [ ] T1.2: H-04 Secrets-Migration | parent: T1 | depends: [T1.1] | skill: hermes-v2-helper | verify: grep -c DASHBOARD ~/.hermes/.env
+- [ ] T2: Phase 1 — Tool-Calling + M3-Tuning | parent: root | skill: hermes-core-patch
+- [ ] T2.1: H-10 MiniMax-Interleaved-Thinking | parent: T2 | skill: hermes-core-patch | verify: pytest tests/run_agent/test_minimax_tool_reasoning.py
+- [ ] T2.2: H-11 ultra in THINKING_BUDGET | parent: T2 | depends: [T2.1] | skill: hermes-core-patch | verify: pytest tests/run_agent/test_thinking_budget_ultra.py
+```
+```
+
 ## Save location
 
 Save the plan with `write_file` under:
 - `.hermes/plans/YYYY-MM-DD_HHMMSS-<slug>.md`
 
 Treat that as relative to the active working directory / backend workspace. Hermes file tools are backend-aware, so using this relative path keeps the plan with the workspace on local, docker, ssh, modal, and daytona backends.
+
+**Pitfall: verify the exact `.hermes/` spelling.** The directory is `.hermes/plans/`, not `.herme/plans/`. After `write_file`, immediately check the tool result's `resolved_path`. If it does not start with `.hermes/plans/`, write the plan again to the correct path with `write_file`; do not continue with a typo-path plan.
 
 If the runtime provides a specific target path, use that exact path.
 If not, create a sensible timestamped filename yourself under `.hermes/plans/`.
@@ -100,6 +250,7 @@ Every step is one action:
 [50 lines of code across 5 files]
 ```
 
+set -euo pipefail
 **Right size:**
 ```markdown
 ### Task 1: Create User model with email field
@@ -112,6 +263,7 @@ Every step is one action:
 [15 lines, 1 file]
 ```
 
+set -euo pipefail
 ## Plan Document Structure
 
 ### Header (Required)
@@ -132,6 +284,7 @@ Every plan MUST start with:
 ---
 ```
 
+set -euo pipefail
 ### Task Structure
 
 Each task follows this format:
@@ -154,6 +307,7 @@ def test_specific_behavior():
     assert result == expected
 ```
 
+set -euo pipefail
 **Step 2: Run test to verify failure**
 
 Run: `pytest tests/path/test.py::test_specific_behavior -v`
@@ -166,6 +320,7 @@ def function(input):
     return expected
 ```
 
+set -euo pipefail
 **Step 4: Run test to verify pass**
 
 Run: `pytest tests/path/test.py::test_specific_behavior -v`
@@ -177,6 +332,8 @@ Expected: PASS
 git add tests/path/test.py src/path/file.py
 git commit -m "feat: add specific feature"
 ```
+
+set -euo pipefail
 ````
 
 ## Writing Process
@@ -207,6 +364,7 @@ search_files("*.py", target="files", path="tests/")
 read_file("src/app.py")
 ```
 
+set -euo pipefail
 ### Step 3: Design Approach
 
 Decide:
@@ -271,6 +429,7 @@ class User:
         self.email = email
 ```
 
+set -euo pipefail
 ### TDD (Test-Driven Development)
 
 Every task that produces code should include the full TDD cycle:
@@ -289,6 +448,7 @@ git add [files]
 git commit -m "type: description"
 ```
 
+set -euo pipefail
 ## Common Mistakes
 
 ### Vague Tasks
