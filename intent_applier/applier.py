@@ -130,7 +130,6 @@ class IntentApplier:
         redrive_base_backoff: float = 120.0,
         redrive_multiplier: float = 2.0,
         redrive_max_backoff: float = 1800.0,
-        max_redrive_attempts: int = 5,
         redrive_give_up_attempts: int = 0,
     ):
         self.inbox_dir = Path(inbox_dir)
@@ -155,10 +154,9 @@ class IntentApplier:
         self.redrive_base_backoff = redrive_base_backoff
         self.redrive_multiplier = redrive_multiplier
         self.redrive_max_backoff = redrive_max_backoff
-        self.max_redrive_attempts = max_redrive_attempts
         # Fix B: attempts after which a partial is truly "capped" (given up,
         # left for the PartialBacklogMonitor alert). 0 => NEVER give up — past
-        # max_redrive_attempts the backoff is already pinned at redrive_max_backoff
+        # the give-up attempt count the backoff is already pinned at redrive_max_backoff
         # (a slow lane), so transient partials keep self-healing at that cadence.
         # Everything in partial/ is transient by construction (permanent/gate
         # failures dead-letter), so a terminal cap surrenders on failures that
@@ -475,7 +473,7 @@ class IntentApplier:
             ("capped") for the PartialBacklogMonitor alert. Default 0 => NEVER
             give up: every partial is transient by construction (permanent/gate
             failures dead-letter, never land here), so surrendering would strand
-            a "try later" failure forever. Past max_redrive_attempts the backoff
+            a "try later" failure forever. Past the give-up attempt count the backoff
             below is already pinned at redrive_max_backoff, i.e. a slow lane that
             keeps self-healing (esp. paired with the Fix A pre-flight, which
             clears the common already-satisfied re-drive without a :4100 write);

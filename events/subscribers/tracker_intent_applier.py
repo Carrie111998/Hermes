@@ -88,7 +88,6 @@ def _redrive_config_from_env() -> dict:
         "redrive_base_backoff": _f("TRACKER_APPLIER_REDRIVE_BASE_SECONDS", 120.0),
         "redrive_multiplier": _f("TRACKER_APPLIER_REDRIVE_MULTIPLIER", 2.0),
         "redrive_max_backoff": _f("TRACKER_APPLIER_REDRIVE_MAX_BACKOFF_SECONDS", 1800.0),
-        "max_redrive_attempts": _i("TRACKER_APPLIER_REDRIVE_MAX_ATTEMPTS", 5),
         # Fix B: 0 => never give up (slow-lane retry at max_backoff forever).
         # Set >0 only to restore a terminal "capped" after N attempts.
         "redrive_give_up_attempts": _i("TRACKER_APPLIER_REDRIVE_GIVE_UP_ATTEMPTS", 0),

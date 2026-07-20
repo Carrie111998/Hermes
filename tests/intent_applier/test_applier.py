@@ -509,7 +509,7 @@ class TestRedrivePartials:
         assert (mailbox["inbox"] / "x_APPROVAL_INTENT_main.rd6.json").exists()
 
     def test_slow_lane_still_honours_max_backoff_cadence(self, mailbox, applier):
-        # Past max_redrive_attempts the backoff is pinned at redrive_max_backoff
+        # Past the give-up attempt count the backoff is pinned at redrive_max_backoff
         # (1800s). An rd8 partial only 1000s old is still "waiting", proving the
         # slow lane retries at the capped cadence rather than hot-looping.
         a, _j, _m = applier
