@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -273,6 +274,10 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
 
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr(
+        "gateway.status._claim_gateway_control_plane_context",
+        lambda: contextlib.nullcontext,
+    )
     monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
     monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
     monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)

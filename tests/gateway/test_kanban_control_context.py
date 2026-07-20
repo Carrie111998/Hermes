@@ -27,7 +27,9 @@ def _event(text: str) -> SimpleNamespace:
     )
 
 
-def test_kanban_handler_arms_control_plane_around_run_slash(monkeypatch):
+def test_kanban_handler_arms_control_plane_around_run_slash(
+    tmp_path, monkeypatch
+):
     seen = {}
 
     def fake_run_slash(_text):
@@ -35,9 +37,17 @@ def test_kanban_handler_arms_control_plane_around_run_slash(monkeypatch):
         return "ok"
 
     monkeypatch.setattr("hermes_cli.kanban.run_slash", fake_run_slash)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert status.acquire_gateway_runtime_lock() is True
     handler = GatewaySlashCommandsMixin()
+    handler._gateway_control_plane_context = (
+        status._claim_gateway_control_plane_context()
+    )
 
-    output = asyncio.run(handler._handle_kanban_command(_event("/kanban list")))
+    try:
+        output = asyncio.run(handler._handle_kanban_command(_event("/kanban list")))
+    finally:
+        status.release_gateway_runtime_lock()
 
     assert output == "ok"
     assert seen["active_inside"] is True
@@ -45,14 +55,24 @@ def test_kanban_handler_arms_control_plane_around_run_slash(monkeypatch):
     assert status.gateway_control_plane_active() is False
 
 
-def test_kanban_handler_capability_does_not_leak_on_error(monkeypatch):
+def test_kanban_handler_capability_does_not_leak_on_error(
+    tmp_path, monkeypatch
+):
     def boom(_text):
         raise RuntimeError("kaput")
 
     monkeypatch.setattr("hermes_cli.kanban.run_slash", boom)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert status.acquire_gateway_runtime_lock() is True
     handler = GatewaySlashCommandsMixin()
+    handler._gateway_control_plane_context = (
+        status._claim_gateway_control_plane_context()
+    )
 
-    output = asyncio.run(handler._handle_kanban_command(_event("/kanban list")))
+    try:
+        output = asyncio.run(handler._handle_kanban_command(_event("/kanban list")))
+    finally:
+        status.release_gateway_runtime_lock()
 
     assert isinstance(output, str)
     assert status.gateway_control_plane_active() is False

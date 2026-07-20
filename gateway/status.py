@@ -40,6 +40,9 @@ _LOCKS_DIRNAME = "gateway-locks"
 _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
+# Compatibility tombstone only.  Runtime-lock authority is intentionally kept
+# in a closure below so assigning a file-like object to this historical module
+# attribute cannot manufacture ownership provenance.
 _gateway_lock_handle = None
 # Windows byte-range locks are mandatory for other readers. Lock a byte well
 # past the JSON payload so runtime status / PID readers can still read the file
@@ -789,53 +792,232 @@ def _release_file_lock(handle) -> None:
         pass
 
 
-def acquire_gateway_runtime_lock() -> bool:
-    """Claim the cross-process runtime lock for the gateway.
+def _build_gateway_runtime_lock_manager():
+    """Create process-private runtime-lock state and authority operations.
 
-    Unlike the PID file, the lock is owned by the live process itself. If the
-    process dies abruptly, the OS releases the lock automatically.
+    The state deliberately lives in this closure, not in an assignable module
+    global.  A helper may import ``gateway.status`` and assign the historical
+    ``_gateway_lock_handle`` name, but it cannot thereby alter the retained
+    handle, acquire-time owner identity, immutable file stamp, or opaque
+    control-plane token used by these operations.
     """
-    global _gateway_lock_handle
-    if _gateway_lock_handle is not None:
-        return True
 
-    path = _get_gateway_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+", encoding="utf-8")
-    if not _try_acquire_file_lock(handle):
-        handle.close()
-        return False
-    _write_gateway_lock_record(handle)
-    _gateway_lock_handle = handle
-    _clear_running_pid_cache()
-    return True
+    state_lock = threading.RLock()
+    state: dict[str, Any] = {"lease": None}
+    control_plane_token: contextvars.ContextVar[object | None] = (
+        contextvars.ContextVar("hermes_gateway_control_plane_token", default=None)
+    )
+
+    def _file_stamp(handle) -> tuple[int, int, int, int, int]:
+        stat_result = os.fstat(handle.fileno())
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            int(stat_result.st_ctime_ns),
+        )
+
+    def _payload_digest(handle) -> str:
+        position = handle.tell()
+        try:
+            handle.seek(0)
+            payload = handle.read()
+        finally:
+            handle.seek(position)
+        return hashlib.sha256(str(payload).encode("utf-8")).hexdigest()
+
+    def owns(
+        authority_root: Optional[Path] = None,
+        *,
+        authority_token: Optional[object] = None,
+    ) -> bool:
+        with state_lock:
+            lease = state["lease"]
+            if lease is None:
+                return False
+            handle = lease["handle"]
+            try:
+                if handle.closed or lease["owner_pid"] != os.getpid():
+                    return False
+                current_start = _get_process_start_time(os.getpid())
+                if (
+                    lease["owner_start"] is not None
+                    and current_start is not None
+                    and lease["owner_start"] != current_start
+                ):
+                    return False
+                if authority_token is not None and authority_token is not lease["token"]:
+                    return False
+                lock_path = lease["lock_path"]
+                if authority_root is not None:
+                    expected = (Path(authority_root).resolve() / _GATEWAY_LOCK_FILENAME)
+                    if expected != lock_path:
+                        return False
+                # Both the retained descriptor and the published path must
+                # remain the exact file acquired by this process.
+                if _file_stamp(handle) != lease["file_stamp"]:
+                    return False
+                path_stat = os.stat(lock_path)
+                if (int(path_stat.st_dev), int(path_stat.st_ino)) != (
+                    lease["file_stamp"][0],
+                    lease["file_stamp"][1],
+                ):
+                    return False
+                if _payload_digest(handle) != lease["payload_digest"]:
+                    return False
+                record = _read_gateway_lock_record(lock_path)
+                if record is None or _pid_from_record(record) != lease["owner_pid"]:
+                    return False
+                if record.get("start_time") != lease["owner_start"]:
+                    return False
+            except (OSError, ValueError, TypeError):
+                return False
+            return True
+
+    def acquire() -> bool:
+        with state_lock:
+            if state["lease"] is not None:
+                return owns()
+            path = _get_gateway_lock_path().resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(path, "a+", encoding="utf-8")
+            if not _try_acquire_file_lock(handle):
+                handle.close()
+                return False
+            try:
+                _write_gateway_lock_record(handle)
+                state["lease"] = {
+                    "handle": handle,
+                    "lock_path": path,
+                    "owner_pid": os.getpid(),
+                    "owner_start": _get_process_start_time(os.getpid()),
+                    "file_stamp": _file_stamp(handle),
+                    "payload_digest": _payload_digest(handle),
+                    "token": object(),
+                }
+            except Exception:
+                _release_file_lock(handle)
+                handle.close()
+                raise
+            return True
+
+    def release() -> None:
+        with state_lock:
+            lease = state["lease"]
+            state["lease"] = None
+            if lease is None:
+                return
+            handle = lease["handle"]
+            _release_file_lock(handle)
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def after_fork_child() -> None:
+        """Drop inherited authority without unlocking the parent's OFD."""
+        # Do not acquire state_lock here: another thread could have owned the
+        # inherited RLock at fork time and no such thread exists in the child
+        # to release it. The child is single-threaded at this callback point.
+        lease = state["lease"]
+        state["lease"] = None
+        if lease is not None:
+            try:
+                # Never call LOCK_UN here: flock state belongs to the open file
+                # description shared with the parent. Closing only the child's
+                # duplicate preserves the parent's lock.
+                lease["handle"].close()
+            except OSError:
+                pass
+        control_plane_token.set(None)
+
+    def has_retained_lock_for(lock_path: Path) -> bool:
+        with state_lock:
+            lease = state["lease"]
+            if lease is None:
+                return False
+            try:
+                return Path(lock_path).resolve() == lease["lock_path"] and owns()
+            except OSError:
+                return False
+
+    def claim_control_plane_context():
+        with state_lock:
+            lease = state["lease"]
+            if lease is None or not owns():
+                raise RuntimeError("gateway-owned runtime-lock provenance is required")
+            authority_token = lease["token"]
+
+        @contextlib.contextmanager
+        def arm():
+            if not owns(authority_token=authority_token):
+                raise RuntimeError("gateway-owned runtime-lock provenance is no longer valid")
+            reset_token = control_plane_token.set(authority_token)
+            try:
+                if not owns(authority_token=authority_token):
+                    raise RuntimeError(
+                        "gateway-owned runtime-lock provenance changed while arming"
+                    )
+                yield
+            finally:
+                control_plane_token.reset(reset_token)
+
+        return arm
+
+    def control_plane_active() -> bool:
+        try:
+            token = control_plane_token.get()
+        except Exception:
+            return False
+        return token is not None and owns(authority_token=token)
+
+    return (
+        acquire,
+        release,
+        owns,
+        has_retained_lock_for,
+        after_fork_child,
+        claim_control_plane_context,
+        control_plane_active,
+    )
+
+
+(
+    _acquire_gateway_runtime_lock,
+    _release_gateway_runtime_lock,
+    _process_owns_gateway_runtime_lock,
+    _has_retained_gateway_runtime_lock_for,
+    _drop_gateway_runtime_authority_after_fork,
+    _claim_gateway_control_plane_context,
+    _gateway_control_plane_active,
+) = _build_gateway_runtime_lock_manager()
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_gateway_runtime_authority_after_fork)
+
+
+def acquire_gateway_runtime_lock() -> bool:
+    """Claim the OS lock and capture non-assignable ownership provenance."""
+    acquired = bool(_acquire_gateway_runtime_lock())
+    if acquired:
+        _clear_running_pid_cache()
+    return acquired
 
 
 def release_gateway_runtime_lock() -> None:
-    """Release the gateway runtime lock when owned by this process."""
-    global _gateway_lock_handle
-    handle = _gateway_lock_handle
-    if handle is None:
-        return
-    _gateway_lock_handle = None
-    _release_file_lock(handle)
-    try:
-        handle.close()
-    except OSError:
-        pass
+    """Release the gateway runtime lock and destroy its authority token."""
+    _release_gateway_runtime_lock()
     _clear_running_pid_cache()
 
 
 def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     """Return True when some process currently owns the gateway runtime lock."""
-    global _gateway_lock_handle
     resolved_lock_path = lock_path or _get_gateway_lock_path()
-    if _gateway_lock_handle is not None and resolved_lock_path == _get_gateway_lock_path():
+    if _has_retained_gateway_runtime_lock_for(resolved_lock_path):
         return True
-
     if not resolved_lock_path.exists():
         return False
-
     handle = open(resolved_lock_path, "a+", encoding="utf-8")
     try:
         if _try_acquire_file_lock(handle):
@@ -849,118 +1031,23 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Control-plane authority (privileged board mutations)
-#
-# Privileged kanban mutations (continuation reviews, one-shot grants, manual
-# claim overrides) must only execute inside the live root gateway process.
-# Authority is proven from two capabilities that cannot be forged by a
-# reparented/double-forked worker:
-#
-#   1. An ephemeral, process-local ContextVar armed ONLY around the root
-#      gateway's ``/kanban`` handler. It is never persisted, never read from
-#      the environment, and never derived from argv.
-#   2. Proof that THIS process owns the retained ``_gateway_lock_handle``
-#      file description for the expected authority root — verified by
-#      descriptor identity (``fstat`` vs canonical on-disk ``stat``), NOT by
-#      the separately writable ``gateway.pid`` record, lock-file contents
-#      alone, or another process merely holding a lock.
-# ---------------------------------------------------------------------------
-
-_GATEWAY_CONTROL_PLANE_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "hermes_gateway_control_plane_active",
-    default=False,
-)
-
-
 @contextlib.contextmanager
 def gateway_control_plane_context():
-    """Arm the ephemeral control-plane capability for the current context.
-
-    The capability is process-local and context-local: ``asyncio.to_thread``
-    inherits the arming (``to_thread`` runs the callable in a copy of the
-    current context), while the reset on exit guarantees the capability never
-    leaks beyond the handler that armed it. A worker process — including a
-    double-forked, setsid, reparented one with a gateway-looking argv — has
-    no way to observe or reconstruct this token.
-    """
-    token = _GATEWAY_CONTROL_PLANE_ACTIVE.set(True)
-    try:
-        yield
-    finally:
-        _GATEWAY_CONTROL_PLANE_ACTIVE.reset(token)
+    """Deprecated public API that deliberately cannot arm gateway authority."""
+    raise RuntimeError(
+        "gateway-owned control-plane context is private to the running gateway"
+    )
+    yield  # pragma: no cover - keeps this a context manager
 
 
 def gateway_control_plane_active() -> bool:
-    """Return True only inside an armed gateway control-plane context."""
-    try:
-        return bool(_GATEWAY_CONTROL_PLANE_ACTIVE.get())
-    except Exception:
-        return False
+    """Return True only for the opaque token captured by the real gateway."""
+    return bool(_gateway_control_plane_active())
 
 
 def process_owns_gateway_runtime_lock(authority_root: Optional[Path] = None) -> bool:
-    """Fail-closed proof that THIS process owns the retained gateway lock.
-
-    Every check must pass; any failure or inconsistency denies:
-
-    - the retained ``_gateway_lock_handle`` exists and is open;
-    - when ``authority_root`` is given, this process's lock path matches the
-      root's canonical ``gateway.lock``;
-    - descriptor identity (``os.fstat`` of the retained handle) equals the
-      canonical on-disk ``gateway.lock`` (``os.stat``), so replacing the
-      file at the path after acquisition fails closed;
-    - the retained lock record still names the current process PID, and the
-      persisted start-time matches the live process start-time when both are
-      readable (PID-reuse guard).
-
-    ``gateway.pid``, argv shape, and lock-file contents alone are NEVER
-    treated as proof of lock ownership.
-    """
-    handle = _gateway_lock_handle
-    if handle is None:
-        return False
-    try:
-        if handle.closed:
-            return False
-    except Exception:
-        return False
-    try:
-        own_lock_path = _get_gateway_lock_path()
-        if authority_root is not None:
-            expected_lock_path = Path(authority_root) / _GATEWAY_LOCK_FILENAME
-            try:
-                if expected_lock_path.resolve() != own_lock_path.resolve():
-                    return False
-            except OSError:
-                return False
-        # Descriptor identity: the file we hold open must still be the file
-        # currently published at the canonical lock path. If an attacker (or
-        # a racing re-install) replaced the path with a new inode, fstat and
-        # stat diverge and authority is denied.
-        fd_stat = os.fstat(handle.fileno())
-        path_stat = os.stat(own_lock_path)
-        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-            return False
-        # The lock record we retained must still describe this live process.
-        # A clobbered/rewritten record cannot prove ownership, so it denies.
-        record = _read_gateway_lock_record(own_lock_path)
-        if record is None:
-            return False
-        recorded_pid = _pid_from_record(record)
-        if recorded_pid is None or recorded_pid != os.getpid():
-            return False
-        recorded_start = record.get("start_time")
-        current_start = _get_process_start_time(os.getpid())
-        if (
-            recorded_start is not None
-            and current_start is not None
-            and recorded_start != current_start
-        ):
-            return False
-    except (OSError, ValueError):
-        return False
-    return True
+    """Prove ownership from captured acquire-time state, never module globals."""
+    return bool(_process_owns_gateway_runtime_lock(authority_root))
 
 
 def write_pid_file() -> None:

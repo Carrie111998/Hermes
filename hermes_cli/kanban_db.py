@@ -7233,12 +7233,11 @@ def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
 
 
 def _operator_control_plane_active() -> bool:
-    """True only inside the root gateway's ephemeral control-plane context.
+    """True only inside the root gateway's opaque control-plane context.
 
-    The capability is a process-local ContextVar armed solely by the root
-    gateway around its ``/kanban`` dispatch. It is never persisted, never
-    read from the environment, and never inferred from argv — a forked or
-    reparented worker process cannot observe or reconstruct it.
+    The ContextVar contains the exact opaque token captured by the running
+    gateway's private lock lease and is armed only through the closure retained
+    on its GatewayRunner. The public context-manager API cannot arm it.
     """
     try:
         from gateway.status import gateway_control_plane_active
@@ -7251,9 +7250,9 @@ def _operator_control_plane_active() -> bool:
 def _operator_gateway_lock_owned(authority_root: Path) -> bool:
     """True only when THIS process owns the retained gateway lock for root.
 
-    Proof is by retained file-description identity (fstat vs canonical stat),
-    never by the separately writable ``gateway.pid`` record, gateway-looking
-    argv, or the contents of the advisory lock file alone.
+    Proof is by closure-private acquire-time provenance: owner PID/start,
+    retained file-description identity and immutable file stamp/payload. It is
+    never derived from assignable module state, ``gateway.pid``, or argv.
     """
     try:
         from gateway.status import process_owns_gateway_runtime_lock
@@ -7320,20 +7319,14 @@ def _continuation_operator_context(
     if authority_root is None:
         raise ContinuationAuthorizationError("operator_authority_root_unresolved")
     if not _operator_control_plane_active():
-        # Authorization is a control-plane mutation and therefore executes
-        # only inside the root gateway's ephemeral ``/kanban`` dispatch
-        # context — never in a descendant CLI/worker process. The capability
-        # is a process-local ContextVar that is never persisted, never read
-        # from the environment, and never derived from argv, so a worker
-        # cannot acquire it by scrubbing env, changing SID/PGID,
-        # double-forking, or being reparented.
+        # Authorization executes only inside the root gateway's privately
+        # armed ``/kanban`` dispatch context. The public status API cannot mint
+        # the opaque lock-lease token, and fork children discard it at fork.
         raise ContinuationAuthorizationError("operator_gateway_context_required")
     if not _operator_gateway_lock_owned(authority_root):
-        # The process must also prove it owns the retained gateway runtime
-        # lock for this board's authority root. Proof is by retained
-        # file-description identity, never by the separately writable
-        # gateway.pid record — replacing that record while the real gateway
-        # holds the lock no longer confers authority.
+        # The process must also prove closure-private acquire-time provenance
+        # for this board root. Assigning a fake handle, rewriting PID/start
+        # records, or inheriting a handle across fork cannot confer authority.
         raise ContinuationAuthorizationError("operator_gateway_process_required")
     profile = str(get_active_profile_name() or "").strip().casefold()
     if not profile or profile == "custom":

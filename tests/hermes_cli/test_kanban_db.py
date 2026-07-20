@@ -2630,6 +2630,145 @@ def test_continuation_forged_gateway_pid_record_cannot_claim_authority(
         assert not [e for e in events if e.kind == "claimed"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock exploit regression")
+def test_exec_fresh_fake_retained_handle_and_public_context_cannot_claim_authority(
+    kanban_home, monkeypatch
+):
+    """Exact R9 regression: an exec-fresh helper may open (but not acquire)
+    the real held lock, assign that handle to the legacy public module state,
+    and rewrite the same inode's PID/start record.  It still cannot arm the
+    private control context, append authoritative review evidence, or claim an
+    operator override."""
+    from gateway import status as gateway_status
+
+    pr_tuple = _continuation_tuple("o269", "omnia", 568, _CONTINUATION_SHA_A)
+    with kb.connect() as conn:
+        task_id = _create_continuation_task(conn, pr_tuple)
+    db_path = kb.kanban_db_path()
+    authority_root = db_path.parent
+    monkeypatch.setenv("HERMES_HOME", str(authority_root))
+    assert gateway_status.acquire_gateway_runtime_lock() is True
+
+    helper = r'''
+import fcntl
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from gateway import status
+from hermes_cli import kanban_db as kb
+
+db_arg, authority_arg, task_id = sys.argv[1:]
+db_path = Path(db_arg)
+authority_root = Path(authority_arg)
+lock_path = authority_root / "gateway.lock"
+
+# The helper is already exec-fresh (spawned with ``python -c``). Complete the
+# reviewed setsid/double-fork/reparent shape before touching authority state.
+first_pid = os.getpid()
+os.setsid()
+second_pid = os.fork()
+if second_pid > 0:
+    os._exit(0)
+deadline = time.monotonic() + 3
+while os.getppid() == first_pid and time.monotonic() < deadline:
+    time.sleep(0.01)
+reparented = os.getppid() != first_pid
+
+handle = open(lock_path, "r+", encoding="utf-8")
+lock_contended = False
+try:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    lock_contended = True
+else:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+# The rejected R8 implementation trusted both of these attacker-controlled
+# mutations: assignable module state plus a same-inode PID/start rewrite.
+status._gateway_lock_handle = handle
+handle.seek(0)
+handle.truncate()
+json.dump(status._build_pid_record(), handle)
+handle.flush()
+os.fsync(handle.fileno())
+
+def attempt_privileged_mutations():
+    result = {
+        "lock_contended": lock_contended,
+        "reparented": reparented,
+        "owns": status.process_owns_gateway_runtime_lock(authority_root),
+    }
+    with kb.connect(db_path) as conn:
+        try:
+            kb.record_continuation_review(
+                conn,
+                task_id,
+                verdict="fix-required",
+                reason="exec-fresh fake retained handle",
+            )
+        except kb.ContinuationAuthorizationError as exc:
+            result["review"] = exc.code
+        else:
+            result["review"] = "recorded"
+        try:
+            claimed = kb.claim_task(
+                conn,
+                task_id,
+                operator_override_reason="exec-fresh fake retained handle",
+            )
+        except kb.ContinuationAuthorizationError as exc:
+            result["claim"] = exc.code
+        else:
+            result["claim"] = "claimed" if claimed is not None else "not_claimed"
+    return result
+
+try:
+    with status.gateway_control_plane_context():
+        public_context_armed = status.gateway_control_plane_active()
+        result = attempt_privileged_mutations()
+except RuntimeError:
+    public_context_armed = False
+    result = attempt_privileged_mutations()
+result["public_context_armed"] = public_context_armed
+handle.close()
+print(json.dumps(result, sort_keys=True))
+'''
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(authority_root)
+    env["HERMES_PROFILE_NAME"] = "default"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", helper, str(db_path), str(authority_root), task_id],
+            cwd=Path(__file__).parents[2],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+    finally:
+        gateway_status.release_gateway_runtime_lock()
+
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result == {
+        "claim": "operator_gateway_context_required",
+        "lock_contended": True,
+        "owns": False,
+        "public_context_armed": False,
+        "reparented": True,
+        "review": "operator_gateway_context_required",
+    }
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, task_id).status == "ready"
+        events = kb.list_events(conn, task_id)
+        assert len([event for event in events if event.kind == "continuation_reviewed"]) == 1
+        assert not [event for event in events if event.kind == "claimed"]
+        assert not [event for event in events if event.kind == "respawn_guard_bypassed"]
+
+
 def test_continuation_real_gateway_lock_and_context_authorize(
     kanban_home, monkeypatch
 ):
@@ -2661,7 +2800,8 @@ def test_continuation_real_gateway_lock_and_context_authorize(
                     reason="context must be armed",
                 )
             assert exc_info.value.code == "operator_gateway_context_required"
-        with gateway_status.gateway_control_plane_context():
+        arm_control_plane = gateway_status._claim_gateway_control_plane_context()
+        with arm_control_plane():
             with kb.connect() as conn:
                 task_id = _create_continuation_task(conn, pr_tuple)
                 authorization = _authorize_continuation(conn, task_id, pr_tuple)

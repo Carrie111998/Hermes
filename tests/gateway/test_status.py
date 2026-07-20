@@ -1736,26 +1736,148 @@ class TestGatewayControlPlaneAuthority:
     def test_control_plane_context_defaults_inactive(self):
         assert status.gateway_control_plane_active() is False
 
-    def test_control_plane_context_arms_and_resets(self):
-        with status.gateway_control_plane_context():
-            assert status.gateway_control_plane_active() is True
-        assert status.gateway_control_plane_active() is False
-
-    def test_control_plane_context_resets_on_exception(self):
-        with pytest.raises(RuntimeError):
+    def test_public_control_plane_context_cannot_arm(self):
+        """Importing the public status module must not mint gateway authority."""
+        with pytest.raises(RuntimeError, match="gateway-owned"):
             with status.gateway_control_plane_context():
-                raise RuntimeError("boom")
+                pass
         assert status.gateway_control_plane_active() is False
 
-    def test_control_plane_context_propagates_through_to_thread(self):
+    def test_assigning_lookalike_contextvar_cannot_arm(self, monkeypatch):
+        import contextvars
+
+        lookalike = contextvars.ContextVar("hermes_gateway_control_plane_token")
+        monkeypatch.setattr(
+            status,
+            "_GATEWAY_CONTROL_PLANE_ACTIVE",
+            lookalike,
+            raising=False,
+        )
+        lookalike.set(True)
+        assert status.gateway_control_plane_active() is False
+
+    def test_private_gateway_context_arms_and_propagates_through_to_thread(
+        self, tmp_path, monkeypatch
+    ):
         import asyncio
 
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        arm_control_plane = status._claim_gateway_control_plane_context()
+
         async def probe():
-            with status.gateway_control_plane_context():
+            with arm_control_plane():
                 return await asyncio.to_thread(status.gateway_control_plane_active)
 
         assert asyncio.run(probe()) is True
         assert status.gateway_control_plane_active() is False
+
+    def test_assigning_open_but_unlocked_fake_handle_cannot_spoof_owner(
+        self, tmp_path, monkeypatch
+    ):
+        """The legacy module attribute is not authority provenance."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = tmp_path / "gateway.lock"
+        lock_path.write_text(json.dumps(status._build_pid_record()), encoding="utf-8")
+        fake_handle = open(lock_path, "r+", encoding="utf-8")
+        monkeypatch.setattr(status, "_gateway_lock_handle", object())
+        assert status.process_owns_gateway_runtime_lock(tmp_path) is False
+        monkeypatch.setattr(status, "_gateway_lock_handle", fake_handle)
+        try:
+            assert status.process_owns_gateway_runtime_lock(tmp_path) is False
+        finally:
+            fake_handle.close()
+
+    def test_same_inode_pid_record_rewrite_invalidates_provenance(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        lock_path = tmp_path / "gateway.lock"
+        # Even byte-equivalent PID/start metadata was written by an external
+        # handle after acquisition and must invalidate the captured provenance.
+        with open(lock_path, "r+", encoding="utf-8") as attacker:
+            attacker.seek(0)
+            attacker.truncate()
+            json.dump(status._build_pid_record(), attacker)
+            attacker.flush()
+            os.fsync(attacker.fileno())
+        assert status.process_owns_gateway_runtime_lock(tmp_path) is False
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork regression")
+    def test_fork_inherited_handle_and_rewritten_record_cannot_spoof_owner(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:  # pragma: no cover - assertion happens in parent
+            os.close(read_fd)
+            try:
+                lock_path = tmp_path / "gateway.lock"
+                with open(lock_path, "r+", encoding="utf-8") as attacker:
+                    attacker.seek(0)
+                    attacker.truncate()
+                    json.dump(status._build_pid_record(), attacker)
+                    attacker.flush()
+                    os.fsync(attacker.fileno())
+                result = status.process_owns_gateway_runtime_lock(tmp_path)
+                os.write(write_fd, b"true" if result else b"false")
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        os.waitpid(child, 0)
+        result = os.read(read_fd, 16)
+        os.close(read_fd)
+        assert result == b"false"
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork regression")
+    def test_atfork_revocation_does_not_unlock_parent_lease(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.acquire_gateway_runtime_lock() is True
+        read_fd, write_fd = os.pipe()
+        child = os.fork()
+        if child == 0:  # pragma: no cover - assertion happens in parent
+            os.close(read_fd)
+            try:
+                os.write(
+                    write_fd,
+                    b"true" if status.process_owns_gateway_runtime_lock() else b"false",
+                )
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        os.waitpid(child, 0)
+        child_result = os.read(read_fd, 16)
+        os.close(read_fd)
+        assert child_result == b"false"
+        assert status.process_owns_gateway_runtime_lock(tmp_path) is True
+
+    def test_substitute_lock_relocated_to_real_root_has_no_authority(
+        self, tmp_path, monkeypatch
+    ):
+        """A helper-owned disposable lock cannot become the real gateway lock
+        merely by publishing its inode at the canonical authority path."""
+        disposable_root = tmp_path / "disposable"
+        real_root = tmp_path / "real"
+        disposable_root.mkdir()
+        real_root.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(disposable_root))
+        assert status.acquire_gateway_runtime_lock() is True
+        os.replace(
+            disposable_root / "gateway.lock",
+            real_root / "gateway.lock",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(real_root))
+        assert status.process_owns_gateway_runtime_lock(real_root) is False
+        with pytest.raises(RuntimeError, match="gateway-owned"):
+            with status.gateway_control_plane_context():
+                pass
 
     def test_lock_proof_denied_without_retained_handle(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
