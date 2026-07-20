@@ -212,10 +212,44 @@ job_briefs:
       create a case from completion evidence.
 
       '
+    - 'A case''s task set closes when the case opens. The supervisor or HDB message
+      that opens a case enumerates its tasks, and exactly those become its work_items.
+      The set does not grow from worker chatter afterwards.
+
+      A message reporting what was DONE is completion evidence: it UPDATES the
+      existing task set and never extends it. Before writing work_items for such a
+      message, read the case''s current items with pa_business_read operation
+      tgg_case_lookup, then map each reported action onto the task it satisfies and
+      emit that task under its ESTABLISHED label, copied verbatim from the existing
+      item, with the new status. Never restate a task in the reporter''s wording:
+      downstream state is keyed by label, so re-labelling forks one task into two —
+      the same defect as inventing a task.
+
+      One task may be satisfied by several actions. A defect fixed in more than one
+      step is ONE task closed, not one per step: record the single established task
+      as done, put the steps in note, and union their message ids into evidence_refs.
+      Never fragment a task because its fix had multiple parts. A replacement closes
+      the defect it replaces — replacing a component satisfies the task reporting
+      that component as cracked, broken, leaking, choked, or faulty. That inference
+      is settled: do NOT raise a clarification for it.
+
+      Scope grows only on an explicit statement, never by inference. A reporter
+      restating, elaborating, or adding detail to a problem already in the set is
+      describing an existing task — attach it there. Genuinely new scope requires
+      someone naming work beyond the opened set: a supervisor adding it (typically
+      with a work costing) or a worker explicitly flagging work he was not sent for.
+      When in doubt, GROUP — attach to the closest existing task rather than open a
+      new one. If an item is genuinely additional and matches no existing task, never
+      add a work_item for it silently: call pa_business_write with operation
+      tgg_clarification_raise naming the case and the unmatched item.
+
+      '
     - 'When recording a tgg_case_observation for a case update or status message,
       extract per-item work state into the observation fields as work_items: a list
-      of objects {label, status, note, evidence_refs}. label is required and uses
-      the trade''s own words (for example "window handle", "cistern parts", "ceiling
+      of objects {label, status, note, evidence_refs}. label is required; when the
+      item is a task the case already carries, reuse that task''s established label
+      verbatim so the update lands on the same item, and otherwise use the trade''s
+      own words (for example "window handle", "cistern parts", "ceiling
       spalling"). status is required and must be one of done, pending, or next_appointment,
       taken from the message semantics ("done"/"completed"/"fixed" means done; "next
       appointment"/"coming back"/a scheduled return means next_appointment; otherwise

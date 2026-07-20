@@ -96,7 +96,7 @@ EVENT_LABELS_NEW = (
 )
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
-NEW_INSTRUCTION_COUNT = 12
+NEW_INSTRUCTION_COUNT = 13
 MGMT_NEW_INSTRUCTION_COUNT = 6
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
@@ -481,6 +481,31 @@ def _validate(
     assert "retry with the SAME sourceRefs" in joined
     assert "never remove photo or media" in joined
     assert "pure social acknowledgement" in joined
+    # Scope rule (2026-07-20, teren-ruled): the task set closes at case creation;
+    # completion reports update tasks under their ESTABLISHED label instead of
+    # minting new ones. Label reuse is the load-bearing half — downstream work
+    # state is keyed by normalized label, so re-wording a task forks one portal
+    # row into two, which is the defect this rule exists to close.
+    assert "task set closes when the case opens" in joined
+    assert "does not grow from worker chatter" in joined
+    assert "UPDATES the existing task set and never extends it" in joined
+    assert "ESTABLISHED label, copied verbatim" in joined
+    assert "re-labelling forks one task into two" in joined
+    assert "ONE task closed, not one per step" in joined
+    assert "Never fragment a task" in joined
+    assert "replacement closes the defect it replaces" in joined
+    assert "do NOT raise a clarification for it" in joined
+    assert "Scope grows only on an explicit statement" in joined
+    assert "When in doubt, GROUP" in joined
+    assert "never add a work_item for it silently" in joined
+    assert "tgg_clarification_raise naming the case and the unmatched item" in joined
+    # The completion path must reuse the established label, not re-word it —
+    # the original "uses the trade's own words" phrasing is now conditional.
+    assert "reuse that task's established label verbatim" in joined
+    # Composes with, and does not contradict, the dormant-identifier hold: that
+    # rule still owns evidence resolving only to dormant/completed cases and
+    # must survive this change untouched.
+    assert "A dormant or completed case is never a rival and never an attach target." in joined
     # Exactly one create policy: the consolidated rule is present, the broader
     # June create instruction is gone, and no other instruction names the
     # create operation.
