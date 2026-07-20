@@ -174,6 +174,7 @@ CANONICAL_OPERATIONS = {
     "tgg_case_list",
     "tgg_case_lookup",
     "tgg_case_observation",
+    "tgg_case_query",
     "tgg_case_search",
     "tgg_case_update",
     "tgg_case_wc_attach",
@@ -595,6 +596,13 @@ def _validate(
         "agent_action_record",
     ):
         assert required in permitted, required
+    # Read-only SQL aggregate query [WB:1e543b12]: management's aggregate
+    # surface. Read-only is enforced server-side (SELECT-only vet + read-only
+    # sqlite connection); it is a read, never a case mutation. Ingest inherits
+    # it through the unscoped registry.
+    assert "tgg_case_query" in permitted
+    assert operations["tgg_case_query"]["method"] == "POST"
+    assert operations["tgg_case_query"]["url"].endswith("/api/operator/query")
     # The ingest brief stays unscoped except for a single denied-only
     # subtraction: it keeps every operation it had (including the new reads)
     # and loses only the management-only annotate write. `allowed` absent

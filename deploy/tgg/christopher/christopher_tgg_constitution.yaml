@@ -595,6 +595,7 @@ job_briefs:
       - tgg_case_list
       - tgg_case_lookup
       - tgg_case_observation
+      - tgg_case_query
       - tgg_case_search
       - tgg_case_update
       - tgg_case_wc_attach

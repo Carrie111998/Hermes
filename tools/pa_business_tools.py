@@ -1056,6 +1056,10 @@ def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
     return _handle_tgg_read("tgg_case_lookup", {"jobNo": args.get("jobNo")})
 
 
+def _handle_tgg_case_query(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    return _handle_tgg_read("tgg_case_query", {"sql": args.get("sql")})
+
+
 def _handle_tgg_case_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload = _normalize_case_search_payload(dict(args))
     payload["limit"] = payload.get("limit", 10)
@@ -1574,6 +1578,57 @@ TGG_CASE_LOOKUP_SCHEMA = {
 }
 
 
+TGG_CASE_QUERY_SCHEMA = {
+    "name": "tgg_case_query",
+    "description": (
+        "Answer AGGREGATE / analytical management questions (counts, "
+        "breakdowns, oldest/newest, cases missing evidence) by running ONE "
+        "read-only SQL SELECT against the TGG case database. The server "
+        "enforces read-only: single SELECT statement (WITH ... SELECT is "
+        "fine), no writes/PRAGMA/ATTACH/semicolon chains, ~200-row cap with "
+        "a truncated flag, results as {columns, rows, rowCount, truncated}. "
+        "For a single known case use tgg_case_lookup; for finding a case by "
+        "address/unit use tgg_case_search. Schema (SQLite; timestamps are "
+        "epoch SECONDS; use datetime(col,'unixepoch','+8 hours') for SGT): "
+        "cases(id, job_no, wc_no, zone, report_zone, priority, address, "
+        "block, unit, street_name, postcode, contact_name, contact_phone, "
+        "problem, state IN "
+        "('open','hdb_confirmed','in_progress','completed','closed',"
+        "'cancelled','dismissed_not_a_case','disputed'), completed_at, "
+        "due_at, job_receipt_date, service_line, type_of_work, job_status, "
+        "linkfm_status, feedback, ma_work_coordinator, hdb_officer_name, "
+        "normalized_job_no, created_at, updated_at). "
+        "case_observations(id, case_id -> cases.id, source, source_ref, "
+        "observed_at, fields JSON, confidence, notes, created_at) — evidence "
+        "and work items attach here; fields is a JSON blob, work items are "
+        "under json_each(fields,'$.work_items') with per-item label/status; "
+        "'cases with no evidence' ~= cases with no case_observations rows. "
+        "attention_items(id, kind, severity, title, meta, context, case_id, "
+        "state, handled_at, handled_by, detected_at, created_at, updated_at). "
+        "attention_item_notes(id, attention_item_id, note, author, "
+        "created_at). Example: SELECT count(*) AS n FROM cases WHERE "
+        "block='314' AND state NOT IN ('closed','completed','cancelled',"
+        "'dismissed_not_a_case'). Always alias aggregates, add ORDER BY + "
+        "LIMIT for top-N questions, and state in your reply which rows the "
+        "answer came from."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "sql": {
+                "type": "string",
+                "description": (
+                    "One SQLite SELECT statement. No semicolons, no writes — "
+                    "the endpoint is read-only and will reject anything else."
+                ),
+            },
+        },
+        "required": ["sql"],
+        "additionalProperties": False,
+    },
+}
+
+
 TGG_CASE_SEARCH_SCHEMA = {
     "name": "tgg_case_search",
     "description": (
@@ -1910,6 +1965,14 @@ registry.register(
     toolset="pa-business",
     schema=TGG_CASE_LOOKUP_SCHEMA,
     handler=_handle_tgg_case_lookup,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_query",
+    toolset="pa-business",
+    schema=TGG_CASE_QUERY_SCHEMA,
+    handler=_handle_tgg_case_query,
     check_fn=_bridge_available,
 )
 
