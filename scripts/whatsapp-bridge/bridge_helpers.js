@@ -187,7 +187,14 @@ export function pollUpdateForAggregation({
 }
 
 export function buildTextSendPayload(text, { replyTo, messageStore } = {}) {
-  const content = { text };
+  // linkPreview: null disables Baileys' server-side link-preview generation.
+  // When it is left undefined, Baileys fetches any URL in the text via
+  // link-preview-js to build a preview — a reachable SSRF sink
+  // (GHSA-4gp8-rjrq-ch6q, CWE-918: IPv6/loopback fetch from the bridge host).
+  // link-preview-js has no fix within Baileys' `^3.0.0` optional-peer range, so
+  // we make the sink unreachable instead. The bridge is an agent relay and does
+  // not need sender-embedded rich previews. Keep this on every text send.
+  const content = { text, linkPreview: null };
   const options = {};
   const quoted = messageStore?.get(replyTo);
   if (quoted?.key && quoted?.message) {
