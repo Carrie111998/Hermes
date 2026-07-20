@@ -158,7 +158,12 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _applier_subscriber = TrackerIntentApplierSubscriber(_bus)
     _registry.register(_applier_subscriber)
     _registry.register(CriticSubscriber(_bus))
-    _registry.register(ScribeRealtime(_bus))
+    # ScribeRealtime retired 2026-07-18 (routing v3, P2 one-event-one-
+    # message): its narrated mailbox_message NOTIFICATION copies duplicated
+    # the typed delivery of the same 7 event types (interview/offer landed
+    # in THREE topics per event). Typed events are canonical; plain-language
+    # bodies live in events/formatting.py. Class + tests kept for history.
+    # _registry.register(ScribeRealtime(_bus))
     _registry.register(ScribeActionTelemetry(_bus))
     _registry.register(ScribeVoiceTuning(_bus))
 

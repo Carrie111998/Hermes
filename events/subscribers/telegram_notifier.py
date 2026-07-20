@@ -1,10 +1,19 @@
 """TelegramNotifier subscriber — routes events to Telegram forum topics.
 
+v3 (2026-07-18): ALL routing decisions live in events.routing_policy —
+this subscriber owns delivery mechanics only (verbosity gate, noise
+guards, batching, sends, reverse signals). One event → exactly one
+Telegram message (cross-posting removed); noise guards enforce P4/P6
+(no no-op messages, no verbatim repeats, flaps collapse to incidents).
+Design: docs/superpowers/specs/2026-07-18-notification-routing-v3-design.md
+(~/.hermes parent repo).
+
 Reads topic registry from ~/.hermes/telegram/topics.json and verbosity
 config from ~/.hermes/telegram/verbosity.json.  Delivers messages via
 the gateway's Telegram adapter send() method.
 """
 
+import dataclasses
 import json
 import logging
 import time
@@ -14,271 +23,32 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
+from events.noise_guards import (
+    FlapGuard,
+    RepeatGuard,
+    is_noop_cron_output,
+    normalize_for_fingerprint,
+    strip_agent_iteration_json,
+)
 from events.paths import notifier_batch_path
-from events.producers.agent_source_mapping import canonical_agent_source
+from events.routing_policy import (
+    Attention,
+    Route,
+    WA_IMMEDIATE,
+    classify,
+    resolve_topic_thread,
+)
 from events.schema import Event, EventType, Priority
 from events.state import load_state, save_state
 from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-# Maps event_type string → topic key.
-# The 7 high-stakes trigger event types (job_high_score, application_submitted,
-# application_ready, interview_signal, offer_signal, critic_proposal,
-# curator_daily) are routed by BOTH paths and that is intentional:
-#   1. scribe-realtime renders each into a one-liner and emits a
-#      mailbox_message NOTIFICATION with `to:` set to a Scribe-narrative
-#      topic (e.g. hermes_milestones for interview/offer). resolve_target()
-#      honors the explicit `to:` field below.
-#   2. The original typed event is also routed via this TOPIC_ROUTING table
-#      to a structured-decisions topic (e.g. jobflow_decisions) so the
-#      action surface remains queryable independently of Scribe narration.
-# This dual path was previously claimed to be "deliberately absent" in
-# 2026-04-28 spec (2026-04-28-scribe-realtime-narration-design.md) but the
-# implementation kept both — verified 2026-04-30. CROSS_POST_TO_ALERTS still
-# fires for high-priority types (preserved).
-TOPIC_ROUTING: Dict[str, str] = {
-    # === Hermes Telegram v2 (cutover 20260424T233627Z) ===
-    # -> jobflow_firehose
-    'job_discovered': 'jobflow_firehose',
-    'job_vip_discovered': 'jobflow_firehose',
-    'job_scored': 'jobflow_firehose',
-    'tailor_completed': 'jobflow_firehose',
-    'tailor_iteration': 'jobflow_firehose',
-    'application_submitted': 'jobflow_firehose',
-    'stage_transition': 'jobflow_firehose',
-    'followup_due': 'jobflow_firehose',
-    # -> jobflow_decisions (human-action signals; per test_critical_events_route_to_alerts)
-    'approval_request': 'jobflow_decisions',
-    'apply_packet': 'jobflow_decisions',
-    'application_ready': 'jobflow_decisions',
-    'interview_signal': 'jobflow_decisions',
-    'offer_signal': 'jobflow_decisions',
-    # Mirror scribe_realtime.py:34-38 so narrated and structured copies
-    # land on the same topic; CROSS_POST_TO_ALERTS still cross-posts at HIGH+.
-    'job_high_score': 'jobflow_decisions',
-    # Tracker partial-backlog alert (2026-07-14) — operator must re-drive or
-    # investigate a growing partial/ queue; same human-action lane as approvals.
-    'tracker_partial_backlog': 'jobflow_decisions',
-    # -> devflow_firehose
-    'run_started': 'devflow_firehose',
-    'run_completed': 'devflow_firehose',
-    'trace_snapshot': 'devflow_firehose',
-    'devflow.run_started': 'devflow_firehose',
-    'devflow.run_completed': 'devflow_firehose',
-    'devflow.trace_snapshot': 'devflow_firehose',
-    # PR + build telemetry -- added 2026-04-30 so SDLC activity surfaces
-    # in the devflow_firehose stream alongside the run.* lifecycle events.
-    # Spec: docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
-    'devflow.pr_opened': 'devflow_firehose',
-    'devflow.pr_merged': 'devflow_firehose',
-    'devflow.pr_closed': 'devflow_firehose',
-    'devflow.build_started': 'devflow_firehose',
-    'devflow.build_succeeded': 'devflow_firehose',
-    # -> devflow_decisions
-    'approval_requested': 'devflow_decisions',
-    'devflow.approval_requested': 'devflow_decisions',
-    # PR ready-for-review and build failures are decisions (someone needs
-    # to act). Routes to devflow_decisions, NOT cross-posted to
-    # watchdog_alerts (DevFlow has its own decision topic and we don't
-    # want every red CI leaking into the operator alert stream).
-    'devflow.pr_review_requested': 'devflow_decisions',
-    'devflow.build_failed': 'devflow_decisions',
-    # -> watchdog_alerts
-    'gateway_health': 'watchdog_alerts',
-    'gateway_started': 'watchdog_alerts',  # gateway lifecycle (boot)
-    'gateway_stopped': 'watchdog_alerts',  # gateway lifecycle (shutdown / dead-pid)
-    'agent_error': 'watchdog_alerts',
-    # -> cron_firehose (2026-07-11 comms-audit split). Routine cron
-    # LIFECYCLE telemetry moved off watchdog_alerts into a dedicated,
-    # operator-muteable firehose topic: the ≥120-char HIGH boost
-    # (cron_emitter.MEANINGFUL_OUTPUT_CHAR_THRESHOLD) was pushing ~340
-    # routine completions/day past watchdog_alerts' significant_only gate,
-    # burying the ~15 real alerts/day. FAILURE modes (cron_failed,
-    # cron_failed_consecutive, cron_stale) deliberately STAY on
-    # watchdog_alerts — those are the operator-actionable signals.
-    'cron_started': 'cron_firehose',
-    'cron_skipped': 'cron_firehose',  # added 2026-04-30 — cron-restart-catchup-gap
-    'cron_triggered': 'cron_firehose',
-    'cron_completed': 'cron_firehose',
-    'cron_failed': 'watchdog_alerts',
-    'cron_failed_consecutive': 'watchdog_alerts',
-    'cron_stale': 'watchdog_alerts',
-    # cron_skipped_duplicate: same-job concurrency guard, low-priority
-    # informational telemetry (LOW priority => batched). A sudden burst of
-    # duplicate-skips on one job is visible in the cron firehose.
-    'cron_skipped_duplicate': 'cron_firehose',
-    # cron_skipped_min_interval: Guard #4 (sequential-burst rejection).
-    # Same routing rationale as cron_skipped_duplicate. LOW priority =>
-    # batched. Added 2026-04-30 follow-up to sentinel-vip-burst-rc §6.
-    'cron_skipped_min_interval': 'cron_firehose',
-    'application_blocked': 'watchdog_alerts',
-    'application_failed': 'watchdog_alerts',
-    # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)
-    'watchdog_tick': 'watchdog_alerts',
-    'watchdog_burst': 'watchdog_alerts',
-    'watchdog_probe_transition': 'watchdog_alerts',
-    'watchdog_silence_alert': 'watchdog_alerts',
-    'watchdog_recovered': 'watchdog_alerts',
-    'watchdog_self_degraded': 'watchdog_alerts',
-    # Once-per-day aggregate health heartbeat (2026-04-30) — see
-    # EventType.WATCHDOG_DAILY docstring for the visibility-restoration
-    # backstory. Routes alongside the other watchdog signals so a topic
-    # cutover only has to update one block.
-    'watchdog_daily': 'watchdog_alerts',
-    'agent_failure_cluster': 'watchdog_alerts',
-    # R57 detection nets (ADR-0024 §2-3) — system-health alerts.
-    # backend_contract_drift → security_and_system (2026-05-30, operator pref):
-    # the backend-conformance canary's drift pages land in the "Security &
-    # System" topic the operator watches. agent_loop_fault stays on watchdog.
-    'backend_contract_drift': 'security_and_system',
-    'agent_loop_fault': 'watchdog_alerts',
-    # Resource-pressure early-warning (2026-06-11 pagefile-burst remediation).
-    # System-health signal — commit/disk/pagefile exhaustion — so it lands in
-    # watchdog_alerts alongside gateway_health and the watchdog signals, the
-    # stream the operator already watches for infrastructure trouble. HIGH
-    # priority => not batched, survives significant_only/digest_only.
-    'resource_pressure': 'watchdog_alerts',
-    # Notification delivery reverse-signal (2026-04-30). These entries
-    # exist so test_all_event_types_have_routing covers them, but the
-    # primary defense is the cycle guard in handle() — both delivery
-    # subscribers early-return for these types so they NEVER actually
-    # route to a chat. If the guard is ever removed by mistake, the
-    # routing here lands them in watchdog_alerts (sensible operator
-    # signal for delivery failures); LOW-priority NOTIFICATION_DELIVERED
-    # would be batched/filtered by verbosity. Spec at
-    # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
-    'notification_delivered': 'watchdog_alerts',
-    'notification_failed': 'watchdog_alerts',
-    # -> critic_proposals
-    'critic_proposal': 'critic_proposals',
-    'critic_auto_applied': 'critic_proposals',
-    'critic_self_degraded': 'critic_proposals',
-    # NOTE: 'agent_failure_cluster' is the Critic's TRIGGER, not its proposal.
-    # It routes to watchdog_alerts (line ~60, with the other watchdog signals).
-    # The Critic still consumes it via the bus and emits critic_proposal events
-    # which DO route here.
-    # -> curator_digest
-    'memory_consolidated': 'curator_digest',
-    'skill_evolved': 'curator_digest',
-    'curator_daily': 'curator_digest',
-    # -> scribe_daily
-    # digest_generated is an observability event (Watchdog/Critic cadence
-    # tracking) — NOT delivered to Telegram in normal flow. The actual digest
-    # content arrives via the special-case mailbox_message + NOTIFICATION
-    # path below (search "message_type") so Diego sees one digest per fire,
-    # not two. Listed here for test coverage (test_all_event_types_have_routing)
-    # but delivery is gated separately.
-    'digest_generated': 'scribe_daily',
-    'scribe_digest': 'scribe_daily',
-    'mailbox_message': 'scribe_daily',
-    'user_inbound_message': 'scribe_daily',
-    # -> security_and_system
-    'secret_detected': 'security_and_system',
-    # Credential/infra loss (2026-07-10, R70 alert-gap fix). Lands in the
-    # "Security & System" topic Diego watches. CRITICAL priority => survives
-    # significant_only and is never batched; Telegram delivers even during
-    # quiet hours, so this is the RELIABLE 3am channel when WhatsApp itself
-    # is the lost credential (the WhatsApp IMMEDIATE route can't self-deliver).
-    'credential_loss': 'security_and_system',
-    # agent_iteration: TOPIC_ROUTING entry is the FALLBACK only — the
-    # actual primary route is per-agent via resolve_target() reading
-    # payload.agent against AGENT_TOPIC_MAP below. resolve_target() short-
-    # circuits before this lookup runs, so this entry is hit only when
-    # the AGENT_ITERATION code path is bypassed (e.g. in test_all_event_
-    # types_have_routing coverage). Default keeps agent activity in the
-    # firehose where it does the least harm if AGENT_TOPIC_MAP misses.
-    'agent_iteration': 'jobflow_firehose',
-}
-
-# Per-agent routing for AGENT_ITERATION events — added 2026-04-30 to
-# distribute generic iteration summaries to the right Telegram topic
-# without needing one EventType per agent. Lookup uses the canonical
-# agent name from event.payload.agent (lowercase, hyphens only). Unknown
-# agents fall back to the default topic.
-AGENT_TOPIC_MAP: Dict[str, str] = {
-    # JobFlow agents
-    'scout': 'jobflow_firehose',
-    'matcher': 'jobflow_firehose',
-    'matcher-shadow': 'jobflow_firehose',
-    'tailor': 'jobflow_firehose',
-    'applier': 'jobflow_firehose',
-    'tracker': 'jobflow_firehose',
-    'sentinel': 'jobflow_firehose',
-    'cv-handler': 'jobflow_firehose',
-    'notifier': 'jobflow_firehose',
-    'main': 'jobflow_firehose',
-    # DevFlow agents
-    'devflow': 'devflow_firehose',
-    'devflow-standup': 'devflow_firehose',
-    'devflow-bridge': 'devflow_firehose',
-    # Platform / learning agents
-    'critic': 'critic_proposals',
-    'curator': 'curator_digest',
-    'watchdog': 'watchdog_alerts',
-    'scribe': 'scribe_daily',
-}
-AGENT_ITERATION_DEFAULT_TOPIC = 'jobflow_firehose'
-
-# Failure events whose SOURCE decides the topic (2026-07-16 operator
-# request): when the failing party is a JobFlow pipeline agent, the event
-# is pipeline telemetry and belongs in jobflow_firehose with the rest of
-# the pipeline stream — burying applier/tracker errors among gateway_health
-# flaps and resource-pressure alerts drowned watchdog_alerts. System-sourced
-# failures (postgres-sync, jaum, mempalace, the watchdog itself) keep the
-# TOPIC_ROUTING default of watchdog_alerts. AGENT_FAILURE_CLUSTER's WhatsApp
-# escalation (whatsapp_escalator.py, URGENT tier) is independent of this
-# Telegram topic choice, so 3-in-a-row pipeline failures still page.
-JOBFLOW_FAILURE_REROUTE_TYPES = frozenset({
-    EventType.AGENT_ERROR,
-    EventType.AGENT_FAILURE_CLUSTER,
-    EventType.CRON_FAILED,
-    EventType.CRON_FAILED_CONSECUTIVE,
-    EventType.CRON_STALE,
-})
-
-# JobFlow pipeline agents (canonical identities per agent_source_mapping).
-# Deliberately EXCLUDES 'main' — it maps to jobflow_firehose for
-# AGENT_ITERATION chatter, but its failures are Hermes-core signals that
-# must stay operator-visible on watchdog_alerts.
-JOBFLOW_PIPELINE_AGENTS = frozenset({
-    'applier',
-    'archiver',
-    'cv-handler',
-    'matcher',
-    'matcher-shadow',
-    'notifier',
-    'scout',
-    'sentinel',
-    'tailor',
-    'tracker',
-})
-
-# Events that cross-post to alerts when high/critical
-CROSS_POST_TO_ALERTS = {
-    'application_ready',
-    'followup_due',
-    'interview_signal',
-    'job_high_score',
-    'offer_signal',
-}
-
-# watchdog_self_degraded payload reasons that mean the laptop-monitor
-# status.json writer has gone DARK (a monitoring blackout) -- as opposed to
-# "monitor pass over budget", where the writer is alive but slow. These route
-# to security_and_system instead of the default watchdog_alerts: the
-# 2026-07-13 3h16m prober blackout's single HIGH status-stale alert was buried
-# under gateway_health / WhatsApp flap on watchdog_alerts and went unactioned
-# for 3h. security_and_system is the low-traffic operator topic (credential_
-# loss, secret_detected, backend_contract_drift already land there) so a
-# "monitoring is blind" alert is actually seen. Reason strings must match
-# watchdog_sweep.py's _emit_self_degraded() EXACTLY. The LaptopMonitor-Canary
-# scheduled task is the primary auto-fix; this reroute is the visibility half.
-STATUS_BLACKOUT_SELF_DEGRADED_REASONS = frozenset({
-    'laptop-monitor status.json stale',
-    'status.json unreadable',
-})
-
+# v3: the event→topic table moved to events.routing_policy._POLICY (the
+# single source of truth both delivery subscribers consult). The pre-v3
+# TOPIC_ROUTING dict below was deleted 2026-07-18; the ScribeRealtime dual
+# delivery path it documented is retired in the same change (typed events
+# are canonical — one event, one message).
 # Event types treated as "digest-class" — once-a-day aggregate summaries
 # that carry no incident urgency on their own but whose absence is meaningful
 # (a missing daily heartbeat = the producer might be dead). Used by the
@@ -320,6 +90,21 @@ CRON_SUMMARY_TRUNCATION_NOTE = (
 # downstream consumers (Critic substrate, audit logger) still see both.
 CLUSTER_DEDUP_BUCKET_SECONDS = 30 * 60
 CLUSTER_DEDUP_LRU_SIZE = 256
+
+# P4: cron_started / cron_triggered carry zero operator information (the
+# completion event covers the run). Bus-only — audit/critic consumers see
+# them; chat never does. Pre-v3 they batched ~4,760 lines/week into the
+# cron firehose. cron_skipped* stay deliverable (rare + meaningful).
+_CRON_BUS_ONLY = frozenset({
+    EventType.CRON_STARTED,
+    EventType.CRON_TRIGGERED,
+})
+
+# TRACE batching: hourly digest per thread (observability cadence, not
+# real-time), flushed early at 20 buffered messages so a busy hour still
+# produces bounded, readable combos.
+BATCH_FLUSH_SECONDS = 3600.0
+BATCH_MAX_MESSAGES = 20
 
 
 class TelegramNotifier(BaseSubscriber):
@@ -363,6 +148,23 @@ class TelegramNotifier(BaseSubscriber):
         # primary fix; this LRU is belt-and-braces for timing skew between
         # the two cluster producers within a single notifier lifetime).
         self._cluster_dedup_lru: "OrderedDict[Tuple[str, int], bool]" = OrderedDict()
+
+        # v3 noise guards (P4/P6). In-memory: a restart re-arms them, which
+        # at worst re-delivers one repeat/flap announcement per key.
+        self._repeat_guard = RepeatGuard()
+        # 2h flap window + 2h base mute (escalating to 24h): the WhatsApp
+        # bridge flapped for DAYS at ~hourly cadence — a 15-min window
+        # never saw 4 transitions, so every flip delivered. 4 flips in 2h
+        # of the SAME signal is flapping; a real outage (down, later up)
+        # is 2 flips and always delivers.
+        self._flap_guard = FlapGuard(
+            window_seconds=7200.0, mute_seconds=7200.0)
+        # Cron novelty: a job whose (normalized) output hasn't changed in
+        # 6h has nothing new to say — "devflow-pr-build-poll: repos=1"
+        # every 5 minutes is one fact, not 288 messages. Sliding window:
+        # steady identical output stays suppressed until it CHANGES;
+        # breakage is covered by cron_failed / cron_stale, not repeats.
+        self._cron_novelty_guard = RepeatGuard(window_seconds=6 * 3600.0)
 
         self._load_config()
 
@@ -453,178 +255,152 @@ class TelegramNotifier(BaseSubscriber):
                 logger.debug("TelegramNotifier: no topics.json configured, skipping")
                 return
 
-        targets = self.resolve_all_targets(event)
-        message = self.format_message(event)
+        route = classify(event, known_topic_keys=self.topics.keys())
 
-        for platform, chat_id, thread_id in targets:
-            topic_key = self._thread_id_to_key(thread_id)
-            verbosity = self._verbosity.get(topic_key, {}).get("mode", "all")
+        # P4: cron lifecycle noise never becomes a message. A no-op
+        # completion ([SILENT]/empty/"no work") is bus-only; the WARN
+        # upgrade from the content sniffer in routing_policy bypasses this
+        # (a real error inside a [SILENT]-prefixed run must deliver).
+        if event.event_type in _CRON_BUS_ONLY:
+            return
+        if event.event_type == EventType.CRON_COMPLETED:
+            output = (event.payload or {}).get("output_summary", "")
+            if (route.attention is not Attention.WARN
+                    and is_noop_cron_output(output)):
+                return
+            # Novelty gate (applies to sniffer-upgraded WARN repeats too):
+            # same job + same normalized output within 6h = nothing new.
+            if self._cron_novelty_guard.is_repeat(
+                    f"cron:{event.source}", normalize_for_fingerprint(output)):
+                return
 
-            if verbosity == "off":
-                continue
-            if verbosity == "significant_only" and event.priority.level < Priority.HIGH.level:
-                continue
-            if verbosity == "digest_only":
-                # 2026-04-30: previously this branch was a code-level
-                # duplicate of ``significant_only`` (both gated on HIGH+).
-                # That made ``digest_only`` indistinguishable from
-                # ``significant_only`` for any topic, so an operator who
-                # set their watchdog_alerts to ``digest_only`` got the
-                # same incident-only stream and never saw the new
-                # WATCHDOG_DAILY heartbeat. Distinct semantics now: the
-                # mode passes HIGH+ failure-fires AND digest-class events
-                # (CURATOR_DAILY, WATCHDOG_DAILY, DIGEST_GENERATED) at any
-                # priority, but still drops routine NORMAL/LOW chatter.
-                is_high = event.priority.level >= Priority.HIGH.level
-                is_digest = event.event_type in DIGEST_EVENT_TYPES
-                if not (is_high or is_digest):
-                    continue
+        # P6: up/down style signals collapse to state transitions with
+        # flap detection (898 alternating bridge-flap messages/week
+        # pre-v3; the "watchdog sweep freshness" probe alternated states
+        # 68 delivered times — A→B→A evades verbatim-repeat dedup).
+        flap_note = None
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.event_type == EventType.GATEWAY_HEALTH:
+            decision = self._flap_guard.observe(
+                f"gw:{payload.get('platform', '?')}",
+                str(payload.get("status", "?")),
+            )
+            if not decision.deliver:
+                return
+            flap_note = decision.note
+        elif event.event_type == EventType.WATCHDOG_PROBE_TRANSITION:
+            decision = self._flap_guard.observe(
+                f"probe:{payload.get('probe', '?')}",
+                str(payload.get("after", "?")),
+            )
+            if not decision.deliver:
+                return
+            flap_note = decision.note
 
-            # Low-priority events are batched for up to 5 minutes
-            if event.priority == Priority.LOW:
-                key = f"{chat_id}:{thread_id}"
-                if key not in self._batch_buffer:
-                    self._batch_buffer[key] = []
-                    self._batch_timestamps[key] = time.monotonic()
-                self._batch_buffer[key].append(message)
-                self._persist_batch_buffer()
-            else:
-                # Pass event + topic_key so _deliver can emit the
-                # NOTIFICATION_DELIVERED / NOTIFICATION_FAILED reverse
-                # signal carrying original_event_id + target metadata.
-                # Batched flushes call _deliver() without an event so
-                # they DO NOT emit per-event reverse signals (Phase 1
-                # scope per the design doc — keeps LOW-priority firehose
-                # volume bounded). Spec at
-                # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
-                self._deliver(
-                    chat_id, thread_id, message,
-                    event=event, topic_key=topic_key,
-                )
+        topic_key, thread_id = resolve_topic_thread(self.topics, route.topic_key)
+        if not thread_id:
+            logger.warning(
+                "TelegramNotifier: no thread for topic %s (event %s) — dropping",
+                route.topic_key, event.event_type.type_string,
+            )
+            return
+        chat_id = self.group_chat_id
+
+        if not self._passes_verbosity(topic_key, route, event):
+            return
+
+        message = self.format_message(event, route=route)
+        if flap_note:
+            message = f"{message}\n{flap_note}"
+
+        # P4: repeats collapse (normalized: digits/telemetry ignored).
+        # IMMEDIATE-tier ACT (interview/offer/secret/credential) is exempt
+        # — those are precious and rare. Everything else, including URGENT
+        # ACT, dedups on a 30-min window: the 2026-07-17 capped-partials
+        # bug machine-gunned 79 near-identical tracker_partial_backlog
+        # pings at the action surface; a broken producer must cost one
+        # message per window, not one per fire.
+        if (route.wa_tier != WA_IMMEDIATE
+                and self._repeat_guard.is_repeat(thread_id, message)):
+            return
+
+        if route.batch:
+            # TRACE batches per thread; flushed hourly or at 20 buffered.
+            key = f"{chat_id}:{thread_id}"
+            if key not in self._batch_buffer:
+                self._batch_buffer[key] = []
+                self._batch_timestamps[key] = time.monotonic()
+            self._batch_buffer[key].append(message)
+            if len(self._batch_buffer[key]) >= BATCH_MAX_MESSAGES:
+                self._flush_batch_key(key)
+            self._persist_batch_buffer()
+        else:
+            # Pass event + topic_key so _deliver can emit the
+            # NOTIFICATION_DELIVERED / NOTIFICATION_FAILED reverse
+            # signal carrying original_event_id + target metadata.
+            # Batched flushes call _deliver() without an event so
+            # they DO NOT emit per-event reverse signals (Phase 1
+            # scope per the design doc — keeps LOW-priority firehose
+            # volume bounded). Spec at
+            # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+            self._deliver(
+                chat_id, thread_id, message,
+                event=event, topic_key=topic_key,
+            )
 
         # Flush any batches older than 5 minutes
         self._flush_stale_batches()
 
+    def _passes_verbosity(self, topic_key: str, route: Route, event: Event) -> bool:
+        """v2 verbosity gate: explicit ``min_priority`` per topic plus the
+        ``off`` kill-switch. Legacy ``mode`` values (significant_only /
+        digest_only) keep their pre-v3 meaning when no min_priority is set,
+        so an old verbosity.json stays safe under new code and vice versa.
+        Gates on the ROUTE's clamped priority, so class floors (ACT>=HIGH,
+        WARN>=NORMAL) are what the threshold sees."""
+        cfg = self._verbosity.get(topic_key) or {}
+        mode = cfg.get("mode", "all")
+        if mode == "off":
+            return False
+        min_priority = cfg.get("min_priority")
+        if min_priority:
+            try:
+                threshold = Priority.from_string(str(min_priority))
+            except Exception:
+                threshold = Priority.LOW
+            return route.priority.level >= threshold.level
+        if mode == "significant_only":
+            return route.priority.level >= Priority.HIGH.level
+        if mode == "digest_only":
+            return (route.priority.level >= Priority.HIGH.level
+                    or event.event_type in DIGEST_EVENT_TYPES)
+        return True
+
     def resolve_target(self, event: Event) -> Tuple[str, str, str]:
-        """Resolve the primary Telegram target for an event."""
-        # AGENT_ITERATION routes per-agent (2026-04-30): the canonical
-        # agent name in payload.agent picks the topic. Falls through to
-        # TOPIC_ROUTING['agent_iteration'] only if payload.agent is
-        # missing or unknown.
-        if event.event_type == EventType.AGENT_ITERATION:
-            agent_name = ""
-            payload = event.payload or {}
-            if isinstance(payload, dict):
-                agent_name = (payload.get('agent') or '').strip().lower()
-            topic_key = AGENT_TOPIC_MAP.get(agent_name, AGENT_ITERATION_DEFAULT_TOPIC)
-            topic = self.topics.get(topic_key, {})
-            thread_id = str(topic.get("thread_id", ""))
-            return ("telegram", self.group_chat_id, thread_id)
-
-        # watchdog_self_degraded is normally an operator watchdog signal
-        # (-> watchdog_alerts), but the "monitoring has gone dark" reasons
-        # (see STATUS_BLACKOUT_SELF_DEGRADED_REASONS) must NOT share the
-        # flap-saturated watchdog_alerts topic -- route them to the low-traffic
-        # security_and_system topic so the blackout alert is actually seen.
-        if event.event_type == EventType.WATCHDOG_SELF_DEGRADED:
-            payload = event.payload if isinstance(event.payload, dict) else {}
-            if payload.get("reason", "") in STATUS_BLACKOUT_SELF_DEGRADED_REASONS:
-                topic = self.topics.get("security_and_system", {})
-                thread_id = str(topic.get("thread_id", ""))
-                if not thread_id:  # topics.json lacks the topic -> don't drop it
-                    topic = self.topics.get("watchdog_alerts", {})
-                    thread_id = str(topic.get("thread_id", ""))
-                return ("telegram", self.group_chat_id, thread_id)
-
-        # Source-aware failure routing (2026-07-16): failure events from
-        # JobFlow pipeline agents go to jobflow_firehose, not watchdog_alerts.
-        # Falls through to the TOPIC_ROUTING default when topics.json lacks
-        # the topic (mirrors the cron_firehose degrade below).
-        if (event.event_type in JOBFLOW_FAILURE_REROUTE_TYPES
-                and self._is_jobflow_failure_source(event)):
-            topic = self.topics.get("jobflow_firehose", {})
-            thread_id = str(topic.get("thread_id", ""))
-            if thread_id:
-                return ("telegram", self.group_chat_id, thread_id)
-
-        topic_key = TOPIC_ROUTING.get(event.event_type.type_string, "system")
-
-        # User-facing NOTIFICATION messages (morning digest, follow-up alerts,
-        # etc.) belong in the ``digests`` topic where verbosity defaults to
-        # ``all`` — NOT in ``agent_comms`` (the default for mailbox_message)
-        # where the ``significant_only`` filter drops the default LOW priority
-        # and the user never sees them.
-        #
-        # Regression: 2026-04-19 — the Sunday morning digest sat in the bus
-        # (rowid 219957, priority=low) but telegram-notifier silently skipped
-        # it because agent_comms verbosity=significant_only requires HIGH+.
-        if (event.event_type == EventType.MAILBOX_MESSAGE
-                and event.payload.get("message_type") == "NOTIFICATION"):
-            requested_to = event.payload.get("to", "")
-            # Honor explicit `to:` when it's a known v2 topic_key (e.g.
-            # scribe-realtime emits to: jobflow_decisions / hermes_milestones / etc).
-            # Legacy batch-digest payloads use `to: "telegram_digests"` (v1
-            # label) which is NOT a v2 key — they fall through to scribe_daily,
-            # preserving 2B behavior.
-            if requested_to in self.topics:
-                topic_key = requested_to
-            else:
-                topic_key = "scribe_daily"
-
-        topic = self.topics.get(topic_key, {})
-        if not topic and topic_key == "cron_firehose":
-            # Code deployed before topics.json gained the cron_firehose
-            # topic (2026-07-11 split) — degrade to the pre-split
-            # watchdog_alerts routing rather than leaking cron telemetry
-            # into the group's General thread via an empty thread_id.
-            topic = self.topics.get("watchdog_alerts", {})
-        thread_id = str(topic.get("thread_id", ""))
+        """Resolve the single Telegram target for an event. v3: the
+        decision is events.routing_policy.classify(); this just maps the
+        policy topic_key onto topics.json (alias-aware)."""
+        route = classify(event, known_topic_keys=self.topics.keys())
+        _key, thread_id = resolve_topic_thread(self.topics, route.topic_key)
         return ("telegram", self.group_chat_id, thread_id)
 
-    @staticmethod
-    def _is_jobflow_failure_source(event: Event) -> bool:
-        """True iff the failing party behind a failure event is a JobFlow
-        pipeline agent (or a jobflow-* cron job).
-
-        Source attribution varies by producer: AGENT_ERROR carries the
-        transport label in event.source ('mailbox:applier') with the real
-        agent in payload.source_agent; AGENT_FAILURE_CLUSTER carries the
-        canonical agent; cron failures carry the raw job name
-        ('jobflow-tracker-cycle'). Normalise all three through
-        canonical_agent_source().
-        """
-        payload = event.payload if isinstance(event.payload, dict) else {}
-        raw = (payload.get("source_agent") or event.source or "").strip()
-        if raw.startswith("mailbox:"):
-            raw = raw[len("mailbox:"):]
-        # Any jobflow-* cron is pipeline work even when the remainder isn't
-        # a known agent (e.g. 'jobflow-approved-release' -> 'approved').
-        if raw.startswith("jobflow-"):
-            return True
-        return canonical_agent_source(raw) in JOBFLOW_PIPELINE_AGENTS
-
     def resolve_all_targets(self, event: Event) -> List[Tuple[str, str, str]]:
-        """Resolve all targets including cross-posts."""
-        targets = [self.resolve_target(event)]
+        """v3: cross-posting removed (P2 — one event, one message). Kept
+        for API compatibility; always returns exactly one target."""
+        return [self.resolve_target(event)]
 
-        # Cross-post action-required high/critical events to watchdog_alerts.
-        # v2 cutover (20260424T233627Z) renamed the catch-all ``alerts`` topic
-        # to ``watchdog_alerts``; the constant name CROSS_POST_TO_ALERTS is
-        # kept as a generic descriptor of intent.
-        if (event.event_type.type_string in CROSS_POST_TO_ALERTS
-                and event.priority.level >= Priority.HIGH.level):
-            alerts_topic = self.topics.get("watchdog_alerts", {})
-            alerts_thread = str(alerts_topic.get("thread_id", ""))
-            primary_thread = targets[0][2]
-            if alerts_thread and alerts_thread != primary_thread:
-                targets.append(("telegram", self.group_chat_id, alerts_thread))
+    def format_message(self, event: Event, route: Optional[Route] = None) -> str:
+        """Format an event into a human-readable Telegram message.
 
-        return targets
-
-    def format_message(self, event: Event) -> str:
-        """Format an event into a human-readable Telegram message."""
+        The priority dot reflects the ROUTE's clamped priority (P5: the
+        dot must match the attention class), not the raw event priority.
+        """
         from events.formatting import format_event_message
 
+        if route is None:
+            route = classify(event, known_topic_keys=self.topics.keys())
+        if route.priority is not event.priority:
+            event = dataclasses.replace(event, priority=route.priority)
         body = self._format_payload(event)
         return format_event_message(event, body)
 
@@ -786,7 +562,8 @@ class TelegramNotifier(BaseSubscriber):
 
     def _trim_cron_summary(self, summary: str) -> str:
         """Keep Mission Control cron updates readable inside a chat topic."""
-        summary = str(summary or "").strip()
+        # Machine-telemetry blocks are for the Critic, never for humans.
+        summary = strip_agent_iteration_json(str(summary or "")).strip()
         if not summary:
             return ""
 
@@ -946,24 +723,28 @@ class TelegramNotifier(BaseSubscriber):
                 "for event %s", event.event_id,
             )
 
-    def _flush_stale_batches(self, max_age: float = 300.0) -> None:
-        """Flush batched low-priority messages older than max_age seconds."""
+    def _flush_stale_batches(self, max_age: float = BATCH_FLUSH_SECONDS) -> None:
+        """Flush batched TRACE messages older than max_age seconds."""
         now = time.monotonic()
         keys_to_flush = [
             k for k, ts in self._batch_timestamps.items()
             if now - ts >= max_age
         ]
         for key in keys_to_flush:
-            messages = self._batch_buffer.pop(key, [])
-            self._batch_timestamps.pop(key, None)
-            if not messages:
-                continue
-            parts = key.split(":", 1)
-            chat_id, thread_id = parts[0], parts[1] if len(parts) > 1 else ""
-            combined = f"Batched ({len(messages)} events):\n\n" + "\n---\n".join(messages)
-            self._deliver(chat_id, thread_id, combined)
+            self._flush_batch_key(key)
         if keys_to_flush:
             self._persist_batch_buffer()
+
+    def _flush_batch_key(self, key: str) -> None:
+        """Deliver and clear one thread's batch buffer."""
+        messages = self._batch_buffer.pop(key, [])
+        self._batch_timestamps.pop(key, None)
+        if not messages:
+            return
+        parts = key.split(":", 1)
+        chat_id, thread_id = parts[0], parts[1] if len(parts) > 1 else ""
+        combined = f"Batched ({len(messages)} events):\n\n" + "\n---\n".join(messages)
+        self._deliver(chat_id, thread_id, combined)
 
     def _persist_batch_buffer(self) -> None:
         """Write current batch state to disk so it survives restart."""
