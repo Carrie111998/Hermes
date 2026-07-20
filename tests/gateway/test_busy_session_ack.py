@@ -242,9 +242,9 @@ class TestBusySessionAck:
 
     @pytest.mark.asyncio
     async def test_busy_text_mode_queue_sends_ack_by_default(self, monkeypatch):
-        """busy_text_mode=queue now sends a short 'Queued' ACK on the first
-        follow-up so users know the message landed. Subsequent follow-ups
-        within the 30s debounce window stay silent."""
+        """busy_text_mode=queue now sends a short 'Queued' ACK for EVERY
+        follow-up (no debounce): each queued message is distinct content
+        that deserves its own receipt."""
         import gateway.run as _gr
 
         monkeypatch.delenv("HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED", raising=False)
@@ -264,27 +264,45 @@ class TestBusySessionAck:
         runner.adapters[first.source.platform] = adapter
         runner.adapters[second.source.platform] = adapter
 
+        # First follow-up: no queue depth yet -> position #1.
         result1 = await runner._handle_active_session_busy_message(first, sk)
+        # Simulate the caller enqueueing "first" so the next follow-up sees
+        # depth=1 and gets position #2 (mirrors real _process_message_background).
+        adapter._pending_messages[sk] = first
         result2 = await runner._handle_active_session_busy_message(second, sk)
 
         assert result1 is False
         assert result2 is False
-        assert sk not in adapter._pending_messages
         agent.interrupt.assert_not_called()
 
-        # First call fires ACK, second is debounced (within 30s window).
-        adapter._send_with_retry.assert_called_once()
-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
-        # New unified format: "📥 排队 #N: "preview..." (Queued)"
-        assert "Queued" in content, f"expected queue ACK marker, got: {content!r}"
-        assert re.search(r"\u6392\u961f #\d+", content), (
-            f"expected position marker like '排队 #N', got: {content!r}"
+        # Both follow-ups fire ACKs — debounce is gone for queue mode.
+        assert adapter._send_with_retry.call_count == 2, (
+            f"expected 2 queue ACKs, got {adapter._send_with_retry.call_count}"
         )
+        calls = adapter._send_with_retry.call_args_list
+        content1 = calls[0].kwargs.get("content", "")
+        content2 = calls[1].kwargs.get("content", "")
+
+        # New unified format: "📥 排队 #N: \"preview...\" (Queued)"
+        for c in (content1, content2):
+            assert "Queued" in c, f"expected queue ACK marker, got: {c!r}"
+            assert re.search(r"\u6392\u961f #\d+", c), (
+                f"expected position marker like '排队 #N', got: {c!r}"
+            )
+
         # ACK carries a preview of the message text so responses can be mapped
         # back to inputs when they come out of visible order.
-        assert '"part one"' in content or "part one" in content, (
-            f"expected message preview in ACK, got: {content!r}"
+        assert '"part one"' in content1 or "part one" in content1, (
+            f"expected preview of part one in first ACK, got: {content1!r}"
         )
+        assert '"part two"' in content2 or "part two" in content2, (
+            f"expected preview of part two in second ACK, got: {content2!r}"
+        )
+
+        # Positions increment: first was #1 (empty queue), second was #2
+        # (after we simulated the enqueue of first).
+        assert "#1" in content1, f"expected #1 in first ACK, got: {content1!r}"
+        assert "#2" in content2, f"expected #2 in second ACK, got: {content2!r}"
 
     @pytest.mark.asyncio
     async def test_busy_text_mode_queue_silent_when_ack_disabled(self, monkeypatch):

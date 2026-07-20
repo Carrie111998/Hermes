@@ -5321,11 +5321,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not busy_ack_enabled:
                 return
 
-            now = time.time()
-            _BUSY_ACK_COOLDOWN = 30
-            last_ack = self._busy_ack_ts.get(session_key, 0)
-            if now - last_ack < _BUSY_ACK_COOLDOWN:
-                return
+            # No debounce for queue-mode ACK: each queued message is distinct
+            # content that deserves its own receipt (unlike interrupt/steer
+            # ACKs where the shared 30s _busy_ack_ts window suppresses "hurry
+            # up" spam of the same intent).
 
             from gateway.display_config import resolve_display_setting
 
@@ -5368,7 +5367,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 content = f"📥 排队: {preview} (Queued)"
 
             reply_anchor = self._reply_anchor_for_event(event)
-            self._busy_ack_ts[session_key] = now
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=content,
