@@ -396,6 +396,34 @@ class DurableInbox:
             for row in rows
         ]
 
+    def newest_pending_for_chats(
+        self, chats: frozenset[str] | set[str]
+    ) -> list[InboxRecord]:
+        """Return one newest pending record from the selected chats."""
+        selected = sorted(chats)
+        if not selected:
+            return []
+        placeholders = ",".join("?" for _ in selected)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "FROM ingress_events WHERE status='pending' "
+                f"AND chat_id IN ({placeholders}) ORDER BY seq DESC LIMIT 1",
+                tuple(selected),
+            ).fetchone()
+        if row is None:
+            return []
+        return [
+            InboxRecord(
+                seq=int(row["seq"]),
+                message_id=str(row["message_id"]),
+                chat_id=str(row["chat_id"]),
+                start_offset=int(row["start_offset"]),
+                end_offset=int(row["end_offset"]),
+                raw=json.loads(row["raw_json"]),
+            )
+        ]
+
     def claim(self, records: Sequence[InboxRecord]) -> None:
         if not records:
             return
@@ -1117,9 +1145,20 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 priority_chats = _management_selector_chats(config_path)
             except Exception:
                 priority_chats = frozenset()
-            records = inbox.pending(
-                limit=args.max_records, priority_chats=priority_chats
-            )
+            demo_management_only = os.environ.get(
+                "TGG_DEMO_MANAGEMENT_ONLY", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if demo_management_only:
+                # Demo window containment: the serial worker must never begin
+                # a site-backlog turn that can hold the management lane for
+                # minutes. Keep staging live traffic, but only claim one newest
+                # management record per cycle. The env flag is removed after
+                # the demo to resume the ordinary backlog drain.
+                records = inbox.newest_pending_for_chats(priority_chats)
+            else:
+                records = inbox.pending(
+                    limit=args.max_records, priority_chats=priority_chats
+                )
             if records:
                 inbox.claim(records)
                 async with _management_typing_presence(
