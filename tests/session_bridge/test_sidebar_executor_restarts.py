@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 
@@ -52,6 +53,7 @@ class _NativeWorld:
     create_calls: list[str] = field(default_factory=list)
     register_calls: list[str] = field(default_factory=list)
     rename_calls: list[str] = field(default_factory=list)
+    find_by_marker_calls: list[BridgeMarkerPayload] = field(default_factory=list)
     lose_create_response_once: bool = False
     die_after_bind_once: bool = False
     die_before_rename_once: bool = False
@@ -163,6 +165,7 @@ class _Verifier:
         self,
         expected: BridgeMarkerPayload,
     ) -> VerifiedSidebarThread | None:
+        self._world.find_by_marker_calls.append(expected)
         matches = [
             thread_id
             for thread_id, payload in self._world.threads.items()
@@ -247,14 +250,19 @@ def test_process_restart_after_durable_bind_resumes_the_exact_thread(
         db.close()
 
     clock.advance(301.0)
+    world.find_by_marker_calls.clear()
     restarted_db = SessionDB(path)
     try:
         restarted_store = _store(restarted_db, clock)
+        persisted = restarted_store.get_sidebar_job_for_source("restart-source")
+        assert persisted is not None
+        assert persisted["codex_thread_id"] == _THREAD_ID
         result = _executor(restarted_store, world, clock).run_once()
 
         assert result.status == "visible"
         assert result.thread_id == _THREAD_ID
         assert world.create_calls == [_THREAD_ID]
+        assert world.find_by_marker_calls == []
         assert world.register_calls == [_THREAD_ID, _THREAD_ID]
         _assert_unique_visible_lineage(restarted_db)
     finally:
@@ -279,14 +287,19 @@ def test_restart_before_rename_resumes_the_exact_thread_without_recreation(
         db.close()
 
     clock.advance(301.0)
+    world.find_by_marker_calls.clear()
     restarted_db = SessionDB(path)
     try:
         restarted_store = _store(restarted_db, clock)
+        persisted = restarted_store.get_sidebar_job_for_source("restart-source")
+        assert persisted is not None
+        assert persisted["codex_thread_id"] == _THREAD_ID
         result = _executor(restarted_store, world, clock).run_once()
 
         assert result.status == "visible"
         assert result.thread_id == _THREAD_ID
         assert world.create_calls == [_THREAD_ID]
+        assert world.find_by_marker_calls == []
         assert world.rename_calls == [_THREAD_ID]
         _assert_unique_visible_lineage(restarted_db)
     finally:
@@ -301,16 +314,13 @@ def test_commit_response_loss_replay_is_unique_and_never_recreates(
     path = tmp_path / "commit-response-loss.db"
     db, store = _seed_store(path, clock)
     lossy_store = _CommitResponseLossStore(store)
+    commit_arguments: dict[str, Any]
     try:
         result = _executor(lossy_store, world, clock).run_once()
 
         assert result.status == "unsettled"
         assert lossy_store.commit_arguments is not None
-        replay = store.commit_sidebar_job_with_lineage(
-            **lossy_store.commit_arguments,
-        )
-        assert replay["state"] == "sidebar_visible"
-        assert replay["codex_thread_id"] == _THREAD_ID
+        commit_arguments = dict(lossy_store.commit_arguments)
         _assert_unique_visible_lineage(db)
     finally:
         db.close()
@@ -318,6 +328,16 @@ def test_commit_response_loss_replay_is_unique_and_never_recreates(
     restarted_db = SessionDB(path)
     try:
         restarted_store = _store(restarted_db, clock)
+        replay = restarted_store.commit_sidebar_job_with_lineage(
+            **commit_arguments,
+        )
+        assert replay["state"] == "sidebar_visible"
+        assert replay["codex_thread_id"] == _THREAD_ID
+        assert replay["completion_digest"] == hashlib.sha256(
+            str(commit_arguments["lease_token"]).encode()
+        ).hexdigest()
+        _assert_unique_visible_lineage(restarted_db)
+
         restarted = _executor(restarted_store, world, clock).run_once()
 
         assert restarted.status == "idle"
