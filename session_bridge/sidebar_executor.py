@@ -290,6 +290,15 @@ class SidebarExecutor:
             lease_seconds=300,
         )
         if not claims:
+            try:
+                self._store.record_sidebar_broker_heartbeat(now=claim_time)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return SidebarExecutionResult(
+                    status="unsettled",
+                    error_code="bridge_temporarily_unavailable",
+                )
             return SidebarExecutionResult(status="idle")
         if len(claims) != 1 or not isinstance(claims[0], Mapping):
             return SidebarExecutionResult(
@@ -308,6 +317,16 @@ class SidebarExecutor:
                 status="unsettled",
                 job_id=job_id,
                 error_code="source_identity_mismatch",
+            )
+        try:
+            self._store.record_sidebar_broker_heartbeat(now=claim_time)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code="bridge_temporarily_unavailable",
             )
         try:
             if job_id is None:

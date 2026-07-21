@@ -418,6 +418,7 @@ class FakeStore:
         failure_state: str | None = None,
         failure_error: Exception | None = None,
         failure_result: object | None = None,
+        heartbeat_error: Exception | None = None,
     ) -> None:
         self.events = events
         self.jobs = jobs
@@ -428,12 +429,14 @@ class FakeStore:
         self.failure_state = failure_state
         self.failure_error = failure_error
         self.failure_result = failure_result
+        self.heartbeat_error = heartbeat_error
         self.candidates = {
             source: _candidate(source)
             for job in jobs
             if isinstance((source := job.get("source_session_id")), str)
         }
         self.failures: list[str] = []
+        self.heartbeats: list[float] = []
 
     def claim_sidebar_jobs(
         self, *, now: float, limit: int, lease_seconds: int
@@ -450,6 +453,11 @@ class FakeStore:
             }
             for job in claimed
         ]
+
+    def record_sidebar_broker_heartbeat(self, *, now: float) -> None:
+        if self.heartbeat_error is not None:
+            raise self.heartbeat_error
+        self.heartbeats.append(now)
 
     def get_sidebar_candidate_for_delivery(self, source_session_id: str) -> SidebarCandidate:
         self.events.append(("candidate", source_session_id))
@@ -651,6 +659,7 @@ def test_recovered_exact_id_is_verified_renamed_and_committed_without_create() -
         thread_id=THREAD_1,
     )
     assert native.create_calls == 0
+    assert store.heartbeats == [100.0]
     assert [event[0] for event in events] == [
         "claim",
         "candidate",
@@ -661,6 +670,56 @@ def test_recovered_exact_id_is_verified_renamed_and_committed_without_create() -
         "rename",
         "commit",
     ]
+
+
+def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [])
+    executor = _executor(store, FakeVerifier(events), FakeNative(events), clock)
+
+    result = executor.run_once()
+
+    assert result == SidebarExecutionResult(status="idle")
+    assert store.heartbeats == [100.0]
+    assert events == [("claim", 1, 300, 100.0)]
+
+
+def test_idle_cycle_fails_closed_when_broker_heartbeat_cannot_persist() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [], heartbeat_error=RuntimeError("write failed"))
+    executor = _executor(store, FakeVerifier(events), FakeNative(events), clock)
+
+    result = executor.run_once()
+
+    assert result == SidebarExecutionResult(
+        status="unsettled",
+        error_code="bridge_temporarily_unavailable",
+    )
+    assert events == [("claim", 1, 300, 100.0)]
+
+
+def test_claimed_cycle_releases_lease_when_broker_heartbeat_cannot_persist() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        heartbeat_error=RuntimeError("write failed"),
+    )
+    native = FakeNative(events)
+    executor = _executor(store, FakeVerifier(events), native, clock)
+
+    result = executor.run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="bridge_temporarily_unavailable",
+    )
+    assert native.create_calls == 0
+    assert [event[0] for event in events] == ["claim", "fail"]
 
 
 def test_zero_marker_candidates_create_bind_and_register_before_any_read() -> None:
