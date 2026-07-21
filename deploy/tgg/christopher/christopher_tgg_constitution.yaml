@@ -682,6 +682,10 @@ selectors:
   match:
     source.platform: whatsapp
     source.chat_id: 120363423568509280@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363429226022766@g.us
 - job_type: tgg_management
   match:
     source.platform: whatsapp

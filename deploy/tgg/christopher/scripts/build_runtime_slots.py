@@ -80,21 +80,32 @@ MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: fa
 # 2026-06-11), vendor/photos/escalation/general groups not positively
 # identifiable as maintenance site groups — full excluded list in the
 # 2026-07-21-activation run archive.
-GROUP_ALLOWLIST_JIDS = (
+# Partition of the inbound allowlist for the outbound-boundary invariant:
+# SITE groups are ops-ingest scope (reply-suppressed) and must NEVER carry
+# outbound authorization; MGMT entries are the only inbound entries allowed
+# to also appear in outbound_allowed_chats. The partition is authored
+# explicitly — never positional — because the boundary is the safety claim.
+SITE_GROUP_JIDS_TUPLE = (
     "120363421424519051@g.us",  # MM1A Maintenance (AMK, SRG)
     "120363422582425366@g.us",  # MM1B Maintenance (HG, Bedok Resv)
     "120363423568509280@g.us",  # MM2 Maintenance (PG)
     "120363403845802098@g.us",  # MM2 Maintenance (SK)
-    "120363426509183563@g.us",  # TGG Christopher Mgmt Live Test 20260528 (rung-3a mgmt selector)
-    "120363409954029949@g.us",  # Boss of Christopher — PcL deployment-verification (deploy-gate infra)
+    # Demo ingest site group (teren 2026-07-21 demo rulings; landed pre-flip
+    # with the rest of the demo end-state so the ceremony head moves once).
+    # SITE class: ingest-selector scope, reply-suppressed, never outbound.
+    "120363429226022766@g.us",  # [TGG] Christopher x PcL Ops Test
 )
-
-# Partition of the inbound allowlist for the outbound-boundary invariant:
-# site groups are ops-ingest scope (reply-suppressed) and must NEVER carry
-# outbound authorization; mgmt/verification chats are the only inbound entries
-# allowed to also appear in outbound_allowed_chats.
-SITE_GROUP_JIDS = frozenset(GROUP_ALLOWLIST_JIDS[:4])
-MGMT_INBOUND_JIDS = frozenset(GROUP_ALLOWLIST_JIDS[4:])
+MGMT_INBOUND_JIDS_TUPLE = (
+    "120363426509183563@g.us",  # TGG Christopher Mgmt Live Test 20260528 (rung-3a destination)
+    "120363409954029949@g.us",  # Boss of Christopher — PcL deployment-verification (deploy-gate infra)
+    # REAL client management group (teren 2026-07-21: the demo runs here;
+    # inbound READ opens now — outbound to it stays impossible until the
+    # separately-ceremonied 3a->3b arm releases the 3b rung).
+    "120363407903158826@g.us",  # Christopher x TGG Management
+)
+GROUP_ALLOWLIST_JIDS = SITE_GROUP_JIDS_TUPLE + MGMT_INBOUND_JIDS_TUPLE
+SITE_GROUP_JIDS = frozenset(SITE_GROUP_JIDS_TUPLE)
+MGMT_INBOUND_JIDS = frozenset(MGMT_INBOUND_JIDS_TUPLE)
 
 def _group_allowlist_block(indent: str) -> str:
     lines = [f"{indent}group_policy: allowlist\n", f"{indent}group_allow_from:\n"]
@@ -110,6 +121,23 @@ GROUP_POLICY_ROOT_OLD = "\n  group_policy: open\n"
 GROUP_POLICY_ROOT_NEW = "\n" + _group_allowlist_block("  ")
 
 # Insertion anchors — each must appear exactly once in its baseline file.
+# Ops-test ingest selector (2026-07-21 demo end-state). The anchor is the
+# LAST tgg_ops_ingest whatsapp selector in the June baseline (MM2 PG),
+# exactly-once; the new selector rides directly after it so the ops-test
+# group processes under the same ingest brief as the maintenance sites.
+OPS_TEST_SELECTOR_ANCHOR = (
+    "- job_type: tgg_ops_ingest\n"
+    "  match:\n"
+    "    source.platform: whatsapp\n"
+    "    source.chat_id: 120363423568509280@g.us\n"
+)
+OPS_TEST_SELECTOR_SNIPPET = (
+    "- job_type: tgg_ops_ingest\n"
+    "  match:\n"
+    "    source.platform: whatsapp\n"
+    "    source.chat_id: 120363429226022766@g.us\n"
+)
+
 OPERATIONS_ANCHOR = "          agent_config_read:\n"
 AGENT_SECTION = "agent:\n  profile: pa\n  max_turns: 12\n"
 OPS_INGEST_OBSERVABILITY_ANCHOR = (
@@ -337,6 +365,12 @@ def _constitution(source: str, slot: dict) -> str:
     )
     rendered = _replace_once(
         rendered,
+        OPS_TEST_SELECTOR_ANCHOR,
+        OPS_TEST_SELECTOR_ANCHOR + OPS_TEST_SELECTOR_SNIPPET,
+        label="ops-test ingest selector",
+    )
+    rendered = _replace_once(
+        rendered,
         CREATE_POLICY_OLD,
         CREATE_POLICY_NEW,
         label="ops-ingest create policy",
@@ -435,6 +469,19 @@ def _validate(
         outbound = set(block["outbound_allowed_chats"])
         assert MGMT_INBOUND_JIDS <= outbound, sorted(MGMT_INBOUND_JIDS - outbound)
         assert not (SITE_GROUP_JIDS & outbound), sorted(SITE_GROUP_JIDS & outbound)
+
+    # Selector <-> allowlist alignment: every allowlisted WHATSAPP group must
+    # bind to a selector of the class its partition claims — site groups to
+    # the reply-suppressed ingest brief, mgmt entries to the management brief.
+    selector_class = {
+        str(sel["match"]["source.chat_id"]): sel["job_type"]
+        for sel in constitution.get("selectors", [])
+        if sel.get("match", {}).get("source.platform") == "whatsapp"
+    }
+    for jid in SITE_GROUP_JIDS:
+        assert selector_class.get(jid) == "tgg_ops_ingest", (jid, selector_class.get(jid))
+    for jid in MGMT_INBOUND_JIDS:
+        assert selector_class.get(jid) == "tgg_management", (jid, selector_class.get(jid))
         # DM policy is explicitly out of scope for this change.
         assert block["dm_policy"] == "allowlist", block["dm_policy"]
     if effort is None:
