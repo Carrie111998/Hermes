@@ -28,6 +28,7 @@ class APIServerRunsMixin:
         prompt_session_key: Optional[str] = None,
         prompt_notify_callback=None,
         principal_scope: Optional[Dict[str, Any]] = None,
+        agent_configurator=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -62,6 +63,7 @@ class APIServerRunsMixin:
                 prompt_session_key=prompt_session_key,
                 prompt_notify_callback=prompt_notify_callback,
                 principal_scope=principal_scope,
+                agent_configurator=agent_configurator,
             )
 
         self._inflight_agent_runs += 1

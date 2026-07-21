@@ -34,6 +34,7 @@ def run_agent_sync(
     prompt_session_key: str | None = None,
     prompt_notify_callback: Any = None,
     principal_scope: dict[str, Any] | None = None,
+    agent_configurator: Any = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     from gateway.session_context import clear_session_vars, set_session_vars
 
@@ -133,6 +134,8 @@ def run_agent_sync(
             gateway_session_key=gateway_session_key,
             clarify_callback=_clarify_callback if prompt_callbacks_enabled else None,
         )
+        if agent_configurator is not None:
+            agent_configurator(agent)
         if agent_ref is not None:
             agent_ref[0] = agent
         effective_task_id = session_id or str(uuid.uuid4())

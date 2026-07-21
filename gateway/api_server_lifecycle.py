@@ -69,6 +69,11 @@ class APIServerLifecycleMixin:
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Private Run Orchestrator Runtime Driver contract.
+            self._app.router.add_get("/healthz", self._handle_health)
+            self._app.router.add_post("/v1/runtime/runs", self._handle_runtime_run)
+            self._app.router.add_post("/v1/runtime/runs/{run_id}/tool-results", self._handle_runtime_tool_result)
+            self._app.router.add_post("/v1/runtime/runs/{run_id}/interrupt", self._handle_runtime_interrupt)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

@@ -15,6 +15,7 @@ from gateway.api_server_sse import APIServerSSEMixin
 from gateway.api_server_responses import APIServerResponsesMixin
 from gateway.api_server_jobs import APIServerJobsMixin
 from gateway.api_server_runs import APIServerRunsMixin
+from gateway.api_server_runtime import APIServerRuntimeMixin
 from gateway.api_server_lifecycle import APIServerLifecycleMixin
 
 
@@ -59,6 +60,7 @@ class APIServerAdapter(
     APIServerResponsesMixin,
     APIServerJobsMixin,
     APIServerRunsMixin,
+    APIServerRuntimeMixin,
     APIServerLifecycleMixin,
     BasePlatformAdapter,
 ):
