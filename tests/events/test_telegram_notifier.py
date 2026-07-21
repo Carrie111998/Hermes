@@ -1535,6 +1535,246 @@ class TestBatchAgeSurvivesRestart:
         assert state["started_at"] == {}
 
 
+class TestBatchFlushFailureRequeue:
+    """Lossy batch-flush gap (confirmed live 2026-07-20/21): _flush_batch_key
+    popped the key's messages BEFORE delivering, and _deliver() swallows send
+    exceptions — so while Telegram sat in a persistent httpx.ReadError
+    reconnect loop, the starved batch (buffered since 18:07Z) simply
+    vanished: no requeue, no NOTIFICATION_FAILED, no trace beyond the
+    generic delivery error line. The ledger contract stands (a batch the
+    chat never saw must NOT produce NOTIFICATION_DELIVERED); these tests
+    pin the recovery: a failed flush restores the popped messages + the
+    key's wall-clock age, emits ONE synthetic NOTIFICATION_FAILED
+    (original_event_type="batch_flush", mirroring 18891230c's delivered
+    twin), persists the restored state, and arms a per-key backoff so a
+    dead transport isn't hammered once per handled event.
+    """
+
+    KEY = "-1001234567890:101"  # jobflow_firehose in the topics_config fixture
+
+    def _buffer_two(self, notifier):
+        # Titles differ by LETTERS (RepeatGuard collapses digit runs).
+        for title in ("Alpha Analyst", "Beta Engineer"):
+            notifier.handle(Event.create(
+                EventType.JOB_DISCOVERED, "scout",
+                {"title": title, "company": "Acme", "source": "Indeed"},
+                priority=Priority.LOW,
+            ))
+
+    def _failing_notifier(self, bus, topics_config, verbosity_config):
+        calls = {"n": 0}
+
+        def failing_send(chat_id, thread_id, msg):
+            calls["n"] += 1
+            raise RuntimeError("Bad Gateway")
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=failing_send,
+        )
+        return notifier, calls
+
+    def test_failed_flush_restores_buffer_and_started_at(
+        self, bus, topics_config, verbosity_config, tmp_path, monkeypatch,
+    ):
+        """The popped messages go back to the buffer (front, in order) with
+        the key's original wall-clock started_at, and the restored state is
+        persisted — so neither an in-process retry nor a restart treats the
+        starved batch as fresh (or, worse, gone)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        notifier, calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        self._buffer_two(notifier)
+        messages_before = list(notifier._batch_buffer[self.KEY])
+        started_before = notifier._batch_started_at[self.KEY]
+
+        notifier._flush_stale_batches(max_age=0)
+
+        assert calls["n"] == 1, "flush must have attempted the send"
+        assert notifier._batch_buffer.get(self.KEY) == messages_before, (
+            "failed flush must restore the popped messages in order"
+        )
+        assert notifier._batch_started_at.get(self.KEY) == started_before, (
+            "failed flush must preserve the key's wall-clock started_at"
+        )
+        assert self.KEY in notifier._batch_timestamps
+        state = json.loads(
+            (tmp_path / "notifications" / "notifier_batch.json")
+            .read_text(encoding="utf-8"))
+        assert state["buffer"][self.KEY] == messages_before
+        assert state["started_at"][self.KEY] == started_before
+
+    def test_failed_flush_emits_synthetic_notification_failed(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """One NOTIFICATION_FAILED per failed flush attempt — the failure
+        twin of 18891230c's batch_flush NOTIFICATION_DELIVERED — so the
+        ledger shows the outage instead of silence. No DELIVERED row."""
+        notifier, _calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        self._buffer_two(notifier)
+
+        notifier._flush_stale_batches(max_age=0)
+
+        failed = bus.query(event_type=EventType.NOTIFICATION_FAILED)
+        assert len(failed) == 1, (
+            f"expected exactly one synthetic NOTIFICATION_FAILED per failed "
+            f"batch flush, got {len(failed)}"
+        )
+        evt = failed[0]
+        assert evt.priority == Priority.NORMAL
+        assert evt.payload["original_event_type"] == "batch_flush"
+        assert evt.payload["batch_count"] == 2
+        assert evt.payload["platform"] == "telegram"
+        assert evt.payload["target"]["chat_id"] == "-1001234567890"
+        assert evt.payload["target"]["thread_id"] == "101"
+        assert evt.payload["target"]["topic_key"] == "jobflow_firehose"
+        assert evt.payload["error"]["kind"] == "RuntimeError"
+        assert "Bad Gateway" in evt.payload["error"]["message"]
+        # No single originating event — the field must not point anywhere.
+        assert "original_event_id" not in evt.payload
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+    def test_retry_backoff_prevents_immediate_resend(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """_flush_stale_batches runs on EVERY handled event; without a
+        per-key backoff a restored stale batch would hammer a dead
+        Telegram once per event. After a failure the key must not retry
+        until the backoff window has elapsed."""
+        import events.subscribers.telegram_notifier as tn
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(tn.time, "monotonic", lambda: clock["now"])
+        notifier, calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        self._buffer_two(notifier)
+
+        notifier._flush_stale_batches(max_age=0)
+        assert calls["n"] == 1
+
+        notifier._flush_stale_batches(max_age=0)  # immediate re-sweep
+        assert calls["n"] == 1, (
+            "a failed key must NOT re-send before the backoff elapses"
+        )
+        assert notifier._batch_buffer.get(self.KEY), (
+            "backoff skip must leave the buffer intact"
+        )
+
+        clock["now"] += tn.BATCH_RETRY_BACKOFF_SECONDS + 1
+        notifier._flush_stale_batches(max_age=0)
+        assert calls["n"] == 2, "after the backoff the key must retry"
+
+    def test_retry_success_delivers_full_batch_and_clears_backoff(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """Once the transport recovers, the retried flush delivers the
+        restored messages, emits the normal batch_flush
+        NOTIFICATION_DELIVERED, empties the buffer, and clears the
+        backoff so later flushes are immediate again."""
+        import events.subscribers.telegram_notifier as tn
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(tn.time, "monotonic", lambda: clock["now"])
+        sent = []
+        state = {"fail": True}
+
+        def flaky_send(chat_id, thread_id, msg):
+            if state["fail"]:
+                raise RuntimeError("Bad Gateway")
+            sent.append(msg)
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=flaky_send,
+        )
+        self._buffer_two(notifier)
+        notifier._flush_stale_batches(max_age=0)
+        assert sent == []
+
+        state["fail"] = False
+        clock["now"] += tn.BATCH_RETRY_BACKOFF_SECONDS + 1
+        notifier._flush_stale_batches(max_age=0)
+
+        assert len(sent) == 1
+        assert "Batched (2 events)" in sent[0]
+        assert self.KEY not in notifier._batch_buffer
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 1
+        assert delivered[0].payload["original_event_type"] == "batch_flush"
+        assert delivered[0].payload["batch_count"] == 2
+
+        # Backoff cleared: a fresh batch flushes without waiting.
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Gamma Developer", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+        notifier._flush_stale_batches(max_age=0)
+        assert len(sent) == 2, "success must clear the per-key backoff"
+
+    def test_failed_flush_restore_caps_at_batch_max(
+        self, bus, topics_config, verbosity_config, caplog,
+    ):
+        """A restored buffer respects BATCH_MAX_MESSAGES: oldest messages
+        drop (with a log line) so a dead transport can't grow the buffer
+        unbounded across repeated failed flushes."""
+        import events.subscribers.telegram_notifier as tn
+
+        notifier, _calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        msgs = [f"msg {chr(ord('A') + i)}" for i in range(25)]
+        notifier._batch_buffer[self.KEY] = list(msgs)
+        notifier._batch_timestamps[self.KEY] = 0.0
+        notifier._batch_started_at[self.KEY] = "2026-07-20T18:07:00+00:00"
+
+        with caplog.at_level("WARNING"):
+            notifier._flush_stale_batches(max_age=0)
+
+        restored = notifier._batch_buffer.get(self.KEY)
+        assert restored == msgs[-tn.BATCH_MAX_MESSAGES:], (
+            "restore must cap oldest-out at BATCH_MAX_MESSAGES"
+        )
+        assert any("dropped" in r.message for r in caplog.records), (
+            "capping must leave a log trace of the dropped messages"
+        )
+
+    def test_buffer_stays_capped_while_backoff_blocks_size_flush(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """During the backoff window handle() keeps appending and the
+        size-triggered flush is skipped — the buffer must still stay at
+        BATCH_MAX_MESSAGES (oldest-out), keeping the newest message."""
+        import events.subscribers.telegram_notifier as tn
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(tn.time, "monotonic", lambda: clock["now"])
+        notifier, calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        msgs = [f"msg {chr(ord('A') + i)}" for i in range(tn.BATCH_MAX_MESSAGES)]
+        notifier._batch_buffer[self.KEY] = list(msgs)
+        notifier._batch_timestamps[self.KEY] = clock["now"]
+        notifier._batch_started_at[self.KEY] = "2026-07-20T18:07:00+00:00"
+
+        notifier._flush_stale_batches(max_age=0)  # fails, arms backoff
+        assert calls["n"] == 1
+
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Gamma Developer", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+
+        assert calls["n"] == 1, "size-triggered flush must respect the backoff"
+        buf = notifier._batch_buffer.get(self.KEY)
+        assert len(buf) == tn.BATCH_MAX_MESSAGES, (
+            f"buffer must stay capped during backoff; got {len(buf)}"
+        )
+        assert "Gamma Developer" in buf[-1], (
+            "cap must drop the OLDEST messages, keeping the newest"
+        )
+
+
 class TestNotificationDeliveredReverseSignal:
     """NOTIFICATION_DELIVERED + NOTIFICATION_FAILED reverse-signal layer
     (2026-04-30, design at docs/superpowers/specs/2026-04-30-notification-

@@ -105,6 +105,12 @@ _CRON_BUS_ONLY = frozenset({
 # produces bounded, readable combos.
 BATCH_FLUSH_SECONDS = 3600.0
 BATCH_MAX_MESSAGES = 20
+# Minimum gap between flush attempts for a key whose last send FAILED.
+# _flush_stale_batches runs on every handled event, so without this a
+# restored stale batch would hammer a dead Telegram once per event
+# (2026-07-20: the transport sat in an httpx.ReadError reconnect loop
+# for hours — retrying per event buys nothing and floods the log).
+BATCH_RETRY_BACKOFF_SECONDS = 120.0
 
 
 class TelegramNotifier(BaseSubscriber):
@@ -168,6 +174,10 @@ class TelegramNotifier(BaseSubscriber):
             if k not in self._batch_started_at:
                 self._batch_started_at[k] = now_wall.isoformat()
             self._batch_timestamps[k] = now_mono - elapsed
+        # topic_key → monotonic time of the last FAILED flush attempt.
+        # In-memory only: a restart grants one fresh attempt, which is the
+        # desired behavior (the transport may well be back by then).
+        self._batch_retry_at: Dict[str, float] = {}
         self._verbosity_mtime: float = 0.0  # mtime of verbosity.json for hot-reload
 
         # AGENT_FAILURE_CLUSTER dedup cache (source, 30-min bucket) -> True.
@@ -631,8 +641,11 @@ class TelegramNotifier(BaseSubscriber):
         event: Optional[Event] = None,
         topic_key: Optional[str] = None,
         batch_count: Optional[int] = None,
-    ) -> None:
-        """Send a message to a Telegram chat/thread.
+    ) -> bool:
+        """Send a message to a Telegram chat/thread. Returns True when
+        the send succeeded, False when it raised (exceptions are swallowed
+        here; callers that must not lose the message — the batch flush —
+        requeue on False, mirroring WhatsAppEscalator's quiet-queue requeue).
 
         When ``event`` is provided (non-batched delivery from handle()),
         emits NOTIFICATION_DELIVERED on success and NOTIFICATION_FAILED
@@ -676,6 +689,7 @@ class TelegramNotifier(BaseSubscriber):
                 self._safe_emit_batch_delivered(
                     chat_id, thread_id, topic_key, latency_ms, batch_count,
                 )
+            return True
         except Exception as exc:
             latency_ms = int((time.monotonic() - t0) * 1000)
             logger.error("TelegramNotifier delivery failed: %s", exc)
@@ -683,6 +697,11 @@ class TelegramNotifier(BaseSubscriber):
                 self._safe_emit_failed(
                     event, chat_id, thread_id, topic_key, latency_ms, exc,
                 )
+            elif batch_count is not None:
+                self._safe_emit_batch_failed(
+                    chat_id, thread_id, topic_key, latency_ms, batch_count, exc,
+                )
+            return False
 
     def _safe_emit_delivered(
         self,
@@ -801,6 +820,53 @@ class TelegramNotifier(BaseSubscriber):
                 "for event %s", event.event_id,
             )
 
+    def _safe_emit_batch_failed(
+        self,
+        chat_id: str,
+        thread_id: str,
+        topic_key: Optional[str],
+        latency_ms: int,
+        batch_count: int,
+        exc: Exception,
+    ) -> None:
+        """Emit ONE synthetic NOTIFICATION_FAILED for a failed batch flush
+        — the failure twin of _safe_emit_batch_delivered (same
+        original_event_type="batch_flush" payload shape, no
+        original_event_id). Before this (2026-07-20/21 live loss) a flush
+        into a dead transport left ZERO ledger rows, indistinguishable
+        from a quiet hour. Same swallow contract; loop-safe via
+        _NEVER_CONSUME."""
+        try:
+            self.bus.emit(
+                event_type=EventType.NOTIFICATION_FAILED,
+                source="telegram-notifier",
+                payload={
+                    "original_event_type": "batch_flush",
+                    "batch_count": batch_count,
+                    "platform": "telegram",
+                    "target": {
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                        "topic_key": topic_key or "",
+                    },
+                    "latency_ms": latency_ms,
+                    "error": {
+                        "kind": type(exc).__name__,
+                        # Cap so a multi-KB stacktrace doesn't bloat the
+                        # bus DB. The full exception stays in the gateway
+                        # log via logger.error in _deliver.
+                        "message": str(exc)[:500],
+                    },
+                },
+                priority=Priority.NORMAL,
+                tags=["delivery", "telegram", "batch", "failure"],
+            )
+        except Exception:
+            logger.exception(
+                "TelegramNotifier: failed to emit batch-flush "
+                "NOTIFICATION_FAILED for %s:%s", chat_id, thread_id,
+            )
+
     def _flush_stale_batches(self, max_age: float = BATCH_FLUSH_SECONDS) -> None:
         """Flush batched TRACE messages older than max_age seconds."""
         now = time.monotonic()
@@ -814,19 +880,70 @@ class TelegramNotifier(BaseSubscriber):
             self._persist_batch_buffer()
 
     def _flush_batch_key(self, key: str) -> None:
-        """Deliver and clear one thread's batch buffer."""
+        """Deliver and clear one thread's batch buffer.
+
+        Failed-send requeue (2026-07-21): the messages are popped BEFORE
+        the send, and _deliver() swallows exceptions — pre-fix, a flush
+        into a dead transport silently LOST the whole batch (live
+        2026-07-20/21: Telegram stuck in an httpx.ReadError reconnect
+        loop; the batch buffered since 18:07Z left zero chat messages and
+        zero ledger rows). On failure the messages go back to the buffer
+        (front, order preserved, capped oldest-out at BATCH_MAX_MESSAGES)
+        with the key's original age, the restored state is persisted, and
+        the key backs off BATCH_RETRY_BACKOFF_SECONDS before the next
+        attempt. The ledger contract stands: NOTIFICATION_DELIVERED only
+        on success; failure emits the batch_flush NOTIFICATION_FAILED
+        twin (via _deliver).
+        """
+        last_failed = self._batch_retry_at.get(key)
+        if (last_failed is not None
+                and time.monotonic() - last_failed < BATCH_RETRY_BACKOFF_SECONDS):
+            # Recent failed attempt: don't hammer a dead transport once
+            # per handled event; keep the still-growing buffer bounded
+            # while we wait the backoff out.
+            self._cap_batch_key(key)
+            return
         messages = self._batch_buffer.pop(key, [])
-        self._batch_timestamps.pop(key, None)
-        self._batch_started_at.pop(key, None)
+        prior_ts = self._batch_timestamps.pop(key, None)
+        prior_started_at = self._batch_started_at.pop(key, None)
         if not messages:
             return
         parts = key.split(":", 1)
         chat_id, thread_id = parts[0], parts[1] if len(parts) > 1 else ""
         combined = f"Batched ({len(messages)} events):\n\n" + "\n---\n".join(messages)
-        self._deliver(
+        if self._deliver(
             chat_id, thread_id, combined,
             topic_key=self._thread_id_to_key(thread_id),
             batch_count=len(messages),
+        ):
+            self._batch_retry_at.pop(key, None)
+            return
+        # Restore to the FRONT (nothing can have appended mid-flush —
+        # handle() is synchronous — but stay order-safe regardless) and
+        # keep the key's original age so the retry isn't treated as a
+        # fresh batch.
+        self._batch_buffer[key] = messages + self._batch_buffer.get(key, [])
+        self._batch_timestamps[key] = (
+            prior_ts if prior_ts is not None else time.monotonic()
+        )
+        self._batch_started_at[key] = (
+            prior_started_at or datetime.now(timezone.utc).isoformat()
+        )
+        self._cap_batch_key(key)
+        self._batch_retry_at[key] = time.monotonic()
+        self._persist_batch_buffer()
+
+    def _cap_batch_key(self, key: str) -> None:
+        """Drop oldest messages beyond BATCH_MAX_MESSAGES for one key —
+        bounds the buffer while failed flushes are being backed off."""
+        buf = self._batch_buffer.get(key)
+        if not buf or len(buf) <= BATCH_MAX_MESSAGES:
+            return
+        dropped = len(buf) - BATCH_MAX_MESSAGES
+        del buf[:dropped]
+        logger.warning(
+            "TelegramNotifier: batch %s over cap while sends fail — "
+            "dropped %d oldest message(s)", key, dropped,
         )
 
     def _persist_batch_buffer(self) -> None:
