@@ -57,32 +57,12 @@ chown -R root:root "$APP_ROOT/.venv"
 
 install -m 0640 -o root -g pclaw "$DEPLOY_ROOT/SOUL.md" "$HERMES_HOME/SOUL.md"
 
-python3 - "$RUNTIME_ROOT/processing-gate.json" <<'PY'
-import datetime, json, os, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-if path.exists():
-    state = json.loads(path.read_text())
-    if state.get("enabled") is not False:
-        raise SystemExit("processing gate is not disabled; sprint deploy refuses")
-else:
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    state = {
-        "version": 1,
-        "enabled": False,
-        "generation": 0,
-        "initial_state": "disabled",
-        "initial_disabled_boundary": now,
-        "disabled_at": now,
-        "last_transition": None,
-        "source": "ClientAgentDeployment",
-    }
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
-    with os.fdopen(fd, "w") as handle:
-        json.dump(state, handle, sort_keys=True, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-PY
+# Deployment owns code/config refresh, not activation state. Create the gate
+# fail-closed on first install, then validate and preserve either live boolean
+# state on every subsequent idempotent bootstrap.
+"$APP_ROOT/.venv/bin/python" \
+  "$DEPLOY_ROOT/scripts/ensure_processing_gate.py" \
+  "$RUNTIME_ROOT/processing-gate.json"
 chown root:pclaw "$RUNTIME_ROOT/processing-gate.json"
 chmod 0640 "$RUNTIME_ROOT/processing-gate.json"
 

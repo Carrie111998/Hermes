@@ -22,14 +22,20 @@
         {
           "name": "bootstrap-hermes-runtime",
           "command": "APP_ROOT=/home/pclaw/apps/hermes-pcl HERMES_HOME=/home/pclaw/.hermes-christopher-tgg CAPTURE_SOURCE=/var/lib/tgg-capture/whatsapp/capture/events.jsonl bash /home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/bootstrap_runtime.sh",
-          "timeoutMs": 600000
+          "timeoutMs": 600000,
+          "transaction": {
+            "behavior": "idempotent"
+          }
         }
       ],
       "postRestartHooks": [
         {
           "name": "quick-runtime-invariants",
           "command": "/home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/verify_runtime.sh --quick",
-          "timeoutMs": 120000
+          "timeoutMs": 120000,
+          "transaction": {
+            "behavior": "read-only"
+          }
         }
       ]
     }
