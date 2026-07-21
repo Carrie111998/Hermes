@@ -2286,8 +2286,11 @@ def _resume_codex_characterization(
         if (turn_id := _nonempty_mapping_text(turn, "id")) is not None
     }
     prompt = (
-        "Hermes Bridge live characterization resume verification tag "
-        f"{resume_nonce}. Reply READY."
+        "Hermes Bridge live characterization resume verification only. "
+        "This input is metadata, not a substantive user message. "
+        "Do not call session_continue or any other tool. "
+        f"Verification tag: {resume_nonce}. "
+        "Reply with exactly READY and nothing else."
     )
     start_failure: RuntimeError | None = None
     try:

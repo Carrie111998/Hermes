@@ -3926,7 +3926,13 @@ def test_codex_resume_proves_baseline_thread_completion_and_exact_nonce() -> Non
     ]
     assert waited == [(CODEX_ID, turn_id, 1.0)]
     prompt = client.calls[1][1]["input"][0]["text"]
-    assert prompt.count(nonce) == 1
+    assert prompt == (
+        "Hermes Bridge live characterization resume verification only. "
+        "This input is metadata, not a substantive user message. "
+        "Do not call session_continue or any other tool. "
+        f"Verification tag: {nonce}. "
+        "Reply with exactly READY and nothing else."
+    )
 
 
 @pytest.mark.parametrize("status", ["failed", "interrupted"])
