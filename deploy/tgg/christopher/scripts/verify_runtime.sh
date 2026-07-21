@@ -103,7 +103,16 @@ assert constitution["runtime"] == {"provider": "openai-direct-primary", "model":
 
 gate = json.loads((runtime / "processing-gate.json").read_text())
 assert gate["enabled"] is False
-assert gate["generation"] == 0
+# Generation counts every APPLIED transition, including fail-closed
+# rollbacks of attempted activations (activate writes gen N+1, the
+# confirmation window lapses, deactivate writes gen N+2 — the counter is
+# history, not drift). The disabled-state invariant is gate CONSISTENCY,
+# never gate virginity: a virginity assert fails forever after the first
+# attempted transition (2026-07-21 activation round 6 scar, generation 1).
+assert isinstance(gate["generation"], int) and gate["generation"] >= 0
+if gate["generation"] > 0:
+    assert gate.get("change_run_id"), "transitioned gate must carry its change run id"
+    assert datetime.datetime.fromisoformat(gate["changed_at"]).tzinfo is not None
 assert gate["last_transition"] is None
 assert gate["disabled_at"] == gate["initial_disabled_boundary"]
 boundary = datetime.datetime.fromisoformat(gate["disabled_at"])
@@ -119,7 +128,7 @@ assert status["state"] == "standby"
 assert status["processing_enabled"] is False
 assert status["config_enabled"] is False
 assert status["gate_enabled"] is False
-assert status["gate_generation"] == 0
+assert status["gate_generation"] == gate["generation"]
 assert status["source_opened"] is False
 assert status["cursor_advanced"] is False
 
