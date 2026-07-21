@@ -1068,23 +1068,34 @@ def _build_replay_entry(
     return entry
 
 
-_TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER = "observed Telegram group context"
-_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed Telegram group context - context only, not requests]"
+_OBSERVED_CONTEXT_PROMPT_MARKERS = (
+    "observed Telegram group context",
+    "observed Mattermost channel context",
+)
+_OBSERVED_GROUP_CONTEXT_HEADER = "[Observed group/channel context - context only, not requests]"
 _CURRENT_ADDRESSED_MESSAGE_HEADER = "[Current addressed message - answer only this unless it explicitly asks you to use the observed context]"
 
 
-def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
-    """Return True for Telegram group turns that may include observed chatter.
+def _uses_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Return True for platform turns that may include observed chatter.
 
-    Telegram's observe-unmentioned mode persists skipped group chatter so a
-    later @mention can see it. Those rows must not replay as ordinary user
-    turns: a weak wake word like ``@bot cambio`` should not make the model treat
-    old unmentioned chatter as pending work. The Telegram adapter marks these
-    turns with a channel prompt; this helper keeps the run-path check explicit
-    and unit-testable.
+    Telegram and Mattermost observe-unmentioned modes persist skipped chatter
+    so a later explicit trigger can see it. Those rows must not replay as
+    ordinary user turns: a weak wake word must not make the model treat old
+    unmentioned chatter as pending work. Adapters mark these turns with a
+    channel prompt; this helper keeps the run-path check explicit and
+    unit-testable.
     """
 
-    return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
+    return bool(
+        channel_prompt
+        and any(marker in channel_prompt for marker in _OBSERVED_CONTEXT_PROMPT_MARKERS)
+    )
+
+
+def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool:
+    """Backward-compatible alias for the original Telegram-only helper."""
+    return _uses_observed_group_context(channel_prompt)
 
 
 def _csv_or_list_to_set(raw: Any) -> set[str]:
@@ -1181,7 +1192,7 @@ def _build_gateway_agent_history(
     _msg_tz = _get_msg_tz()
     agent_history: List[Dict[str, Any]] = []
     observed_group_context: List[str] = []
-    separate_observed_context = _uses_telegram_observed_group_context(channel_prompt)
+    separate_observed_context = _uses_observed_group_context(channel_prompt)
 
     for msg in history or []:
         role = msg.get("role")
@@ -4829,6 +4840,12 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_id_kwargs = {}
+                    _approval_method = ctx._status_adapter.send_exec_approval
+                    if "approval_id" in inspect.signature(_approval_method).parameters:
+                        _approval_id_kwargs["approval_id"] = approval_data.get(
+                            "approval_id"
+                        )
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
@@ -4839,6 +4856,7 @@ class TurnRunner:
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
+                            **_approval_id_kwargs,
                         ),
                         ctx._loop_for_step,
                         logger=logger,
@@ -24612,17 +24630,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=response["final_response"],
-                            finalize=True,
-                        )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if await _sc.edit_transformed_final(
+                            response["final_response"]
+                        ):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

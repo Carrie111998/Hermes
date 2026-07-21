@@ -1169,6 +1169,26 @@ class TestApprovalTimeoutIsNotConsent:
         """The reported #24912 scenario — user never responds, agent must see
         BLOCKED, and the post hook must distinguish timeout from deny so audit
         plugins can alert on 'agent asked, user never replied'."""
+    def test_resolve_by_approval_id_targets_exact_pending_entry(self):
+        from tools import approval as mod
+
+        first = mod._ApprovalEntry({"approval_id": "approval-a"})
+        second = mod._ApprovalEntry({"approval_id": "approval-b"})
+        mod._gateway_queues[self.SESSION_KEY] = [first, second]
+
+        count = mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", approval_id="approval-b"
+        )
+
+        assert count == 1
+        assert second.result == "once"
+        assert second.event.is_set()
+        assert first.result is None
+        assert not first.event.is_set()
+        assert mod._gateway_queues[self.SESSION_KEY] == [first]
+
+    def test_timeout_returns_approved_false_with_no_consent(self, monkeypatch):
+        """The reported #24912 scenario — user never responds, agent must see BLOCKED."""
         from tools import approval as mod
 
         self._force_short_timeout(monkeypatch)
@@ -1193,6 +1213,7 @@ class TestApprovalTimeoutIsNotConsent:
         assert result.get("outcome") == "timeout"
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
+        assert notified[0].get("approval_id")
 
         # The BLOCKED message must explicitly tell the agent not to rephrase;
         # without it the agent treats "Do NOT retry this command" as permission
