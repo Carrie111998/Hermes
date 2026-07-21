@@ -689,6 +689,12 @@ async def process_live_records(
     provider, model = configured_engine(config_path)
     runner = GatewayRunner(load_gateway_config())
     run_id = f"live-drain-{uuid.uuid4().hex[:12]}"
+    management_chats = _management_selector_chats(config_path)
+    replay_namespace = (
+        "agent:live-drain:management"
+        if records and all(record.chat_id in management_chats for record in records)
+        else None
+    )
     result = await runner.replay(
         ReplayPlan(
             platform="whatsapp",
@@ -700,6 +706,10 @@ async def process_live_records(
             bypass_auth=True,
             live_business_writes=True,
             source_path="durable-jsonl-consumer-live",
+            # Management chat is a real ongoing conversation. A stable replay
+            # namespace keeps one persistent Hermes session per chat while
+            # site drain/eval batches retain their isolated run namespace.
+            replay_namespace=replay_namespace,
         )
     )
     handled: list[dict[str, Any]] = []
