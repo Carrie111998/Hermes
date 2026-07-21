@@ -2804,6 +2804,37 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _surface_context_for_event(
+    event: "MessageEvent", source: Any, accepted_text: Any
+) -> dict:
+    """Build bounded, serializable provenance for one platform event."""
+    metadata = getattr(event, "metadata", None) or {}
+    members = metadata.get("platform_event_members")
+    member_texts = getattr(event, "_platform_event_member_texts", None)
+    if (
+        not isinstance(members, list)
+        or not isinstance(member_texts, list)
+        or not 1 <= len(members) <= 16
+        or len(members) != len(member_texts)
+        or not all(isinstance(member, dict) for member in members)
+    ):
+        return {}
+    return {
+        "platform": _gateway_platform_value(getattr(source, "platform", "")),
+        "sender_id": str(getattr(source, "user_id", "") or ""),
+        "chat_id": str(getattr(source, "chat_id", "") or ""),
+        "chat_type": str(getattr(source, "chat_type", "") or ""),
+        "thread_id": str(getattr(source, "thread_id", "") or ""),
+        "profile": str(getattr(source, "profile", "") or ""),
+        "platform_account": str(metadata.get("platform_account") or ""),
+        "accepted_text": accepted_text if isinstance(accepted_text, str) else "",
+        "source_messages": [
+            {**dict(member), "text": str(member_texts[index])}
+            for index, member in enumerate(members)
+        ],
+    }
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -5081,7 +5112,13 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            agent._gateway_event_context = dict(ctx.surface_context or {})
+            try:
+                result = agent.run_conversation(
+                    _api_run_message, **_conversation_kwargs
+                )
+            finally:
+                agent._gateway_event_context = {}
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -16667,6 +16704,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                surface_context=_surface_context_for_event(
+                    event,
+                    source,
+                    persist_user_message
+                    if isinstance(persist_user_message, str)
+                    else message_text,
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -22976,6 +23020,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        surface_context: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -22995,6 +23040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                surface_context=surface_context,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23007,6 +23053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                surface_context=surface_context,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23129,6 +23176,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        surface_context: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23413,6 +23461,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            surface_context=surface_context,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -24398,6 +24447,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_surface_context = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -24430,6 +24480,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_surface_context = _surface_context_for_event(
+                        pending_event, next_source, next_message
+                    )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -24485,6 +24538,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    surface_context=next_surface_context,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

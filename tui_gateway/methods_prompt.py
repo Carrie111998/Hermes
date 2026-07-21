@@ -111,6 +111,9 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    surface_context = _prompt_surface_context(
+        params, sid=sid, session=session, text=text
+    )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
@@ -141,6 +144,7 @@ def _(rid, params: dict) -> dict:
                 break
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
+            surface_context=surface_context,
             queued=bool(params.get("queued")),
         )
         if busy_response is not None:
@@ -223,7 +227,9 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid, sid, session, text, surface_context
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -280,7 +286,9 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid, sid, session, text, surface_context=surface_context
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

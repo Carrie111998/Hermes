@@ -171,6 +171,20 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Platform ingress provenance hook. Fired by adapters immediately before
+    # a user-authored event enters an adapter-side debounce/aggregation queue.
+    # It is observational: return values are ignored and MUST NOT authorize a
+    # turn.  The hook exists so trusted local plugins can durably record the
+    # ordered raw event identifiers that would otherwise be lost when multiple
+    # platform messages are combined into one MessageEvent.
+    #
+    # Current kwargs: event: MessageEvent, adapter: BasePlatformAdapter.
+    "pre_platform_event_enqueue",
+    # Desktop ingress provenance. Fired by the TUI/dashboard prompt handler
+    # after session lookup and text sanitization, before queueing or dispatch.
+    # A trusted plugin may return {"surface_context": {...}}; absent/invalid
+    # provenance leaves the ordinary chat path unchanged.
+    "pre_prompt_submit",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

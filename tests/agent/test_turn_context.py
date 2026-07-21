@@ -254,6 +254,26 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
+def test_pre_llm_hook_receives_gateway_surface_context():
+    agent = _FakeAgent()
+    agent.platform = "telegram"
+    agent._user_id = "42"
+    agent._gateway_event_context = {
+        "platform": "telegram",
+        "sender_id": "42",
+        "chat_id": "42",
+        "source_messages": [{"raw_event_id": "100", "message_id": "7"}],
+    }
+
+    with patch("hermes_cli.lifecycle.invoke_hook", return_value=[]) as invoke:
+        _build(agent)
+
+    kwargs = invoke.call_args.kwargs
+    assert kwargs["platform"] == "telegram"
+    assert kwargs["sender_id"] == "42"
+    assert kwargs["surface_context"] == agent._gateway_event_context
+
+
 
 
 
@@ -331,7 +351,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

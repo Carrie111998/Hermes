@@ -1113,6 +1113,7 @@ export function ChatBar({
               poppedOut && 'bg-transparent',
               dragging && 'cursor-grabbing select-none touch-none'
             )}
+            data-direct-action-eligible={!busy && hasText && attachments.length === 0 ? 'true' : undefined}
             data-drag-active={dragActive ? '' : undefined}
             data-popped-out={poppedOut ? '' : undefined}
             data-slot="composer-root"

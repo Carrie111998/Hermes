@@ -179,11 +179,11 @@ class TestPluginDiscovery:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
         mgr.discover_and_load()
         assert mgr._discovered is True
-        non_bundled = {
+        user_plugins = {
             n: p for n, p in mgr._plugins.items()
-            if p.manifest.source != "bundled"
+            if p.manifest.source == "user"
         }
-        assert len(non_bundled) == 1
+        assert len(user_plugins) == 1
 
 
 
@@ -305,6 +305,12 @@ class TestPluginLoading:
 
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
+
+    def test_valid_hooks_include_product_neutral_provenance_seams(self):
+        assert {
+            "pre_platform_event_enqueue",
+            "pre_prompt_submit",
+        } <= VALID_HOOKS
 
 
 

@@ -31,7 +31,11 @@ from gateway.session import SessionSource
 class _NoopAgent:
     """Minimal agent stub that returns immediately without tool calls."""
 
+    last_instance = None
+    seen_surface_context = None
+
     def __init__(self, *args, **kwargs):
+        type(self).last_instance = self
         self.tools = []
         self.model = kwargs.get("model", "test-model")
         self.provider = kwargs.get("provider", "test-provider")
@@ -42,6 +46,7 @@ class _NoopAgent:
     def run_conversation(self, user_message, conversation_history=None,
                          task_id=None, persist_user_message=None,
                          persist_user_timestamp=None):
+        type(self).seen_surface_context = dict(self._gateway_event_context)
         return {
             "final_response": "Hello from the agent.",
             "messages": [],
@@ -130,6 +135,11 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     """
     _setup_monkeypatches(monkeypatch, tmp_path)
     runner = _make_runner()
+    surface_context = {
+        "platform": "telegram",
+        "accepted_text": "Hello Jarvis",
+        "source_messages": [{"raw_event_id": "update-1"}],
+    }
 
     # No adapter for this source → consumer setup skipped, but the outer
     # finalisation path still runs with streaming_tts_consumer_holder[0]=None.
@@ -148,10 +158,12 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
             session_id="session-1",
             session_key="agent:main:telegram:dm:12345",
             message_type=MessageType.VOICE,
+            surface_context=surface_context,
         )
         return result
 
     result = asyncio.new_event_loop().run_until_complete(_run())
     assert result["final_response"] == "Hello from the agent."
-
+    assert _NoopAgent.seen_surface_context == surface_context
+    assert _NoopAgent.last_instance._gateway_event_context == {}
 

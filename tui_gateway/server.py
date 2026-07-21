@@ -1367,6 +1367,44 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     write_json(_event_frame(event, sid, payload))
 
 
+def _prompt_surface_context(
+    params: dict, *, sid: str, session: dict, text: object
+) -> dict | None:
+    """Resolve one plugin-verified context for a Desktop prompt."""
+    provenance = params.get("desktop_provenance")
+    if not isinstance(provenance, dict) or not isinstance(text, str):
+        return None
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+
+        results = invoke_hook(
+            "pre_prompt_submit",
+            provenance=dict(provenance),
+            session_id=sid,
+            task_id=str(session.get("session_key") or sid),
+            user_message=text,
+            platform="desktop",
+        )
+    except Exception:
+        logger.debug("prompt provenance hook failed", exc_info=True)
+        return None
+    contexts = [
+        dict(result["surface_context"])
+        for result in results
+        if isinstance(result, dict)
+        and set(result) == {"surface_context"}
+        and isinstance(result["surface_context"], dict)
+        and result["surface_context"].get("accepted_text") == text
+        and isinstance(result["surface_context"].get("source_messages"), list)
+        and 1 <= len(result["surface_context"]["source_messages"]) <= 16
+        and all(
+            isinstance(item, dict)
+            for item in result["surface_context"]["source_messages"]
+        )
+    ]
+    return contexts[0] if len(contexts) == 1 else None
+
+
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
 # A session-less event from a background thread has neither a session transport
 # nor a contextvar binding, so write_json would drop it on stdio — this registry
@@ -1454,7 +1492,13 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
         return _compute_host_supervisor
 
 
-def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _compute_host_turn_frame(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    surface_context: dict | None = None,
+) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
@@ -1475,6 +1519,7 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
         "attached_images": attached_images,
+        "surface_context": dict(surface_context or {}),
     }
 
 
@@ -1545,9 +1590,15 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
-def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any) -> dict:
+def _submit_prompt_to_compute_host(
+    rid: str,
+    sid: str,
+    session: dict,
+    text: Any,
+    surface_context: dict | None = None,
+) -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(rid, sid, session, text)
+    frame = _compute_host_turn_frame(rid, sid, session, text, surface_context)
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -7026,7 +7077,42 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _merge_surface_context(
+    previous: dict | None, current: dict | None, combined_text: Any
+) -> dict | None:
+    """Merge authenticated source sets only for the same principal."""
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return None
+    excluded = {"accepted_text", "source_messages"}
+    previous_static = {
+        key: value for key, value in previous.items() if key not in excluded
+    }
+    current_static = {
+        key: value for key, value in current.items() if key not in excluded
+    }
+    if previous_static != current_static:
+        return None
+    sources = [
+        *(previous.get("source_messages") or []),
+        *(current.get("source_messages") or []),
+    ]
+    if not 1 <= len(sources) <= 16 or not all(
+        isinstance(item, dict) for item in sources
+    ):
+        return None
+    return {
+        **previous_static,
+        "accepted_text": combined_text if isinstance(combined_text, str) else "",
+        "source_messages": sources,
+    }
+
+
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    surface_context: dict | None = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -7043,7 +7129,14 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+        surface_context = _merge_surface_context(
+            existing.get("surface_context"), surface_context, text
+        )
+    session["queued_prompt"] = {
+        "text": text,
+        "transport": transport,
+        "surface_context": surface_context,
+    }
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7082,7 +7175,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    surface_context: dict | None = None,
+    queued: bool = False,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7112,7 +7211,14 @@ def _handle_busy_submit(
             return None
     text_only = _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
+    if (
+        mode == "steer"
+        and surface_context is None
+        and text_only
+        and plain_text
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
             if agent.steer(plain_text):
                 with session["history_lock"]:
@@ -7125,6 +7231,7 @@ def _handle_busy_submit(
     # the proven interrupt + queue path below.
     if (
         mode == "interrupt"
+        and surface_context is None
         and text_only
         and plain_text
         and agent is not None
@@ -7145,7 +7252,7 @@ def _handle_busy_submit(
     with session["history_lock"]:
         if not session.get("running"):
             return None
-        _enqueue_prompt(session, text, transport)
+        _enqueue_prompt(session, text, transport, surface_context)
         session["last_active"] = time.time()
 
     if mode != "queue":
@@ -7170,7 +7277,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["transport"] = queued["transport"]
     try:
         if _session_uses_compute_host(session):
-            resp = _submit_prompt_to_compute_host(rid, sid, session, queued["text"])
+            resp = _submit_prompt_to_compute_host(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                queued.get("surface_context"),
+            )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
@@ -7178,7 +7291,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
         else:
-            _run_prompt_submit(rid, sid, session, queued["text"])
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                surface_context=queued.get("surface_context"),
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -8962,6 +9081,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    surface_context: dict | None = None,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -9250,7 +9370,11 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            agent._gateway_event_context = dict(surface_context or {})
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            finally:
+                agent._gateway_event_context = {}
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
