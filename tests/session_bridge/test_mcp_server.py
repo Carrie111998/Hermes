@@ -1570,6 +1570,47 @@ def test_claude_visibility_status_degrades_oversized_heartbeat_timestamp() -> No
     assert payload["degraded_reasons"] == ["invalid_status"]
 
 
+def test_claude_visibility_status_exposes_and_degrades_unlinked_lineage() -> None:
+    config = ClaudeVisibilityConfig(
+        enabled=True,
+        continuous=True,
+        daily_registration_limit=25,
+        reserved_cost_per_attempt_usd="0.02",
+        emergency_daily_cost_usd="0.50",
+    )
+    raw = {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_visible": 2,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "usage": {
+            "local_day": "2026-07-21",
+            "attempts": 0,
+            "reserved_cost_usd": "0",
+        },
+        "fatal": [],
+        "lineage": {
+            "unlinked_visible": 2,
+            "repairable": 1,
+            "blocked": 1,
+            "blocker_codes": {"claude_lineage_missing_source": 1},
+        },
+    }
+
+    payload = _claude_visibility_status_payload(raw, config)
+
+    assert payload["lineage"] == raw["lineage"]
+    assert payload["degraded_reasons"] == [
+        "claude_lineage_missing_source",
+        "unlinked_visible_lineage",
+    ]
+
+
 def test_session_sidebar_fail_has_fixed_schema_and_rejects_arbitrary_errors(
     db: SessionDB,
 ) -> None:

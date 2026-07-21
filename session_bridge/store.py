@@ -69,6 +69,18 @@ _SIDEBAR_CREATE_RESERVATION_PREFIX = "session-bridge:sidebar-create:"
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
+_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX = 100
+_CLAUDE_LINEAGE_TARGET_MISSING = "claude_lineage_target_missing"
+_CLAUDE_LINEAGE_TARGET_DUPLICATE = "claude_lineage_target_duplicate"
+_CLAUDE_LINEAGE_TARGET_IDENTITY_MISMATCH = (
+    "claude_lineage_target_identity_mismatch"
+)
+_CLAUDE_LINEAGE_TARGET_PROVENANCE_MISMATCH = (
+    "claude_lineage_target_provenance_mismatch"
+)
+_CLAUDE_LINEAGE_MISSING_SOURCE = "claude_lineage_missing_source"
+_CLAUDE_LINEAGE_INVALID_COMPLETION = "claude_lineage_invalid_completion"
+_CLAUDE_LINEAGE_CONFLICT = "claude_lineage_conflict"
 _PROFILE_SHADOW_SOURCE = "session_bridge_profile"
 _WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
 _WORKTREE_SNAPSHOT_FIELDS = frozenset({
@@ -1699,6 +1711,15 @@ class SessionBridgeStore:
             )
             if completed.rowcount != 1:
                 raise ValueError("stale Claude authentication recovery completion")
+            lineage = _finalize_claude_visibility_lineage_if_indexed(
+                conn,
+                job_id=normalized_job,
+                created_at=operation_time,
+            )
+            if lineage["state"] == "blocked" and lineage["code"] != (
+                _CLAUDE_LINEAGE_TARGET_MISSING
+            ):
+                raise ValueError(str(lineage["code"]))
             return dict(
                 conn.execute(
                     "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
@@ -1769,6 +1790,15 @@ class SessionBridgeStore:
                     raise ValueError(
                         "exact Claude authentication recovery authority required"
                     )
+                lineage = _finalize_claude_visibility_lineage_if_indexed(
+                    conn,
+                    job_id=normalized_job,
+                    created_at=operation_time,
+                )
+                if lineage["state"] == "blocked" and lineage["code"] != (
+                    _CLAUDE_LINEAGE_TARGET_MISSING
+                ):
+                    raise ValueError(str(lineage["code"]))
                 return dict(completed_job)
             if (
                 recovery["state"] not in ("leased", "retry")
@@ -1806,6 +1836,15 @@ class SessionBridgeStore:
             )
             if completed.rowcount != 1:
                 raise ValueError("stale Claude authentication recovery completion")
+            lineage = _finalize_claude_visibility_lineage_if_indexed(
+                conn,
+                job_id=normalized_job,
+                created_at=operation_time,
+            )
+            if lineage["state"] == "blocked" and lineage["code"] != (
+                _CLAUDE_LINEAGE_TARGET_MISSING
+            ):
+                raise ValueError(str(lineage["code"]))
             return dict(
                 conn.execute(
                     "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
@@ -1955,6 +1994,15 @@ class SessionBridgeStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("exact active Claude visibility lease required")
+            lineage = _finalize_claude_visibility_lineage_if_indexed(
+                conn,
+                job_id=normalized_job_id,
+                created_at=operation_time,
+            )
+            if lineage["state"] == "blocked" and lineage["code"] != (
+                _CLAUDE_LINEAGE_TARGET_MISSING
+            ):
+                raise ValueError(str(lineage["code"]))
             return dict(
                 conn.execute(
                     "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
@@ -2070,6 +2118,7 @@ class SessionBridgeStore:
                 "SELECT value_json FROM session_bridge_state WHERE key = ?",
                 (_CLAUDE_VISIBILITY_CYCLE_STATE_KEY,),
             ).fetchone()
+            lineage = _claude_visibility_lineage_status(conn)
         counts = {state: 0 for state in states}
         fatal: list[dict[str, Any]] = []
         for row in count_rows:
@@ -2131,8 +2180,66 @@ class SessionBridgeStore:
                 "reserved_cost_usd": str(total_cost),
             },
             "fatal": fatal,
+            "lineage": lineage,
             **_public_claude_visibility_cycle_state(cycle),
         }
+
+    def reconcile_claude_visibility_lineage(
+        self,
+        *,
+        limit: int,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Inspect or repair a bounded page of already-visible Claude lineage.
+
+        This is deliberately store-local: it never performs provider calls or native
+        creation. A row is repaired only after its existing source, exact reserved
+        Claude target, authenticated bridge provenance, completion, and link identity
+        all validate in the same transaction.
+        """
+
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("Claude lineage reconciliation limit must be an integer")
+        if limit < 1 or limit > _CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX:
+            raise ValueError(
+                "Claude lineage reconciliation limit must be between 1 and "
+                f"{_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX}"
+            )
+
+        def _write(conn):
+            rows = _unlinked_claude_visibility_jobs(conn, limit=limit)
+            blocker_codes: dict[str, int] = {}
+            repairable = 0
+            repaired = 0
+            operation_time = _finite_number(self._clock(), "clock")
+            for row in rows:
+                inspected = _inspect_claude_visibility_lineage(conn, row)
+                if inspected["state"] == "repairable":
+                    repairable += 1
+                    if apply:
+                        finalized = _finalize_claude_visibility_lineage_if_indexed(
+                            conn,
+                            job_id=str(row["id"]),
+                            created_at=operation_time,
+                        )
+                        if finalized["state"] not in {"linked", "already_linked"}:
+                            raise ValueError(
+                                str(finalized["code"] or _CLAUDE_LINEAGE_CONFLICT)
+                            )
+                        repaired += 1
+                    continue
+                code = str(inspected["code"] or _CLAUDE_LINEAGE_CONFLICT)
+                blocker_codes[code] = blocker_codes.get(code, 0) + 1
+            remaining = _count_unlinked_claude_visibility_jobs(conn)
+            return {
+                "scanned": len(rows),
+                "repairable": repairable,
+                "repaired": repaired,
+                "remaining": remaining,
+                "blocker_codes": dict(sorted(blocker_codes.items())),
+            }
+
+        return self.db._execute_write(_write)
 
     def record_claude_visibility_cycle(
         self,
@@ -6695,7 +6802,7 @@ def _ensure_claude_visibility_lineage_row_if_known(
     created_at: float,
 ) -> dict[str, Any] | None:
     jobs = conn.execute(
-        """SELECT source_session_id FROM session_claude_visibility_jobs
+        """SELECT id FROM session_claude_visibility_jobs
            WHERE bridge_id = ? AND reserved_claude_uuid = ?
              AND state = 'claude_visible'
            ORDER BY id LIMIT 2""",
@@ -6704,61 +6811,249 @@ def _ensure_claude_visibility_lineage_row_if_known(
     if not jobs:
         return None
     if len(jobs) != 1:
-        raise ValueError("duplicate Claude visibility lineage identity")
-    source_session_id = str(jobs[0]["source_session_id"])
+        raise ValueError(_CLAUDE_LINEAGE_TARGET_DUPLICATE)
+    finalized = _finalize_claude_visibility_lineage_if_indexed(
+        conn,
+        job_id=str(jobs[0]["id"]),
+        created_at=created_at,
+    )
+    if finalized["state"] == "blocked":
+        raise ValueError(str(finalized["code"] or _CLAUDE_LINEAGE_CONFLICT))
+    if finalized["state"] == "target_missing":
+        return None
+    return finalized.get("link")
+
+
+def _claude_visibility_lineage_link_id(
+    bridge_id: str,
+    source_session_id: str,
+    target_session_id: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"{bridge_id}\0{source_session_id}\0{target_session_id}".encode()
+    ).hexdigest()
+    return f"claude-visibility-link:{digest}"
+
+
+def _inspect_claude_visibility_lineage(
+    conn: Any,
+    job: Mapping[str, Any],
+) -> dict[str, Any]:
+    bridge_id = str(job["bridge_id"])
+    source_session_id = str(job["source_session_id"])
+    reserved_uuid = str(job["reserved_claude_uuid"])
+    target_session_id = canonical_session_id(Provider.CLAUDE, reserved_uuid)
+    expected_link_id = _claude_visibility_lineage_link_id(
+        bridge_id,
+        source_session_id,
+        target_session_id,
+    )
+
+    exact_target = conn.execute(
+        "SELECT * FROM external_sessions WHERE session_id = ?",
+        (target_session_id,),
+    ).fetchone()
+    bridge_targets = conn.execute(
+        """SELECT * FROM external_sessions
+           WHERE origin_bridge_id = ?
+           ORDER BY session_id LIMIT 3""",
+        (bridge_id,),
+    ).fetchall()
+    if exact_target is None:
+        return {
+            "state": "blocked",
+            "code": (
+                _CLAUDE_LINEAGE_TARGET_IDENTITY_MISMATCH
+                if bridge_targets
+                else _CLAUDE_LINEAGE_TARGET_MISSING
+            ),
+            "link": None,
+        }
+    if (
+        exact_target["provider"] != Provider.CLAUDE.value
+        or exact_target["native_id"] != reserved_uuid
+    ):
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_TARGET_IDENTITY_MISMATCH,
+            "link": None,
+        }
+    if (
+        exact_target["origin_kind"]
+        not in {
+            OriginKind.BRIDGE_PLACEHOLDER.value,
+            OriginKind.BRIDGE_CONTINUATION.value,
+        }
+        or exact_target["origin_bridge_id"] != bridge_id
+    ):
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_TARGET_PROVENANCE_MISMATCH,
+            "link": None,
+        }
+    if len(bridge_targets) != 1 or bridge_targets[0]["session_id"] != target_session_id:
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_TARGET_DUPLICATE,
+            "link": None,
+        }
     if (
         conn.execute(
             "SELECT 1 FROM sessions WHERE id = ?", (source_session_id,)
         ).fetchone()
         is None
     ):
-        raise ValueError("Claude visibility source session is not indexed")
-    conflicting = conn.execute(
-        """SELECT 1 FROM session_links
-           WHERE bridge_id = ? AND (
-               from_session_id != ? OR to_session_id != ? OR relation != ?
-           ) LIMIT 1""",
-        (
-            bridge_id,
-            source_session_id,
-            target_session_id,
-            Relation.MIRRORS.value,
-        ),
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_MISSING_SOURCE,
+            "link": None,
+        }
+    completion = job["completion_digest"]
+    if (
+        not isinstance(completion, str)
+        or len(completion) != 64
+        or re.fullmatch(r"[0-9a-f]{64}", completion) is None
+        or job["visible_at"] is None
+    ):
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_INVALID_COMPLETION,
+            "link": None,
+        }
+
+    links = conn.execute(
+        "SELECT * FROM session_links WHERE bridge_id = ? ORDER BY id LIMIT 3",
+        (bridge_id,),
+    ).fetchall()
+    if not links:
+        return {
+            "state": "repairable",
+            "code": None,
+            "link": None,
+            "link_id": expected_link_id,
+            "source_session_id": source_session_id,
+            "target_session_id": target_session_id,
+            "bridge_id": bridge_id,
+        }
+    if len(links) != 1:
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_CONFLICT,
+            "link": None,
+        }
+    link = links[0]
+    if (
+        link["id"] != expected_link_id
+        or link["from_session_id"] != source_session_id
+        or link["to_session_id"] != target_session_id
+        or link["relation"]
+        not in {Relation.MIRRORS.value, Relation.CONTINUES.value}
+    ):
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_CONFLICT,
+            "link": None,
+        }
+    return {"state": "already_linked", "code": None, "link": dict(link)}
+
+
+def _finalize_claude_visibility_lineage_if_indexed(
+    conn: Any,
+    *,
+    job_id: str,
+    created_at: float,
+) -> dict[str, Any]:
+    job = conn.execute(
+        """SELECT * FROM session_claude_visibility_jobs
+           WHERE id = ? AND state = 'claude_visible'""",
+        (job_id,),
     ).fetchone()
-    if conflicting is not None:
-        raise ValueError("Claude visibility lineage identity conflict")
-    digest = hashlib.sha256(
-        f"{bridge_id}\0{source_session_id}\0{target_session_id}".encode()
-    ).hexdigest()
-    link_id = f"claude-visibility-link:{digest}"
+    if job is None:
+        raise ValueError("exact visible Claude visibility job required")
+    inspected = _inspect_claude_visibility_lineage(conn, job)
+    if inspected["state"] != "repairable":
+        if inspected["code"] == _CLAUDE_LINEAGE_TARGET_MISSING:
+            return {"state": "target_missing", "code": inspected["code"], "link": None}
+        return inspected
+
     conn.execute(
         """INSERT OR IGNORE INTO session_links (
                id, from_session_id, to_session_id, relation, bridge_id,
                source_cursor, source_hash, created_at
            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)""",
         (
-            link_id,
-            source_session_id,
-            target_session_id,
+            inspected["link_id"],
+            inspected["source_session_id"],
+            inspected["target_session_id"],
             Relation.MIRRORS.value,
-            bridge_id,
+            inspected["bridge_id"],
             created_at,
         ),
     )
-    row = conn.execute(
-        """SELECT * FROM session_links
-           WHERE bridge_id = ? AND from_session_id = ?
-             AND to_session_id = ? AND relation = ?""",
-        (
-            bridge_id,
-            source_session_id,
-            target_session_id,
-            Relation.MIRRORS.value,
-        ),
-    ).fetchone()
-    if row is None or row["id"] != link_id:
-        raise ValueError("Claude visibility lineage link collision")
-    return dict(row)
+    verified = _inspect_claude_visibility_lineage(conn, job)
+    if verified["state"] != "already_linked":
+        return {
+            "state": "blocked",
+            "code": verified["code"] or _CLAUDE_LINEAGE_CONFLICT,
+            "link": None,
+        }
+    return {"state": "linked", "code": None, "link": verified["link"]}
+
+
+def _unlinked_claude_visibility_jobs(conn: Any, *, limit: int) -> list[Any]:
+    selected: list[Any] = []
+    rows = conn.execute(
+        """SELECT job.*
+           FROM session_claude_visibility_jobs AS job
+           WHERE job.state = 'claude_visible'
+           ORDER BY job.visible_at, job.id"""
+    )
+    for row in rows:
+        if _inspect_claude_visibility_lineage(conn, row)["state"] == "already_linked":
+            continue
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _count_unlinked_claude_visibility_jobs(conn: Any) -> int:
+    count = 0
+    rows = conn.execute(
+        """SELECT job.*
+           FROM session_claude_visibility_jobs AS job
+           WHERE job.state = 'claude_visible'
+           ORDER BY job.visible_at, job.id"""
+    )
+    for row in rows:
+        if _inspect_claude_visibility_lineage(conn, row)["state"] != "already_linked":
+            count += 1
+    return count
+
+
+def _claude_visibility_lineage_status(conn: Any) -> dict[str, Any]:
+    rows = _unlinked_claude_visibility_jobs(
+        conn,
+        limit=_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX,
+    )
+    total = _count_unlinked_claude_visibility_jobs(conn)
+    blocker_codes: dict[str, int] = {}
+    repairable = 0
+    for row in rows:
+        inspected = _inspect_claude_visibility_lineage(conn, row)
+        if inspected["state"] == "repairable":
+            repairable += 1
+            continue
+        code = str(inspected["code"] or _CLAUDE_LINEAGE_CONFLICT)
+        blocker_codes[code] = blocker_codes.get(code, 0) + 1
+    if total > len(rows):
+        blocker_codes["claude_lineage_status_truncated"] = total - len(rows)
+    return {
+        "unlinked_visible": total,
+        "repairable": repairable,
+        "blocked": total - repairable,
+        "blocker_codes": dict(sorted(blocker_codes.items())),
+    }
 
 
 def _find_sidebar_job_by_digest(

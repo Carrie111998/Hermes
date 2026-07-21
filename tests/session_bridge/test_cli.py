@@ -131,6 +131,12 @@ class FakeBackend:
                 "attempts": 0,
                 "reserved_cost_usd": "0",
             },
+            "lineage": {
+                "unlinked_visible": 0,
+                "repairable": 0,
+                "blocked": 0,
+                "blocker_codes": {},
+            },
             "candidates": [],
             "exclusions": [],
             "open_reasons": [],
@@ -204,6 +210,17 @@ class FakeBackend:
             "dry_run": not apply,
             "applied": apply,
             "enqueued": 0,
+        }
+
+    def reconcile_claude_visibility_lineage(self, *, limit: int, apply: bool):
+        self.calls.append(("reconcile_claude_visibility_lineage", limit, apply))
+        return {
+            "mode": "apply" if apply else "dry_run",
+            "scanned": 1,
+            "repairable": 1,
+            "repaired": 1 if apply else 0,
+            "remaining": 0 if apply else 1,
+            "blocker_codes": {},
         }
 
     def set_claude_visibility_continuous(self, *, enabled: bool):
@@ -890,6 +907,121 @@ def test_claude_visibility_backfill_validation_precedes_backend_mutation(
         )
 
     assert backend.calls == []
+
+
+def test_claude_visibility_lineage_reconcile_requires_explicit_apply_confirmation(
+    capsys,
+) -> None:
+    backend = FakeBackend()
+
+    assert (
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--limit",
+                "25",
+                "--dry-run",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys) == {
+        "mode": "dry_run",
+        "scanned": 1,
+        "repairable": 1,
+        "repaired": 0,
+        "remaining": 1,
+        "blocker_codes": {},
+    }
+    assert (
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--limit",
+                "25",
+                "--apply",
+            ],
+            backend,
+        )
+        != 0
+    )
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": "historical_lineage_repair_confirmation_required",
+    }
+    assert (
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--limit",
+                "25",
+                "--apply",
+                "--confirm-historical-repair",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["mode"] == "apply"
+    assert backend.calls == [
+        ("reconcile_claude_visibility_lineage", 25, False),
+        ("close",),
+        ("close",),
+        ("reconcile_claude_visibility_lineage", 25, True),
+        ("close",),
+    ]
+
+
+def test_claude_visibility_status_blocks_on_unlinked_visible_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": "2026-07-21",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+                "lineage": {
+                    "unlinked_visible": 2,
+                    "repairable": 1,
+                    "blocked": 1,
+                    "blocker_codes": {"claude_lineage_missing_source": 1},
+                },
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["lineage"] == {
+        "unlinked_visible": 2,
+        "repairable": 1,
+        "blocked": 1,
+        "blocker_codes": {"claude_lineage_missing_source": 1},
+    }
+    assert result["open_reasons"] == ["unlinked_visible_lineage"]
+    assert result["fatal_reasons"] == ["claude_lineage_missing_source"]
+    assert result["degraded_reasons"] == [
+        "claude_lineage_missing_source",
+        "unlinked_visible_lineage",
+    ]
 
 
 def test_claude_visibility_apply_and_run_once_use_typed_nonzero_contract(

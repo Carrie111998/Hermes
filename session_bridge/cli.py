@@ -126,6 +126,7 @@ _SENSITIVE_KEY_FRAGMENTS = (
     "token",
 )
 _LOG = logging.getLogger(__name__)
+_CLAUDE_LINEAGE_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}")
 
 
 def _run_continuous_visibility_worker(
@@ -366,6 +367,9 @@ class _Backend(Protocol):
     def claude_visibility_status(self) -> Mapping[str, Any]: ...
     def claude_visibility_backfill(
         self, *, days: int, limit: int, apply: bool
+    ) -> Mapping[str, Any]: ...
+    def reconcile_claude_visibility_lineage(
+        self, *, limit: int, apply: bool
     ) -> Mapping[str, Any]: ...
     def set_claude_visibility_continuous(
         self, *, enabled: bool
@@ -823,6 +827,10 @@ class ProductionBackend:
         store = self._require_store()
         raw = store.claude_visibility_status(time.time())
         status_fatal = _claude_visibility_fatal_reasons(raw)
+        lineage = _public_claude_visibility_lineage(raw)
+        degraded = list(status_fatal)
+        if lineage["unlinked_visible"] > 0:
+            degraded.append("unlinked_visible_lineage")
         return {
             "enabled": config.enabled,
             "continuous": config.continuous,
@@ -830,12 +838,13 @@ class ProductionBackend:
             "retry_codes": dict(raw["retry_codes"]),
             "failed_codes": dict(raw["failed_codes"]),
             "usage": dict(raw["usage"]),
+            "lineage": lineage,
             "fatal": list(raw.get("fatal", [])),
             "candidates": [],
             "exclusions": [],
             "open_reasons": _claude_visibility_open_reasons(raw),
             "fatal_reasons": status_fatal,
-            "degraded_reasons": status_fatal,
+            "degraded_reasons": sorted(set(degraded)),
             "last_cycle": dict(
                 raw.get("last_cycle", {"tracked": False, "value": None})
             ),
@@ -845,6 +854,22 @@ class ProductionBackend:
             "last_registrar_result": dict(
                 raw.get("last_registrar_result", {"tracked": False, "value": None})
             ),
+        }
+
+    def reconcile_claude_visibility_lineage(
+        self, *, limit: int, apply: bool
+    ) -> Mapping[str, Any]:
+        result = self._require_store().reconcile_claude_visibility_lineage(
+            limit=limit,
+            apply=apply,
+        )
+        return {
+            "mode": "apply" if apply else "dry_run",
+            "scanned": int(result["scanned"]),
+            "repairable": int(result["repairable"]),
+            "repaired": int(result["repaired"]),
+            "remaining": int(result["remaining"]),
+            "blocker_codes": dict(result["blocker_codes"]),
         }
 
     def claude_visibility_backfill(
@@ -1714,6 +1739,22 @@ def build_parser() -> argparse.ArgumentParser:
     claude_visibility_mode.add_argument("--dry-run", action="store_true")
     claude_visibility_mode.add_argument("--apply", action="store_true")
 
+    claude_lineage = commands.add_parser(
+        "claude-visibility-reconcile-lineage",
+        help="inspect or repair bounded historical Claude catalog lineage",
+    )
+    claude_lineage.add_argument(
+        "--limit", type=_bounded_claude_lineage_limit, default=25
+    )
+    claude_lineage_mode = claude_lineage.add_mutually_exclusive_group(required=True)
+    claude_lineage_mode.add_argument("--dry-run", action="store_true")
+    claude_lineage_mode.add_argument("--apply", action="store_true")
+    claude_lineage.add_argument(
+        "--confirm-historical-repair",
+        action="store_true",
+        help="confirm the existing-row-only repair when --apply is selected",
+    )
+
     claude_visibility_continuous = commands.add_parser(
         "claude-visibility-continuous",
         help="persist the Claude visibility continuous discovery preference",
@@ -1877,6 +1918,19 @@ def main(
                 if args.apply and blocked
                 else (EXIT_DEGRADED if blocked else EXIT_OK)
             )
+        if args.command == "claude-visibility-reconcile-lineage":
+            if args.apply and not args.confirm_historical_repair:
+                raise RolloutGateBlocked(
+                    "historical_lineage_repair_confirmation_required"
+                )
+            payload = dict(
+                backend.reconcile_claude_visibility_lineage(
+                    limit=args.limit,
+                    apply=bool(args.apply),
+                )
+            )
+            _emit(payload)
+            return EXIT_DEGRADED if payload.get("blocker_codes") else EXIT_OK
         if args.command == "claude-visibility-continuous":
             payload = dict(
                 backend.set_claude_visibility_continuous(enabled=bool(args.enable))
@@ -2112,6 +2166,7 @@ def _claude_visibility_open_reasons(raw: Mapping[str, Any]) -> list[str]:
     counts = raw.get("counts")
     if not isinstance(counts, Mapping):
         return ["invalid_status"]
+    reasons: list[str] = []
     if any(
         int(counts.get(state, 0)) > 0
         for state in (
@@ -2121,8 +2176,14 @@ def _claude_visibility_open_reasons(raw: Mapping[str, Any]) -> list[str]:
             "claude_failed",
         )
     ):
-        return ["open_visibility_work"]
-    return []
+        reasons.append("open_visibility_work")
+    try:
+        lineage = _public_claude_visibility_lineage(raw)
+    except ConfigurationFailure:
+        return ["invalid_status"]
+    if lineage["unlinked_visible"] > 0:
+        reasons.append("unlinked_visible_lineage")
+    return reasons
 
 
 def _claude_characterization_open_work_allowed(
@@ -2197,7 +2258,60 @@ def _claude_visibility_fatal_reasons(raw: Mapping[str, Any]) -> list[str]:
             if code in CLAUDE_VISIBILITY_FATAL_CODES
             else "unknown_failed_code"
         )
+    try:
+        lineage = _public_claude_visibility_lineage(raw)
+    except ConfigurationFailure:
+        reasons.append("invalid_status")
+    else:
+        for code, count in lineage["blocker_codes"].items():
+            if count > 0 and code != "claude_lineage_target_missing":
+                reasons.append(code)
     return sorted(set(reasons))
+
+
+def _public_claude_visibility_lineage(raw: Mapping[str, Any]) -> dict[str, Any]:
+    value = raw.get(
+        "lineage",
+        {
+            "unlinked_visible": 0,
+            "repairable": 0,
+            "blocked": 0,
+            "blocker_codes": {},
+        },
+    )
+    if not isinstance(value, Mapping) or set(value) != {
+        "unlinked_visible",
+        "repairable",
+        "blocked",
+        "blocker_codes",
+    }:
+        raise ConfigurationFailure("invalid_claude_lineage_status")
+    selected: dict[str, int] = {}
+    for name in ("unlinked_visible", "repairable", "blocked"):
+        item = value.get(name)
+        if type(item) is not int or item < 0:
+            raise ConfigurationFailure("invalid_claude_lineage_status")
+        selected[name] = item
+    blockers = value.get("blocker_codes")
+    if not isinstance(blockers, Mapping):
+        raise ConfigurationFailure("invalid_claude_lineage_status")
+    blocker_codes: dict[str, int] = {}
+    for code, count in blockers.items():
+        if (
+            type(code) is not str
+            or _CLAUDE_LINEAGE_CODE.fullmatch(code) is None
+            or type(count) is not int
+            or count < 1
+        ):
+            raise ConfigurationFailure("invalid_claude_lineage_status")
+        blocker_codes[code] = count
+    if (
+        selected["repairable"] + selected["blocked"]
+        != selected["unlinked_visible"]
+        or sum(blocker_codes.values()) != selected["blocked"]
+    ):
+        raise ConfigurationFailure("invalid_claude_lineage_status")
+    return {**selected, "blocker_codes": dict(sorted(blocker_codes.items()))}
 
 
 def _disabled_claude_visibility_payload(continuous: bool) -> dict[str, Any]:
@@ -2215,6 +2329,12 @@ def _disabled_claude_visibility_payload(continuous: bool) -> dict[str, Any]:
         "failed_codes": {},
         "fatal": [],
         "usage": {"local_day": None, "attempts": 0, "reserved_cost_usd": "0"},
+        "lineage": {
+            "unlinked_visible": 0,
+            "repairable": 0,
+            "blocked": 0,
+            "blocker_codes": {},
+        },
         "candidates": [],
         "exclusions": [],
         "open_reasons": [],
@@ -2579,6 +2699,13 @@ def _bounded_claude_visibility_limit(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > 10:
         raise argparse.ArgumentTypeError("value must be at most 10")
+    return parsed
+
+
+def _bounded_claude_lineage_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 100:
+        raise argparse.ArgumentTypeError("value must be at most 100")
     return parsed
 
 

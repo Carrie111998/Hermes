@@ -650,6 +650,15 @@ def _claude_visibility_status_payload(
     retry_raw = raw.get("retry_codes")
     failed_raw = raw.get("failed_codes")
     usage_raw = raw.get("usage")
+    lineage_raw = raw.get(
+        "lineage",
+        {
+            "unlinked_visible": 0,
+            "repairable": 0,
+            "blocked": 0,
+            "blocker_codes": {},
+        },
+    )
     degraded: set[str] = set()
     if not isinstance(counts_raw, Mapping):
         counts_raw = {}
@@ -663,6 +672,19 @@ def _claude_visibility_status_payload(
     if not isinstance(usage_raw, Mapping):
         usage_raw = {}
         degraded.add("invalid_status")
+    if not isinstance(lineage_raw, Mapping) or set(lineage_raw) != {
+        "unlinked_visible",
+        "repairable",
+        "blocked",
+        "blocker_codes",
+    }:
+        lineage_raw = {
+            "unlinked_visible": 0,
+            "repairable": 0,
+            "blocked": 0,
+            "blocker_codes": {},
+        }
+        degraded.add("invalid_status")
 
     counts: dict[str, int] = {}
     for state in states:
@@ -670,6 +692,29 @@ def _claude_visibility_status_payload(
 
     retry_codes = _fixed_count_mapping(retry_raw, degraded)
     failed_codes = _fixed_count_mapping(failed_raw, degraded)
+    lineage_blockers_raw = lineage_raw.get("blocker_codes")
+    if not isinstance(lineage_blockers_raw, Mapping):
+        lineage_blockers_raw = {}
+        degraded.add("invalid_status")
+    lineage = {
+        "unlinked_visible": _nonnegative_int(
+            lineage_raw.get("unlinked_visible"), degraded
+        ),
+        "repairable": _nonnegative_int(lineage_raw.get("repairable"), degraded),
+        "blocked": _nonnegative_int(lineage_raw.get("blocked"), degraded),
+        "blocker_codes": _fixed_count_mapping(lineage_blockers_raw, degraded),
+    }
+    if (
+        lineage["repairable"] + lineage["blocked"]
+        != lineage["unlinked_visible"]
+        or sum(lineage["blocker_codes"].values()) != lineage["blocked"]
+    ):
+        degraded.add("invalid_status")
+    if lineage["unlinked_visible"] > 0:
+        degraded.add("unlinked_visible_lineage")
+    for code, count in lineage["blocker_codes"].items():
+        if count > 0 and code != "claude_lineage_target_missing":
+            degraded.add(code)
     for code, count in retry_codes.items():
         if count > 0 and code not in CLAUDE_VISIBILITY_RETRY_CODES:
             degraded.add("unknown_retry_code")
@@ -739,6 +784,7 @@ def _claude_visibility_status_payload(
             "attempts": attempts,
             "reserved_cost_usd": str(reserved_cost),
         },
+        "lineage": lineage,
         "cost_gates": {
             "daily_registration_limit": daily_limit,
             "attempts_remaining": max(0, daily_limit - attempts),
