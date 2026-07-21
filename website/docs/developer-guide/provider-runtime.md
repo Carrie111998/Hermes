@@ -68,6 +68,7 @@ Current provider families include (see `plugins/model-providers/` for the comple
 - Ollama Cloud
 - LM Studio
 - Tencent TokenHub
+- Ant Ling (`ant-ling`)
 - Custom (`provider: custom`) — first-class provider for any OpenAI-compatible endpoint
 - Named custom providers (`custom_providers` list in config.yaml)
 

@@ -127,6 +127,45 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openai.com/index/previewing-gpt-5-6-sol/",
         pricing_version="openai-gpt-5.6-2026-07",
     ),
+    # ── Ant Ling — Ling / Ring 2.6 series ────────────────────
+    # Direct endpoint (provider "ant-ling") bills in RMB. A promotional
+    # 90%-off discount ("1 折") runs through 2026-07-31; rates below are the
+    # *promotional* RMB prices converted to USD at ¥1 ≈ $0.14 (rough — the
+    # usage system is USD-denominated, and ant-ling is RMB-only, so these
+    # are an approximation, not an exact published USD rate).
+    #   promotional RMB/M (in/out): flash ¥0.006 / ¥0.018; 1T ¥0.045 / ¥0.18.
+    # Full RMB price list: https://developer.ant-ling.com/zh-CN/docs/models/price/
+    # Only Ring-2.6-1T supports reasoning.effort; cost is per-token regardless.
+    (
+        "ant-ling",
+        "Ling-2.6-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.0008"),
+        output_cost_per_million=Decimal("0.0025"),
+        source="official_docs_snapshot",
+        source_url="https://developer.ant-ling.com/zh-CN/docs/models/price/",
+        pricing_version="ant-ling-2.6-2026-07-promo-rmb2usd",
+    ),
+    (
+        "ant-ling",
+        "Ling-2.6-1T",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.006"),
+        output_cost_per_million=Decimal("0.025"),
+        source="official_docs_snapshot",
+        source_url="https://developer.ant-ling.com/zh-CN/docs/models/price/",
+        pricing_version="ant-ling-2.6-2026-07-promo-rmb2usd",
+    ),
+    (
+        "ant-ling",
+        "Ring-2.6-1T",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.006"),
+        output_cost_per_million=Decimal("0.025"),
+        source="official_docs_snapshot",
+        source_url="https://developer.ant-ling.com/zh-CN/docs/models/price/",
+        pricing_version="ant-ling-2.6-2026-07-promo-rmb2usd",
+    ),
     (
         "openai",
         "gpt-5.6-terra",

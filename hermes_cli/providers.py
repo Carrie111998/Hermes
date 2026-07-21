@@ -185,6 +185,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="TOKENHUB_BASE_URL",
     ),
+    "ant-ling": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("ANT_LING_API_KEY",),
+        base_url_override="https://api.ant-ling.com/v1",
+        base_url_env_var="ANT_LING_BASE_URL",
+    ),
     "arcee": HermesOverlay(
         transport="openai_chat",
         base_url_override="https://api.arcee.ai/api/v1",
@@ -353,6 +359,9 @@ ALIASES: Dict[str, str] = {
     "tencent-cloud": "tencent-tokenhub",
     "tencentmaas": "tencent-tokenhub",
 
+    # ant-ling
+    "antling": "ant-ling",
+
     # bedrock
     "aws": "bedrock",
     "aws-bedrock": "bedrock",
@@ -400,6 +409,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "gmi": "GMI Cloud",
     "upstage": "Upstage Solar",
     "tencent-tokenhub": "Tencent TokenHub",
+    "ant-ling": "Ant Ling",
     "lmstudio": "LM Studio",
     "local": "Local endpoint",
     "bedrock": "AWS Bedrock",

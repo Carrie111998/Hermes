@@ -378,6 +378,7 @@ def run_dump(args):
         ("DASHSCOPE_API_KEY", "dashscope"),
         ("HF_TOKEN", "huggingface"),
         ("NVIDIA_API_KEY", "nvidia"),
+        ("ANT_LING_API_KEY", "ant_ling"),
         ("OPENCODE_ZEN_API_KEY", "opencode_zen"),
         ("OPENCODE_GO_API_KEY", "opencode_go"),
         ("KILOCODE_API_KEY", "kilocode"),

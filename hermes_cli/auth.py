@@ -290,6 +290,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("GMI_API_KEY",),
         base_url_env_var="GMI_BASE_URL",
     ),
+    "ant-ling": ProviderConfig(
+        id="ant-ling",
+        name="Ant Ling",
+        auth_type="api_key",
+        inference_base_url="https://api.ant-ling.com/v1",
+        api_key_env_vars=("ANT_LING_API_KEY",),
+        base_url_env_var="ANT_LING_BASE_URL",
+    ),
     "minimax": ProviderConfig(
         id="minimax",
         name="MiniMax",

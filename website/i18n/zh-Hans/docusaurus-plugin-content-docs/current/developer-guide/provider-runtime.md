@@ -68,6 +68,7 @@ Hermes 拥有一个共享的 provider 运行时解析器，用于以下场景：
 - Ollama Cloud
 - LM Studio
 - Tencent TokenHub
+- Ant Ling（`ant-ling`）
 - Custom（`provider: custom`）— 适用于任何 OpenAI 兼容端点的一等 provider
 - 命名自定义 provider（`config.yaml` 中的 `custom_providers` 列表）
 
