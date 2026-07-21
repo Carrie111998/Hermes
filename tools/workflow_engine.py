@@ -1180,7 +1180,7 @@ class WorkflowEngine:
     def execute(self, workflow_name: str, context: dict = None,
                 start_node: str = None, dry_run: bool = False,
                 resume: bool = False, board: str = None,
-                inputs: dict = None, delivery: str = None) -> dict:
+                inputs: dict = None) -> dict:
         """
         Run a workflow to completion. Supports revision loops via
         the LOOP:<target> convention in block reasons.
@@ -1192,11 +1192,6 @@ class WorkflowEngine:
 
         ``inputs`` are merged into context and available as
         ``{inputs.<key>}`` template substitutions across all nodes.
-
-        ``delivery`` is an optional delivery target (e.g.
-        ``"discord:CHANNEL_ID"``). When set, the result is routed
-        through the delivery router after the DAG completes. When
-        ``None``, the normal return-to-caller flow is used.
 
         Returns execution summary: {node_id: final_status, ...}
         """
@@ -1544,11 +1539,6 @@ class WorkflowEngine:
 
         self._clear_state(workflow_name, run_id=workflow.run_id)
 
-        # ── Delivery routing ──
-        if delivery:
-            from plugins.workflow.delivery_router import deliver
-            deliver(results, delivery, workflow.run_id, workflow.name)
-
         return results
 
     def _monitor_layer(self, workflow: Workflow, layer: list[str],
@@ -1795,7 +1785,6 @@ def main():
     start.add_argument("--dry-run", action="store_true", help="Print plan without executing")
     start.add_argument("--node", help="Start from a specific node (partial execution)")
     start.add_argument("--resume", action="store_true", help="Resume from saved state")
-    start.add_argument("--delivery", "-d", help="Delivery target (e.g. discord:CHANNEL_ID, telegram:CHAT_ID)")
 
     # validate
     validate = sub.add_parser("validate", help="Validate a workflow without executing")
@@ -1828,8 +1817,7 @@ def main():
                 inputs[k] = v
         engine.execute(args.workflow, context=context, start_node=args.node,
                       dry_run=args.dry_run, resume=args.resume,
-                      board=args.board, inputs=inputs or None,
-                      delivery=args.delivery)
+                      board=args.board, inputs=inputs or None)
 
     elif args.command == "validate":
         result = engine.validate(args.workflow)

@@ -15,8 +15,8 @@ Architecture:
     Model (tool call) → handle_workflow_dynamic (this) → delegate_task
     → async_delegation → completion_queue → reconcile → dispatch next layer
 
-The engine is in-memory only.  Persistence, kanban integration, delivery
-routing, and cost guards belong in ``dynamic_bridge.py``.
+The engine is in-memory only.  Persistence, kanban integration,
+and cost guards belong in ``dynamic_bridge.py``.
 """
 
 from __future__ import annotations

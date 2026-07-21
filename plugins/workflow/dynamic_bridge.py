@@ -2,7 +2,6 @@
 
 Wraps the in-memory dynamic engine (``dynamic.py``) with:
   - Kanban card lifecycle (create on project-scope, complete on record)
-  - Delivery routing on workflow completion
   - Optional JSON persistence for durable scopes
   - Cost guards (max nodes, max dispatch, single-flight)
 
@@ -46,9 +45,6 @@ def _auto_approve(key: str) -> bool:
 
 def _auto_discover() -> bool:
     return bool(get_config().get("auto_discovery", True))
-
-def _auto_deliver() -> bool:
-    return bool(get_config().get("auto_deliver", True))
 
 VALID_SCOPES = frozenset({"project", "global", "durable"})
 
@@ -291,49 +287,6 @@ def _load_state(workflow_id: str) -> dict | None:
         return None
 
 
-# ── Delivery helpers ──────────────────────────────────────────────
-
-
-def _deliver_workflow(
-    wf_view: dict,
-    run_id: str,
-    delivery_target: str,
-) -> dict | None:
-    """Route completed workflow to the delivery router.
-
-    Builds a summary dict and calls ``delivery_router.deliver``.
-    Returns the delivery result, or None if delivery is not configured.
-    """
-    if not delivery_target or not delivery_target.strip():
-        return None
-
-    nodes = wf_view.get("nodes", [])
-    total = len(nodes)
-    completed = sum(1 for n in nodes if n.get("status") == "completed")
-    failed = sum(1 for n in nodes if n.get("status") == "failed")
-    cancelled = sum(1 for n in nodes if n.get("status") == "cancelled")
-
-    created = wf_view.get("created_at", 0)
-    now = time.time()
-    duration = round(now - created, 1) if created else 0
-
-    summary = {
-        "workflow_id": wf_view.get("workflow_id"),
-        "objective": wf_view.get("objective"),
-        "total_nodes": total,
-        "completed": completed,
-        "failed": failed,
-        "cancelled": cancelled,
-        "duration_seconds": duration,
-    }
-    try:
-        from plugins.workflow.delivery_router import deliver
-        return deliver(summary, delivery_target, run_id, wf_view.get("workflow_id", ""))
-    except Exception as exc:
-        logger.warning("delivery failed: %s", exc)
-        return None
-
-
 # ── Cost guards ───────────────────────────────────────────────────
 
 
@@ -382,8 +335,6 @@ def _validate_dispatch_count(count: int) -> int:
 _kanban_card_map: dict[str, dict[str, str]] = {}
 # workflow_id -> {node_id: card_id}
 
-_delivered_workflows: set[str] = set()
-
 
 
 # ── Public entry point ────────────────────────────────────────────
@@ -397,7 +348,6 @@ def run_dynamic_workflow(
     scope: str = "project",
     single_flight: bool = False,
     dispatch_ready: bool = True,
-    delivery_target: str = "",
     board: str = "",
 ) -> dict:
     """Create and optionally dispatch a dynamic workflow with fleet integration.
@@ -410,7 +360,6 @@ def run_dynamic_workflow(
         scope: One of "project", "global", or "durable".
         single_flight: If True, refuse creation when a same-id run is active.
         dispatch_ready: If True, dispatch ready nodes immediately.
-        delivery_target: Delivery target string (e.g. "discord:CHANNEL_ID").
         board: Kanban board override. When empty, uses the bridge default
                ("dynamic-workflows").
 
@@ -483,9 +432,6 @@ def run_dynamic_workflow(
     if scope == "durable":
         _save_state(actual_id, wf_view)
 
-    # Auto-delivery on completion
-    _try_auto_deliver(wf_view, actual_id, delivery_target)
-
     result["workflow"] = wf_view
     return result
 
@@ -499,12 +445,11 @@ def record_node(
     result: Any = None,
     context: Any = None,
     scope: str = "project",
-    delivery_target: str = "",
 ) -> dict:
     """Record a node's result and handle side effects.
 
-    Wraps the engine's ``record`` action with kanban completion,
-    durable persistence, and auto-delivery routing.
+    Wraps the engine's ``record`` action with kanban completion
+    and durable persistence.
 
     Returns the engine result dict.
     """
@@ -547,9 +492,6 @@ def record_node(
     if scope == "durable":
         _save_state(workflow_id, wf_view)
 
-    # Auto-delivery — check if all nodes terminal after this record
-    _try_auto_deliver(wf_view, workflow_id, delivery_target)
-
     return res
 
 
@@ -557,12 +499,11 @@ def dispatch_nodes(
     workflow_id: str,
     max_dispatch: int = _max_dispatch(),
     scope: str = "project",
-    delivery_target: str = "",
 ) -> dict:
     """Manually trigger dispatch of ready nodes.
 
     Wraps the engine's ``dispatch`` action with dispatch count capping,
-    kanban creation, durable persistence, and auto-delivery routing.
+    kanban creation, and durable persistence.
     """
     import json as _json
 
@@ -607,9 +548,6 @@ def dispatch_nodes(
     if scope == "durable":
         _save_state(workflow_id, wf_view)
 
-    # Auto-delivery — check if workflow is already complete
-    _try_auto_deliver(wf_view, workflow_id, delivery_target)
-
     return res
 
 
@@ -638,41 +576,3 @@ def _append_extension_artifact(workflow_id: str, node_id: str, node_summary: str
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as exc:
         logger.warning("failed to write extension artifact for %s: %s", workflow_id, exc)
-
-
-def _all_nodes_terminal(wf_view: dict) -> bool:
-    """Check whether every node in the workflow view is in a terminal state."""
-    nodes = wf_view.get("nodes", [])
-    if not nodes:
-        return False
-    terminal = {"completed", "failed", "cancelled"}
-    return all(n.get("status") in terminal for n in nodes)
-
-
-def _try_auto_deliver(
-    wf_view: dict,
-    workflow_id: str,
-    delivery_target: str,
-) -> dict | None:
-    """Auto-deliver workflow summary if conditions are met.
-
-    Conditions:
-      1. ``auto_deliver`` is enabled in plugin config.
-      2. A non-empty ``delivery_target`` is provided.
-      3. All nodes are in a terminal state.
-      4. This workflow has not already been delivered (dedup guard).
-
-    Returns the delivery result, or None if delivery was skipped.
-    """
-    if not _auto_deliver():
-        return None
-    if not delivery_target or not delivery_target.strip():
-        return None
-    if not _all_nodes_terminal(wf_view):
-        return None
-    if workflow_id in _delivered_workflows:
-        logger.debug("workflow %s already delivered, skipping", workflow_id)
-        return None
-    _delivered_workflows.add(workflow_id)
-    logger.info("auto-delivering workflow %s to %s", workflow_id, delivery_target)
-    return _deliver_workflow(wf_view, workflow_id, delivery_target)
