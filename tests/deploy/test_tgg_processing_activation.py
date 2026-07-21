@@ -270,7 +270,7 @@ def test_ps_service_token_materializes_from_systems_and_verifies_without_receipt
         expected_source_uid=os.getuid(),
     )
     assert module.read_env_value(
-        target.read_text(encoding="utf-8"), module.TARGET_PS_TOKEN_KEY
+        target.read_text(encoding="utf-8"), module.TARGET_CREDENTIAL_ENV
     ) == "fixture-token"
     assert "OPENAI_API_KEY=fixture-openai" in target.read_text(encoding="utf-8")
     assert observed == [

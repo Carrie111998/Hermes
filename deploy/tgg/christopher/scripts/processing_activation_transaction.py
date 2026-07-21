@@ -36,8 +36,8 @@ GRANT_LEDGER = Path("/home/pclaw/.hermes-christopher-tgg/runtime/activation-cont
 GRANT_SCHEMA = "tgg-activation-controller-grant/v1"
 HERMES_ENV_PATH = Path("/home/pclaw/.hermes-christopher-tgg/.env")
 SYSTEMS_ENV_PATH = Path("/etc/systems-papercut-labs/tgg.env")
-SOURCE_PS_TOKEN_KEY = "CHRISTOPHER_TGG_PS_SERVICE_TOKEN"
-TARGET_PS_TOKEN_KEY = "CHRISTOPHER_TGG_PS_SERVICE_TOKEN"
+SOURCE_CREDENTIAL_ENV = "CHRISTOPHER_TGG_PS_SERVICE_TOKEN"
+TARGET_CREDENTIAL_ENV = "CHRISTOPHER_TGG_PS_SERVICE_TOKEN"
 PS_SERVICE_IDENTITY_URL = "http://127.0.0.1:5191/api/operator/auth/identity"
 PS_SERVICE_VERIFY_URL = "http://127.0.0.1:5191/api/operator/cases/count"
 EXPECTED_PS_SCOPES = frozenset(
@@ -205,22 +205,24 @@ def materialize_ps_service_token(
                 raise RuntimeError("systems source env must be 0640-or-stricter")
         if label == "Hermes target" and stat.st_mode & 0o077:
             raise RuntimeError("Hermes target env must be 0600-or-stricter")
-    source_token = read_env_value(source_env_path.read_text(encoding="utf-8"), SOURCE_PS_TOKEN_KEY)
+    source_token = read_env_value(
+        source_env_path.read_text(encoding="utf-8"), SOURCE_CREDENTIAL_ENV
+    )
     before = target_env_path.read_bytes()
     before_text = before.decode()
     try:
-        prior_token = read_env_value(before_text, TARGET_PS_TOKEN_KEY)
+        prior_token = read_env_value(before_text, TARGET_CREDENTIAL_ENV)
     except RuntimeError as exc:
         if "found 0" not in str(exc):
             raise
         prior_token = None
-    next_bytes = patch_env_value(before_text, TARGET_PS_TOKEN_KEY, source_token)
+    next_bytes = patch_env_value(before_text, TARGET_CREDENTIAL_ENV, source_token)
     changed = next_bytes != before
     if changed:
         writer(target_env_path, next_bytes)
     try:
         materialized_token = read_env_value(
-            target_env_path.read_text(encoding="utf-8"), TARGET_PS_TOKEN_KEY
+            target_env_path.read_text(encoding="utf-8"), TARGET_CREDENTIAL_ENV
         )
         if not hmac.compare_digest(materialized_token, source_token):
             raise RuntimeError("materialized PS service token does not match the systems authority")
@@ -231,9 +233,9 @@ def materialize_ps_service_token(
         raise
     return {
         "sourcePath": str(source_env_path),
-        "sourceKey": SOURCE_PS_TOKEN_KEY,
+        "sourceKey": SOURCE_CREDENTIAL_ENV,
         "targetPath": str(target_env_path),
-        "targetKey": TARGET_PS_TOKEN_KEY,
+        "targetKey": TARGET_CREDENTIAL_ENV,
         "changed": changed,
         "replacedExisting": prior_token is not None and not hmac.compare_digest(prior_token, source_token),
         "verification": verification,
