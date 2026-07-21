@@ -5764,6 +5764,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # never written to by an update (#89507 review feedback). Only meaningful
     # when updates.parked_branch_strategy is "update_in_place".
     switch_branch = bool(getattr(args, "switch_branch", False))
+    restart_gateways = not bool(getattr(args, "no_restart", False))
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -7458,6 +7459,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # freshly-restarted gateways to settle, and the phase's except
         # path forwards it to the update receipt.
         killed_pids: set = set()
+        if not restart_gateways:
+            print()
+            print("→ Skipping automatic gateway restart (--no-restart).")
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
@@ -7658,7 +7662,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles) plus
             # hermes-serve* units (the Desktop app's backend, #83438).
-            if supports_systemd_services():
+            if restart_gateways and supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
                 except Exception:
@@ -7994,7 +7998,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Restart EVERY ai.hermes.gateway* LaunchAgent, not only the
             # invoking profile's — parity with the systemd branch above
             # (#41403). Per-label TimeoutExpired isolation happens inside.
-            if is_macos():
+            if restart_gateways and is_macos():
                 try:
                     _restart_macos_launchd_gateways(
                         restarted_services,
@@ -8009,8 +8013,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids(all_profiles=True)
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
+            manual_pids = (
+                find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+                if restart_gateways
+                else []
             )
             profile_processes = {
                 proc.pid: proc
@@ -8177,7 +8183,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # any remaining pre-update PIDs so the watcher / service
             # manager can relaunch with fresh code.
             try:
-                _time.sleep(3.0)
+                _time.sleep(3.0 if restart_gateways else 0.0)
                 _service_pids_after = _get_service_pids(all_profiles=True)
                 _surviving = find_gateway_pids(
                     exclude_pids=_service_pids_after,
@@ -8296,29 +8302,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # every live gateway's stamped code_sha against the freshly-updated
         # checkout and surface any gateway still serving pre-update code —
         # instead of assuming the restart phase worked (#88654, #69754).
+        # Under --no-restart an external orchestrator restarts and verifies
+        # the fleet itself AFTER this command returns — every running
+        # gateway is still expected to serve pre-update code here, so the
+        # matrix would always report STALE and force exit 1. Skip it.
         _fleet_snapshot: list = []
-        try:
-            from hermes_cli.update_receipt import (
-                collect_fleet_versions,
-                print_fleet_version_matrix,
-            )
+        if restart_gateways:
+            try:
+                from hermes_cli.update_receipt import (
+                    collect_fleet_versions,
+                    print_fleet_version_matrix,
+                )
 
-            # A brief settle window: freshly restarted gateways need a
-            # moment to rewrite gateway_state.json with their new identity.
-            # Skipped when the restart phase touched nothing (no gateways
-            # were running) — nothing to settle.
-            if restarted_services or killed_pids:
-                _time.sleep(2.0)
-            # Pass the pre-restart PID snapshot so a gateway the restart
-            # phase stopped WITHOUT a verified replacement shows as a DOWN
-            # row (exit 1) instead of silently producing no row at all.
-            _fleet_snapshot = collect_fleet_versions(
-                pre_restart_pids=_pre_restart_gateway_pids
-            )
-            if print_fleet_version_matrix(_fleet_snapshot):
-                gateway_fleet_restart_incomplete = True
-        except Exception as _fleet_exc:
-            logger.debug("Fleet version verification failed: %s", _fleet_exc)
+                # A brief settle window: freshly restarted gateways need a
+                # moment to rewrite gateway_state.json with their new identity.
+                # Skipped when the restart phase touched nothing (no gateways
+                # were running) — nothing to settle.
+                if restarted_services or killed_pids:
+                    _time.sleep(2.0)
+                # Pass the pre-restart PID snapshot so a gateway the restart
+                # phase stopped WITHOUT a verified replacement shows as a DOWN
+                # row (exit 1) instead of silently producing no row at all.
+                _fleet_snapshot = collect_fleet_versions(
+                    pre_restart_pids=_pre_restart_gateway_pids
+                )
+                if print_fleet_version_matrix(_fleet_snapshot):
+                    gateway_fleet_restart_incomplete = True
+            except Exception as _fleet_exc:
+                logger.debug("Fleet version verification failed: %s", _fleet_exc)
 
         # Plan-vs-execution reconciliation (#91277 Phase 2, restart via
         # declared mechanism): every runtime the PLAN saw must be accounted
@@ -8326,33 +8337,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the silent-miss class (a platform branch re-discovered its own
         # targets and skipped one the inventory knew about) — escalate it
         # exactly like a STALE/DOWN fleet row.
+        # Under --no-restart the restart phase deliberately touched nothing,
+        # so every planned runtime would reconcile as unaccounted and force
+        # exit 1 — the external orchestrator owns restart accounting. Skip.
         _runtime_outcomes: list = []
-        try:
-            if _pre_update_plan is not None and _pre_update_plan.runtimes:
-                from hermes_cli.update_inventory import (
-                    match_runtime_outcomes,
-                    report_unaccounted_runtimes,
-                )
+        if restart_gateways:
+            try:
+                if _pre_update_plan is not None and _pre_update_plan.runtimes:
+                    from hermes_cli.update_inventory import (
+                        match_runtime_outcomes,
+                        report_unaccounted_runtimes,
+                    )
 
-                _runtime_outcomes = match_runtime_outcomes(
-                    _pre_update_plan,
-                    restarted_services=restarted_services,
-                    relaunched_profiles=relaunched_profiles,
-                    externally_supervised_profiles=externally_supervised_profiles,
-                    killed_pids=killed_pids,
-                    failed_units=failed_or_stale_units,
-                )
-                if report_unaccounted_runtimes(_runtime_outcomes):
-                    gateway_fleet_restart_incomplete = True
-                try:
-                    import hermes_cli.update_receipt as _ur
+                    _runtime_outcomes = match_runtime_outcomes(
+                        _pre_update_plan,
+                        restarted_services=restarted_services,
+                        relaunched_profiles=relaunched_profiles,
+                        externally_supervised_profiles=externally_supervised_profiles,
+                        killed_pids=killed_pids,
+                        failed_units=failed_or_stale_units,
+                    )
+                    if report_unaccounted_runtimes(_runtime_outcomes):
+                        gateway_fleet_restart_incomplete = True
+                    try:
+                        import hermes_cli.update_receipt as _ur
 
-                    if _ur._current is not None:
-                        _ur._current.data["runtime_outcomes"] = _runtime_outcomes
-                except Exception:
-                    pass
-        except Exception as _outcome_exc:
-            logger.debug("Runtime-outcome reconciliation failed: %s", _outcome_exc)
+                        if _ur._current is not None:
+                            _ur._current.data["runtime_outcomes"] = _runtime_outcomes
+                    except Exception:
+                        pass
+            except Exception as _outcome_exc:
+                logger.debug("Runtime-outcome reconciliation failed: %s", _outcome_exc)
 
         try:
             from hermes_cli.update_receipt import finalize_update_receipt

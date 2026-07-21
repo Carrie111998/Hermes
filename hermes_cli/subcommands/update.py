@@ -74,6 +74,16 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not automatically restart running gateways after the update. "
+            "Intended for external update orchestrators that perform their own "
+            "verified rolling restart."
+        ),
+    )
+    update_parser.add_argument(
         "--branch",
         default=None,
         metavar="NAME",
