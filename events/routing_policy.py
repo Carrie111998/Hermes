@@ -158,6 +158,7 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.AGENT_FAILURE_CLUSTER: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
     _E.AGENT_LOOP_FAULT: _Spec(Attention.WARN, ALERTS),
     _E.RESOURCE_PRESSURE: _Spec(Attention.WARN, ALERTS),
+    _E.CODE_DRIFT: _Spec(Attention.WARN, ALERTS),           # hook: resolved → INFO
     _E.WATCHDOG_TICK: _Spec(Attention.TRACE, ALERTS),
     _E.WATCHDOG_PROBE_TRANSITION: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
     _E.WATCHDOG_BURST: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
@@ -314,6 +315,11 @@ def classify(
             wa = WA_URGENT
         else:
             attention = Attention.INFO   # recovery / heartbeat
+            wa = "none"
+
+    elif et == EventType.CODE_DRIFT:
+        if payload.get("status") == "resolved":
+            attention = Attention.INFO   # recovery — closure telemetry
             wa = "none"
 
     elif et == EventType.JOB_HIGH_SCORE:

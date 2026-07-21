@@ -131,6 +131,10 @@ EVENT_TYPE_EMOJI = {
     # Tracker partial/ backlog alert (2026-07-14) — a growing queue of intents
     # whose Postgres mirror is stuck; the inbox-tray icon reads as "pile-up".
     EventType.TRACKER_PARTIAL_BACKLOG:  "📥",
+    # Agent-src code drift (2026-07-21) — the deployed detached checkout is
+    # not running what main says should be running. Shuffle arrows read as
+    # "the code paths crossed"; distinct from 🔃 (PR opened).
+    EventType.CODE_DRIFT:               "🔀",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)
@@ -250,6 +254,7 @@ WHATSAPP_TITLE_BY_EVENT = {
     EventType.OFFER_SIGNAL:                "JOB OFFER",
     EventType.SECRET_DETECTED:             "SECRET DETECTED",
     EventType.RESOURCE_PRESSURE:           "RESOURCE PRESSURE",
+    EventType.CODE_DRIFT:                  "STALE CODE RUNNING",
     EventType.DIGEST_GENERATED:            "MORNING DIGEST",
 }
 

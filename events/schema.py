@@ -323,6 +323,26 @@ class EventType(Enum):
     #   sample_job_ids (list[str]) — up to SAMPLE_CAP job IDs for triage
     TRACKER_PARTIAL_BACKLOG = ("tracker_partial_backlog", Priority.HIGH)
 
+    # Agent-src code-drift alert — added 2026-07-21. The gateway's editable
+    # install imports the WORKING TREE of ~/.hermes/agent-src, which is
+    # deliberately kept on a detached HEAD so worktree agents can land
+    # commits onto the `main` ref via `git branch -f`. A commit landed on
+    # main therefore does NOT run until the checkout is fast-forwarded and
+    # the gateway restarted — on 2026-07-20/21 three restart cycles ran
+    # stale code while every session believed the fix was live. Emitted by
+    # events.producers.code_drift_monitor.CodeDriftMonitor (read-only git
+    # probe every 15 min on the subscriber poll loop; rising edge / shape
+    # change / 6h re-ping, plus a falling-edge status="resolved" event).
+    # HIGH so it survives significant_only / digest_only verbosity. Payload:
+    #   status (str)            — "drifting" | "resolved"
+    #   state (str)             — "behind" | "ahead" | "diverged" (drifting only)
+    #   head / main (str)       — short SHAs
+    #   behind_count / ahead_count (int)
+    #   dirty (bool)            — uncommitted changes in the checkout
+    #   missed_subjects (list[str]) — up to 5 "<sha> <subject>" lines (behind)
+    #   repo (str)              — checkout path probed
+    CODE_DRIFT = ("code_drift", Priority.HIGH)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

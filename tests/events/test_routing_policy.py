@@ -123,6 +123,19 @@ def test_gateway_health_up_is_info_no_page():
     assert route.wa_tier is None
 
 
+def test_code_drift_drifting_is_warn_on_alerts():
+    route = classify(make_event(
+        EventType.CODE_DRIFT, {"status": "drifting", "state": "behind"}))
+    assert route.attention is Attention.WARN
+    assert route.topic_key == ALERTS
+
+
+def test_code_drift_resolved_is_info_no_page():
+    route = classify(make_event(EventType.CODE_DRIFT, {"status": "resolved"}))
+    assert route.attention is Attention.INFO
+    assert route.wa_tier is None
+
+
 def test_high_score_at_9_pages_important():
     route = classify(make_event(EventType.JOB_HIGH_SCORE, {"score": 9.2}))
     assert route.wa_tier == WA_IMPORTANT
