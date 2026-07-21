@@ -70,6 +70,12 @@ _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
 _CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX = 100
+_CLAUDE_LINEAGE_CURSOR_FIELDS = frozenset({
+    "after_visible_at",
+    "after_job_id",
+    "high_water_visible_at",
+    "high_water_job_id",
+})
 _CLAUDE_LINEAGE_TARGET_MISSING = "claude_lineage_target_missing"
 _CLAUDE_LINEAGE_TARGET_DUPLICATE = "claude_lineage_target_duplicate"
 _CLAUDE_LINEAGE_TARGET_IDENTITY_MISMATCH = (
@@ -79,6 +85,12 @@ _CLAUDE_LINEAGE_TARGET_PROVENANCE_MISMATCH = (
     "claude_lineage_target_provenance_mismatch"
 )
 _CLAUDE_LINEAGE_MISSING_SOURCE = "claude_lineage_missing_source"
+_CLAUDE_LINEAGE_SOURCE_IDENTITY_MISMATCH = (
+    "claude_lineage_source_identity_mismatch"
+)
+_CLAUDE_LINEAGE_SOURCE_PROVENANCE_MISMATCH = (
+    "claude_lineage_source_provenance_mismatch"
+)
 _CLAUDE_LINEAGE_INVALID_COMPLETION = "claude_lineage_invalid_completion"
 _CLAUDE_LINEAGE_CONFLICT = "claude_lineage_conflict"
 _PROFILE_SHADOW_SOURCE = "session_bridge_profile"
@@ -1947,7 +1959,7 @@ class SessionBridgeStore:
         normalized_lease = _exact_nonempty_text(
             lease_digest, "Claude visibility lease digest"
         )
-        completion = _exact_nonempty_text(transcript_digest, "transcript digest")
+        completion = _sha256_text(transcript_digest, "transcript digest")
         timestamp = _finite_number(visible_at, "visible_at")
 
         def _write(conn):
@@ -2189,6 +2201,7 @@ class SessionBridgeStore:
         *,
         limit: int,
         apply: bool = False,
+        cursor: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Inspect or repair a bounded page of already-visible Claude lineage.
 
@@ -2205,9 +2218,31 @@ class SessionBridgeStore:
                 "Claude lineage reconciliation limit must be between 1 and "
                 f"{_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX}"
             )
+        normalized_cursor = _validated_claude_lineage_cursor(cursor)
 
         def _write(conn):
-            rows = _unlinked_claude_visibility_jobs(conn, limit=limit)
+            if normalized_cursor is None:
+                after_key = None
+                high_water_key = _last_unlinked_claude_visibility_job_key(conn)
+            else:
+                after_key, high_water_key = normalized_cursor
+                _validate_claude_lineage_cursor_anchors(
+                    conn,
+                    after_key=after_key,
+                    high_water_key=high_water_key,
+                )
+            candidates = (
+                []
+                if high_water_key is None
+                else _unlinked_claude_visibility_jobs(
+                    conn,
+                    limit=limit + 1,
+                    after_key=after_key,
+                    high_water_key=high_water_key,
+                )
+            )
+            has_more = len(candidates) > limit
+            rows = candidates[:limit]
             blocker_codes: dict[str, int] = {}
             repairable = 0
             repaired = 0
@@ -2231,12 +2266,23 @@ class SessionBridgeStore:
                 code = str(inspected["code"] or _CLAUDE_LINEAGE_CONFLICT)
                 blocker_codes[code] = blocker_codes.get(code, 0) + 1
             remaining = _count_unlinked_claude_visibility_jobs(conn)
+            next_cursor = None
+            if has_more and rows:
+                last_key = _claude_lineage_job_key(rows[-1])
+                assert high_water_key is not None
+                next_cursor = _public_claude_lineage_cursor(
+                    after_key=last_key,
+                    high_water_key=high_water_key,
+                )
             return {
                 "scanned": len(rows),
                 "repairable": repairable,
                 "repaired": repaired,
                 "remaining": remaining,
                 "blocker_codes": dict(sorted(blocker_codes.items())),
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "complete": remaining == 0,
             }
 
         return self.db._execute_write(_write)
@@ -6849,6 +6895,30 @@ def _inspect_claude_visibility_lineage(
         target_session_id,
     )
 
+    source_issue = _native_source_identity_issue(
+        conn,
+        source_session_id=source_session_id,
+        source_provider=job["source_provider"],
+    )
+    if source_issue == "missing":
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_MISSING_SOURCE,
+            "link": None,
+        }
+    if source_issue == "identity":
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_SOURCE_IDENTITY_MISMATCH,
+            "link": None,
+        }
+    if source_issue == "provenance":
+        return {
+            "state": "blocked",
+            "code": _CLAUDE_LINEAGE_SOURCE_PROVENANCE_MISMATCH,
+            "link": None,
+        }
+
     exact_target = conn.execute(
         "SELECT * FROM external_sessions WHERE session_id = ?",
         (target_session_id,),
@@ -6895,17 +6965,6 @@ def _inspect_claude_visibility_lineage(
         return {
             "state": "blocked",
             "code": _CLAUDE_LINEAGE_TARGET_DUPLICATE,
-            "link": None,
-        }
-    if (
-        conn.execute(
-            "SELECT 1 FROM sessions WHERE id = ?", (source_session_id,)
-        ).fetchone()
-        is None
-    ):
-        return {
-            "state": "blocked",
-            "code": _CLAUDE_LINEAGE_MISSING_SOURCE,
             "link": None,
         }
     completion = job["completion_digest"]
@@ -7000,13 +7059,58 @@ def _finalize_claude_visibility_lineage_if_indexed(
     return {"state": "linked", "code": None, "link": verified["link"]}
 
 
-def _unlinked_claude_visibility_jobs(conn: Any, *, limit: int) -> list[Any]:
-    selected: list[Any] = []
+def _claude_lineage_job_key(job: Mapping[str, Any]) -> tuple[float, str]:
+    return (
+        _finite_number(job["visible_at"], "Claude lineage visible_at"),
+        _exact_nonempty_text(job["id"], "Claude lineage job ID"),
+    )
+
+
+def _last_unlinked_claude_visibility_job_key(
+    conn: Any,
+) -> tuple[float, str] | None:
     rows = conn.execute(
         """SELECT job.*
            FROM session_claude_visibility_jobs AS job
            WHERE job.state = 'claude_visible'
-           ORDER BY job.visible_at, job.id"""
+           ORDER BY job.visible_at DESC, job.id DESC"""
+    )
+    for row in rows:
+        if _inspect_claude_visibility_lineage(conn, row)["state"] != "already_linked":
+            return _claude_lineage_job_key(row)
+    return None
+
+
+def _unlinked_claude_visibility_jobs(
+    conn: Any,
+    *,
+    limit: int,
+    after_key: tuple[float, str] | None = None,
+    high_water_key: tuple[float, str] | None = None,
+) -> list[Any]:
+    selected: list[Any] = []
+    clauses = ["job.state = 'claude_visible'"]
+    params: list[Any] = []
+    if after_key is not None:
+        clauses.append(
+            """(job.visible_at > ? OR
+                 (job.visible_at = ? AND job.id > ?))"""
+        )
+        params.extend((after_key[0], after_key[0], after_key[1]))
+    if high_water_key is not None:
+        clauses.append(
+            """(job.visible_at < ? OR
+                 (job.visible_at = ? AND job.id <= ?))"""
+        )
+        params.extend(
+            (high_water_key[0], high_water_key[0], high_water_key[1])
+        )
+    rows = conn.execute(
+        f"""SELECT job.*
+           FROM session_claude_visibility_jobs AS job
+           WHERE {' AND '.join(clauses)}
+           ORDER BY job.visible_at, job.id""",
+        params,
     )
     for row in rows:
         if _inspect_claude_visibility_lineage(conn, row)["state"] == "already_linked":
@@ -7015,6 +7119,73 @@ def _unlinked_claude_visibility_jobs(conn: Any, *, limit: int) -> list[Any]:
         if len(selected) >= limit:
             break
     return selected
+
+
+def _validated_claude_lineage_cursor(
+    cursor: Mapping[str, Any] | None,
+) -> tuple[tuple[float, str], tuple[float, str]] | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, Mapping) or set(cursor) != _CLAUDE_LINEAGE_CURSOR_FIELDS:
+        raise ValueError(
+            "Claude lineage reconciliation cursor must have the exact fields"
+        )
+    after_key = (
+        _finite_number(
+            cursor["after_visible_at"],
+            "Claude lineage reconciliation cursor after_visible_at",
+        ),
+        _exact_nonempty_text(
+            cursor["after_job_id"],
+            "Claude lineage reconciliation cursor after_job_id",
+        ),
+    )
+    high_water_key = (
+        _finite_number(
+            cursor["high_water_visible_at"],
+            "Claude lineage reconciliation cursor high_water_visible_at",
+        ),
+        _exact_nonempty_text(
+            cursor["high_water_job_id"],
+            "Claude lineage reconciliation cursor high_water_job_id",
+        ),
+    )
+    if after_key > high_water_key:
+        raise ValueError(
+            "Claude lineage reconciliation cursor exceeds its high-water mark"
+        )
+    return after_key, high_water_key
+
+
+def _validate_claude_lineage_cursor_anchors(
+    conn: Any,
+    *,
+    after_key: tuple[float, str],
+    high_water_key: tuple[float, str],
+) -> None:
+    for visible_at, job_id in (after_key, high_water_key):
+        row = conn.execute(
+            """SELECT visible_at FROM session_claude_visibility_jobs
+               WHERE id = ? AND state = 'claude_visible'""",
+            (job_id,),
+        ).fetchone()
+        if row is None or row["visible_at"] != visible_at:
+            raise ValueError(
+                "Claude lineage reconciliation cursor is not durably anchored"
+            )
+
+
+def _public_claude_lineage_cursor(
+    *,
+    after_key: tuple[float, str],
+    high_water_key: tuple[float, str],
+) -> dict[str, Any]:
+    return {
+        "after_visible_at": after_key[0],
+        "after_job_id": after_key[1],
+        "high_water_visible_at": high_water_key[0],
+        "high_water_job_id": high_water_key[1],
+    }
 
 
 def _count_unlinked_claude_visibility_jobs(conn: Any) -> int:
@@ -7777,6 +7948,81 @@ def _terminalize_unclaimable_job(
         raise ValueError("stale mirror job authority transition")
 
 
+def _native_source_identity_issue(
+    conn: Any,
+    *,
+    source_session_id: object,
+    source_provider: object,
+) -> str | None:
+    """Return a fixed reason when a claimed source is not exact native authority."""
+
+    try:
+        provider = Provider(source_provider)
+    except (TypeError, ValueError):
+        return "identity"
+    if provider not in {Provider.CLAUDE, Provider.CODEX, Provider.HERMES}:
+        return "identity"
+    if not isinstance(source_session_id, str):
+        return "identity"
+    try:
+        if provider in {Provider.CLAUDE, Provider.CODEX}:
+            canonical_provider = _provider_from_canonical_session_id(
+                source_session_id
+            )
+            if canonical_provider is not provider:
+                return "identity"
+            expected_native_id = source_session_id.split(":", 1)[1]
+        else:
+            if canonical_session_id(provider, source_session_id) != source_session_id:
+                return "identity"
+            expected_native_id = source_session_id
+    except (TypeError, ValueError):
+        return "identity"
+
+    source = conn.execute(
+        """SELECT s.source, e.session_id AS external_session_id,
+                  e.provider, e.native_id, e.origin_kind, e.origin_bridge_id
+           FROM sessions AS s
+           LEFT JOIN external_sessions AS e ON e.session_id = s.id
+           WHERE s.id = ?""",
+        (source_session_id,),
+    ).fetchone()
+    if source is None:
+        return "missing"
+    if provider in {Provider.CLAUDE, Provider.CODEX}:
+        if (
+            source["source"] != provider.value
+            or source["external_session_id"] != source_session_id
+            or source["provider"] != provider.value
+            or source["native_id"] != expected_native_id
+        ):
+            return "identity"
+        if (
+            source["origin_kind"] != OriginKind.NATIVE.value
+            or source["origin_bridge_id"] is not None
+        ):
+            return "provenance"
+    else:
+        session_source = source["source"]
+        if (
+            not isinstance(session_source, str)
+            or not session_source.strip()
+            or session_source
+            in {
+                Provider.CLAUDE.value,
+                Provider.CODEX.value,
+                _PROFILE_SHADOW_SOURCE,
+            }
+            or source["external_session_id"] is not None
+        ):
+            return "identity"
+    incoming = conn.execute(
+        "SELECT 1 FROM session_links WHERE to_session_id = ? LIMIT 1",
+        (source_session_id,),
+    ).fetchone()
+    return "provenance" if incoming is not None else None
+
+
 def _automatic_claim_denial(conn: Any, job: Mapping[str, Any]) -> str | None:
     source_session_id = job["source_session_id"]
     try:
@@ -7784,25 +8030,14 @@ def _automatic_claim_denial(conn: Any, job: Mapping[str, Any]) -> str | None:
         target_provider = _external_provider(job["target_provider"])
     except (TypeError, ValueError):
         return "automatic mirror authority is invalid"
-    source = conn.execute(
-        """SELECT s.source, e.provider, e.native_id, e.origin_kind,
-                  e.origin_bridge_id
-           FROM sessions AS s
-           JOIN external_sessions AS e ON e.session_id = s.id
-           WHERE s.id = ?""",
-        (source_session_id,),
-    ).fetchone()
-    expected_native_id = source_session_id.split(":", 1)[1]
-    if source is None or (
-        source["source"] != source_provider.value
-        or source["provider"] != source_provider.value
-        or source["native_id"] != expected_native_id
-    ):
+    source_issue = _native_source_identity_issue(
+        conn,
+        source_session_id=source_session_id,
+        source_provider=source_provider,
+    )
+    if source_issue in {"missing", "identity"}:
         return "automatic mirror source identity is not durable"
-    if (
-        source["origin_kind"] != OriginKind.NATIVE.value
-        or source["origin_bridge_id"] is not None
-    ):
+    if source_issue == "provenance":
         return "automatic mirror source origin is not native"
     mapped = conn.execute(
         """SELECT 1 FROM session_links AS link

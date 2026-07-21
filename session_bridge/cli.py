@@ -369,7 +369,11 @@ class _Backend(Protocol):
         self, *, days: int, limit: int, apply: bool
     ) -> Mapping[str, Any]: ...
     def reconcile_claude_visibility_lineage(
-        self, *, limit: int, apply: bool
+        self,
+        *,
+        limit: int,
+        apply: bool,
+        cursor: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]: ...
     def set_claude_visibility_continuous(
         self, *, enabled: bool
@@ -857,11 +861,16 @@ class ProductionBackend:
         }
 
     def reconcile_claude_visibility_lineage(
-        self, *, limit: int, apply: bool
+        self,
+        *,
+        limit: int,
+        apply: bool,
+        cursor: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         result = self._require_store().reconcile_claude_visibility_lineage(
             limit=limit,
             apply=apply,
+            cursor=cursor,
         )
         return {
             "mode": "apply" if apply else "dry_run",
@@ -870,6 +879,9 @@ class ProductionBackend:
             "repaired": int(result["repaired"]),
             "remaining": int(result["remaining"]),
             "blocker_codes": dict(result["blocker_codes"]),
+            "next_cursor": result["next_cursor"],
+            "has_more": bool(result["has_more"]),
+            "complete": bool(result["complete"]),
         }
 
     def claude_visibility_backfill(
@@ -1746,6 +1758,11 @@ def build_parser() -> argparse.ArgumentParser:
     claude_lineage.add_argument(
         "--limit", type=_bounded_claude_lineage_limit, default=25
     )
+    claude_lineage.add_argument(
+        "--cursor",
+        type=_claude_lineage_cursor_argument,
+        help="continue from an exact cursor emitted by the preceding page",
+    )
     claude_lineage_mode = claude_lineage.add_mutually_exclusive_group(required=True)
     claude_lineage_mode.add_argument("--dry-run", action="store_true")
     claude_lineage_mode.add_argument("--apply", action="store_true")
@@ -1927,10 +1944,19 @@ def main(
                 backend.reconcile_claude_visibility_lineage(
                     limit=args.limit,
                     apply=bool(args.apply),
+                    cursor=args.cursor,
                 )
             )
             _emit(payload)
-            return EXIT_DEGRADED if payload.get("blocker_codes") else EXIT_OK
+            incomplete = (
+                bool(payload.get("blocker_codes"))
+                or bool(payload.get("has_more"))
+                or int(payload.get("remaining", 0)) > 0
+                or payload.get("complete") is not True
+            )
+            if args.apply and incomplete:
+                return EXIT_ROLLOUT_GATE
+            return EXIT_DEGRADED if incomplete else EXIT_OK
         if args.command == "claude-visibility-continuous":
             payload = dict(
                 backend.set_claude_visibility_continuous(enabled=bool(args.enable))
@@ -2706,6 +2732,15 @@ def _bounded_claude_lineage_limit(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > 100:
         raise argparse.ArgumentTypeError("value must be at most 100")
+    return parsed
+
+
+def _claude_lineage_cursor_argument(value: str) -> Mapping[str, Any]:
+    parsed = _strict_json_object(value)
+    if parsed is None:
+        raise argparse.ArgumentTypeError(
+            "cursor must be one strict JSON object emitted by the preceding page"
+        )
     return parsed
 
 

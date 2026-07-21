@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Event, Thread
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -212,8 +212,12 @@ class FakeBackend:
             "enqueued": 0,
         }
 
-    def reconcile_claude_visibility_lineage(self, *, limit: int, apply: bool):
-        self.calls.append(("reconcile_claude_visibility_lineage", limit, apply))
+    def reconcile_claude_visibility_lineage(
+        self, *, limit: int, apply: bool, cursor: Mapping[str, Any] | None = None
+    ):
+        self.calls.append(
+            ("reconcile_claude_visibility_lineage", limit, apply, cursor)
+        )
         return {
             "mode": "apply" if apply else "dry_run",
             "scanned": 1,
@@ -221,6 +225,9 @@ class FakeBackend:
             "repaired": 1 if apply else 0,
             "remaining": 0 if apply else 1,
             "blocker_codes": {},
+            "next_cursor": None,
+            "has_more": False,
+            "complete": apply,
         }
 
     def set_claude_visibility_continuous(self, *, enabled: bool):
@@ -924,7 +931,7 @@ def test_claude_visibility_lineage_reconcile_requires_explicit_apply_confirmatio
             ],
             backend,
         )
-        == 0
+        != 0
     )
     assert _json_output(capsys) == {
         "mode": "dry_run",
@@ -933,6 +940,8 @@ def test_claude_visibility_lineage_reconcile_requires_explicit_apply_confirmatio
         "repaired": 0,
         "remaining": 1,
         "blocker_codes": {},
+        "has_more": False,
+        "complete": False,
     }
     assert (
         _run(
@@ -965,12 +974,88 @@ def test_claude_visibility_lineage_reconcile_requires_explicit_apply_confirmatio
     )
     assert _json_output(capsys)["mode"] == "apply"
     assert backend.calls == [
-        ("reconcile_claude_visibility_lineage", 25, False),
+        ("reconcile_claude_visibility_lineage", 25, False, None),
         ("close",),
         ("close",),
-        ("reconcile_claude_visibility_lineage", 25, True),
+        ("reconcile_claude_visibility_lineage", 25, True, None),
         ("close",),
     ]
+
+
+def test_claude_visibility_lineage_reconcile_passes_cursor_and_never_succeeds_partial_apply(
+    capsys,
+) -> None:
+    cursor = {
+        "after_visible_at": 100.0,
+        "after_job_id": "job-a",
+        "high_water_visible_at": 101.0,
+        "high_water_job_id": "job-b",
+    }
+
+    class PartialBackend(FakeBackend):
+        def reconcile_claude_visibility_lineage(
+            self,
+            *,
+            limit: int,
+            apply: bool,
+            cursor: Mapping[str, Any] | None = None,
+        ):
+            self.calls.append(
+                ("reconcile_claude_visibility_lineage", limit, apply, cursor)
+            )
+            return {
+                "mode": "apply",
+                "scanned": 1,
+                "repairable": 1,
+                "repaired": 1,
+                "remaining": 2,
+                "blocker_codes": {},
+                "next_cursor": cursor,
+                "has_more": True,
+                "complete": False,
+            }
+
+    backend = PartialBackend()
+    result = _run(
+        [
+            "claude-visibility-reconcile-lineage",
+            "--limit",
+            "1",
+            "--cursor",
+            json.dumps(cursor),
+            "--apply",
+            "--confirm-historical-repair",
+        ],
+        backend,
+    )
+
+    assert result != 0
+    assert _json_output(capsys)["complete"] is False
+    assert backend.calls[0] == (
+        "reconcile_claude_visibility_lineage",
+        1,
+        True,
+        cursor,
+    )
+
+
+def test_claude_visibility_lineage_reconcile_rejects_non_object_cursor_before_backend(
+    capsys,
+) -> None:
+    backend = FakeBackend()
+
+    with pytest.raises(SystemExit):
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--cursor",
+                "[]",
+                "--dry-run",
+            ],
+            backend,
+        )
+
+    assert backend.calls == []
 
 
 def test_claude_visibility_status_blocks_on_unlinked_visible_lineage(

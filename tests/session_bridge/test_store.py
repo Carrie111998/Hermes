@@ -81,6 +81,25 @@ def _claude_visibility_identity(
     )
 
 
+def _claude_visibility_hermes_identity(
+    suffix: str,
+) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=f"hermes-source-{suffix}",
+        source_provider=Provider.HERMES,
+        native_name=f"[Hermes] Request {suffix}",
+        source_cwd="C:/work/project",
+        git_root="C:/work/project",
+        git_branch="main",
+        git_head=f"head-{suffix}",
+        worktree_id=f"worktree-{suffix}",
+        eligible_at=100.0,
+    )
+    return candidate, derive_claude_visibility_identity(
+        candidate, _CLAUDE_MARKER_SECRET
+    )
+
+
 _CLAUDE_MARKER_SECRET = b"store-claude-visibility-secret"
 
 
@@ -92,6 +111,145 @@ def _enqueue_claude_visibility_job(
     return store.enqueue_claude_visibility_job(
         candidate, identity, _CLAUDE_MARKER_SECRET
     )
+
+
+def _seed_claude_visibility_native_source(
+    db: SessionDB,
+    store: SessionBridgeStore,
+    candidate: ClaudeVisibilityCandidate,
+) -> None:
+    if candidate.source_provider is Provider.CODEX:
+        store.upsert_projection(
+            _projection(
+                _message(f"source-{candidate.source_session_id}", "meaningful request"),
+                provider=Provider.CODEX,
+                native_id=candidate.source_session_id.removeprefix("codex:"),
+            )
+        )
+        return
+    db.create_session(
+        candidate.source_session_id,
+        source="cli",
+        cwd=candidate.source_cwd,
+    )
+
+
+def _corrupt_claude_visibility_source_identity(
+    db: SessionDB,
+    candidate: ClaudeVisibilityCandidate,
+    identity: ClaudeVisibilityIdentity,
+    case: str,
+) -> None:
+    source_session_id = candidate.source_session_id
+
+    def _write(conn) -> None:
+        if case == "job_provider":
+            conn.execute(
+                "UPDATE session_claude_visibility_jobs SET source_provider = ? WHERE id = ?",
+                (
+                    (
+                        Provider.HERMES.value
+                        if candidate.source_provider is Provider.CODEX
+                        else Provider.CODEX.value
+                    ),
+                    identity.job_id,
+                ),
+            )
+        elif case == "session_source":
+            conn.execute(
+                "UPDATE sessions SET source = ? WHERE id = ?",
+                (
+                    "cli"
+                    if candidate.source_provider is Provider.CODEX
+                    else Provider.CODEX.value,
+                    source_session_id,
+                ),
+            )
+        elif case == "external_provider":
+            conn.execute(
+                "UPDATE external_sessions SET provider = 'claude' WHERE session_id = ?",
+                (source_session_id,),
+            )
+        elif case == "external_native_id":
+            conn.execute(
+                "UPDATE external_sessions SET native_id = 'wrong-native-id' WHERE session_id = ?",
+                (source_session_id,),
+            )
+        elif case == "origin_kind":
+            conn.execute(
+                "UPDATE external_sessions SET origin_kind = 'bridge_placeholder' WHERE session_id = ?",
+                (source_session_id,),
+            )
+        elif case == "origin_bridge_id":
+            conn.execute(
+                "UPDATE external_sessions SET origin_bridge_id = 'wrong-origin' WHERE session_id = ?",
+                (source_session_id,),
+            )
+        elif case == "unexpected_external":
+            conn.execute(
+                """INSERT INTO external_sessions (
+                       session_id, provider, native_id, native_status,
+                       first_indexed_at, last_indexed_at, parser_version,
+                       origin_kind, origin_bridge_id
+                   ) VALUES (?, 'codex', ?, 'active', 1, 1, 1, 'native', NULL)""",
+                (source_session_id, f"unexpected-{source_session_id}"),
+            )
+        elif case == "incoming_lineage":
+            origin_id = f"origin-{source_session_id}"
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, 'cli', 1)",
+                (origin_id,),
+            )
+            conn.execute(
+                """INSERT INTO session_links (
+                       id, from_session_id, to_session_id, relation, bridge_id,
+                       created_at
+                   ) VALUES (?, ?, ?, 'continues', ?, 1)""",
+                (
+                    f"incoming-{identity.job_id}",
+                    origin_id,
+                    source_session_id,
+                    f"incoming-{identity.bridge_id}",
+                ),
+            )
+        else:
+            raise AssertionError(case)
+
+    db._execute_write(_write)
+
+
+def _seed_unlinked_claude_visibility_lineage(
+    db: SessionDB,
+    store: SessionBridgeStore,
+    *,
+    suffix: str,
+    visible_at: float,
+    source_provider: Provider = Provider.CODEX,
+) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
+    candidate, identity = (
+        _claude_visibility_identity(suffix)
+        if source_provider is Provider.CODEX
+        else _claude_visibility_hermes_identity(suffix)
+    )
+    _seed_claude_visibility_native_source(db, store, candidate)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.upsert_projection(
+        _projection(
+            _message(f"target-{suffix}", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_visible', completion_digest = ?, visible_at = ?,
+                   updated_at = ? WHERE id = ?""",
+            ("e" * 64, visible_at, visible_at, identity.job_id),
+        )
+    )
+    return candidate, identity
 
 
 def test_fresh_schema_has_current_version_and_sidebar_terminal_ledger(db) -> None:
@@ -1875,6 +2033,314 @@ def test_claude_visibility_commit_finalizes_preindexed_target_lineage_atomically
     )["target_session_id"] == f"claude:{identity.claude_uuid}"
 
 
+def test_claude_visibility_commit_rejects_invalid_digest_before_target_without_poisoning(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("invalid-digest-before-target")
+    store.upsert_projection(
+        _projection(
+            _message("source-user", "meaningful request"),
+            provider=Provider.CODEX,
+            native_id="source-invalid-digest-before-target",
+        )
+    )
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    before = _rows(
+        db,
+        """SELECT state, lease_digest, lease_expires_at, lease_kind,
+                  completion_digest, visible_at
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0]
+
+    with pytest.raises(ValueError, match="transcript digest"):
+        store.commit_claude_visibility_job(
+            identity.job_id,
+            claim.lease_digest,
+            "not-a-sha256-digest",
+            100.0,
+        )
+
+    assert _rows(
+        db,
+        """SELECT state, lease_digest, lease_expires_at, lease_kind,
+                  completion_digest, visible_at
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0] == before
+
+    store.upsert_projection(
+        _projection(
+            _message("target-user", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    assert _rows(
+        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) == []
+
+    committed = store.commit_claude_visibility_job(
+        identity.job_id,
+        claim.lease_digest,
+        "a" * 64,
+        100.0,
+    )
+    assert committed["completion_digest"] == "a" * 64
+    assert _rows(
+        db,
+        "SELECT from_session_id, to_session_id FROM session_links WHERE bridge_id = ?",
+        (identity.bridge_id,),
+    ) == [
+        {
+            "from_session_id": candidate.source_session_id,
+            "to_session_id": f"claude:{identity.claude_uuid}",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_provider", "case", "expected_code"),
+    [
+        (Provider.CODEX, "job_provider", "claude_lineage_source_identity_mismatch"),
+        (Provider.CODEX, "session_source", "claude_lineage_source_identity_mismatch"),
+        (
+            Provider.CODEX,
+            "external_provider",
+            "claude_lineage_source_identity_mismatch",
+        ),
+        (
+            Provider.CODEX,
+            "external_native_id",
+            "claude_lineage_source_identity_mismatch",
+        ),
+        (
+            Provider.CODEX,
+            "origin_kind",
+            "claude_lineage_source_provenance_mismatch",
+        ),
+        (
+            Provider.CODEX,
+            "origin_bridge_id",
+            "claude_lineage_source_provenance_mismatch",
+        ),
+        (Provider.HERMES, "job_provider", "claude_lineage_source_identity_mismatch"),
+        (Provider.HERMES, "session_source", "claude_lineage_source_identity_mismatch"),
+        (
+            Provider.HERMES,
+            "unexpected_external",
+            "claude_lineage_source_identity_mismatch",
+        ),
+        (
+            Provider.HERMES,
+            "incoming_lineage",
+            "claude_lineage_source_provenance_mismatch",
+        ),
+    ],
+)
+def test_claude_visibility_historical_lineage_validates_exact_native_source_identity(
+    db: SessionDB,
+    source_provider: Provider,
+    case: str,
+    expected_code: str,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    suffix = f"source-identity-{source_provider.value}-{case}"
+    candidate, identity = (
+        _claude_visibility_identity(suffix)
+        if source_provider is Provider.CODEX
+        else _claude_visibility_hermes_identity(suffix)
+    )
+    _seed_claude_visibility_native_source(db, store, candidate)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.upsert_projection(
+        _projection(
+            _message("target-user", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_visible', completion_digest = ?, visible_at = 100,
+                   updated_at = 100 WHERE id = ?""",
+            ("b" * 64, identity.job_id),
+        )
+    )
+    _corrupt_claude_visibility_source_identity(db, candidate, identity, case)
+
+    result = store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+
+    assert result["scanned"] == 1
+    assert result["repairable"] == 0
+    assert result["repaired"] == 0
+    assert result["remaining"] == 1
+    assert result["blocker_codes"] == {expected_code: 1}
+    assert _rows(
+        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) == []
+
+
+@pytest.mark.parametrize("source_provider", [Provider.CODEX, Provider.HERMES])
+@pytest.mark.parametrize("entrypoint", ["commit", "reconcile", "upsert"])
+def test_claude_visibility_source_identity_mismatch_is_atomic_across_finalizers(
+    db: SessionDB,
+    source_provider: Provider,
+    entrypoint: str,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    suffix = f"atomic-{source_provider.value}-{entrypoint}"
+    candidate, identity = (
+        _claude_visibility_identity(suffix)
+        if source_provider is Provider.CODEX
+        else _claude_visibility_hermes_identity(suffix)
+    )
+    _seed_claude_visibility_native_source(db, store, candidate)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    target = _projection(
+        _message("target-user", "signed registration"),
+        native_id=identity.claude_uuid,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=identity.bridge_id,
+    )
+    claim = None
+    if entrypoint == "commit":
+        store.upsert_projection(target)
+        claim = store.claim_claude_visibility_job(
+            100.0, 60, 25, "0.50", "0.02"
+        )
+    elif entrypoint == "reconcile":
+        store.upsert_projection(target)
+        db._execute_write(
+            lambda conn: conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_visible', completion_digest = ?,
+                       visible_at = 100, updated_at = 100 WHERE id = ?""",
+                ("c" * 64, identity.job_id),
+            )
+        )
+    else:
+        db._execute_write(
+            lambda conn: conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_visible', completion_digest = ?,
+                       visible_at = 100, updated_at = 100 WHERE id = ?""",
+                ("c" * 64, identity.job_id),
+            )
+        )
+    _corrupt_claude_visibility_source_identity(
+        db, candidate, identity, "session_source"
+    )
+    before_job = _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )[0]
+
+    if entrypoint == "commit":
+        assert claim is not None
+        with pytest.raises(
+            ValueError, match="claude_lineage_source_identity_mismatch"
+        ):
+            store.commit_claude_visibility_job(
+                identity.job_id, claim.lease_digest, "d" * 64, 100.0
+            )
+    elif entrypoint == "reconcile":
+        result = store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+        assert result["blocker_codes"] == {
+            "claude_lineage_source_identity_mismatch": 1
+        }
+    else:
+        with pytest.raises(
+            ValueError, match="claude_lineage_source_identity_mismatch"
+        ):
+            store.upsert_projection(target)
+
+    assert _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )[0] == before_job
+    assert _rows(
+        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) == []
+    if entrypoint == "upsert":
+        assert store.get_external_session(f"claude:{identity.claude_uuid}") is None
+
+
+@pytest.mark.parametrize("source_provider", [Provider.CODEX, Provider.HERMES])
+def test_claude_visibility_commit_before_target_rejects_source_mismatch_without_poisoning(
+    db: SessionDB,
+    source_provider: Provider,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    suffix = f"source-before-target-{source_provider.value}"
+    candidate, identity = (
+        _claude_visibility_identity(suffix)
+        if source_provider is Provider.CODEX
+        else _claude_visibility_hermes_identity(suffix)
+    )
+    _seed_claude_visibility_native_source(db, store, candidate)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    _corrupt_claude_visibility_source_identity(
+        db, candidate, identity, "session_source"
+    )
+    before = _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )[0]
+
+    with pytest.raises(ValueError, match="claude_lineage_source_identity_mismatch"):
+        store.commit_claude_visibility_job(
+            identity.job_id, claim.lease_digest, "f" * 64, 100.0
+        )
+
+    assert _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )[0] == before
+    store.upsert_projection(
+        _projection(
+            _message("target-user", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    assert _rows(
+        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) == []
+
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE sessions SET source = ? WHERE id = ?",
+            (
+                (
+                    Provider.CODEX.value
+                    if source_provider is Provider.CODEX
+                    else "cli"
+                ),
+                candidate.source_session_id,
+            ),
+        )
+    )
+    committed = store.commit_claude_visibility_job(
+        identity.job_id, claim.lease_digest, "f" * 64, 100.0
+    )
+    assert committed["state"] == "claude_visible"
+    assert _rows(
+        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) != []
+
+
 def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idempotent(
     db,
 ) -> None:
@@ -1913,6 +2379,9 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
         "repaired": 0,
         "remaining": 1,
         "blocker_codes": {},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": False,
     }
     assert _rows(db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)) == []
 
@@ -1924,6 +2393,9 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
         "repaired": 1,
         "remaining": 0,
         "blocker_codes": {},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": True,
     }
     assert replay == {
         "scanned": 0,
@@ -1931,6 +2403,9 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
         "repaired": 0,
         "remaining": 0,
         "blocker_codes": {},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": True,
     }
     assert store.claude_visibility_status(100.0)["lineage"] == {
         "unlinked_visible": 0,
@@ -1938,6 +2413,145 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
         "blocked": 0,
         "blocker_codes": {},
     }
+
+
+def test_claude_visibility_lineage_cursor_advances_past_blocker_to_later_repair(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0, local_timezone=timezone.utc)
+    blocked_candidate, blocked_identity = _seed_unlinked_claude_visibility_lineage(
+        db, store, suffix="cursor-blocker", visible_at=100.0
+    )
+    repair_candidate, repair_identity = _seed_unlinked_claude_visibility_lineage(
+        db, store, suffix="cursor-repair", visible_at=101.0
+    )
+    _corrupt_claude_visibility_source_identity(
+        db, blocked_candidate, blocked_identity, "session_source"
+    )
+
+    first = store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+    second = store.reconcile_claude_visibility_lineage(
+        limit=1,
+        apply=True,
+        cursor=first["next_cursor"],
+    )
+
+    assert first == {
+        "scanned": 1,
+        "repairable": 0,
+        "repaired": 0,
+        "remaining": 2,
+        "blocker_codes": {"claude_lineage_source_identity_mismatch": 1},
+        "next_cursor": {
+            "after_visible_at": 100.0,
+            "after_job_id": blocked_identity.job_id,
+            "high_water_visible_at": 101.0,
+            "high_water_job_id": repair_identity.job_id,
+        },
+        "has_more": True,
+        "complete": False,
+    }
+    assert second == {
+        "scanned": 1,
+        "repairable": 1,
+        "repaired": 1,
+        "remaining": 1,
+        "blocker_codes": {},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": False,
+    }
+    assert _rows(
+        db,
+        "SELECT bridge_id FROM session_links WHERE bridge_id = ?",
+        (repair_identity.bridge_id,),
+    ) == [{"bridge_id": repair_identity.bridge_id}]
+    assert _rows(
+        db,
+        "SELECT bridge_id FROM session_links WHERE bridge_id = ?",
+        (blocked_identity.bridge_id,),
+    ) == []
+
+
+def test_claude_visibility_lineage_cursor_is_stable_for_equal_timestamps_and_replay(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0, local_timezone=timezone.utc)
+    identities = [
+        _seed_unlinked_claude_visibility_lineage(
+            db, store, suffix=f"equal-cursor-{index}", visible_at=100.0
+        )[1]
+        for index in range(3)
+    ]
+    ordered = sorted(identity.job_id for identity in identities)
+
+    first = store.reconcile_claude_visibility_lineage(limit=1, apply=False)
+    second = store.reconcile_claude_visibility_lineage(
+        limit=1, apply=False, cursor=first["next_cursor"]
+    )
+    replay = store.reconcile_claude_visibility_lineage(
+        limit=1, apply=False, cursor=first["next_cursor"]
+    )
+    third = store.reconcile_claude_visibility_lineage(
+        limit=1, apply=False, cursor=second["next_cursor"]
+    )
+
+    assert first["next_cursor"] == {
+        "after_visible_at": 100.0,
+        "after_job_id": ordered[0],
+        "high_water_visible_at": 100.0,
+        "high_water_job_id": ordered[2],
+    }
+    assert second == replay
+    assert second["next_cursor"] == {
+        "after_visible_at": 100.0,
+        "after_job_id": ordered[1],
+        "high_water_visible_at": 100.0,
+        "high_water_job_id": ordered[2],
+    }
+    assert third["scanned"] == 1
+    assert third["next_cursor"] is None
+    assert third["has_more"] is False
+    assert third["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        {},
+        {"after_visible_at": 100.0},
+        {
+            "after_visible_at": float("nan"),
+            "after_job_id": "job-a",
+            "high_water_visible_at": 100.0,
+            "high_water_job_id": "job-b",
+        },
+        {
+            "after_visible_at": 101.0,
+            "after_job_id": "job-b",
+            "high_water_visible_at": 100.0,
+            "high_water_job_id": "job-a",
+        },
+        {
+            "after_visible_at": 100.0,
+            "after_job_id": "forged-job",
+            "high_water_visible_at": 100.0,
+            "high_water_job_id": "also-forged",
+        },
+    ],
+)
+def test_claude_visibility_lineage_cursor_rejects_malformed_or_unanchored_values(
+    db: SessionDB,
+    cursor: object,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0, local_timezone=timezone.utc)
+
+    with pytest.raises(ValueError, match="Claude lineage reconciliation cursor"):
+        store.reconcile_claude_visibility_lineage(
+            limit=1,
+            apply=False,
+            cursor=cursor,
+        )
 
 
 def test_claude_visibility_status_blocks_clean_gate_on_unlinked_visible_job(db) -> None:
@@ -2030,7 +2644,6 @@ def test_claude_visibility_historical_lineage_reconciliation_is_concurrent_safe(
         ("wrong_target", "claude_lineage_target_identity_mismatch"),
         ("wrong_provenance", "claude_lineage_target_provenance_mismatch"),
         ("duplicate_target", "claude_lineage_target_duplicate"),
-        ("invalid_completion", "claude_lineage_invalid_completion"),
         ("conflicting_link", "claude_lineage_conflict"),
     ],
 )
@@ -2107,7 +2720,7 @@ def test_claude_visibility_commit_lineage_mismatch_rolls_back_without_partial_wr
         store.commit_claude_visibility_job(
             identity.job_id,
             claim.lease_digest,
-            "not-a-sha" if case == "invalid_completion" else "e" * 64,
+            "e" * 64,
             100.0,
         )
 
@@ -2157,6 +2770,9 @@ def test_claude_visibility_historical_lineage_missing_source_remains_blocked(db)
         "repaired": 0,
         "remaining": 1,
         "blocker_codes": {"claude_lineage_missing_source": 1},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": False,
     }
     assert _rows(db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)) == []
 
@@ -2212,6 +2828,9 @@ def test_claude_visibility_continued_lineage_remains_healthy_and_idempotent(
         "repaired": 0,
         "remaining": 0,
         "blocker_codes": {},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": True,
     }
     assert _rows(
         db,
@@ -2303,6 +2922,9 @@ def test_claude_visibility_historical_link_identity_conflict_blocks_repair(
         "repaired": 0,
         "remaining": 1,
         "blocker_codes": {"claude_lineage_conflict": 1},
+        "next_cursor": None,
+        "has_more": False,
+        "complete": False,
     }
     assert _rows(
         db, "SELECT * FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
@@ -7172,6 +7794,7 @@ def test_claude_visibility_enqueue_claim_commit_and_idempotency(db: SessionDB) -
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity()
     first = _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
     duplicate = _enqueue_claude_visibility_job(store, candidate, identity)
     claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
 
@@ -7184,7 +7807,7 @@ def test_claude_visibility_enqueue_claim_commit_and_idempotency(db: SessionDB) -
     assert claim.lease_digest and len(claim.lease_digest) == 64
     assert claim.requires_exact_id_reconciliation is False
     visible = store.commit_claude_visibility_job(
-        identity.job_id, claim.lease_digest, "transcript-digest", 120.0
+        identity.job_id, claim.lease_digest, "a" * 64, 120.0
     )
     assert visible["state"] == "claude_visible"
     assert visible["reserved_claude_uuid"] == identity.claude_uuid
@@ -7452,6 +8075,7 @@ def test_claude_auth_recovery_is_paid_once_and_releases_only_same_uuid(
     store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity("auth-recovery")
     _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
     launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
     store.fail_claude_visibility_job(
         identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
@@ -7618,6 +8242,7 @@ def test_claude_auth_recovery_reconciles_completed_transcript_without_new_call(
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity("auth-reconcile-crash")
     _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
     launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
     store.fail_claude_visibility_job(
         identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
@@ -7672,6 +8297,97 @@ def test_claude_auth_recovery_reconciles_completed_transcript_without_new_call(
             transcript_digest="d" * 64,
             visible_at=102.0,
         )
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_label"),
+    [
+        ("commit_transcript", "recovered transcript digest"),
+        ("reconcile_evidence", "authentication evidence digest"),
+        ("reconcile_prompt", "authentication recovery prompt digest"),
+        ("reconcile_transcript", "recovered transcript digest"),
+    ],
+)
+def test_claude_auth_recovery_rejects_invalid_digest_before_mutation(
+    db: SessionDB,
+    boundary: str,
+    expected_label: str,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity(f"auth-invalid-{boundary}")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 10, 25, "1.00", "0.02")
+    store.fail_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "bridge_conflict", "redacted"
+    )
+    operation_id = "6ae1c4de-0000-4000-8000-000000000025"
+    recovery = store.claim_claude_auth_recovery(
+        job_id=identity.job_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+        prompt_digest="b" * 64,
+        now=100.0,
+        lease_seconds=10,
+        daily_limit=25,
+        cost_limit="1.00",
+        reserved_cost="0.02",
+        max_attempts=5,
+    )
+    store.begin_claude_auth_recovery(identity.job_id, recovery["lease_digest"])
+    before_job = _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )[0]
+    before_recovery = _rows(
+        db,
+        "SELECT * FROM session_claude_auth_recoveries WHERE job_id = ?",
+        (identity.job_id,),
+    )[0]
+
+    with pytest.raises(ValueError, match=expected_label):
+        if boundary == "commit_transcript":
+            store.commit_claude_auth_recovery(
+                job_id=identity.job_id,
+                lease_digest=recovery["lease_digest"],
+                reserved_claude_uuid=identity.claude_uuid,
+                transcript_digest="not-a-sha256-digest",
+                visible_at=101.0,
+            )
+        else:
+            store.reconcile_claude_auth_recovery(
+                job_id=identity.job_id,
+                reserved_claude_uuid=identity.claude_uuid,
+                operation_id=operation_id,
+                evidence_digest=(
+                    "not-a-sha256-digest"
+                    if boundary == "reconcile_evidence"
+                    else "a" * 64
+                ),
+                prompt_digest=(
+                    "not-a-sha256-digest"
+                    if boundary == "reconcile_prompt"
+                    else "b" * 64
+                ),
+                transcript_digest=(
+                    "not-a-sha256-digest"
+                    if boundary == "reconcile_transcript"
+                    else "c" * 64
+                ),
+                visible_at=101.0,
+            )
+
+    assert _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )[0] == before_job
+    assert _rows(
+        db,
+        "SELECT * FROM session_claude_auth_recoveries WHERE job_id = ?",
+        (identity.job_id,),
+    )[0] == before_recovery
 
 
 @pytest.mark.parametrize("recovery_mode", ["leased_commit", "crash_reconcile"])
@@ -7875,13 +8591,14 @@ def test_claude_visibility_max_attempts_allows_exact_match_reconciliation(
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity("max-match")
     _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
     launch = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
     store.retry_claude_visibility_job(
         identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
     reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
     visible = store.commit_claude_visibility_job(
-        identity.job_id, reconciliation.lease_digest, "digest", 100.0
+        identity.job_id, reconciliation.lease_digest, "a" * 64, 100.0
     )
     assert reconciliation.registration_reserved is False
     assert visible["state"] == "claude_visible"
@@ -8249,9 +8966,10 @@ def test_no_due_cycle_advances_empty_for_zero_or_visible_only_rows(
     if visible_only:
         candidate, identity = _claude_visibility_identity("visible-empty")
         _enqueue_claude_visibility_job(store, candidate, identity)
+        _seed_claude_visibility_native_source(db, store, candidate)
         claim = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 5)
         store.commit_claude_visibility_job(
-            identity.job_id, claim.lease_digest, "digest", 100.0
+            identity.job_id, claim.lease_digest, "a" * 64, 100.0
         )
 
     store.record_claude_visibility_cycle(
@@ -8268,12 +8986,13 @@ def test_later_no_due_cycle_advances_empty_after_work_clears(db: SessionDB) -> N
     store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity("cleared-work")
     _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
     store.record_claude_visibility_cycle(
         status="no_due_job", error_code=None, registrar_result=False
     )
     claim = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 5)
     store.commit_claude_visibility_job(
-        identity.job_id, claim.lease_digest, "digest", 100.0
+        identity.job_id, claim.lease_digest, "a" * 64, 100.0
     )
     clock[0] = 200.0
 
@@ -8415,7 +9134,7 @@ def test_claude_visibility_transitions_require_exact_active_lease(
             identity.job_id, "wrong", "creation_ambiguous", 120.0, "detail"
         ),
         lambda: store.commit_claude_visibility_job(
-            identity.job_id, "wrong", "transcript", 120.0
+            identity.job_id, "wrong", "a" * 64, 120.0
         ),
         lambda: store.fail_claude_visibility_job(
             identity.job_id, "wrong", "uuid_conflict", "detail"
@@ -8451,7 +9170,7 @@ def test_claude_visibility_commit_cannot_backdate_an_expired_lease(
         store.commit_claude_visibility_job(
             identity.job_id,
             claim.lease_digest,
-            "transcript",
+            "a" * 64,
             105.0,
         )
 
@@ -8535,6 +9254,7 @@ def test_claude_visibility_claims_at_most_one_due_job_and_status_is_exact(
     for suffix in range(5):
         candidate, identity = _claude_visibility_identity(str(suffix))
         _enqueue_claude_visibility_job(store, candidate, identity)
+        _seed_claude_visibility_native_source(db, store, candidate)
 
     leased = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     retry_source = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
@@ -8553,7 +9273,7 @@ def test_claude_visibility_claims_at_most_one_due_job_and_status_is_exact(
     store.commit_claude_visibility_job(
         visible_source.job_id,
         visible_source.lease_digest,
-        "transcript",
+        "a" * 64,
         110.0,
     )
     status = store.claude_visibility_status(100.0)
@@ -8627,10 +9347,11 @@ def test_atomic_idle_batch_reports_exact_duplicates_and_blocks_open_work(
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     duplicate = _claude_visibility_identity("duplicate")
     _enqueue_claude_visibility_job(store, *duplicate)
+    _seed_claude_visibility_native_source(db, store, duplicate[0])
     store.commit_claude_visibility_job(
         duplicate[1].job_id,
         store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").lease_digest,
-        "digest",
+        "a" * 64,
         100.0,
     )
     fresh = _claude_visibility_identity("fresh")
@@ -8999,6 +9720,7 @@ def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
     )
     candidate, identity = _claude_visibility_identity()
     _enqueue_claude_visibility_job(store, candidate, identity)
+    _seed_claude_visibility_native_source(db, store, candidate)
     launch = store.claim_claude_visibility_job(1_768_608_000.0, 200, 25, "0.50", "0.02")
     store.retry_claude_visibility_job(
         identity.job_id,
@@ -9018,7 +9740,7 @@ def test_claude_visibility_reconciliation_lease_can_commit_without_new_slot(
     visible = store.commit_claude_visibility_job(
         identity.job_id,
         reconciliation.lease_digest,
-        "existing-transcript",
+        "a" * 64,
         1_768_608_110.0,
     )
     assert visible["state"] == "claude_visible"

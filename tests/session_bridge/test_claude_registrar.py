@@ -1943,6 +1943,21 @@ def test_restart_reconciliation_commits_exact_uuid_without_second_spawn_or_usage
     value = candidate()
     identity = derive_claude_visibility_identity(value, SECRET)
     first_store.enqueue_claude_visibility_job(value, identity, SECRET)
+    first_store.upsert_projection(
+        SessionProjection(
+            provider=Provider.CODEX,
+            native_id=value.source_session_id.removeprefix("codex:"),
+            title=value.native_name,
+            cwd=value.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=(ProjectedMessage("source-u1", 0, "user", "request", 10.0),),
+            native_path="C:/codex/source-1.jsonl",
+            native_cursor="source-cursor",
+            native_hash="source-hash",
+            origin_kind=OriginKind.NATIVE,
+        )
+    )
     first = first_store.claim_claude_visibility_job(now[0], 60, 25, "0.50", "0.02")
     assert first.lease_kind == "launch"
     first_factory = FakeFactory(FakePty(read_error=TimeoutError()))

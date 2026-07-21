@@ -809,6 +809,12 @@ def test_claude_visibility_registrar_faults_reconcile_same_uuid_without_relaunch
         candidate = _registrar_candidate()
         identity = derive_claude_visibility_identity(candidate, _REGISTRAR_SECRET)
         store.enqueue_claude_visibility_job(candidate, identity, _REGISTRAR_SECRET)
+        store.upsert_projection(
+            _projection(
+                provider=Provider.CODEX,
+                native_id=candidate.source_session_id.removeprefix("codex:"),
+            )
+        )
         launch = store.claim_claude_visibility_job(base, 10.0, 25, "0.50", "0.02", 5)
         assert launch.lease_kind == "launch"
         assert launch.reserved_claude_uuid == identity.claude_uuid
