@@ -1037,7 +1037,8 @@ CREATE TABLE IF NOT EXISTS session_sidebar_terminal_resolutions (
         length(evidence_digest) = 64
         AND evidence_digest NOT GLOB '*[^0-9a-f]*'
     ),
-    resolved_at REAL NOT NULL
+    resolved_at REAL NOT NULL,
+    CHECK (resolved_at >= failure_updated_at)
 );
 
 CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_replacement

@@ -76,12 +76,11 @@ from .sidebar_executor import (
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
-    SIDEBAR_TERMINAL_EVIDENCE_KIND,
-    SIDEBAR_TERMINAL_EVIDENCE_VERSION,
     SIDEBAR_TERMINAL_RESOLUTION_CODE,
     SessionBridgeStore,
     SidebarSource,
     redact_codex_thread_id,
+    sidebar_terminal_evidence_digest,
 )
 
 
@@ -794,7 +793,7 @@ class ProductionBackend:
             del native_state
             raise RolloutGateBlocked("native_thread_materialized")
 
-        evidence_digest = _sidebar_terminal_evidence_digest(
+        evidence_digest = sidebar_terminal_evidence_digest(
             job=job,
             reservation=reservation,
         )
@@ -2460,79 +2459,6 @@ def _public_sidebar_terminal_resolution_result(
         "error_code": "native_create_ambiguous",
         "resolution_code": "native_thread_unrecoverable",
     }
-
-
-def _sidebar_terminal_evidence_digest(
-    *,
-    job: Mapping[str, Any],
-    reservation: Mapping[str, Any],
-) -> str:
-    """Hash the exact durable snapshot and fixed provider proof, never user input."""
-
-    thread_id = job.get("codex_thread_id")
-    document = {
-        "evidence_kind": SIDEBAR_TERMINAL_EVIDENCE_KIND,
-        "evidence_version": SIDEBAR_TERMINAL_EVIDENCE_VERSION,
-        "job": {
-            key: job.get(key)
-            for key in (
-                "id",
-                "idempotency_key",
-                "source_session_id",
-                "bridge_id",
-                "state",
-                "attempts",
-                "next_attempt_at",
-                "lease_digest",
-                "lease_expires_at",
-                "completion_digest",
-                "codex_thread_id",
-                "error_code",
-                "eligible_at",
-                "created_at",
-                "updated_at",
-                "visible_at",
-            )
-        },
-        "provider_probe": [
-            {
-                "method": "thread/read",
-                "params": {"threadId": thread_id, "includeTurns": True},
-                "error": {
-                    "code": -32600,
-                    "message": f"thread not loaded: {thread_id}",
-                },
-            },
-            {
-                "method": "thread/resume",
-                "params": {"threadId": thread_id},
-                "error": {
-                    "code": -32600,
-                    "message": f"no rollout found for thread id {thread_id}",
-                },
-            },
-        ],
-        "reservation": {
-            key: reservation.get(key)
-            for key in (
-                "version",
-                "job_id",
-                "source_session_id",
-                "bridge_id",
-                "recovery_key",
-                "reserved_at",
-            )
-        },
-        "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
-    }
-    encoded = json.dumps(
-        document,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _status_count(value: object) -> int:

@@ -50,6 +50,7 @@ from session_bridge.store import (
     SIDEBAR_EXCLUSION_REASONS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
+    sidebar_terminal_evidence_digest,
 )
 from session_bridge.worktree import WorktreeSnapshot, capture_worktree_snapshot
 
@@ -160,6 +161,7 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledger(db) -> Non
         "evidence_version = 1",
         "length(evidence_digest) = 64",
         "evidence_digest NOT GLOB '*[^0-9a-f]*'",
+        "resolved_at >= failure_updated_at",
     ):
         assert required in normalized
     assert {
@@ -4199,9 +4201,11 @@ def _acknowledge_terminal_resolution(
     store: SessionBridgeStore,
     failed: dict[str, object],
     *,
-    evidence_digest: str = "e" * 64,
+    evidence_digest: str | None = None,
     now: float = 200.0,
 ) -> dict[str, object]:
+    if evidence_digest is None:
+        evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
     return store.acknowledge_sidebar_terminal_resolution(
         job_id=failed["id"],
         codex_thread_id=failed["codex_thread_id"],
@@ -4211,6 +4215,96 @@ def _acknowledge_terminal_resolution(
         expected_updated_at=failed["updated_at"],
         evidence_digest=evidence_digest,
         now=now,
+    )
+
+
+def _canonical_terminal_evidence_for_test(
+    store: SessionBridgeStore,
+    failed: dict[str, object],
+) -> str:
+    job = store.get_sidebar_job_by_id(str(failed["id"]))
+    assert job is not None
+    reservation = store.get_sidebar_create_reservation(
+        str(failed["source_session_id"])
+    )
+    assert reservation is not None
+    return sidebar_terminal_evidence_digest(job=job, reservation=reservation)
+
+
+def _drift_terminal_evidence_snapshot(
+    db: SessionDB,
+    failed: dict[str, object],
+    reservation: dict[str, object],
+    *,
+    snapshot: str,
+    field: str,
+) -> None:
+    if snapshot == "job":
+        db._execute_write(
+            lambda conn: conn.execute(
+                f"UPDATE session_sidebar_jobs SET {field} = {field} + 1 WHERE id = ?",
+                (failed["id"],),
+            )
+        )
+        return
+    changed = dict(reservation)
+    changed[field] = (
+        f"{changed[field]}-drift"
+        if field == "recovery_key"
+        else float(changed[field]) + 1.0
+    )
+    state_key = (
+        "session-bridge:sidebar-create:"
+        + hashlib.sha256(
+            str(failed["source_session_id"]).encode("utf-8")
+        ).hexdigest()
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_bridge_state SET value_json = ?, updated_at = ? "
+            "WHERE key = ?",
+            (
+                json.dumps(
+                    changed,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                160.0,
+                state_key,
+            ),
+        )
+    )
+
+
+def _insert_terminal_resolution_directly(
+    db: SessionDB,
+    failed: dict[str, object],
+    *,
+    evidence_digest: str,
+    resolved_at: float,
+) -> None:
+    db._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO session_sidebar_terminal_resolutions (
+                   job_id, idempotency_key, source_session_id, bridge_id,
+                   codex_thread_id, failure_state, failure_code,
+                   failure_attempts, failure_next_attempt_at,
+                   failure_updated_at, resolution_code, evidence_kind,
+                   evidence_version, evidence_digest, resolved_at
+               ) SELECT id, idempotency_key, source_session_id, bridge_id,
+                        codex_thread_id, state, error_code, attempts,
+                        next_attempt_at, updated_at, ?, ?, ?, ?, ?
+                   FROM session_sidebar_jobs WHERE id = ?""",
+            (
+                "native_thread_unrecoverable",
+                "codex_app_server_read_not_loaded_resume_no_rollout",
+                1,
+                evidence_digest,
+                resolved_at,
+                failed["id"],
+            ),
+        )
     )
 
 
@@ -4889,6 +4983,7 @@ def test_sidebar_terminal_resolution_is_append_only_and_unblocks_unrelated_work(
     )
     pending = _sidebar_candidate(db, native_id="terminal-resolution-pending")
     store.enqueue_sidebar_job(pending)
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
 
     resolved = _acknowledge_terminal_resolution(store, failed)
 
@@ -4922,7 +5017,7 @@ def test_sidebar_terminal_resolution_is_append_only_and_unblocks_unrelated_work(
                 "codex_app_server_read_not_loaded_resume_no_rollout"
             ),
             "evidence_version": 1,
-            "evidence_digest": "e" * 64,
+            "evidence_digest": evidence_digest,
             "resolved_at": 200.0,
         }
     ]
@@ -4966,6 +5061,7 @@ def test_sidebar_terminal_resolution_replay_is_idempotent_and_conflicts_fail_clo
         token="terminal-replay-token",
         thread_id="019f-terminal-replay-thread",
     )
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
 
     first = _acknowledge_terminal_resolution(store, failed, now=200.0)
     replay = _acknowledge_terminal_resolution(store, failed, now=300.0)
@@ -4975,7 +5071,7 @@ def test_sidebar_terminal_resolution_replay_is_idempotent_and_conflicts_fail_clo
         db,
         "SELECT evidence_digest, resolved_at "
         "FROM session_sidebar_terminal_resolutions",
-    ) == [{"evidence_digest": "e" * 64, "resolved_at": 200.0}]
+    ) == [{"evidence_digest": evidence_digest, "resolved_at": 200.0}]
     with pytest.raises(ValueError, match="terminal resolution"):
         _acknowledge_terminal_resolution(
             store,
@@ -4983,6 +5079,171 @@ def test_sidebar_terminal_resolution_replay_is_idempotent_and_conflicts_fail_clo
             evidence_digest="f" * 64,
             now=400.0,
         )
+
+
+def test_sidebar_terminal_resolution_rejects_a_sha_shaped_fabricated_digest(
+    db,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-fabricated-evidence",
+        token="terminal-fabricated-evidence-token",
+        thread_id="019f-terminal-fabricated-evidence",
+    )
+
+    with pytest.raises(ValueError, match="terminal resolution evidence"):
+        _acknowledge_terminal_resolution(
+            store,
+            failed,
+            evidence_digest="f" * 64,
+        )
+
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "field"),
+    (
+        ("job", "eligible_at"),
+        ("job", "created_at"),
+        ("reservation", "recovery_key"),
+        ("reservation", "reserved_at"),
+    ),
+)
+def test_sidebar_terminal_resolution_rejects_digest_bound_snapshot_drift(
+    db,
+    snapshot: str,
+    field: str,
+) -> None:
+    store, _candidate, failed, reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id=f"terminal-evidence-drift-{snapshot}-{field}",
+        token=f"terminal-evidence-drift-{snapshot}-{field}-token",
+        thread_id=f"019f-terminal-evidence-drift-{snapshot}-{field}",
+    )
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
+
+    _drift_terminal_evidence_snapshot(
+        db,
+        failed,
+        reservation,
+        snapshot=snapshot,
+        field=field,
+    )
+
+    with pytest.raises(ValueError, match="terminal resolution evidence"):
+        _acknowledge_terminal_resolution(
+            store,
+            failed,
+            evidence_digest=evidence_digest,
+        )
+
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
+
+
+def test_sidebar_terminal_resolution_waiver_rejects_forged_legacy_evidence(
+    db,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-forged-legacy-evidence",
+        token="terminal-forged-legacy-evidence-token",
+        thread_id="019f-terminal-forged-legacy-evidence",
+    )
+    _insert_terminal_resolution_directly(
+        db,
+        failed,
+        evidence_digest="f" * 64,
+        resolved_at=200.0,
+    )
+
+    assert store.sidebar_execution_blockers() == (
+        "sidebar_failed",
+        "sidebar_terminal_resolution_mismatch",
+    )
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "field"),
+    (
+        ("job", "eligible_at"),
+        ("job", "created_at"),
+        ("reservation", "recovery_key"),
+        ("reservation", "reserved_at"),
+    ),
+)
+def test_sidebar_terminal_resolution_waiver_downgrades_on_evidence_snapshot_drift(
+    db,
+    snapshot: str,
+    field: str,
+) -> None:
+    store, _candidate, failed, reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id=f"terminal-waiver-drift-{snapshot}-{field}",
+        token=f"terminal-waiver-drift-{snapshot}-{field}-token",
+        thread_id=f"019f-terminal-waiver-drift-{snapshot}-{field}",
+    )
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
+    _acknowledge_terminal_resolution(
+        store,
+        failed,
+        evidence_digest=evidence_digest,
+    )
+
+    _drift_terminal_evidence_snapshot(
+        db,
+        failed,
+        reservation,
+        snapshot=snapshot,
+        field=field,
+    )
+
+    assert store.sidebar_execution_blockers() == (
+        "sidebar_failed",
+        "sidebar_terminal_resolution_mismatch",
+    )
+
+
+def test_sidebar_terminal_resolution_rejects_resolution_before_failure_time(
+    db,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-invalid-chronology",
+        token="terminal-invalid-chronology-token",
+        thread_id="019f-terminal-invalid-chronology",
+    )
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
+
+    with pytest.raises(ValueError, match="terminal resolution time"):
+        _acknowledge_terminal_resolution(
+            store,
+            failed,
+            evidence_digest=evidence_digest,
+            now=float(failed["updated_at"]) - 1.0,
+        )
+
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
+
+
+def test_sidebar_terminal_resolution_schema_rejects_invalid_chronology(db) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-schema-chronology",
+        token="terminal-schema-chronology-token",
+        thread_id="019f-terminal-schema-chronology",
+    )
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
+
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        _insert_terminal_resolution_directly(
+            db,
+            failed,
+            evidence_digest=evidence_digest,
+            resolved_at=float(failed["updated_at"]) - 1.0,
+        )
+
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
 
 
 def test_sidebar_terminal_resolution_ledger_rows_cannot_be_changed_or_deleted(
@@ -5057,6 +5318,7 @@ def test_sidebar_terminal_resolution_cas_rejects_every_expected_snapshot_mismatc
         token=f"terminal-cas-{parameter}-token",
         thread_id=f"019f-terminal-cas-{parameter}",
     )
+    evidence_digest = _canonical_terminal_evidence_for_test(store, failed)
     arguments = {
         "job_id": failed["id"],
         "codex_thread_id": failed["codex_thread_id"],
@@ -5064,7 +5326,7 @@ def test_sidebar_terminal_resolution_cas_rejects_every_expected_snapshot_mismatc
         "expected_attempts": failed["attempts"],
         "expected_next_attempt_at": failed["next_attempt_at"],
         "expected_updated_at": failed["updated_at"],
-        "evidence_digest": "e" * 64,
+        "evidence_digest": evidence_digest,
         "now": 200.0,
     }
     arguments[parameter] = replacement

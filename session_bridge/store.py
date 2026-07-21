@@ -214,6 +214,7 @@ _SIDEBAR_TERMINAL_LEDGER_SQL_REQUIREMENTS = (
     "evidence_digest TEXT NOT NULL CHECK ( length(evidence_digest) = 64 "
     "AND evidence_digest NOT GLOB '*[^0-9a-f]*' )",
     "resolved_at REAL NOT NULL",
+    "CHECK (resolved_at >= failure_updated_at)",
 )
 PUBLIC_SIDEBAR_STATE = {
     SidebarJobState.PENDING.value: "pending",
@@ -234,6 +235,79 @@ _SIDEBAR_LATENCY_SAMPLE_LIMIT = 512
 
 NativeProjectionCursor = tuple[float, str]
 SidebarCandidateCursor = tuple[float, str]
+
+
+def sidebar_terminal_evidence_digest(
+    *,
+    job: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+) -> str:
+    """Hash the exact durable snapshot and fixed provider proof."""
+
+    thread_id = job.get("codex_thread_id")
+    document = {
+        "evidence_kind": SIDEBAR_TERMINAL_EVIDENCE_KIND,
+        "evidence_version": SIDEBAR_TERMINAL_EVIDENCE_VERSION,
+        "job": {
+            key: job.get(key)
+            for key in (
+                "id",
+                "idempotency_key",
+                "source_session_id",
+                "bridge_id",
+                "state",
+                "attempts",
+                "next_attempt_at",
+                "lease_digest",
+                "lease_expires_at",
+                "completion_digest",
+                "codex_thread_id",
+                "error_code",
+                "eligible_at",
+                "created_at",
+                "updated_at",
+                "visible_at",
+            )
+        },
+        "provider_probe": [
+            {
+                "method": "thread/read",
+                "params": {"threadId": thread_id, "includeTurns": True},
+                "error": {
+                    "code": -32600,
+                    "message": f"thread not loaded: {thread_id}",
+                },
+            },
+            {
+                "method": "thread/resume",
+                "params": {"threadId": thread_id},
+                "error": {
+                    "code": -32600,
+                    "message": f"no rollout found for thread id {thread_id}",
+                },
+            },
+        ],
+        "reservation": {
+            key: reservation.get(key)
+            for key in (
+                "version",
+                "job_id",
+                "source_session_id",
+                "bridge_id",
+                "recovery_key",
+                "reserved_at",
+            )
+        },
+        "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
+    }
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _claude_error_detail(value: object) -> str:
@@ -3931,54 +4005,91 @@ class SessionBridgeStore:
                     "FROM session_sidebar_terminal_resolutions"
                 ).fetchone()["resolution_count"]
             )
-            effective = int(
-                conn.execute(
-                    """SELECT COUNT(DISTINCT job.id) AS resolution_count
-                         FROM session_sidebar_jobs AS job
-                         JOIN session_sidebar_terminal_resolutions AS resolution
-                           ON resolution.job_id = job.id
-                          AND resolution.idempotency_key = job.idempotency_key
-                          AND resolution.source_session_id = job.source_session_id
-                          AND resolution.bridge_id = job.bridge_id
-                          AND resolution.codex_thread_id = job.codex_thread_id
-                          AND resolution.failure_state = job.state
-                          AND resolution.failure_code = job.error_code
-                          AND resolution.failure_attempts = job.attempts
-                          AND resolution.failure_next_attempt_at = job.next_attempt_at
-                          AND resolution.failure_updated_at = job.updated_at
-                          AND resolution.resolution_code = ?
-                          AND resolution.evidence_kind = ?
-                          AND resolution.evidence_version = ?
-                        WHERE job.state = ?
-                          AND job.error_code = ?
-                          AND job.codex_thread_id IS NOT NULL
-                          AND job.lease_digest IS NULL
-                          AND job.lease_expires_at IS NULL
-                          AND job.completion_digest IS NULL
-                          AND job.visible_at IS NULL
-                          AND NOT EXISTS (
-                              SELECT 1 FROM external_sessions AS external
-                               WHERE external.provider = ?
-                                 AND external.native_id = job.codex_thread_id
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM session_links AS link
-                               WHERE link.bridge_id = job.bridge_id
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM session_sidebar_exclusions AS exclusion
-                               WHERE exclusion.source_session_id = job.source_session_id
-                          )""",
-                    (
-                        SIDEBAR_TERMINAL_RESOLUTION_CODE,
-                        SIDEBAR_TERMINAL_EVIDENCE_KIND,
-                        SIDEBAR_TERMINAL_EVIDENCE_VERSION,
-                        SidebarJobState.FAILED.value,
-                        "native_create_ambiguous",
-                        Provider.CODEX.value,
-                    ),
-                ).fetchone()["resolution_count"]
-            )
+            candidates = conn.execute(
+                """SELECT job.*,
+                          resolution.evidence_digest AS resolution_evidence_digest
+                     FROM session_sidebar_jobs AS job
+                     JOIN session_sidebar_terminal_resolutions AS resolution
+                       ON resolution.job_id = job.id
+                      AND resolution.idempotency_key = job.idempotency_key
+                      AND resolution.source_session_id = job.source_session_id
+                      AND resolution.bridge_id = job.bridge_id
+                      AND resolution.codex_thread_id = job.codex_thread_id
+                      AND resolution.failure_state = job.state
+                      AND resolution.failure_code = job.error_code
+                      AND resolution.failure_attempts = job.attempts
+                      AND resolution.failure_next_attempt_at = job.next_attempt_at
+                      AND resolution.failure_updated_at = job.updated_at
+                      AND resolution.resolution_code = ?
+                      AND resolution.evidence_kind = ?
+                      AND resolution.evidence_version = ?
+                    WHERE job.state = ?
+                      AND job.error_code = ?
+                      AND job.codex_thread_id IS NOT NULL
+                      AND job.lease_digest IS NULL
+                      AND job.lease_expires_at IS NULL
+                      AND job.completion_digest IS NULL
+                      AND job.visible_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM external_sessions AS external
+                           WHERE external.provider = ?
+                             AND external.native_id = job.codex_thread_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM session_links AS link
+                           WHERE link.bridge_id = job.bridge_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM session_sidebar_exclusions AS exclusion
+                           WHERE exclusion.source_session_id = job.source_session_id
+                      )""",
+                (
+                    SIDEBAR_TERMINAL_RESOLUTION_CODE,
+                    SIDEBAR_TERMINAL_EVIDENCE_KIND,
+                    SIDEBAR_TERMINAL_EVIDENCE_VERSION,
+                    SidebarJobState.FAILED.value,
+                    "native_create_ambiguous",
+                    Provider.CODEX.value,
+                ),
+            ).fetchall()
+            effective = 0
+            for candidate in candidates:
+                try:
+                    job = dict(candidate)
+                    source_session_id = _exact_nonempty_text(
+                        job["source_session_id"], "sidebar source session ID"
+                    )
+                    reservation_row = conn.execute(
+                        "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                        (
+                            _sidebar_create_reservation_state_key(
+                                source_session_id
+                            ),
+                        ),
+                    ).fetchone()
+                    if reservation_row is None:
+                        continue
+                    reservation = _decode_sidebar_create_reservation(
+                        reservation_row["value_json"],
+                        expected_source_session_id=source_session_id,
+                    )
+                    if (
+                        reservation["job_id"] != job["id"]
+                        or reservation["bridge_id"] != job["bridge_id"]
+                    ):
+                        continue
+                    canonical_evidence = sidebar_terminal_evidence_digest(
+                        job=job,
+                        reservation=reservation,
+                    )
+                    stored_evidence = job["resolution_evidence_digest"]
+                    if not isinstance(stored_evidence, str):
+                        continue
+                    if hmac.compare_digest(stored_evidence, canonical_evidence):
+                        effective += 1
+                except (TypeError, ValueError):
+                    # Corrupt current evidence snapshots cannot waive a failure.
+                    continue
             ledger_valid = True
         except sqlite3.DatabaseError:
             # Missing or malformed ledgers are never authority to waive a failure.
@@ -4933,6 +5044,19 @@ class SessionBridgeStore:
             if materialized is not None:
                 raise ValueError("expected sidebar terminal resolution does not match")
 
+            canonical_evidence = sidebar_terminal_evidence_digest(
+                job=dict(job),
+                reservation=reservation,
+            )
+            if not hmac.compare_digest(evidence, canonical_evidence):
+                raise ValueError(
+                    "sidebar terminal resolution evidence does not match"
+                )
+            if resolved_at < updated_at:
+                raise ValueError(
+                    "sidebar terminal resolution time precedes failure"
+                )
+
             expected_fields = {
                 "job_id": expected_job_id,
                 "idempotency_key": idempotency_key,
@@ -4947,7 +5071,7 @@ class SessionBridgeStore:
                 "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
                 "evidence_kind": SIDEBAR_TERMINAL_EVIDENCE_KIND,
                 "evidence_version": SIDEBAR_TERMINAL_EVIDENCE_VERSION,
-                "evidence_digest": evidence,
+                "evidence_digest": canonical_evidence,
             }
             resolution = conn.execute(
                 "SELECT * FROM session_sidebar_terminal_resolutions WHERE job_id = ?",
@@ -5012,7 +5136,7 @@ class SessionBridgeStore:
                         SIDEBAR_TERMINAL_RESOLUTION_CODE,
                         SIDEBAR_TERMINAL_EVIDENCE_KIND,
                         SIDEBAR_TERMINAL_EVIDENCE_VERSION,
-                        evidence,
+                        canonical_evidence,
                         resolved_at,
                         expected_job_id,
                         idempotency_key,
