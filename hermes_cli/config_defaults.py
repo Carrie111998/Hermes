@@ -1546,6 +1546,11 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Rotating operational posture (POSTURE.md). The enable flag is
+        # intentionally absent from defaults so callers can distinguish an
+        # unspecified setting from explicit true/false. When unspecified,
+        # posture follows memory_enabled OR user_profile_enabled.
+        "posture_char_limit": 1800,  # ~650 tokens
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

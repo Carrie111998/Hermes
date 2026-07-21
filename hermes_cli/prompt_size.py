@@ -234,11 +234,12 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     """Return a dict of prompt-size measurements for a fresh session.
 
     Keys: ``system_prompt`` (chars/bytes), ``skills_index``, ``memory``,
-    ``user_profile``, ``tools`` (count + json bytes), ``sections`` (a list of
-    (label, chars, bytes) for the three prompt tiers), ``skills_breakdown``
-    (per-skill index-line + on-disk SKILL.md bytes, largest-first), and
-    ``toolsets_breakdown`` (per-toolset tool count + schema json bytes,
-    largest-first). The last two answer "what should I disable to cut tokens?".
+    ``user_profile``, ``posture``, ``tools`` (count + json bytes), ``sections``
+    (a list of (label, chars, bytes) for the three prompt tiers),
+    ``skills_breakdown`` (per-skill index-line + on-disk SKILL.md bytes,
+    largest-first), and ``toolsets_breakdown`` (per-toolset tool count + schema
+    json bytes, largest-first). The last two answer "what should I disable to
+    cut tokens?".
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
@@ -261,6 +262,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # even though they're joined into ``volatile``.
     memory_block = ""
     user_block = ""
+    posture_block = ""
     store = getattr(agent, "_memory_store", None)
     if store is not None:
         try:
@@ -268,6 +270,10 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
                 memory_block = store.format_for_system_prompt("memory") or ""
             if getattr(agent, "_user_profile_enabled", True):
                 user_block = store.format_for_system_prompt("user") or ""
+            if getattr(agent, "_posture_enabled", False):
+                posture_block = (
+                    store.format_for_system_prompt("posture") or ""
+                )
         except Exception:
             pass
 
@@ -288,6 +294,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "skills_index": {"chars": len(skills_index), "bytes": _bytes(skills_index)},
         "memory": {"chars": len(memory_block), "bytes": _bytes(memory_block)},
         "user_profile": {"chars": len(user_block), "bytes": _bytes(user_block)},
+        "posture": {"chars": len(posture_block), "bytes": _bytes(posture_block)},
         "tools": {"count": len(tools), "json_bytes": _bytes(tools_json)},
         "sections": sections,
         "skills_breakdown": _compute_skills_breakdown(skills_index),
@@ -311,9 +318,11 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     si = data["skills_index"]
     mem = data["memory"]
     up = data["user_profile"]
+    posture = data["posture"]
     lines.append(f"    skills index       : {si['bytes']:>8,} B  ({_fmt_kb(si['bytes'])})")
     lines.append(f"    memory             : {mem['bytes']:>8,} B  ({_fmt_kb(mem['bytes'])})")
     lines.append(f"    user profile       : {up['bytes']:>8,} B  ({_fmt_kb(up['bytes'])})")
+    lines.append(f"    posture            : {posture['bytes']:>8,} B  ({_fmt_kb(posture['bytes'])})")
     lines.append("")
     lines.append("  Prompt tiers:")
     for label, chars, byts in data["sections"]:

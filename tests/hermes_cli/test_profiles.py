@@ -142,6 +142,11 @@ class TestCreateProfile:
         (default_home / "config.yaml").write_text("model: test")
         (default_home / ".env").write_text("KEY=val")
         (default_home / "SOUL.md").write_text("Be helpful.")
+        memories = default_home / "memories"
+        memories.mkdir(exist_ok=True)
+        (memories / "MEMORY.md").write_text("durable memory")
+        (memories / "USER.md").write_text("user profile")
+        (memories / "POSTURE.md").write_text("current posture")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
@@ -150,6 +155,15 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (
+            profile_dir / "memories" / "MEMORY.md"
+        ).read_text() == "durable memory"
+        assert (
+            profile_dir / "memories" / "USER.md"
+        ).read_text() == "user profile"
+        assert (
+            profile_dir / "memories" / "POSTURE.md"
+        ).read_text() == "current posture"
 
 
 
@@ -814,6 +828,5 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
 
 

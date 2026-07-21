@@ -16,13 +16,23 @@ from hermes_cli.prompt_size import (
 )
 
 
-def _seed_memory(hermes_home, memory_text="", user_text=""):
+def _seed_memory(
+    hermes_home,
+    memory_text="",
+    user_text="",
+    posture_text="",
+):
     mem_dir = hermes_home / "memories"
     mem_dir.mkdir(parents=True, exist_ok=True)
     if memory_text:
         (mem_dir / "MEMORY.md").write_text(memory_text, encoding="utf-8")
     if user_text:
         (mem_dir / "USER.md").write_text(user_text, encoding="utf-8")
+    if posture_text:
+        (mem_dir / "POSTURE.md").write_text(
+            posture_text,
+            encoding="utf-8",
+        )
 
 
 def _seed_skill(hermes_home, name, description):
@@ -52,6 +62,19 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     data = compute_prompt_breakdown("cli")
     assert data["system_prompt"]["bytes"] > 0
+
+
+def test_reports_posture_block_size(isolated_home):
+    _seed_memory(
+        isolated_home,
+        posture_text="Primary bet: finish the current review queue.",
+    )
+
+    data = compute_prompt_breakdown("cli")
+    rendered = render_breakdown(data)
+
+    assert data["posture"]["bytes"] > 0
+    assert "posture" in rendered
 
 
 
@@ -115,7 +138,6 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_total_bytes"] == shared_line_bytes
         assert entry["index_line_shared_bytes"] > 0
         assert entry["index_line_skill_count"] == 2
-
 
 
 

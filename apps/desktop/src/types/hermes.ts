@@ -1330,7 +1330,7 @@ export interface McpCatalogResponse {
 export interface MemoryStatusResponse {
   active: string
   providers: { name: string; description: string; configured: boolean }[]
-  builtin_files: { memory: number; user: number }
+  builtin_files: { memory: number; user: number; posture: number }
 }
 
 /** `GET /api/curator` — background skill-curator status. */

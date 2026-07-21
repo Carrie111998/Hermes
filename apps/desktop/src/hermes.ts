@@ -1712,7 +1712,9 @@ export function getMemoryStatus(): Promise<MemoryStatusResponse> {
   })
 }
 
-export function resetMemory(target: 'all' | 'memory' | 'user'): Promise<{ ok: boolean; deleted: string[] }> {
+export function resetMemory(
+  target: 'all' | 'memory' | 'user' | 'posture'
+): Promise<{ ok: boolean; deleted: string[] }> {
   return window.hermesDesktop.api<{ ok: boolean; deleted: string[] }>({
     ...profileScoped(),
     path: '/api/memory/reset',

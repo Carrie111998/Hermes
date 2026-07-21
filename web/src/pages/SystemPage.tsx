@@ -325,7 +325,7 @@ export default function SystemPage() {
       async (target: string) => {
         try {
           const res = await api.resetMemory(
-            target as "all" | "memory" | "user",
+            target as "all" | "memory" | "user" | "posture",
           );
           showToast(`Reset: ${res.deleted.join(", ") || "nothing"}`, "success");
           loadAll();
@@ -1124,7 +1124,8 @@ export default function SystemPage() {
               <span className="text-xs text-muted-foreground">
                 Built-in files — MEMORY.md:{" "}
                 {formatBytes(memory?.builtin_files.memory ?? 0)} · USER.md:{" "}
-                {formatBytes(memory?.builtin_files.user ?? 0)}
+                {formatBytes(memory?.builtin_files.user ?? 0)} · POSTURE.md:{" "}
+                {formatBytes(memory?.builtin_files.posture ?? 0)}
               </span>
               <div className="flex items-center gap-2 ml-auto">
                 <Button size="sm" ghost className="text-destructive" onClick={() => memoryReset.requestDelete("memory")}>
@@ -1132,6 +1133,9 @@ export default function SystemPage() {
                 </Button>
                 <Button size="sm" ghost className="text-destructive" onClick={() => memoryReset.requestDelete("user")}>
                   Reset USER.md
+                </Button>
+                <Button size="sm" ghost className="text-destructive" onClick={() => memoryReset.requestDelete("posture")}>
+                  Reset POSTURE.md
                 </Button>
                 <Button size="sm" ghost className="text-destructive" onClick={() => memoryReset.requestDelete("all")}>
                   Reset all

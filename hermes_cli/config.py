@@ -934,6 +934,29 @@ def _ensure_hermes_home_managed(home: Path):
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG, OPTIONAL_ENV_VARS  # noqa: F401
 
+
+def resolve_memory_target_flags(
+    memory_config: Any,
+) -> Tuple[bool, bool, bool]:
+    """Return effective MEMORY, USER, and POSTURE enable flags.
+
+    POSTURE follows either durable built-in store when its flag is omitted.
+    Keeping ``posture_enabled`` out of ``DEFAULT_CONFIG`` preserves the
+    distinction between that derived default and an explicit true or false.
+    """
+    if not isinstance(memory_config, dict):
+        memory_config = {}
+    memory_enabled = bool(memory_config.get("memory_enabled", False))
+    user_profile_enabled = bool(
+        memory_config.get("user_profile_enabled", False)
+    )
+    if "posture_enabled" in memory_config:
+        posture_enabled = bool(memory_config.get("posture_enabled"))
+    else:
+        posture_enabled = memory_enabled or user_profile_enabled
+    return memory_enabled, user_profile_enabled, posture_enabled
+
+
 # =============================================================================
 # Config Migration System
 # =============================================================================
