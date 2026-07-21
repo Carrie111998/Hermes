@@ -37,6 +37,8 @@ from .models import (
 )
 from .sidebar import (
     build_registration_prompt,
+    sidebar_create_recovery_key,
+    validate_sidebar_create_reservation,
 )
 from .store import (
     SIDEBAR_FATAL_ERRORS,
@@ -55,6 +57,7 @@ EXPECTED_TOOLS = {
     "session_status",
     "session_claude_visibility_status",
     "session_sidebar_pending",
+    "session_sidebar_reserve",
     "session_sidebar_bind",
     "session_sidebar_commit",
     "session_sidebar_fail",
@@ -404,12 +407,12 @@ def create_app(
         return _claude_visibility_status_payload(raw, visibility)
 
     @mcp.tool()
-    async def session_sidebar_pending(limit: Any = 5) -> dict[str, Any]:
-        """Lease up to five native sidebar registrations for the Codex broker."""
+    async def session_sidebar_pending(limit: Any = 1) -> dict[str, Any]:
+        """Lease exactly one native sidebar registration for the Codex broker."""
 
-        if type(limit) is not int:
+        if type(limit) is not int or limit != 1:
             raise ValueError("sidebar_pending_invalid_request")
-        bounded_limit = max(1, min(limit, 5))
+        bounded_limit = 1
         claim_method = getattr(coordinator, "claim_sidebar_jobs_for_delivery", None)
         if not callable(claim_method):
             raise RuntimeError("sidebar_pending_unavailable")
@@ -419,20 +422,13 @@ def create_app(
             if secret is None:
                 secret = await asyncio.to_thread(resolve_marker_key)
             claims = await claim_method(limit=bounded_limit)
-            if not isinstance(claims, tuple) or len(claims) > bounded_limit:
-                raise ValueError("malformed sidebar claims")
-            malformed_token = False
-            for claim in claims:
-                try:
-                    claimed_tokens.append(
-                        _exact_sidebar_text(
-                            getattr(claim, "lease_token", None), "lease token"
-                        )
-                    )
-                except ValueError:
-                    malformed_token = True
-            if malformed_token or len(set(claimed_tokens)) != len(claimed_tokens):
+            claimed_tokens, malformed_claims = _sidebar_delivery_claim_tokens(
+                claims,
+                limit=bounded_limit,
+            )
+            if malformed_claims:
                 raise ValueError("malformed sidebar lease batch")
+            assert isinstance(claims, tuple)
             jobs: list[dict[str, Any]] = []
             for claim, token_text in zip(claims, claimed_tokens, strict=True):
                 try:
@@ -459,6 +455,55 @@ def create_app(
         except Exception:
             await _rollback_sidebar_claims(store, claimed_tokens)
             raise ValueError("sidebar_pending_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_reserve(lease_token: Any) -> dict[str, Any]:
+        """Persist native-create intent before dispatching one Codex task."""
+
+        token_text = _exact_sidebar_text(lease_token, "lease token")
+        try:
+            secret = marker_key
+            if secret is None:
+                secret = await asyncio.to_thread(resolve_marker_key)
+            job = await asyncio.to_thread(store.lookup_sidebar_job_by_lease, token_text)
+            if not isinstance(job, Mapping) or job.get("state") != "sidebar_leased":
+                raise ValueError("invalid sidebar lease")
+            source_session_id = _exact_sidebar_text(
+                job.get("source_session_id"),
+                "source session ID",
+            )
+            job_id = _exact_sidebar_text(job.get("id"), "job ID")
+            bridge_id = _exact_sidebar_text(job.get("bridge_id"), "bridge ID")
+            if job.get("codex_thread_id") is not None:
+                raise ValueError("sidebar lease already has a native thread")
+            marker = encode_bridge_marker(
+                BridgeMarkerPayload(
+                    bridge_id=bridge_id,
+                    source_session_id=source_session_id,
+                    target_provider=Provider.CODEX,
+                    policy_generation=1,
+                ),
+                secret,
+            )
+            recovery_key = sidebar_create_recovery_key(marker, secret)
+            reservation = await asyncio.to_thread(
+                store.reserve_sidebar_create,
+                lease_token=token_text,
+                recovery_key=recovery_key,
+                now=time.time(),
+            )
+            validate_sidebar_create_reservation(
+                reservation,
+                job_id=job_id,
+                source_session_id=source_session_id,
+                bridge_id=bridge_id,
+                expected_recovery_key=recovery_key,
+            )
+            return {"state": "sidebar_leased", "create_reserved": True}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_reserve_failed") from None
 
     @mcp.tool()
     async def session_sidebar_bind(
@@ -529,6 +574,7 @@ def create_app(
     async def session_sidebar_fail(
         lease_token: Any,
         error_code: Any,
+        codex_thread_id: Any = None,
     ) -> dict[str, Any]:
         """Release or retry one leased sidebar registration with a fixed code."""
 
@@ -538,12 +584,18 @@ def create_app(
             or error_code not in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
         ):
             raise ValueError("sidebar_fail_invalid_request")
+        thread_id = (
+            None
+            if codex_thread_id is None
+            else _exact_sidebar_text(codex_thread_id, "Codex thread ID")
+        )
         try:
             result = await asyncio.to_thread(
                 store.fail_sidebar_job,
                 lease_token=token_text,
                 error_code=error_code,
                 now=time.time(),
+                codex_thread_id=thread_id,
             )
             state = result.get("state") if isinstance(result, Mapping) else None
             if state not in {
@@ -552,7 +604,15 @@ def create_app(
                 "sidebar_failed",
             }:
                 raise ValueError("invalid sidebar failure result")
-            return {"state": state, "error_code": error_code}
+            result_thread_id = (
+                result.get("codex_thread_id") if isinstance(result, Mapping) else None
+            )
+            if thread_id is not None and result_thread_id != thread_id:
+                raise ValueError("invalid sidebar failure thread identity")
+            response = {"state": state, "error_code": error_code}
+            if thread_id is not None:
+                response["codex_thread_id"] = thread_id
+            return response
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -705,8 +765,7 @@ def _claude_visibility_status_payload(
         "blocker_codes": _fixed_count_mapping(lineage_blockers_raw, degraded),
     }
     if (
-        lineage["repairable"] + lineage["blocked"]
-        != lineage["unlinked_visible"]
+        lineage["repairable"] + lineage["blocked"] != lineage["unlinked_visible"]
         or sum(lineage["blocker_codes"].values()) != lineage["blocked"]
     ):
         degraded.add("invalid_status")
@@ -1345,6 +1404,32 @@ def _exact_sidebar_text(value: object, label: str) -> str:
     return value
 
 
+def _sidebar_delivery_claim_tokens(
+    claims: object,
+    *,
+    limit: int,
+) -> tuple[list[str], bool]:
+    """Extract recoverable tokens without consuming arbitrary iterables."""
+
+    if not isinstance(claims, (list, tuple)):
+        return [], True
+    malformed = not isinstance(claims, tuple) or len(claims) > limit
+    tokens: list[str] = []
+    for claim in claims:
+        try:
+            tokens.append(
+                _exact_sidebar_text(
+                    getattr(claim, "lease_token", None),
+                    "lease token",
+                )
+            )
+        except ValueError:
+            malformed = True
+    if len(set(tokens)) != len(tokens):
+        malformed = True
+    return tokens, malformed
+
+
 def _build_sidebar_broker_job(
     store: SessionBridgeStore,
     claim: object,
@@ -1359,7 +1444,12 @@ def _build_sidebar_broker_job(
     bridge_id = _exact_sidebar_text(getattr(claim, "bridge_id", None), "bridge ID")
     reconcile_required = getattr(claim, "reconcile_required", None)
     rename_required = getattr(claim, "rename_required", None)
-    if type(reconcile_required) is not bool or type(rename_required) is not bool:
+    create_reserved = getattr(claim, "create_reserved", None)
+    if (
+        type(reconcile_required) is not bool
+        or type(rename_required) is not bool
+        or type(create_reserved) is not bool
+    ):
         raise ValueError("sidebar claim flags are malformed")
     candidate = store.get_sidebar_candidate_for_delivery(source_session_id)
     if candidate.bridge_id != bridge_id:
@@ -1408,6 +1498,7 @@ def _build_sidebar_broker_job(
         "reconcile_required": reconcile_required,
         "rename_required": rename_required,
         "recovered_thread_id": recovered_thread_id,
+        "create_reserved": create_reserved,
     }
 
 

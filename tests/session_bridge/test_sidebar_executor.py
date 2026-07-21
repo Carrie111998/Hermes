@@ -196,7 +196,14 @@ def test_codex_delivery_starts_exact_cwd_and_returns_exact_thread_id() -> None:
     ]
 
 
-@pytest.mark.parametrize("failure", [TimeoutError("timeout"), RuntimeError("unknown")])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timeout"),
+        RuntimeError("unknown"),
+        NativeCreateRejected("codex_tool_unavailable"),
+    ],
+)
 def test_codex_delivery_maps_post_dispatch_create_failures_to_ambiguity(
     failure: Exception,
 ) -> None:
@@ -1434,6 +1441,7 @@ def test_existing_create_reservation_with_zero_recovery_never_creates() -> None:
     native = FakeNative(events)
 
     result = _executor(store, FakeVerifier(events), native, clock).run_once()
+    replay = _executor(store, FakeVerifier(events), native, clock).run_once()
 
     assert result == SidebarExecutionResult(
         status="failed",
@@ -1441,12 +1449,15 @@ def test_existing_create_reservation_with_zero_recovery_never_creates() -> None:
         error_code="native_create_ambiguous",
     )
     assert native.create_calls == 0
+    assert replay == SidebarExecutionResult(status="idle")
+    assert store.reservations[SOURCE_1]["recovery_key"] == recovery_key
     assert [event[0] for event in events] == [
         "claim",
         "candidate",
         "find",
         "recover",
         "fail",
+        "claim",
     ]
 
 
@@ -1744,6 +1755,49 @@ def test_post_claim_parse_error_settles_once_when_lease_token_is_available() -> 
     assert result.status == "failed"
     assert result.error_code == "source_identity_mismatch"
     assert store.failures == ["source_identity_mismatch"]
+
+
+@pytest.mark.parametrize("container_type", [list, tuple])
+def test_multi_claim_batch_releases_every_recoverable_lease(container_type) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+
+    class OverclaimStore(FakeStore):
+        def claim_sidebar_jobs(
+            self, *, now: float, limit: int, lease_seconds: int
+        ) -> object:
+            self.events.append(("claim", limit, lease_seconds, now))
+            claims = [
+                {
+                    **job,
+                    "state": "sidebar_leased",
+                    "lease_token": f"lease:{job['id']}",
+                    "lease_expires_at": now + lease_seconds,
+                }
+                for job in self.jobs
+            ]
+            self.jobs = []
+            return container_type(claims)
+
+    store = OverclaimStore(
+        events,
+        [_job(SOURCE_1), _job(SOURCE_2)],
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == "unsettled"
+    assert result.error_code == "source_identity_mismatch"
+    assert store.failures == [
+        "broker_time_budget",
+        "broker_time_budget",
+    ]
+    assert [event[0] for event in events] == ["claim", "fail", "fail"]
 
 
 def test_post_claim_parse_error_without_lease_token_is_explicitly_unsettled() -> None:

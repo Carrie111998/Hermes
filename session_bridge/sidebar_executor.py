@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-import hashlib
 import hmac
 import math
 import os
@@ -20,6 +19,8 @@ from .sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
     build_registration_prompt,
+    sidebar_create_recovery_key,
+    validate_sidebar_create_reservation,
 )
 from .store import SIDEBAR_FATAL_ERRORS, SIDEBAR_RETRYABLE_ERRORS, SessionBridgeStore
 
@@ -177,6 +178,10 @@ class CodexAppServerSidebarDelivery:
         del prompt
         expected_recovery_key = _required_recovery_key(recovery_key)
         self._ensure_initialized(deadline)
+        # Expiry is the sole trusted pre-dispatch rejection. Once request()
+        # is entered, even a nonconforming injected client that raises
+        # NativeCreateRejected has crossed the ambiguity boundary.
+        timeout = self._remaining(deadline)
         try:
             result = self._client.request(
                 "thread/start",
@@ -184,10 +189,8 @@ class CodexAppServerSidebarDelivery:
                     "cwd": candidate.cwd,
                     "threadSource": expected_recovery_key,
                 },
-                timeout=self._remaining(deadline),
+                timeout=timeout,
             )
-        except NativeCreateRejected:
-            raise
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
@@ -571,6 +574,19 @@ class SidebarExecutor:
             limit=1,
             lease_seconds=300,
         )
+        recoverable_tokens, malformed_claims = _direct_claim_tokens(claims, limit=1)
+        if malformed_claims:
+            for lease_token in dict.fromkeys(recoverable_tokens):
+                self._settle(
+                    job_id=None,
+                    lease_token=lease_token,
+                    error_code="broker_time_budget",
+                )
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="source_identity_mismatch",
+            )
+        assert isinstance(claims, list)
         if not claims:
             gate = self._store_gate(now=claim_time)
             if gate is not None:
@@ -585,11 +601,7 @@ class SidebarExecutor:
                     error_code="bridge_temporarily_unavailable",
                 )
             return SidebarExecutionResult(status="idle")
-        if len(claims) != 1 or not isinstance(claims[0], Mapping):
-            return SidebarExecutionResult(
-                status="unsettled",
-                error_code="source_identity_mismatch",
-            )
+        assert len(claims) == 1 and isinstance(claims[0], Mapping)
 
         claim = claims[0]
         job_id = _optional_text(claim.get("id"))
@@ -677,7 +689,10 @@ class SidebarExecutor:
         )
         marker = encode_bridge_marker(expected, self._marker_secret)
         prompt = build_registration_prompt(candidate, marker)
-        expected_recovery_key = _sidebar_recovery_key(marker, self._marker_secret)
+        expected_recovery_key = sidebar_create_recovery_key(
+            marker,
+            self._marker_secret,
+        )
         recovered: VerifiedSidebarThread | None = None
         if thread_id is None:
             if not self._has_budget(operation_deadline, lease_expires_at):
@@ -743,7 +758,7 @@ class SidebarExecutor:
                     )
                 if reservation is not None:
                     try:
-                        recovery_key = _validated_create_reservation(
+                        recovery_key = validate_sidebar_create_reservation(
                             reservation,
                             job_id=job_id,
                             source_session_id=source_session_id,
@@ -780,7 +795,7 @@ class SidebarExecutor:
                             recovery_key=expected_recovery_key,
                             now=_finite_time(self._clock()),
                         )
-                        recovery_key = _validated_create_reservation(
+                        recovery_key = validate_sidebar_create_reservation(
                             reservation,
                             job_id=job_id,
                             source_session_id=source_session_id,
@@ -1202,48 +1217,25 @@ def _matches_expected(
     )
 
 
-def _sidebar_recovery_key(marker: str, marker_secret: bytes) -> str:
-    digest = hmac.new(
-        marker_secret,
-        b"sidebar-create-v1\0" + marker.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"hermes-session-bridge-create-v1:{digest}"
+def _direct_claim_tokens(claims: object, *, limit: int) -> tuple[list[str], bool]:
+    """Extract every concrete lease token before rejecting a malformed batch."""
 
-
-def _validated_create_reservation(
-    reservation: object,
-    *,
-    job_id: str,
-    source_session_id: str,
-    bridge_id: str,
-    expected_recovery_key: str,
-) -> str:
-    if not isinstance(reservation, Mapping) or set(reservation) != {
-        "version",
-        "job_id",
-        "source_session_id",
-        "bridge_id",
-        "recovery_key",
-        "reserved_at",
-    }:
-        raise ValueError("sidebar create reservation is malformed")
-    reservation_map = cast(Mapping[str, object], reservation)
-    if reservation_map.get("version") != 1 or isinstance(
-        reservation_map.get("version"), bool
-    ):
-        raise ValueError("sidebar create reservation is malformed")
-    if (
-        reservation_map.get("job_id") != job_id
-        or reservation_map.get("source_session_id") != source_session_id
-        or reservation_map.get("bridge_id") != bridge_id
-    ):
-        raise ValueError("sidebar create reservation identity mismatch")
-    recovery_key = _required_recovery_key(reservation_map.get("recovery_key"))
-    _finite_time(reservation_map.get("reserved_at"))
-    if not hmac.compare_digest(recovery_key, expected_recovery_key):
-        raise ValueError("sidebar create reservation key mismatch")
-    return recovery_key
+    if not isinstance(claims, (list, tuple)):
+        return [], True
+    malformed = not isinstance(claims, list) or len(claims) > limit
+    tokens: list[str] = []
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            malformed = True
+            continue
+        claim_map = cast(Mapping[str, object], claim)
+        try:
+            tokens.append(_required_text(claim_map.get("lease_token"), "lease token"))
+        except ValueError:
+            malformed = True
+    if len(set(tokens)) != len(tokens):
+        malformed = True
+    return tokens, malformed
 
 
 def _registration_marker(prompt: object) -> str:

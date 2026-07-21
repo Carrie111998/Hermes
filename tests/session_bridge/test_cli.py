@@ -193,14 +193,12 @@ class FakeBackend:
         codex_thread_id: str,
         expected_error_code: str,
     ) -> dict[str, Any]:
-        self.calls.append(
-            (
-                "sidebar_acknowledge_unrecoverable",
-                job_id,
-                codex_thread_id,
-                expected_error_code,
-            )
-        )
+        self.calls.append((
+            "sidebar_acknowledge_unrecoverable",
+            job_id,
+            codex_thread_id,
+            expected_error_code,
+        ))
         return dict(self.sidebar_terminal_payload)
 
     def claude_visibility_status(self) -> dict[str, Any]:
@@ -220,9 +218,7 @@ class FakeBackend:
     def reconcile_claude_visibility_lineage(
         self, *, limit: int, apply: bool, cursor: Mapping[str, Any] | None = None
     ):
-        self.calls.append(
-            ("reconcile_claude_visibility_lineage", limit, apply, cursor)
-        )
+        self.calls.append(("reconcile_claude_visibility_lineage", limit, apply, cursor))
         return {
             "mode": "apply" if apply else "dry_run",
             "scanned": 1,
@@ -1005,9 +1001,12 @@ def test_claude_visibility_lineage_reconcile_passes_cursor_and_never_succeeds_pa
             apply: bool,
             cursor: Mapping[str, Any] | None = None,
         ):
-            self.calls.append(
-                ("reconcile_claude_visibility_lineage", limit, apply, cursor)
-            )
+            self.calls.append((
+                "reconcile_claude_visibility_lineage",
+                limit,
+                apply,
+                cursor,
+            ))
             return {
                 "mode": "apply",
                 "scanned": 1,
@@ -1885,9 +1884,7 @@ def test_claude_visibility_preflight_blocks_before_any_runtime_side_effect(
         ),
     )
 
-    with pytest.raises(
-        ProviderDegraded, match="claude_visibility_preflight_failed"
-    ):
+    with pytest.raises(ProviderDegraded, match="claude_visibility_preflight_failed"):
         backend.claude_visibility_run_once()
 
     assert events == ["resolve_executable", ("preflight", ("claude",))]
@@ -2002,9 +1999,7 @@ def test_characterization_preflight_blocks_before_store_or_registrar(
         ),
     )
 
-    with pytest.raises(
-        ProviderDegraded, match="claude_visibility_preflight_failed"
-    ):
+    with pytest.raises(ProviderDegraded, match="claude_visibility_preflight_failed"):
         backend.characterize_claude_visibility()
 
     assert events == [("preflight", ("claude",))]
@@ -2344,6 +2339,32 @@ def test_production_serve_blocks_automatic_mode_without_passing_gate(
     assert raised.value.gate == "characterization_failed"
 
 
+def test_production_serve_applies_sidebar_create_cutover_before_public_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: events.append("cutover"),
+        raising=False,
+    )
+
+    def fail_provider_runtime(**_kwargs: Any) -> None:
+        assert events == ["cutover"]
+        events.append("provider_runtime")
+        raise RuntimeError("stop before serving")
+
+    monkeypatch.setattr(backend, "_provider_runtime", fail_provider_runtime)
+
+    with pytest.raises(ProviderDegraded, match="service_start_failed"):
+        backend.serve()
+
+    assert events == ["cutover", "provider_runtime"]
+
+
 def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
     calls: list[str] = []
     waits: list[float] = []
@@ -2638,7 +2659,17 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
     backend._store = store
     backend._catalog = UnifiedCatalog(db, store)
     executor_calls: list[str] = []
+    construction_order: list[str] = []
     captured: dict[str, Any] = {}
+    real_cutover = store.apply_sidebar_create_reservation_cutover
+
+    def record_cutover(**kwargs: Any) -> dict[str, Any]:
+        construction_order.append("cutover")
+        return real_cutover(**kwargs)
+
+    monkeypatch.setattr(
+        store, "apply_sidebar_create_reservation_cutover", record_cutover
+    )
 
     class ProtocolCodexClient:
         def __init__(self) -> None:
@@ -2655,6 +2686,7 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
             return SidebarExecutionResult(status="idle")
 
     def executor_factory(**kwargs: Any) -> OneCycleExecutor:
+        construction_order.append("executor")
         captured.update(kwargs)
         return OneCycleExecutor()
 
@@ -2681,6 +2713,7 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
         "error_code": None,
     }
     assert executor_calls == ["run_once"]
+    assert construction_order == ["cutover", "executor"]
     assert captured["store"] is store
     assert isinstance(captured["verifier"], SidebarThreadVerifier)
     assert isinstance(captured["native"], CodexAppServerSidebarDelivery)

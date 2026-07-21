@@ -33,6 +33,7 @@ from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_RETRY_CODES,
 )
 from .models import (
+    BridgeMarkerPayload,
     ContextPack,
     MirrorJobState,
     OriginKind,
@@ -44,6 +45,7 @@ from .models import (
     SidebarJobState,
     UpsertResult,
     canonical_session_id,
+    encode_bridge_marker,
 )
 
 if TYPE_CHECKING:
@@ -66,6 +68,9 @@ _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
 _SIDEBAR_CREATE_RESERVATION_PREFIX = "session-bridge:sidebar-create:"
+_SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY = (
+    "session-bridge:sidebar:create-reservation-cutover:v1"
+)
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
@@ -89,19 +94,11 @@ _CLAUDE_LINEAGE_CURSOR_FIELDS = frozenset({
 })
 _CLAUDE_LINEAGE_TARGET_MISSING = "claude_lineage_target_missing"
 _CLAUDE_LINEAGE_TARGET_DUPLICATE = "claude_lineage_target_duplicate"
-_CLAUDE_LINEAGE_TARGET_IDENTITY_MISMATCH = (
-    "claude_lineage_target_identity_mismatch"
-)
-_CLAUDE_LINEAGE_TARGET_PROVENANCE_MISMATCH = (
-    "claude_lineage_target_provenance_mismatch"
-)
+_CLAUDE_LINEAGE_TARGET_IDENTITY_MISMATCH = "claude_lineage_target_identity_mismatch"
+_CLAUDE_LINEAGE_TARGET_PROVENANCE_MISMATCH = "claude_lineage_target_provenance_mismatch"
 _CLAUDE_LINEAGE_MISSING_SOURCE = "claude_lineage_missing_source"
-_CLAUDE_LINEAGE_SOURCE_IDENTITY_MISMATCH = (
-    "claude_lineage_source_identity_mismatch"
-)
-_CLAUDE_LINEAGE_SOURCE_PROVENANCE_MISMATCH = (
-    "claude_lineage_source_provenance_mismatch"
-)
+_CLAUDE_LINEAGE_SOURCE_IDENTITY_MISMATCH = "claude_lineage_source_identity_mismatch"
+_CLAUDE_LINEAGE_SOURCE_PROVENANCE_MISMATCH = "claude_lineage_source_provenance_mismatch"
 _CLAUDE_LINEAGE_INVALID_COMPLETION = "claude_lineage_invalid_completion"
 _CLAUDE_LINEAGE_CONFLICT = "claude_lineage_conflict"
 _PROFILE_SHADOW_SOURCE = "session_bridge_profile"
@@ -208,9 +205,7 @@ SIDEBAR_FATAL_ERRORS = frozenset({
 })
 SIDEBAR_EXCLUSION_REASONS = frozenset({"source_cwd_missing"})
 SIDEBAR_TERMINAL_RESOLUTION_CODE = "native_thread_unrecoverable"
-SIDEBAR_TERMINAL_EVIDENCE_KIND = (
-    "codex_app_server_read_not_loaded_resume_no_rollout"
-)
+SIDEBAR_TERMINAL_EVIDENCE_KIND = "codex_app_server_read_not_loaded_resume_no_rollout"
 SIDEBAR_TERMINAL_EVIDENCE_VERSION = 1
 _SIDEBAR_TERMINAL_LEDGER_COLUMNS = (
     "job_id",
@@ -4358,11 +4353,7 @@ class SessionBridgeStore:
                     )
                     reservation_row = conn.execute(
                         "SELECT value_json FROM session_bridge_state WHERE key = ?",
-                        (
-                            _sidebar_create_reservation_state_key(
-                                source_session_id
-                            ),
-                        ),
+                        (_sidebar_create_reservation_state_key(source_session_id),),
                     ).fetchone()
                     if reservation_row is None:
                         continue
@@ -4615,6 +4606,167 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def apply_sidebar_create_reservation_cutover(
+        self,
+        *,
+        marker_secret: bytes,
+        now: float,
+    ) -> dict[str, Any]:
+        """One-time quarantine for jobs that predate durable create intent."""
+
+        if type(marker_secret) is not bytes or not marker_secret:
+            raise ValueError("sidebar cutover marker secret is malformed")
+        applied_at = _finite_number(now, "sidebar create reservation cutover time")
+
+        def _write(conn):
+            active_lease = conn.execute(
+                """SELECT 1 FROM session_sidebar_jobs
+                   WHERE state = ? AND lease_expires_at > ? LIMIT 1""",
+                (SidebarJobState.LEASED.value, applied_at),
+            ).fetchone()
+            if active_lease is not None:
+                raise ValueError("active sidebar lease blocks create cutover")
+
+            conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+                       lease_expires_at = NULL, error_code = NULL, updated_at = ?
+                   WHERE state = ? AND lease_expires_at <= ?""",
+                (
+                    SidebarJobState.RETRY.value,
+                    applied_at,
+                    applied_at,
+                    SidebarJobState.LEASED.value,
+                    applied_at,
+                ),
+            )
+
+            ledger_row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY,),
+            ).fetchone()
+            if ledger_row is not None:
+                ledger = _decode_sidebar_create_reservation_cutover(
+                    ledger_row["value_json"]
+                )
+                _validate_sidebar_create_reservation_cutover_replay(
+                    conn,
+                    ledger,
+                    marker_secret=marker_secret,
+                )
+                return ledger, True
+
+            rows = conn.execute(
+                """SELECT * FROM session_sidebar_jobs
+                   WHERE state IN (?, ?)
+                   ORDER BY id""",
+                (
+                    SidebarJobState.PENDING.value,
+                    SidebarJobState.RETRY.value,
+                ),
+            ).fetchall()
+            quarantined_job_ids: list[str] = []
+            for raw_row in rows:
+                job = dict(raw_row)
+                _validated_sidebar_cutover_candidate(conn, job)
+                if (
+                    job["lease_digest"] is not None
+                    or job["lease_expires_at"] is not None
+                    or job["completion_digest"] is not None
+                    or job["visible_at"] is not None
+                ):
+                    raise ValueError("sidebar cutover job state is malformed")
+
+                expected_recovery_key = _sidebar_cutover_recovery_key(
+                    job,
+                    marker_secret=marker_secret,
+                )
+                state_key = _sidebar_create_reservation_state_key(
+                    job["source_session_id"]
+                )
+                reservation_row = conn.execute(
+                    "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                    (state_key,),
+                ).fetchone()
+                if reservation_row is not None:
+                    _validate_sidebar_cutover_reservation(
+                        reservation_row["value_json"],
+                        job=job,
+                        expected_recovery_key=expected_recovery_key,
+                    )
+                    continue
+                if job["codex_thread_id"] is not None:
+                    _exact_nonempty_text(
+                        job["codex_thread_id"],
+                        "Codex thread ID",
+                    )
+                    continue
+
+                pristine = (
+                    job["state"] == SidebarJobState.PENDING.value
+                    and int(job["attempts"]) == 0
+                    and job["error_code"] is None
+                    and float(job["next_attempt_at"]) == float(job["eligible_at"])
+                    and float(job["updated_at"]) == float(job["created_at"])
+                )
+                if pristine:
+                    continue
+
+                reservation = {
+                    "version": 1,
+                    "job_id": job["id"],
+                    "source_session_id": job["source_session_id"],
+                    "bridge_id": job["bridge_id"],
+                    "recovery_key": expected_recovery_key,
+                    "reserved_at": applied_at,
+                }
+                conn.execute(
+                    """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                       VALUES (?, ?, ?)""",
+                    (
+                        state_key,
+                        json.dumps(
+                            reservation,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                        applied_at,
+                    ),
+                )
+                quarantined_job_ids.append(job["id"])
+
+            ledger = {
+                "version": 1,
+                "applied_at": applied_at,
+                "quarantined_job_ids": sorted(quarantined_job_ids),
+            }
+            conn.execute(
+                """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                   VALUES (?, ?, ?)""",
+                (
+                    _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY,
+                    json.dumps(
+                        ledger,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ),
+                    applied_at,
+                ),
+            )
+            return ledger, False
+
+        ledger, replayed = self.db._execute_write(_write)
+        return {
+            "version": 1,
+            "applied_at": ledger["applied_at"],
+            "quarantined": len(ledger["quarantined_job_ids"]),
+            "replayed": replayed,
+        }
+
     def reserve_sidebar_create(
         self,
         *,
@@ -4791,43 +4943,16 @@ class SessionBridgeStore:
             )
             if job is None:
                 raise ValueError("invalid sidebar lease token")
+            job = _persist_sidebar_thread_identity(
+                conn,
+                job,
+                thread_id=thread_id,
+                now=bind_time,
+            )
             if float(job["lease_expires_at"]) <= bind_time:
                 _recover_one_expired_sidebar_lease(conn, job, now=bind_time)
                 return dict(job), True
-            existing = job["codex_thread_id"]
-            if existing is not None:
-                if existing == thread_id:
-                    return dict(job), False
-                raise ValueError("conflicting Codex thread identity")
-            conflict = conn.execute(
-                """SELECT id FROM session_sidebar_jobs
-                   WHERE codex_thread_id = ? AND id != ?""",
-                (thread_id, job["id"]),
-            ).fetchone()
-            if conflict is not None:
-                raise ValueError("conflicting Codex thread identity")
-            cursor = conn.execute(
-                """UPDATE session_sidebar_jobs
-                   SET codex_thread_id = ?, updated_at = ?
-                   WHERE id = ? AND state = ? AND codex_thread_id IS NULL""",
-                (
-                    thread_id,
-                    bind_time,
-                    job["id"],
-                    SidebarJobState.LEASED.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("stale sidebar thread binding")
-            return (
-                dict(
-                    conn.execute(
-                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
-                        (job["id"],),
-                    ).fetchone()
-                ),
-                False,
-            )
+            return dict(job), False
 
         result, expired = self.db._execute_write(_write)
         if expired:
@@ -5020,6 +5145,7 @@ class SessionBridgeStore:
             elif state != SidebarJobState.LEASED.value:
                 raise ValueError("sidebar job is not leased")
             return {
+                "id": job["id"],
                 "source_session_id": job["source_session_id"],
                 "bridge_id": job["bridge_id"],
                 "state": state,
@@ -5055,39 +5181,16 @@ class SessionBridgeStore:
             )
             if job is None:
                 raise ValueError("invalid sidebar lease token")
+            if thread_id is not None:
+                job = _persist_sidebar_thread_identity(
+                    conn,
+                    job,
+                    thread_id=thread_id,
+                    now=failure_time,
+                )
             if float(job["lease_expires_at"]) <= failure_time:
                 _recover_one_expired_sidebar_lease(conn, job, now=failure_time)
                 return dict(job), True
-            if thread_id is not None:
-                existing_thread_id = job["codex_thread_id"]
-                if existing_thread_id is not None and existing_thread_id != thread_id:
-                    raise ValueError("conflicting Codex thread identity")
-                conflict = conn.execute(
-                    """SELECT id FROM session_sidebar_jobs
-                       WHERE codex_thread_id = ? AND id != ?""",
-                    (thread_id, job["id"]),
-                ).fetchone()
-                if conflict is not None:
-                    raise ValueError("conflicting Codex thread identity")
-                if existing_thread_id is None:
-                    cursor = conn.execute(
-                        """UPDATE session_sidebar_jobs
-                           SET codex_thread_id = ?, updated_at = ?
-                           WHERE id = ? AND state = ? AND codex_thread_id IS NULL""",
-                        (
-                            thread_id,
-                            failure_time,
-                            job["id"],
-                            SidebarJobState.LEASED.value,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise ValueError("stale sidebar thread binding")
-                    job = conn.execute(
-                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
-                        (job["id"],),
-                    ).fetchone()
-                    assert job is not None
             if error_code == "broker_time_budget":
                 cursor = conn.execute(
                     """UPDATE session_sidebar_jobs
@@ -5231,9 +5334,7 @@ class SessionBridgeStore:
         """Append exact evidence for one unrecoverable bound native thread."""
 
         expected_job_id = _exact_nonempty_text(job_id, "sidebar job ID")
-        expected_thread_id = _exact_nonempty_text(
-            codex_thread_id, "Codex thread ID"
-        )
+        expected_thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
         expected_error = _exact_nonempty_text(
             expected_error_code, "expected sidebar failure"
         )
@@ -5244,9 +5345,7 @@ class SessionBridgeStore:
         next_attempt_at = _finite_number(
             expected_next_attempt_at, "expected sidebar next attempt"
         )
-        updated_at = _finite_number(
-            expected_updated_at, "expected sidebar update time"
-        )
+        updated_at = _finite_number(expected_updated_at, "expected sidebar update time")
         evidence = _sha256_text(
             evidence_digest, "sidebar terminal resolution evidence digest"
         )
@@ -5346,13 +5445,9 @@ class SessionBridgeStore:
                 reservation=reservation,
             )
             if not hmac.compare_digest(evidence, canonical_evidence):
-                raise ValueError(
-                    "sidebar terminal resolution evidence does not match"
-                )
+                raise ValueError("sidebar terminal resolution evidence does not match")
             if resolved_at < updated_at:
-                raise ValueError(
-                    "sidebar terminal resolution time precedes failure"
-                )
+                raise ValueError("sidebar terminal resolution time precedes failure")
 
             expected_fields = {
                 "job_id": expected_job_id,
@@ -5376,8 +5471,7 @@ class SessionBridgeStore:
             ).fetchone()
             if resolution is not None:
                 if any(
-                    resolution[key] != value
-                    for key, value in expected_fields.items()
+                    resolution[key] != value for key, value in expected_fields.items()
                 ):
                     raise ValueError("conflicting sidebar terminal resolution")
                 return {
@@ -5459,10 +5553,7 @@ class SessionBridgeStore:
             if resolution is None:
                 raise ValueError("expected sidebar terminal resolution does not match")
             if (
-                any(
-                    resolution[key] != value
-                    for key, value in expected_fields.items()
-                )
+                any(resolution[key] != value for key, value in expected_fields.items())
                 or resolution["resolved_at"] != resolved_at
             ):
                 raise ValueError("conflicting sidebar terminal resolution")
@@ -7154,8 +7245,7 @@ def _inspect_claude_visibility_lineage(
         link["id"] != expected_link_id
         or link["from_session_id"] != source_session_id
         or link["to_session_id"] != target_session_id
-        or link["relation"]
-        not in {Relation.MIRRORS.value, Relation.CONTINUES.value}
+        or link["relation"] not in {Relation.MIRRORS.value, Relation.CONTINUES.value}
     ):
         return {
             "state": "blocked",
@@ -7270,13 +7360,11 @@ def _unlinked_claude_visibility_jobs(
             """(job.visible_at < ? OR
                  (job.visible_at = ? AND job.id <= ?))"""
         )
-        params.extend(
-            (high_water_key[0], high_water_key[0], high_water_key[1])
-        )
+        params.extend((high_water_key[0], high_water_key[0], high_water_key[1]))
     rows = conn.execute(
         f"""SELECT job.*
            FROM session_claude_visibility_jobs AS job
-           WHERE {' AND '.join(clauses)}
+           WHERE {" AND ".join(clauses)}
            ORDER BY job.visible_at, job.id""",
         params,
     )
@@ -7544,6 +7632,49 @@ def _recover_one_expired_sidebar_lease(
         raise ValueError("stale expired sidebar lease")
 
 
+def _persist_sidebar_thread_identity(
+    conn: Any,
+    job: Mapping[str, Any],
+    *,
+    thread_id: str,
+    now: float,
+) -> Mapping[str, Any]:
+    """Bind an exact native ID before any lease-expiry transition."""
+
+    existing = job["codex_thread_id"]
+    if existing is not None:
+        if existing == thread_id:
+            return job
+        raise ValueError("conflicting Codex thread identity")
+    conflict = conn.execute(
+        """SELECT id FROM session_sidebar_jobs
+           WHERE codex_thread_id = ? AND id != ?""",
+        (thread_id, job["id"]),
+    ).fetchone()
+    if conflict is not None:
+        raise ValueError("conflicting Codex thread identity")
+    cursor = conn.execute(
+        """UPDATE session_sidebar_jobs
+           SET codex_thread_id = ?, updated_at = ?
+           WHERE id = ? AND state = ? AND codex_thread_id IS NULL""",
+        (
+            thread_id,
+            now,
+            job["id"],
+            SidebarJobState.LEASED.value,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("stale sidebar thread binding")
+    persisted = conn.execute(
+        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+        (job["id"],),
+    ).fetchone()
+    if persisted is None:
+        raise ValueError("stale sidebar thread binding")
+    return persisted
+
+
 def _validated_sidebar_job_provider(job: Mapping[str, Any]) -> Provider:
     from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
 
@@ -7578,6 +7709,167 @@ def _sidebar_create_reservation_state_key(source_session_id: str) -> str:
     sidebar_idempotency_key(source_session_id)
     digest = hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()
     return f"{_SIDEBAR_CREATE_RESERVATION_PREFIX}{digest}"
+
+
+def _validated_sidebar_cutover_candidate(
+    conn: Any,
+    job: Mapping[str, Any],
+) -> SidebarCandidate:
+    """Validate canonical job and persisted candidate identity for cutover."""
+
+    _validated_sidebar_job_provider(job)
+    job_id = _exact_nonempty_text(job.get("id"), "sidebar job ID")
+    idempotency_key = _exact_nonempty_text(
+        job.get("idempotency_key"),
+        "sidebar idempotency key",
+    )
+    expected_job_id = (
+        "sidebar-job:" + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    )
+    if job_id != expected_job_id:
+        raise ValueError("invalid sidebar cutover job identity")
+    source_session_id = _exact_nonempty_text(
+        job.get("source_session_id"),
+        "sidebar source session ID",
+    )
+    state_row = conn.execute(
+        "SELECT value_json FROM session_bridge_state WHERE key = ?",
+        (_sidebar_delivery_state_key(source_session_id),),
+    ).fetchone()
+    if state_row is None:
+        raise ValueError("missing sidebar cutover delivery candidate")
+    candidate = _decode_sidebar_delivery_candidate(state_row["value_json"])
+    if (
+        candidate.source_session_id != source_session_id
+        or candidate.bridge_id != job["bridge_id"]
+        or candidate.eligible_at != float(job["eligible_at"])
+    ):
+        raise ValueError("invalid sidebar cutover delivery candidate")
+    expected_provider = (
+        Provider.CLAUDE if source_session_id.startswith("claude:") else Provider.HERMES
+    )
+    if candidate.provider is not expected_provider:
+        raise ValueError("invalid sidebar cutover delivery candidate")
+    return candidate
+
+
+def _sidebar_cutover_recovery_key(
+    job: Mapping[str, Any],
+    *,
+    marker_secret: bytes,
+) -> str:
+    from .sidebar import sidebar_create_recovery_key
+
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=_exact_nonempty_text(job.get("bridge_id"), "sidebar bridge ID"),
+            source_session_id=_exact_nonempty_text(
+                job.get("source_session_id"),
+                "sidebar source session ID",
+            ),
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_secret,
+    )
+    return sidebar_create_recovery_key(marker, marker_secret)
+
+
+def _validate_sidebar_cutover_reservation(
+    value_json: object,
+    *,
+    job: Mapping[str, Any],
+    expected_recovery_key: str,
+    expected_reserved_at: float | None = None,
+) -> dict[str, Any]:
+    reservation = _decode_sidebar_create_reservation(
+        value_json,
+        expected_source_session_id=job["source_session_id"],
+    )
+    if (
+        reservation["job_id"] != job["id"]
+        or reservation["bridge_id"] != job["bridge_id"]
+        or not hmac.compare_digest(
+            reservation["recovery_key"],
+            expected_recovery_key,
+        )
+        or (
+            expected_reserved_at is not None
+            and float(reservation["reserved_at"]) != expected_reserved_at
+        )
+    ):
+        raise ValueError("sidebar cutover reservation conflict")
+    return reservation
+
+
+def _decode_sidebar_create_reservation_cutover(value_json: object) -> dict[str, Any]:
+    if not isinstance(value_json, (str, bytes, bytearray)):
+        raise ValueError("invalid sidebar create reservation cutover ledger")
+    try:
+        payload = json.loads(value_json)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("invalid sidebar create reservation cutover ledger") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "applied_at",
+        "quarantined_job_ids",
+    }:
+        raise ValueError("invalid sidebar create reservation cutover ledger")
+    if type(payload.get("version")) is not int or payload["version"] != 1:
+        raise ValueError("invalid sidebar create reservation cutover ledger")
+    applied_at = _finite_number(
+        payload.get("applied_at"),
+        "sidebar create reservation cutover time",
+    )
+    raw_job_ids = payload.get("quarantined_job_ids")
+    if not isinstance(raw_job_ids, list):
+        raise ValueError("invalid sidebar create reservation cutover ledger")
+    job_ids: list[str] = []
+    for value in raw_job_ids:
+        job_id = _exact_nonempty_text(value, "sidebar cutover job ID")
+        if re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None:
+            raise ValueError("invalid sidebar create reservation cutover ledger")
+        job_ids.append(job_id)
+    if job_ids != sorted(set(job_ids)):
+        raise ValueError("invalid sidebar create reservation cutover ledger")
+    return {
+        "version": 1,
+        "applied_at": applied_at,
+        "quarantined_job_ids": job_ids,
+    }
+
+
+def _validate_sidebar_create_reservation_cutover_replay(
+    conn: Any,
+    ledger: Mapping[str, Any],
+    *,
+    marker_secret: bytes,
+) -> None:
+    applied_at = float(ledger["applied_at"])
+    for job_id in ledger["quarantined_job_ids"]:
+        row = conn.execute(
+            "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("sidebar cutover reservation job is missing")
+        job = dict(row)
+        _validated_sidebar_cutover_candidate(conn, job)
+        reservation_row = conn.execute(
+            "SELECT value_json FROM session_bridge_state WHERE key = ?",
+            (_sidebar_create_reservation_state_key(job["source_session_id"]),),
+        ).fetchone()
+        if reservation_row is None:
+            raise ValueError("sidebar cutover reservation is missing")
+        _validate_sidebar_cutover_reservation(
+            reservation_row["value_json"],
+            job=job,
+            expected_recovery_key=_sidebar_cutover_recovery_key(
+                job,
+                marker_secret=marker_secret,
+            ),
+            expected_reserved_at=applied_at,
+        )
 
 
 def _sidebar_create_recovery_key(value: object) -> str:
@@ -8224,9 +8516,7 @@ def _native_source_identity_issue(
         return "identity"
     try:
         if provider in {Provider.CLAUDE, Provider.CODEX}:
-            canonical_provider = _provider_from_canonical_session_id(
-                source_session_id
-            )
+            canonical_provider = _provider_from_canonical_session_id(source_session_id)
             if canonical_provider is not provider:
                 return "identity"
             expected_native_id = source_session_id.split(":", 1)[1]

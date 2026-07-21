@@ -73,7 +73,9 @@ class _SidebarSkillContract:
     projects_tool: str
     list_threads_tool: str
     read_thread_tool: str
+    reserve_tool: str
     create_tool: str
+    bind_tool: str
     rename_tool: str
     commit_tool: str
     fail_tool: str
@@ -114,7 +116,9 @@ class _SidebarSkillContract:
                 steps[5],
             )
             read_thread = re.search(r"call `(read_thread)\(", steps[5])
+            reserve = re.search(r"call `(session_sidebar_reserve)\(", steps[6])
             create = re.search(r"with `(create_thread)\(", steps[6])
+            bind = re.search(r"call `(session_sidebar_bind)\(", steps[6])
             rename = re.search(r"Use `(set_thread_title)\(", steps[7])
             commit = re.search(r"Call `(session_sidebar_commit)\(", steps[8])
             fail = re.search(r"call `(session_sidebar_fail)\(", steps[9])
@@ -124,7 +128,9 @@ class _SidebarSkillContract:
                 projects,
                 list_threads,
                 read_thread,
+                reserve,
                 create,
+                bind,
                 rename,
                 commit,
                 fail,
@@ -132,7 +138,15 @@ class _SidebarSkillContract:
             if any(match is None for match in matches):
                 raise ValueError("required call schemas")
             assert status and pending and projects and list_threads
-            assert read_thread and create and rename and commit and fail
+            assert (
+                read_thread
+                and reserve
+                and create
+                and bind
+                and rename
+                and commit
+                and fail
+            )
 
             precedence: list[str] = []
             for item in re.findall(r"(?m)^   \d+\. (.+)$", steps[3]):
@@ -190,7 +204,9 @@ class _SidebarSkillContract:
                 projects_tool=projects.group(1),
                 list_threads_tool=list_threads.group(1),
                 read_thread_tool=read_thread.group(1),
+                reserve_tool=reserve.group(1),
                 create_tool=create.group(1),
+                bind_tool=bind.group(1),
                 rename_tool=rename.group(1),
                 commit_tool=commit.group(1),
                 fail_tool=fail.group(1),
@@ -250,14 +266,23 @@ class _SidebarSkillContract:
             ranks = {
                 "project_choice": 0,
                 self.list_threads_tool: 1,
-                self.read_thread_tool: 2,
-                self.create_tool: 3,
-                self.rename_tool: 4,
-                self.commit_tool: 5,
-                self.fail_tool: 6,
+                self.reserve_tool: 3,
+                self.create_tool: 4,
+                self.bind_tool: 5,
+                self.rename_tool: 7,
+                self.commit_tool: 8,
+                self.fail_tool: 9,
             }
             try:
-                ordered = [ranks[tool] for tool in tools]
+                ordered: list[int] = []
+                bound = False
+                for tool in tools:
+                    if tool == self.read_thread_tool:
+                        ordered.append(6 if bound else 2)
+                    else:
+                        ordered.append(ranks[tool])
+                    if tool == self.bind_tool:
+                        bound = True
             except KeyError as exc:
                 raise AssertionError("worker trace contains an unknown call") from exc
             if ordered != sorted(ordered):
@@ -266,9 +291,18 @@ class _SidebarSkillContract:
                 create = events[tools.index(self.create_tool)]
                 if create["arguments"]["prompt"] != create["registration_prompt"]:
                     raise AssertionError("registration prompt must be verbatim")
+                if self.reserve_tool not in tools or tools.index(
+                    self.reserve_tool
+                ) > tools.index(self.create_tool):
+                    raise AssertionError("create must follow durable reservation")
             if self.list_threads_tool in tools and self.create_tool in tools:
                 if tools.index(self.list_threads_tool) > tools.index(self.create_tool):
                     raise AssertionError("reconciliation must precede creation")
+            if self.rename_tool in tools:
+                if self.bind_tool not in tools or tools.index(
+                    self.bind_tool
+                ) > tools.index(self.rename_tool):
+                    raise AssertionError("bind must precede rename")
             if self.commit_tool in tools:
                 if self.rename_tool not in tools or tools.index(
                     self.rename_tool
@@ -280,6 +314,30 @@ class _SidebarSkillContract:
             for event in fail_events:
                 if event["arguments"]["error_code"] not in self.failure_codes.values():
                     raise AssertionError("failure code must come from shipped mapping")
+                fail_index = events.index(event)
+                known_thread_id: str | None = None
+                marker_search_seen = False
+                for prior in events[:fail_index]:
+                    if prior["tool"] == self.list_threads_tool:
+                        marker_search_seen = True
+                    elif prior["tool"] == self.bind_tool:
+                        candidate = prior["arguments"].get("codex_thread_id")
+                        if isinstance(candidate, str):
+                            known_thread_id = candidate
+                    elif (
+                        prior["tool"] == self.read_thread_tool
+                        and not marker_search_seen
+                    ):
+                        candidate = prior["arguments"].get("threadId")
+                        if isinstance(candidate, str):
+                            known_thread_id = candidate
+                if (
+                    known_thread_id is not None
+                    and event["arguments"].get("codex_thread_id") != known_thread_id
+                ):
+                    raise AssertionError(
+                        "failure must retain the exact known native ID"
+                    )
 
 
 class _SyntheticCodexClient:
@@ -1281,6 +1339,17 @@ class _SidebarMcpCoordinator:
             ensure_lineage=ensure_lineage,
         )
 
+    async def bind_sidebar_thread(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+    ):
+        return await self.delegate.bind_sidebar_thread(
+            lease_token=lease_token,
+            codex_thread_id=codex_thread_id,
+        )
+
     def health(self) -> dict[str, Any]:
         return self.delegate.health()
 
@@ -1417,6 +1486,42 @@ class _CommitDroppingClient:
         raise httpx.ReadError("synthetic commit response drop")
 
 
+class _BindDroppingClient:
+    """Drop one public bind request before or after MCP server processing."""
+
+    def __init__(self, delegate: TestClient, *, timing: str) -> None:
+        if timing not in {"before_processing", "after_processing"}:
+            raise ValueError("bind drop timing is invalid")
+        self.delegate = delegate
+        self.timing = timing
+        self.bind_attempts = 0
+        self.dropped = False
+        self.tool_calls: list[str] = []
+
+    @property
+    def headers(self):
+        return self.delegate.headers
+
+    def post(self, *args: Any, **kwargs: Any):
+        payload = kwargs.get("json")
+        tool_name = None
+        if isinstance(payload, dict) and payload.get("method") == "tools/call":
+            params = payload.get("params")
+            if isinstance(params, dict):
+                tool_name = params.get("name")
+                if isinstance(tool_name, str):
+                    self.tool_calls.append(tool_name)
+        if tool_name != "session_sidebar_bind" or self.dropped:
+            return self.delegate.post(*args, **kwargs)
+
+        self.bind_attempts += 1
+        self.dropped = True
+        if self.timing == "before_processing":
+            raise httpx.ReadError("synthetic bind connection drop")
+        self.delegate.post(*args, **kwargs)
+        raise httpx.ReadError("synthetic bind response drop")
+
+
 class _SidebarEndToEndHarness:
     """Drive registration and delivery through the public MCP tools."""
 
@@ -1429,7 +1534,8 @@ class _SidebarEndToEndHarness:
     ) -> None:
         self.contract = _SidebarSkillContract.load(skill_path)
         self.now = time.time()
-        self.db = SessionDB(tmp_path / "sidebar-e2e-state.db")
+        self.db_path = tmp_path / "sidebar-e2e-state.db"
+        self.db = SessionDB(self.db_path)
         self.store = SessionBridgeStore(
             self.db,
             clock=lambda: self.now,
@@ -1449,6 +1555,7 @@ class _SidebarEndToEndHarness:
                 claude_projects_root,
                 marker_secret=_MARKER_SECRET,
             )
+        self.adapters = adapters
         self.coordinator = SessionBridgeCoordinator(
             config=self.config,
             store=self.store,
@@ -1662,6 +1769,27 @@ class _SidebarEndToEndHarness:
     def advance_lease_expiry(self) -> None:
         self.now += 301.0
 
+    def restart_bridge(self) -> None:
+        if self.production_backend is not None:
+            raise RuntimeError("production composition cannot use harness restart")
+        self.db.close()
+        self.db = SessionDB(self.db_path)
+        self.store = SessionBridgeStore(
+            self.db,
+            clock=lambda: self.now,
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        self.coordinator = SessionBridgeCoordinator(
+            config=self.config,
+            store=self.store,
+            adapters=self.adapters,
+            target_adapters={},
+            sidebar_verifier=self.native,
+            clock=lambda: self.now,
+        )
+        self.catalog = UnifiedCatalog(self.db, self.store)
+        self._rebuild_app()
+
     def run_worker_once(
         self,
         client: Any,
@@ -1724,12 +1852,17 @@ class _SidebarEndToEndHarness:
                 },
             })
 
-            def fail_once(label: str) -> dict[str, Any]:
+            def fail_once(
+                label: str,
+                known_thread_id: str | None = None,
+            ) -> dict[str, Any]:
                 code = self.contract.failure_code(label)
                 arguments = {
                     "lease_token": job["lease_token"],
                     "error_code": code,
                 }
+                if known_thread_id is not None:
+                    arguments["codex_thread_id"] = known_thread_id
                 trace.append({
                     "tool": self.contract.fail_tool,
                     "job": job_id,
@@ -1747,9 +1880,42 @@ class _SidebarEndToEndHarness:
                 )
 
             thread_id = None
+            created = False
             recovered_thread_id = job["recovered_thread_id"]
-            if job.get("reconcile_required") or recovered_thread_id is not None:
-                marker = _registration_marker(job["registration_prompt"])
+            marker = _registration_marker(job["registration_prompt"])
+            if recovered_thread_id is not None:
+                read_arguments = {"threadId": recovered_thread_id}
+                trace.append({
+                    "tool": self.contract.read_thread_tool,
+                    "job": job_id,
+                    "arguments": read_arguments,
+                })
+                try:
+                    recovered = getattr(
+                        self.native,
+                        self.contract.read_thread_tool,
+                    )(thread_id=recovered_thread_id)
+                except (KeyError, RuntimeError):
+                    outcomes.append(
+                        fail_once(
+                            "Authenticated marker conflict",
+                            recovered_thread_id,
+                        )
+                    )
+                    continue
+                if (
+                    recovered.get("thread_id") != recovered_thread_id
+                    or recovered.get("marker") != marker
+                ):
+                    outcomes.append(
+                        fail_once(
+                            "Authenticated marker conflict",
+                            recovered_thread_id,
+                        )
+                    )
+                    continue
+                thread_id = recovered_thread_id
+            elif job.get("reconcile_required") or job.get("create_reserved"):
                 list_arguments = {
                     "query": marker,
                     "limit": self.contract.reconcile_limit,
@@ -1773,14 +1939,37 @@ class _SidebarEndToEndHarness:
                     getattr(self.native, self.contract.read_thread_tool)(
                         thread_id=candidate_id
                     )
-                    if recovered_thread_id in (None, candidate_id):
-                        thread_id = candidate_id
-                        break
-                if recovered_thread_id is not None and thread_id is None:
-                    outcomes.append(fail_once("Authenticated marker conflict"))
-                    continue
+                    thread_id = candidate_id
+                    break
+
+            if thread_id is None and job.get("create_reserved"):
+                outcomes.append(
+                    fail_once("Create response lost or otherwise ambiguous")
+                )
+                continue
 
             if thread_id is None:
+                reserve_arguments = {"lease_token": job["lease_token"]}
+                trace.append({
+                    "tool": self.contract.reserve_tool,
+                    "job": job_id,
+                    "arguments": reserve_arguments,
+                })
+                try:
+                    reservation = _sidebar_call_tool(
+                        client,
+                        self.contract.reserve_tool,
+                        reserve_arguments,
+                    )
+                except (httpx.TransportError, AssertionError, ValueError):
+                    outcomes.append(fail_once("Bridge temporarily unavailable"))
+                    continue
+                if reservation != {
+                    "state": "sidebar_leased",
+                    "create_reserved": True,
+                }:
+                    outcomes.append(fail_once("Bridge temporarily unavailable"))
+                    continue
                 create_arguments = {
                     "prompt": job["registration_prompt"],
                     "target": {
@@ -1804,6 +1993,7 @@ class _SidebarEndToEndHarness:
                         project_id=project_id,
                         source_cwd=job["cwd"],
                     )
+                    created = True
                 except RuntimeError:
                     if self.production_codex_target is not None and (
                         self.allow_forbidden_app_server_fallback_for_mutation
@@ -1828,6 +2018,46 @@ class _SidebarEndToEndHarness:
                     outcomes.append(fail_once("Desktop offline"))
                     continue
 
+            bind_arguments = {
+                "lease_token": job["lease_token"],
+                "codex_thread_id": thread_id,
+            }
+            trace.append({
+                "tool": self.contract.bind_tool,
+                "job": job_id,
+                "arguments": bind_arguments,
+            })
+            try:
+                _sidebar_call_tool(
+                    client,
+                    self.contract.bind_tool,
+                    bind_arguments,
+                )
+            except (httpx.TransportError, AssertionError, ValueError):
+                outcomes.append(fail_once("Bridge temporarily unavailable", thread_id))
+                continue
+
+            if created:
+                trace.append({
+                    "tool": self.contract.read_thread_tool,
+                    "job": job_id,
+                    "arguments": {"threadId": thread_id},
+                })
+                try:
+                    indexed = getattr(
+                        self.native,
+                        self.contract.read_thread_tool,
+                    )(thread_id=thread_id)
+                except (KeyError, RuntimeError):
+                    outcomes.append(fail_once("Bound task not yet indexed", thread_id))
+                    continue
+                if (
+                    indexed.get("thread_id") != thread_id
+                    or indexed.get("marker") != marker
+                ):
+                    outcomes.append(fail_once("Bound task not yet indexed", thread_id))
+                    continue
+
             rename_arguments = {"threadId": thread_id, "title": job["title"]}
             trace.append({
                 "tool": self.contract.rename_tool,
@@ -1840,7 +2070,7 @@ class _SidebarEndToEndHarness:
                     job["title"],
                 )
             except RuntimeError:
-                outcomes.append(fail_once("Rename failed"))
+                outcomes.append(fail_once("Rename failed", thread_id))
                 continue
 
             commit_arguments = {
@@ -1861,7 +2091,7 @@ class _SidebarEndToEndHarness:
                     )
                 )
             except httpx.TransportError:
-                outcomes.append(fail_once("Bridge temporarily unavailable"))
+                outcomes.append(fail_once("Bridge temporarily unavailable", thread_id))
         self.contract.validate_trace(trace)
         self.worker_traces.append(trace)
         return outcomes
@@ -1996,6 +2226,33 @@ def _sidebar_try_fail(
     )
 
 
+def test_sidebar_skill_trace_requires_exact_id_on_fail_after_recovered_read() -> None:
+    contract = _SidebarSkillContract.load(_SIDEBAR_SKILL_PATH)
+    job_id = "claude:known-recovered-id"
+    trace = [
+        {"tool": contract.status_tool},
+        {"tool": contract.projects_tool},
+        {"tool": contract.pending_tool},
+        {"tool": "project_choice", "job": job_id},
+        {
+            "tool": contract.read_thread_tool,
+            "job": job_id,
+            "arguments": {"threadId": "native-known-recovered-id"},
+        },
+        {
+            "tool": contract.fail_tool,
+            "job": job_id,
+            "arguments": {"error_code": "marker_conflict"},
+        },
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match="known native ID",
+    ):
+        contract.validate_trace(trace)
+
+
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.HERMES])
 def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
     tmp_path: Path,
@@ -2031,7 +2288,10 @@ def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
             harness.contract.pending_tool,
             "project_choice",
             harness.contract.list_threads_tool,
+            harness.contract.reserve_tool,
             harness.contract.create_tool,
+            harness.contract.bind_tool,
+            harness.contract.read_thread_tool,
             harness.contract.rename_tool,
             harness.contract.commit_tool,
         ]
@@ -2136,6 +2396,7 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
                 {
                     "state": "sidebar_retry",
                     "error_code": "bridge_temporarily_unavailable",
+                    "codex_thread_id": "native-sidebar-1",
                 }
             ]
             assert state_after_drop["state"] == SidebarJobState.RETRY.value
@@ -2156,6 +2417,110 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
         assert harness.store.get_sidebar_job_for_source(source_id)["state"] == (
             SidebarJobState.VISIBLE.value
         )
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("drop_timing", ["before_processing", "after_processing"])
+def test_sidebar_bind_response_drop_survives_restart_without_replacement_creation(
+    tmp_path: Path,
+    drop_timing: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "bind-drop"
+        harness.add_project("bind-drop-project", source_cwd)
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "bind-drop",
+            cwd=source_cwd,
+        )
+        harness.register()
+
+        with harness.client() as client:
+            dropped_client = _BindDroppingClient(client, timing=drop_timing)
+            first = harness.run_worker_once(dropped_client)
+
+        after_drop = harness.store.get_sidebar_job_for_source(source_id)
+        harness.restart_bridge()
+        harness.advance_retry()
+        with harness.client() as client:
+            second = harness.run_worker_once(client)
+
+        assert dropped_client.bind_attempts == 1
+        assert dropped_client.dropped is True
+        assert dropped_client.tool_calls.count("session_sidebar_reserve") == 1
+        assert dropped_client.tool_calls.count("session_sidebar_bind") == 1
+        assert dropped_client.tool_calls.count("session_sidebar_fail") == 1
+        assert first == [
+            {
+                "state": "sidebar_retry",
+                "error_code": "bridge_temporarily_unavailable",
+                "codex_thread_id": "native-sidebar-1",
+            }
+        ]
+        assert after_drop["state"] == SidebarJobState.RETRY.value
+        assert after_drop["codex_thread_id"] == "native-sidebar-1"
+        assert second == [
+            {
+                "state": "sidebar_visible",
+                "codex_thread_id": "native-sidebar-1",
+            }
+        ]
+        assert len(harness.native.create_calls) == 1
+        final = harness.store.get_sidebar_job_for_source(source_id)
+        assert final["state"] == SidebarJobState.VISIBLE.value
+        assert final["codex_thread_id"] == "native-sidebar-1"
+    finally:
+        harness.close()
+
+
+def test_recovered_id_read_failure_settles_with_the_same_exact_id(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "missing-recovered-id"
+        harness.add_project("missing-recovered-project", source_cwd)
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "missing-recovered-id",
+            cwd=source_cwd,
+        )
+        harness.register()
+        lease = harness.store.claim_sidebar_jobs(now=harness.now, limit=1)[0]
+        recovered_thread_id = "native-missing-recovered-id"
+        harness.store.bind_sidebar_thread(
+            lease_token=lease["lease_token"],
+            codex_thread_id=recovered_thread_id,
+            now=harness.now,
+        )
+        harness.store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="sqlite_busy",
+            codex_thread_id=recovered_thread_id,
+            now=harness.now,
+        )
+        harness.advance_retry()
+
+        with harness.client() as client:
+            outcome = harness.run_worker_once(client)
+
+        fail_event = next(
+            event
+            for event in harness.worker_traces[-1]
+            if event["tool"] == harness.contract.fail_tool
+        )
+        assert fail_event["arguments"]["codex_thread_id"] == recovered_thread_id
+        assert outcome == [
+            {
+                "state": "sidebar_failed",
+                "error_code": "marker_conflict",
+                "codex_thread_id": recovered_thread_id,
+            }
+        ]
+        persisted = harness.store.get_sidebar_job_for_source(source_id)
+        assert persisted["codex_thread_id"] == recovered_thread_id
     finally:
         harness.close()
 

@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ASSET = ROOT / "session_bridge" / "assets" / "session-sidebar-sync"
 BASELINE = Path(__file__).parent / "fixtures" / "sidebar_skill_baseline.txt"
 LOCK_NAME = ".session-sidebar-sync.install.lock"
+BACKUP_ROOT_NAME = ".session-bridge-skill-backups"
 
 
 @pytest.mark.parametrize("relative", ("a:b", "D:/escape.txt", "D:escape.txt"))
@@ -220,7 +221,9 @@ def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missin
         'uv run --project "C:\\\\Users\\\\diego\\\\.hermes\\\\worktrees\\\\'
         'session-bridge-ship" --no-sync python -m session_bridge.broker_client'
     ) in skill
-    assert "status|pending|bind|commit|fail" in skill
+    assert "status|pending|reserve|bind|commit|fail" in skill
+    assert "session_sidebar_reserve" in skill
+    assert "reserve --lease-token=<exact token>" in skill
     assert "--lease-token=<exact token>" in skill
     assert "--lease-token <exact token>" not in skill
     assert "never call both transports for the same bridge step" in skill
@@ -243,7 +246,7 @@ def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     assert 'prompt="Review launch"' not in skill
 
 
-def test_sidebar_skill_unconditionally_renames_every_task_before_commit() -> None:
+def test_sidebar_skill_renames_only_after_applicable_read_checks_pass() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     rename_step = skill.split("\n7. ", 1)[1].split("\n8. ", 1)[0]
 
@@ -251,12 +254,17 @@ def test_sidebar_skill_unconditionally_renames_every_task_before_commit() -> Non
         "Before any rename, durably bind every reconciled task and every newly "
         "created task to its exact native thread ID"
     )
-    assert "Rename every bound task" in rename_step
+    assert (
+        "Rename a bound task only after every applicable exact-ID read, identity, "
+        "marker, and idle-status check has passed"
+    ) in rename_step
+    assert "Rename every bound task" not in rename_step
     assert "whenever" not in rename_step
     assert "flag" not in rename_step.casefold()
     assert (
-        "On rename failure, call `session_sidebar_fail` with `rename_failed`; "
-        "do not commit and do not create a replacement task."
+        "On rename failure, call `session_sidebar_fail` with `rename_failed` and "
+        "`codex_thread_id=<threadId>`; do not commit and do not create a "
+        "replacement task."
     ) in rename_step
 
 
@@ -277,6 +285,51 @@ def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
     assert create_step.index("`read_thread`") > create_step.index(
         "session_sidebar_bind"
     )
+
+
+def test_sidebar_skill_reserves_the_create_boundary_before_native_creation() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+    create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
+
+    assert "`create_reserved`" in skill
+    assert (
+        "When `create_reserved` is true, zero marker-search results never authorize "
+        "creation"
+    ) in reconcile_step
+    assert "settle once with `native_create_ambiguous`" in reconcile_step
+    assert (
+        "`session_sidebar_reserve(lease_token=<exact token>)` immediately before "
+        "`create_thread`"
+    ) in create_step
+    assert create_step.index("session_sidebar_reserve") < create_step.index(
+        "create_thread"
+    )
+    assert "Do not create unless reserve succeeds" in create_step
+
+
+def test_sidebar_skill_retains_exact_returned_id_when_bind_response_is_lost() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
+
+    assert (
+        "`session_sidebar_fail(lease_token=<exact token>, "
+        "error_code=bridge_temporarily_unavailable, "
+        "codex_thread_id=<threadId>)`"
+    ) in create_step
+    assert "fail --lease-token=<exact token> --error-code=<fixed code> " in skill
+    assert "--thread-id=<threadId>" in skill
+    assert "Only that exact same thread ID may be rebound idempotently" in skill
+    assert "never create a replacement" in create_step
+
+
+def test_sidebar_skill_passes_exact_id_to_every_fail_after_identity_is_known() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    bind_and_rename_step = skill.split("\n7. ", 1)[1].split("\n8. ", 1)[0]
+    exit_step = skill.split("\n9. ", 1)[1].split("\n\n## Fixed Failure", 1)[0]
+
+    assert "codex_thread_id=<threadId>" in bind_and_rename_step
+    assert "include `codex_thread_id=<threadId>`" in exit_step
 
 
 def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
@@ -330,7 +383,21 @@ def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() ->
     recovered_branch = reconcile_step.split("When `recovered_thread_id` is present", 1)[
         1
     ].split("Only when `recovered_thread_id` is absent", 1)[0]
-    assert "missing or mismatched task maps to `marker_conflict`" in recovered_branch
+    assert (
+        "unavailable, missing, or not-yet-indexed recovered-ID read maps to "
+        "`native_task_not_indexed`"
+    ) in recovered_branch
+    assert (
+        "returns successfully but `thread.id` or the signed marker mismatches, map "
+        "to `marker_conflict`"
+    ) in recovered_branch
+    assert (
+        "host, project, environment, or task-kind field that explicitly contradicts "
+        "local native execution maps to `codex_thread_conflict`"
+    ) in recovered_branch
+    assert (
+        "missing or mismatched task maps to `marker_conflict`" not in recovered_branch
+    )
     assert "never permits creation" in recovered_branch
 
 
@@ -362,9 +429,14 @@ def test_sidebar_skill_never_creates_after_an_unverifiable_search_candidate() ->
         "candidate summaries"
     ) in reconcile_step
     assert (
-        "any returned candidate that cannot be authenticated within the ten-turn "
-        "read maps to `native_task_not_indexed`"
+        "candidate read is unavailable or not yet indexed within the ten-turn "
+        "read, map to `native_task_not_indexed`"
     ) in reconcile_step
+    assert (
+        "candidate read returns successfully but its exact ID or signed marker "
+        "mismatches, map to `marker_conflict`"
+    ) in reconcile_step
+    assert "any returned candidate that cannot be authenticated" not in reconcile_step
     assert "never continue to creation after a candidate summary was returned" in (
         reconcile_step
     )
@@ -379,7 +451,12 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
         "Desktop explicitly offline -> `desktop_offline`",
         "Definite create failure -> `native_task_not_indexed`",
         "ambiguous create failure -> `native_create_ambiguous`",
-        "Failed or ambiguous reconciliation -> `native_task_not_indexed`",
+        "Unavailable or not-yet-indexed reconciliation read -> "
+        "`native_task_not_indexed`",
+        "Successfully returned thread-ID or marker mismatch, or multiple exact "
+        "marker matches -> `marker_conflict`",
+        "Explicit host, project, environment, or task-kind contradiction -> "
+        "`codex_thread_conflict`",
         "Failed rename -> `rename_failed`",
         "Definite or ambiguous commit failure -> `bridge_temporarily_unavailable`",
         "If the fail/release call itself fails",
@@ -412,6 +489,31 @@ def test_sidebar_skill_verification_requires_exactly_one_settlement_attempt() ->
     ) in verification
     assert "every other lease was failed/released" not in verification
     assert "at most one" not in verification
+
+
+def test_sidebar_skill_verification_is_conditional_on_the_taken_delivery_path() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    verification = skill.split("\n## Verification\n", 1)[1]
+
+    assert "If a task was created" in verification
+    assert "If a task was reconciled" in verification
+    assert "If commit succeeded" in verification
+    assert "If commit did not succeed" in verification
+    assert "If a newly created task reached native-read polling" in verification
+    assert "If a reconciled candidate was read before binding" in verification
+    assert "If exact-ID polling reached readable and idle" in verification
+    assert "If exact-ID polling failed or timed out" in verification
+    assert "If rename succeeded" in verification
+    assert "If bind or rename failed" in verification
+    assert "the created task used `registration_prompt` verbatim" not in verification
+    assert "the completed lease was committed, and the noncommitted lease" not in (
+        verification
+    )
+    assert "every known native task ID was durably bound before native read" not in (
+        verification
+    )
+    assert "every newly created task became readable and idle" not in verification
+    assert "every bound task was renamed" not in verification
 
 
 def test_sidebar_skill_normalizes_only_current_local_host_identity() -> None:
@@ -465,6 +567,7 @@ def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
     assert named == {
         "session_status",
         "session_sidebar_pending",
+        "session_sidebar_reserve",
         "session_sidebar_bind",
         "session_sidebar_commit",
         "session_sidebar_fail",
@@ -521,13 +624,112 @@ def test_install_sidebar_skill_backs_up_different_content_without_collision(
 
     install_sidebar_skill(codex_home)
 
-    backups = sorted((codex_home / "skills").glob("session-sidebar-sync.backup*"))
+    backups = sorted(
+        (codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*")
+    )
     assert len(backups) == 2
     assert {(backup / "old.txt").read_text(encoding="utf-8") for backup in backups} == {
         "first",
         "second",
     }
     assert _installed_files(destination) == _installed_files(ASSET)
+
+
+def test_install_sidebar_skill_keeps_replacement_backup_outside_skills_root(
+    tmp_path: Path,
+) -> None:
+    from session_bridge.sidebar_skill import install_sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = skills / "session-sidebar-sync"
+    destination.mkdir(parents=True)
+    original = b"\x00\xfflegacy-sidebar-skill\r\n"
+    (destination / "old.bin").write_bytes(original)
+
+    install_sidebar_skill(codex_home)
+
+    assert list(skills.glob("session-sidebar-sync.backup*")) == []
+    backups = list((codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old.bin").read_bytes() == original
+
+
+def test_install_sidebar_skill_migrates_legacy_backups_before_idempotent_return(
+    tmp_path: Path,
+) -> None:
+    from session_bridge.sidebar_skill import install_sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = install_sidebar_skill(codex_home)
+    payloads = {b"\x00\xfffirst\r\n", b"second\x00payload"}
+    for name, payload in zip(
+        ("session-sidebar-sync.backup", "session-sidebar-sync.backup-7"),
+        payloads,
+        strict=True,
+    ):
+        legacy = skills / name
+        legacy.mkdir()
+        (legacy / "old.bin").write_bytes(payload)
+
+    assert _installed_files(destination) == _installed_files(ASSET)
+    install_sidebar_skill(codex_home)
+
+    assert list(skills.glob("session-sidebar-sync.backup*")) == []
+    migrated = list(
+        (codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*")
+    )
+    assert len(migrated) == 2
+    assert {(backup / "old.bin").read_bytes() for backup in migrated} == payloads
+    assert _installed_files(destination) == _installed_files(ASSET)
+
+
+def test_install_sidebar_skill_migrates_legacy_regular_file_backup_verbatim(
+    tmp_path: Path,
+) -> None:
+    from session_bridge.sidebar_skill import install_sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = install_sidebar_skill(codex_home)
+    payload = b"\x00\xfflegacy-file-backup\r\n"
+    legacy = skills / "session-sidebar-sync.backup"
+    legacy.write_bytes(payload)
+
+    install_sidebar_skill(codex_home)
+
+    assert not legacy.exists()
+    migrated = list(
+        (codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*")
+    )
+    assert len(migrated) == 1
+    assert migrated[0].is_file()
+    assert migrated[0].read_bytes() == payload
+    assert _installed_files(destination) == _installed_files(ASSET)
+
+
+def test_install_sidebar_skill_rejects_redirected_legacy_backup(
+    tmp_path: Path,
+) -> None:
+    from session_bridge.sidebar_skill import install_sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = install_sidebar_skill(codex_home)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.bin").write_bytes(b"do-not-move")
+    legacy = skills / "session-sidebar-sync.backup"
+    _create_directory_redirect(legacy, outside)
+
+    with pytest.raises(PermissionError, match="redirect"):
+        install_sidebar_skill(codex_home)
+
+    assert legacy.exists()
+    assert (outside / "keep.bin").read_bytes() == b"do-not-move"
+    assert _installed_files(destination) == _installed_files(ASSET)
+    _remove_directory_redirect(legacy)
 
 
 def test_install_sidebar_skill_copy_failure_preserves_existing_tree(
@@ -742,7 +944,7 @@ def test_install_sidebar_skill_preserves_promotion_and_restore_failures(
         "restore failed",
     }
     assert not destination.exists()
-    backup = next(skills.glob("session-sidebar-sync.backup*"))
+    backup = next((codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*"))
     assert (backup / "old.txt").read_text(encoding="utf-8") == "preserve"
 
 
@@ -870,7 +1072,7 @@ def test_process_lock_serializes_install_and_preserves_one_backup(
     installer_stdout, installer_stderr = installer.communicate(timeout=10)
     assert holder.returncode == 0, (holder_stdout, holder_stderr)
     assert installer.returncode == 0, (installer_stdout, installer_stderr)
-    backups = list(skills.glob("session-sidebar-sync.backup*"))
+    backups = list((codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*"))
     assert len(backups) == 1
     assert (backups[0] / "old.txt").read_text(encoding="utf-8") == "preserve"
     assert _installed_files(destination) == _installed_files(ASSET)
@@ -1000,7 +1202,7 @@ def test_process_lock_concurrent_installers_do_not_lose_backup_or_install(
     outputs = [process.communicate(timeout=15) for process in installers]
 
     assert [process.returncode for process in installers] == [0, 0, 0, 0], outputs
-    backups = list(skills.glob("session-sidebar-sync.backup*"))
+    backups = list((codex_home / BACKUP_ROOT_NAME).glob("session-sidebar-sync.backup*"))
     assert len(backups) == 1
     assert (backups[0] / "old.txt").read_text(encoding="utf-8") == "original"
     assert _installed_files(destination) == _installed_files(ASSET)

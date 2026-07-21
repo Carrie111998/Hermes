@@ -469,6 +469,7 @@ class ProductionBackend:
                     resolve_characterization_gate()
                 except CharacterizationGateError as exc:
                     raise RolloutGateBlocked(f"characterization_{exc.code}") from exc
+            self._apply_sidebar_create_reservation_cutover()
             coordinator = self._provider_runtime(
                 targets=True,
                 catalog_only=False,
@@ -723,6 +724,24 @@ class ProductionBackend:
         except Exception as exc:
             raise ProviderDegraded("sidebar_executor_failed") from exc
 
+    def _apply_sidebar_create_reservation_cutover(
+        self,
+        *,
+        marker_secret: bytes | None = None,
+    ) -> Mapping[str, Any]:
+        secret = resolve_marker_key() if marker_secret is None else marker_secret
+        try:
+            return self._require_store().apply_sidebar_create_reservation_cutover(
+                marker_secret=secret,
+                now=time.time(),
+            )
+        except ConfigurationFailure:
+            raise
+        except Exception as exc:
+            raise ConfigurationFailure(
+                "sidebar_create_reservation_cutover_failed"
+            ) from exc
+
     def sidebar_acknowledge_unrecoverable(
         self,
         *,
@@ -750,9 +769,10 @@ class ProductionBackend:
                 raise ValueError("missing sidebar source identity")
             expected_idempotency_key = sidebar_idempotency_key(source_session_id)
             expected_bridge_id = sidebar_bridge_id(source_session_id)
-            expected_job_id = "sidebar-job:" + hashlib.sha256(
-                expected_idempotency_key.encode("utf-8")
-            ).hexdigest()
+            expected_job_id = (
+                "sidebar-job:"
+                + hashlib.sha256(expected_idempotency_key.encode("utf-8")).hexdigest()
+            )
             attempts = job.get("attempts")
             next_attempt_at = job.get("next_attempt_at")
             updated_at = job.get("updated_at")
@@ -820,7 +840,9 @@ class ProductionBackend:
             raise RolloutGateBlocked("sidebar_terminal_snapshot_mismatch") from None
         return {
             "status": (
-                "acknowledged" if result.get("created") is True else "already_acknowledged"
+                "acknowledged"
+                if result.get("created") is True
+                else "already_acknowledged"
             ),
             "error_code": "native_create_ambiguous",
             "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
@@ -1564,6 +1586,9 @@ class ProductionBackend:
             return self._sidebar_executor
         try:
             marker_key = resolve_marker_key()
+            self._apply_sidebar_create_reservation_cutover(
+                marker_secret=marker_key,
+            )
             codex_command = resolve_cli_executable("codex")
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
@@ -1610,9 +1635,7 @@ class ProductionBackend:
                 self._sidebar_codex_client = CodexAppServerClient(
                     codex_bin=codex_command[0]
                 )
-            return CodexAppServerSidebarDelivery(
-                cast(Any, self._sidebar_codex_client)
-            )
+            return CodexAppServerSidebarDelivery(cast(Any, self._sidebar_codex_client))
         except ConfigurationFailure:
             raise
         except Exception as exc:
@@ -1718,7 +1741,9 @@ def build_parser() -> argparse.ArgumentParser:
         "sidebar-acknowledge-unrecoverable",
         help="acknowledge one audited unrecoverable bound Codex thread",
     )
-    sidebar_terminal.add_argument("--job-id", type=_sidebar_terminal_job_id, required=True)
+    sidebar_terminal.add_argument(
+        "--job-id", type=_sidebar_terminal_job_id, required=True
+    )
     sidebar_terminal.add_argument(
         "--codex-thread-id",
         type=_sidebar_terminal_thread_id,
@@ -2334,8 +2359,7 @@ def _public_claude_visibility_lineage(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ConfigurationFailure("invalid_claude_lineage_status")
         blocker_codes[code] = count
     if (
-        selected["repairable"] + selected["blocked"]
-        != selected["unlinked_visible"]
+        selected["repairable"] + selected["blocked"] != selected["unlinked_visible"]
         or sum(blocker_codes.values()) != selected["blocked"]
     ):
         raise ConfigurationFailure("invalid_claude_lineage_status")
@@ -2418,14 +2442,11 @@ def _public_sidebar_status(
     terminal_total = _status_count(
         terminal_resolutions_source.get(
             "total",
-            terminally_resolved_failed_count
-            + ineffective_terminal_resolution_count,
+            terminally_resolved_failed_count + ineffective_terminal_resolution_count,
         )
     )
     terminal_effective = _status_count(
-        terminal_resolutions_source.get(
-            "effective", terminally_resolved_failed_count
-        )
+        terminal_resolutions_source.get("effective", terminally_resolved_failed_count)
     )
     terminal_ineffective = _status_count(
         terminal_resolutions_source.get(
@@ -2446,8 +2467,7 @@ def _public_sidebar_status(
         )
     )
     if (
-        blocking_failed_count
-        + terminally_resolved_failed_count
+        blocking_failed_count + terminally_resolved_failed_count
         != state_counts[SidebarJobState.FAILED.value]
         or terminal_total != terminal_effective + terminal_ineffective
         or terminal_effective != terminally_resolved_failed_count

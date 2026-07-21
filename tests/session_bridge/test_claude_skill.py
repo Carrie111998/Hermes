@@ -8,6 +8,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSET = ROOT / "session_bridge" / "assets" / "claude-session-bridge"
+BACKUP_ROOT_NAME = ".session-bridge-skill-backups"
 EXPECTED_FRONTMATTER = """---
 name: session-bridge
 description: Browse and continue the unified Claude, Codex, and Hermes session catalog.
@@ -181,5 +182,11 @@ def test_claude_install_promotion_failure_restores_existing_tree(
     assert any(
         target.name.startswith("session-bridge.backup") for _, target in replacements
     )
+    assert any(
+        target.parent == claude_home / BACKUP_ROOT_NAME
+        for _, target in replacements
+        if target.name.startswith("session-bridge.backup")
+    )
     assert replacements[-1][0].name.startswith("session-bridge.backup")
+    assert replacements[-1][0].parent == claude_home / BACKUP_ROOT_NAME
     assert replacements[-1][1] == destination

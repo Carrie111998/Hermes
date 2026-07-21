@@ -30,6 +30,7 @@ _WINDOWS_RESERVED_NAMES: Final = frozenset(
     | {f"LPT{suffix}" for suffix in "123456789¹²³"}
 )
 _WINDOWS_FORBIDDEN_CHARACTERS: Final = frozenset('<>"|?*')
+_BACKUP_ROOT_NAME: Final = ".session-bridge-skill-backups"
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,17 @@ def install_packaged_asset(
 
     with lock_factory(root):
         identity = _InstallIdentity.capture(root)
+        backup_root = root.parent / _BACKUP_ROOT_NAME
+        _ensure_directory(backup_root, f"{selected.error_label} backup directory")
+        identity.revalidate()
+        identity = identity.extend(backup_root)
+        _migrate_legacy_backups(
+            root,
+            backup_root,
+            identity,
+            selected,
+            replacer,
+        )
         _remove_verified_stale_staging(root, identity, selected)
         identity.revalidate()
         _assert_not_redirect(destination, "skill destination", missing_ok=True)
@@ -133,7 +145,7 @@ def install_packaged_asset(
                 )
 
             if destination.exists():
-                backup = _next_backup_path(root, selected.destination_name)
+                backup = _next_backup_path(backup_root, selected.destination_name)
                 replacer(destination, backup, identity)
             try:
                 replacer(staging, destination, identity)
@@ -247,13 +259,35 @@ def _assert_not_redirect(path: Path, label: str, *, missing_ok: bool = False) ->
         raise PermissionError(f"{label} must not be a redirect")
 
 
-def _next_backup_path(skills: Path, skill_name: str) -> Path:
-    base = skills / f"{skill_name}.backup"
+def _migrate_legacy_backups(
+    skills: Path,
+    backup_root: Path,
+    identity: _InstallIdentity,
+    spec: AssetInstallSpec,
+    replacer: GuardedReplace,
+) -> None:
+    pattern = re.compile(
+        rf"{re.escape(spec.destination_name)}\.backup(?:-[1-9][0-9]*)?"
+    )
+    for candidate in sorted(skills.iterdir(), key=lambda path: path.name):
+        if pattern.fullmatch(candidate.name) is None:
+            continue
+        identity.revalidate()
+        _assert_not_redirect(candidate, "legacy skill backup")
+        candidate_info = os.lstat(candidate)
+        if stat.S_ISDIR(candidate_info.st_mode):
+            _assert_tree_has_no_redirects(candidate)
+        destination = _next_backup_path(backup_root, spec.destination_name)
+        replacer(candidate, destination, identity)
+
+
+def _next_backup_path(backup_root: Path, skill_name: str) -> Path:
+    base = backup_root / f"{skill_name}.backup"
     candidate = base
     suffix = 0
     while candidate.exists() or candidate.is_symlink():
         suffix += 1
-        candidate = skills / f"{skill_name}.backup-{suffix}"
+        candidate = backup_root / f"{skill_name}.backup-{suffix}"
     return candidate
 
 

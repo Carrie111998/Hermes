@@ -4,10 +4,13 @@ import base64
 import binascii
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import math
 import re
 import unicodedata
+from collections.abc import Mapping
+from typing import cast
 
 from .context_pack import _redact
 from .models import OriginKind, Provider, SessionProjection, canonical_session_id
@@ -145,6 +148,78 @@ def sidebar_bridge_id(source_session_id: str) -> str:
     key = sidebar_idempotency_key(source_session_id)
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     return f"sidebar:{digest}"
+
+
+def sidebar_create_recovery_key(marker: str, marker_secret: bytes) -> str:
+    """Derive the durable native-create reservation key for one signed marker."""
+
+    if (
+        type(marker) is not str
+        or not marker
+        or marker != marker.strip()
+        or "\n" in marker
+        or "\r" in marker
+    ):
+        raise ValueError("sidebar marker must be canonical")
+    if type(marker_secret) is not bytes or not marker_secret:
+        raise ValueError("sidebar marker secret must be non-empty bytes")
+    digest = hmac.new(
+        marker_secret,
+        b"sidebar-create-v1\0" + marker.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hermes-session-bridge-create-v1:{digest}"
+
+
+def validate_sidebar_create_reservation(
+    reservation: object,
+    *,
+    job_id: str,
+    source_session_id: str,
+    bridge_id: str,
+    expected_recovery_key: str,
+) -> str:
+    """Validate the exact durable reservation record returned by the store."""
+
+    expected_fields = {
+        "version",
+        "job_id",
+        "source_session_id",
+        "bridge_id",
+        "recovery_key",
+        "reserved_at",
+    }
+    if not isinstance(reservation, Mapping) or set(reservation) != expected_fields:
+        raise ValueError("sidebar create reservation is malformed")
+    reservation_map = cast(Mapping[str, object], reservation)
+    version = reservation_map.get("version")
+    if type(version) is not int or version != 1:
+        raise ValueError("sidebar create reservation is malformed")
+    if (
+        reservation_map.get("job_id") != job_id
+        or reservation_map.get("source_session_id") != source_session_id
+        or reservation_map.get("bridge_id") != bridge_id
+    ):
+        raise ValueError("sidebar create reservation identity mismatch")
+    recovery_key = reservation_map.get("recovery_key")
+    if (
+        type(recovery_key) is not str
+        or not recovery_key
+        or recovery_key != recovery_key.strip()
+        or "\n" in recovery_key
+        or "\r" in recovery_key
+    ):
+        raise ValueError("sidebar create reservation is malformed")
+    reserved_at = reservation_map.get("reserved_at")
+    if (
+        isinstance(reserved_at, bool)
+        or not isinstance(reserved_at, (int, float))
+        or not math.isfinite(float(reserved_at))
+    ):
+        raise ValueError("sidebar create reservation is malformed")
+    if not hmac.compare_digest(recovery_key, expected_recovery_key):
+        raise ValueError("sidebar create reservation key mismatch")
+    return recovery_key
 
 
 def sidebar_title(provider: Provider, title: str | None, first_request: str) -> str:
@@ -368,9 +443,7 @@ def _is_exact_registration_block(value: object) -> bool:
         return False
     if lines[10] != "Do not call session_continue during this registration turn.":
         return False
-    if lines[12] != (
-        "Until that later user message, reply with only: REGISTERED"
-    ):
+    if lines[12] != ("Until that later user message, reply with only: REGISTERED"):
         return False
 
     try:

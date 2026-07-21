@@ -739,7 +739,7 @@ def test_health_is_minimal_and_mcp_auth_is_constant_surface(db: SessionDB) -> No
     assert coordinator.stopped == 1
 
 
-def test_tools_list_exposes_exactly_the_ten_approved_tools(db: SessionDB) -> None:
+def test_tools_list_exposes_exactly_the_eleven_approved_tools(db: SessionDB) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
     coordinator = _FakeCoordinator(
         bridge_id=bridge_id, source_id=source_id, target_id=target_id
@@ -760,6 +760,7 @@ def test_tools_list_exposes_exactly_the_ten_approved_tools(db: SessionDB) -> Non
             "session_status",
             "session_claude_visibility_status",
             "session_sidebar_pending",
+            "session_sidebar_reserve",
             "session_sidebar_bind",
             "session_sidebar_commit",
             "session_sidebar_fail",
@@ -822,9 +823,8 @@ def test_all_eight_tools_are_callable_and_search_filters_are_forwarded(
     assert "C:/private/session.jsonl" not in json.dumps(status)
 
 
-@pytest.mark.parametrize("supplied, expected", [(0, 1), (1, 1), (5, 5), (99, 5)])
-def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
-    db: SessionDB, supplied: int, expected: int
+def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fields(
+    db: SessionDB,
 ) -> None:
     store, candidate = _seed_sidebar_source(db)
     coordinator = _FakeCoordinator(
@@ -847,10 +847,10 @@ def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
         response = _call_tool(
             client,
             "session_sidebar_pending",
-            {"limit": supplied},
+            {"limit": 1},
         )
 
-    assert coordinator.sidebar_claim_limits == [expected]
+    assert coordinator.sidebar_claim_limits == [1]
     assert set(response) == {"jobs"}
     assert len(response["jobs"]) == 1
     job = response["jobs"][0]
@@ -867,6 +867,7 @@ def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
         "reconcile_required",
         "rename_required",
         "recovered_thread_id",
+        "create_reserved",
     }
     assert job["lease_token"] == "plaintext-opaque-lease"
     assert job["title"].startswith("[Claude] ")
@@ -879,6 +880,7 @@ def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
     assert job["reconcile_required"] is True
     assert job["rename_required"] is False
     assert job["recovered_thread_id"] is None
+    assert job["create_reserved"] is False
     prompt = job["registration_prompt"]
     assert "Fix the sidebar registration broker" not in prompt
     assert "C:/claude/sidebar-source.jsonl" not in prompt
@@ -894,6 +896,47 @@ def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
         Provider.CODEX,
         1,
     )
+
+
+@pytest.mark.parametrize("supplied", [0, -1, 2, 5, 99])
+def test_session_sidebar_pending_rejects_every_integer_except_one_without_leasing(
+    db: SessionDB,
+    supplied: int,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_sidebar_pending",
+                "arguments": {"limit": supplied},
+            },
+            request_id=47,
+        )
+
+    assert payload["result"]["isError"] is True
+    assert coordinator.sidebar_claim_limits == []
+
+
+def test_session_sidebar_pending_defaults_to_exactly_one(db: SessionDB) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        assert _call_tool(client, "session_sidebar_pending", {}) == {"jobs": []}
+
+    assert coordinator.sidebar_claim_limits == [1]
 
 
 def test_session_sidebar_pending_returns_durable_reserved_thread_id(
@@ -927,6 +970,131 @@ def test_session_sidebar_pending_returns_durable_reserved_thread_id(
     assert response["jobs"][0]["recovered_thread_id"] == (
         "44444444-4444-4444-8444-444444444444"
     )
+
+
+def test_session_sidebar_reserve_durably_records_pre_create_boundary(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    lease = store.claim_sidebar_jobs(now=time.time(), limit=1)[0]
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        tools = _rpc(client, "tools/list")["result"]["tools"]
+        schema = next(
+            tool["inputSchema"]
+            for tool in tools
+            if tool["name"] == "session_sidebar_reserve"
+        )
+        first = _call_tool(
+            client,
+            "session_sidebar_reserve",
+            {"lease_token": lease["lease_token"]},
+        )
+        replay = _call_tool(
+            client,
+            "session_sidebar_reserve",
+            {"lease_token": lease["lease_token"]},
+        )
+
+    reservation = store.get_sidebar_create_reservation(candidate.source_session_id)
+    assert set(schema["properties"]) == {"lease_token"}
+    assert replay == first == {"state": "sidebar_leased", "create_reserved": True}
+    assert reservation is not None
+    assert reservation["source_session_id"] == candidate.source_session_id
+    assert reservation["bridge_id"] == candidate.bridge_id
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_field",
+        "boolean_version",
+        "extra_field",
+        "wrong_job",
+        "nan_reserved_at",
+        "infinite_reserved_at",
+    ],
+)
+def test_session_sidebar_reserve_rejects_malformed_store_confirmation(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    lease = store.claim_sidebar_jobs(now=time.time(), limit=1)[0]
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    original_reserve = store.reserve_sidebar_create
+
+    def malformed_reserve(**kwargs: Any) -> dict[str, Any]:
+        reservation = dict(original_reserve(**kwargs))
+        if malformation == "missing_field":
+            del reservation["bridge_id"]
+        elif malformation == "boolean_version":
+            reservation["version"] = True
+        elif malformation == "extra_field":
+            reservation["unexpected"] = "field"
+        elif malformation == "wrong_job":
+            reservation["job_id"] = "sidebar-job:wrong"
+        elif malformation == "nan_reserved_at":
+            reservation["reserved_at"] = float("nan")
+        elif malformation == "infinite_reserved_at":
+            reservation["reserved_at"] = float("inf")
+        else:  # pragma: no cover - parameter exhaustiveness
+            raise AssertionError(malformation)
+        return reservation
+
+    monkeypatch.setattr(store, "reserve_sidebar_create", malformed_reserve)
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_sidebar_reserve",
+                "arguments": {"lease_token": lease["lease_token"]},
+            },
+            request_id=44,
+        )
+
+    serialized = json.dumps(payload)
+    assert payload["result"]["isError"] is True
+    assert "sidebar_reserve_failed" in serialized
+    assert "create_reserved" not in serialized
+
+
+def test_session_sidebar_pending_exposes_durable_create_boundary(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token="create-reserved-lease",
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+            create_reserved=True,
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(client, "session_sidebar_pending", {})
+
+    assert response["jobs"][0]["create_reserved"] is True
 
 
 def test_session_sidebar_pending_never_reads_transcript_after_enqueue(
@@ -1051,7 +1219,7 @@ def test_session_sidebar_pending_rejects_malformed_limits_without_leasing(
 
 
 @pytest.mark.parametrize("failed_index", [0, 1])
-def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_claim(
+def test_session_sidebar_pending_settles_one_bad_claim_and_returns_no_job(
     db: SessionDB,
     monkeypatch: pytest.MonkeyPatch,
     failed_index: int,
@@ -1062,7 +1230,7 @@ def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_cla
         source_id=claims[0].source_session_id,
         target_id="codex:unused",
     )
-    coordinator.sidebar_claims = claims
+    coordinator.sidebar_claims = (claims[failed_index],)
     original_get = store.get_sidebar_candidate_for_delivery
     failed_source = claims[failed_index].source_session_id
 
@@ -1073,10 +1241,9 @@ def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_cla
 
     monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", selective_get)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
-        response = _call_tool(client, "session_sidebar_pending", {"limit": 5})
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
 
-    good_claim = claims[1 - failed_index]
-    assert [job["lease_token"] for job in response["jobs"]] == [good_claim.lease_token]
+    assert response == {"jobs": []}
     failed = store.get_sidebar_job_for_source(failed_source)
     assert failed is not None
     assert failed["state"] == "sidebar_failed"
@@ -1109,7 +1276,7 @@ def test_session_sidebar_pending_marker_preflight_failure_never_claims(
         marker_failure = _rpc(
             client,
             "tools/call",
-            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            {"name": "session_sidebar_pending", "arguments": {"limit": 1}},
             request_id=43,
         )
     assert marker_failure["result"]["isError"] is True
@@ -1140,16 +1307,16 @@ def test_session_sidebar_pending_claim_failure_does_not_advance_heartbeat(
         response = _rpc(
             client,
             "tools/call",
-            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            {"name": "session_sidebar_pending", "arguments": {"limit": 1}},
             request_id=45,
         )
 
     assert response["result"]["isError"] is True
-    assert coordinator.sidebar_claim_limits == [5]
+    assert coordinator.sidebar_claim_limits == [1]
     assert store.get_state("session-bridge:sidebar:broker-heartbeat") == before
 
 
-def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
+def test_session_sidebar_pending_cleanup_failure_rolls_back_single_claim_safely(
     db: SessionDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1159,12 +1326,12 @@ def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
         source_id=claims[0].source_session_id,
         target_id="codex:unused",
     )
-    coordinator.sidebar_claims = claims
+    coordinator.sidebar_claims = (claims[0],)
     original_get = store.get_sidebar_candidate_for_delivery
     original_fail = store.fail_sidebar_job
 
-    def fail_second_source(source_session_id: str):
-        if source_session_id == claims[1].source_session_id:
+    def fail_claim_source(source_session_id: str):
+        if source_session_id == claims[0].source_session_id:
             raise RuntimeError("traceback marker=must-not-leak")
         return original_get(source_session_id)
 
@@ -1174,16 +1341,16 @@ def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
         nonlocal cleanup_calls
         cleanup_calls += 1
         if cleanup_calls == 1:
-            raise RuntimeError("lease token " + claims[1].lease_token)
+            raise RuntimeError("lease token " + claims[0].lease_token)
         return original_fail(**kwargs)
 
-    monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", fail_second_source)
+    monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", fail_claim_source)
     monkeypatch.setattr(store, "fail_sidebar_job", flaky_cleanup)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         payload = _rpc(
             client,
             "tools/call",
-            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            {"name": "session_sidebar_pending", "arguments": {"limit": 1}},
             request_id=45,
         )
 
@@ -1191,61 +1358,88 @@ def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
     assert payload["result"]["isError"] is True
     assert "sidebar_pending_failed" in serialized
     assert "must-not-leak" not in serialized
-    assert all(claim.lease_token not in serialized for claim in claims)
-    assert all(
-        store.get_sidebar_job_for_source(claim.source_session_id)["state"]
+    assert claims[0].lease_token not in serialized
+    assert cleanup_calls == 2
+    assert (
+        store.get_sidebar_job_for_source(claims[0].source_session_id)["state"]
         != "sidebar_leased"
-        for claim in claims
     )
 
 
-def test_session_sidebar_pending_first_cleanup_failure_rolls_back_later_claims(
+def test_session_sidebar_pending_rejects_overlimit_coordinator_and_rolls_back_leases(
     db: SessionDB,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, claims = _seed_claimed_sidebar_pair(db)
-    coordinator = _FakeCoordinator(
+
+    class OverlimitCoordinator(_FakeCoordinator):
+        async def claim_sidebar_jobs_for_delivery(
+            self,
+            *,
+            limit: int,
+        ) -> tuple[SidebarDeliveryClaim, ...]:
+            self.sidebar_claim_limits.append(limit)
+            return self.sidebar_claims
+
+    coordinator = OverlimitCoordinator(
         bridge_id=claims[0].bridge_id,
         source_id=claims[0].source_session_id,
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = claims
-    original_get = store.get_sidebar_candidate_for_delivery
-    original_fail = store.fail_sidebar_job
-
-    def fail_first_source(source_session_id: str):
-        if source_session_id == claims[0].source_session_id:
-            raise RuntimeError("first source traceback token=must-not-leak")
-        return original_get(source_session_id)
-
-    cleanup_calls = 0
-
-    def fail_first_cleanup(**kwargs: Any):
-        nonlocal cleanup_calls
-        cleanup_calls += 1
-        if cleanup_calls == 1:
-            raise RuntimeError("first cleanup lease=" + claims[0].lease_token)
-        return original_fail(**kwargs)
-
-    monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", fail_first_source)
-    monkeypatch.setattr(store, "fail_sidebar_job", fail_first_cleanup)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         payload = _rpc(
             client,
             "tools/call",
-            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            {"name": "session_sidebar_pending", "arguments": {"limit": 1}},
             request_id=46,
         )
 
     serialized = json.dumps(payload)
     assert payload["result"]["isError"] is True
     assert "sidebar_pending_failed" in serialized
-    assert "must-not-leak" not in serialized
     assert all(claim.lease_token not in serialized for claim in claims)
+    assert coordinator.sidebar_claim_limits == [1]
     assert all(
         store.get_sidebar_job_for_source(claim.source_session_id)["state"]
         != "sidebar_leased"
         for claim in claims
+    )
+
+
+def test_session_sidebar_pending_rejects_list_result_and_rolls_back_real_lease(
+    db: SessionDB,
+) -> None:
+    store, claims = _seed_claimed_sidebar_pair(db)
+
+    class ListResultCoordinator(_FakeCoordinator):
+        async def claim_sidebar_jobs_for_delivery(
+            self,
+            *,
+            limit: int,
+        ) -> list[SidebarDeliveryClaim]:
+            self.sidebar_claim_limits.append(limit)
+            return [claims[0]]
+
+    coordinator = ListResultCoordinator(
+        bridge_id=claims[0].bridge_id,
+        source_id=claims[0].source_session_id,
+        target_id="codex:unused",
+    )
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {"name": "session_sidebar_pending", "arguments": {"limit": 1}},
+            request_id=47,
+        )
+
+    serialized = json.dumps(payload)
+    assert payload["result"]["isError"] is True
+    assert "sidebar_pending_failed" in serialized
+    assert claims[0].lease_token not in serialized
+    assert coordinator.sidebar_claim_limits == [1]
+    assert store.get_sidebar_job_for_source(claims[0].source_session_id)["state"] != (
+        "sidebar_leased"
     )
 
 
@@ -1647,6 +1841,7 @@ def test_session_sidebar_fail_has_fixed_schema_and_rejects_arbitrary_errors(
     coordinator = _FakeCoordinator(
         bridge_id="unused", source_id="claude:fail-source", target_id="codex:unused"
     )
+    thread_id = "55555555-5555-4555-8555-555555555555"
 
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         tools = _rpc(client, "tools/list")["result"]["tools"]
@@ -1670,15 +1865,30 @@ def test_session_sidebar_fail_has_fixed_schema_and_rejects_arbitrary_errors(
         failed = _call_tool(
             client,
             "session_sidebar_fail",
-            {"lease_token": token, "error_code": "desktop_offline"},
+            {
+                "lease_token": token,
+                "error_code": "desktop_offline",
+                "codex_thread_id": thread_id,
+            },
         )
 
-    assert set(schema["properties"]) == {"lease_token", "error_code"}
+    assert set(schema["properties"]) == {
+        "lease_token",
+        "error_code",
+        "codex_thread_id",
+    }
+    assert set(schema["required"]) == {"lease_token", "error_code"}
     assert arbitrary["result"]["isError"] is True
     assert token not in json.dumps(arbitrary)
     assert "super-secret" not in json.dumps(arbitrary)
-    assert set(failed) == {"state", "error_code"}
-    assert failed == {"state": "sidebar_retry", "error_code": "desktop_offline"}
+    assert failed == {
+        "state": "sidebar_retry",
+        "error_code": "desktop_offline",
+        "codex_thread_id": thread_id,
+    }
+    row = store.get_sidebar_job_for_source("claude:fail-source")
+    assert row is not None
+    assert row["codex_thread_id"] == thread_id
 
 
 def test_session_status_exposes_only_sanitized_sidebar_observability(
@@ -1700,7 +1910,7 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
     }
 
     with _test_client(_create_test_app(db, store, coordinator)) as client:
-        _call_tool(client, "session_sidebar_pending", {"limit": 5})
+        _call_tool(client, "session_sidebar_pending", {"limit": 1})
         status = _call_tool(client, "session_status", {})
 
     serialized = json.dumps(status)

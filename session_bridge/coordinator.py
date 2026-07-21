@@ -120,6 +120,7 @@ class SidebarDeliveryClaim:
     rename_required: bool
     recovered_thread: VerifiedSidebarThread | None
     reserved_thread_id: str | None = None
+    create_reserved: bool = False
 
 
 @dataclass(frozen=True)
@@ -1175,10 +1176,10 @@ class SessionBridgeCoordinator:
         self,
         *,
         now: float | None = None,
-        limit: int = 5,
+        limit: int = 1,
     ) -> tuple[SidebarDeliveryClaim, ...]:
-        if type(limit) is not int or not 1 <= limit <= 5:
-            raise ValueError("sidebar delivery limit must be between 1 and 5")
+        if type(limit) is not int or limit != 1:
+            raise ValueError("sidebar delivery limit must be exactly one")
         claim_time = _finite_number(self._clock() if now is None else now, "now")
         verifier = self._sidebar_verifier
         if verifier is None:
@@ -1213,6 +1214,7 @@ class SessionBridgeCoordinator:
             await self._cleanup_sidebar_delivery_claims(owned_tokens)
             raise ValueError("sidebar delivery claims are malformed")
         assert isinstance(raw_claims, list)
+        known_thread_ids: dict[str, str] = {}
 
         try:
             delivery: list[SidebarDeliveryClaim] = []
@@ -1239,6 +1241,30 @@ class SessionBridgeCoordinator:
                         "reserved Codex thread ID",
                     )
                 )
+                create_reserved = False
+                if reserved_thread_id is not None:
+                    known_thread_ids[lease_token] = reserved_thread_id
+                if reserved_thread_id is None:
+                    try:
+                        reservation_method = getattr(
+                            self._store,
+                            "get_sidebar_create_reservation",
+                        )
+                        if not callable(reservation_method):
+                            raise TypeError("sidebar reservation lookup is unavailable")
+                        reservation = await asyncio.to_thread(
+                            reservation_method,
+                            source_session_id,
+                        )
+                    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        await self._fail_sidebar_delivery_claim(
+                            lease_token,
+                            "bridge_temporarily_unavailable",
+                        )
+                        continue
+                    create_reserved = reservation is not None
                 recovered = None
                 if reserved_thread_id is None:
                     try:
@@ -1280,7 +1306,11 @@ class SessionBridgeCoordinator:
                     )
                     continue
                 if recovered is not None:
-                    reserved_thread_id = recovered.thread_id
+                    reserved_thread_id = _exact_sidebar_claim_text(
+                        recovered.thread_id,
+                        "recovered Codex thread ID",
+                    )
+                    known_thread_ids[lease_token] = reserved_thread_id
                     try:
                         await asyncio.to_thread(
                             _call,
@@ -1296,6 +1326,7 @@ class SessionBridgeCoordinator:
                         await self._fail_sidebar_delivery_claim(
                             lease_token,
                             "bridge_temporarily_unavailable",
+                            codex_thread_id=reserved_thread_id,
                         )
                         continue
                 delivery.append(
@@ -1307,6 +1338,7 @@ class SessionBridgeCoordinator:
                         rename_required=reserved_thread_id is not None,
                         recovered_thread=recovered,
                         reserved_thread_id=reserved_thread_id,
+                        create_reserved=create_reserved,
                     )
                 )
             heartbeat = getattr(
@@ -1319,12 +1351,18 @@ class SessionBridgeCoordinator:
             return tuple(delivery)
         except asyncio.CancelledError as cancelled:
             try:
-                await self._cleanup_sidebar_delivery_claims(owned_tokens)
+                await self._cleanup_sidebar_delivery_claims(
+                    owned_tokens,
+                    known_thread_ids=known_thread_ids,
+                )
             except BaseException:
                 pass
             _raise_detached_cancelled(cancelled)
         except BaseException:
-            await self._cleanup_sidebar_delivery_claims(owned_tokens)
+            await self._cleanup_sidebar_delivery_claims(
+                owned_tokens,
+                known_thread_ids=known_thread_ids,
+            )
             raise
 
     async def _finish_cancelled_sidebar_claim(
@@ -1426,16 +1464,23 @@ class SessionBridgeCoordinator:
         self,
         lease_token: str,
         error_code: str,
+        *,
+        codex_thread_id: str | None = None,
     ) -> bool:
         failure_time = _finite_number(self._clock(), "now")
         try:
+            arguments: dict[str, object] = {
+                "lease_token": lease_token,
+                "error_code": error_code,
+                "now": failure_time,
+            }
+            if codex_thread_id is not None:
+                arguments["codex_thread_id"] = codex_thread_id
             await asyncio.to_thread(
                 _call,
                 self._store,
                 "fail_sidebar_job",
-                lease_token=lease_token,
-                error_code=error_code,
-                now=failure_time,
+                **arguments,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -1447,17 +1492,26 @@ class SessionBridgeCoordinator:
     async def _cleanup_sidebar_delivery_claims(
         self,
         lease_tokens: Sequence[str],
+        *,
+        known_thread_ids: Mapping[str, str] | None = None,
     ) -> None:
         async def _cleanup() -> None:
             for lease_token in dict.fromkeys(lease_tokens):
                 try:
+                    arguments: dict[str, object] = {
+                        "lease_token": lease_token,
+                        "error_code": "broker_time_budget",
+                        "now": _finite_number(self._clock(), "now"),
+                    }
+                    if known_thread_ids is not None:
+                        thread_id = known_thread_ids.get(lease_token)
+                        if thread_id is not None:
+                            arguments["codex_thread_id"] = thread_id
                     await asyncio.to_thread(
                         _call,
                         self._store,
                         "fail_sidebar_job",
-                        lease_token=lease_token,
-                        error_code="broker_time_budget",
-                        now=_finite_number(self._clock(), "now"),
+                        **arguments,
                     )
                 except (KeyboardInterrupt, SystemExit):
                     raise
@@ -4111,9 +4165,9 @@ def _sidebar_claim_tokens(
 ) -> tuple[list[str], bool]:
     """Extract every recoverable lease token before validating the batch."""
 
-    if not isinstance(raw_claims, list):
+    if not isinstance(raw_claims, (list, tuple)):
         return [], True
-    malformed = len(raw_claims) > limit
+    malformed = not isinstance(raw_claims, list) or len(raw_claims) > limit
     owned_tokens: list[str] = []
     for raw_claim in raw_claims:
         if not isinstance(raw_claim, Mapping):

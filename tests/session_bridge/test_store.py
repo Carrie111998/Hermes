@@ -32,6 +32,7 @@ from session_bridge.mirror import (
 )
 from session_bridge.catalog import UnifiedCatalog
 from session_bridge.models import (
+    BridgeMarkerPayload,
     ContextPack,
     MirrorJobState,
     OriginKind,
@@ -42,10 +43,12 @@ from session_bridge.models import (
     SessionProjection,
     SidebarJobState,
     canonical_session_id,
+    encode_bridge_marker,
 )
 from session_bridge.sidebar import (
     SidebarCandidate,
     sidebar_bridge_id,
+    sidebar_create_recovery_key,
     sidebar_idempotency_key,
 )
 from session_bridge.store import (
@@ -477,11 +480,14 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
             assert _rows(reopened, "SELECT version FROM schema_version") == [
                 {"version": SCHEMA_VERSION}
             ]
-            assert _rows(
-                reopened,
-                "SELECT * FROM session_sidebar_jobs WHERE id = ?",
-                (queued["id"],),
-            ) == before
+            assert (
+                _rows(
+                    reopened,
+                    "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                    (queued["id"],),
+                )
+                == before
+            )
             assert _rows(
                 reopened,
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -2100,7 +2106,14 @@ def test_claude_visibility_commit_finalizes_preindexed_target_lineage_atomically
             origin_bridge_id=identity.bridge_id,
         )
     )
-    assert _rows(db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)) == []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
     claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     committed = store.commit_claude_visibility_job(
@@ -2121,11 +2134,14 @@ def test_claude_visibility_commit_finalizes_preindexed_target_lineage_atomically
             "bridge_id": identity.bridge_id,
         }
     ]
-    assert UnifiedCatalog(db, store).resolve_continuation(
-        session_id=candidate.source_session_id,
-        bridge_id=None,
-        target_provider="claude",
-    )["target_session_id"] == f"claude:{identity.claude_uuid}"
+    assert (
+        UnifiedCatalog(db, store).resolve_continuation(
+            session_id=candidate.source_session_id,
+            bridge_id=None,
+            target_provider="claude",
+        )["target_session_id"]
+        == f"claude:{identity.claude_uuid}"
+    )
 
 
 @pytest.mark.parametrize("source_provider", [Provider.CODEX, Provider.HERMES])
@@ -2429,13 +2445,16 @@ def test_claude_visibility_commit_rejects_invalid_digest_before_target_without_p
             100.0,
         )
 
-    assert _rows(
-        db,
-        """SELECT state, lease_digest, lease_expires_at, lease_kind,
+    assert (
+        _rows(
+            db,
+            """SELECT state, lease_digest, lease_expires_at, lease_kind,
                   completion_digest, visible_at
              FROM session_claude_visibility_jobs WHERE id = ?""",
-        (identity.job_id,),
-    )[0] == before
+            (identity.job_id,),
+        )[0]
+        == before
+    )
 
     store.upsert_projection(
         _projection(
@@ -2445,9 +2464,14 @@ def test_claude_visibility_commit_rejects_invalid_digest_before_target_without_p
             origin_bridge_id=identity.bridge_id,
         )
     )
-    assert _rows(
-        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
     committed = store.commit_claude_visibility_job(
         identity.job_id,
@@ -2549,9 +2573,14 @@ def test_claude_visibility_historical_lineage_validates_exact_native_source_iden
     assert result["repaired"] == 0
     assert result["remaining"] == 1
     assert result["blocker_codes"] == {expected_code: 1}
-    assert _rows(
-        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("source_provider", [Provider.CODEX, Provider.HERMES])
@@ -2579,9 +2608,7 @@ def test_claude_visibility_source_identity_mismatch_is_atomic_across_finalizers(
     claim = None
     if entrypoint == "commit":
         store.upsert_projection(target)
-        claim = store.claim_claude_visibility_job(
-            100.0, 60, 25, "0.50", "0.02"
-        )
+        claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
     elif entrypoint == "reconcile":
         store.upsert_projection(target)
         db._execute_write(
@@ -2612,9 +2639,7 @@ def test_claude_visibility_source_identity_mismatch_is_atomic_across_finalizers(
 
     if entrypoint == "commit":
         assert claim is not None
-        with pytest.raises(
-            ValueError, match="claude_lineage_source_identity_mismatch"
-        ):
+        with pytest.raises(ValueError, match="claude_lineage_source_identity_mismatch"):
             store.commit_claude_visibility_job(
                 identity.job_id, claim.lease_digest, "d" * 64, 100.0
             )
@@ -2626,19 +2651,25 @@ def test_claude_visibility_source_identity_mismatch_is_atomic_across_finalizers(
             "claude_lineage_source_identity_mismatch": 1
         }
     else:
-        with pytest.raises(
-            ValueError, match="claude_lineage_source_identity_mismatch"
-        ):
+        with pytest.raises(ValueError, match="claude_lineage_source_identity_mismatch"):
             store.upsert_projection(target)
 
-    assert _rows(
-        db,
-        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
-        (identity.job_id,),
-    )[0] == before_job
-    assert _rows(
-        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == []
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )[0]
+        == before_job
+    )
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
     if entrypoint == "upsert":
         assert store.get_external_session(f"claude:{identity.claude_uuid}") is None
 
@@ -2672,11 +2703,14 @@ def test_claude_visibility_commit_before_target_rejects_source_mismatch_without_
             identity.job_id, claim.lease_digest, "f" * 64, 100.0
         )
 
-    assert _rows(
-        db,
-        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
-        (identity.job_id,),
-    )[0] == before
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )[0]
+        == before
+    )
     store.upsert_projection(
         _projection(
             _message("target-user", "signed registration"),
@@ -2685,19 +2719,20 @@ def test_claude_visibility_commit_before_target_rejects_source_mismatch_without_
             origin_bridge_id=identity.bridge_id,
         )
     )
-    assert _rows(
-        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
     db._execute_write(
         lambda conn: conn.execute(
             "UPDATE sessions SET source = ? WHERE id = ?",
             (
-                (
-                    Provider.CODEX.value
-                    if source_provider is Provider.CODEX
-                    else "cli"
-                ),
+                (Provider.CODEX.value if source_provider is Provider.CODEX else "cli"),
                 candidate.source_session_id,
             ),
         )
@@ -2706,9 +2741,14 @@ def test_claude_visibility_commit_before_target_rejects_source_mismatch_without_
         identity.job_id, claim.lease_digest, "f" * 64, 100.0
     )
     assert committed["state"] == "claude_visible"
-    assert _rows(
-        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) != []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        != []
+    )
 
 
 def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idempotent(
@@ -2755,7 +2795,14 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
         "has_more": False,
         "complete": False,
     }
-    assert _rows(db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)) == []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
     applied = store.reconcile_claude_visibility_lineage(
         limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
@@ -2848,11 +2895,14 @@ def test_claude_visibility_lineage_cursor_advances_past_blocker_to_later_repair(
         "SELECT bridge_id FROM session_links WHERE bridge_id = ?",
         (repair_identity.bridge_id,),
     ) == [{"bridge_id": repair_identity.bridge_id}]
-    assert _rows(
-        db,
-        "SELECT bridge_id FROM session_links WHERE bridge_id = ?",
-        (blocked_identity.bridge_id,),
-    ) == []
+    assert (
+        _rows(
+            db,
+            "SELECT bridge_id FROM session_links WHERE bridge_id = ?",
+            (blocked_identity.bridge_id,),
+        )
+        == []
+    )
 
 
 def test_claude_visibility_lineage_cursor_is_stable_for_equal_timestamps_and_replay(
@@ -3219,12 +3269,17 @@ def test_claude_visibility_commit_lineage_mismatch_rolls_back_without_partial_wr
         "completion_digest": None,
         "visible_at": None,
     }
-    assert _rows(
-        db, "SELECT * FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == before_links
+    assert (
+        _rows(
+            db, "SELECT * FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+        )
+        == before_links
+    )
 
 
-def test_claude_visibility_historical_lineage_missing_source_remains_blocked(db) -> None:
+def test_claude_visibility_historical_lineage_missing_source_remains_blocked(
+    db,
+) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
     candidate, identity = _claude_visibility_identity("historical-missing-source")
     _enqueue_claude_visibility_job(store, candidate, identity)
@@ -3260,7 +3315,14 @@ def test_claude_visibility_historical_lineage_missing_source_remains_blocked(db)
         "has_more": False,
         "complete": False,
     }
-    assert _rows(db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)) == []
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("diverged_at", [None, 140.0])
@@ -3332,11 +3394,14 @@ def test_claude_visibility_continued_lineage_remains_healthy_and_idempotent(
             "diverged_at": diverged_at,
         }
     ]
-    assert UnifiedCatalog(db, store).resolve_continuation(
-        session_id=candidate.source_session_id,
-        bridge_id=None,
-        target_provider="claude",
-    )["target_session_id"] == f"claude:{identity.claude_uuid}"
+    assert (
+        UnifiedCatalog(db, store).resolve_continuation(
+            session_id=candidate.source_session_id,
+            bridge_id=None,
+            target_provider="claude",
+        )["target_session_id"]
+        == f"claude:{identity.claude_uuid}"
+    )
 
 
 @pytest.mark.parametrize("conflict", ["wrong_link_id", "forks", "extra_link"])
@@ -3416,9 +3481,12 @@ def test_claude_visibility_historical_link_identity_conflict_blocks_repair(
         "has_more": False,
         "complete": False,
     }
-    assert _rows(
-        db, "SELECT * FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == before
+    assert (
+        _rows(
+            db, "SELECT * FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+        )
+        == before
+    )
 
 
 def test_new_native_user_delta_promotes_placeholder(db):
@@ -5819,9 +5887,7 @@ def _canonical_terminal_evidence_for_test(
 ) -> str:
     job = store.get_sidebar_job_by_id(str(failed["id"]))
     assert job is not None
-    reservation = store.get_sidebar_create_reservation(
-        str(failed["source_session_id"])
-    )
+    reservation = store.get_sidebar_create_reservation(str(failed["source_session_id"]))
     assert reservation is not None
     return sidebar_terminal_evidence_digest(job=job, reservation=reservation)
 
@@ -5850,9 +5916,7 @@ def _drift_terminal_evidence_snapshot(
     )
     state_key = (
         "session-bridge:sidebar-create:"
-        + hashlib.sha256(
-            str(failed["source_session_id"]).encode("utf-8")
-        ).hexdigest()
+        + hashlib.sha256(str(failed["source_session_id"]).encode("utf-8")).hexdigest()
     )
     db._execute_write(
         lambda conn: conn.execute(
@@ -6547,6 +6611,211 @@ def test_sidebar_failure_atomically_retains_known_thread_after_bind_ambiguity(
     assert reclaimed["codex_thread_id"] == "codex-bind-loss-thread"
 
 
+def test_expired_sidebar_bind_retains_exact_thread_across_restart(tmp_path) -> None:
+    path = tmp_path / "expired-sidebar-bind.db"
+    first_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(
+            first_db,
+            sidebar_token_factory=_token_factory("expired-bind-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        candidate = _sidebar_candidate(first_db, native_id="expired-bind-retention")
+        first.enqueue_sidebar_job(candidate)
+        lease = first.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+        with pytest.raises(ValueError, match="sidebar lease has expired"):
+            first.bind_sidebar_thread(
+                lease_token=lease["lease_token"],
+                codex_thread_id="codex-expired-bind-thread",
+                now=400.0,
+            )
+    finally:
+        first_db.close()
+
+    reopened_db = SessionDB(path)
+    try:
+        reopened = SessionBridgeStore(reopened_db)
+        persisted = reopened.get_sidebar_job_for_source(candidate.source_session_id)
+        assert persisted["state"] == SidebarJobState.RETRY.value
+        assert persisted["codex_thread_id"] == "codex-expired-bind-thread"
+    finally:
+        reopened_db.close()
+
+
+def test_sidebar_create_reservation_cutover_quarantines_expired_legacy_lease_once(
+    db,
+) -> None:
+    marker_secret = b"cutover-marker-secret" * 2
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 100.0,
+        sidebar_token_factory=_token_factory("cutover-expired-token"),
+    )
+    legacy = _sidebar_candidate(
+        db,
+        native_id="cutover-expired",
+        eligible_at=90.0,
+    )
+    pristine = _sidebar_candidate(db, native_id="cutover-pristine")
+    legacy_job = store.enqueue_sidebar_job(legacy)
+    pristine_job = store.enqueue_sidebar_job(pristine)
+    store.claim_sidebar_jobs(now=100.0, limit=1)
+
+    applied = store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=400.0,
+    )
+
+    assert applied == {
+        "version": 1,
+        "applied_at": 400.0,
+        "quarantined": 1,
+        "replayed": False,
+    }
+    assert store.get_state("session-bridge:sidebar:create-reservation-cutover:v1") == {
+        "version": 1,
+        "applied_at": 400.0,
+        "quarantined_job_ids": [legacy_job["id"]],
+    }
+    reservation = store.get_sidebar_create_reservation(legacy.source_session_id)
+    assert reservation is not None
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=legacy.bridge_id,
+            source_session_id=legacy.source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_secret,
+    )
+    assert reservation["recovery_key"] == sidebar_create_recovery_key(
+        marker,
+        marker_secret,
+    )
+    assert store.get_sidebar_create_reservation(pristine.source_session_id) is None
+    assert reservation["recovery_key"] not in json.dumps(applied)
+    assert marker_secret.hex() not in json.dumps(applied)
+
+    replay = store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=500.0,
+    )
+    assert replay == {
+        "version": 1,
+        "applied_at": 400.0,
+        "quarantined": 1,
+        "replayed": True,
+    }
+
+    def _post_cutover_retry(conn):
+        conn.execute(
+            """UPDATE session_sidebar_jobs
+                  SET state = ?, attempts = 1, error_code = ?,
+                      next_attempt_at = 600.0, updated_at = 500.0
+                WHERE id = ?""",
+            (
+                SidebarJobState.RETRY.value,
+                "sqlite_busy",
+                pristine_job["id"],
+            ),
+        )
+
+    db._execute_write(_post_cutover_retry)
+    store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=550.0,
+    )
+    assert store.get_sidebar_create_reservation(pristine.source_session_id) is None
+
+
+def test_sidebar_create_reservation_cutover_refuses_an_active_lease(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 100.0,
+        sidebar_token_factory=_token_factory("cutover-active-token"),
+    )
+    candidate = _sidebar_candidate(db, native_id="cutover-active")
+    store.enqueue_sidebar_job(candidate)
+    store.claim_sidebar_jobs(now=100.0, limit=1)
+
+    with pytest.raises(ValueError, match="active sidebar lease"):
+        store.apply_sidebar_create_reservation_cutover(
+            marker_secret=b"active-cutover-secret" * 2,
+            now=200.0,
+        )
+
+    assert (
+        store.get_state("session-bridge:sidebar:create-reservation-cutover:v1") is None
+    )
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) is None
+
+
+def test_sidebar_create_reservation_cutover_replay_fails_on_reservation_drift(
+    db,
+) -> None:
+    marker_secret = b"replay-cutover-secret" * 2
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 100.0,
+        sidebar_token_factory=_token_factory("cutover-replay-token"),
+    )
+    candidate = _sidebar_candidate(db, native_id="cutover-replay")
+    store.enqueue_sidebar_job(candidate)
+    store.claim_sidebar_jobs(now=100.0, limit=1)
+    store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=400.0,
+    )
+    reservation_key = (
+        "session-bridge:sidebar-create:"
+        + hashlib.sha256(candidate.source_session_id.encode("utf-8")).hexdigest()
+    )
+    reservation = store.get_state(reservation_key)
+    assert reservation is not None
+    reservation["recovery_key"] = "hermes-session-bridge-create-v1:tampered"
+    store.set_state(reservation_key, reservation)
+
+    with pytest.raises(ValueError, match="cutover.*reservation"):
+        store.apply_sidebar_create_reservation_cutover(
+            marker_secret=marker_secret,
+            now=500.0,
+        )
+
+
+def test_expired_sidebar_fail_retains_exact_thread_across_restart(tmp_path) -> None:
+    path = tmp_path / "expired-sidebar-fail.db"
+    first_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(
+            first_db,
+            sidebar_token_factory=_token_factory("expired-fail-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        candidate = _sidebar_candidate(first_db, native_id="expired-fail-retention")
+        first.enqueue_sidebar_job(candidate)
+        lease = first.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+        with pytest.raises(ValueError, match="sidebar lease has expired"):
+            first.fail_sidebar_job(
+                lease_token=lease["lease_token"],
+                error_code="bridge_temporarily_unavailable",
+                codex_thread_id="codex-expired-fail-thread",
+                now=400.0,
+            )
+    finally:
+        first_db.close()
+
+    reopened_db = SessionDB(path)
+    try:
+        reopened = SessionBridgeStore(reopened_db)
+        persisted = reopened.get_sidebar_job_for_source(candidate.source_session_id)
+        assert persisted["state"] == SidebarJobState.RETRY.value
+        assert persisted["codex_thread_id"] == "codex-expired-fail-thread"
+    finally:
+        reopened_db.close()
+
+
 def test_sidebar_execution_blockers_report_any_failed_row(db) -> None:
     store = SessionBridgeStore(
         db,
@@ -6608,30 +6877,32 @@ def test_sidebar_terminal_resolution_is_append_only_and_unblocks_unrelated_work(
             "failure_next_attempt_at": failed["next_attempt_at"],
             "failure_updated_at": failed["updated_at"],
             "resolution_code": "native_thread_unrecoverable",
-            "evidence_kind": (
-                "codex_app_server_read_not_loaded_resume_no_rollout"
-            ),
+            "evidence_kind": ("codex_app_server_read_not_loaded_resume_no_rollout"),
             "evidence_version": 1,
             "evidence_digest": evidence_digest,
             "resolved_at": 200.0,
         }
     ]
     assert _rows(db, "SELECT * FROM session_sidebar_exclusions") == []
-    assert _rows(
-        db,
-        "SELECT * FROM session_links WHERE bridge_id = ?",
-        (candidate.bridge_id,),
-    ) == []
-    assert _rows(
-        db,
-        "SELECT * FROM external_sessions WHERE provider = 'codex' AND native_id = ?",
-        (failed["codex_thread_id"],),
-    ) == []
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_links WHERE bridge_id = ?",
+            (candidate.bridge_id,),
+        )
+        == []
+    )
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM external_sessions WHERE provider = 'codex' AND native_id = ?",
+            (failed["codex_thread_id"],),
+        )
+        == []
+    )
     assert store.sidebar_execution_blockers() == ()
     claimed = store.claim_sidebar_jobs(now=200.0, limit=1)
-    assert [row["source_session_id"] for row in claimed] == [
-        pending.source_session_id
-    ]
+    assert [row["source_session_id"] for row in claimed] == [pending.source_session_id]
     assert store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
 
     status = store.sidebar_delivery_status(now=200.0)
@@ -6664,8 +6935,7 @@ def test_sidebar_terminal_resolution_replay_is_idempotent_and_conflicts_fail_clo
     assert replay == {**first, "created": False}
     assert _rows(
         db,
-        "SELECT evidence_digest, resolved_at "
-        "FROM session_sidebar_terminal_resolutions",
+        "SELECT evidence_digest, resolved_at FROM session_sidebar_terminal_resolutions",
     ) == [{"evidence_digest": evidence_digest, "resolved_at": 200.0}]
     with pytest.raises(ValueError, match="terminal resolution"):
         _acknowledge_terminal_resolution(
@@ -6885,9 +7155,7 @@ def test_sidebar_terminal_resolution_ledger_rows_cannot_be_changed_or_deleted(
                 replacement,
             )
         )
-    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == [
-        existing
-    ]
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == [existing]
 
 
 @pytest.mark.parametrize(
@@ -7078,9 +7346,10 @@ def test_sidebar_terminal_resolution_concurrent_replay_converges_once(tmp_path) 
             results = list(pool.map(resolve, stores))
 
         assert sorted(result["created"] for result in results) == [False, True]
-        assert len(
-            _rows(first_db, "SELECT * FROM session_sidebar_terminal_resolutions")
-        ) == 1
+        assert (
+            len(_rows(first_db, "SELECT * FROM session_sidebar_terminal_resolutions"))
+            == 1
+        )
     finally:
         first_db.close()
         second_db.close()
@@ -7096,8 +7365,7 @@ def test_sidebar_retry_rejects_any_job_with_terminal_resolution_history(db) -> N
     _acknowledge_terminal_resolution(store, failed)
     db._execute_write(
         lambda conn: conn.execute(
-            "UPDATE session_sidebar_jobs SET codex_thread_id = NULL "
-            "WHERE id = ?",
+            "UPDATE session_sidebar_jobs SET codex_thread_id = NULL WHERE id = ?",
             (failed["id"],),
         )
     )
@@ -7143,9 +7411,7 @@ def test_sidebar_terminal_resolution_snapshot_drift_is_an_explicit_blocker(
         thread_id="019f-terminal-snapshot-drift",
     )
     _acknowledge_terminal_resolution(store, failed)
-    db._execute_write(
-        lambda conn: conn.execute(mutation_sql, (failed["id"],))
-    )
+    db._execute_write(lambda conn: conn.execute(mutation_sql, (failed["id"],)))
 
     assert store.sidebar_execution_blockers() == expected_blockers
     status = store.sidebar_delivery_status(now=300.0)
@@ -7540,6 +7806,7 @@ def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimall
 
     active = store.lookup_sidebar_job_by_lease(lease["lease_token"])
     assert active == {
+        "id": lease["id"],
         "source_session_id": candidate.source_session_id,
         "bridge_id": candidate.bridge_id,
         "state": SidebarJobState.LEASED.value,
@@ -7555,6 +7822,7 @@ def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimall
         now=200.0,
     )
     assert store.lookup_sidebar_job_by_lease(lease["lease_token"]) == {
+        "id": lease["id"],
         "source_session_id": candidate.source_session_id,
         "bridge_id": candidate.bridge_id,
         "state": SidebarJobState.VISIBLE.value,
@@ -8868,16 +9136,22 @@ def test_claude_auth_recovery_rejects_invalid_digest_before_mutation(
                 visible_at=101.0,
             )
 
-    assert _rows(
-        db,
-        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
-        (identity.job_id,),
-    )[0] == before_job
-    assert _rows(
-        db,
-        "SELECT * FROM session_claude_auth_recoveries WHERE job_id = ?",
-        (identity.job_id,),
-    )[0] == before_recovery
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )[0]
+        == before_job
+    )
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_claude_auth_recoveries WHERE job_id = ?",
+            (identity.job_id,),
+        )[0]
+        == before_recovery
+    )
 
 
 @pytest.mark.parametrize("recovery_mode", ["leased_commit", "crash_reconcile"])
@@ -8886,9 +9160,7 @@ def test_claude_auth_recovery_finalizes_preindexed_target_lineage(
     recovery_mode: str,
 ) -> None:
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
-    candidate, identity = _claude_visibility_identity(
-        f"auth-lineage-{recovery_mode}"
-    )
+    candidate, identity = _claude_visibility_identity(f"auth-lineage-{recovery_mode}")
     store.upsert_projection(
         _projection(
             _message("source-user", "meaningful request"),
@@ -9139,9 +9411,7 @@ def test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_histor
     store.retry_claude_visibility_job(
         identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
     )
-    reconciliation = store.claim_claude_visibility_job(
-        100.0, 60, 25, "1.00", "0.02", 1
-    )
+    reconciliation = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
     store.record_claude_visibility_exact_id_absent(
         identity.job_id,
         reconciliation.lease_digest,
@@ -9150,9 +9420,7 @@ def test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_histor
         "a" * 64,
     )
     clock[0] = 86_500.0
-    exhausted = store.claim_claude_visibility_job(
-        86_500.0, 60, 25, "1.00", "0.02", 1
-    )
+    exhausted = store.claim_claude_visibility_job(86_500.0, 60, 25, "1.00", "0.02", 1)
     assert exhausted.status == "max_attempts_exhausted"
 
     repaired = store.requeue_failed_claude_visibility_reconciliation(

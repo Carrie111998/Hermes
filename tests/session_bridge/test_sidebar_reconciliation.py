@@ -43,10 +43,17 @@ class FakeSidebarStore:
         *,
         claim_after: float = 0.0,
         reserved_thread_id: str | None = None,
+        create_reserved: bool = False,
+        reservation_error: Exception | None = None,
+        bind_error: Exception | None = None,
     ) -> None:
         self.claim_after = claim_after
         self.reserved_thread_id = reserved_thread_id
+        self.create_reserved = create_reserved
+        self.reservation_error = reservation_error
+        self.bind_error = bind_error
         self.failures: list[tuple[str, str, float]] = []
+        self.failure_thread_ids: list[str | None] = []
         self.binds: list[tuple[str, str, float]] = []
         self.commits: list[tuple[str, str, float]] = []
 
@@ -66,6 +73,8 @@ class FakeSidebarStore:
     def bind_sidebar_thread(
         self, *, lease_token: str, codex_thread_id: str, now: float
     ) -> dict[str, Any]:
+        if self.bind_error is not None:
+            raise self.bind_error
         self.binds.append((lease_token, codex_thread_id, now))
         self.reserved_thread_id = codex_thread_id
         return {
@@ -74,9 +83,15 @@ class FakeSidebarStore:
         }
 
     def fail_sidebar_job(
-        self, *, lease_token: str, error_code: str, now: float
+        self,
+        *,
+        lease_token: str,
+        error_code: str,
+        now: float,
+        codex_thread_id: str | None = None,
     ) -> dict[str, Any]:
         self.failures.append((lease_token, error_code, now))
+        self.failure_thread_ids.append(codex_thread_id)
         return {**_leased_job(), "state": "sidebar_failed", "error_code": error_code}
 
     def commit_sidebar_job(
@@ -96,6 +111,23 @@ class FakeSidebarStore:
             "bridge_id": BRIDGE,
             "state": "sidebar_leased",
             "codex_thread_id": None,
+        }
+
+    def get_sidebar_create_reservation(
+        self, source_session_id: str
+    ) -> dict[str, Any] | None:
+        assert source_session_id == SOURCE
+        if self.reservation_error is not None:
+            raise self.reservation_error
+        if not self.create_reserved:
+            return None
+        return {
+            "version": 1,
+            "job_id": "sidebar-job:1",
+            "source_session_id": SOURCE,
+            "bridge_id": BRIDGE,
+            "recovery_key": "hermes-session-bridge-create-v1:" + "a" * 64,
+            "reserved_at": 90.0,
         }
 
 
@@ -178,6 +210,62 @@ def test_verified_sidebar_thread_is_frozen() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reserved_create_with_zero_marker_is_returned_as_no_create_boundary() -> (
+    None
+):
+    coordinator = _coordinator(
+        FakeSidebarStore(create_reserved=True),
+        FakeVerifier(None),
+    )
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert len(claims) == 1
+    assert claims[0].create_reserved is True
+    assert claims[0].reserved_thread_id is None
+    assert claims[0].recovered_thread is None
+
+
+@pytest.mark.asyncio
+async def test_missing_create_reservation_capability_fails_closed_before_marker_search() -> (
+    None
+):
+    store = FakeSidebarStore()
+    store.get_sidebar_create_reservation = None  # type: ignore[method-assign]
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert verifier.find_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unreadable_create_reservation_fails_closed_before_marker_search() -> (
+    None
+):
+    store = FakeSidebarStore(reservation_error=RuntimeError("stale store"))
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert verifier.find_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sidebar_delivery_claim_rejects_every_limit_except_one() -> None:
+    coordinator = _coordinator(FakeSidebarStore(), FakeVerifier(None))
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+
+
+@pytest.mark.asyncio
 async def test_lost_commit_recovers_one_authenticated_thread_without_creation() -> None:
     store = FakeSidebarStore()
     verifier = FakeVerifier(_verified())
@@ -194,6 +282,56 @@ async def test_lost_commit_recovers_one_authenticated_thread_without_creation() 
     ]
     assert store.binds == [("opaque-lease-token", THREAD, 100.0)]
     assert store.failures == []
+
+
+@pytest.mark.asyncio
+async def test_recovered_thread_bind_failure_atomically_retains_exact_id() -> None:
+    store = FakeSidebarStore(bind_error=RuntimeError("bind unavailable"))
+    verifier = FakeVerifier(_verified())
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert store.failure_thread_ids == [THREAD]
+
+
+class BlockingBindStore(FakeSidebarStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bind_started = threading.Event()
+        self.bind_release = threading.Event()
+
+    def bind_sidebar_thread(
+        self, *, lease_token: str, codex_thread_id: str, now: float
+    ) -> dict[str, Any]:
+        self.bind_started.set()
+        assert self.bind_release.wait(timeout=5)
+        return super().bind_sidebar_thread(
+            lease_token=lease_token,
+            codex_thread_id=codex_thread_id,
+            now=now,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_recovered_bind_settles_with_exact_id() -> None:
+    store = BlockingBindStore()
+    coordinator = _coordinator(store, FakeVerifier(_verified()))
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    )
+    assert await asyncio.to_thread(store.bind_started.wait, 5)
+
+    claim_task.cancel("cancel-during-recovered-bind")
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await claim_task
+    finally:
+        store.bind_release.set()
+
+    assert store.failure_thread_ids == [THREAD]
 
 
 @pytest.mark.asyncio
@@ -260,6 +398,26 @@ async def test_related_near_match_is_persisted_fatal_and_never_exposed(
     assert claims == ()
     assert store.failures == [("opaque-lease-token", code, 100.0)]
     assert store.commits == []
+
+
+@pytest.mark.asyncio
+async def test_mismatched_verifier_candidate_id_is_never_durably_bound() -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(
+        VerifiedSidebarThread(
+            thread_id=THREAD,
+            source_session_id="claude:wrong-source",
+            bridge_id=BRIDGE,
+        )
+    )
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert claims == ()
+    assert store.failures == [("opaque-lease-token", "source_identity_mismatch", 100.0)]
+    assert store.failure_thread_ids == [None]
+    assert store.binds == []
 
 
 @pytest.mark.asyncio
@@ -434,14 +592,14 @@ async def test_reconciliation_failure_uses_fresh_clock_and_hides_expired_lease()
 @pytest.mark.asyncio
 async def test_cancelled_reconciliation_releases_every_claimed_lease(tmp_path) -> None:
     db = SessionDB(tmp_path / "cancelled-sidebar.db")
-    tokens = iter(("cancelled-lease-one", "cancelled-lease-two"))
+    tokens = iter(("cancelled-lease-one",))
     store = SessionBridgeStore(
         db,
         sidebar_token_factory=lambda: next(tokens),
         sidebar_jitter=lambda _bound: 0.0,
     )
     sources: list[str] = []
-    for ordinal in (1, 2):
+    for ordinal in (1,):
         source = f"claude:cancelled-{ordinal}"
         sources.append(source)
         db.ensure_session(source, source="cli")
@@ -463,7 +621,7 @@ async def test_cancelled_reconciliation_releases_every_claimed_lease(tmp_path) -
     coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
 
     claim_task = asyncio.create_task(
-        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
     )
     assert await asyncio.to_thread(verifier.started.wait, 5)
     claim_task.cancel()
@@ -484,14 +642,14 @@ async def test_cancelled_durable_claim_returns_by_deadline_then_recovers_in_back
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = SessionDB(tmp_path / "cancelled-during-claim.db")
-    tokens = iter(("claim-boundary-one", "claim-boundary-two"))
+    tokens = iter(("claim-boundary-one",))
     store = SessionBridgeStore(
         db,
         sidebar_token_factory=lambda: next(tokens),
         sidebar_jitter=lambda _bound: 0.0,
     )
     sources: list[str] = []
-    for ordinal in (1, 2):
+    for ordinal in (1,):
         source = f"claude:claim-boundary-{ordinal}"
         sources.append(source)
         db.ensure_session(source, source="cli")
@@ -527,7 +685,7 @@ async def test_cancelled_durable_claim_returns_by_deadline_then_recovers_in_back
         recovery_timeout=0.02,
     )
     claim_task = asyncio.create_task(
-        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
     )
     assert await asyncio.to_thread(committed.wait, 5)
 
@@ -677,20 +835,49 @@ async def test_malformed_claim_batch_releases_every_recoverable_token() -> None:
     assert verifier.find_calls == []
 
 
+class TupleClaimBatchStore(MalformedClaimBatchStore):
+    def claim_sidebar_jobs(
+        self, *, now: float, limit: int, lease_seconds: int
+    ) -> tuple[dict[str, Any] | object, ...]:
+        return tuple(
+            super().claim_sidebar_jobs(
+                now=now,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            )
+        )
+
+
 @pytest.mark.asyncio
-async def test_repeated_cancellation_during_cleanup_still_releases_full_batch(
+async def test_wrong_claim_container_releases_every_recoverable_token() -> None:
+    store = TupleClaimBatchStore()
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
+
+    with pytest.raises(ValueError, match="claims are malformed"):
+        await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert store.failures == [
+        ("malformed-batch-one", "broker_time_budget", 100.0),
+        ("malformed-batch-two", "broker_time_budget", 100.0),
+    ]
+    assert verifier.find_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_cleanup_still_releases_single_lease(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = SessionDB(tmp_path / "repeated-cancel-cleanup.db")
-    tokens = iter(("repeated-cancel-one", "repeated-cancel-two"))
+    tokens = iter(("repeated-cancel-one",))
     store = SessionBridgeStore(
         db,
         sidebar_token_factory=lambda: next(tokens),
         sidebar_jitter=lambda _bound: 0.0,
     )
     sources: list[str] = []
-    for ordinal in (1, 2):
+    for ordinal in (1,):
         source = f"claude:repeated-cancel-{ordinal}"
         sources.append(source)
         db.ensure_session(source, source="cli")
@@ -725,7 +912,7 @@ async def test_repeated_cancellation_during_cleanup_still_releases_full_batch(
     monkeypatch.setattr(store, "fail_sidebar_job", blocking_first_cleanup)
     coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
     claim_task = asyncio.create_task(
-        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
     )
     assert await asyncio.to_thread(verifier.started.wait, 5)
     claim_task.cancel()
@@ -739,7 +926,7 @@ async def test_repeated_cancellation_during_cleanup_still_releases_full_batch(
     with pytest.raises(asyncio.CancelledError):
         await claim_task
 
-    assert cleanup_calls == 2
+    assert cleanup_calls == 1
     assert all(
         store.get_sidebar_job_for_source(source)["state"] == "sidebar_pending"
         for source in sources
@@ -818,13 +1005,6 @@ class CleanupFailureStore(FakeSidebarStore):
         super().__init__()
         self.claims = [
             {**_leased_job(), "lease_token": "cleanup-one"},
-            {
-                **_leased_job(),
-                "id": "sidebar-job:2",
-                "source_session_id": "claude:source-2",
-                "bridge_id": "sidebar:bridge-2",
-                "lease_token": "cleanup-two",
-            },
         ]
 
     def claim_sidebar_jobs(
@@ -838,17 +1018,17 @@ class CleanupFailureStore(FakeSidebarStore):
         self.failures.append((lease_token, error_code, now))
         if lease_token == "cleanup-one":
             raise RuntimeError("first cleanup failed")
-        return {**self.claims[1], "state": "sidebar_pending"}
+        return {**self.claims[0], "state": "sidebar_pending"}
 
 
 @pytest.mark.asyncio
-async def test_cancelled_reconciliation_cleanup_continues_after_one_failure() -> None:
+async def test_cancelled_reconciliation_cleanup_failure_does_not_mask_cancel() -> None:
     store = CleanupFailureStore()
     verifier = BlockingVerifier()
     coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
 
     claim_task = asyncio.create_task(
-        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
     )
     assert await asyncio.to_thread(verifier.started.wait, 5)
     claim_task.cancel()
@@ -858,5 +1038,4 @@ async def test_cancelled_reconciliation_cleanup_continues_after_one_failure() ->
 
     assert store.failures == [
         ("cleanup-one", "broker_time_budget", 100.0),
-        ("cleanup-two", "broker_time_budget", 100.0),
     ]
