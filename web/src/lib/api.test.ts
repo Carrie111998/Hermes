@@ -104,3 +104,22 @@ describe("api OAuth helpers", () => {
     }
   });
 });
+
+describe("api.setProfileReasoning", () => {
+  it("writes the selected effort to the requested profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ ok: true, reasoning_effort: "high" });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.setProfileReasoning("my profile", "high");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profiles/my%20profile/reasoning",
+      expect.objectContaining({
+        body: JSON.stringify({ effort: "high" }),
+        credentials: "include",
+        method: "PUT",
+      }),
+    );
+  });
+});

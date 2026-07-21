@@ -29,6 +29,10 @@ export const VALID_EFFORTS: ReadonlySet<string> = new Set(
   EFFORT_OPTIONS.map((o) => o.value),
 );
 
+export function effortLabel(value: string): string {
+  return EFFORT_OPTIONS.find((option) => option.value === value)?.label ?? value;
+}
+
 /** Normalize a raw `agent.reasoning_effort` config value to a selectable
  *  option. Empty/unknown → `medium` (Hermes' default when unset). */
 export function normalizeEffort(raw: unknown): string {

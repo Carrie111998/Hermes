@@ -709,6 +709,15 @@ export const api = {
         body: JSON.stringify({ provider, model }),
       },
     ),
+  setProfileReasoning: (name: string, effort: string) =>
+    fetchJSON<{ ok: boolean; reasoning_effort: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/reasoning`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ effort }),
+      },
+    ),
   renameProfile: (name: string, newName: string) =>
     fetchJSON<{ ok: boolean; name: string; path: string }>(
       `/api/profiles/${encodeURIComponent(name)}`,
@@ -2118,6 +2127,7 @@ export interface ProfileInfo {
   is_default: boolean;
   model: string | null;
   provider: string | null;
+  reasoning_effort: string;
   has_env: boolean;
   skill_count: number;
   gateway_running: boolean;

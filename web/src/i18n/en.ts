@@ -366,6 +366,10 @@ export const en: Translations = {
     editModel: "Change model",
     modelSaved: "Model updated",
     modelSelect: "Select a model",
+    reasoningEffort: "Reasoning effort",
+    reasoningInherit: "Inherit provider default",
+    reasoningSaved: "Reasoning effort updated",
+    reasoningUnset: "provider default",
     actions: "Actions",
   },
 

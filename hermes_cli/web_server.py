@@ -944,6 +944,25 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "API service tier (OpenAI/Anthropic)",
         "options": ["", "auto", "default", "flex"],
     },
+    # This virtual field is intentionally absent from DEFAULT_CONFIG: an empty
+    # value preserves the provider default and is only written when selected.
+    "agent.reasoning_effort": {
+        "type": "select",
+        "description": "Reasoning effort for the main agent",
+        "category": "agent",
+        "emptyLabel": "Inherit provider default",
+        "options": [
+            "",
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        ],
+    },
     "delegation.reasoning_effort": {
         "type": "select",
         "description": "Reasoning effort for delegated subagents",
@@ -1079,12 +1098,18 @@ CONFIG_SCHEMA = _build_schema_from_config(DEFAULT_CONFIG)
 # by the normalize/denormalize cycle.  Insert model_context_length right after
 # the "model" key so it renders adjacent in the frontend.
 _mcl_entry = _SCHEMA_OVERRIDES["model_context_length"]
+_reasoning_entry = _SCHEMA_OVERRIDES["agent.reasoning_effort"]
 _ordered_schema: Dict[str, Dict[str, Any]] = {}
 for _k, _v in CONFIG_SCHEMA.items():
     _ordered_schema[_k] = _v
     if _k == "model":
         _ordered_schema["model_context_length"] = _mcl_entry
+        _ordered_schema["agent.reasoning_effort"] = _reasoning_entry
 CONFIG_SCHEMA = _ordered_schema
+
+_REASONING_EFFORT_OPTIONS = tuple(
+    _SCHEMA_OVERRIDES["agent.reasoning_effort"]["options"]
+)
 
 
 def _is_command_provider_block(value: Any) -> bool:
@@ -7509,11 +7534,34 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # key absent from the schema — most visibly ``custom_providers``, but
             # also ``agent.personalities``, ``terminal.lifetime_seconds``, etc. —
             # is not sent in the PUT body. A full-replace save would silently
-            # drop those keys. Deep-merge incoming over what's on disk so the
+            # is not sent in the PUT body. Deep-merge incoming over what's on disk so the
             # frontend can only overwrite what it explicitly sends.
             existing = read_raw_config()
             incoming = _denormalize_config_from_web(body.config)
-            save_config(_deep_merge(existing, incoming))
+            incoming_agent = incoming.get("agent")
+            reasoning_empty = False
+            if isinstance(incoming_agent, dict) and "reasoning_effort" in incoming_agent:
+                effort = incoming_agent["reasoning_effort"]
+                if effort is False or (
+                    isinstance(effort, str)
+                    and effort.strip().lower() in {"false", "disabled"}
+                ):
+                    effort = "none"
+                if (
+                    not isinstance(effort, str)
+                    or effort.strip().lower() not in _REASONING_EFFORT_OPTIONS
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="invalid agent.reasoning_effort",
+                    )
+                effort = effort.strip().lower()
+                reasoning_empty = effort == ""
+                incoming_agent["reasoning_effort"] = effort
+            merged = _deep_merge(existing, incoming)
+            if reasoning_empty and isinstance(merged.get("agent"), dict):
+                merged["agent"].pop("reasoning_effort", None)
+            save_config(merged)
         return {"ok": True}
     except HTTPException:
         raise
@@ -15162,6 +15210,10 @@ class ProfileModelUpdate(BaseModel):
     model: str
 
 
+class ProfileReasoningUpdate(BaseModel):
+    effort: str = ""
+
+
 class ProfileDescribeAuto(BaseModel):
     overwrite: bool = False
 
@@ -15173,13 +15225,57 @@ def _profile_attr(info, name: str, default: Any = None) -> Any:
         return default
 
 
+def _read_profile_reasoning_effort(profile_dir: Path) -> str:
+    """Read and canonicalize a profile's optional main-agent default."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        config = load_config()
+        agent = config.get("agent")
+        raw = agent.get("reasoning_effort") if isinstance(agent, dict) else ""
+        if raw is False or (
+            isinstance(raw, str) and raw.strip().lower() in {"false", "disabled"}
+        ):
+            return "none"
+        value = str(raw or "").strip().lower()
+        return value if value in _REASONING_EFFORT_OPTIONS else ""
+    except Exception:
+        return ""
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _write_profile_reasoning_effort(profile_dir: Path, effort: str) -> str:
+    """Persist or clear a profile's optional main-agent default."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        config = load_config()
+        agent = config.get("agent")
+        if not isinstance(agent, dict):
+            agent = {}
+            config["agent"] = agent
+        if effort:
+            agent["reasoning_effort"] = effort
+        else:
+            agent.pop("reasoning_effort", None)
+        save_config(config)
+        return effort
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _profile_to_dict(info) -> Dict[str, Any]:
+    profile_path = Path(str(_profile_attr(info, "path", "")))
     return {
         "name": _profile_attr(info, "name", ""),
         "path": str(_profile_attr(info, "path", "")),
         "is_default": bool(_profile_attr(info, "is_default", False)),
         "model": _profile_attr(info, "model"),
         "provider": _profile_attr(info, "provider"),
+        "reasoning_effort": _read_profile_reasoning_effort(profile_path),
         "has_env": bool(_profile_attr(info, "has_env", False)),
         "skill_count": int(_profile_attr(info, "skill_count", 0) or 0),
         "gateway_running": bool(_profile_attr(info, "gateway_running", False)),
@@ -15209,6 +15305,7 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
             "is_default": True,
             "model": model,
             "provider": provider,
+            "reasoning_effort": _safe(lambda: _read_profile_reasoning_effort(default_home), ""),
             "has_env": (default_home / ".env").exists(),
             "skill_count": _safe(lambda: profiles_mod._count_skills(default_home), 0),
             "gateway_running": _safe(lambda: profiles_mod._check_gateway_running(default_home), False),
@@ -15232,6 +15329,7 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
                 "is_default": False,
                 "model": model,
                 "provider": provider,
+                "reasoning_effort": _safe(lambda entry=entry: _read_profile_reasoning_effort(entry), ""),
                 "has_env": (entry / ".env").exists(),
                 "skill_count": _safe(lambda entry=entry: profiles_mod._count_skills(entry), 0),
                 "gateway_running": _safe(lambda entry=entry: profiles_mod._check_gateway_running(entry), False),
@@ -15689,6 +15787,25 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
         _log.exception("PUT /api/profiles/%s/model failed", name)
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True, "provider": provider, "model": model}
+
+
+@app.put("/api/profiles/{name}/reasoning")
+async def update_profile_reasoning_endpoint(name: str, body: ProfileReasoningUpdate):
+    """Set or clear a profile's main-agent reasoning default."""
+    profile_dir = _resolve_profile_dir(name)
+    effort = (body.effort or "").strip().lower()
+    if effort not in _REASONING_EFFORT_OPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="effort must be one of: "
+            + ", ".join(option or "(inherit)" for option in _REASONING_EFFORT_OPTIONS),
+        )
+    try:
+        saved = _write_profile_reasoning_effort(profile_dir, effort)
+    except Exception as e:
+        _log.exception("PUT /api/profiles/%s/reasoning failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "reasoning_effort": saved}
 
 
 @app.post("/api/profiles/{name}/describe-auto")

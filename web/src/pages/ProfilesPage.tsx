@@ -44,6 +44,7 @@ import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { cn, themedBody } from "@/lib/utils";
+import { EFFORT_OPTIONS } from "@/lib/reasoning-effort";
 
 // Mirrors hermes_cli/profiles.py::_PROFILE_ID_RE so we can reject obviously
 // invalid names (uppercase, spaces, …) before round-tripping a doomed POST.
@@ -303,6 +304,10 @@ export default function ProfilesPage() {
       editModel: p.editModel ?? "Change model",
       modelSaved: p.modelSaved ?? "Model updated",
       modelSelect: p.modelSelect ?? "Select a model",
+      reasoningEffort: p.reasoningEffort ?? "Reasoning effort",
+      reasoningInherit: p.reasoningInherit ?? "Inherit provider default",
+      reasoningSaved: p.reasoningSaved ?? "Reasoning effort updated",
+      reasoningUnset: p.reasoningUnset ?? "provider default",
       actions: p.actions ?? "Actions",
       manageSkills: p.manageSkills ?? "Manage skills & tools",
       activeSetHint:
@@ -360,6 +365,7 @@ export default function ProfilesPage() {
   // Inline model editor state
   const [editingModelFor, setEditingModelFor] = useState<string | null>(null);
   const [modelEditChoice, setModelEditChoice] = useState("");
+  const [reasoningEditChoice, setReasoningEditChoice] = useState("");
   const [modelSaving, setModelSaving] = useState(false);
 
   // Per-profile "set active" in-flight name
@@ -654,6 +660,7 @@ export default function ProfilesPage() {
       setEditingDescFor(null);
       setEditingModelFor(p.name);
       setModelEditChoice(modelKey(p.provider, p.model));
+      setReasoningEditChoice(p.reasoning_effort ?? "");
       loadModelChoices();
     },
     [closeEditor, editingModelFor, loadModelChoices],
@@ -665,15 +672,26 @@ export default function ProfilesPage() {
           (c) => `${c.provider}\u0000${c.model}` === modelEditChoice,
         )
       : undefined;
-    if (!picked) return;
+    if (modelEditChoice && modelChoices?.length && !picked) return;
     setModelSaving(true);
     try {
-      await api.setProfileModel(name, picked.provider, picked.model);
-      showToast(`${L.modelSaved}: ${picked.model}`, "success");
+      if (picked) {
+        await api.setProfileModel(name, picked.provider, picked.model);
+        showToast(`${L.modelSaved}: ${picked.model}`, "success");
+      }
+      const reasoning = await api.setProfileReasoning(name, reasoningEditChoice);
+      showToast(
+        `${L.reasoningSaved}: ${reasoning.reasoning_effort || L.reasoningUnset}`,
+        "success",
+      );
       setProfiles((prev) =>
         prev.map((p) =>
           p.name === name
-            ? { ...p, model: picked.model, provider: picked.provider }
+            ? {
+                ...p,
+                ...(picked ? { model: picked.model, provider: picked.provider } : {}),
+                reasoning_effort: reasoning.reasoning_effort,
+              }
             : p,
         ),
       );
@@ -1216,6 +1234,10 @@ export default function ProfilesPage() {
                           {t.profiles.skills}: {p.skill_count}
                         </span>
 
+                        <span className="truncate">
+                          {L.reasoningEffort}: {p.reasoning_effort || L.reasoningUnset}
+                        </span>
+
                         <span className="font-mono truncate">{p.path}</span>
                       </div>
                     </>
@@ -1273,11 +1295,11 @@ export default function ProfilesPage() {
                 editorKind === "soul" && "min-h-0 overflow-y-auto",
               )}
             >
-              {editorKind === "model" &&
-                (modelChoices !== null && modelChoices.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">{L.modelNone}</p>
-                ) : (
-                  <>
+              {editorKind === "model" && (
+                <>
+                  {modelChoices !== null && modelChoices.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">{L.modelNone}</p>
+                  ) : (
                     <Select
                       value={modelEditChoice}
                       disabled={modelChoices === null}
@@ -1295,26 +1317,48 @@ export default function ProfilesPage() {
                         </SelectOption>
                       ))}
                     </Select>
+                  )}
 
-                    <div className="flex justify-end">
-                      <Button
-                        size="sm"
-                        className="uppercase"
-                        onClick={() => handleSaveModel(editorName)}
-                        disabled={
-                          modelSaving ||
-                          !modelChoices?.some(
-                            (c) =>
-                              `${c.provider}\u0000${c.model}` ===
-                              modelEditChoice,
-                          )
-                        }
-                      >
-                        {modelSaving ? t.common.saving : t.common.save}
-                      </Button>
-                    </div>
-                  </>
-                ))}
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="profile-reasoning-effort">
+                      {L.reasoningEffort}
+                    </Label>
+                    <Select
+                      id="profile-reasoning-effort"
+                      value={reasoningEditChoice}
+                      disabled={modelSaving}
+                      onValueChange={setReasoningEditChoice}
+                    >
+                      <SelectOption value="">{L.reasoningInherit}</SelectOption>
+                      {EFFORT_OPTIONS.map((option) => (
+                        <SelectOption key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                  </div>
+
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      className="uppercase"
+                      onClick={() => handleSaveModel(editorName)}
+                      disabled={
+                        modelSaving ||
+                        (modelEditChoice !== "" &&
+                          (modelChoices === null ||
+                            (modelChoices.length > 0 &&
+                              !modelChoices.some(
+                                (c) =>
+                                  `${c.provider}\u0000${c.model}` === modelEditChoice,
+                              ))))
+                      }
+                    >
+                      {modelSaving ? t.common.saving : t.common.save}
+                    </Button>
+                  </div>
+                </>
+              )}
 
               {editorKind === "desc" && (
                 <>

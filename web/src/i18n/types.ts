@@ -422,6 +422,10 @@ export interface Translations {
     editModel?: string;
     modelSaved?: string;
     modelSelect?: string;
+    reasoningEffort?: string;
+    reasoningInherit?: string;
+    reasoningSaved?: string;
+    reasoningUnset?: string;
     actions?: string;
     manageSkills?: string;
     activeSetHint?: string;
