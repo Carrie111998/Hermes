@@ -1594,6 +1594,27 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+
+    # Opt-in non-convergence tracking is scoped to delegate_task children. The
+    # setting lives under ``delegation`` and must not alter parent/cron agents.
+    agent._progress_tracker = None
+    try:
+        from agent.delegation_context import is_delegated_child_context
+        from agent.progress_tracker import ProgressTracker
+
+        if is_delegated_child_context():
+            _delegation_cfg = _agent_cfg.get("delegation", {})
+            _pt_cfg = (
+                _delegation_cfg.get("progress_tracker", {})
+                if isinstance(_delegation_cfg, dict)
+                else {}
+            )
+            _progress_tracker = ProgressTracker.from_mapping(_pt_cfg)
+            if _progress_tracker.enabled:
+                agent._progress_tracker = _progress_tracker
+    except Exception as _pt_err:
+        _ra().logger.warning("Progress tracker config ignored: %s", _pt_err)
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

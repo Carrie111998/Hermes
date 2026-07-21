@@ -3279,6 +3279,8 @@ class AIAgent:
             return
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
+            if getattr(self, "_progress_tracker", None) is not None:
+                self._progress_iteration_made_progress = True
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
@@ -5613,6 +5615,28 @@ class AIAgent:
         content = assistant_msg.get("content")
         return self._strip_think_blocks(flatten_message_text(content)).strip()
 
+    def _interim_assistant_has_new_visible_text(
+        self, assistant_msg: Dict[str, Any]
+    ) -> bool:
+        """Return whether interim emission would surface previously unseen text."""
+        commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+        if commentary_parts:
+            pending_keys: set[str] = set()
+            for part in commentary_parts:
+                key = self._normalize_interim_visible_text(part)
+                if not key or key in pending_keys:
+                    continue
+                pending_keys.add(key)
+                if not self._interim_text_was_delivered(part):
+                    return True
+            return False
+        visible = self._interim_assistant_visible_text(assistant_msg)
+        return bool(
+            visible
+            and visible != "(empty)"
+            and not self._interim_text_was_delivered(visible)
+        )
+
     def _interim_text_was_delivered(self, text: str) -> bool:
         normalized = self._normalize_interim_visible_text(text)
         if not normalized:
@@ -6805,12 +6829,81 @@ class AIAgent:
             if token is not None:
                 reset_conversation_context(token)
 
+    def _start_progress_iteration(
+        self,
+        messages: list,
+        *,
+        tool_call_count: int,
+        had_text: bool,
+    ) -> None:
+        """Initialize one delegated-child tool round before persistence."""
+        if getattr(self, "_progress_tracker", None) is None:
+            return
+        self._progress_iteration_made_progress = False
+        self._progress_iteration_had_text = had_text
+        self._progress_iteration_remaining_results = max(0, int(tool_call_count))
+        self._progress_iteration_completed = False
+        if self._progress_iteration_remaining_results == 0:
+            self._complete_progress_iteration(messages)
+
+    def _prepare_progress_before_tool_flush(self, messages: list) -> None:
+        """Complete tracking immediately before the final tool result is durable."""
+        if getattr(self, "_progress_tracker", None) is None:
+            return
+        remaining = getattr(self, "_progress_iteration_remaining_results", 0)
+        if remaining <= 0:
+            return
+        remaining -= 1
+        self._progress_iteration_remaining_results = remaining
+        if remaining == 0:
+            self._complete_progress_iteration(messages)
+
+    def _complete_progress_iteration(self, messages: list) -> None:
+        """Evaluate the round and attach guidance before its final DB flush."""
+        tracker = getattr(self, "_progress_tracker", None)
+        if tracker is None or getattr(self, "_progress_iteration_completed", False):
+            return
+        self._progress_iteration_completed = True
+        made_progress = bool(
+            getattr(self, "_progress_iteration_had_text", False)
+            or getattr(self, "_progress_iteration_made_progress", False)
+        )
+        decision = tracker.finish_iteration(made_progress=made_progress)
+        if decision.action not in {"warn", "halt"}:
+            return
+
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                message["content"] = f"{content}\n\n{decision.message}"
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": decision.message})
+            break
+
+        if decision.action == "halt":
+            self._set_tool_guardrail_halt(
+                ToolGuardrailDecision(
+                    action="halt",
+                    code="subagent_non_convergence_halt",
+                    message=decision.message,
+                    count=decision.count,
+                )
+            )
+
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
+        if decision.code == "subagent_non_convergence_halt":
+            return (
+                "I stopped this delegated task because the non-convergence "
+                f"guardrail observed {decision.count} consecutive tool rounds "
+                "without user-visible text or a successful file change."
+            )
         tool = decision.tool_name or "a tool"
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "

@@ -6021,6 +6021,9 @@ def run_conversation(
 
                 previous_msg = messages[-1] if messages else None
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
+                current_interim_has_new_text = (
+                    agent._interim_assistant_has_new_visible_text(assistant_msg)
+                )
                 previous_interim_visible = (
                     agent._interim_assistant_visible_text(previous_msg)
                     if isinstance(previous_msg, dict)
@@ -6054,6 +6057,15 @@ def run_conversation(
                         tc for tc in assistant_message.tool_calls
                         if tc.function.name in agent.valid_tool_names
                     ]
+
+                agent._start_progress_iteration(
+                    messages,
+                    tool_call_count=len(assistant_message.tool_calls or []),
+                    had_text=bool(
+                        current_interim_has_new_text
+                        and not duplicate_previous_interim
+                    ),
+                )
 
                 _tool_turn_persisted = None
                 try:

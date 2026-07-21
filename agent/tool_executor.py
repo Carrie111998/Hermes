@@ -149,6 +149,9 @@ def _flush_session_db_after_tool_progress(
     transcript survives destructive-but-valid tool calls.
     """
     try:
+        _prepare_progress = getattr(agent, "_prepare_progress_before_tool_flush", None)
+        if callable(_prepare_progress):
+            _prepare_progress(messages)
         persisted = agent._flush_messages_to_session_db(messages) is not False
         if not persisted:
             agent._incremental_persistence_failed = True
@@ -1160,6 +1163,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            mutation_result = function_result
             name = function_name
             args = function_args
             progress_function_name = function_name
@@ -1185,7 +1189,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if not blocked:
                 try:
                     agent._record_file_mutation_result(
-                        function_name, function_args, function_result, is_error,
+                        function_name, function_args, mutation_result, is_error,
                     )
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1813,6 +1817,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        mutation_result = function_result
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1857,7 +1862,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _execution_blocked:
             try:
                 agent._record_file_mutation_result(
-                    function_name, function_args, function_result, _is_error_result,
+                    function_name, function_args, mutation_result, _is_error_result,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)

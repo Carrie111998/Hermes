@@ -1574,6 +1574,13 @@ DEFAULT_CONFIG = {
         "inherit_mcp_toolsets": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
+        # Opt-in circuit breaker for delegated children that keep calling tools
+        # without producing user-visible text or landing a file mutation.
+        "progress_tracker": {
+            "enabled": False,
+            "warn_after": 15,
+            "halt_after": 25,
+        },
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death

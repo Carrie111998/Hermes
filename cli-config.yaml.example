@@ -1254,6 +1254,14 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  # Opt-in non-convergence circuit breaker for delegated children. It counts
+  # complete tool rounds with neither user-visible text nor a successful
+  # write_file/patch result. This complements the iteration budget; it does
+  # not determine whether read-only research is useful.
+  progress_tracker:
+    enabled: false                            # Disabled by default; enable only for runaway children
+    warn_after: 15                            # Add a convergence warning after N stalled rounds
+    halt_after: 25                            # Stop the child through the controlled-halt path
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
