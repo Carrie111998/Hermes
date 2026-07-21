@@ -1348,8 +1348,12 @@ def test_winpty_readiness_ignores_conpty_prologue_and_requires_main_repl() -> No
                 ]
             )
 
-        def read_with_timeout(self, _size: int, _timeout: float) -> str:
-            return next(self.chunks)
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
 
     output = _WinPtyProcess(Process()).read_until_ready(1.0)
 
@@ -1367,8 +1371,12 @@ def test_winpty_readiness_accepts_claude_216_compact_main_footer() -> None:
                 "\x1b[2m\u23f5\u23f5don't ask on (shift+tab to cycle)\x1b[0m",
             ])
 
-        def read_with_timeout(self, _size: int, _timeout: float) -> str:
-            return next(self.chunks)
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
 
     output = _WinPtyProcess(Process()).read_until_ready(1.0)
 
@@ -1398,9 +1406,9 @@ def test_winpty_readiness_waits_for_footer_then_product_modal() -> None:
                 raise EOFError from exc
 
     process = Process()
-    output = _WinPtyProcess(process).read_until_ready(1.0)
+    with pytest.raises(RuntimeError, match="closed before readiness"):
+        _WinPtyProcess(process).read_until_ready(1.0)
 
-    assert "Not now" in output
     assert process.reads == 3
 
 
@@ -1425,9 +1433,9 @@ def test_winpty_readiness_rejects_footer_and_product_modal_in_same_chunk() -> No
                 raise EOFError from exc
 
     process = Process()
-    output = _WinPtyProcess(process).read_until_ready(1.0)
+    with pytest.raises(RuntimeError, match="closed before readiness"):
+        _WinPtyProcess(process).read_until_ready(1.0)
 
-    assert "Not now" in output
     assert process.reads == 2
 
 
@@ -1471,9 +1479,13 @@ def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
             self.writes: list[str] = []
             self.reads = 0
 
-        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
             self.reads += 1
-            return next(self.chunks)
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
 
         def write(self, data: str) -> None:
             self.writes.append(data)
@@ -1487,6 +1499,116 @@ def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
     assert "⏵⏵ don't ask on" in output
     assert process.writes == ["\r"]
     assert process.reads == 6
+
+
+@pytest.mark.parametrize(
+    "redraw_chunks, expected_reads",
+    [
+        (
+            [
+                "\x1b[2JAccessing workspace:\r\n"
+                "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n",
+                "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m",
+            ],
+            4,
+        ),
+        (
+            [
+                "\x1b[2JAccessing workspace:\r\n"
+                "\x1b[1mYes, I trust this folder\x1b[0m\r\n"
+                "No, exit\r\nSecurity guide\x1b[0m\r\n"
+                "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m",
+            ],
+            3,
+        ),
+    ],
+    ids=["redraw-then-footer", "redraw-and-footer-same-chunk"],
+)
+def test_winpty_readiness_slices_past_latest_trust_redraw_without_resubmitting(
+    redraw_chunks: list[str], expected_reads: int
+) -> None:
+    trust = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([trust, *redraw_chunks])
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert "\u23f5\u23f5 don't ask on" in output
+    assert process.writes == ["\r"]
+    assert process.reads == expected_reads
+
+
+def test_winpty_readiness_keeps_post_trust_product_modal_sticky_across_redraw() -> None:
+    trust = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n"
+    )
+    modal = (
+        "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+        "1. Yes, try it\r\n2. Not now\r\n"
+    )
+    footer = "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([trust, modal, trust + footer, "\x1b[H"])
+            self.writes: list[str] = []
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    with pytest.raises(TimeoutError):
+        _WinPtyProcess(process).read_until_ready(
+            1.0, accept_workspace_trust=True
+        )
+
+    assert process.writes == ["\r"]
+
+
+def test_winpty_readiness_eof_before_settle_fails_closed() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                ["\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"]
+            )
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            try:
+                return next(self.chunks)
+            except StopIteration as exc:
+                raise EOFError from exc
+
+    with pytest.raises(RuntimeError, match="closed before readiness"):
+        _WinPtyProcess(Process()).read_until_ready(1.0)
 
 
 def test_winpty_readiness_never_returns_on_trust_dialog_marker_alone() -> None:
@@ -1512,11 +1634,11 @@ def test_winpty_readiness_never_returns_on_trust_dialog_marker_alone() -> None:
             self.writes.append(data)
 
     process = Process()
-    output = _WinPtyProcess(process).read_until_ready(
-        1.0, accept_workspace_trust=True
-    )
+    with pytest.raises(RuntimeError, match="closed before readiness"):
+        _WinPtyProcess(process).read_until_ready(
+            1.0, accept_workspace_trust=True
+        )
 
-    assert "⏵⏵ don't ask on" not in output
     assert process.writes == ["\r"]
     assert process.reads == 2
 
@@ -1545,12 +1667,11 @@ def test_winpty_readiness_never_accepts_theme_or_onboarding_screen() -> None:
             self.writes.append(data)
 
     process = Process()
-    output = _WinPtyProcess(process).read_until_ready(
-        1.0, accept_workspace_trust=True
-    )
+    with pytest.raises(RuntimeError, match="closed before readiness"):
+        _WinPtyProcess(process).read_until_ready(
+            1.0, accept_workspace_trust=True
+        )
 
-    assert "Let's get started" in output
-    assert "don't ask on" not in output
     assert process.writes == []
     assert process.reads == 2
 

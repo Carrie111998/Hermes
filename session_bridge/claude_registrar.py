@@ -574,6 +574,7 @@ class _WinPtyProcess:
         chunks: list[str] = []
         workspace_trust_submitted = False
         workspace_trust_submit_offset: int | None = None
+        post_trust_modal_seen = False
         ready_settle_deadline: float | None = None
         readiness_output = ""
         while True:
@@ -588,14 +589,20 @@ class _WinPtyProcess:
                 if (
                     ready_settle_deadline is not None
                     and now >= ready_settle_deadline
+                    and not post_trust_modal_seen
                     and _claude_launch_input_ready(readiness_output)
                 ):
                     return "".join(chunks)
                 raise TimeoutError
             try:
                 value = timed_read(4096, remaining)
-            except (EOFError, StopIteration):
-                return "".join(chunks)
+            except (EOFError, StopIteration) as exc:
+                joined = "".join(chunks)
+                if _is_authentication_failure(joined) or _is_provider_limit_failure(
+                    joined
+                ):
+                    return joined
+                raise RuntimeError("PTY closed before readiness") from exc
             except Exception as exc:
                 raise RuntimeError("PTY readiness read unavailable") from exc
             if value is None:
@@ -617,12 +624,22 @@ class _WinPtyProcess:
                 self.write("\r")
                 workspace_trust_submitted = True
                 workspace_trust_submit_offset = len(joined)
+            if workspace_trust_submit_offset is not None:
+                post_submit_output = joined[workspace_trust_submit_offset:]
+                post_trust_modal_seen = post_trust_modal_seen or (
+                    _known_claude_input_modal_visible(post_submit_output)
+                )
+                trust_redraw_end = _workspace_trust_prompt_end(post_submit_output)
+                if trust_redraw_end is not None:
+                    workspace_trust_submit_offset += trust_redraw_end
             readiness_output = (
                 joined[workspace_trust_submit_offset:]
                 if workspace_trust_submit_offset is not None
                 else joined
             )
-            if _claude_launch_input_ready(readiness_output):
+            if not post_trust_modal_seen and _claude_launch_input_ready(
+                readiness_output
+            ):
                 ready_settle_deadline = (
                     time.monotonic() + _READINESS_SETTLE_SECONDS
                 )
@@ -1599,17 +1616,49 @@ def _fileno_closed(resource: object) -> bool:
 def _workspace_trust_prompt_visible(output: str) -> bool:
     """Recognize only Claude's native two-choice trust gate before submitting."""
 
-    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
-    collapsed = " ".join(cleaned.split())
-    return all(
-        value in collapsed
-        for value in (
-            "Accessing workspace:",
-            "Yes, I trust this folder",
-            "No, exit",
-            "Security guide",
+    return _workspace_trust_prompt_end(output) is not None
+
+
+def _workspace_trust_prompt_end(output: str) -> int | None:
+    """Return the raw offset after the latest complete native trust frame."""
+
+    cleaned: list[str] = []
+    raw_ends: list[int] = []
+    cursor = 0
+    while cursor < len(output):
+        escape = _ANSI_OSC_RE.match(output, cursor) or _ANSI_CSI_RE.match(
+            output, cursor
         )
+        if escape is not None:
+            cursor = escape.end()
+            continue
+        if output[cursor] != "\r":
+            cleaned.append(output[cursor])
+            raw_ends.append(cursor + 1)
+        cursor += 1
+
+    text = "".join(cleaned)
+    signature = (
+        "Accessing workspace:",
+        "Yes, I trust this folder",
+        "No, exit",
+        "Security guide",
     )
+    latest_end: int | None = None
+    search_from = 0
+    while True:
+        frame_start = text.find(signature[0], search_from)
+        if frame_start < 0:
+            return latest_end
+        frame_cursor = frame_start + len(signature[0])
+        for value in signature[1:]:
+            value_start = text.find(value, frame_cursor)
+            if value_start < 0:
+                break
+            frame_cursor = value_start + len(value)
+        else:
+            latest_end = raw_ends[frame_cursor - 1]
+        search_from = frame_start + len(signature[0])
 
 
 def _claude_main_repl_ready(output: str) -> bool:
