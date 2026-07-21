@@ -68,6 +68,9 @@ H43_WORKER_PROTOCOL = (
     "- On failure/exception: write `output/result.json` with "
     "`status: \"failed\"` and an `error` field before exiting.\n"
     "- An empty result is a failure — write result.json no matter what.\n"
+    "- Keep `result.json` a flat, literal JSON object (plain strings, flat "
+    "arrays) — never a Python-repr string like \"['a','b']\" — so the "
+    "verifier parses it cleanly regardless of which model wrote it.\n"
 )
 
 # Worker-failure-discipline gate for the verifier card body.

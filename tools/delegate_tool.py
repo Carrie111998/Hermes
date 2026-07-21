@@ -786,6 +786,60 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+def _model_family_briefing(
+    provider: Optional[str], model: Optional[str]
+) -> Optional[str]:
+    """Return a short model-family-tuned briefing block for a child prompt.
+
+    [hermes-v2] G-2 — the two live agentic models behave differently enough
+    that a one-line tuned note measurably helps each, without changing any
+    user config:
+
+    - MiniMax-M3 (native minimax provider, anthropic_messages): a strong
+      native tool-caller whose interleaved reasoning is preserved across
+      tool rounds (H-10). It benefits from being told to lean on that
+      reasoning and NOT restate it in prose (which just burns the parent's
+      context on replay).
+    - GLM-5.2 / GLM (zai, chat_completions): occasionally emits bare scalars
+      or Python-repr list strings (``"['a','b']"``) that coerce_tool_args has
+      to repair; it benefits from an explicit "call tools, keep args flat and
+      literal" nudge.
+
+    Returns ``None`` for any other provider/model (DeepSeek, StepFun, Kimi,
+    Claude, local Ollama, …) so their child prompts are byte-for-byte
+    unchanged — this block is strictly additive for the M3/GLM pair.
+    """
+    p = (provider or "").strip().lower()
+    m = (model or "").strip().lower()
+    is_minimax = (
+        p in {"minimax", "minimax-cn", "minimax-oauth"}
+        or "minimax" in m
+        or m.endswith("-m3")
+        or m == "m3"
+    )
+    is_glm = p in {"zai", "z-ai", "z.ai", "zhipu", "glm"} or "glm" in m
+    # Ambiguous match (should not happen with real configs) → stay neutral.
+    if is_minimax and not is_glm:
+        return (
+            "\n## Model note (MiniMax-M3)\n"
+            "You run on MiniMax-M3, a strong native tool-caller. Reason "
+            "step-by-step to derive each tool call, then call the tool — your "
+            "interleaved reasoning is preserved across rounds, so you do NOT "
+            "need to restate it as prose. Spend words on tool calls and the "
+            "final summary, not on narrating your thinking."
+        )
+    if is_glm and not is_minimax:
+        return (
+            "\n## Model note (GLM)\n"
+            "You run on GLM. When a step needs a tool, CALL the tool rather "
+            "than describing what you would do. Keep tool arguments flat and "
+            "literal — plain strings and flat arrays. Never pass a Python-repr "
+            "string like \"['a','b']\" for a list argument; pass the real "
+            "array [\"a\", \"b\"]."
+        )
+    return None
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
@@ -794,6 +848,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    model_provider: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -802,6 +858,10 @@ def _build_child_system_prompt(
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
+
+    ``model_provider``/``model_name`` (G-2) optionally append a
+    model-family-tuned note for the MiniMax-M3 / GLM pair; any other model
+    leaves the prompt unchanged (see ``_model_family_briefing``).
     """
     parts = [
         "You are a focused subagent working on a specific delegated task.",
@@ -830,6 +890,9 @@ def _build_child_system_prompt(
         "response is returned to the parent agent as a summary, and overlong "
         "summaries crowd out the parent's context window."
     )
+    model_note = _model_family_briefing(model_provider, model_name)
+    if model_note:
+        parts.append(model_note)
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -1316,6 +1379,13 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    # G-2: resolve the child's effective provider/model the same way the
+    # credential block below does (override > parent inherit), so the child
+    # prompt can carry a model-family-tuned note. Cheap string reads only.
+    _child_prompt_provider = override_provider or getattr(
+        parent_agent, "provider", None
+    )
+    _child_prompt_model = model or getattr(parent_agent, "model", None)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1323,6 +1393,8 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        model_provider=_child_prompt_provider,
+        model_name=_child_prompt_model,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
