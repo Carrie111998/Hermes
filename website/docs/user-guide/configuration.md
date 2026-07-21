@@ -1526,6 +1526,32 @@ A single `delegate_task` batch counts each task toward `max_subagents` (a batch 
 
 This mirrors Claude Code's per-session WebSearch and subagent caps (v2.1.212), which also default to 200 and reset on `/clear`.
 
+### Stricter profile for unattended workloads
+
+For installations primarily running autonomous workloads, such as cron jobs or `delegate_task` subagents, enable hard stops and tighten the thresholds to prevent stuck loops from wasting iteration budgets:
+
+```yaml
+tool_loop_guardrails:
+  hard_stop_enabled: true
+  hard_stop_after:
+    exact_failure: 3           # block after 3 identical failures (default: 5)
+    same_tool_failure: 5       # halt after 5 failures on the same tool (default: 8)
+    idempotent_no_progress: 3  # block after 3 no-progress reads (default: 5)
+```
+
+:::warning Global configuration
+`tool_loop_guardrails` applies to every agent instance, including interactive parent sessions, delegated children, and cron jobs. It cannot currently be scoped only to subagents or cron jobs, so tightening these thresholds also changes interactive-session behavior.
+:::
+
+This profile blocks repeated failing calls sooner than the defaults. Configure the subagent iteration budget separately when complex delegated tasks need more headroom:
+
+```yaml
+delegation:
+  max_iterations: 80  # default: 50
+```
+
+Increasing `delegation.max_iterations` gives each subagent a larger independent budget; it does not change the parent agent or cron-job budget.
+
 ## TTS Configuration
 
 ```yaml
