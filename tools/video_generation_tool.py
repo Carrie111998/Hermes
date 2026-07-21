@@ -53,6 +53,7 @@ from agent.video_gen_provider import (
     DEFAULT_RESOLUTION,
     error_response,
 )
+from tools import atlas_catalog_generate
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -331,8 +332,30 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     if provider is None:
         return _missing_provider_error(configured)
 
-    # Resolve model: explicit arg wins, then config, then provider default.
-    model = model_override or _read_configured_video_model() or provider.default_model()
+    # Atlas/aiproxy is handled at the tool layer: the model is validated
+    # against the dynamic backend catalog and generation goes straight to
+    # aiproxy, bypassing the plugin's static family resolver (which used to
+    # silently swap unknown models for wan-2.6-flash). See
+    # tools/atlas_catalog_generate.py. Other backends dispatch normally below.
+    if getattr(provider, "name", "") == atlas_catalog_generate.PROVIDER_NAME:
+        atlas_result = atlas_catalog_generate.generate(
+            prompt,
+            model=model_override,
+            video_gen_section=_read_video_gen_section(),
+            image_url=image_url,
+            reference_image_urls=reference_image_urls,
+            duration=duration,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            negative_prompt=negative_prompt,
+            audio=audio,
+            seed=seed,
+        )
+        return json.dumps(atlas_result)
+
+    # Resolve model: explicit arg wins, then config. No silent tool-level
+    # default — picking a model is the caller's job (skill / models_explore).
+    model = model_override or _read_configured_video_model()
 
     kwargs: Dict[str, Any] = {
         "model": model,

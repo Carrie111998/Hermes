@@ -69,16 +69,42 @@ def test_resolve_credentials_prefers_dev_key_for_dev_base(monkeypatch):
     assert root == "https://api.dev.atlascloud.ai"
 
 
-def test_headers_include_extra_api_header(monkeypatch):
+def test_headers_include_extra_api_header_for_dev_root(monkeypatch):
     from plugins.video_gen.atlas import client
 
     monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
     monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
 
-    headers = client.headers("api-key")
+    headers = client.headers("api-key", api_root="https://api.dev.atlascloud.ai")
 
     assert headers["Authorization"] == "Bearer api-key"
     assert headers["atlas"] == "gateway-secret"
+
+
+def test_headers_omit_extra_api_header_for_production_root(monkeypatch):
+    from plugins.video_gen.atlas import client
+
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
+
+    headers = client.headers("api-key", api_root="https://api.atlascloud.ai")
+
+    assert headers["Authorization"] == "Bearer api-key"
+    assert "atlas" not in headers
+
+
+def test_headers_omit_extra_api_header_for_spoofed_dev_hostname(monkeypatch):
+    from plugins.video_gen.atlas import client
+
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
+
+    headers = client.headers(
+        "api-key",
+        api_root="https://api.dev.atlascloud.ai.attacker.example",
+    )
+
+    assert "atlas" not in headers
 
 
 def test_payload_uses_top_level_atlas_image_data_uri(tmp_path):

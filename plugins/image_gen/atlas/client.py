@@ -6,6 +6,7 @@ import base64
 import binascii
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -16,7 +17,11 @@ from agent.image_gen_provider import save_b64_image
 
 DEFAULT_API_BASE = "https://api.atlascloud.ai/v1"
 DEFAULT_TIMEOUT_SECONDS = 120
+DEFAULT_POLL_INTERVAL_SECONDS = 2
 MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
+
+_COMPLETE_STATUSES = {"completed", "succeeded", "success", "done"}
+_FAILED_STATUSES = {"failed", "error", "cancelled", "canceled", "expired"}
 
 _ASPECT_RATIO_MAP = {
     "landscape": "16:9",
@@ -81,14 +86,15 @@ def resolve_credentials() -> Tuple[str, str]:
     return key, root
 
 
-def headers(api_key: str) -> Dict[str, str]:
+def headers(api_key: str, *, api_root: str) -> Dict[str, str]:
     values = {
         "Content-Type": "application/json",
         "User-Agent": "hermes-agent/image_gen_atlas",
     }
     extra_name = (os.environ.get("ATLAS_API_EXTRA_HEADER_NAME") or "").strip()
     extra_value = (os.environ.get("ATLAS_API_EXTRA_HEADER_VALUE") or "").strip()
-    if extra_name and extra_value and extra_name.lower() not in {
+    is_dev_root = (urlparse(api_root).hostname or "").lower() == "api.dev.atlascloud.ai"
+    if is_dev_root and extra_name and extra_value and extra_name.lower() not in {
         "authorization",
         "content-type",
         "user-agent",
@@ -188,7 +194,6 @@ def build_payload(
     prompt: str,
     aspect_ratio: str,
     output_format: str = "png",
-    num_images: int = 1,
     reference_image_urls: Optional[Iterable[str]] = None,
     seed: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -197,8 +202,7 @@ def build_payload(
         "prompt": prompt,
         "aspect_ratio": normalize_aspect_ratio(aspect_ratio),
         "output_format": output_format,
-        "enable_sync_mode": True,
-        "num_images": num_images,
+        "enable_sync_mode": False,
     }
     refs = normalize_reference_images(reference_image_urls)
     if refs:
@@ -216,13 +220,44 @@ def generate_image(
 ) -> Dict[str, Any]:
     response = httpx.post(
         f"{api_root}/api/v1/model/generateImage",
-        headers=headers(api_key),
+        headers=headers(api_key, api_root=api_root),
         json=payload,
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     body = response.json()
-    return body if isinstance(body, dict) else {}
+    body = body if isinstance(body, dict) else {}
+
+    if first_output(body):
+        return body
+
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    prediction_id = data.get("id") if isinstance(data, dict) else None
+    if not isinstance(prediction_id, str) or not prediction_id.strip():
+        return body
+
+    deadline = time.monotonic() + DEFAULT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(DEFAULT_POLL_INTERVAL_SECONDS)
+        response = httpx.get(
+            f"{api_root}/api/v1/model/prediction/{prediction_id.strip()}",
+            headers=headers(api_key, api_root=api_root),
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        polled = response.json()
+        body = polled if isinstance(polled, dict) else {}
+        data = body.get("data") if isinstance(body.get("data"), dict) else body
+        status = str(data.get("status") or "").lower() if isinstance(data, dict) else ""
+        if status in _COMPLETE_STATUSES or first_output(body):
+            return body
+        if status in _FAILED_STATUSES:
+            error = data.get("error") if isinstance(data, dict) else None
+            raise RuntimeError(f"Atlas prediction failed: {error or status}")
+
+    raise httpx.TimeoutException(
+        f"Atlas image prediction {prediction_id.strip()} timed out"
+    )
 
 
 def _candidate_outputs(value: Any, *, allow_url: bool = False) -> Iterable[str]:

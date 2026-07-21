@@ -71,16 +71,42 @@ def test_resolve_credentials_prefers_dev_key_for_dev_base(monkeypatch):
     assert root == "https://api.dev.atlascloud.ai"
 
 
-def test_headers_include_extra_api_header(monkeypatch):
+def test_headers_include_extra_api_header_for_dev_root(monkeypatch):
     from plugins.image_gen.atlas import client
 
     monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
     monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
 
-    headers = client.headers("api-key")
+    headers = client.headers("api-key", api_root="https://api.dev.atlascloud.ai")
 
     assert headers["Authorization"] == "Bearer api-key"
     assert headers["atlas"] == "gateway-secret"
+
+
+def test_headers_omit_extra_api_header_for_production_root(monkeypatch):
+    from plugins.image_gen.atlas import client
+
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
+
+    headers = client.headers("api-key", api_root="https://api.atlascloud.ai")
+
+    assert headers["Authorization"] == "Bearer api-key"
+    assert "atlas" not in headers
+
+
+def test_headers_omit_extra_api_header_for_spoofed_dev_hostname(monkeypatch):
+    from plugins.image_gen.atlas import client
+
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
+
+    headers = client.headers(
+        "api-key",
+        api_root="https://api.dev.atlascloud.ai.attacker.example",
+    )
+
+    assert "atlas" not in headers
 
 
 def test_build_payload_uses_atlas_top_level_fields():
@@ -97,9 +123,47 @@ def test_build_payload_uses_atlas_top_level_fields():
         "prompt": "a cat",
         "aspect_ratio": "9:16",
         "output_format": "png",
-        "enable_sync_mode": True,
-        "num_images": 1,
+        "enable_sync_mode": False,
     }
+    assert "num_images" not in payload
+
+
+def test_generate_image_polls_async_prediction(monkeypatch):
+    from plugins.image_gen.atlas import client
+
+    post_response = MagicMock()
+    post_response.json.return_value = {
+        "data": {"id": "pred-1", "status": "processing"}
+    }
+    processing_response = MagicMock()
+    processing_response.json.return_value = {
+        "data": {"id": "pred-1", "status": "processing"}
+    }
+    completed_response = MagicMock()
+    completed_response.json.return_value = {
+        "data": {
+            "id": "pred-1",
+            "status": "completed",
+            "outputs": ["https://cdn.example/cat.png"],
+        }
+    }
+    get = MagicMock(side_effect=[processing_response, completed_response])
+    monkeypatch.setattr(client.httpx, "post", MagicMock(return_value=post_response))
+    monkeypatch.setattr(client.httpx, "get", get)
+    monkeypatch.setattr(client.time, "sleep", lambda _seconds: None)
+
+    body = client.generate_image(
+        {
+            "model": "google/nano-banana-2/text-to-image",
+            "prompt": "a cat",
+            "enable_sync_mode": False,
+        },
+        api_key="test-key",
+        api_root="https://api.atlascloud.ai",
+    )
+
+    assert client.first_output(body) == "https://cdn.example/cat.png"
+    assert get.call_count == 2
 
 
 def test_build_payload_uses_images_for_reference_inputs(tmp_path):

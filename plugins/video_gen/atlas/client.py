@@ -67,14 +67,15 @@ def resolve_credentials() -> Tuple[str, str]:
     return key, root
 
 
-def headers(api_key: str) -> Dict[str, str]:
+def headers(api_key: str, *, api_root: str) -> Dict[str, str]:
     values = {
         "Content-Type": "application/json",
         "User-Agent": "hermes-agent/video_gen_atlas",
     }
     extra_name = (os.environ.get("ATLAS_API_EXTRA_HEADER_NAME") or "").strip()
     extra_value = (os.environ.get("ATLAS_API_EXTRA_HEADER_VALUE") or "").strip()
-    if extra_name and extra_value and extra_name.lower() not in {
+    is_dev_root = (urlparse(api_root).hostname or "").lower() == "api.dev.atlascloud.ai"
+    if is_dev_root and extra_name and extra_value and extra_name.lower() not in {
         "authorization",
         "content-type",
         "user-agent",
@@ -260,7 +261,7 @@ async def submit(
 ) -> str:
     response = await client.post(
         f"{api_root}/api/v1/model/generateVideo",
-        headers=headers(api_key),
+        headers=headers(api_key, api_root=api_root),
         json=payload,
         timeout=60,
     )
@@ -285,7 +286,7 @@ async def poll(
     while elapsed <= timeout_seconds:
         response = await client.get(
             f"{api_root}/api/v1/model/prediction/{prediction_id}",
-            headers=headers(api_key),
+            headers=headers(api_key, api_root=api_root),
             timeout=30,
         )
         response.raise_for_status()
