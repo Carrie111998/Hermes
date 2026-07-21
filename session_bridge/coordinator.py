@@ -816,6 +816,10 @@ class _SidebarVerifier(Protocol):
     ) -> VerifiedSidebarThread | None: ...
 
 
+class _SidebarExecutor(Protocol):
+    def run_once(self) -> object: ...
+
+
 _ProviderHealth = dict[str, float | str | None]
 _RECENT_ERROR_LIMIT = 20
 _ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
@@ -872,6 +876,7 @@ class SessionBridgeCoordinator:
         watch_debounce_seconds: float = 0.25,
         refresh_timeout: float = 60.0,
         sidebar_verifier: _SidebarVerifier | None = None,
+        sidebar_executor: _SidebarExecutor | None = None,
         sidebar_cancellation_recovery_timeout: float = (
             _SIDEBAR_CANCELLATION_RECOVERY_SECONDS
         ),
@@ -920,6 +925,11 @@ class SessionBridgeCoordinator:
         self._watch_debounce_seconds = float(watch_debounce_seconds)
         self._refresh_timeout = float(refresh_timeout)
         self._sidebar_verifier = sidebar_verifier
+        if sidebar_executor is not None and not callable(
+            getattr(sidebar_executor, "run_once", None)
+        ):
+            raise TypeError("sidebar_executor must provide run_once() or be None")
+        self._sidebar_executor = sidebar_executor
         self._sidebar_cancellation_recovery_timeout = float(
             sidebar_cancellation_recovery_timeout
         )
@@ -1047,13 +1057,15 @@ class SessionBridgeCoordinator:
             normalized = Provider(provider)
             if normalized not in _EXTERNAL_PROVIDERS:
                 raise ValueError("scan provider must be Claude or Codex")
-            return await self._scan_provider(normalized)
+            summary = await self._scan_provider(normalized)
+            await self._after_successful_scan(summary)
+            return summary
 
         summaries = [
             await self._scan_provider(candidate)
             for candidate in (Provider.CLAUDE, Provider.CODEX)
         ]
-        return ScanSummary(
+        summary = ScanSummary(
             provider=None,
             discovered=sum(summary.discovered for summary in summaries),
             indexed=sum(summary.indexed for summary in summaries),
@@ -1061,6 +1073,8 @@ class SessionBridgeCoordinator:
             failed=sum(summary.failed for summary in summaries),
             duration_ms=sum(summary.duration_ms for summary in summaries),
         )
+        await self._after_successful_scan(summary)
+        return summary
 
     async def scan_all_history(self, provider: Provider | None = None) -> ScanSummary:
         """Index one complete provider inventory without mirror side effects."""
@@ -2662,18 +2676,48 @@ class SessionBridgeCoordinator:
             },
         }
 
-    async def _register_sidebar_after_successful_scan(self) -> None:
+    async def _after_successful_scan(self, summary: ScanSummary) -> None:
+        if summary.failed or not await self._register_sidebar_after_successful_scan():
+            return
+        if self._sidebar_executor is None:
+            return
+        configured_providers = set(self._adapters).intersection(_EXTERNAL_PROVIDERS)
+        if any(
+            self._provider_health[provider]["last_success"] is None
+            or self._provider_health[provider]["degraded_reason"] is not None
+            for provider in configured_providers
+        ):
+            return
+        executor_task = asyncio.create_task(
+            asyncio.to_thread(self._sidebar_executor.run_once)
+        )
+        try:
+            await asyncio.shield(executor_task)
+        except asyncio.CancelledError:
+            await asyncio.gather(executor_task, return_exceptions=True)
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._record_error_code("sidebar_executor_failed")
+
+    async def _register_sidebar_after_successful_scan(self) -> bool:
         sidebar = self._config.sidebar
         if not sidebar.enabled or not sidebar.continuous:
-            return
+            return False
         try:
-            await self.register_sidebar_jobs_once(
+            registration = await self.register_sidebar_jobs_once(
                 limit=sidebar.continuous_batch_limit,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception:
             self._record_error_code("sidebar_registration_failed")
+            return False
+        if registration.failed:
+            self._record_error_code("sidebar_registration_failed")
+            return False
+        return True
 
     async def _creation_capacity(
         self,
@@ -3254,7 +3298,6 @@ class SessionBridgeCoordinator:
             else:
                 await self._complete_backfill_if_drained(provider, discovery_mode)
                 self._mark_scan_success(provider)
-                await self._register_sidebar_after_successful_scan()
             return ScanSummary(
                 provider=provider,
                 discovered=summary.discovered,

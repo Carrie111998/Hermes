@@ -47,6 +47,11 @@ from session_bridge.models import (
     encode_bridge_marker,
 )
 from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
+from session_bridge.sidebar_executor import (
+    CodexAppServerSidebarDelivery,
+    SidebarExecutionResult,
+    SidebarExecutor,
+)
 from session_bridge.store import SessionBridgeStore
 
 
@@ -89,6 +94,14 @@ class FakeBackend:
             "failed": 0,
             "excluded": 0,
             "excluded_by_reason": {"source_cwd_missing": 0},
+        }
+    )
+    sidebar_run_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "idle",
+            "job_id": None,
+            "thread_id": None,
+            "error_code": None,
         }
     )
     claude_visibility_payload: dict[str, Any] = field(
@@ -148,6 +161,10 @@ class FakeBackend:
     def set_sidebar_continuous(self, *, enabled: bool) -> dict[str, Any]:
         self.calls.append(("set_sidebar_continuous", enabled))
         return {"enabled": enabled, "continuous": enabled}
+
+    def sidebar_run_once(self) -> dict[str, Any]:
+        self.calls.append(("sidebar_run_once",))
+        return dict(self.sidebar_run_payload)
 
     def claude_visibility_status(self) -> dict[str, Any]:
         self.calls.append(("claude_visibility_status",))
@@ -354,6 +371,61 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
     assert not any(
         call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit"),
+    [
+        ("idle", 0),
+        ("visible", 0),
+        ("retry", 3),
+        ("failed", 3),
+        ("unsettled", 3),
+    ],
+)
+def test_sidebar_run_once_dispatches_once_emits_only_the_sanitized_result_and_closes(
+    status: str,
+    expected_exit: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend(
+        sidebar_run_payload={
+            "status": status,
+            "job_id": "sidebar-job-1",
+            "thread_id": "native-thread-1",
+            "error_code": "broker_time_budget" if status == "retry" else None,
+            "private_detail": "C:/private/provider-detail-must-not-render",
+        }
+    )
+
+    assert _run(["sidebar-run-once"], backend) == expected_exit
+
+    assert backend.calls == [("sidebar_run_once",), ("close",)]
+    expected = {"status": status}
+    if status == "retry":
+        expected["error_code"] = "broker_time_budget"
+    assert _json_output(capsys) == expected
+
+
+def test_sidebar_run_once_rejects_a_nonfixed_error_code_without_rendering_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_error = "C:/private/provider-detail-must-not-render"
+    backend = FakeBackend(
+        sidebar_run_payload={
+            "status": "retry",
+            "job_id": "sidebar-job-1",
+            "thread_id": "native-thread-1",
+            "error_code": private_error,
+        }
+    )
+
+    assert _run(["sidebar-run-once"], backend) == 3
+
+    assert backend.calls == [("sidebar_run_once",), ("close",)]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {"error": "provider_degraded"}
+    assert private_error not in rendered
 
 
 def test_claude_visibility_exact_commands_route_with_safe_defaults(capsys) -> None:
@@ -1489,7 +1561,7 @@ def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
         replace(
             BridgeConfig(),
             service=replace(ServiceConfig(), reconcile_seconds=0.0),
-            sidebar=replace(SidebarConfig(), enabled=True),
+            sidebar=replace(SidebarConfig(), enabled=True, continuous=True),
         )
     )
     backend._db = db
@@ -1511,6 +1583,12 @@ def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
             providers=(Provider.CODEX,),
         )
         assert isinstance(coordinator._sidebar_verifier, SidebarThreadVerifier)
+        assert isinstance(coordinator._sidebar_executor, SidebarExecutor)
+        assert isinstance(
+            coordinator._sidebar_executor._native,
+            CodexAppServerSidebarDelivery,
+        )
+        assert coordinator._sidebar_executor._native._client is client
 
         claim = asyncio.run(
             coordinator.claim_sidebar_jobs_for_delivery(now=now, limit=1)
@@ -1528,6 +1606,70 @@ def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
 
     assert committed["state"] == "sidebar_visible"
     assert "thread/read" in client.calls
+    assert client.closed is True
+
+
+def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_key = b"m" * 32
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(
+        replace(BridgeConfig(), sidebar=replace(SidebarConfig(), enabled=True))
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    executor_calls: list[str] = []
+    captured: dict[str, Any] = {}
+
+    class ProtocolCodexClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = ProtocolCodexClient()
+
+    class OneCycleExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_calls.append("run_once")
+            return SidebarExecutionResult(status="idle")
+
+    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
+        captured.update(kwargs)
+        return OneCycleExecutor()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: client,
+    )
+    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
+
+    try:
+        result = backend.sidebar_run_once()
+    finally:
+        backend.close()
+
+    assert result == {
+        "status": "idle",
+        "job_id": None,
+        "thread_id": None,
+        "error_code": None,
+    }
+    assert executor_calls == ["run_once"]
+    assert captured["store"] is store
+    assert isinstance(captured["verifier"], SidebarThreadVerifier)
+    assert isinstance(captured["native"], CodexAppServerSidebarDelivery)
+    assert captured["marker_secret"] == marker_key
     assert client.closed is True
 
 

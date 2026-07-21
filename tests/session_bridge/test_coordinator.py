@@ -35,6 +35,7 @@ from session_bridge.coordinator import (
     JobSummary,
     ReconcileSummary,
     SessionBridgeCoordinator,
+    SidebarRegistrationSummary,
 )
 from session_bridge.mirror import MirrorPolicy
 from session_bridge.models import (
@@ -55,6 +56,7 @@ from session_bridge.sidebar import (
     VerifiedSidebarThread,
     sidebar_bridge_id,
 )
+from session_bridge.sidebar_executor import SidebarExecutionResult
 from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
 from session_bridge.worktree import (
     WorktreeSnapshot,
@@ -4083,20 +4085,210 @@ async def test_successful_provider_scan_only_registers_sidebar_in_continuous_mod
 ) -> None:
     now = 3_000_000.0
     store = _SidebarScanStore()
+    event_loop_thread = get_ident()
+    executor_threads: list[int] = []
+
+    class RecordingExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_threads.append(get_ident())
+            return SidebarExecutionResult(status="idle")
+
     coordinator = SessionBridgeCoordinator(
         config=_sidebar_config(continuous=continuous),
         store=store,
         adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
         target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
         clock=lambda: now,
+        sidebar_executor=RecordingExecutor(),
     )
 
     summary = await coordinator.scan_once(Provider.CLAUDE)
 
     assert summary.failed == 0
     assert len(store.sidebar_list_calls) == int(continuous)
+    assert len(executor_threads) == int(continuous)
+    if continuous:
+        assert executor_threads[0] != event_loop_thread
     if continuous:
         assert store.sidebar_list_calls == [(now - 30 * 86_400, 30, None)]
+
+
+@pytest.mark.asyncio
+async def test_sidebar_executor_does_not_run_when_any_provider_scan_degrades() -> None:
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    executor_calls: list[str] = []
+
+    class RecordingExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_calls.append("run_once")
+            return SidebarExecutionResult(status="idle")
+
+    class DegradedCodexAdapter:
+        def list_inventory(self, *, archived: bool) -> list[object]:
+            del archived
+            raise RuntimeError("private provider detail")
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={
+            Provider.CLAUDE: _LifecycleClaudeAdapter(),
+            Provider.CODEX: DegradedCodexAdapter(),
+        },
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        sidebar_executor=RecordingExecutor(),
+    )
+
+    summary = await coordinator.scan_once()
+
+    assert summary.failed == 1
+    assert executor_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sidebar_executor_does_not_run_while_another_provider_is_degraded() -> (
+    None
+):
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    executor_calls: list[str] = []
+
+    class RecordingExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_calls.append("run_once")
+            return SidebarExecutionResult(status="idle")
+
+    class DegradedCodexAdapter:
+        def list_inventory(self, *, archived: bool) -> list[object]:
+            del archived
+            raise RuntimeError("private provider detail")
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={
+            Provider.CLAUDE: _LifecycleClaudeAdapter(),
+            Provider.CODEX: DegradedCodexAdapter(),
+        },
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        sidebar_executor=RecordingExecutor(),
+    )
+
+    degraded = await coordinator.scan_once(Provider.CODEX)
+    healthy = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert degraded.failed == 1
+    assert healthy.failed == 0
+    assert executor_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sidebar_executor_waits_for_every_configured_provider_preflight() -> None:
+    executor_calls: list[str] = []
+
+    class RecordingExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_calls.append("run_once")
+            return SidebarExecutionResult(status="idle")
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=_SidebarScanStore(),
+        adapters={
+            Provider.CLAUDE: _LifecycleClaudeAdapter(),
+            Provider.CODEX: _LifecycleCodexAdapter(),
+        },
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: 3_000_000.0,
+        sidebar_executor=RecordingExecutor(),
+    )
+
+    claude = await coordinator.scan_once(Provider.CLAUDE)
+    assert claude.failed == 0
+    assert executor_calls == []
+
+    codex = await coordinator.scan_once(Provider.CODEX)
+    assert codex.failed == 0
+    assert executor_calls == ["run_once"]
+
+
+@pytest.mark.asyncio
+async def test_sidebar_executor_cancellation_drains_worker_before_propagating() -> None:
+    started = Event()
+    release = Event()
+    completed = Event()
+
+    class BlockingExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            started.set()
+            if not release.wait(timeout=5.0):
+                raise RuntimeError("test executor release timed out")
+            completed.set()
+            return SidebarExecutionResult(status="idle")
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=_SidebarScanStore(),
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: 3_000_000.0,
+        sidebar_executor=BlockingExecutor(),
+    )
+    scan = asyncio.create_task(coordinator.scan_once(Provider.CLAUDE))
+    assert await asyncio.to_thread(started.wait, 2.0) is True
+
+    scan.cancel()
+    await asyncio.sleep(0)
+    cancellation_propagated_before_release = scan.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await scan
+    assert completed.wait(timeout=2.0) is True
+    assert cancellation_propagated_before_release is False
+
+
+@pytest.mark.asyncio
+async def test_sidebar_executor_does_not_run_after_registration_candidate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor_calls: list[str] = []
+
+    class RecordingExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_calls.append("run_once")
+            return SidebarExecutionResult(status="idle")
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=_SidebarScanStore(),
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: 3_000_000.0,
+        sidebar_executor=RecordingExecutor(),
+    )
+
+    async def failed_registration(**_kwargs: Any) -> SidebarRegistrationSummary:
+        return SidebarRegistrationSummary(
+            examined=1,
+            queued=0,
+            by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
+            failed=1,
+        )
+
+    monkeypatch.setattr(
+        coordinator,
+        "register_sidebar_jobs_once",
+        failed_registration,
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert executor_calls == []
 
 
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.CODEX])
