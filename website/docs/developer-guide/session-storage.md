@@ -165,7 +165,7 @@ END;
 
 ## Schema Version and Migrations
 
-Current schema version: **13**
+Current schema version: **22**
 
 The `schema_version` table stores a single integer. Simple column additions are handled declaratively by `_reconcile_columns()` (which diffs live columns against `SCHEMA_SQL` and ADDs any missing ones). The version-gated chain is reserved for data migrations and index/FTS changes that can't be expressed declaratively:
 
@@ -180,10 +180,17 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 7 | Add `reasoning_content` to messages and introduce the first `copilot_remote` table |
 | 8 | Add `api_call_count` to sessions and simplify Copilot remote storage |
 | 9 | Add `codex_message_items` column to messages for Codex Responses message id/phase replay |
-| 10 | Remove `copilot_session_id`; Hermes job IDs become the canonical Copilot remote key |
-| 11 | Rename legacy `copilot_jobs` storage to `copilot_remote` |
-| 12 | Add `connect_handle` column to `copilot_remote` and split it from `signal_ref` (caller metadata vs. launcher-extracted reconnect handle); best-effort backfill from `signal_ref` for in-flight rows |
-| 13 | Re-index `messages_fts` and `messages_fts_trigram` to cover `tool_name` + `tool_calls`, switch to inline mode, and backfill every message row; this also creates/backfills the trigram FTS table for existing fork databases |
+| 10 | Add `messages_fts_trigram` virtual table (trigram tokenizer for CJK / substring search) and backfill existing rows. Only runs when v10 is the direct target schema — v11 below drops and rebuilds both FTS tables anyway |
+| 11 | Re-index `messages_fts` and `messages_fts_trigram` to cover `tool_name` + `tool_calls` and switch from external-content to inline mode; drop old triggers and backfill every message row |
+| 13 | [rosenblatt] Remove `copilot_session_id`; Hermes job IDs become the canonical Copilot remote key. Renumbered from v10 to avoid colliding with upstream's v10 (trigram FTS5) |
+| 14 | [rosenblatt] Rename legacy `copilot_jobs` storage to `copilot_remote`. Renumbered from v11 to avoid colliding with upstream's v11 (FTS re-index) |
+| 15 | [rosenblatt] Add `connect_handle` column to `copilot_remote` and split it from `signal_ref` (caller metadata vs. launcher-extracted reconnect handle); best-effort backfill from `signal_ref` for in-flight rows. Renumbered from v12 |
+| 16 | Tag delegate subagent rows in `model_config` (`$._delegate_from`) so session pickers stay clean after parent deletes orphan them |
+| 18 | Gateway metadata consolidation — backfill `display_name` / `origin_json` / `expiry_finalized` from `sessions.json` |
+| 20 | Per-model usage attribution — seed `session_model_usage` rows from historical per-session aggregate totals |
+| 22 | Task-dimension usage attribution — add a `task` column to `session_model_usage`'s primary key (rebuilds the table, since SQLite cannot `ALTER` a primary key) so auxiliary-call spend (vision/compression/title_generation/...) is tracked separately from the main agent loop |
+
+Versions not listed above were declarative column additions handled by `_reconcile_columns()` (version bump only, no data migration).
 
 Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The version number is bumped after each successful migration block.
 
