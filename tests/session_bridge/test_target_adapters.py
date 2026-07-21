@@ -898,6 +898,218 @@ def test_sidebar_marker_lookup_recovers_one_exact_thread_read_only() -> None:
     ]
 
 
+def test_sidebar_recovery_key_lookup_returns_one_exact_native_thread(
+    tmp_path: Path,
+) -> None:
+    recovery_key = "hermes-session-bridge-create-v1:exact-recovery-key"
+    row = _codex_inventory(cwd=str(tmp_path.resolve()))["data"][0]
+    row["threadSource"] = recovery_key
+    client = FakeRequestClient({
+        "thread/list": [{"data": [row]}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert (
+        verifier.find_by_recovery_key(
+            recovery_key,
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+        == CODEX_ID
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+    ]
+
+
+def test_sidebar_recovery_key_lookup_returns_none_after_complete_zero_scan(
+    tmp_path: Path,
+) -> None:
+    client = FakeRequestClient({
+        "thread/list": [{"data": []}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert (
+        verifier.find_by_recovery_key(
+            "hermes-session-bridge-create-v1:absent",
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+        is None
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+    ]
+
+
+def test_sidebar_recovery_key_lookup_rejects_duplicate_native_threads(
+    tmp_path: Path,
+) -> None:
+    recovery_key = "hermes-session-bridge-create-v1:duplicate"
+    first = _codex_inventory(cwd=str(tmp_path.resolve()))["data"][0]
+    second = _codex_inventory(
+        native_id="33333333-3333-4333-8333-333333333333",
+        cwd=str(tmp_path.resolve()),
+    )["data"][0]
+    first["threadSource"] = recovery_key
+    second["threadSource"] = recovery_key
+    client = FakeRequestClient({
+        "thread/list": [{"data": [first]}, {"data": [second]}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_recovery_key(
+            recovery_key,
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+
+    assert raised.value.code == "codex_thread_conflict"
+
+
+def test_sidebar_recovery_key_lookup_rejects_matching_thread_in_wrong_cwd(
+    tmp_path: Path,
+) -> None:
+    recovery_key = "hermes-session-bridge-create-v1:wrong-cwd"
+    observed_cwd = tmp_path / "observed"
+    expected_cwd = tmp_path / "expected"
+    observed_cwd.mkdir()
+    expected_cwd.mkdir()
+    row = _codex_inventory(cwd=str(observed_cwd.resolve()))["data"][0]
+    row["threadSource"] = recovery_key
+    client = FakeRequestClient({
+        "thread/list": [{"data": [row]}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_recovery_key(
+            recovery_key,
+            expected_cwd=str(expected_cwd),
+            deadline=30.0,
+        )
+
+    assert raised.value.code == "codex_thread_conflict"
+
+
+def test_sidebar_recovery_key_lookup_never_returns_zero_after_incomplete_pagination(
+    tmp_path: Path,
+) -> None:
+    client = FakeRequestClient({
+        "thread/list": [{"data": [], "nextCursor": "more"}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        inventory_page_cap=1,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_recovery_key(
+            "hermes-session-bridge-create-v1:unknown",
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+
+
+def test_sidebar_recovery_key_lookup_never_returns_zero_for_malformed_metadata(
+    tmp_path: Path,
+) -> None:
+    malformed = _codex_inventory(cwd=str(tmp_path.resolve()))["data"][0]
+    malformed["threadSource"] = 7
+    client = FakeRequestClient({
+        "thread/list": [{"data": [malformed]}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_recovery_key(
+            "hermes-session-bridge-create-v1:unknown",
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+
+
+def test_sidebar_recovery_key_lookup_rejects_conflicting_thread_source_aliases(
+    tmp_path: Path,
+) -> None:
+    recovery_key = "hermes-session-bridge-create-v1:metadata-conflict"
+    conflicting = _codex_inventory(cwd=str(tmp_path.resolve()))["data"][0]
+    conflicting["threadSource"] = recovery_key
+    conflicting["thread_source"] = "different-source"
+    client = FakeRequestClient({"thread/list": [{"data": [conflicting]}]})
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_recovery_key(
+            recovery_key,
+            expected_cwd=str(tmp_path),
+            deadline=30.0,
+        )
+
+    assert raised.value.code == "codex_thread_conflict"
+
+
+def test_codex_thread_source_metadata_is_normalized_and_reconciled_exactly(
+    tmp_path: Path,
+) -> None:
+    recovery_key = "hermes-session-bridge-create-v1:reconciled"
+    row = _codex_inventory(cwd=str(tmp_path.resolve()))["data"][0]
+    row["threadSource"] = recovery_key
+    conflicting_read = _codex_read()
+    conflicting_read["thread"]["threadSource"] = "different-source"
+    client = FakeRequestClient({
+        "thread/list": [{"data": [row]}, {"data": []}],
+        "thread/read": [conflicting_read],
+    })
+    source = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    summary = source.list_sidebar_inventory(deadline=None, page_cap=2)[0]
+    assert summary.thread_source == recovery_key
+    with pytest.raises(ValueError, match="metadata_conflict"):
+        source.read_sidebar_thread(summary, deadline=None)
+
+
 def test_sidebar_marker_lookup_searches_exact_marker_before_thread_reads() -> None:
     expected = _sidebar_expected()
     marker = encode_bridge_marker(expected, SECRET)
@@ -933,6 +1145,65 @@ def test_sidebar_marker_lookup_searches_exact_marker_before_thread_reads() -> No
     assert all(params["searchTerm"] == unsigned_marker for params in search_calls)
     assert all(method != "thread/list" for method, _, _ in client.calls)
     assert client.initialize_calls == [{"capabilities": {"experimentalApi": True}}]
+
+
+def test_sidebar_marker_search_survives_preflight_first_client_initialization() -> None:
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    row = _codex_inventory()["data"][0]
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {"data": [{"thread": row, "snippet": marker}]},
+            {"data": []},
+        ],
+        "thread/read": [_codex_signed_read()],
+    })
+    client._initialized = True
+    setattr(client, "_session_bridge_experimental_api", True)
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+    )
+
+    assert verifier.find_by_marker(expected) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/search",
+        "thread/search",
+        "thread/read",
+    ]
+    assert client.initialize_calls == []
+
+
+def test_preinitialized_client_without_capability_signal_does_not_enable_search() -> (
+    None
+):
+    client = ExperimentalSearchClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_signed_read()],
+    })
+    client._initialized = True
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
+    ]
+    assert client.initialize_calls == []
 
 
 def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> None:

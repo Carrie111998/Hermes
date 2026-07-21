@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import hashlib
+import hmac
 import math
 import os
 import re
@@ -61,11 +63,14 @@ class NativeThreadState:
 class NativeSidebarDelivery(Protocol):
     """Narrow native task boundary used by the deterministic executor."""
 
+    def preflight(self, *, deadline: float) -> None: ...
+
     def create_thread(
         self,
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        recovery_key: str,
         deadline: float,
     ) -> str: ...
 
@@ -77,9 +82,7 @@ class NativeSidebarDelivery(Protocol):
         self, *, thread_id: str, prompt: str, deadline: float
     ) -> None: ...
 
-    def rename_thread(
-        self, *, thread_id: str, title: str, deadline: float
-    ) -> None: ...
+    def rename_thread(self, *, thread_id: str, title: str, deadline: float) -> None: ...
 
 
 class _CodexAppServerClient(Protocol):
@@ -106,19 +109,44 @@ class CodexAppServerSidebarDelivery:
         self._monotonic = monotonic
         self._initialized = bool(getattr(client, "_initialized", False))
 
+    def preflight(self, *, deadline: float) -> None:
+        self._ensure_initialized(deadline)
+        try:
+            response = self._client.request(
+                "thread/list",
+                {"archived": False, "limit": 1},
+                timeout=self._remaining(deadline),
+            )
+            if not isinstance(response, Mapping):
+                raise ValueError("thread/list response is malformed")
+            entries = response.get("data", response.get("threads"))
+            if not isinstance(entries, list):
+                raise ValueError("thread/list response has no entries list")
+        except NativeCreateRejected:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise NativeCreateRejected("codex_tool_unavailable") from exc
+
     def create_thread(
         self,
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        recovery_key: str,
         deadline: float,
     ) -> str:
         del prompt
+        expected_recovery_key = _required_recovery_key(recovery_key)
         self._ensure_initialized(deadline)
         try:
             result = self._client.request(
                 "thread/start",
-                {"cwd": candidate.cwd},
+                {
+                    "cwd": candidate.cwd,
+                    "threadSource": expected_recovery_key,
+                },
                 timeout=self._remaining(deadline),
             )
         except NativeCreateRejected:
@@ -131,7 +159,14 @@ class CodexAppServerSidebarDelivery:
             thread = result.get("thread")
             if not isinstance(thread, Mapping):
                 raise ValueError("thread/start response is malformed")
-            return _required_text(thread.get("id"), "created Codex thread ID")
+            thread_id = _required_text(thread.get("id"), "created Codex thread ID")
+            returned_recovery_key = _required_recovery_key(thread.get("threadSource"))
+            returned_cwd = _required_text(thread.get("cwd"), "created Codex cwd")
+            if not hmac.compare_digest(
+                returned_recovery_key, expected_recovery_key
+            ) or not _filesystem_equivalent(returned_cwd, candidate.cwd):
+                raise ValueError("thread/start response identity mismatch")
+            return thread_id
         except (AttributeError, TypeError, ValueError) as exc:
             raise NativeCreateAmbiguous() from exc
 
@@ -202,7 +237,10 @@ class CodexAppServerSidebarDelivery:
             self._initialized = True
             return
         try:
-            self._client.initialize(timeout=self._remaining(deadline))
+            self._client.initialize(
+                timeout=self._remaining(deadline),
+                capabilities={"experimentalApi": True},
+            )
         except NativeCreateRejected:
             raise
         except (KeyboardInterrupt, SystemExit):
@@ -212,6 +250,10 @@ class CodexAppServerSidebarDelivery:
                 raise NativeCreateRejected("codex_tool_unavailable") from exc
         except Exception as exc:
             raise NativeCreateRejected("codex_tool_unavailable") from exc
+        try:
+            setattr(self._client, "_session_bridge_experimental_api", True)
+        except (AttributeError, TypeError):
+            pass
         self._initialized = True
 
     def _remaining(self, deadline: float) -> float:
@@ -277,19 +319,53 @@ class SidebarExecutor:
 
     def run_once(self) -> SidebarExecutionResult:
         with _PROCESS_DELIVERY_LOCK:
-            return self._run_once_locked()
+            try:
+                worker_lock = self._store.try_acquire_sidebar_worker_lock()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return SidebarExecutionResult(
+                    status="unsettled",
+                    error_code="bridge_temporarily_unavailable",
+                )
+            if worker_lock is None:
+                return SidebarExecutionResult(
+                    status="unsettled",
+                    error_code="bridge_temporarily_unavailable",
+                )
+            try:
+                return self._run_once_locked()
+            finally:
+                worker_lock.release()
 
     def _run_once_locked(self) -> SidebarExecutionResult:
         operation_deadline = (
             _finite_time(self._monotonic()) + self._operation_budget_seconds
         )
+        try:
+            self._native.preflight(deadline=operation_deadline)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except NativeCreateRejected as exc:
+            return SidebarExecutionResult(status="unsettled", error_code=exc.code)
+        except Exception:
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="bridge_temporarily_unavailable",
+            )
         claim_time = _finite_time(self._clock())
+        gate = self._store_gate(now=claim_time)
+        if gate is not None:
+            return gate
         claims = self._store.claim_sidebar_jobs(
             now=claim_time,
             limit=1,
             lease_seconds=300,
         )
         if not claims:
+            gate = self._store_gate(now=claim_time)
+            if gate is not None:
+                return gate
             try:
                 self._store.record_sidebar_broker_heartbeat(now=claim_time)
             except (KeyboardInterrupt, SystemExit):
@@ -391,6 +467,7 @@ class SidebarExecutor:
         )
         marker = encode_bridge_marker(expected, self._marker_secret)
         prompt = build_registration_prompt(candidate, marker)
+        expected_recovery_key = _sidebar_recovery_key(marker, self._marker_secret)
         recovered: VerifiedSidebarThread | None = None
         if thread_id is None:
             if not self._has_budget(operation_deadline, lease_expires_at):
@@ -416,10 +493,9 @@ class SidebarExecutor:
                     error_code="bridge_temporarily_unavailable",
                 )
             if recovered is not None:
-                if (
-                    not isinstance(recovered, VerifiedSidebarThread)
-                    or not _matches_expected(recovered, expected)
-                ):
+                if not isinstance(
+                    recovered, VerifiedSidebarThread
+                ) or not _matches_expected(recovered, expected):
                     return self._settle(
                         job_id=job_id,
                         lease_token=lease_token,
@@ -444,42 +520,143 @@ class SidebarExecutor:
                         error_code="broker_time_budget",
                     )
                 try:
-                    raw_created_thread_id = self._native.create_thread(
-                        prompt=prompt,
-                        candidate=candidate,
-                        deadline=operation_deadline,
+                    reservation = self._store.get_sidebar_create_reservation(
+                        source_session_id
                     )
                 except (KeyboardInterrupt, SystemExit):
                     raise
-                except NativeCreateRejected as exc:
+                except Exception as exc:
                     return self._settle(
                         job_id=job_id,
                         lease_token=lease_token,
-                        error_code=exc.code,
+                        error_code=_store_error_code(exc),
                     )
-                except NativeCreateAmbiguous:
-                    return self._settle(
-                        job_id=job_id,
-                        lease_token=lease_token,
-                        error_code="native_create_ambiguous",
+                if reservation is not None:
+                    try:
+                        recovery_key = _validated_create_reservation(
+                            reservation,
+                            job_id=job_id,
+                            source_session_id=source_session_id,
+                            bridge_id=bridge_id,
+                            expected_recovery_key=expected_recovery_key,
+                        )
+                    except ValueError:
+                        return self._settle(
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            error_code="native_create_ambiguous",
+                        )
+                    thread_id, recovery_error = self._recover_reserved_thread(
+                        recovery_key,
+                        expected_cwd=candidate.cwd,
+                        operation_deadline=operation_deadline,
                     )
-                except Exception:
-                    return self._settle(
-                        job_id=job_id,
-                        lease_token=lease_token,
-                        error_code="native_create_ambiguous",
-                    )
-                try:
-                    thread_id = _required_text(
-                        raw_created_thread_id,
-                        "created Codex thread ID",
-                    )
-                except ValueError:
-                    return self._settle(
-                        job_id=job_id,
-                        lease_token=lease_token,
-                        error_code="native_create_ambiguous",
-                    )
+                    if recovery_error is not None:
+                        return self._settle(
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            error_code=recovery_error,
+                        )
+                    if thread_id is None:
+                        return self._settle(
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            error_code="native_create_ambiguous",
+                        )
+                else:
+                    try:
+                        reservation = self._store.reserve_sidebar_create(
+                            lease_token=lease_token,
+                            recovery_key=expected_recovery_key,
+                            now=_finite_time(self._clock()),
+                        )
+                        recovery_key = _validated_create_reservation(
+                            reservation,
+                            job_id=job_id,
+                            source_session_id=source_session_id,
+                            bridge_id=bridge_id,
+                            expected_recovery_key=expected_recovery_key,
+                        )
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        return self._settle(
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            error_code=_store_error_code(exc),
+                        )
+                    try:
+                        raw_created_thread_id = self._native.create_thread(
+                            prompt=prompt,
+                            candidate=candidate,
+                            recovery_key=recovery_key,
+                            deadline=operation_deadline,
+                        )
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except NativeCreateRejected as exc:
+                        try:
+                            self._store.clear_sidebar_create_reservation(
+                                lease_token=lease_token,
+                                recovery_key=recovery_key,
+                                now=_finite_time(self._clock()),
+                            )
+                        except (KeyboardInterrupt, SystemExit):
+                            raise
+                        except Exception:
+                            return self._settle(
+                                job_id=job_id,
+                                lease_token=lease_token,
+                                error_code="native_create_ambiguous",
+                            )
+                        return self._settle(
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            error_code=exc.code,
+                        )
+                    except NativeCreateAmbiguous:
+                        thread_id, recovery_error = self._recover_reserved_thread(
+                            recovery_key,
+                            expected_cwd=candidate.cwd,
+                            operation_deadline=operation_deadline,
+                        )
+                        if recovery_error is not None:
+                            return self._settle(
+                                job_id=job_id,
+                                lease_token=lease_token,
+                                error_code=recovery_error,
+                            )
+                        if thread_id is None:
+                            return self._settle(
+                                job_id=job_id,
+                                lease_token=lease_token,
+                                error_code="native_create_ambiguous",
+                            )
+                    except Exception:
+                        return self._settle(
+                            job_id=job_id,
+                            lease_token=lease_token,
+                            error_code="native_create_ambiguous",
+                        )
+                    else:
+                        try:
+                            thread_id = _required_text(
+                                raw_created_thread_id,
+                                "created Codex thread ID",
+                            )
+                        except ValueError:
+                            return self._settle(
+                                job_id=job_id,
+                                lease_token=lease_token,
+                                error_code="native_create_ambiguous",
+                            )
+
+        if thread_id is None:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code="native_create_ambiguous",
+            )
 
         if not self._has_budget(operation_deadline, lease_expires_at):
             # A successful create must still be bound below before any retry.  A
@@ -646,6 +823,70 @@ class SidebarExecutor:
             thread_id=thread_id,
         )
 
+    def _store_gate(self, *, now: float) -> SidebarExecutionResult | None:
+        try:
+            blockers = self._store.sidebar_execution_blockers()
+            active_lease = self._store.sidebar_has_active_lease(now=now)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="bridge_temporarily_unavailable",
+            )
+        valid_blocker_sets = (
+            (),
+            ("sidebar_failed",),
+            ("unknown_retry_code",),
+            ("sidebar_failed", "unknown_retry_code"),
+        )
+        if (
+            not isinstance(blockers, tuple)
+            or blockers not in valid_blocker_sets
+            or not isinstance(active_lease, bool)
+        ):
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="bridge_temporarily_unavailable",
+            )
+        if blockers:
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="source_identity_mismatch",
+            )
+        if active_lease:
+            return SidebarExecutionResult(
+                status="unsettled",
+                error_code="bridge_temporarily_unavailable",
+            )
+        return None
+
+    def _recover_reserved_thread(
+        self,
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        operation_deadline: float,
+    ) -> tuple[str | None, str | None]:
+        try:
+            raw_thread_id = self._verifier.find_by_recovery_key(
+                recovery_key,
+                expected_cwd=expected_cwd,
+                deadline=operation_deadline,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except SidebarVerificationError as exc:
+            return None, _verification_code(exc)
+        except Exception:
+            return None, "bridge_temporarily_unavailable"
+        if raw_thread_id is None:
+            return None, None
+        try:
+            return _required_text(raw_thread_id, "recovered Codex thread ID"), None
+        except ValueError:
+            return None, "codex_thread_conflict"
+
     def _has_budget(
         self,
         operation_deadline: float,
@@ -683,9 +924,8 @@ class SidebarExecutor:
             if state is not None:
                 if not isinstance(state, NativeThreadState):
                     return "native_task_not_indexed"
-                if (
-                    state.thread_id != thread_id
-                    or not _filesystem_equivalent(state.cwd, expected_cwd)
+                if state.thread_id != thread_id or not _filesystem_equivalent(
+                    state.cwd, expected_cwd
                 ):
                     return "codex_thread_conflict"
                 if not isinstance(state.status, NativeThreadStatus):
@@ -716,6 +956,7 @@ class SidebarExecutor:
                 lease_token=lease_token,
                 error_code=error_code,
                 now=_finite_time(self._clock()),
+                codex_thread_id=thread_id,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -743,6 +984,50 @@ def _matches_expected(
         verified.source_session_id == expected.source_session_id
         and verified.bridge_id == expected.bridge_id
     )
+
+
+def _sidebar_recovery_key(marker: str, marker_secret: bytes) -> str:
+    digest = hmac.new(
+        marker_secret,
+        b"sidebar-create-v1\0" + marker.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hermes-session-bridge-create-v1:{digest}"
+
+
+def _validated_create_reservation(
+    reservation: object,
+    *,
+    job_id: str,
+    source_session_id: str,
+    bridge_id: str,
+    expected_recovery_key: str,
+) -> str:
+    if not isinstance(reservation, Mapping) or set(reservation) != {
+        "version",
+        "job_id",
+        "source_session_id",
+        "bridge_id",
+        "recovery_key",
+        "reserved_at",
+    }:
+        raise ValueError("sidebar create reservation is malformed")
+    reservation_map = cast(Mapping[str, object], reservation)
+    if reservation_map.get("version") != 1 or isinstance(
+        reservation_map.get("version"), bool
+    ):
+        raise ValueError("sidebar create reservation is malformed")
+    if (
+        reservation_map.get("job_id") != job_id
+        or reservation_map.get("source_session_id") != source_session_id
+        or reservation_map.get("bridge_id") != bridge_id
+    ):
+        raise ValueError("sidebar create reservation identity mismatch")
+    recovery_key = _required_recovery_key(reservation_map.get("recovery_key"))
+    _finite_time(reservation_map.get("reserved_at"))
+    if not hmac.compare_digest(recovery_key, expected_recovery_key):
+        raise ValueError("sidebar create reservation key mismatch")
+    return recovery_key
 
 
 def _registration_marker(prompt: object) -> str:
@@ -836,6 +1121,10 @@ def _store_error_code(exc: Exception) -> str:
             return "sqlite_busy"
     if isinstance(exc, ValueError):
         message = str(exc).casefold()
+        if "sidebar create reservation" in message:
+            return "native_create_ambiguous"
+        if "sidebar lease has expired" in message:
+            return "broker_time_budget"
         if "source_identity_mismatch" in message:
             return "source_identity_mismatch"
         if (
@@ -857,6 +1146,15 @@ def _required_text(value: object, label: str) -> str:
     if type(value) is not str or not value or value != value.strip():
         raise ValueError(f"{label} is malformed")
     return value
+
+
+def _required_recovery_key(value: object) -> str:
+    recovery_key = _required_text(value, "sidebar recovery key")
+    prefix = "hermes-session-bridge-create-v1:"
+    digest = recovery_key.removeprefix(prefix)
+    if digest == recovery_key or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("sidebar recovery key is malformed")
+    return recovery_key
 
 
 def _finite_time(value: object) -> float:

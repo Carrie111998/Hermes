@@ -80,6 +80,7 @@ class CodexThreadSummary:
     subagent_only: bool = False
     preview: str | None = None
     native_path: str | None = None
+    thread_source: str | None = None
 
 
 class CodexInventoryProtocolError(ValueError):
@@ -101,6 +102,7 @@ class SidebarVerificationError(RuntimeError):
     def __init__(self, code: str) -> None:
         if code not in {
             "bridge_temporarily_unavailable",
+            "codex_thread_conflict",
             "marker_conflict",
             "native_task_not_indexed",
             "provider_mismatch",
@@ -302,6 +304,43 @@ class SidebarThreadVerifier:
             raise SidebarVerificationError("marker_conflict")
         return next(iter(matches.values()), None)
 
+    def find_by_recovery_key(
+        self,
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        key = _nonempty_string(recovery_key)
+        if key is None or key != recovery_key:
+            raise ValueError("Codex recovery key is malformed")
+        cwd = _nonempty_string(expected_cwd)
+        if cwd is None or cwd != expected_cwd:
+            raise ValueError("Codex recovery cwd is malformed")
+        try:
+            if not Path(cwd).expanduser().is_absolute():
+                raise ValueError("Codex recovery cwd must be absolute")
+        except (OSError, TypeError, ValueError):
+            raise ValueError("Codex recovery cwd must be absolute") from None
+        try:
+            summaries = self._source_adapter.list_sidebar_inventory(
+                deadline=deadline,
+                page_cap=self._inventory_page_cap,
+            )
+        except CodexInventoryProtocolError:
+            raise SidebarVerificationError("codex_thread_conflict") from None
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise SidebarVerificationError("bridge_temporarily_unavailable") from None
+        matches = [summary for summary in summaries if summary.thread_source == key]
+        if any(not _same_filesystem_location(summary.cwd, cwd) for summary in matches):
+            raise SidebarVerificationError("codex_thread_conflict")
+        native_ids = {summary.native_id for summary in matches}
+        if len(native_ids) > 1:
+            raise SidebarVerificationError("codex_thread_conflict")
+        return next(iter(native_ids), None)
+
     def _searched_inventory_projections(
         self,
         expected: BridgeMarkerPayload,
@@ -411,7 +450,12 @@ class CodexSourceAdapter:
             deadline=deadline,
             page_cap=page_cap - used,
         )
-        combined = {summary.native_id: summary for summary in (*active, *archived)}
+        combined: dict[str, CodexThreadSummary] = {}
+        for summary in (*active, *archived):
+            prior = combined.get(summary.native_id)
+            if prior is not None and prior != summary:
+                raise CodexInventoryProtocolError("metadata_conflict")
+            combined[summary.native_id] = summary
         return [combined[native_id] for native_id in sorted(combined)]
 
     def search_sidebar_inventory(
@@ -520,7 +564,6 @@ class CodexSourceAdapter:
         cursor: Any = None
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
-        conflicts: set[str] = set()
         pages = 0
         while True:
             if pages >= page_cap:
@@ -541,17 +584,22 @@ class CodexSourceAdapter:
                 raise ValueError("Codex thread/list response has no entries list")
             for entry in entries:
                 if not isinstance(entry, dict):
-                    continue
+                    raise ValueError(
+                        "Codex thread/list inventory entry must be an object"
+                    )
                 try:
                     summary = _normalize_summary(entry, archived=archived)
+                except CodexInventoryProtocolError:
+                    raise
                 except (TypeError, ValueError):
-                    continue
+                    raise ValueError(
+                        "Codex thread/list inventory entry is invalid"
+                    ) from None
                 prior = normalized.get(summary.native_id)
-                if prior is None and summary.native_id not in conflicts:
+                if prior is None:
                     normalized[summary.native_id] = summary
                 elif prior != summary:
-                    normalized.pop(summary.native_id, None)
-                    conflicts.add(summary.native_id)
+                    raise CodexInventoryProtocolError("metadata_conflict")
             next_cursor = _first(response, "nextCursor", "next_cursor")
             if next_cursor in (None, ""):
                 break
@@ -942,6 +990,14 @@ class CodexSourceAdapter:
         if self._initialized:
             return
         if getattr(self._client, "_initialized", False) is True:
+            self._experimental_search_enabled = (
+                getattr(
+                    self._client,
+                    "_session_bridge_experimental_api",
+                    False,
+                )
+                is True
+            )
             self._initialized = True
             return
         initialize = getattr(self._client, "initialize", None)
@@ -963,6 +1019,10 @@ class CodexSourceAdapter:
             raise RuntimeError(
                 "Codex app-server initialization did not complete; replace the client"
             )
+        try:
+            setattr(self._client, "_session_bridge_experimental_api", True)
+        except (AttributeError, TypeError):
+            pass
         self._experimental_search_enabled = True
         self._initialized = True
 
@@ -1042,8 +1102,7 @@ class CodexSourceAdapter:
 
             next_cursor = _first(response, "nextCursor", "next_cursor")
             if stop_after is not None and any(
-                summary.last_active < stop_after
-                for summary in normalized.values()
+                summary.last_active < stop_after for summary in normalized.values()
             ):
                 break
             if next_cursor in (None, ""):
@@ -1843,9 +1902,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
 
     title = _optional_string(_first(entry, "title", "name", "preview"))
     preview = _optional_string(_first(entry, "preview"))
-    native_path = _optional_string(
-        _first(entry, "path", "rolloutPath", "rollout_path")
-    )
+    native_path = _optional_string(_first(entry, "path", "rolloutPath", "rollout_path"))
     cwd = _cwd_alias_metadata(entry)
     started_at = _inventory_timestamp(
         entry,
@@ -1886,6 +1943,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
     source_kind, automation_only, subagent_only = _source_kind_metadata(
         entry, required=False
     )
+    thread_source = _thread_source_metadata(entry)
     normalized: dict[str, Any] = {
         "native_id": native_id,
         "title": title,
@@ -1894,6 +1952,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         "last_active": last_active,
         "archived": archived_value,
         "source_kind": source_kind,
+        "thread_source": thread_source,
     }
     revision_value = _first(entry, "revision", "version", "updatedVersion")
     revision = _normalize_revision(revision_value)
@@ -1929,6 +1988,7 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
         subagent_only=subagent_only,
         preview=preview,
         native_path=native_path,
+        thread_source=thread_source,
     )
 
 
@@ -2058,9 +2118,30 @@ def _cwd_alias_metadata(entry: dict[str, Any]) -> str | None:
     return selected
 
 
+def _thread_source_metadata(entry: dict[str, Any]) -> str | None:
+    values: list[str] = []
+    for alias in ("threadSource", "thread_source"):
+        if alias not in entry or entry[alias] is None:
+            continue
+        value = entry[alias]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Codex inventory threadSource must be a non-empty string")
+        normalized = value.strip()
+        if normalized != value:
+            raise ValueError("Codex inventory threadSource must be exact")
+        values.append(normalized)
+    if not values:
+        return None
+    selected = values[0]
+    if any(value != selected for value in values[1:]):
+        raise CodexInventoryProtocolError("metadata_conflict")
+    return selected
+
+
 def _read_summary_metadata(entry: dict[str, Any]) -> dict[str, str | None]:
     return {
         "cwd": _cwd_alias_metadata(entry),
+        "thread_source": _thread_source_metadata(entry),
         "git_root": _summary_metadata(
             entry,
             ("gitRoot", "git_root", "repositoryRoot", "repository_root"),
@@ -2118,6 +2199,10 @@ def _reconcile_summary_metadata(
         git_branch=reconcile(summary.git_branch, read_metadata["git_branch"]),
         git_head=reconcile(summary.git_head, read_metadata["git_head"]),
         worktree_id=reconcile(summary.worktree_id, read_metadata["worktree_id"]),
+        thread_source=reconcile(
+            summary.thread_source,
+            read_metadata["thread_source"],
+        ),
         source_kind=source_kind,
         automation_only=automation_only,
         subagent_only=subagent_only,

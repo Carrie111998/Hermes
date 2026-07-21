@@ -65,6 +65,7 @@ _MIRROR_RATE_STATE_KEY = "session-bridge:mirror-rate"
 _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
+_SIDEBAR_CREATE_RESERVATION_PREFIX = "session-bridge:sidebar-create:"
 _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
@@ -125,6 +126,15 @@ _SIDEBAR_DELIVERY_STATE_FIELDS = frozenset({
     "worktree_id",
     "eligible_at",
 })
+_SIDEBAR_CREATE_RESERVATION_FIELDS = frozenset({
+    "version",
+    "job_id",
+    "source_session_id",
+    "bridge_id",
+    "recovery_key",
+    "reserved_at",
+})
+_SIDEBAR_CREATE_RECOVERY_PREFIX = "hermes-session-bridge-create-v1:"
 _STRUCTURED_CONTENT_HEX_PREFIX = "006A736F6E3A"
 _PYTHON_STRIP_CHARACTERS = (
     "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
@@ -2207,8 +2217,19 @@ class SessionBridgeStore:
     def try_acquire_mirror_worker_lock(self) -> _MirrorWorkerFileLock | None:
         """Try to serialize mirror processing and reconciliation across processes."""
 
+        return self._try_acquire_worker_file_lock("session-bridge-worker")
+
+    def try_acquire_sidebar_worker_lock(self) -> _MirrorWorkerFileLock | None:
+        """Try to serialize the complete native-sidebar delivery transaction."""
+
+        return self._try_acquire_worker_file_lock("session-bridge-sidebar-worker")
+
+    def _try_acquire_worker_file_lock(
+        self,
+        lock_name: str,
+    ) -> _MirrorWorkerFileLock | None:
         lock_path = self.db.db_path.with_name(
-            f"{self.db.db_path.name}.session-bridge-worker.lock"
+            f"{self.db.db_path.name}.{lock_name}.lock"
         )
         stream = lock_path.open("a+b")
         try:
@@ -3788,6 +3809,54 @@ class SessionBridgeStore:
             return None
         return _decode_worktree_snapshot(row["value_json"], source_session_id)
 
+    def sidebar_execution_blockers(self) -> tuple[str, ...]:
+        """Return durable hard stops that forbid claiming another sidebar job."""
+
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            return self._sidebar_execution_blockers_in_connection(conn)
+
+    @staticmethod
+    def _sidebar_execution_blockers_in_connection(
+        conn: sqlite3.Connection,
+    ) -> tuple[str, ...]:
+        retryable_codes = tuple(sorted(SIDEBAR_RETRYABLE_ERRORS))
+        placeholders = ", ".join("?" for _ in retryable_codes)
+        failed = conn.execute(
+            """SELECT 1 FROM session_sidebar_jobs
+               WHERE state = ? LIMIT 1""",
+            (SidebarJobState.FAILED.value,),
+        ).fetchone()
+        unknown_retry = conn.execute(
+            f"""SELECT 1 FROM session_sidebar_jobs
+                WHERE state = ? AND error_code IS NOT NULL
+                  AND error_code NOT IN ({placeholders})
+                LIMIT 1""",
+            (SidebarJobState.RETRY.value, *retryable_codes),
+        ).fetchone()
+
+        blockers: list[str] = []
+        if failed is not None:
+            blockers.append("sidebar_failed")
+        if unknown_retry is not None:
+            blockers.append("unknown_retry_code")
+        return tuple(blockers)
+
+    def sidebar_has_active_lease(self, *, now: float) -> bool:
+        """Return whether another worker owns an unexpired durable sidebar lease."""
+
+        checked_at = _finite_number(now, "sidebar active lease time")
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                """SELECT 1 FROM session_sidebar_jobs
+                   WHERE state = ? AND lease_expires_at > ? LIMIT 1""",
+                (SidebarJobState.LEASED.value, checked_at),
+            ).fetchone()
+        return row is not None
+
     def claim_sidebar_jobs(
         self,
         *,
@@ -3823,6 +3892,15 @@ class SessionBridgeStore:
                     claim_time,
                 ),
             )
+            if self._sidebar_execution_blockers_in_connection(conn):
+                return []
+            active_lease = conn.execute(
+                """SELECT 1 FROM session_sidebar_jobs
+                   WHERE state = ? AND lease_expires_at > ? LIMIT 1""",
+                (SidebarJobState.LEASED.value, claim_time),
+            ).fetchone()
+            if active_lease is not None:
+                return []
             due = conn.execute(
                 """SELECT * FROM session_sidebar_jobs
                    WHERE state IN (?, ?) AND next_attempt_at <= ?
@@ -3837,10 +3915,9 @@ class SessionBridgeStore:
                     _SIDEBAR_CLAIM_SCAN_LIMIT,
                 ),
             ).fetchall()
-            claimed: list[dict[str, Any]] = []
+            validated: list[tuple[dict[str, Any], Provider]] = []
+            found_invalid = False
             for raw_row in due:
-                if len(claimed) >= limit:
-                    break
                 row = dict(raw_row)
                 try:
                     provider = _validated_sidebar_job_provider(row)
@@ -3857,7 +3934,16 @@ class SessionBridgeStore:
                             row["state"],
                         ),
                     )
+                    found_invalid = True
                     continue
+                validated.append((row, provider))
+            if found_invalid:
+                return []
+
+            claimed: list[dict[str, Any]] = []
+            for row, provider in validated:
+                if len(claimed) >= limit:
+                    break
                 lease_token, lease_digest = self._new_sidebar_lease(conn)
                 lease_expires_at = claim_time + lease_seconds
                 cursor = conn.execute(
@@ -3889,6 +3975,161 @@ class SessionBridgeStore:
             return claimed
 
         return self.db._execute_write(_write)
+
+    def reserve_sidebar_create(
+        self,
+        *,
+        lease_token: str,
+        recovery_key: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """Persist immutable native-create intent before calling Codex."""
+
+        token_digest = _sidebar_lease_digest(lease_token)
+        normalized_key = _sidebar_create_recovery_key(recovery_key)
+        reserved_at = _finite_number(now, "sidebar create reservation time")
+
+        def _write(conn):
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if float(job["lease_expires_at"]) <= reserved_at:
+                _recover_one_expired_sidebar_lease(conn, job, now=reserved_at)
+                return None, True
+            if job["codex_thread_id"] is not None:
+                raise ValueError(
+                    "sidebar create reservation already has a native thread"
+                )
+            payload = {
+                "version": 1,
+                "job_id": job["id"],
+                "source_session_id": job["source_session_id"],
+                "bridge_id": job["bridge_id"],
+                "recovery_key": normalized_key,
+                "reserved_at": reserved_at,
+            }
+            state_key = _sidebar_create_reservation_state_key(job["source_session_id"])
+            existing = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (state_key,),
+            ).fetchone()
+            if existing is not None:
+                decoded = _decode_sidebar_create_reservation(
+                    existing["value_json"],
+                    expected_source_session_id=job["source_session_id"],
+                )
+                if (
+                    decoded["job_id"] != job["id"]
+                    or decoded["bridge_id"] != job["bridge_id"]
+                    or not hmac.compare_digest(decoded["recovery_key"], normalized_key)
+                ):
+                    raise ValueError("conflicting sidebar create reservation")
+                return decoded, False
+            value_json = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            conn.execute(
+                """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                   VALUES (?, ?, ?)""",
+                (state_key, value_json, reserved_at),
+            )
+            return payload, False
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        assert result is not None
+        return result
+
+    def get_sidebar_create_reservation(
+        self,
+        source_session_id: str,
+    ) -> dict[str, Any] | None:
+        source_id = _exact_nonempty_text(source_session_id, "sidebar source session ID")
+        state_key = _sidebar_create_reservation_state_key(source_id)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (state_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            reservation = _decode_sidebar_create_reservation(
+                row["value_json"],
+                expected_source_session_id=source_id,
+            )
+            job = conn.execute(
+                "SELECT id, bridge_id FROM session_sidebar_jobs WHERE source_session_id = ?",
+                (source_id,),
+            ).fetchone()
+        if (
+            job is None
+            or job["id"] != reservation["job_id"]
+            or job["bridge_id"] != reservation["bridge_id"]
+        ):
+            raise ValueError("invalid sidebar create reservation identity")
+        return reservation
+
+    def clear_sidebar_create_reservation(
+        self,
+        *,
+        lease_token: str,
+        recovery_key: str,
+        now: float,
+    ) -> None:
+        """Clear intent only after a conclusive pre-dispatch rejection."""
+
+        token_digest = _sidebar_lease_digest(lease_token)
+        normalized_key = _sidebar_create_recovery_key(recovery_key)
+        cleared_at = _finite_number(now, "sidebar create reservation clear time")
+
+        def _write(conn):
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if float(job["lease_expires_at"]) <= cleared_at:
+                _recover_one_expired_sidebar_lease(conn, job, now=cleared_at)
+                return True
+            state_key = _sidebar_create_reservation_state_key(job["source_session_id"])
+            row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (state_key,),
+            ).fetchone()
+            if row is None:
+                return False
+            reservation = _decode_sidebar_create_reservation(
+                row["value_json"],
+                expected_source_session_id=job["source_session_id"],
+            )
+            if (
+                reservation["job_id"] != job["id"]
+                or reservation["bridge_id"] != job["bridge_id"]
+                or not hmac.compare_digest(reservation["recovery_key"], normalized_key)
+            ):
+                raise ValueError("conflicting sidebar create reservation")
+            conn.execute(
+                "DELETE FROM session_bridge_state WHERE key = ?",
+                (state_key,),
+            )
+            return False
+
+        expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
 
     def bind_sidebar_thread(
         self,
@@ -4152,6 +4393,7 @@ class SessionBridgeStore:
         lease_token: str,
         error_code: str,
         now: float,
+        codex_thread_id: str | None = None,
     ) -> dict[str, Any]:
         if (
             type(error_code) is not str
@@ -4160,6 +4402,11 @@ class SessionBridgeStore:
             raise ValueError("sidebar error code is not in the fixed allowlist")
         token_digest = _sidebar_lease_digest(lease_token)
         failure_time = _finite_number(now, "now")
+        thread_id = (
+            None
+            if codex_thread_id is None
+            else _exact_nonempty_text(codex_thread_id, "Codex thread ID")
+        )
 
         def _write(conn):
             job, _ = _find_sidebar_job_by_digest(
@@ -4172,6 +4419,36 @@ class SessionBridgeStore:
             if float(job["lease_expires_at"]) <= failure_time:
                 _recover_one_expired_sidebar_lease(conn, job, now=failure_time)
                 return dict(job), True
+            if thread_id is not None:
+                existing_thread_id = job["codex_thread_id"]
+                if existing_thread_id is not None and existing_thread_id != thread_id:
+                    raise ValueError("conflicting Codex thread identity")
+                conflict = conn.execute(
+                    """SELECT id FROM session_sidebar_jobs
+                       WHERE codex_thread_id = ? AND id != ?""",
+                    (thread_id, job["id"]),
+                ).fetchone()
+                if conflict is not None:
+                    raise ValueError("conflicting Codex thread identity")
+                if existing_thread_id is None:
+                    cursor = conn.execute(
+                        """UPDATE session_sidebar_jobs
+                           SET codex_thread_id = ?, updated_at = ?
+                           WHERE id = ? AND state = ? AND codex_thread_id IS NULL""",
+                        (
+                            thread_id,
+                            failure_time,
+                            job["id"],
+                            SidebarJobState.LEASED.value,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("stale sidebar thread binding")
+                    job = conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                    assert job is not None
             if error_code == "broker_time_budget":
                 cursor = conn.execute(
                     """UPDATE session_sidebar_jobs
@@ -5922,6 +6199,72 @@ def _sidebar_delivery_state_key(source_session_id: str) -> str:
     sidebar_idempotency_key(source_session_id)
     digest = hashlib.sha256(source_session_id.encode()).hexdigest()
     return f"{_SIDEBAR_DELIVERY_STATE_PREFIX}{digest}"
+
+
+def _sidebar_create_reservation_state_key(source_session_id: str) -> str:
+    from .sidebar import sidebar_idempotency_key
+
+    sidebar_idempotency_key(source_session_id)
+    digest = hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()
+    return f"{_SIDEBAR_CREATE_RESERVATION_PREFIX}{digest}"
+
+
+def _sidebar_create_recovery_key(value: object) -> str:
+    recovery_key = _exact_nonempty_text(value, "sidebar create recovery key")
+    suffix = recovery_key.removeprefix(_SIDEBAR_CREATE_RECOVERY_PREFIX)
+    if (
+        suffix == recovery_key
+        or not suffix
+        or len(recovery_key) > 256
+        or any(character in recovery_key for character in "\x00\r\n")
+    ):
+        raise ValueError("invalid sidebar create recovery key")
+    return recovery_key
+
+
+def _decode_sidebar_create_reservation(
+    value_json: object,
+    *,
+    expected_source_session_id: str,
+) -> dict[str, Any]:
+    if not isinstance(value_json, (str, bytes, bytearray)):
+        raise ValueError("invalid sidebar create reservation")
+    try:
+        payload = json.loads(value_json)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("invalid sidebar create reservation") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _SIDEBAR_CREATE_RESERVATION_FIELDS
+        or payload.get("version") != 1
+        or isinstance(payload.get("version"), bool)
+        or payload.get("source_session_id") != expected_source_session_id
+    ):
+        raise ValueError("invalid sidebar create reservation")
+    job_id = _exact_nonempty_text(payload.get("job_id"), "sidebar reservation job ID")
+    source_session_id = _exact_nonempty_text(
+        payload.get("source_session_id"), "sidebar reservation source ID"
+    )
+    bridge_id = _exact_nonempty_text(
+        payload.get("bridge_id"), "sidebar reservation bridge ID"
+    )
+    recovery_key = _sidebar_create_recovery_key(payload.get("recovery_key"))
+    reserved_at = _finite_number(
+        payload.get("reserved_at"), "sidebar create reservation time"
+    )
+    from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
+
+    sidebar_idempotency_key(source_session_id)
+    if bridge_id != sidebar_bridge_id(source_session_id):
+        raise ValueError("invalid sidebar create reservation identity")
+    return {
+        "version": 1,
+        "job_id": job_id,
+        "source_session_id": source_session_id,
+        "bridge_id": bridge_id,
+        "recovery_key": recovery_key,
+        "reserved_at": reserved_at,
+    }
 
 
 def _worktree_snapshot_state_key(source_session_id: str) -> str:

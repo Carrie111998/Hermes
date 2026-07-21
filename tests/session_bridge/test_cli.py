@@ -1803,6 +1803,40 @@ def test_production_backend_close_closes_both_codex_transports_once_and_resets_l
     assert backend._sidebar_executor is None
 
 
+def test_production_backend_close_attempts_all_cleanup_when_first_client_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+
+    class CloseProbe:
+        def __init__(self, *, failure: Exception | None = None) -> None:
+            self.failure = failure
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.failure is not None:
+                raise self.failure
+
+    provider_client = CloseProbe(failure=RuntimeError("provider close failed"))
+    sidebar_client = CloseProbe()
+    database = CloseProbe()
+    monkeypatch.setattr(backend, "_codex_client", provider_client)
+    monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(backend, "_db", database)
+
+    with pytest.raises(RuntimeError, match="provider close failed"):
+        backend.close()
+    backend.close()
+
+    assert provider_client.close_count == 1
+    assert sidebar_client.close_count == 1
+    assert database.close_count == 1
+    assert backend._codex_client is None
+    assert backend._sidebar_codex_client is None
+    assert backend._db is None
+
+
 def test_production_all_provider_scan_isolates_provider_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

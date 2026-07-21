@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import hmac
 import math
 import sqlite3
 import threading
@@ -34,6 +36,7 @@ SOURCE_2 = "claude:source-2"
 THREAD_1 = "11111111-1111-4111-8111-111111111111"
 THREAD_2 = "22222222-2222-4222-8222-222222222222"
 SECRET = b"sidebar-executor-test-secret"
+RECOVERY_KEY = "hermes-session-bridge-create-v1:" + "a" * 64
 
 
 def test_concrete_codex_app_server_delivery_is_available() -> None:
@@ -77,19 +80,34 @@ class FakeCodexAppServerClient:
 def test_codex_delivery_starts_exact_cwd_and_returns_exact_thread_id() -> None:
     clock = FakeClock()
     client = FakeCodexAppServerClient({
-        "thread/start": [{"thread": {"id": THREAD_1}}],
+        "thread/start": [
+            {
+                "thread": {
+                    "id": THREAD_1,
+                    "cwd": "C:/source",
+                    "threadSource": RECOVERY_KEY,
+                }
+            }
+        ],
     })
     delivery = CodexAppServerSidebarDelivery(client, monotonic=clock)
 
     created = delivery.create_thread(
         prompt="registration happens later",
         candidate=_candidate(SOURCE_1),
+        recovery_key=RECOVERY_KEY,
         deadline=105.0,
     )
 
     assert created == THREAD_1
     assert client.initialize_timeouts == [5.0]
-    assert client.calls == [("thread/start", {"cwd": "C:/source"}, 5.0)]
+    assert client.calls == [
+        (
+            "thread/start",
+            {"cwd": "C:/source", "threadSource": RECOVERY_KEY},
+            5.0,
+        )
+    ]
 
 
 @pytest.mark.parametrize("failure", [TimeoutError("timeout"), RuntimeError("unknown")])
@@ -103,6 +121,7 @@ def test_codex_delivery_maps_post_dispatch_create_failures_to_ambiguity(
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
 
@@ -121,6 +140,7 @@ def test_codex_delivery_treats_missing_exact_create_identity_as_ambiguous(
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
 
@@ -135,6 +155,7 @@ def test_codex_delivery_rejects_expired_deadline_before_create_dispatch() -> Non
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            recovery_key=RECOVERY_KEY,
             deadline=100.0,
         )
 
@@ -154,6 +175,7 @@ def test_codex_delivery_maps_initialize_failure_to_pre_dispatch_rejection() -> N
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
 
@@ -161,11 +183,47 @@ def test_codex_delivery_maps_initialize_failure_to_pre_dispatch_rejection() -> N
     assert client.calls == []
 
 
+def test_codex_delivery_preflight_initializes_experimental_api_and_reads_inventory() -> (
+    None
+):
+    client = FakeCodexAppServerClient({
+        "thread/list": [{"data": [], "nextCursor": None}],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    delivery.preflight(deadline=105.0)
+
+    assert client.initialize_timeouts == [5.0]
+    assert getattr(client, "_session_bridge_experimental_api") is True
+    assert client.calls == [("thread/list", {"archived": False, "limit": 1}, 5.0)]
+
+
+@pytest.mark.parametrize(
+    "thread",
+    [
+        {"id": THREAD_1, "cwd": "C:/source", "threadSource": "wrong"},
+        {"id": THREAD_1, "cwd": "C:/different", "threadSource": RECOVERY_KEY},
+        {"id": THREAD_1, "cwd": "C:/source"},
+    ],
+)
+def test_codex_delivery_rejects_create_response_identity_mismatch_as_ambiguous(
+    thread: dict[str, object],
+) -> None:
+    client = FakeCodexAppServerClient({"thread/start": [{"thread": thread}]})
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(NativeCreateAmbiguous):
+        delivery.create_thread(
+            prompt="registration happens later",
+            candidate=_candidate(SOURCE_1),
+            recovery_key=RECOVERY_KEY,
+            deadline=105.0,
+        )
+
+
 def test_codex_delivery_observes_client_initialized_after_construction() -> None:
     client = FakeCodexAppServerClient({
-        "thread/read": [
-            {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
-        ],
+        "thread/read": [{"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}],
     })
     delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
     client._initialized = True
@@ -267,9 +325,7 @@ def test_codex_delivery_does_not_accept_marker_embedded_in_larger_token(
 def test_codex_delivery_starts_registration_turn_when_exact_marker_is_absent() -> None:
     prompt = _registration_prompt()
     client = FakeCodexAppServerClient({
-        "thread/read": [
-            {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
-        ],
+        "thread/read": [{"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}],
         "turn/start": [{"turn": {"id": "registration-turn"}}],
     })
     delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
@@ -295,9 +351,7 @@ def test_codex_delivery_starts_registration_turn_when_exact_marker_is_absent() -
 
 def test_codex_delivery_reads_exact_idle_thread_with_remaining_deadline() -> None:
     client = FakeCodexAppServerClient({
-        "thread/read": [
-            {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
-        ],
+        "thread/read": [{"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}],
     })
     delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
 
@@ -395,6 +449,22 @@ def _candidate(source: str) -> SidebarCandidate:
     )
 
 
+def _expected_recovery_key(source: str) -> str:
+    expected = BridgeMarkerPayload(
+        bridge_id=sidebar_bridge_id(source),
+        source_session_id=source,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+    marker = encode_bridge_marker(expected, SECRET)
+    digest = hmac.new(
+        SECRET,
+        b"sidebar-create-v1\0" + marker.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hermes-session-bridge-create-v1:{digest}"
+
+
 def _job(source: str, *, thread_id: str | None = None) -> dict[str, Any]:
     return {
         "id": f"sidebar-job:{source}",
@@ -419,6 +489,11 @@ class FakeStore:
         failure_error: Exception | None = None,
         failure_result: object | None = None,
         heartbeat_error: Exception | None = None,
+        reservations: dict[str, dict[str, Any]] | None = None,
+        worker_lock_available: bool = True,
+        execution_blockers: tuple[str, ...] = (),
+        active_lease: bool = False,
+        execution_blockers_after_claim: tuple[str, ...] = (),
     ) -> None:
         self.events = events
         self.jobs = jobs
@@ -430,18 +505,41 @@ class FakeStore:
         self.failure_error = failure_error
         self.failure_result = failure_result
         self.heartbeat_error = heartbeat_error
+        self.reservations = dict(reservations or {})
+        self.worker_lock_available = worker_lock_available
+        self.execution_blockers = execution_blockers
+        self.active_lease = active_lease
+        self.execution_blockers_after_claim = execution_blockers_after_claim
         self.candidates = {
             source: _candidate(source)
             for job in jobs
             if isinstance((source := job.get("source_session_id")), str)
         }
         self.failures: list[str] = []
+        self.failure_thread_ids: list[str | None] = []
         self.heartbeats: list[float] = []
+
+    class _Lock:
+        def release(self) -> None:
+            return None
+
+    def try_acquire_sidebar_worker_lock(self) -> _Lock | None:
+        return self._Lock() if self.worker_lock_available else None
+
+    def sidebar_execution_blockers(self) -> tuple[str, ...]:
+        return self.execution_blockers
+
+    def sidebar_has_active_lease(self, *, now: float) -> bool:
+        del now
+        return self.active_lease
 
     def claim_sidebar_jobs(
         self, *, now: float, limit: int, lease_seconds: int
     ) -> list[dict[str, Any]]:
         self.events.append(("claim", limit, lease_seconds, now))
+        if self.execution_blockers_after_claim:
+            self.execution_blockers = self.execution_blockers_after_claim
+            return []
         claimed = self.jobs[:limit]
         self.jobs = self.jobs[limit:]
         return [
@@ -459,7 +557,9 @@ class FakeStore:
             raise self.heartbeat_error
         self.heartbeats.append(now)
 
-    def get_sidebar_candidate_for_delivery(self, source_session_id: str) -> SidebarCandidate:
+    def get_sidebar_candidate_for_delivery(
+        self, source_session_id: str
+    ) -> SidebarCandidate:
         self.events.append(("candidate", source_session_id))
         if self.candidate_error is not None:
             raise self.candidate_error
@@ -479,6 +579,45 @@ class FakeStore:
             "lease_token": lease_token,
             "updated_at": now,
         }
+
+    def get_sidebar_create_reservation(
+        self, source_session_id: str
+    ) -> dict[str, Any] | None:
+        return self.reservations.get(source_session_id)
+
+    def reserve_sidebar_create(
+        self, *, lease_token: str, recovery_key: str, now: float
+    ) -> dict[str, Any]:
+        del lease_token
+        source_session_id = next(iter(self.candidates))
+        candidate = self.candidates[source_session_id]
+        existing = self.reservations.get(source_session_id)
+        if existing is not None:
+            if existing["recovery_key"] != recovery_key:
+                raise ValueError("conflicting sidebar create reservation")
+            return existing
+        reservation = {
+            "version": 1,
+            "job_id": f"sidebar-job:{source_session_id}",
+            "source_session_id": source_session_id,
+            "bridge_id": candidate.bridge_id,
+            "recovery_key": recovery_key,
+            "reserved_at": now,
+        }
+        self.events.append(("reserve", recovery_key))
+        self.reservations[source_session_id] = reservation
+        return reservation
+
+    def clear_sidebar_create_reservation(
+        self, *, lease_token: str, recovery_key: str, now: float
+    ) -> None:
+        del lease_token, now
+        source_session_id = next(iter(self.candidates))
+        existing = self.reservations.get(source_session_id)
+        if existing is None or existing["recovery_key"] != recovery_key:
+            raise ValueError("conflicting sidebar create reservation")
+        self.events.append(("clear_reservation", recovery_key))
+        del self.reservations[source_session_id]
 
     def commit_sidebar_job_with_lineage(
         self,
@@ -502,19 +641,23 @@ class FakeStore:
         }
 
     def fail_sidebar_job(
-        self, *, lease_token: str, error_code: str, now: float
+        self,
+        *,
+        lease_token: str,
+        error_code: str,
+        now: float,
+        codex_thread_id: str | None = None,
     ) -> dict[str, Any]:
         del lease_token, now
         self.events.append(("fail", error_code))
         self.failures.append(error_code)
+        self.failure_thread_ids.append(codex_thread_id)
         if self.failure_error is not None:
             raise self.failure_error
         if self.failure_result is not None:
             return self.failure_result  # type: ignore[return-value]
         state = self.failure_state or (
-            "sidebar_failed"
-            if error_code in SIDEBAR_FATAL_ERRORS
-            else "sidebar_retry"
+            "sidebar_failed" if error_code in SIDEBAR_FATAL_ERRORS else "sidebar_retry"
         )
         return {"state": state, "error_code": error_code}
 
@@ -525,15 +668,31 @@ class FakeVerifier:
         events: list[tuple[Any, ...]],
         *,
         find_result: VerifiedSidebarThread | None = None,
+        recovery_result: str | None = None,
+        recovery_error: Exception | None = None,
     ) -> None:
         self.events = events
         self.find_result = find_result
+        self.recovery_result = recovery_result
+        self.recovery_error = recovery_error
 
     def find_by_marker(
         self, expected: BridgeMarkerPayload
     ) -> VerifiedSidebarThread | None:
         self.events.append(("find", expected.source_session_id))
         return self.find_result
+
+    def find_by_recovery_key(
+        self,
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        self.events.append(("recover", recovery_key, expected_cwd, deadline))
+        if self.recovery_error is not None:
+            raise self.recovery_error
+        return self.recovery_result
 
     def verify_thread(
         self, *, thread_id: str, expected: BridgeMarkerPayload
@@ -558,6 +717,7 @@ class FakeNative:
         read_cwd: str = "C:/source",
         after_create: Callable[[], None] | None = None,
         register_error: Exception | None = None,
+        preflight_error: Exception | None = None,
     ) -> None:
         self.events = events
         self.create_result = create_result
@@ -567,18 +727,33 @@ class FakeNative:
         self.read_cwd = read_cwd
         self.after_create = after_create
         self.register_error = register_error
+        self.preflight_error = preflight_error
+        self.preflight_calls = 0
         self.create_calls = 0
+
+    def preflight(self, *, deadline: float) -> None:
+        del deadline
+        self.preflight_calls += 1
+        if self.preflight_error is not None:
+            raise self.preflight_error
 
     def create_thread(
         self,
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        recovery_key: str,
         deadline: float,
     ) -> str:
         assert candidate.cwd == "C:/source"
         assert "Signed marker:" in prompt
-        self.events.append(("create", candidate.source_session_id, deadline))
+        assert recovery_key.startswith("hermes-session-bridge-create-v1:")
+        self.events.append((
+            "create",
+            candidate.source_session_id,
+            recovery_key,
+            deadline,
+        ))
         self.create_calls += 1
         if isinstance(self.create_result, Exception):
             raise self.create_result
@@ -685,6 +860,112 @@ def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:
     assert events == [("claim", 1, 300, 100.0)]
 
 
+def test_provider_preflight_failure_never_claims_a_sidebar_job() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(
+        events,
+        preflight_error=NativeCreateRejected("codex_tool_unavailable"),
+    )
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="unsettled",
+        error_code="codex_tool_unavailable",
+    )
+    assert native.preflight_calls == 1
+    assert events == []
+    assert store.jobs == [_job(SOURCE_1)]
+
+
+def test_cross_process_lock_contention_is_degraded_and_never_claims() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        worker_lock_available=False,
+    )
+    native = FakeNative(events)
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="unsettled",
+        error_code="bridge_temporarily_unavailable",
+    )
+    assert native.preflight_calls == 0
+    assert events == []
+    assert store.jobs == [_job(SOURCE_1)]
+
+
+@pytest.mark.parametrize("blocker", ["sidebar_failed", "unknown_retry_code"])
+def test_existing_hard_stop_row_prevents_claim(blocker: str) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        execution_blockers=(blocker,),
+    )
+    native = FakeNative(events)
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="unsettled",
+        error_code="source_identity_mismatch",
+    )
+    assert native.preflight_calls == 1
+    assert events == []
+    assert store.jobs == [_job(SOURCE_1)]
+
+
+def test_active_database_lease_is_unsettled_and_never_claims_or_heartbeats() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)], active_lease=True)
+    native = FakeNative(events)
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="unsettled",
+        error_code="bridge_temporarily_unavailable",
+    )
+    assert native.preflight_calls == 1
+    assert events == []
+    assert store.heartbeats == []
+    assert store.jobs == [_job(SOURCE_1)]
+
+
+def test_empty_claim_that_creates_hard_stop_is_never_reported_idle() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        execution_blockers_after_claim=("sidebar_failed",),
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="unsettled",
+        error_code="source_identity_mismatch",
+    )
+    assert events == [("claim", 1, 300, 100.0)]
+    assert store.heartbeats == []
+    assert store.jobs == [_job(SOURCE_1)]
+
+
 def test_idle_cycle_fails_closed_when_broker_heartbeat_cannot_persist() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
@@ -737,6 +1018,7 @@ def test_zero_marker_candidates_create_bind_and_register_before_any_read() -> No
         "claim",
         "candidate",
         "find",
+        "reserve",
         "create",
         "bind",
         "register",
@@ -744,6 +1026,82 @@ def test_zero_marker_candidates_create_bind_and_register_before_any_read() -> No
         "verify",
         "rename",
         "commit",
+    ]
+    assert events[3][1] == _expected_recovery_key(SOURCE_1)
+    assert events[4][2] == _expected_recovery_key(SOURCE_1)
+
+
+def test_existing_create_reservation_with_zero_recovery_never_creates() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    recovery_key = _expected_recovery_key(SOURCE_1)
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        reservations={
+            SOURCE_1: {
+                "version": 1,
+                "job_id": f"sidebar-job:{SOURCE_1}",
+                "source_session_id": SOURCE_1,
+                "bridge_id": sidebar_bridge_id(SOURCE_1),
+                "recovery_key": recovery_key,
+                "reserved_at": 50.0,
+            }
+        },
+    )
+    native = FakeNative(events)
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="native_create_ambiguous",
+    )
+    assert native.create_calls == 0
+    assert [event[0] for event in events] == [
+        "claim",
+        "candidate",
+        "find",
+        "recover",
+        "fail",
+    ]
+
+
+def test_existing_create_reservation_recovers_exact_tagged_thread_without_create() -> (
+    None
+):
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    recovery_key = _expected_recovery_key(SOURCE_1)
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        reservations={
+            SOURCE_1: {
+                "version": 1,
+                "job_id": f"sidebar-job:{SOURCE_1}",
+                "source_session_id": SOURCE_1,
+                "bridge_id": sidebar_bridge_id(SOURCE_1),
+                "recovery_key": recovery_key,
+                "reserved_at": 50.0,
+            }
+        },
+    )
+    native = FakeNative(events)
+    verifier = FakeVerifier(events, recovery_result=THREAD_1)
+
+    result = _executor(store, verifier, native, clock).run_once()
+
+    assert result.status == "visible"
+    assert result.thread_id == THREAD_1
+    assert native.create_calls == 0
+    assert [event[0] for event in events][:5] == [
+        "claim",
+        "candidate",
+        "find",
+        "recover",
+        "bind",
     ]
 
 
@@ -817,6 +1175,8 @@ def test_explicit_pre_dispatch_create_rejection_is_retryable() -> None:
     assert result.status == "retry"
     assert result.error_code == "codex_tool_unavailable"
     assert store.failures == ["codex_tool_unavailable"]
+    assert store.reservations == {}
+    assert [event[0] for event in events][-2:] == ["clear_reservation", "fail"]
 
 
 @pytest.mark.parametrize("create_result", [None, "", 42])
@@ -853,10 +1213,12 @@ def test_bind_ambiguity_releases_once_without_read_rename_or_commit() -> None:
     assert result.error_code == "bridge_temporarily_unavailable"
     assert result.status == "retry"
     assert store.failures == ["bridge_temporarily_unavailable"]
+    assert store.failure_thread_ids == [THREAD_1]
     assert [event[0] for event in events] == [
         "claim",
         "candidate",
         "find",
+        "reserve",
         "create",
         "bind",
         "fail",
@@ -1082,7 +1444,9 @@ def test_rename_failure_retries_without_commit_or_replacement() -> None:
 def test_commit_ambiguity_releases_once_without_replacement() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
-    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)], commit_error=TimeoutError())
+    store = FakeStore(
+        events, [_job(SOURCE_1, thread_id=THREAD_1)], commit_error=TimeoutError()
+    )
     native = FakeNative(events)
     executor = _executor(store, FakeVerifier(events), native, clock)
 
@@ -1110,8 +1474,18 @@ def test_commit_ambiguity_releases_once_without_replacement() -> None:
             "source_identity_mismatch",
             "failed",
         ),
-        ("bind", sqlite3.OperationalError("database is locked"), "sqlite_busy", "retry"),
-        ("commit", sqlite3.OperationalError("database is busy"), "sqlite_busy", "retry"),
+        (
+            "bind",
+            sqlite3.OperationalError("database is locked"),
+            "sqlite_busy",
+            "retry",
+        ),
+        (
+            "commit",
+            sqlite3.OperationalError("database is busy"),
+            "sqlite_busy",
+            "retry",
+        ),
     ],
 )
 def test_store_errors_use_fixed_identity_or_transient_codes(
@@ -1273,11 +1647,13 @@ def test_two_executor_instances_share_one_process_wide_delivery_lock() -> None:
             *,
             prompt: str,
             candidate: SidebarCandidate,
+            recovery_key: str,
             deadline: float,
         ) -> str:
             result = super().create_thread(
                 prompt=prompt,
                 candidate=candidate,
+                recovery_key=recovery_key,
                 deadline=deadline,
             )
             entered_create.set()

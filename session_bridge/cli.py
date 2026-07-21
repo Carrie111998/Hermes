@@ -265,19 +265,31 @@ class ProductionBackend:
             self._sidebar_codex_client,
             None,
         )
-        self._sidebar_executor = None
-        closed_clients: set[int] = set()
-        for client in (provider_client, sidebar_client):
-            if client is not None and id(client) not in closed_clients:
-                closed_clients.add(id(client))
-                client.close()
         db, self._db = self._db, None
+        self._sidebar_executor = None
         self._store = None
         self._catalog = None
         self._coordinator = None
         self._claude_visibility_coordinator = None
+
+        first_error: BaseException | None = None
+        closed_clients: set[int] = set()
+        for client in (provider_client, sidebar_client):
+            if client is not None and id(client) not in closed_clients:
+                closed_clients.add(id(client))
+                try:
+                    client.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
         if db is not None:
-            db.close()
+            try:
+                db.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def serve(self) -> None:
         visibility_stop: threading.Event | None = None

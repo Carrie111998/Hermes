@@ -50,11 +50,14 @@ class _Clock:
 @dataclass
 class _NativeWorld:
     threads: dict[str, BridgeMarkerPayload] = field(default_factory=dict)
+    recovery_keys: dict[str, str] = field(default_factory=dict)
+    registered_threads: set[str] = field(default_factory=set)
     create_calls: list[str] = field(default_factory=list)
     register_calls: list[str] = field(default_factory=list)
     rename_calls: list[str] = field(default_factory=list)
     find_by_marker_calls: list[BridgeMarkerPayload] = field(default_factory=list)
     lose_create_response_once: bool = False
+    die_after_create_once: bool = False
     die_after_bind_once: bool = False
     die_before_rename_once: bool = False
 
@@ -70,11 +73,15 @@ class _NativeDelivery:
         self._store = store
         self._clock = clock
 
+    def preflight(self, *, deadline: float) -> None:
+        assert deadline > self._clock()
+
     def create_thread(
         self,
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        recovery_key: str,
         deadline: float,
     ) -> str:
         assert deadline > self._clock()
@@ -86,6 +93,7 @@ class _NativeDelivery:
         payload = decode_bridge_marker(marker, _MARKER_SECRET)
         self._world.create_calls.append(_THREAD_ID)
         self._world.threads[_THREAD_ID] = payload
+        self._world.recovery_keys[_THREAD_ID] = recovery_key
         self._store.upsert_projection(
             SessionProjection(
                 provider=Provider.CODEX,
@@ -113,6 +121,9 @@ class _NativeDelivery:
         if self._world.lose_create_response_once:
             self._world.lose_create_response_once = False
             raise NativeCreateAmbiguous()
+        if self._world.die_after_create_once:
+            self._world.die_after_create_once = False
+            raise SystemExit("synthetic process death after native create")
         return _THREAD_ID
 
     def register_thread(
@@ -126,6 +137,7 @@ class _NativeDelivery:
         assert deadline > self._clock()
         assert thread_id in self._world.threads
         self._world.register_calls.append(thread_id)
+        self._world.registered_threads.add(thread_id)
         if self._world.die_after_bind_once:
             self._world.die_after_bind_once = False
             raise SystemExit("synthetic process death after durable bind")
@@ -169,12 +181,29 @@ class _Verifier:
         matches = [
             thread_id
             for thread_id, payload in self._world.threads.items()
-            if payload == expected
+            if payload == expected and thread_id in self._world.registered_threads
         ]
         assert len(matches) <= 1
         if not matches:
             return None
         return _verified(matches[0], expected)
+
+    def find_by_recovery_key(
+        self,
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        assert deadline > 0
+        assert expected_cwd == "C:/workspace/project"
+        matches = [
+            thread_id
+            for thread_id, key in self._world.recovery_keys.items()
+            if key == recovery_key
+        ]
+        assert len(matches) <= 1
+        return matches[0] if matches else None
 
     def verify_thread(
         self,
@@ -203,6 +232,18 @@ class _CommitResponseLossStore:
         raise OSError("synthetic commit response loss")
 
 
+class _BindResponseLossStore:
+    def __init__(self, delegate: SessionBridgeStore) -> None:
+        self.delegate = delegate
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    def bind_sidebar_thread(self, **arguments: Any) -> dict[str, Any]:
+        self.delegate.bind_sidebar_thread(**arguments)
+        raise OSError("synthetic bind response loss")
+
+
 def test_thread_start_response_loss_never_authorizes_a_second_create(
     tmp_path: Path,
 ) -> None:
@@ -212,8 +253,8 @@ def test_thread_start_response_loss_never_authorizes_a_second_create(
     db, store = _seed_store(path, clock)
     try:
         first = _executor(store, world, clock).run_once()
-        assert first.status == "failed"
-        assert first.error_code == "native_create_ambiguous"
+        assert first.status == "visible"
+        assert first.thread_id == _THREAD_ID
     finally:
         db.close()
 
@@ -226,8 +267,72 @@ def test_thread_start_response_loss_never_authorizes_a_second_create(
         assert world.create_calls == [_THREAD_ID]
         job = restarted_store.get_sidebar_job_for_source("restart-source")
         assert job is not None
-        assert job["state"] == "sidebar_failed"
+        assert job["state"] == "sidebar_visible"
+        assert job["codex_thread_id"] == _THREAD_ID
+    finally:
+        restarted_db.close()
+
+
+def test_process_death_after_create_recovers_reserved_exact_thread_without_recreation(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    world = _NativeWorld(die_after_create_once=True)
+    path = tmp_path / "restart-after-create.db"
+    db, store = _seed_store(path, clock)
+    try:
+        with pytest.raises(SystemExit, match="after native create"):
+            _executor(store, world, clock).run_once()
+        job = store.get_sidebar_job_for_source("restart-source")
+        assert job is not None
+        assert job["state"] == "sidebar_leased"
         assert job["codex_thread_id"] is None
+        reservation = store.get_sidebar_create_reservation("restart-source")
+        assert reservation is not None
+        assert reservation["recovery_key"] in world.recovery_keys.values()
+    finally:
+        db.close()
+
+    clock.advance(301.0)
+    restarted_db = SessionDB(path)
+    try:
+        restarted_store = _store(restarted_db, clock)
+        result = _executor(restarted_store, world, clock).run_once()
+
+        assert result.status == "visible"
+        assert result.thread_id == _THREAD_ID
+        assert world.create_calls == [_THREAD_ID]
+        _assert_unique_visible_lineage(restarted_db)
+    finally:
+        restarted_db.close()
+
+
+def test_bind_response_loss_atomically_retains_exact_id_across_restart(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    world = _NativeWorld()
+    path = tmp_path / "bind-response-loss.db"
+    db, store = _seed_store(path, clock)
+    try:
+        first = _executor(_BindResponseLossStore(store), world, clock).run_once()
+        assert first.status == "retry"
+        retained = store.get_sidebar_job_for_source("restart-source")
+        assert retained is not None
+        assert retained["codex_thread_id"] == _THREAD_ID
+    finally:
+        db.close()
+
+    clock.advance(61.0)
+    restarted_db = SessionDB(path)
+    try:
+        restarted_store = _store(restarted_db, clock)
+        result = _executor(restarted_store, world, clock).run_once()
+
+        assert result.status == "visible"
+        assert result.thread_id == _THREAD_ID
+        assert world.create_calls == [_THREAD_ID]
+        _assert_unique_visible_lineage(restarted_db)
     finally:
         restarted_db.close()
 
@@ -333,9 +438,10 @@ def test_commit_response_loss_replay_is_unique_and_never_recreates(
         )
         assert replay["state"] == "sidebar_visible"
         assert replay["codex_thread_id"] == _THREAD_ID
-        assert replay["completion_digest"] == hashlib.sha256(
-            str(commit_arguments["lease_token"]).encode()
-        ).hexdigest()
+        assert (
+            replay["completion_digest"]
+            == hashlib.sha256(str(commit_arguments["lease_token"]).encode()).hexdigest()
+        )
         _assert_unique_visible_lineage(restarted_db)
 
         restarted = _executor(restarted_store, world, clock).run_once()
@@ -431,8 +537,7 @@ def _assert_unique_visible_lineage(db: SessionDB) -> None:
     ]
     assert _rows(
         db,
-        "SELECT from_session_id, to_session_id, bridge_id, relation "
-        "FROM session_links",
+        "SELECT from_session_id, to_session_id, bridge_id, relation FROM session_links",
     ) == [
         {
             "from_session_id": "restart-source",

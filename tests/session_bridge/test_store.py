@@ -847,6 +847,29 @@ def test_mirror_worker_lock_serializes_independent_store_instances(db) -> None:
         second_db.close()
 
 
+def test_sidebar_worker_lock_serializes_independent_store_instances(db) -> None:
+    first = SessionBridgeStore(db)
+    second_db = SessionDB(db.db_path)
+    second = SessionBridgeStore(second_db)
+    first_lock = None
+    second_lock = None
+    try:
+        first_lock = first.try_acquire_sidebar_worker_lock()
+        assert first_lock is not None
+        assert second.try_acquire_sidebar_worker_lock() is None
+
+        first_lock.release()
+        first_lock = None
+        second_lock = second.try_acquire_sidebar_worker_lock()
+        assert second_lock is not None
+    finally:
+        if first_lock is not None:
+            first_lock.release()
+        if second_lock is not None:
+            second_lock.release()
+        second_db.close()
+
+
 def _message(
     event_id: str,
     content: str,
@@ -4310,7 +4333,9 @@ def test_sidebar_enqueue_rejects_a_conflicting_source_bridge_identity(db) -> Non
     assert _rows(db, "SELECT * FROM session_sidebar_jobs") == []
 
 
-def test_sidebar_claims_are_ordered_bounded_and_digest_tokens_at_rest(db) -> None:
+def test_sidebar_claims_are_ordered_bounded_and_serialize_active_batches_at_rest(
+    db,
+) -> None:
     tokens = ("opaque-token-a", "opaque-token-b", "opaque-token-c")
     store = SessionBridgeStore(
         db,
@@ -4348,8 +4373,15 @@ def test_sidebar_claims_are_ordered_bounded_and_digest_tokens_at_rest(db) -> Non
         assert row["lease_digest"] == hashlib.sha256(token.encode()).hexdigest()
         assert token not in row.values()
         assert "lease_token" not in row
-    assert store.claim_sidebar_jobs(now=200.0, limit=1)[0]["lease_token"] == tokens[2]
     assert store.claim_sidebar_jobs(now=200.0, limit=1) == []
+    for claim in claimed:
+        store.fail_sidebar_job(
+            lease_token=claim["lease_token"],
+            error_code="sqlite_busy",
+            now=201.0,
+        )
+    assert store.claim_sidebar_jobs(now=202.0, limit=1)[0]["lease_token"] == tokens[2]
+    assert store.claim_sidebar_jobs(now=202.0, limit=1) == []
 
 
 def test_sidebar_claim_prioritizes_ready_retry_before_older_pending(db) -> None:
@@ -4411,7 +4443,9 @@ def test_sidebar_claim_accepts_only_exact_integer_five_minute_lease(db) -> None:
     assert store.claim_sidebar_jobs(now=100.0, limit=1, lease_seconds=300) == []
 
 
-def test_sidebar_claim_is_atomic_across_independent_store_instances(tmp_path) -> None:
+def test_sidebar_claim_allows_only_one_active_delivery_across_store_instances(
+    tmp_path,
+) -> None:
     path = tmp_path / "shared-sidebar-state.db"
     first_db = SessionDB(path)
     second_db = SessionDB(path)
@@ -4440,12 +4474,10 @@ def test_sidebar_claim_is_atomic_across_independent_store_instances(tmp_path) ->
             batches = list(executor.map(_claim, (first, second)))
 
         claimed = [job for batch in batches for job in batch]
-        assert len(claimed) == 2
-        assert len({job["id"] for job in claimed}) == 2
-        assert {job["lease_token"] for job in claimed} == {
-            "first-token",
-            "second-token",
-        }
+        assert len(claimed) == 1
+        assert len({job["id"] for job in claimed}) == 1
+        assert claimed[0]["lease_token"] in {"first-token", "second-token"}
+        assert first.sidebar_job_counts()[SidebarJobState.PENDING.value] == 1
     finally:
         second_db.close()
         first_db.close()
@@ -4553,6 +4585,157 @@ def test_sidebar_bind_persists_exact_thread_across_retry_and_rejects_rebind(db) 
     reclaimed = store.claim_sidebar_jobs(now=1_000.0, limit=1)[0]
     assert reclaimed["lease_token"] == "retry-token"
     assert reclaimed["codex_thread_id"] == "codex-bound-thread"
+
+
+def test_sidebar_create_reservation_is_lease_validated_and_survives_reopen(
+    tmp_path,
+) -> None:
+    path = tmp_path / "sidebar-create-reservation.db"
+    first_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(
+            first_db,
+            sidebar_token_factory=_token_factory("reservation-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        candidate = _sidebar_candidate(first_db, native_id="create-reservation")
+        first.enqueue_sidebar_job(candidate)
+        lease = first.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+        reserved = first.reserve_sidebar_create(
+            lease_token=lease["lease_token"],
+            recovery_key="hermes-session-bridge-create-v1:recovery-key",
+            now=110.0,
+        )
+        replay = first.reserve_sidebar_create(
+            lease_token=lease["lease_token"],
+            recovery_key="hermes-session-bridge-create-v1:recovery-key",
+            now=111.0,
+        )
+
+        assert replay == reserved
+        assert reserved["source_session_id"] == candidate.source_session_id
+        assert reserved["bridge_id"] == candidate.bridge_id
+        assert reserved["reserved_at"] == 110.0
+        with pytest.raises(ValueError, match="create reservation"):
+            first.reserve_sidebar_create(
+                lease_token=lease["lease_token"],
+                recovery_key="hermes-session-bridge-create-v1:different",
+                now=112.0,
+            )
+    finally:
+        first_db.close()
+
+    reopened_db = SessionDB(path)
+    try:
+        reopened = SessionBridgeStore(reopened_db)
+        assert (
+            reopened.get_sidebar_create_reservation(candidate.source_session_id)
+            == reserved
+        )
+    finally:
+        reopened_db.close()
+
+
+def test_sidebar_failure_atomically_retains_known_thread_after_bind_ambiguity(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("bind-loss", "bind-loss-retry"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="bind-loss")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    retried = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="sqlite_busy",
+        codex_thread_id="codex-bind-loss-thread",
+        now=120.0,
+    )
+
+    assert retried["state"] == SidebarJobState.RETRY.value
+    assert retried["codex_thread_id"] == "codex-bind-loss-thread"
+    reclaimed = store.claim_sidebar_jobs(now=1_000.0, limit=1)[0]
+    assert reclaimed["codex_thread_id"] == "codex-bind-loss-thread"
+
+
+def test_sidebar_execution_blockers_report_any_failed_row(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("hard-stop-failed"),
+    )
+    store.enqueue_sidebar_job(_sidebar_candidate(db, native_id="hard-stop-failed"))
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="source_identity_mismatch",
+        now=110.0,
+    )
+
+    assert store.sidebar_execution_blockers() == ("sidebar_failed",)
+
+
+def test_sidebar_execution_blockers_report_unknown_retry_code(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("hard-stop-retry"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="hard-stop-retry")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="sqlite_busy",
+        now=110.0,
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET error_code = ? WHERE source_session_id = ?",
+            ("future_retry_code", candidate.source_session_id),
+        )
+    )
+
+    assert store.sidebar_execution_blockers() == ("unknown_retry_code",)
+
+
+def test_sidebar_claim_refuses_pending_work_when_failed_row_exists(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("hard-stop-claim"),
+    )
+    failed = _sidebar_candidate(db, native_id="hard-stop-existing-failed")
+    pending = _sidebar_candidate(db, native_id="hard-stop-still-pending")
+    store.enqueue_sidebar_job(failed)
+    failed_lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=failed_lease["lease_token"],
+        error_code="source_identity_mismatch",
+        now=110.0,
+    )
+    store.enqueue_sidebar_job(pending)
+
+    assert store.claim_sidebar_jobs(now=200.0, limit=1) == []
+    pending_row = store.get_sidebar_job_for_source(pending.source_session_id)
+    assert pending_row is not None
+    assert pending_row["state"] == SidebarJobState.PENDING.value
+
+
+def test_sidebar_active_lease_probe_distinguishes_persisted_worker_ownership(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("active-probe"),
+    )
+    store.enqueue_sidebar_job(_sidebar_candidate(db, native_id="active-probe"))
+    store.claim_sidebar_jobs(now=100.0, limit=1)
+
+    assert store.sidebar_has_active_lease(now=399.999) is True
+    assert store.sidebar_has_active_lease(now=400.0) is False
 
 
 def test_sidebar_atomic_lineage_commit_and_exact_replay_are_idempotent(db) -> None:
@@ -5466,7 +5649,7 @@ def test_sidebar_operator_retry_rejects_a_stale_visibility_timestamp(db) -> None
         )
 
 
-def test_malformed_sidebar_provider_row_does_not_block_valid_provider(db) -> None:
+def test_malformed_sidebar_provider_row_hard_stops_before_valid_provider(db) -> None:
     store = SessionBridgeStore(
         db,
         sidebar_token_factory=_token_factory("valid-provider-token"),
@@ -5492,18 +5675,19 @@ def test_malformed_sidebar_provider_row_does_not_block_valid_provider(db) -> Non
 
     claimed = store.claim_sidebar_jobs(now=100.0, limit=1)
 
-    assert [job["source_session_id"] for job in claimed] == [
-        candidate.source_session_id
-    ]
+    assert claimed == []
     malformed = _rows(
         db,
         "SELECT * FROM session_sidebar_jobs WHERE id = 'sidebar-job-malformed'",
     )[0]
     assert malformed["state"] == SidebarJobState.FAILED.value
     assert malformed["error_code"] == "provider_mismatch"
+    valid = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert valid is not None
+    assert valid["state"] == SidebarJobState.PENDING.value
 
 
-def test_sidebar_claim_scans_bounded_pages_and_eventually_passes_malformed_rows(
+def test_sidebar_claim_scans_one_bounded_page_then_hard_stops_malformed_rows(
     db,
 ) -> None:
     store = SessionBridgeStore(
@@ -5559,10 +5743,12 @@ def test_sidebar_claim_scans_bounded_pages_and_eventually_passes_malformed_rows(
     assert first == []
     assert after_first[SidebarJobState.FAILED.value] == 40
     assert after_first[SidebarJobState.PENDING.value] == 6
-    assert [job["source_session_id"] for job in second] == [valid.source_session_id]
-    assert len({job["id"] for job in second}) == 1
-    assert len(due_queries) == 2
+    assert second == []
+    assert len(due_queries) == 1
     assert all("LIMIT 40" in statement for statement in due_queries)
+    valid_row = store.get_sidebar_job_for_source(valid.source_session_id)
+    assert valid_row is not None
+    assert valid_row["state"] == SidebarJobState.PENDING.value
 
 
 def test_sidebar_counts_and_source_lookup_have_stable_public_shapes(db) -> None:
