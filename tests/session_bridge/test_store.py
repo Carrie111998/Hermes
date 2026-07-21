@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
+from pathlib import Path
 from threading import Barrier, Event
 from zoneinfo import ZoneInfo
 
@@ -103,6 +105,41 @@ def _claude_visibility_hermes_identity(
 _CLAUDE_MARKER_SECRET = b"store-claude-visibility-secret"
 
 
+def _assert_authenticated_claude_lineage_cursor(
+    cursor: object,
+    *,
+    mode: str,
+    after_visible_at: float,
+    after_job_id: str,
+    high_water_visible_at: float,
+    high_water_job_id: str,
+) -> None:
+    assert isinstance(cursor, Mapping)
+    assert set(cursor) == {
+        "version",
+        "schema_version",
+        "operation",
+        "mode",
+        "after_visible_at",
+        "after_job_id",
+        "high_water_visible_at",
+        "high_water_job_id",
+        "signature",
+    }
+    assert cursor["version"] == 1
+    assert cursor["schema_version"] == SCHEMA_VERSION
+    assert cursor["operation"] == "claude_visibility_lineage_reconcile"
+    assert cursor["mode"] == mode
+    assert cursor["after_visible_at"] == after_visible_at
+    assert cursor["after_job_id"] == after_job_id
+    assert cursor["high_water_visible_at"] == high_water_visible_at
+    assert cursor["high_water_job_id"] == high_water_job_id
+    signature = cursor["signature"]
+    assert isinstance(signature, str)
+    assert len(signature) == 64
+    assert set(signature) <= set("0123456789abcdef")
+
+
 def _enqueue_claude_visibility_job(
     store: SessionBridgeStore,
     candidate: ClaudeVisibilityCandidate,
@@ -131,6 +168,64 @@ def _seed_claude_visibility_native_source(
         candidate.source_session_id,
         source="cli",
         cwd=candidate.source_cwd,
+    )
+
+
+def _seed_profile_native_hermes_source(
+    profile_path,
+    candidate: ClaudeVisibilityCandidate,
+    *,
+    source: str = "tui",
+) -> None:
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_db = SessionDB(profile_path)
+    try:
+        profile_db.create_session(
+            candidate.source_session_id,
+            source,
+            cwd=candidate.source_cwd,
+        )
+        profile_db.append_message(
+            candidate.source_session_id,
+            "user",
+            "meaningful profile request",
+            timestamp=100.0,
+        )
+    finally:
+        profile_db.close()
+
+
+def _seed_exact_profile_shadow(
+    db: SessionDB,
+    candidate: ClaudeVisibilityCandidate,
+    *,
+    profile: str = "main",
+    extra_config: Mapping[str, object] | None = None,
+) -> None:
+    model_config = {"_session_bridge_profile": profile, **(extra_config or {})}
+    db._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO sessions (
+                   id, source, model_config, started_at, cwd
+               ) VALUES (?, 'session_bridge_profile', ?, 100, ?)""",
+            (
+                candidate.source_session_id,
+                json.dumps(model_config, sort_keys=True, separators=(",", ":")),
+                candidate.source_cwd,
+            ),
+        )
+    )
+
+
+def _profile_aware_claude_visibility_store(
+    db: SessionDB,
+    profile_paths: tuple[tuple[str, Path], ...],
+) -> SessionBridgeStore:
+    return SessionBridgeStore(
+        db,
+        clock=lambda: 200.0,
+        local_timezone=timezone.utc,
+        hermes_profile_db_paths=lambda: profile_paths,
     )
 
 
@@ -2033,6 +2128,277 @@ def test_claude_visibility_commit_finalizes_preindexed_target_lineage_atomically
     )["target_session_id"] == f"claude:{identity.claude_uuid}"
 
 
+@pytest.mark.parametrize("source_provider", [Provider.CODEX, Provider.HERMES])
+def test_claude_visibility_commit_accepts_exact_native_or_profile_shadow_source(
+    db: SessionDB,
+    tmp_path: Path,
+    source_provider: Provider,
+) -> None:
+    suffix = f"profile-commit-{source_provider.value}"
+    candidate, identity = (
+        _claude_visibility_identity(suffix)
+        if source_provider is Provider.CODEX
+        else _claude_visibility_hermes_identity(suffix)
+    )
+    profile_path = tmp_path / "profiles" / "main" / "state.db"
+    if source_provider is Provider.HERMES:
+        _seed_profile_native_hermes_source(profile_path, candidate)
+        _seed_exact_profile_shadow(db, candidate)
+    else:
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        SessionDB(profile_path).close()
+    store = _profile_aware_claude_visibility_store(
+        db, (("main", profile_path),)
+    )
+    if source_provider is Provider.CODEX:
+        _seed_claude_visibility_native_source(db, store, candidate)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.upsert_projection(
+        _projection(
+            _message("profile-target", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    claim = store.claim_claude_visibility_job(200.0, 60, 25, "0.50", "0.02")
+
+    committed = store.commit_claude_visibility_job(
+        identity.job_id, claim.lease_digest, "a" * 64, 200.0
+    )
+
+    assert committed["state"] == "claude_visible"
+    assert _rows(
+        db,
+        "SELECT from_session_id, to_session_id FROM session_links WHERE bridge_id = ?",
+        (identity.bridge_id,),
+    ) == [
+        {
+            "from_session_id": candidate.source_session_id,
+            "to_session_id": f"claude:{identity.claude_uuid}",
+        }
+    ]
+
+
+@pytest.mark.parametrize("source_provider", [Provider.CODEX, Provider.HERMES])
+def test_claude_visibility_status_and_reconcile_accept_profile_aware_source(
+    db: SessionDB,
+    tmp_path: Path,
+    source_provider: Provider,
+) -> None:
+    suffix = f"profile-reconcile-{source_provider.value}"
+    candidate, identity = (
+        _claude_visibility_identity(suffix)
+        if source_provider is Provider.CODEX
+        else _claude_visibility_hermes_identity(suffix)
+    )
+    profile_path = tmp_path / "profiles" / "main" / "state.db"
+    if source_provider is Provider.HERMES:
+        _seed_profile_native_hermes_source(profile_path, candidate)
+        _seed_exact_profile_shadow(db, candidate)
+    else:
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        SessionDB(profile_path).close()
+    store = _profile_aware_claude_visibility_store(
+        db, (("main", profile_path),)
+    )
+    if source_provider is Provider.CODEX:
+        _seed_claude_visibility_native_source(db, store, candidate)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.upsert_projection(
+        _projection(
+            _message("profile-history-target", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_visible', completion_digest = ?, visible_at = 150,
+                   updated_at = 150 WHERE id = ?""",
+            ("b" * 64, identity.job_id),
+        )
+    )
+
+    assert store.claude_visibility_status(200.0)["lineage"] == {
+        "unlinked_visible": 1,
+        "repairable": 1,
+        "blocked": 0,
+        "blocker_codes": {},
+    }
+    repaired = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
+
+    assert repaired["repaired"] == 1
+    assert repaired["remaining"] == 0
+    assert repaired["complete"] is True
+    assert _rows(
+        db, "SELECT bridge_id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) == [{"bridge_id": identity.bridge_id}]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("extra_shadow_config", "claude_lineage_source_identity_mismatch"),
+        ("wrong_profile", "claude_lineage_source_identity_mismatch"),
+        ("duplicate_profile", "claude_lineage_source_identity_mismatch"),
+        ("malformed_external_table", "claude_lineage_source_identity_mismatch"),
+        ("malformed_links_table", "claude_lineage_source_identity_mismatch"),
+        ("profile_external", "claude_lineage_source_provenance_mismatch"),
+        ("profile_incoming", "claude_lineage_source_provenance_mismatch"),
+    ],
+)
+def test_profile_shadow_source_mismatch_precedes_target_and_is_atomic(
+    db: SessionDB,
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+) -> None:
+    candidate, identity = _claude_visibility_hermes_identity(f"profile-{case}")
+    main_path = tmp_path / "profiles" / "main" / "state.db"
+    _seed_profile_native_hermes_source(main_path, candidate)
+    profile_paths: tuple[tuple[str, Path], ...] = (("main", main_path),)
+    if case == "extra_shadow_config":
+        _seed_exact_profile_shadow(db, candidate, extra_config={"extra": True})
+    elif case == "wrong_profile":
+        _seed_exact_profile_shadow(db, candidate, profile="other")
+    else:
+        _seed_exact_profile_shadow(db, candidate)
+    if case == "duplicate_profile":
+        other_path = tmp_path / "profiles" / "other" / "state.db"
+        _seed_profile_native_hermes_source(other_path, candidate)
+        profile_paths = (("main", main_path), ("other", other_path))
+    elif case in {"malformed_external_table", "malformed_links_table"}:
+        table = (
+            "external_sessions"
+            if case == "malformed_external_table"
+            else "session_links"
+        )
+        with sqlite3.connect(main_path) as legacy_conn:
+            legacy_conn.execute("PRAGMA foreign_keys = OFF")
+            legacy_conn.execute(f"DROP TABLE {table}")
+            legacy_conn.execute(f"CREATE TABLE {table} (legacy_id TEXT)")
+    elif case in {"profile_external", "profile_incoming"}:
+        profile_db = SessionDB(main_path)
+        try:
+            if case == "profile_external":
+                profile_db._execute_write(
+                    lambda conn: conn.execute(
+                        """INSERT INTO external_sessions (
+                               session_id, provider, native_id, native_status,
+                               first_indexed_at, last_indexed_at, parser_version,
+                               origin_kind, origin_bridge_id
+                           ) VALUES (?, 'codex', ?, 'active', 1, 1, 1, 'native', NULL)""",
+                        (candidate.source_session_id, f"external-{case}"),
+                    )
+                )
+            else:
+                profile_db.create_session("profile-origin", "tui", cwd="C:/work")
+                profile_db._execute_write(
+                    lambda conn: conn.execute(
+                        """INSERT INTO session_links (
+                               id, from_session_id, to_session_id, relation,
+                               bridge_id, created_at
+                           ) VALUES ('profile-incoming', 'profile-origin', ?,
+                                     'continues', 'profile-incoming-bridge', 1)""",
+                        (candidate.source_session_id,),
+                    )
+                )
+        finally:
+            profile_db.close()
+    store = _profile_aware_claude_visibility_store(db, profile_paths)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    claim = store.claim_claude_visibility_job(200.0, 60, 25, "0.50", "0.02")
+    before_job = _rows(
+        db,
+        """SELECT state, lease_digest, completion_digest, visible_at
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0]
+
+    with pytest.raises(ValueError, match=expected_code):
+        store.commit_claude_visibility_job(
+            identity.job_id, claim.lease_digest, "c" * 64, 200.0
+        )
+
+    assert _rows(
+        db,
+        """SELECT state, lease_digest, completion_digest, visible_at
+             FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    )[0] == before_job
+    assert _rows(
+        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+    ) == []
+
+
+@pytest.mark.parametrize("table", ["external_sessions", "session_links"])
+def test_profile_shadow_status_and_reconcile_fail_closed_on_legacy_bridge_table(
+    db: SessionDB,
+    tmp_path: Path,
+    table: str,
+) -> None:
+    candidate, identity = _claude_visibility_hermes_identity(
+        f"legacy-profile-{table}"
+    )
+    profile_path = tmp_path / "profiles" / "main" / "state.db"
+    _seed_profile_native_hermes_source(profile_path, candidate)
+    _seed_exact_profile_shadow(db, candidate)
+    store = _profile_aware_claude_visibility_store(
+        db, (("main", profile_path),)
+    )
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.upsert_projection(
+        _projection(
+            _message(f"legacy-target-{table}", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_visible', completion_digest = ?,
+                   visible_at = 150, updated_at = 150 WHERE id = ?""",
+            ("d" * 64, identity.job_id),
+        )
+    )
+    with sqlite3.connect(profile_path) as legacy_conn:
+        legacy_conn.execute("PRAGMA foreign_keys = OFF")
+        legacy_conn.execute(f"DROP TABLE {table}")
+        legacy_conn.execute(f"CREATE TABLE {table} (legacy_id TEXT)")
+
+    assert store.claude_visibility_status(200.0)["lineage"] == {
+        "unlinked_visible": 1,
+        "repairable": 0,
+        "blocked": 1,
+        "blocker_codes": {"claude_lineage_source_identity_mismatch": 1},
+    }
+    before = _rows(
+        db,
+        "SELECT id, bridge_id FROM session_links ORDER BY id",
+    )
+    reconciled = store.reconcile_claude_visibility_lineage(
+        limit=1,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        apply=True,
+    )
+
+    assert reconciled["repaired"] == 0
+    assert reconciled["blocker_codes"] == {
+        "claude_lineage_source_identity_mismatch": 1
+    }
+    assert _rows(
+        db,
+        "SELECT id, bridge_id FROM session_links ORDER BY id",
+    ) == before == []
+
+
 def test_claude_visibility_commit_rejects_invalid_digest_before_target_without_poisoning(
     db,
 ) -> None:
@@ -2174,7 +2540,9 @@ def test_claude_visibility_historical_lineage_validates_exact_native_source_iden
     )
     _corrupt_claude_visibility_source_identity(db, candidate, identity, case)
 
-    result = store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+    result = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
 
     assert result["scanned"] == 1
     assert result["repairable"] == 0
@@ -2251,7 +2619,9 @@ def test_claude_visibility_source_identity_mismatch_is_atomic_across_finalizers(
                 identity.job_id, claim.lease_digest, "d" * 64, 100.0
             )
     elif entrypoint == "reconcile":
-        result = store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+        result = store.reconcile_claude_visibility_lineage(
+            limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+        )
         assert result["blocker_codes"] == {
             "claude_lineage_source_identity_mismatch": 1
         }
@@ -2372,7 +2742,9 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
         )
     )
 
-    dry_run = store.reconcile_claude_visibility_lineage(limit=10, apply=False)
+    dry_run = store.reconcile_claude_visibility_lineage(
+        limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=False
+    )
     assert dry_run == {
         "scanned": 1,
         "repairable": 1,
@@ -2385,8 +2757,12 @@ def test_claude_visibility_historical_lineage_reconciliation_is_bounded_and_idem
     }
     assert _rows(db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)) == []
 
-    applied = store.reconcile_claude_visibility_lineage(limit=10, apply=True)
-    replay = store.reconcile_claude_visibility_lineage(limit=10, apply=True)
+    applied = store.reconcile_claude_visibility_lineage(
+        limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
+    replay = store.reconcile_claude_visibility_lineage(
+        limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
     assert applied == {
         "scanned": 1,
         "repairable": 1,
@@ -2429,28 +2805,34 @@ def test_claude_visibility_lineage_cursor_advances_past_blocker_to_later_repair(
         db, blocked_candidate, blocked_identity, "session_source"
     )
 
-    first = store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+    first = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
     second = store.reconcile_claude_visibility_lineage(
         limit=1,
+        marker_secret=_CLAUDE_MARKER_SECRET,
         apply=True,
         cursor=first["next_cursor"],
     )
 
+    first_cursor = first.pop("next_cursor")
     assert first == {
         "scanned": 1,
         "repairable": 0,
         "repaired": 0,
         "remaining": 2,
         "blocker_codes": {"claude_lineage_source_identity_mismatch": 1},
-        "next_cursor": {
-            "after_visible_at": 100.0,
-            "after_job_id": blocked_identity.job_id,
-            "high_water_visible_at": 101.0,
-            "high_water_job_id": repair_identity.job_id,
-        },
         "has_more": True,
         "complete": False,
     }
+    _assert_authenticated_claude_lineage_cursor(
+        first_cursor,
+        mode="apply",
+        after_visible_at=100.0,
+        after_job_id=blocked_identity.job_id,
+        high_water_visible_at=101.0,
+        high_water_job_id=repair_identity.job_id,
+    )
     assert second == {
         "scanned": 1,
         "repairable": 1,
@@ -2485,34 +2867,133 @@ def test_claude_visibility_lineage_cursor_is_stable_for_equal_timestamps_and_rep
     ]
     ordered = sorted(identity.job_id for identity in identities)
 
-    first = store.reconcile_claude_visibility_lineage(limit=1, apply=False)
+    first = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=False
+    )
     second = store.reconcile_claude_visibility_lineage(
-        limit=1, apply=False, cursor=first["next_cursor"]
+        limit=1,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        apply=False,
+        cursor=first["next_cursor"],
     )
     replay = store.reconcile_claude_visibility_lineage(
-        limit=1, apply=False, cursor=first["next_cursor"]
+        limit=1,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        apply=False,
+        cursor=first["next_cursor"],
     )
     third = store.reconcile_claude_visibility_lineage(
-        limit=1, apply=False, cursor=second["next_cursor"]
+        limit=1,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        apply=False,
+        cursor=second["next_cursor"],
     )
 
-    assert first["next_cursor"] == {
-        "after_visible_at": 100.0,
-        "after_job_id": ordered[0],
-        "high_water_visible_at": 100.0,
-        "high_water_job_id": ordered[2],
-    }
+    _assert_authenticated_claude_lineage_cursor(
+        first["next_cursor"],
+        mode="dry_run",
+        after_visible_at=100.0,
+        after_job_id=ordered[0],
+        high_water_visible_at=100.0,
+        high_water_job_id=ordered[2],
+    )
     assert second == replay
-    assert second["next_cursor"] == {
-        "after_visible_at": 100.0,
-        "after_job_id": ordered[1],
-        "high_water_visible_at": 100.0,
-        "high_water_job_id": ordered[2],
-    }
+    _assert_authenticated_claude_lineage_cursor(
+        second["next_cursor"],
+        mode="dry_run",
+        after_visible_at=100.0,
+        after_job_id=ordered[1],
+        high_water_visible_at=100.0,
+        high_water_job_id=ordered[2],
+    )
     assert third["scanned"] == 1
     assert third["next_cursor"] is None
     assert third["has_more"] is False
     assert third["complete"] is False
+
+
+def test_claude_visibility_lineage_cursor_is_mode_bound_before_mutation(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0, local_timezone=timezone.utc)
+    identities = [
+        _seed_unlinked_claude_visibility_lineage(
+            db, store, suffix=f"cursor-mode-{index}", visible_at=100.0 + index
+        )[1]
+        for index in range(2)
+    ]
+    dry_run = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=False
+    )
+    before = _rows(
+        db,
+        "SELECT bridge_id FROM session_links ORDER BY bridge_id",
+    )
+
+    with pytest.raises(ValueError, match="Claude lineage reconciliation cursor"):
+        store.reconcile_claude_visibility_lineage(
+            limit=1,
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            apply=True,
+            cursor=dry_run["next_cursor"],
+        )
+
+    assert before == []
+    assert _rows(
+        db,
+        "SELECT bridge_id FROM session_links ORDER BY bridge_id",
+    ) == before
+    assert all(
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+        for identity in identities
+    )
+
+
+def test_claude_visibility_lineage_cursor_rejects_forged_anchored_values_before_mutation(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0, local_timezone=timezone.utc)
+    identities = [
+        _seed_unlinked_claude_visibility_lineage(
+            db, store, suffix=f"cursor-forge-{index}", visible_at=100.0
+        )[1]
+        for index in range(3)
+    ]
+    ordered = sorted(identity.job_id for identity in identities)
+    first = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
+    cursor = dict(first["next_cursor"])
+    forged_anchor = {**cursor, "after_job_id": ordered[1]}
+    signature = str(cursor["signature"])
+    forged_signature = {
+        **cursor,
+        "signature": signature[:-1] + ("0" if signature[-1] != "0" else "1"),
+    }
+    forged_schema = {**cursor, "schema_version": SCHEMA_VERSION + 1}
+    before = _rows(
+        db,
+        "SELECT id, bridge_id FROM session_links ORDER BY id",
+    )
+
+    for forged in (forged_anchor, forged_signature, forged_schema):
+        with pytest.raises(ValueError, match="Claude lineage reconciliation cursor"):
+            store.reconcile_claude_visibility_lineage(
+                limit=1,
+                marker_secret=_CLAUDE_MARKER_SECRET,
+                apply=True,
+                cursor=forged,
+            )
+
+        assert _rows(
+            db,
+            "SELECT id, bridge_id FROM session_links ORDER BY id",
+        ) == before
 
 
 @pytest.mark.parametrize(
@@ -2549,6 +3030,7 @@ def test_claude_visibility_lineage_cursor_rejects_malformed_or_unanchored_values
     with pytest.raises(ValueError, match="Claude lineage reconciliation cursor"):
         store.reconcile_claude_visibility_lineage(
             limit=1,
+            marker_secret=_CLAUDE_MARKER_SECRET,
             apply=False,
             cursor=cursor,
         )
@@ -2612,7 +3094,9 @@ def test_claude_visibility_historical_lineage_reconciliation_is_concurrent_safe(
 
     def _repair() -> dict[str, object]:
         barrier.wait()
-        return store.reconcile_claude_visibility_lineage(limit=1, apply=True)
+        return store.reconcile_claude_visibility_lineage(
+            limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+        )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(lambda _index: _repair(), range(2)))
@@ -2762,7 +3246,9 @@ def test_claude_visibility_historical_lineage_missing_source_remains_blocked(db)
         )
     )
 
-    result = store.reconcile_claude_visibility_lineage(limit=10, apply=True)
+    result = store.reconcile_claude_visibility_lineage(
+        limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    )
 
     assert result == {
         "scanned": 1,
@@ -2822,7 +3308,9 @@ def test_claude_visibility_continued_lineage_remains_healthy_and_idempotent(
         "blocked": 0,
         "blocker_codes": {},
     }
-    assert store.reconcile_claude_visibility_lineage(limit=10, apply=True) == {
+    assert store.reconcile_claude_visibility_lineage(
+        limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    ) == {
         "scanned": 0,
         "repairable": 0,
         "repaired": 0,
@@ -2916,7 +3404,9 @@ def test_claude_visibility_historical_link_identity_conflict_blocks_repair(
         "blocked": 1,
         "blocker_codes": {"claude_lineage_conflict": 1},
     }
-    assert store.reconcile_claude_visibility_lineage(limit=10, apply=True) == {
+    assert store.reconcile_claude_visibility_lineage(
+        limit=10, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
+    ) == {
         "scanned": 1,
         "repairable": 0,
         "repaired": 0,

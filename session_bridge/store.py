@@ -25,7 +25,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-from hermes_state import SessionDB
+from hermes_state import SCHEMA_VERSION, SessionDB
 
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
@@ -70,11 +70,22 @@ _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _CLAUDE_VISIBILITY_CYCLE_STATE_KEY = "session-bridge:claude-visibility:cycle"
 _CLAUDE_VISIBILITY_CYCLE_STATE_VERSION = 2
 _CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX = 100
-_CLAUDE_LINEAGE_CURSOR_FIELDS = frozenset({
+_CLAUDE_LINEAGE_CURSOR_VERSION = 1
+_CLAUDE_LINEAGE_CURSOR_OPERATION = "claude_visibility_lineage_reconcile"
+_CLAUDE_LINEAGE_CURSOR_DOMAIN = b"session-bridge:claude-lineage-cursor:v1\0"
+_CLAUDE_LINEAGE_CURSOR_UNSIGNED_FIELDS = frozenset({
+    "version",
+    "schema_version",
+    "operation",
+    "mode",
     "after_visible_at",
     "after_job_id",
     "high_water_visible_at",
     "high_water_job_id",
+})
+_CLAUDE_LINEAGE_CURSOR_FIELDS = frozenset({
+    *_CLAUDE_LINEAGE_CURSOR_UNSIGNED_FIELDS,
+    "signature",
 })
 _CLAUDE_LINEAGE_TARGET_MISSING = "claude_lineage_target_missing"
 _CLAUDE_LINEAGE_TARGET_DUPLICATE = "claude_lineage_target_duplicate"
@@ -1727,6 +1738,7 @@ class SessionBridgeStore:
                 conn,
                 job_id=normalized_job,
                 created_at=operation_time,
+                source_identity_issue=self._claude_lineage_source_identity_issue,
             )
             if lineage["state"] == "blocked" and lineage["code"] != (
                 _CLAUDE_LINEAGE_TARGET_MISSING
@@ -1806,6 +1818,7 @@ class SessionBridgeStore:
                     conn,
                     job_id=normalized_job,
                     created_at=operation_time,
+                    source_identity_issue=self._claude_lineage_source_identity_issue,
                 )
                 if lineage["state"] == "blocked" and lineage["code"] != (
                     _CLAUDE_LINEAGE_TARGET_MISSING
@@ -1852,6 +1865,7 @@ class SessionBridgeStore:
                 conn,
                 job_id=normalized_job,
                 created_at=operation_time,
+                source_identity_issue=self._claude_lineage_source_identity_issue,
             )
             if lineage["state"] == "blocked" and lineage["code"] != (
                 _CLAUDE_LINEAGE_TARGET_MISSING
@@ -2010,6 +2024,7 @@ class SessionBridgeStore:
                 conn,
                 job_id=normalized_job_id,
                 created_at=operation_time,
+                source_identity_issue=self._claude_lineage_source_identity_issue,
             )
             if lineage["state"] == "blocked" and lineage["code"] != (
                 _CLAUDE_LINEAGE_TARGET_MISSING
@@ -2130,7 +2145,10 @@ class SessionBridgeStore:
                 "SELECT value_json FROM session_bridge_state WHERE key = ?",
                 (_CLAUDE_VISIBILITY_CYCLE_STATE_KEY,),
             ).fetchone()
-            lineage = _claude_visibility_lineage_status(conn)
+            lineage = _claude_visibility_lineage_status(
+                conn,
+                source_identity_issue=self._claude_lineage_source_identity_issue,
+            )
         counts = {state: 0 for state in states}
         fatal: list[dict[str, Any]] = []
         for row in count_rows:
@@ -2200,6 +2218,7 @@ class SessionBridgeStore:
         self,
         *,
         limit: int,
+        marker_secret: bytes,
         apply: bool = False,
         cursor: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -2218,12 +2237,20 @@ class SessionBridgeStore:
                 "Claude lineage reconciliation limit must be between 1 and "
                 f"{_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX}"
             )
-        normalized_cursor = _validated_claude_lineage_cursor(cursor)
+        cursor_secret = _validated_claude_lineage_cursor_secret(marker_secret)
+        normalized_cursor = _validated_claude_lineage_cursor(
+            cursor,
+            marker_secret=cursor_secret,
+            apply=apply,
+        )
 
         def _write(conn):
             if normalized_cursor is None:
                 after_key = None
-                high_water_key = _last_unlinked_claude_visibility_job_key(conn)
+                high_water_key = _last_unlinked_claude_visibility_job_key(
+                    conn,
+                    source_identity_issue=self._claude_lineage_source_identity_issue,
+                )
             else:
                 after_key, high_water_key = normalized_cursor
                 _validate_claude_lineage_cursor_anchors(
@@ -2239,6 +2266,7 @@ class SessionBridgeStore:
                     limit=limit + 1,
                     after_key=after_key,
                     high_water_key=high_water_key,
+                    source_identity_issue=self._claude_lineage_source_identity_issue,
                 )
             )
             has_more = len(candidates) > limit
@@ -2248,7 +2276,11 @@ class SessionBridgeStore:
             repaired = 0
             operation_time = _finite_number(self._clock(), "clock")
             for row in rows:
-                inspected = _inspect_claude_visibility_lineage(conn, row)
+                inspected = _inspect_claude_visibility_lineage(
+                    conn,
+                    row,
+                    source_identity_issue=self._claude_lineage_source_identity_issue,
+                )
                 if inspected["state"] == "repairable":
                     repairable += 1
                     if apply:
@@ -2256,6 +2288,9 @@ class SessionBridgeStore:
                             conn,
                             job_id=str(row["id"]),
                             created_at=operation_time,
+                            source_identity_issue=(
+                                self._claude_lineage_source_identity_issue
+                            ),
                         )
                         if finalized["state"] not in {"linked", "already_linked"}:
                             raise ValueError(
@@ -2265,7 +2300,10 @@ class SessionBridgeStore:
                     continue
                 code = str(inspected["code"] or _CLAUDE_LINEAGE_CONFLICT)
                 blocker_codes[code] = blocker_codes.get(code, 0) + 1
-            remaining = _count_unlinked_claude_visibility_jobs(conn)
+            remaining = _count_unlinked_claude_visibility_jobs(
+                conn,
+                source_identity_issue=self._claude_lineage_source_identity_issue,
+            )
             next_cursor = None
             if has_more and rows:
                 last_key = _claude_lineage_job_key(rows[-1])
@@ -2273,6 +2311,8 @@ class SessionBridgeStore:
                 next_cursor = _public_claude_lineage_cursor(
                     after_key=last_key,
                     high_water_key=high_water_key,
+                    marker_secret=cursor_secret,
+                    apply=apply,
                 )
             return {
                 "scanned": len(rows),
@@ -2489,6 +2529,107 @@ class SessionBridgeStore:
             "active",
             "compacted",
         }.issubset(message_columns)
+
+    @classmethod
+    def _profile_lineage_compatible(cls, database: SessionDB) -> bool:
+        """Return whether profile bridge tables support lineage validation."""
+
+        return {"session_id"}.issubset(
+            cls._database_columns(database, "external_sessions")
+        ) and {"to_session_id"}.issubset(
+            cls._database_columns(database, "session_links")
+        )
+
+    def _profile_shadow_source_identity_issue(
+        self,
+        *,
+        source_session_id: str,
+        model_config: object,
+    ) -> str | None:
+        """Validate one root profile shadow against its read-only native authority."""
+
+        if not isinstance(model_config, str) or not model_config:
+            return "identity"
+        try:
+            shadow_config = json.loads(model_config)
+        except (TypeError, ValueError):
+            return "identity"
+        if (
+            not isinstance(shadow_config, Mapping)
+            or set(shadow_config) != {"_session_bridge_profile"}
+        ):
+            return "identity"
+        expected_profile = shadow_config["_session_bridge_profile"]
+        if (
+            not isinstance(expected_profile, str)
+            or not expected_profile.strip()
+            or expected_profile != expected_profile.strip()
+        ):
+            return "identity"
+
+        matches: list[tuple[str, Mapping[str, Any], bool]] = []
+        with self._native_hermes_databases() as databases:
+            for profile, database, owned in databases:
+                if (
+                    not owned
+                    or not self._profile_catalog_compatible(database)
+                    or not self._profile_lineage_compatible(database)
+                ):
+                    continue
+                with database._lock:
+                    profile_conn = database._conn
+                    assert profile_conn is not None
+                    row = profile_conn.execute(
+                        """SELECT s.source,
+                                  e.session_id AS external_session_id
+                           FROM sessions AS s
+                           LEFT JOIN external_sessions AS e
+                             ON e.session_id = s.id
+                           WHERE s.id = ?""",
+                        (source_session_id,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    incoming = profile_conn.execute(
+                        """SELECT 1 FROM session_links
+                           WHERE to_session_id = ? LIMIT 1""",
+                        (source_session_id,),
+                    ).fetchone()
+                matches.append((profile, row, incoming is not None))
+
+        if len(matches) != 1 or matches[0][0] != expected_profile:
+            return "identity"
+        _profile, source, has_incoming = matches[0]
+        session_source = source["source"]
+        if (
+            not isinstance(session_source, str)
+            or not session_source.strip()
+            or session_source != session_source.strip()
+            or session_source
+            in {
+                Provider.CLAUDE.value,
+                Provider.CODEX.value,
+                _PROFILE_SHADOW_SOURCE,
+            }
+        ):
+            return "identity"
+        if source["external_session_id"] is not None or has_incoming:
+            return "provenance"
+        return None
+
+    def _claude_lineage_source_identity_issue(
+        self,
+        conn: Any,
+        *,
+        source_session_id: object,
+        source_provider: object,
+    ) -> str | None:
+        return _native_source_identity_issue(
+            conn,
+            source_session_id=source_session_id,
+            source_provider=source_provider,
+            profile_shadow_validator=self._profile_shadow_source_identity_issue,
+        )
 
     def try_acquire_mirror_worker_lock(self) -> _MirrorWorkerFileLock | None:
         """Try to serialize mirror processing and reconciliation across processes."""
@@ -2709,6 +2850,9 @@ class SessionBridgeStore:
                     target_native_id=native_id,
                     bridge_id=origin_bridge_id,
                     created_at=now,
+                    source_identity_issue=(
+                        self._claude_lineage_source_identity_issue
+                    ),
                 )
 
             if rebuild:
@@ -6846,6 +6990,7 @@ def _ensure_claude_visibility_lineage_row_if_known(
     target_native_id: str,
     bridge_id: str,
     created_at: float,
+    source_identity_issue: Callable[..., str | None] | None = None,
 ) -> dict[str, Any] | None:
     jobs = conn.execute(
         """SELECT id FROM session_claude_visibility_jobs
@@ -6862,6 +7007,7 @@ def _ensure_claude_visibility_lineage_row_if_known(
         conn,
         job_id=str(jobs[0]["id"]),
         created_at=created_at,
+        source_identity_issue=source_identity_issue,
     )
     if finalized["state"] == "blocked":
         raise ValueError(str(finalized["code"] or _CLAUDE_LINEAGE_CONFLICT))
@@ -6884,6 +7030,8 @@ def _claude_visibility_lineage_link_id(
 def _inspect_claude_visibility_lineage(
     conn: Any,
     job: Mapping[str, Any],
+    *,
+    source_identity_issue: Callable[..., str | None] | None = None,
 ) -> dict[str, Any]:
     bridge_id = str(job["bridge_id"])
     source_session_id = str(job["source_session_id"])
@@ -6895,7 +7043,8 @@ def _inspect_claude_visibility_lineage(
         target_session_id,
     )
 
-    source_issue = _native_source_identity_issue(
+    source_validator = source_identity_issue or _native_source_identity_issue
+    source_issue = source_validator(
         conn,
         source_session_id=source_session_id,
         source_provider=job["source_provider"],
@@ -7021,6 +7170,7 @@ def _finalize_claude_visibility_lineage_if_indexed(
     *,
     job_id: str,
     created_at: float,
+    source_identity_issue: Callable[..., str | None] | None = None,
 ) -> dict[str, Any]:
     job = conn.execute(
         """SELECT * FROM session_claude_visibility_jobs
@@ -7029,7 +7179,11 @@ def _finalize_claude_visibility_lineage_if_indexed(
     ).fetchone()
     if job is None:
         raise ValueError("exact visible Claude visibility job required")
-    inspected = _inspect_claude_visibility_lineage(conn, job)
+    inspected = _inspect_claude_visibility_lineage(
+        conn,
+        job,
+        source_identity_issue=source_identity_issue,
+    )
     if inspected["state"] != "repairable":
         if inspected["code"] == _CLAUDE_LINEAGE_TARGET_MISSING:
             return {"state": "target_missing", "code": inspected["code"], "link": None}
@@ -7049,7 +7203,11 @@ def _finalize_claude_visibility_lineage_if_indexed(
             created_at,
         ),
     )
-    verified = _inspect_claude_visibility_lineage(conn, job)
+    verified = _inspect_claude_visibility_lineage(
+        conn,
+        job,
+        source_identity_issue=source_identity_issue,
+    )
     if verified["state"] != "already_linked":
         return {
             "state": "blocked",
@@ -7068,6 +7226,8 @@ def _claude_lineage_job_key(job: Mapping[str, Any]) -> tuple[float, str]:
 
 def _last_unlinked_claude_visibility_job_key(
     conn: Any,
+    *,
+    source_identity_issue: Callable[..., str | None] | None = None,
 ) -> tuple[float, str] | None:
     rows = conn.execute(
         """SELECT job.*
@@ -7076,7 +7236,14 @@ def _last_unlinked_claude_visibility_job_key(
            ORDER BY job.visible_at DESC, job.id DESC"""
     )
     for row in rows:
-        if _inspect_claude_visibility_lineage(conn, row)["state"] != "already_linked":
+        if (
+            _inspect_claude_visibility_lineage(
+                conn,
+                row,
+                source_identity_issue=source_identity_issue,
+            )["state"]
+            != "already_linked"
+        ):
             return _claude_lineage_job_key(row)
     return None
 
@@ -7087,6 +7254,7 @@ def _unlinked_claude_visibility_jobs(
     limit: int,
     after_key: tuple[float, str] | None = None,
     high_water_key: tuple[float, str] | None = None,
+    source_identity_issue: Callable[..., str | None] | None = None,
 ) -> list[Any]:
     selected: list[Any] = []
     clauses = ["job.state = 'claude_visible'"]
@@ -7113,7 +7281,14 @@ def _unlinked_claude_visibility_jobs(
         params,
     )
     for row in rows:
-        if _inspect_claude_visibility_lineage(conn, row)["state"] == "already_linked":
+        if (
+            _inspect_claude_visibility_lineage(
+                conn,
+                row,
+                source_identity_issue=source_identity_issue,
+            )["state"]
+            == "already_linked"
+        ):
             continue
         selected.append(row)
         if len(selected) >= limit:
@@ -7123,6 +7298,9 @@ def _unlinked_claude_visibility_jobs(
 
 def _validated_claude_lineage_cursor(
     cursor: Mapping[str, Any] | None,
+    *,
+    marker_secret: bytes,
+    apply: bool,
 ) -> tuple[tuple[float, str], tuple[float, str]] | None:
     if cursor is None:
         return None
@@ -7130,6 +7308,15 @@ def _validated_claude_lineage_cursor(
         raise ValueError(
             "Claude lineage reconciliation cursor must have the exact fields"
         )
+    if (
+        isinstance(cursor["version"], bool)
+        or cursor["version"] != _CLAUDE_LINEAGE_CURSOR_VERSION
+        or isinstance(cursor["schema_version"], bool)
+        or cursor["schema_version"] != SCHEMA_VERSION
+        or cursor["operation"] != _CLAUDE_LINEAGE_CURSOR_OPERATION
+        or cursor["mode"] != ("apply" if apply else "dry_run")
+    ):
+        raise ValueError("Claude lineage reconciliation cursor context is invalid")
     after_key = (
         _finite_number(
             cursor["after_visible_at"],
@@ -7154,7 +7341,44 @@ def _validated_claude_lineage_cursor(
         raise ValueError(
             "Claude lineage reconciliation cursor exceeds its high-water mark"
         )
+    signature = cursor["signature"]
+    expected_signature = _claude_lineage_cursor_signature(
+        {field: cursor[field] for field in _CLAUDE_LINEAGE_CURSOR_UNSIGNED_FIELDS},
+        marker_secret,
+    )
+    if (
+        not isinstance(signature, str)
+        or re.fullmatch(r"[0-9a-f]{64}", signature) is None
+        or not hmac.compare_digest(signature, expected_signature)
+    ):
+        raise ValueError("Claude lineage reconciliation cursor signature is invalid")
     return after_key, high_water_key
+
+
+def _validated_claude_lineage_cursor_secret(marker_secret: bytes) -> bytes:
+    if not isinstance(marker_secret, bytes):
+        raise TypeError("Claude lineage reconciliation marker secret must be bytes")
+    if not marker_secret:
+        raise ValueError("Claude lineage reconciliation marker secret must be nonempty")
+    return marker_secret
+
+
+def _claude_lineage_cursor_signature(
+    payload: Mapping[str, Any],
+    marker_secret: bytes,
+) -> str:
+    encoded = json.dumps(
+        dict(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hmac.new(
+        marker_secret,
+        _CLAUDE_LINEAGE_CURSOR_DOMAIN + encoded,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _validate_claude_lineage_cursor_anchors(
@@ -7179,16 +7403,30 @@ def _public_claude_lineage_cursor(
     *,
     after_key: tuple[float, str],
     high_water_key: tuple[float, str],
+    marker_secret: bytes,
+    apply: bool,
 ) -> dict[str, Any]:
-    return {
+    payload = {
+        "version": _CLAUDE_LINEAGE_CURSOR_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "operation": _CLAUDE_LINEAGE_CURSOR_OPERATION,
+        "mode": "apply" if apply else "dry_run",
         "after_visible_at": after_key[0],
         "after_job_id": after_key[1],
         "high_water_visible_at": high_water_key[0],
         "high_water_job_id": high_water_key[1],
     }
+    return {
+        **payload,
+        "signature": _claude_lineage_cursor_signature(payload, marker_secret),
+    }
 
 
-def _count_unlinked_claude_visibility_jobs(conn: Any) -> int:
+def _count_unlinked_claude_visibility_jobs(
+    conn: Any,
+    *,
+    source_identity_issue: Callable[..., str | None] | None = None,
+) -> int:
     count = 0
     rows = conn.execute(
         """SELECT job.*
@@ -7197,21 +7435,40 @@ def _count_unlinked_claude_visibility_jobs(conn: Any) -> int:
            ORDER BY job.visible_at, job.id"""
     )
     for row in rows:
-        if _inspect_claude_visibility_lineage(conn, row)["state"] != "already_linked":
+        if (
+            _inspect_claude_visibility_lineage(
+                conn,
+                row,
+                source_identity_issue=source_identity_issue,
+            )["state"]
+            != "already_linked"
+        ):
             count += 1
     return count
 
 
-def _claude_visibility_lineage_status(conn: Any) -> dict[str, Any]:
+def _claude_visibility_lineage_status(
+    conn: Any,
+    *,
+    source_identity_issue: Callable[..., str | None] | None = None,
+) -> dict[str, Any]:
     rows = _unlinked_claude_visibility_jobs(
         conn,
         limit=_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX,
+        source_identity_issue=source_identity_issue,
     )
-    total = _count_unlinked_claude_visibility_jobs(conn)
+    total = _count_unlinked_claude_visibility_jobs(
+        conn,
+        source_identity_issue=source_identity_issue,
+    )
     blocker_codes: dict[str, int] = {}
     repairable = 0
     for row in rows:
-        inspected = _inspect_claude_visibility_lineage(conn, row)
+        inspected = _inspect_claude_visibility_lineage(
+            conn,
+            row,
+            source_identity_issue=source_identity_issue,
+        )
         if inspected["state"] == "repairable":
             repairable += 1
             continue
@@ -7953,6 +8210,7 @@ def _native_source_identity_issue(
     *,
     source_session_id: object,
     source_provider: object,
+    profile_shadow_validator: Callable[..., str | None] | None = None,
 ) -> str | None:
     """Return a fixed reason when a claimed source is not exact native authority."""
 
@@ -7980,7 +8238,8 @@ def _native_source_identity_issue(
         return "identity"
 
     source = conn.execute(
-        """SELECT s.source, e.session_id AS external_session_id,
+        """SELECT s.source, s.model_config,
+                  e.session_id AS external_session_id,
                   e.provider, e.native_id, e.origin_kind, e.origin_bridge_id
            FROM sessions AS s
            LEFT JOIN external_sessions AS e ON e.session_id = s.id
@@ -8004,15 +8263,22 @@ def _native_source_identity_issue(
             return "provenance"
     else:
         session_source = source["source"]
-        if (
+        if session_source == _PROFILE_SHADOW_SOURCE:
+            if source["external_session_id"] is not None:
+                return "provenance"
+            if profile_shadow_validator is None:
+                return "identity"
+            profile_issue = profile_shadow_validator(
+                source_session_id=source_session_id,
+                model_config=source["model_config"],
+            )
+            if profile_issue is not None:
+                return profile_issue
+        elif (
             not isinstance(session_source, str)
             or not session_source.strip()
-            or session_source
-            in {
-                Provider.CLAUDE.value,
-                Provider.CODEX.value,
-                _PROFILE_SHADOW_SOURCE,
-            }
+            or session_source != session_source.strip()
+            or session_source in {Provider.CLAUDE.value, Provider.CODEX.value}
             or source["external_session_id"] is not None
         ):
             return "identity"

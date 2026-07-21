@@ -867,8 +867,10 @@ class ProductionBackend:
         apply: bool,
         cursor: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
+        marker_secret = resolve_marker_key()
         result = self._require_store().reconcile_claude_visibility_lineage(
             limit=limit,
+            marker_secret=marker_secret,
             apply=apply,
             cursor=cursor,
         )

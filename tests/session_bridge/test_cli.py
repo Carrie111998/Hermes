@@ -22,6 +22,10 @@ if os.name == "nt" and "USERPROFILE" not in os.environ:
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
 from session_bridge.characterize import CharacterizationGateError
+from session_bridge.claude_visibility import (
+    ClaudeVisibilityCandidate,
+    derive_claude_visibility_identity,
+)
 from session_bridge.cli import (
     ConfigurationFailure,
     ProductionBackend,
@@ -43,6 +47,7 @@ from session_bridge.coordinator import ScanSummary
 from session_bridge.mirror import MirrorPolicy, enqueue_mirror_job
 from session_bridge.models import (
     BridgeMarkerPayload,
+    OriginKind,
     ProjectedMessage,
     Provider,
     SessionProjection,
@@ -1056,6 +1061,153 @@ def test_claude_visibility_lineage_reconcile_rejects_non_object_cursor_before_ba
         )
 
     assert backend.calls == []
+
+
+def test_production_lineage_cursor_auth_rejects_mode_replay_and_forgery_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker_key = b"c" * 32
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    identities = []
+    for index in range(3):
+        candidate = ClaudeVisibilityCandidate(
+            source_session_id=f"codex:cli-lineage-source-{index}",
+            source_provider=Provider.CODEX,
+            native_name=f"[Codex] CLI lineage {index}",
+            source_cwd=str(tmp_path),
+            git_root=str(tmp_path),
+            git_branch="main",
+            git_head=f"head-{index}",
+            worktree_id=f"worktree-{index}",
+            eligible_at=100.0,
+        )
+        identity = derive_claude_visibility_identity(candidate, marker_key)
+        identities.append(identity)
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CODEX,
+                native_id=f"cli-lineage-source-{index}",
+                title=candidate.native_name,
+                cwd=str(tmp_path),
+                started_at=90.0,
+                last_active=100.0,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"source-{index}",
+                        ordinal=0,
+                        role="user",
+                        content="meaningful source request",
+                        timestamp=100.0,
+                    ),
+                ),
+                native_cursor=f"source-cursor-{index}",
+                native_hash=f"source-hash-{index}",
+            )
+        )
+        store.enqueue_claude_visibility_job(candidate, identity, marker_key)
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=identity.claude_uuid,
+                title=f"Claude lineage target {index}",
+                cwd=str(tmp_path),
+                started_at=100.0,
+                last_active=100.0,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"target-{index}",
+                        ordinal=0,
+                        role="user",
+                        content="signed registration",
+                        timestamp=100.0,
+                    ),
+                ),
+                native_cursor=f"target-cursor-{index}",
+                native_hash=f"target-hash-{index}",
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id=identity.bridge_id,
+            )
+        )
+        db._execute_write(
+            lambda conn, job_id=identity.job_id: conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_visible', completion_digest = ?,
+                       visible_at = 100, updated_at = 100 WHERE id = ?""",
+                ("a" * 64, job_id),
+            )
+        )
+
+    def link_rows() -> list[tuple[str, str]]:
+        with db._lock:
+            conn = db._conn
+            assert conn is not None
+            return [
+                (str(row["id"]), str(row["bridge_id"]))
+                for row in conn.execute(
+                    "SELECT id, bridge_id FROM session_links ORDER BY id"
+                ).fetchall()
+            ]
+
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(backend, "close", lambda: None)
+    try:
+        dry_run = backend.reconcile_claude_visibility_lineage(
+            limit=1,
+            apply=False,
+        )
+        before_mode_replay = link_rows()
+        assert (
+            _run(
+                [
+                    "claude-visibility-reconcile-lineage",
+                    "--limit",
+                    "1",
+                    "--cursor",
+                    json.dumps(dry_run["next_cursor"]),
+                    "--apply",
+                    "--confirm-historical-repair",
+                ],
+                backend,
+            )
+            != 0
+        )
+        assert _json_output(capsys) == {"error": "configuration_error"}
+        assert link_rows() == before_mode_replay == []
+
+        first_apply = backend.reconcile_claude_visibility_lineage(
+            limit=1,
+            apply=True,
+        )
+        cursor = dict(first_apply["next_cursor"])
+        ordered_job_ids = sorted(identity.job_id for identity in identities)
+        forged = {**cursor, "after_job_id": ordered_job_ids[1]}
+        before_forgery = link_rows()
+        assert (
+            _run(
+                [
+                    "claude-visibility-reconcile-lineage",
+                    "--limit",
+                    "1",
+                    "--cursor",
+                    json.dumps(forged),
+                    "--apply",
+                    "--confirm-historical-repair",
+                ],
+                backend,
+            )
+            != 0
+        )
+        assert _json_output(capsys) == {"error": "configuration_error"}
+        assert link_rows() == before_forgery
+    finally:
+        db.close()
 
 
 def test_claude_visibility_status_blocks_on_unlinked_visible_lineage(
