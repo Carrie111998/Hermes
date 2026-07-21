@@ -1931,3 +1931,35 @@ class TestGatewayControlPlaneAuthority:
         assert status.acquire_gateway_runtime_lock() is True
         status.release_gateway_runtime_lock()
         assert status.process_owns_gateway_runtime_lock() is False
+
+    def test_boot_identity_helper_reassignment_cannot_change_live_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """Assignable module helpers cannot alter closure-captured boot provenance."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        boot_identity = status._get_boot_identity()
+        assert status.acquire_gateway_runtime_lock() is True
+        monkeypatch.setattr(
+            status,
+            "_get_boot_identity",
+            lambda: f"{boot_identity}:different-boot",
+        )
+        assert status._get_boot_identity() != boot_identity
+        assert status.process_owns_gateway_runtime_lock() is True
+        assert status._claim_gateway_control_plane_context() is not None
+
+    def test_os_identity_helper_reassignment_cannot_change_live_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """Assignable module helpers cannot alter closure-captured UID provenance."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        security_identity = status._get_process_security_identity()
+        assert status.acquire_gateway_runtime_lock() is True
+        monkeypatch.setattr(
+            status,
+            "_get_process_security_identity",
+            lambda: f"{security_identity}:different-account",
+        )
+        assert status._get_process_security_identity() != security_identity
+        assert status.process_owns_gateway_runtime_lock() is True
+        assert status._claim_gateway_control_plane_context() is not None
