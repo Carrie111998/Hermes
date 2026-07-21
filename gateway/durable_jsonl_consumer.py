@@ -689,11 +689,21 @@ async def process_live_records(
     provider, model = configured_engine(config_path)
     runner = GatewayRunner(load_gateway_config())
     run_id = f"live-drain-{uuid.uuid4().hex[:12]}"
+    persistent_scope = os.environ.get(
+        "TGG_PERSISTENT_CHAT_SESSION_SCOPE", "management"
+    ).strip().lower()
+    if persistent_scope not in {"off", "management", "all"}:
+        raise ConsumerError(
+            "TGG_PERSISTENT_CHAT_SESSION_SCOPE must be off, management, or all"
+        )
     management_chats = _management_selector_chats(config_path)
+    persistent_batch = persistent_scope == "all" or (
+        persistent_scope == "management"
+        and bool(records)
+        and all(record.chat_id in management_chats for record in records)
+    )
     replay_namespace = (
-        "agent:live-drain:management"
-        if records and all(record.chat_id in management_chats for record in records)
-        else None
+        "agent:live-drain:persistent-chat" if persistent_batch else None
     )
     result = await runner.replay(
         ReplayPlan(
@@ -706,9 +716,11 @@ async def process_live_records(
             bypass_auth=True,
             live_business_writes=True,
             source_path="durable-jsonl-consumer-live",
-            # Management chat is a real ongoing conversation. A stable replay
-            # namespace keeps one persistent Hermes session per chat while
-            # site drain/eval batches retain their isolated run namespace.
+            # Every chat is one ongoing conversation. The stable prefix plus
+            # SessionStore's existing platform/chat suffix yields one session
+            # per chat. Rollout scope is management-only for the demo; setting
+            # TGG_PERSISTENT_CHAT_SESSION_SCOPE=all extends the same mechanism
+            # to site chats after backlog/autocompact validation.
             replay_namespace=replay_namespace,
         )
     )
