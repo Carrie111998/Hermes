@@ -602,6 +602,7 @@ async def process_live_records(
             delivery_mode="capture",
             bypass_require_mention=True,
             bypass_auth=True,
+            live_business_writes=True,
             source_path="durable-jsonl-consumer-live",
         )
     )

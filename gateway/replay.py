@@ -557,6 +557,12 @@ class ReplayPlan:
     delivery_mode: str = "capture"  # capture | drop
     bypass_require_mention: bool = True
     bypass_auth: bool = True
+    # True ONLY for the durable live consumer's drain: business-bridge ops run
+    # as ordinary LIVE writes (no X-Replay-* tagging), because the drain IS
+    # live processing that happens to reuse the replay machinery for bundling
+    # and debounce parity. Evals/replays keep the default False so the
+    # server-side replay-target protection continues to refuse prod writes.
+    live_business_writes: bool = False
     replay_safe_commands: tuple[str, ...] = ()
     history_before_ts: Optional[int] = None
     source_path: Optional[str] = None
@@ -946,6 +952,9 @@ class ReplayExecutionContext:
         return namespace_session_key(session_key, self.replay_namespace)
 
     def bridge_headers(self) -> dict[str, str]:
+        if self.plan.live_business_writes:
+            # Live-drain semantics: business ops are ordinary live writes.
+            return {}
         return {
             "X-Replay-Run-Id": self.run_id,
             "X-Replay-Attempt-Id": self.attempt_id,
