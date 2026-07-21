@@ -11,6 +11,14 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+  # Allow manual runs on any ref. The Tests badge on `main` is driven by
+  # the most recent run on that branch; squash-merges performed by
+  # GitHub's auto-merge bot push with the repository's GITHUB_TOKEN,
+  # which GitHub does not use to spawn new push-triggered workflow runs.
+  # Without this dispatch entry there is no way to refresh the badge on
+  # the current HEAD when that happens — the CI Auto-Healer can only
+  # `gh run rerun` a frozen past commit (see DAN-2141).
+  workflow_dispatch:
 
 permissions:
   contents: read
