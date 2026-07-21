@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import threading
 import time
 from typing import Literal, Mapping, Protocol
@@ -16,6 +17,9 @@ from .sidebar import (
 from .store import SIDEBAR_FATAL_ERRORS, SIDEBAR_RETRYABLE_ERRORS, SessionBridgeStore
 
 
+_PROCESS_DELIVERY_LOCK = threading.Lock()
+
+
 class NativeCreateAmbiguous(RuntimeError):
     """The native create call may have succeeded but returned no usable identity."""
 
@@ -23,12 +27,19 @@ class NativeCreateAmbiguous(RuntimeError):
         super().__init__("native_create_ambiguous")
 
 
+@dataclass(frozen=True)
+class NativeThreadState:
+    thread_id: str
+    status: str
+    cwd: str
+
+
 class NativeSidebarDelivery(Protocol):
     """Narrow native task boundary used by the deterministic executor."""
 
     def create_thread(self, *, prompt: str, candidate: SidebarCandidate) -> str: ...
 
-    def read_thread_status(self, *, thread_id: str) -> str | None: ...
+    def read_thread_state(self, *, thread_id: str) -> NativeThreadState | None: ...
 
     def rename_thread(self, *, thread_id: str, title: str) -> None: ...
 
@@ -79,10 +90,9 @@ class SidebarExecutor:
         self._sleep = sleep
         self._read_timeout_seconds = float(read_timeout_seconds)
         self._poll_interval = float(poll_interval)
-        self._run_lock = threading.Lock()
 
     def run_once(self) -> SidebarExecutionResult:
-        with self._run_lock:
+        with _PROCESS_DELIVERY_LOCK:
             return self._run_once_locked()
 
     def _run_once_locked(self) -> SidebarExecutionResult:
@@ -156,12 +166,9 @@ class SidebarExecutor:
                 marker = encode_bridge_marker(expected, self._marker_secret)
                 prompt = build_registration_prompt(candidate, marker)
                 try:
-                    thread_id = _required_text(
-                        self._native.create_thread(
-                            prompt=prompt,
-                            candidate=candidate,
-                        ),
-                        "created Codex thread ID",
+                    raw_created_thread_id = self._native.create_thread(
+                        prompt=prompt,
+                        candidate=candidate,
                     )
                 except (KeyboardInterrupt, SystemExit):
                     raise
@@ -176,6 +183,17 @@ class SidebarExecutor:
                         job_id=job_id,
                         lease_token=lease_token,
                         error_code="native_task_not_indexed",
+                    )
+                try:
+                    thread_id = _required_text(
+                        raw_created_thread_id,
+                        "created Codex thread ID",
+                    )
+                except ValueError:
+                    return self._settle(
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        error_code="native_create_ambiguous",
                     )
 
         try:
@@ -194,12 +212,13 @@ class SidebarExecutor:
                 error_code="bridge_temporarily_unavailable",
             )
 
-        if not self._wait_until_idle(thread_id):
+        read_error = self._wait_until_idle(thread_id, expected_cwd=candidate.cwd)
+        if read_error is not None:
             return self._settle(
                 job_id=job_id,
                 lease_token=lease_token,
                 thread_id=thread_id,
-                error_code="native_task_not_indexed",
+                error_code=read_error,
             )
 
         try:
@@ -272,20 +291,28 @@ class SidebarExecutor:
             thread_id=thread_id,
         )
 
-    def _wait_until_idle(self, thread_id: str) -> bool:
+    def _wait_until_idle(self, thread_id: str, *, expected_cwd: str) -> str | None:
         deadline = _finite_time(self._monotonic()) + self._read_timeout_seconds
         while True:
             try:
-                status = self._native.read_thread_status(thread_id=thread_id)
+                state = self._native.read_thread_state(thread_id=thread_id)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
-                return False
-            if status == "idle":
-                return True
+                return "native_task_not_indexed"
+            if state is not None:
+                if not isinstance(state, NativeThreadState):
+                    return "native_task_not_indexed"
+                if (
+                    state.thread_id != thread_id
+                    or not _filesystem_equivalent(state.cwd, expected_cwd)
+                ):
+                    return "codex_thread_conflict"
+                if state.status == "idle":
+                    return None
             now = _finite_time(self._monotonic())
             if now >= deadline:
-                return False
+                return "native_task_not_indexed"
             self._sleep(min(self._poll_interval, deadline - now))
 
     def _settle(
@@ -347,9 +374,21 @@ def _finite_time(value: object) -> float:
     return float(value)
 
 
+def _filesystem_equivalent(left: object, right: object) -> bool:
+    if type(left) is not str or type(right) is not str or not left or not right:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+            os.path.abspath(right)
+        )
+    except (OSError, ValueError):
+        return False
+
+
 __all__ = [
     "NativeCreateAmbiguous",
     "NativeSidebarDelivery",
+    "NativeThreadState",
     "SidebarExecutionResult",
     "SidebarExecutor",
 ]

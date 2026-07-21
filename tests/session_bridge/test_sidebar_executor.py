@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Any
+
+import pytest
 
 from session_bridge.models import BridgeMarkerPayload, Provider
 from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
 from session_bridge.sidebar_executor import (
     NativeCreateAmbiguous,
+    NativeThreadState,
     SidebarExecutionResult,
     SidebarExecutor,
 )
@@ -174,14 +178,18 @@ class FakeNative:
         self,
         events: list[tuple[Any, ...]],
         *,
-        create_result: str | Exception = THREAD_1,
+        create_result: object = THREAD_1,
         statuses: list[str | None] | None = None,
         rename_error: Exception | None = None,
+        read_thread_id: str | None = None,
+        read_cwd: str = "C:/source",
     ) -> None:
         self.events = events
         self.create_result = create_result
         self.statuses = list(statuses or ["idle"])
         self.rename_error = rename_error
+        self.read_thread_id = read_thread_id
+        self.read_cwd = read_cwd
         self.create_calls = 0
 
     def create_thread(self, *, prompt: str, candidate: SidebarCandidate) -> str:
@@ -191,13 +199,21 @@ class FakeNative:
         self.create_calls += 1
         if isinstance(self.create_result, Exception):
             raise self.create_result
-        return self.create_result
+        return self.create_result  # type: ignore[return-value]
 
-    def read_thread_status(self, *, thread_id: str) -> str | None:
+    def read_thread_state(self, *, thread_id: str) -> NativeThreadState | None:
         self.events.append(("read", thread_id))
         if len(self.statuses) > 1:
-            return self.statuses.pop(0)
-        return self.statuses[0]
+            status = self.statuses.pop(0)
+        else:
+            status = self.statuses[0]
+        if status is None:
+            return None
+        return NativeThreadState(
+            thread_id=self.read_thread_id or thread_id,
+            status=status,
+            cwd=self.read_cwd,
+        )
 
     def rename_thread(self, *, thread_id: str, title: str) -> None:
         assert title.startswith("[Claude]")
@@ -298,6 +314,28 @@ def test_ambiguous_create_is_quarantined_and_never_replaced() -> None:
     assert not any(event[0] in {"bind", "read", "rename", "commit"} for event in events)
 
 
+@pytest.mark.parametrize("create_result", [None, "", 42])
+def test_missing_or_malformed_create_result_is_fatal_ambiguity(
+    create_result: object,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(events, create_result=create_result)
+    executor = _executor(store, FakeVerifier(events), native, clock)
+
+    result = executor.run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="native_create_ambiguous",
+    )
+    assert store.failures == ["native_create_ambiguous"]
+    assert native.create_calls == 1
+    assert not any(event[0] in {"bind", "read", "rename", "commit"} for event in events)
+
+
 def test_bind_ambiguity_releases_once_without_read_rename_or_commit() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
@@ -339,6 +377,47 @@ def test_read_until_idle_timeout_is_retryable_and_never_renames() -> None:
     assert result.status == "retry"
     assert sum(event[0] == "read" for event in events) == 3
     assert not any(event[0] in {"verify", "rename", "commit"} for event in events)
+
+
+@pytest.mark.parametrize(
+    ("read_thread_id", "read_cwd"),
+    [
+        (THREAD_2, "C:/source"),
+        (THREAD_1, "C:/different-source"),
+    ],
+)
+def test_native_read_identity_mismatch_is_fatal_conflict(
+    read_thread_id: str,
+    read_cwd: str,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    native = FakeNative(
+        events,
+        read_thread_id=read_thread_id,
+        read_cwd=read_cwd,
+    )
+    executor = _executor(store, FakeVerifier(events), native, clock)
+
+    result = executor.run_once()
+
+    assert result.status == "failed"
+    assert result.error_code == "codex_thread_conflict"
+    assert store.failures == ["codex_thread_conflict"]
+    assert not any(event[0] in {"verify", "rename", "commit"} for event in events)
+
+
+def test_native_read_accepts_filesystem_equivalent_cwd() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    native = FakeNative(events, read_cwd="c:\\SOURCE\\.")
+    executor = _executor(store, FakeVerifier(events), native, clock)
+
+    result = executor.run_once()
+
+    assert result.status == "visible"
 
 
 def test_rename_failure_retries_without_commit_or_replacement() -> None:
@@ -389,3 +468,58 @@ def test_run_once_claims_and_processes_only_one_job_serially() -> None:
     ]
     assert native.create_calls == 1
     assert not any(SOURCE_2 in map(str, event) for event in events)
+
+
+def test_two_executor_instances_share_one_process_wide_delivery_lock() -> None:
+    entered_create = threading.Event()
+    release_create = threading.Event()
+    second_claimed = threading.Event()
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+
+    class BlockingNative(FakeNative):
+        def create_thread(self, *, prompt: str, candidate: SidebarCandidate) -> str:
+            result = super().create_thread(prompt=prompt, candidate=candidate)
+            entered_create.set()
+            assert release_create.wait(timeout=5)
+            return result
+
+    class SecondStore(FakeStore):
+        def claim_sidebar_jobs(
+            self, *, now: float, limit: int, lease_seconds: int
+        ) -> list[dict[str, Any]]:
+            second_claimed.set()
+            return super().claim_sidebar_jobs(
+                now=now,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            )
+
+    first = _executor(
+        FakeStore(events, [_job(SOURCE_1)]),
+        FakeVerifier(events),
+        BlockingNative(events, create_result=THREAD_1),
+        clock,
+    )
+    second = _executor(
+        SecondStore(events, [_job(SOURCE_2)]),
+        FakeVerifier(events),
+        FakeNative(events, create_result=THREAD_2),
+        clock,
+    )
+    results: list[SidebarExecutionResult] = []
+    first_thread = threading.Thread(target=lambda: results.append(first.run_once()))
+    second_thread = threading.Thread(target=lambda: results.append(second.run_once()))
+
+    first_thread.start()
+    assert entered_create.wait(timeout=5)
+    second_thread.start()
+    assert not second_claimed.wait(timeout=0.2)
+    release_create.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert [result.status for result in results] == ["visible", "visible"]
+    assert second_claimed.is_set()
