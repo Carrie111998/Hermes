@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
-from typing import Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol, cast
 
 from .codex_adapter import SidebarThreadVerifier, SidebarVerificationError
 from .models import BridgeMarkerPayload, Provider, encode_bridge_marker
@@ -20,6 +21,11 @@ from .store import SIDEBAR_FATAL_ERRORS, SIDEBAR_RETRYABLE_ERRORS, SessionBridge
 
 
 _PROCESS_DELIVERY_LOCK = threading.Lock()
+_SIGNED_MARKER_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+    r"(?![A-Za-z0-9_-])"
+)
 
 
 class NativeCreateAmbiguous(RuntimeError):
@@ -67,9 +73,152 @@ class NativeSidebarDelivery(Protocol):
         self, *, thread_id: str, deadline: float
     ) -> NativeThreadState | None: ...
 
+    def register_thread(
+        self, *, thread_id: str, prompt: str, deadline: float
+    ) -> None: ...
+
     def rename_thread(
         self, *, thread_id: str, title: str, deadline: float
     ) -> None: ...
+
+
+class _CodexAppServerClient(Protocol):
+    def initialize(self, *, timeout: float, **kwargs: object) -> dict[str, Any]: ...
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]: ...
+
+
+class CodexAppServerSidebarDelivery:
+    """Concrete native sidebar delivery over the Codex app-server protocol."""
+
+    def __init__(
+        self,
+        client: _CodexAppServerClient,
+        *,
+        monotonic=time.monotonic,
+    ) -> None:
+        self._client = client
+        self._monotonic = monotonic
+        self._initialized = bool(getattr(client, "_initialized", False))
+
+    def create_thread(
+        self,
+        *,
+        prompt: str,
+        candidate: SidebarCandidate,
+        deadline: float,
+    ) -> str:
+        del prompt
+        self._ensure_initialized(deadline)
+        try:
+            result = self._client.request(
+                "thread/start",
+                {"cwd": candidate.cwd},
+                timeout=self._remaining(deadline),
+            )
+        except NativeCreateRejected:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise NativeCreateAmbiguous() from exc
+        try:
+            thread = result.get("thread")
+            if not isinstance(thread, Mapping):
+                raise ValueError("thread/start response is malformed")
+            return _required_text(thread.get("id"), "created Codex thread ID")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise NativeCreateAmbiguous() from exc
+
+    def register_thread(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        deadline: float,
+    ) -> None:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        marker = _registration_marker(prompt)
+        self._ensure_initialized(deadline)
+        response = self._client.request(
+            "thread/read",
+            {"threadId": wanted, "includeTurns": True},
+            timeout=self._remaining(deadline),
+        )
+        thread = _exact_thread(response, wanted)
+        if _thread_has_exact_marker(thread, marker):
+            return
+        self._client.request(
+            "turn/start",
+            {
+                "threadId": wanted,
+                "input": [{"type": "text", "text": prompt}],
+            },
+            timeout=self._remaining(deadline),
+        )
+
+    def read_thread_state(
+        self,
+        *,
+        thread_id: str,
+        deadline: float,
+    ) -> NativeThreadState | None:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        self._ensure_initialized(deadline)
+        response = self._client.request(
+            "thread/read",
+            {"threadId": wanted, "includeTurns": True},
+            timeout=self._remaining(deadline),
+        )
+        thread = _exact_thread(response, wanted)
+        cwd = _required_text(thread.get("cwd"), "Codex thread cwd")
+        turns = cast(list[object], thread["turns"])
+        status = _native_thread_status(thread.get("status"), turns=turns)
+        return NativeThreadState(thread_id=wanted, status=status, cwd=cwd)
+
+    def rename_thread(
+        self,
+        *,
+        thread_id: str,
+        title: str,
+        deadline: float,
+    ) -> None:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        name = _required_text(title, "Codex thread title")
+        self._ensure_initialized(deadline)
+        self._client.request(
+            "thread/name/set",
+            {"threadId": wanted, "name": name},
+            timeout=self._remaining(deadline),
+        )
+
+    def _ensure_initialized(self, deadline: float) -> None:
+        if self._initialized or bool(getattr(self._client, "_initialized", False)):
+            self._initialized = True
+            return
+        try:
+            self._client.initialize(timeout=self._remaining(deadline))
+        except NativeCreateRejected:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except RuntimeError as exc:
+            if str(exc) != "already initialized":
+                raise NativeCreateRejected("codex_tool_unavailable") from exc
+        except Exception as exc:
+            raise NativeCreateRejected("codex_tool_unavailable") from exc
+        self._initialized = True
+
+    def _remaining(self, deadline: float) -> float:
+        remaining = _finite_time(deadline) - _finite_time(self._monotonic())
+        if remaining <= 0:
+            raise NativeCreateRejected("broker_time_budget")
+        return remaining
 
 
 @dataclass(frozen=True)
@@ -221,6 +370,8 @@ class SidebarExecutor:
             target_provider=Provider.CODEX,
             policy_generation=1,
         )
+        marker = encode_bridge_marker(expected, self._marker_secret)
+        prompt = build_registration_prompt(candidate, marker)
         recovered: VerifiedSidebarThread | None = None
         if thread_id is None:
             if not self._has_budget(operation_deadline, lease_expires_at):
@@ -273,8 +424,6 @@ class SidebarExecutor:
                         lease_token=lease_token,
                         error_code="broker_time_budget",
                     )
-                marker = encode_bridge_marker(expected, self._marker_secret)
-                prompt = build_registration_prompt(candidate, marker)
                 try:
                     raw_created_thread_id = self._native.create_thread(
                         prompt=prompt,
@@ -347,6 +496,22 @@ class SidebarExecutor:
                 lease_token=lease_token,
                 thread_id=thread_id,
                 error_code="broker_time_budget",
+            )
+
+        try:
+            self._native.register_thread(
+                thread_id=thread_id,
+                prompt=prompt,
+                deadline=operation_deadline,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="native_task_not_indexed",
             )
 
         read_error = self._wait_until_idle(
@@ -561,6 +726,84 @@ def _matches_expected(
     )
 
 
+def _registration_marker(prompt: object) -> str:
+    if type(prompt) is not str:
+        raise ValueError("registration prompt is malformed")
+    matches = _SIGNED_MARKER_RE.findall(prompt)
+    if len(matches) != 1:
+        raise ValueError("registration prompt marker is malformed")
+    return matches[0]
+
+
+def _exact_thread(response: object, thread_id: str) -> dict[str, object]:
+    if not isinstance(response, dict):
+        raise ValueError("thread/read response is malformed")
+    response_map = cast(dict[str, object], response)
+    thread = response_map.get("thread")
+    if not isinstance(thread, dict):
+        raise ValueError("thread/read returned a different thread identity")
+    thread = cast(dict[str, object], thread)
+    if thread.get("id") != thread_id:
+        raise ValueError("thread/read returned a different thread identity")
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        raise ValueError("thread/read response has no turns list")
+    return thread
+
+
+def _thread_has_exact_marker(thread: Mapping[str, object], marker: str) -> bool:
+    turns = thread.get("turns")
+    assert isinstance(turns, list)
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        turn = cast(dict[str, object], turn)
+        items = turn.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item = cast(dict[str, object], item)
+            if item.get("type") != "userMessage":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            text_parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part = cast(dict[str, object], part)
+                part_text = part.get("text")
+                if part.get("type") == "text" and isinstance(part_text, str):
+                    text_parts.append(part_text)
+            text = "".join(text_parts)
+            if marker in _SIGNED_MARKER_RE.findall(text):
+                return True
+    return False
+
+
+def _native_thread_status(
+    value: object,
+    *,
+    turns: list[object],
+) -> NativeThreadStatus:
+    if value is None:
+        return NativeThreadStatus.IDLE if not turns else NativeThreadStatus.TERMINAL
+    if not isinstance(value, dict):
+        raise ValueError("Codex thread status is malformed")
+    value = cast(dict[str, object], value)
+    status_type = value.get("type")
+    if status_type in {"idle", "notLoaded"}:
+        return NativeThreadStatus.IDLE
+    if status_type == "active":
+        return NativeThreadStatus.ACTIVE
+    if status_type == "systemError":
+        return NativeThreadStatus.TERMINAL
+    raise ValueError("Codex thread status is unknown")
+
+
 def _verification_code(exc: SidebarVerificationError) -> str:
     if exc.code in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS:
         return exc.code
@@ -619,6 +862,7 @@ def _filesystem_equivalent(left: object, right: object) -> bool:
 
 
 __all__ = [
+    "CodexAppServerSidebarDelivery",
     "NativeCreateAmbiguous",
     "NativeCreateRejected",
     "NativeSidebarDelivery",
