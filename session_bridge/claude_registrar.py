@@ -58,6 +58,8 @@ def build_characterization_auth_recovery_prompt(
 
 
 class InteractivePty(Protocol):
+    def read_until_ready(self, timeout: float) -> str: ...
+
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str: ...
     def write(self, data: str) -> None: ...
     def wait(self, timeout: float) -> int | None: ...
@@ -516,6 +518,38 @@ class _WinPtyProcess:
             if candidate_seen:
                 settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
 
+    def read_until_ready(self, timeout: float) -> str:
+        """Wait for Claude's event-driven bracketed-paste readiness signal."""
+
+        timed_read = getattr(self._process, "read_with_timeout", None)
+        if not callable(timed_read):
+            raise RuntimeError("PTY readiness read unavailable")
+        deadline = time.monotonic() + timeout
+        chunks: list[str] = []
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                value = timed_read(4096, remaining)
+            except EOFError:
+                return "".join(chunks)
+            except Exception as exc:
+                raise RuntimeError("PTY readiness read unavailable") from exc
+            if value is None:
+                continue
+            text = (
+                value.decode("utf-8", "replace")
+                if isinstance(value, bytes)
+                else str(value)
+            )
+            chunks.append(text)
+            joined = "".join(chunks)
+            if len(joined) > _MAX_RESPONSE_CHARS:
+                raise RuntimeError("PTY readiness output exceeded limit")
+            if "\x1b[?2004h" in joined:
+                return joined
+
     def _read_until_cancellable(
         self,
         timeout: float,
@@ -827,25 +861,37 @@ class ClaudeNativeRegistrar:
             )
         try:
             process = self._factory.spawn(argv, cwd=str(source_cwd))
-            process.write(_interactive_prompt_frame(prompt))
-            output = process.read_until(self._process_timeout, prompt=prompt)
-            if _is_authentication_failure(output):
+            deadline = self._monotonic() + self._process_timeout
+            startup = process.read_until_ready(self._remaining_process_time(deadline))
+            if _is_authentication_failure(startup):
                 pending = (
                     "claude_authentication_unavailable",
                     "Claude authentication unavailable",
                 )
-            elif not _has_exact_registered_response(output, prompt):
-                pending = ("bridge_conflict", "recovery response malformed")
+            elif "\x1b[?2004h" not in startup:
+                pending = ("creation_ambiguous", "Claude TUI readiness unavailable")
             else:
-                process.write("/exit\r")
-                exit_code = process.wait(self._exit_timeout)
-                if type(exit_code) is not int or exit_code != 0:
+                process.write(_interactive_prompt_frame(prompt))
+                output = process.read_until(
+                    self._remaining_process_time(deadline), prompt=prompt
+                )
+                if _is_authentication_failure(output):
                     pending = (
-                        "clean_exit_not_observed",
-                        "Claude did not exit cleanly",
+                        "claude_authentication_unavailable",
+                        "Claude authentication unavailable",
                     )
+                elif not _has_exact_registered_response(output, prompt):
+                    pending = ("bridge_conflict", "recovery response malformed")
                 else:
-                    clean_exit = True
+                    process.write("/exit\r")
+                    exit_code = process.wait(self._exit_timeout)
+                    if type(exit_code) is not int or exit_code != 0:
+                        pending = (
+                            "clean_exit_not_observed",
+                            "Claude did not exit cleanly",
+                        )
+                    else:
+                        clean_exit = True
         except FileNotFoundError:
             pending = (
                 "claude_executable_unavailable",
@@ -889,6 +935,12 @@ class ClaudeNativeRegistrar:
                 status, str(job_id), str(native_id), code, detail
             )
         return ClaudeRegistrarOutcome("recovered", str(job_id), str(native_id))
+
+    def _remaining_process_time(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        return remaining
 
     def _materialize_claim(
         self, claim: ClaudeVisibilityClaim
@@ -1043,34 +1095,62 @@ class ClaudeNativeRegistrar:
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
-            process.write(_interactive_prompt_frame(prompt))
-            output = process.read_until(self._process_timeout, prompt=prompt)
-            if _is_authentication_failure(output):
+            deadline = self._monotonic() + self._process_timeout
+            startup = process.read_until_ready(self._remaining_process_time(deadline))
+            if _is_authentication_failure(startup):
                 pending = (
                     "retry",
                     "claude_authentication_unavailable",
                     "Claude authentication unavailable",
                 )
-            elif _is_provider_limit_failure(output):
+            elif _is_provider_limit_failure(startup):
                 provider_limit_observed = True
                 pending = (
                     "retry",
                     "creation_ambiguous",
                     "Claude provider limit interrupted registration",
                 )
-            elif not _has_exact_registered_response(output, prompt):
-                pending = ("fail", "bridge_conflict", "registration response malformed")
+            elif "\x1b[?2004h" not in startup:
+                pending = (
+                    "retry",
+                    "creation_ambiguous",
+                    "Claude TUI readiness unavailable",
+                )
             else:
-                process.write("/exit\r")
-                exit_code = process.wait(self._exit_timeout)
-                if type(exit_code) is not int or exit_code != 0:
+                process.write(_interactive_prompt_frame(prompt))
+                output = process.read_until(
+                    self._remaining_process_time(deadline), prompt=prompt
+                )
+                if _is_authentication_failure(output):
                     pending = (
                         "retry",
-                        "clean_exit_not_observed",
-                        "Claude did not exit cleanly",
+                        "claude_authentication_unavailable",
+                        "Claude authentication unavailable",
+                    )
+                elif _is_provider_limit_failure(output):
+                    provider_limit_observed = True
+                    pending = (
+                        "retry",
+                        "creation_ambiguous",
+                        "Claude provider limit interrupted registration",
+                    )
+                elif not _has_exact_registered_response(output, prompt):
+                    pending = (
+                        "fail",
+                        "bridge_conflict",
+                        "registration response malformed",
                     )
                 else:
-                    clean_exit = True
+                    process.write("/exit\r")
+                    exit_code = process.wait(self._exit_timeout)
+                    if type(exit_code) is not int or exit_code != 0:
+                        pending = (
+                            "retry",
+                            "clean_exit_not_observed",
+                            "Claude did not exit cleanly",
+                        )
+                    else:
+                        clean_exit = True
         except FileNotFoundError:
             pending = (
                 "retry",

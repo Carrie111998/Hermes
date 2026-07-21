@@ -196,12 +196,16 @@ class FakePty:
         output: str = "REGISTERED\r\n",
         exit_code: int = 0,
         read_error: Exception | None = None,
+        ready_output: str = "\x1b[?2004h",
+        ready_error: Exception | None = None,
         write_error_at: int | None = None,
         wait_error: Exception | None = None,
     ):
         self.output = output
         self.exit_code = exit_code
         self.read_error = read_error
+        self.ready_output = ready_output
+        self.ready_error = ready_error
         self.write_error_at = write_error_at
         self.wait_error = wait_error
         self.writes: list[str] = []
@@ -209,6 +213,13 @@ class FakePty:
         self.terminated = False
         self.closed = False
         self.cleanup_result = PtyCleanupResult(True, True, True, exit_code)
+        self.ready_waits: list[float] = []
+
+    def read_until_ready(self, timeout: float) -> str:
+        self.ready_waits.append(timeout)
+        if self.ready_error is not None:
+            raise self.ready_error
+        return self.ready_output
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
         if self.read_error:
@@ -334,6 +345,7 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
     assert "--no-session-persistence" not in argv
     assert process.writes == [f"\x1b[200~{expected}\x1b[201~\r", "/exit\r"]
     assert "tool_calls" not in expected
+    assert process.ready_waits == [2.0]
     assert process.closed and process.waits == [1.0]
 
 
@@ -376,6 +388,17 @@ def test_malformed_interactive_response_never_sends_exit_command() -> None:
     assert len(process.writes) == 1
     assert process.writes[0].startswith("\x1b[200~")
     assert "/exit\r" not in process.writes
+    assert process.terminated and process.closed
+
+
+def test_tui_readiness_timeout_never_writes_registration_prompt() -> None:
+    process = FakePty(ready_error=TimeoutError())
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert process.writes == []
     assert process.terminated and process.closed
 
 
@@ -891,7 +914,7 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
     item = claim()
     source = FakeSource([None, projection_for(item)])
     factory = FakeFactory()
-    ticks = iter([0.0, 0.0, 0.1])
+    ticks = iter([0.0, 0.0, 0.1, 0.1])
     reg = ClaudeNativeRegistrar(
         FakeStore(),
         source,
