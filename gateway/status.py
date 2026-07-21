@@ -948,14 +948,16 @@ def _build_gateway_runtime_lock_manager():
             lock_path, boot_identity, security_identity
         )
         assert socket_family is not None  # narrowed by linux_anchor_required
-        anchor = socket_factory(socket_family, socket_stream)
+        anchor = None
         try:
+            anchor = socket_factory(socket_family, socket_stream)
             anchor.bind(address)
             stat_result = fstat(anchor.fileno())
             stamp = (int(stat_result.st_dev), int(stat_result.st_ino))
             return anchor, address, stamp
         except OSError:
-            anchor.close()
+            if anchor is not None:
+                anchor.close()
             return None
 
     def _authority_anchor_required() -> bool:

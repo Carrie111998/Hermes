@@ -1736,6 +1736,48 @@ class TestGatewayControlPlaneAuthority:
     def test_control_plane_context_defaults_inactive(self):
         assert status.gateway_control_plane_active() is False
 
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="Linux abstract-socket authority regression",
+    )
+    def test_socket_constructor_failure_releases_directory_anchor(
+        self, tmp_path, monkeypatch
+    ):
+        import fcntl
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        def fail_socket_constructor(*_args, **_kwargs):
+            raise OSError("injected socket constructor failure")
+
+        with monkeypatch.context() as manager_build_patch:
+            manager_build_patch.setattr(
+                status.socket, "socket", fail_socket_constructor
+            )
+            failing_manager = status._build_gateway_runtime_lock_manager()
+
+        failing_acquire, failing_release = failing_manager[:2]
+        fd_count_before = len(list(Path("/proc/self/fd").iterdir()))
+        reacquire_release = None
+        try:
+            assert failing_acquire() is False
+            assert len(list(Path("/proc/self/fd").iterdir())) == fd_count_before
+
+            directory_fd = os.open(tmp_path, os.O_RDONLY)
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(directory_fd)
+
+            reacquire_manager = status._build_gateway_runtime_lock_manager()
+            reacquire, reacquire_release = reacquire_manager[:2]
+            assert reacquire() is True
+        finally:
+            if reacquire_release is not None:
+                reacquire_release()
+            failing_release()
+
     def test_public_control_plane_context_cannot_arm(self):
         """Importing the public status module must not mint gateway authority."""
         with pytest.raises(RuntimeError, match="gateway-owned"):
