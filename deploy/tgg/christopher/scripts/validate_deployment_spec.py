@@ -11,6 +11,23 @@ from typing import Any
 
 import yaml
 
+# Authored selector additions on top of the recovered June brain. The build
+# layer (build_runtime_slots.py) inserts each addition directly after its
+# anchor selector; the deployment spec's allowlists and the active
+# constitution must both carry recovered + exactly these, nothing else.
+# 2026-07-21 demo end-state (teren demo rulings): the ops-test ingest group.
+AUTHORED_SELECTOR_ADDITIONS: list[dict[str, Any]] = [
+    {
+        "job_type": "tgg_ops_ingest",
+        "match": {
+            "source.platform": "whatsapp",
+            "source.chat_id": "120363429226022766@g.us",
+        },
+        "anchor_job_type": "tgg_ops_ingest",
+        "anchor_chat_id": "120363423568509280@g.us",
+    }
+]
+
 
 EXPECTED_API_VERSION = "pa.papercutlabs.com/v1"
 EXPECTED_KIND = "ClientAgentDeployment"
@@ -218,7 +235,12 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         recovered_constitution,
         platform="whatsapp",
         job_type="tgg_ops_ingest",
-    )
+    ) + [
+        addition["match"]["source.chat_id"]
+        for addition in AUTHORED_SELECTOR_ADDITIONS
+        if addition["job_type"] == "tgg_ops_ingest"
+        and addition["match"]["source.platform"] == "whatsapp"
+    ]
     expected_management = _selector_chats(
         recovered_constitution,
         platform="whatsapp",
@@ -237,8 +259,25 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         != recovered_config["platforms"]["whatsapp"]["extra"]["allow_from"]
     ):
         raise RuntimeError("active config changed the recovered DM allowlist")
-    if active_constitution["selectors"] != recovered_constitution["selectors"]:
-        raise RuntimeError("active default constitution changed recovered selectors")
+    expected_selectors = list(recovered_constitution["selectors"])
+    for addition in AUTHORED_SELECTOR_ADDITIONS:
+        anchor_index = next(
+            index
+            for index, selector in enumerate(expected_selectors)
+            if selector.get("job_type") == addition["anchor_job_type"]
+            and selector.get("match", {}).get("source.platform")
+            == addition["match"]["source.platform"]
+            and str(selector.get("match", {}).get("source.chat_id"))
+            == addition["anchor_chat_id"]
+        )
+        expected_selectors.insert(
+            anchor_index + 1,
+            {"job_type": addition["job_type"], "match": dict(addition["match"])},
+        )
+    if active_constitution["selectors"] != expected_selectors:
+        raise RuntimeError(
+            "active default constitution changed recovered selectors beyond the authored additions"
+        )
 
     telegram = spec["channels"]["telegram"]["selectorChats"]
     if telegram["operations"] != _selector_chats(

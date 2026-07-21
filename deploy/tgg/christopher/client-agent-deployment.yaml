@@ -219,6 +219,10 @@ spec:
           - 120363422582425366@g.us
           - 120363423535922556@g.us
           - 120363423568509280@g.us
+          # Authored addition (2026-07-21 demo end-state): ops-test ingest
+          # group, inserted by the build layer after the last recovered ops
+          # selector. Mirrored in validate_deployment_spec.AUTHORED_SELECTOR_ADDITIONS.
+          - 120363429226022766@g.us
         managementChats:
           - 120363409954029949@g.us
           - 120363427363740087@g.us
