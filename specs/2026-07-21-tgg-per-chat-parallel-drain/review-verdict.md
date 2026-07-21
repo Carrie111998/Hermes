@@ -1,0 +1,31 @@
+# TGG per-chat parallel drain — blocking review verdict
+
+Reviewed: `origin/worker/b6240e2d` @ `98effd45f5ac7fc2958f188363d77a62110acd2d` against `origin/main` @ `d2ecfc4d0b3c1a44021e64d53f48e273dc1c070d` (repo: hermes-pcl).
+Approved design record: `specs/2026-07-21-tgg-per-chat-parallel-drain/plan.md` (that worktree).
+
+## Verdict: CLEAR to merge / deploy-with-pause.
+
+### 1. Replay concurrency safety — CLEAR
+`gateway/run.py`: `_TaskLocalAdapterRegistry` (new) backs `GatewayRunner.adapters` with a `ContextVar`-scoped overlay (`task_local()` contextmanager entered inside `replay()`), so concurrent `replay()` calls never share adapter state via the process-wide dict. `_REPLAY_HOME_CHANNELS` similarly moved from mutating `os.environ` to a `ContextVar`. `DeliveryRouter.adapters` is rebound post-construction to the same task-local registry (comment notes the constructor otherwise treats an empty mapping as falsy and replaces it). Verified by `test_gateway_runner_concurrent_replays_keep_adapter_context_home_and_sessions_isolated`: two `runner.replay()` calls forced to overlap via a barrier assert distinct `run_id`/`session_key`/outbound capture and that `WHATSAPP_HOME_CHANNEL` never leaks into `os.environ`.
+
+### 2. Scheduler: one durable inbox, one runner, one FIFO batch per chat — CLEAR
+`DurableInbox.pending_chat_batches` (`gateway/durable_jsonl_consumer.py:398-459`) groups pending rows by `chat_id` in seq order, returns each chat once, split into management/site by `priority_chats`. `run_consumer`'s scheduling loop passes `exclude_chats=set(tasks)` so a chat with a live `asyncio.Task` is never re-selected — one active batch per chat holds across scheduler cycles. Management chats get an unconditional `asyncio.create_task`, never gated on site-pool availability — reserved capacity confirmed. Site pool bounded by CLI `--site-concurrency` (default 4), sliced via `site_batches[:available_site]`. `TGG_DEMO_MANAGEMENT_ONLY` is unchanged and the entire site-task-launch block is wrapped in `if not demo_management_only:` — no hidden scope=all flip; `TGG_PERSISTENT_CHAT_SESSION_SCOPE` is untouched by this diff.
+
+### 3. Reconciliation / conservation / no deletion-based drain — CLEAR
+`reconcile_orphan_processing` (`:554-622`) reads `pa_turns` (`turn_status='completed' AND error_json IS NULL`), maps `message_refs_json` -> real turn id; every orphaned `processing` row either becomes `completed` with that turn id or is requeued to `pending` (`last_error='startup-orphan-requeued'`), inside one transaction with a before/after `COUNT(*)` guard. `_process_claimed_chat_batch`'s `except asyncio.CancelledError: inbox.requeue(...)` requeues an in-flight chat batch on graceful cancellation rather than leaving it `processing` or marking `failed`. Every state transition (`finish`, `requeue`, `finish_processed_batch`, `reconcile_orphan_processing`) guards `rowcount==1` and raises `ConsumerError` otherwise; no `DELETE` appears anywhere in the diff. `assert_and_record_conservation` persists a monotonic high-water mark and hard-aborts (raises, not warns) on any decrease; `run_consumer` checks total conservation at standby-entry, post-staging, the `--once` boundary, steady-state per-cycle, and on cancellation.
+
+### 4. Reply dedupe contract — CLEAR
+`deliver_management_replies`: `delivery_key = f"{chat_id}::{anchor}"` where `anchor` is the WA-native inbound message id — the prior content-hash scheme (`hashlib.sha256(...)`) is fully removed (import dropped). `test_distinct_renderings_for_same_anchor_still_deliver_only_once` reads back the literal `delivery_key` from `reply_deliveries` and confirms one delivery for two distinct renderings of the same anchor.
+
+**WA-id parity** (real export/capture WA-id fidelity) is unverified/unavailable per the plan and remains a data-quality question, not a code-correctness one: the dedupe key shape is now correct regardless. This gates any backfill or live-flip activation that depends on WA-id fidelity; it does **not** block deploy-with-pause, since `TGG_DEMO_MANAGEMENT_ONLY=true` keeps the site lane fully inert.
+
+### 5. Safety invariants — CLEAR
+Diff touches no `processing-gate.json` / rung-authority files. Deploy files only add `--site-concurrency 4 --chat-batch-size 25` to the systemd `ExecStart` and scheduler metadata to `client-agent-deployment.yaml`; the `.env`-based `TGG_DEMO_MANAGEMENT_ONLY` flag is untouched by this change and, per §2 above, fully disables site-task scheduling when set. Live-checked via `tgg-runtime-refresh.py`: `pa.enabled=true`, matching the plan's stated baseline (gate generation/rung/verdict fields are runtime facts this diff does not touch and must be re-verified at actual deploy time per the plan's own ship-time checklist).
+
+### 6. Tests + deploy verifier — CLEAR
+Ran the full changed/new test set in a fresh worktree against the repo's `.venv`: **46/46 passing** (`test_durable_jsonl_consumer.py`, `test_replay_runner.py`, `test_consumer_reply_delivery.py`). Confirmed real (non-mock-only) assertions for: the seq-3030-shape regression (999 site rows + forced-seq management row, real `asyncio.Event`-gated ordering assertion that management completes before a blocked site batch), the two-chat replay overlap test above, interrupt+restart conservation, and the dedupe key. `deploy/tgg/christopher/scripts/verify_runtime.sh` polls up to 30s for `scheduler_mode=='per-chat-parallel'`, hard-asserts `state_total_high_water == inbox_rows`, cross-checks `processing_chats <= active_chats` against a **live DB query** (not trusting the status file's own claim), and includes a real starvation-detector (management pending with no management task). No stale-status-trusting pattern found.
+
+### Non-blocking note
+`DeliveryRouter.adapters` rebind-after-construction in `gateway/run.py` is correct as written today but is fragile to a future reordering of `GatewayRunner.__init__` — worth a comment or a small refactor on next touch, not a merge blocker.
+
+No correctness bugs or race conditions found. Full independent second-pass review (ran the test suite itself, cross-checked all file:line citations) available at `/tmp/tgg-consumer-review-findings.md` (subagent output, not committed — ephemeral).
