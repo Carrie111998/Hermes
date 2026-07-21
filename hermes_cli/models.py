@@ -1937,6 +1937,11 @@ def _resolve_openrouter_api_key() -> str:
     return os.getenv("OPENROUTER_API_KEY", "").strip()
 
 
+def _resolve_kilocode_api_key() -> str:
+    """Best-effort Kilo Code API key for pricing fetch."""
+    return os.getenv("KILOCODE_API_KEY", "").strip()
+
+
 _DEFAULT_NOUS_INFERENCE_BASE = "https://inference-api.nousresearch.com"
 
 
@@ -1985,8 +1990,86 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
     return (api_key, base_url)
 
 
+def _fetch_kilocode_pricing(
+    timeout: float = 8.0,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Fetch pricing from the Kilo Gateway models endpoint.
+
+    The catalog is served from the provider's base URL at ``/models`` — the
+    same composition the doctor probe uses for Kilo connectivity checks
+    (``{KILOCODE_BASE_URL}/models``). The default base
+    (``https://api.kilo.ai/api/gateway``) serves the same OpenRouter-shaped
+    catalog as ``/api/openrouter/models``; honoring the override means a
+    custom endpoint shows its own catalog instead of the public one.
+
+    The endpoint is public, so the API key is attached best-effort (same as
+    the OpenRouter and Nous fetchers) rather than gating the fetch.
+
+    The Kilo API returns ``isFree`` as an explicit boolean per model, which
+    is more reliable than inferring from zero pricing — some free models
+    (e.g. ``kilo-auto/free``) are routers with non-zero underlying costs.
+    When ``isFree`` is True, pricing is set to ``"0"`` so the downstream
+    ``_apply_pricing()`` logic naturally marks the model as free.
+
+    Results are cached keyed on the resolved base URL so a custom
+    ``KILOCODE_BASE_URL`` never serves another endpoint's pricing.
+    """
+    api_key = _resolve_kilocode_api_key()
+
+    base_url = os.getenv("KILOCODE_BASE_URL", "").strip() or "https://api.kilo.ai/api/gateway"
+    cache_key = base_url.rstrip("/")
+    if not force_refresh and cache_key in _pricing_cache:
+        return _pricing_cache[cache_key]
+
+    url = cache_key + "/models"
+    headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": _HERMES_USER_AGENT,
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        _pricing_cache[cache_key] = {}
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if not mid:
+            continue
+        pricing = item.get("pricing") or {}
+        is_free = bool(item.get("isFree"))
+
+        entry: dict[str, str] = {}
+        if is_free:
+            entry["prompt"] = "0"
+            entry["completion"] = "0"
+        else:
+            if pricing.get("prompt"):
+                entry["prompt"] = str(pricing["prompt"])
+            if pricing.get("completion"):
+                entry["completion"] = str(pricing["completion"])
+        if pricing.get("input_cache_read"):
+            entry["input_cache_read"] = str(pricing["input_cache_read"])
+
+        if entry:
+            result[str(mid)] = entry
+
+    _pricing_cache[cache_key] = result
+    return result
+
+
 def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> dict[str, dict[str, str]]:
-    """Return live pricing for providers that support it (openrouter, nous, ai-gateway, novita)."""
+    """Return live pricing for providers that support it (openrouter, nous, ai-gateway, novita, kilocode)."""
     normalized = normalize_provider(provider)
     if normalized == "openrouter":
         return fetch_models_with_pricing(
@@ -2017,6 +2100,8 @@ def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> d
                 # Sale chrome (pricing.original) is Nous Portal-only.
                 include_sale_original=True,
             )
+    if normalized == "kilocode":
+        return _fetch_kilocode_pricing(force_refresh=force_refresh)
     return {}
 
 
