@@ -150,10 +150,102 @@ def test_parse_returns_canonical_metadata_and_native_activity(tmp_path):
         "offset": result.cursor.offset,
     }
     assert result.cursor.offset == path.stat().st_size
-    assert result.cursor.head_length == min(path.stat().st_size, 4096)
+    assert result.cursor.head_length == min(path.stat().st_size, 65_536)
     assert result.rebuild is False
     assert result.malformed_lines == 0
     assert result.unknown_records == 0
+    assert result.entrypoint is None
+
+
+@pytest.mark.parametrize("entrypoint", ["cli", "sdk-cli"])
+def test_parse_preserves_transcript_head_entrypoint(
+    tmp_path: Path, entrypoint: str
+) -> None:
+    record = _message_record("entrypoint characterization")
+    record["entrypoint"] = entrypoint
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(record))
+
+    result = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert result.entrypoint == entrypoint
+
+
+def test_parse_finds_entrypoint_after_leading_named_session_metadata(
+    tmp_path: Path,
+) -> None:
+    first = {
+        "type": "custom-title",
+        "sessionId": BASIC_SESSION_ID,
+        "customTitle": "Named registration",
+        "timestamp": "2026-01-01T00:00:00Z",
+    }
+    second = _message_record("interactive registration")
+    second["entrypoint"] = "cli"
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(first) + _json_line(second))
+
+    result = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert result.entrypoint == "cli"
+
+
+def test_parse_finds_entrypoint_beyond_four_kibibytes_of_named_metadata(
+    tmp_path: Path,
+) -> None:
+    first = {
+        "type": "custom-title",
+        "sessionId": BASIC_SESSION_ID,
+        "customTitle": "x" * 5_500,
+        "timestamp": "2026-01-01T00:00:00Z",
+    }
+    second = _message_record("interactive registration")
+    second["entrypoint"] = "cli"
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(first) + _json_line(second))
+
+    result = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert result.entrypoint == "cli"
+
+
+def test_cold_increment_probes_entrypoint_beyond_cursor_head(tmp_path: Path) -> None:
+    first = {
+        "type": "custom-title",
+        "sessionId": BASIC_SESSION_ID,
+        "customTitle": "x" * 5_500,
+        "timestamp": "2026-01-01T00:00:00Z",
+    }
+    second = _message_record("interactive registration")
+    second["entrypoint"] = "cli"
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(first) + _json_line(second))
+    cursor = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path).cursor
+    tail = _message_record(
+        "later metadata-free event",
+        event_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    )
+    with path.open("ab") as stream:
+        stream.write(_json_line(tail))
+
+    result = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, cursor)
+
+    assert result.entrypoint == "cli"
+
+
+def test_parse_rejects_conflicting_head_entrypoints(tmp_path: Path) -> None:
+    first = _message_record("first")
+    first["entrypoint"] = "cli"
+    second = _message_record(
+        "second",
+        event_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+    second["entrypoint"] = "sdk-cli"
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(first) + _json_line(second))
+
+    with pytest.raises(ValueError, match="entrypoint changed"):
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
 
 
 def test_parse_prefers_record_session_id_and_extracts_custom_title(tmp_path):
@@ -308,7 +400,7 @@ def test_cold_identity_outside_head_falls_back_to_stem(tmp_path):
     initial = _message_record("first")
     initial = {
         "type": initial.pop("type"),
-        "syntheticPadding": "x" * 5000,
+        "syntheticPadding": "x" * 70_000,
         **initial,
     }
     path.write_bytes(_json_line(initial))
@@ -872,7 +964,7 @@ def test_tail_replacement_that_removes_newline_holds_partial_record(tmp_path):
     path.write_bytes(first_line + second_line)
     adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
     first = adapter.parse(path)
-    assert first.cursor.head_length == 4096
+    assert first.cursor.head_length == min(path.stat().st_size, 65_536)
     path.write_bytes((first_line + second_line)[:-1] + b" ")
 
     rebuilt = adapter.parse(path, first.cursor)

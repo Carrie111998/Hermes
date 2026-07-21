@@ -29,7 +29,7 @@ from .models import (
 
 
 _PARSER_VERSION = 1
-_HEAD_SAMPLE_BYTES = 4096
+_HEAD_SAMPLE_BYTES = 65_536
 _NATIVE_ID_PROBE_BYTES = 65_536
 _RECOGNIZED_RECORD_TYPES = {
     "assistant",
@@ -76,6 +76,7 @@ class ClaudeParseResult:
     rebuild: bool
     malformed_lines: int
     unknown_records: int
+    entrypoint: str | None = None
 
 
 class ClaudeReadableSource(Protocol):
@@ -170,6 +171,7 @@ class _CacheEntry:
     metadata: _Metadata
     origin_kind: OriginKind
     origin_bridge_id: str | None
+    entrypoint: str | None
 
 
 class ClaudeSourceAdapter:
@@ -188,20 +190,26 @@ class ClaudeSourceAdapter:
         self, path: Path, previous: ClaudeCursor | None = None
     ) -> ClaudeParseResult:
         transcript_path = Path(path)
-        read_slice = _read_for_parse(transcript_path, previous)
+        cache_key = str(transcript_path.absolute())
+        cached = self._cache.get(cache_key)
+        read_slice = _read_for_parse(
+            transcript_path,
+            previous,
+            probe_head=previous is not None and cached is None,
+        )
         lines = _parse_complete_lines(
             read_slice.data,
             read_slice.completed_length,
             base_offset=read_slice.base_offset,
         )
         records = [line.record for line in lines if line.record is not None]
+        head_entrypoint = _entrypoint_from_head(read_slice.head_data)
+        delta_entrypoint = _entrypoint_from_records(records)
         delta_native_id = _validated_record_native_id(
             records,
             transcript_path=transcript_path,
         )
         metadata_delta = _metadata_delta(records, native_id=delta_native_id)
-        cache_key = str(transcript_path.absolute())
-        cached = self._cache.get(cache_key)
         warm_increment = (
             previous is not None
             and not read_slice.rebuild
@@ -217,6 +225,11 @@ class ClaudeSourceAdapter:
             metadata = _merge_metadata(cached.metadata, metadata_delta)
             prior_origin_kind = cached.origin_kind
             prior_origin_bridge_id = cached.origin_bridge_id
+            entrypoint = _merge_entrypoints(
+                cached.entrypoint,
+                head_entrypoint,
+                delta_entrypoint,
+            )
         else:
             if previous is not None and not read_slice.rebuild:
                 baseline_native_id = _native_id_from_bytes(read_slice.head_data)
@@ -237,6 +250,10 @@ class ClaudeSourceAdapter:
             )
             prior_origin_kind = OriginKind.NATIVE
             prior_origin_bridge_id = None
+            entrypoint = _merge_entrypoints(
+                head_entrypoint,
+                delta_entrypoint,
+            )
 
         malformed_lines = 0
         unknown_records = 0
@@ -290,6 +307,7 @@ class ClaudeSourceAdapter:
             metadata=metadata,
             origin_kind=origin_kind,
             origin_bridge_id=origin_bridge_id,
+            entrypoint=entrypoint,
         )
         return ClaudeParseResult(
             projection=projection,
@@ -297,6 +315,7 @@ class ClaudeSourceAdapter:
             rebuild=read_slice.rebuild,
             malformed_lines=malformed_lines,
             unknown_records=unknown_records,
+            entrypoint=entrypoint,
         )
 
     def find_native_session(self, native_id: str) -> Path | None:
@@ -721,7 +740,12 @@ def _existing_directory(value: Path | str | None) -> str | None:
     return None
 
 
-def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:
+def _read_for_parse(
+    path: Path,
+    previous: ClaudeCursor | None,
+    *,
+    probe_head: bool = False,
+) -> _ReadSlice:
     with path.open("rb") as stream:
         if previous is None:
             return _read_full(stream, rebuild=False)
@@ -731,7 +755,16 @@ def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:
         stream.seek(0, 2)
         file_size = stream.tell()
         stream.seek(0)
-        previous_head = stream.read(max(previous.head_length, 0))
+        requested_head = max(
+            previous.head_length,
+            min(
+                previous.offset,
+                _HEAD_SAMPLE_BYTES if probe_head else previous.head_length,
+            ),
+            0,
+        )
+        probed_head = stream.read(requested_head)
+        previous_head = probed_head[: max(previous.head_length, 0)]
         boundary = b"\n"
         if previous.offset > 0 and file_size >= previous.offset:
             stream.seek(previous.offset - 1)
@@ -753,7 +786,7 @@ def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:
         completed_length = _completed_byte_length(tail)
         return _ReadSlice(
             data=tail,
-            head_data=previous_head,
+            head_data=probed_head,
             base_offset=previous.offset,
             completed_length=completed_length,
             cursor=ClaudeCursor(
@@ -969,6 +1002,38 @@ def _single_native_id(native_ids: set[str]) -> str | None:
     if len(native_ids) > 1:
         raise ValueError("Claude transcript native identity conflict")
     return next(iter(native_ids), None)
+
+
+def _entrypoint_from_head(value: bytes) -> str | None:
+    """Read bounded head metadata without letting later mode overwrite it."""
+
+    records: list[dict[str, Any]] = []
+    for fragment in value.splitlines():
+        try:
+            record = json.loads(fragment)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return _entrypoint_from_records(records)
+
+
+def _entrypoint_from_records(records: Sequence[dict[str, Any]]) -> str | None:
+    values = {
+        value.strip()
+        for record in records
+        if isinstance((value := record.get("entrypoint")), str) and value.strip()
+    }
+    if len(values) > 1:
+        raise ValueError("Claude transcript entrypoint changed")
+    return next(iter(values), None)
+
+
+def _merge_entrypoints(*values: str | None) -> str | None:
+    normalized = {value for value in values if value is not None}
+    if len(normalized) > 1:
+        raise ValueError("Claude transcript entrypoint changed")
+    return next(iter(normalized), None)
 
 
 def _is_eligible_record(record: dict[str, Any]) -> bool:

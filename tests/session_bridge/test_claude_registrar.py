@@ -95,6 +95,7 @@ class FakeParse:
     projection: SessionProjection
     malformed_lines: int = 0
     unknown_records: int = 0
+    entrypoint: str | None = "cli"
 
 
 class FakeSource:
@@ -107,6 +108,7 @@ class FakeSource:
         duplicate_paths: list[Path] | None = None,
         malformed_lines: int = 0,
         unknown_records: int = 0,
+        entrypoint: str | None = "cli",
     ):
         self.projections = list(projections or [None])
         self.lookups: list[str] = []
@@ -115,6 +117,7 @@ class FakeSource:
         self.duplicate_paths = duplicate_paths
         self.malformed_lines = malformed_lines
         self.unknown_records = unknown_records
+        self.entrypoint = entrypoint
 
     def find_native_session(self, native_id: str) -> Path | None:
         self.lookups.append(native_id)
@@ -149,6 +152,7 @@ class FakeSource:
             self.current,
             malformed_lines=self.malformed_lines,
             unknown_records=self.unknown_records,
+            entrypoint=self.entrypoint,
         )
 
     def projection_has_exact_marker(
@@ -192,10 +196,14 @@ class FakePty:
         output: str = "REGISTERED\r\n",
         exit_code: int = 0,
         read_error: Exception | None = None,
+        write_error_at: int | None = None,
+        wait_error: Exception | None = None,
     ):
         self.output = output
         self.exit_code = exit_code
         self.read_error = read_error
+        self.write_error_at = write_error_at
+        self.wait_error = wait_error
         self.writes: list[str] = []
         self.waits: list[float] = []
         self.terminated = False
@@ -208,10 +216,14 @@ class FakePty:
         return self.output
 
     def write(self, data: str) -> None:
+        if self.write_error_at == len(self.writes):
+            raise RuntimeError("PTY write failed")
         self.writes.append(data)
 
     def wait(self, timeout: float) -> int:
         self.waits.append(timeout)
+        if self.wait_error is not None:
+            raise self.wait_error
         return self.exit_code
 
     def terminate(self, timeout: float = 1.0) -> bool:
@@ -287,7 +299,7 @@ def registrar(
     )
 
 
-def test_launch_uses_persistent_print_mode_and_never_writes_exit_command() -> None:
+def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
     item = claim()
     process = FakePty(output="\x1b[?2004hClaude>\x1b[0m REGISTERED\r\n")
     factory = FakeFactory(process)
@@ -312,22 +324,75 @@ def test_launch_uses_persistent_print_mode_and_never_writes_exit_command() -> No
                 "",
                 "--permission-mode",
                 "dontAsk",
-                "--print",
-                expected,
             ],
             item.source_cwd,
         )
     ]
     argv = factory.spawns[0][0]
+    assert "--print" not in argv and "-p" not in argv
+    assert expected not in argv
     assert "--no-session-persistence" not in argv
-    assert process.writes == []
-    assert "tool_calls" not in factory.spawns[0][0][-1]
+    assert process.writes == [f"\x1b[200~{expected}\x1b[201~\r", "/exit\r"]
+    assert "tool_calls" not in expected
     assert process.closed and process.waits == [1.0]
 
 
-def test_auth_recovery_resumes_exact_uuid_in_print_mode_without_create_or_exit() -> (
-    None
-):
+@pytest.mark.parametrize(
+    ("process", "expected_writes"),
+    [
+        (FakePty(write_error_at=0), []),
+        (FakePty(write_error_at=1), ["prompt"]),
+        (FakePty(wait_error=TimeoutError()), ["prompt", "/exit\r"]),
+    ],
+)
+def test_interactive_write_or_exit_uncertainty_is_creation_ambiguous(
+    process: FakePty, expected_writes: list[str]
+) -> None:
+    item = claim()
+    expected = build_claude_registration_prompt(
+        candidate(), derive_claude_visibility_identity(candidate(), SECRET), SECRET
+    )
+    source = FakeSource([None])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    normalized = [
+        "prompt" if value == f"\x1b[200~{expected}\x1b[201~\r" else value
+        for value in process.writes
+    ]
+    assert normalized == expected_writes
+    assert process.terminated and process.closed
+
+
+def test_malformed_interactive_response_never_sends_exit_command() -> None:
+    process = FakePty(output="NOT REGISTERED")
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "failed"
+    assert result.error_code == "bridge_conflict"
+    assert len(process.writes) == 1
+    assert process.writes[0].startswith("\x1b[200~")
+    assert "/exit\r" not in process.writes
+    assert process.terminated and process.closed
+
+
+def test_print_mode_transcript_can_never_commit_native_visibility() -> None:
+    item = claim()
+    source = FakeSource(
+        [None, projection_for(item)],
+        entrypoint="sdk-cli",
+    )
+
+    result = registrar(source, FakeFactory()).process(item)
+
+    assert result.status == "failed"
+    assert result.error_code == "bridge_conflict"
+
+
+def test_auth_recovery_resumes_exact_uuid_interactively_without_create() -> None:
     item = claim()
     prompt = "bounded same-UUID authentication recovery prompt"
     recovery = {
@@ -359,15 +424,15 @@ def test_auth_recovery_resumes_exact_uuid_in_print_mode_without_create_or_exit()
                 "",
                 "--permission-mode",
                 "dontAsk",
-                "--print",
-                prompt,
             ],
             item.source_cwd,
         )
     ]
     assert "--session-id" not in factory.spawns[0][0]
+    assert "--print" not in factory.spawns[0][0]
+    assert prompt not in factory.spawns[0][0]
     assert "--no-session-persistence" not in factory.spawns[0][0]
-    assert process.writes == []
+    assert process.writes == [f"\x1b[200~{prompt}\x1b[201~\r", "/exit\r"]
 
 
 def test_auth_recovery_durably_marks_call_started_before_spawn() -> None:
@@ -1219,6 +1284,40 @@ def test_winpty_unknown_private_resource_layout_fails_closed() -> None:
         _WinPtyProcess(object(), require_supported_layout=True)
 
 
+def test_factory_sets_cli_entrypoint_only_in_child_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class ProcessType:
+        @staticmethod
+        def spawn(
+            argv: list[str],
+            *,
+            cwd: str,
+            env: dict[str, str],
+            dimensions: tuple[int, int],
+        ) -> object:
+            observed.update(
+                argv=argv,
+                cwd=cwd,
+                env=env,
+                dimensions=dimensions,
+            )
+            return object()
+
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr(
+        "session_bridge.claude_registrar._registrar_pywinpty_process_type",
+        lambda: ProcessType,
+    )
+
+    WindowsConPtyFactory()._spawn_process(["claude"], cwd="C:/exact")
+
+    assert observed["env"]["CLAUDE_CODE_ENTRYPOINT"] == "cli"
+    assert "CLAUDE_CODE_ENTRYPOINT" not in os.environ
+
+
 def test_factory_validation_failure_reclaims_spawned_child_and_descriptors() -> None:
     class Resource:
         def __init__(self, descriptor: int):
@@ -1605,6 +1704,75 @@ def test_real_windows_conpty_fixture_exit_and_cleanup(
     assert events[0]["argv"] == ["--session-id", "real-conpty-uuid"]
     assert events[1]["frame"].rstrip("\r\n") == registration_prompt.replace("\n", "")
     assert events[-2]["frame"].strip() == "/exit"
+
+
+@pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")
+def test_registrar_completes_genuine_interactive_conpty_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = replace(
+        candidate(),
+        source_cwd=str(tmp_path),
+        git_root=str(tmp_path),
+    )
+    identity = derive_claude_visibility_identity(value, SECRET)
+    item = replace(
+        claim(),
+        job_id=identity.job_id,
+        source_session_id=value.source_session_id,
+        reserved_claude_uuid=identity.claude_uuid,
+        native_name=value.native_name,
+        source_cwd=value.source_cwd,
+        git_root=value.git_root,
+        signed_marker=identity.signed_marker,
+    )
+    prompt = build_claude_registration_prompt(value, identity, SECRET)
+    projection = SessionProjection(
+        provider=Provider.CLAUDE,
+        native_id=identity.claude_uuid,
+        title=value.native_name,
+        cwd=value.source_cwd,
+        started_at=10.0,
+        last_active=11.0,
+        messages=[
+            ProjectedMessage("u1", 0, "user", prompt, 10.0),
+            ProjectedMessage("a1", 0, "assistant", "REGISTERED", 11.0),
+        ],
+        native_path=str(tmp_path / f"{identity.claude_uuid}.jsonl"),
+        native_hash="c" * 64,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=identity.bridge_id,
+    )
+    record = tmp_path / "registrar-record.json"
+    fixture = Path(__file__).parent / "fixtures" / "fake_interactive_claude.py"
+    monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "registered")
+
+    result = ClaudeNativeRegistrar(
+        cast(Any, FakeStore()),
+        cast(Any, FakeSource([None, projection])),
+        marker_secret=SECRET,
+        pty_factory=WindowsConPtyFactory(),
+        claude_command=(sys.executable, str(fixture)),
+        clock=lambda: 100.0,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+        process_timeout=10.0,
+        exit_timeout=5.0,
+        discovery_timeout=0.0,
+        retry_delay=5.0,
+    ).process(item)
+
+    assert result.status == "visible"
+    events = json.loads(record.read_text(encoding="utf-8"))
+    spawn_argv = events[0]["argv"]
+    assert "--print" not in spawn_argv and "-p" not in spawn_argv
+    assert prompt not in spawn_argv
+    assert events[0]["entrypoint"] == "cli"
+    # ConPTY consumes bracketed-paste controls and normalizes the multiline frame.
+    assert events[1]["frame"].rstrip("\r\n") == prompt.replace("\n", "")
+    assert events[-2] == {"event": "stdin", "frame": "/exit\r\n"}
+    assert events[-1] == {"event": "exit", "scenario": "registered", "sequence": 0}
 
 
 @pytest.mark.skipif(not _real_conpty_available(), reason="Windows ConPTY unavailable")

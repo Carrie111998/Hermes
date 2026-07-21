@@ -188,8 +188,10 @@ class WindowsConPtyFactory:
 
     def _spawn_process(self, argv: list[str], *, cwd: str) -> object:
         process_type = _registrar_pywinpty_process_type()
+        child_env = os.environ.copy()
+        child_env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
         return process_type.spawn(
-            argv, cwd=cwd, env=os.environ.copy(), dimensions=(24, 120)
+            argv, cwd=cwd, env=child_env, dimensions=(24, 120)
         )
 
     def _adapt_process(self, spawned: object) -> _WinPtyProcess:
@@ -809,8 +811,6 @@ class ClaudeNativeRegistrar:
             "",
             "--permission-mode",
             "dontAsk",
-            "--print",
-            prompt,
         ]
         process: InteractivePty | None = None
         clean_exit = False
@@ -827,6 +827,7 @@ class ClaudeNativeRegistrar:
             )
         try:
             process = self._factory.spawn(argv, cwd=str(source_cwd))
+            process.write(_interactive_prompt_frame(prompt))
             output = process.read_until(self._process_timeout, prompt=prompt)
             if _is_authentication_failure(output):
                 pending = (
@@ -836,6 +837,7 @@ class ClaudeNativeRegistrar:
             elif not _has_exact_registered_response(output, prompt):
                 pending = ("bridge_conflict", "recovery response malformed")
             else:
+                process.write("/exit\r")
                 exit_code = process.wait(self._exit_timeout)
                 if type(exit_code) is not int or exit_code != 0:
                     pending = (
@@ -1032,8 +1034,6 @@ class ClaudeNativeRegistrar:
             "",
             "--permission-mode",
             "dontAsk",
-            "--print",
-            prompt,
         ]
         process: InteractivePty | None = None
         launched = False
@@ -1043,6 +1043,7 @@ class ClaudeNativeRegistrar:
         try:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
+            process.write(_interactive_prompt_frame(prompt))
             output = process.read_until(self._process_timeout, prompt=prompt)
             if _is_authentication_failure(output):
                 pending = (
@@ -1060,6 +1061,7 @@ class ClaudeNativeRegistrar:
             elif not _has_exact_registered_response(output, prompt):
                 pending = ("fail", "bridge_conflict", "registration response malformed")
             else:
+                process.write("/exit\r")
                 exit_code = process.wait(self._exit_timeout)
                 if type(exit_code) is not int or exit_code != 0:
                     pending = (
@@ -1235,6 +1237,8 @@ def _validate_projection(
 ) -> None:
     projection = transcript.projection
     if transcript.parsed.malformed_lines or transcript.parsed.unknown_records:
+        raise _TranscriptConflict("bridge_conflict")
+    if transcript.parsed.entrypoint != "cli":
         raise _TranscriptConflict("bridge_conflict")
     if (
         projection.provider is not Provider.CLAUDE
@@ -1450,6 +1454,12 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
             continue
         meaningful.append(line)
     return "\n".join(meaningful) + ("\n" if meaningful else "")
+
+
+def _interactive_prompt_frame(prompt: str) -> str:
+    """Send one multiline prompt as a terminal bracketed-paste frame."""
+
+    return f"\x1b[200~{prompt}\x1b[201~\r"
 
 
 def _has_exact_registered_response(output: str, prompt: str) -> bool:

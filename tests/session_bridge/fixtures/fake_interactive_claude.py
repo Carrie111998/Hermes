@@ -62,7 +62,11 @@ def _read_frame(stream: BinaryIO | None = None) -> str:
 
 def main() -> int:
     scenario = os.environ.get("FAKE_CLAUDE_SCENARIO", "registered")
-    _record(event="spawn", argv=sys.argv[1:], cwd=os.getcwd())
+    spawn = {"event": "spawn", "argv": sys.argv[1:], "cwd": os.getcwd()}
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT")
+    if entrypoint:
+        spawn["entrypoint"] = entrypoint
+    _record(**spawn)
     if scenario == "authentication_failure":
         sys.stdout.write("Authentication required\r\n")
         sys.stdout.flush()
