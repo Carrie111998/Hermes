@@ -1,14 +1,14 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-21
-**Task:** Task 24 — Authoritative approval control (checkpointed)
-**Status:** Task 23 checkpointed `c89f1161`; **Task 24 checkpointed**; **Task 25 not started**; all lifecycle invoke disabled
+**Task:** Task 24.1 — Execution-lock contention test harness repair
+**Status:** Task 24 production checkpointed `af4868054`; **Task 24.1 in progress**; **Task 25 not started**; all lifecycle invoke disabled
 
 ---
 
 ## 1. One-paragraph state
 
-Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1ed651`) delivered read-only observe. Task 20 (`2fa580b5`) accepted **Policy C** (docs). Task 21 delivered read-only derived action plans. Task 22 enforces Policy C immutable seal at all 25 public/run-aware mutation boundaries. Task 23 adds a run-scoped durable write barrier for those same 25 mutators. **Task 24** adds authoritative approval control at `{runs_root}/.control/approvals/{approval_id}/` with immutable issue/revoke/claim/outcome records, a dedicated control-plane write barrier reusing the Task 23 marker, and read/write approval APIs — still **no lifecycle invoke**. Phase 2 lifecycle invoke remains disabled until Task 25.
+Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1ed651`) delivered read-only observe. Task 20 (`2fa580b5`) accepted **Policy C** (docs). Task 21 delivered read-only derived action plans. Task 22 enforces Policy C immutable seal at all 25 public/run-aware mutation boundaries. Task 23 adds a run-scoped durable write barrier for those same 25 mutators. **Task 24** (`af4868054`) adds authoritative approval control at `{runs_root}/.control/approvals/{approval_id}/` with immutable issue/revoke/claim/outcome records, a dedicated control-plane write barrier reusing the Task 23 marker, and read/write approval APIs — still **no lifecycle invoke**. Task 24's first strict no-retry post-commit run exposed a pre-existing synchronization defect in `test_concurrent_bootstrap_succeeds`; parent-versus-child diagnosis proved no production regression. **Task 24.1** repairs only that test harness. Phase 2 lifecycle invoke remains disabled until Task 25.
 
 ---
 
@@ -80,4 +80,4 @@ Task 25 re-observe + stale rejection + canonical invoke + post-verification. Tas
 
 ---
 
-Task 17 `939e8b606`. Task 17.1 `8fea4daa0`. Task 18 `f7e291ff7`. Task 18.5 `04b11bc4d`. Task 19 `57a1ed651`. Task 20 `2fa580b5`. Task 21 `798bc1ea`. Task 22 `896961d0`. Task 23 `c89f1161`. **Task 24 checkpointed (this commit).**
+Task 17 `939e8b606`. Task 17.1 `8fea4daa0`. Task 18 `f7e291ff7`. Task 18.5 `04b11bc4d`. Task 19 `57a1ed651`. Task 20 `2fa580b5`. Task 21 `798bc1ea`. Task 22 `896961d0`. Task 23 `c89f1161`. Task 24 production `af4868054`. **Task 24.1: test harness repair (this checkpoint).**

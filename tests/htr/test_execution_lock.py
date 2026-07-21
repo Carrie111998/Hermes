@@ -1017,11 +1017,13 @@ def _subprocess_fork_child_release_worker(runs_root: str, run_id: str, slot: Any
     slot.put("no_entry")
 
 
-def _subprocess_concurrent_bootstrap_worker(runs_root: str, run_id: str, slot: Any) -> None:
+def _subprocess_concurrent_bootstrap_worker(
+    runs_root: str, run_id: str, slot: Any, release_gate: Any
+) -> None:
     try:
         with run_write_barrier(run_id, Path(runs_root)):
             slot.put("ok")
-            time.sleep(0.4)
+            release_gate.wait(timeout=10)
     except RunExecutionLockOccupiedError:
         slot.put("blocked")
     except BaseException as exc:
@@ -1271,21 +1273,24 @@ def test_concurrent_bootstrap_succeeds(tmp_path):
     run_id = new_run_id()
     deep = tmp_path / "nested" / "deep" / "runs"
     ctx = multiprocessing.get_context("spawn")
+    release_gate = ctx.Event()
     slots = [ctx.Queue() for _ in range(6)]
     procs = [
         ctx.Process(
             target=_subprocess_concurrent_bootstrap_worker,
-            args=(str(deep), run_id, slots[i]),
+            args=(str(deep), run_id, slots[i], release_gate),
         )
         for i in range(6)
     ]
     for proc in procs:
         proc.start()
-    for proc in procs:
-        proc.join(timeout=15)
-    outcomes = [slots[i].get(timeout=2) for i in range(6)]
+    outcomes = [slots[i].get(timeout=5) for i in range(6)]
     assert outcomes.count("ok") == 1
     assert outcomes.count("blocked") == 5
+    release_gate.set()
+    for proc in procs:
+        proc.join(timeout=10)
+        assert proc.exitcode == 0
 
 
 def test_missing_marker_release_conflict(tmp_path):

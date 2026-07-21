@@ -1216,10 +1216,32 @@ Committed Phase 1 `project_dir` = HTR **runs-storage root** (identical path role
 
 ---
 
+## Task 24.1 — Execution-Lock Contention Test Harness Repair (2026-07-21)
+
+**Implementer:** Cursor
+**Status:** ✅ Checkpointed (test-only harness repair)
+**Depends on:** Task 24 production checkpoint `af4868054b0a61fa0511241d58411d16780daa6b`
+
+### Context
+
+Task 24 production checkpoint (`af4868054`) first strict no-retry post-commit archive run failed on `test_concurrent_bootstrap_succeeds`. Read-only parent-versus-child diagnosis proved **equivalent behavior** on Task 23 parent (`c89f1161`) and Task 24 child (`af4868054`); held-marker safety property passed on both commits; **no production regression**.
+
+### Delivered
+
+- `tests/htr/test_execution_lock.py` — `test_concurrent_bootstrap_succeeds` / `_subprocess_concurrent_bootstrap_worker` now hold the winning marker via `release_gate` until all worker outcomes are collected (pattern from `test_subprocess_o_excl_race_exactly_one_winner`)
+
+### Non-goals confirmed
+
+- No production module changes; no approval schema/API changes; no lifecycle invoke (Task 25); Task 25 not started
+
+**Next implementation:** Task 25 — Human-gated single-API invoke pilot.
+
+---
+
 ## Task 24 — Authoritative Approval Control (2026-07-21)
 
 **Implementer:** Cursor
-**Status:** ✅ Checkpointed (fifth Phase 2 **implementation**)
+**Status:** ✅ Checkpointed (fifth Phase 2 **implementation**; commit `af4868054b0a61fa0511241d58411d16780daa6b`)
 **Depends on:** Task 23 `c89f1161968931e329f64acb350b166ec564c174`
 
 ### Delivered
@@ -1246,6 +1268,6 @@ Committed Phase 1 `project_dir` = HTR **runs-storage root** (identical path role
 - No lifecycle invocation (Task 25); no ambiguous reconciliation (Task 26); no Recovery/Successor Runs (Task 27)
 - No self-healing; no marker reconciliation; no distributed locking; no finalized-run mutation bypass
 
-**Tests (formal Git-only isolated archive):** full HTR manifest **1487 passed** (26 files); **0 failed**; **0 skipped**
+**Tests (formal Git-only isolated archive, pre-commit with file-retry):** full HTR manifest **1487 passed** (26 files); **0 failed**; **0 skipped** — strict no-retry post-commit exposed pre-existing test defect; repaired in Task 24.1
 
 **Next implementation:** Task 25 — Human-gated single-API invoke pilot.

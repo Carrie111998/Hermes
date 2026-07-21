@@ -1,12 +1,12 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-21 (Task 24 authoritative approval control checkpoint; parent Task 23 `c89f1161`)
+**Last updated:** 2026-07-21 (Task 24.1 execution-lock test harness repair; parent Task 24 `af4868054`)
 
 ---
 
 ## Active Task
 
-**Task 25 — Human-gated single-API invoke pilot** — blocked until Task 24 checkpoint ✅. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Task 25 — Human-gated single-API invoke pilot** — blocked until Task 24 checkpoint ✅ and Task 24.1 harness repair ✅. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
 
 **All Phase 2 lifecycle invoke remains disabled** until Task 25 is implemented.
 
@@ -14,10 +14,27 @@
 
 ## Completed
 
+### Task 24.1 — Execution-Lock Contention Test Harness Repair
+
+**Status:** ✅ Checkpointed (test-only; parent Task 24 `af4868054b0a61fa0511241d58411d16780daa6b`)
+**Production diff:** empty — no production modules changed
+**Depends on:** Task 24 `af4868054b0a61fa0511241d58411d16780daa6b`
+
+**Context:** Task 24 production checkpoint (`af4868054`) passed pre-commit formal verification with file-retry masking. Its first strict no-retry post-commit archive run exposed a **pre-existing synchronization defect** in `test_concurrent_bootstrap_succeeds` (timing-based release allowed sequential re-acquisition). Parent-versus-child diagnosis on `af4868054` vs `c89f1161` proved equivalent behavior and **no production regression**; held-marker safety (`test_subprocess_o_excl_race_exactly_one_winner`) passed 50/50 on both commits.
+
+**Delivered:**
+
+- `tests/htr/test_execution_lock.py` — `test_concurrent_bootstrap_succeeds` now uses a `release_gate` so the winning worker retains marker ownership until all challengers report (same pattern as `test_subprocess_o_excl_race_exactly_one_winner`)
+
+**Explicitly not implemented:** lifecycle invoke (Task 25), production changes, Task 25 work
+
+---
+
 ### Task 24 — Authoritative Approval Control
 
-**Status:** ✅ Checkpointed (fifth Phase 2 **implementation**; parent Task 23 `c89f1161968931e329f64acb350b166ec564c174`)
-**Tests (formal Git-only isolated archive):** full HTR manifest **1487 passed** (26 files: Task 23 **1400** + approval-control **87**); **0 failed**; **0 skipped**
+**Status:** ✅ Checkpointed (fifth Phase 2 **implementation**; commit `af4868054b0a61fa0511241d58411d16780daa6b`; parent Task 23 `c89f1161968931e329f64acb350b166ec564c174`)
+**Tests (formal Git-only isolated archive, pre-commit with file-retry):** full HTR manifest **1487 passed** (26 files: Task 23 **1400** + approval-control **87**); **0 failed**; **0 skipped**
+**Post-commit note:** first strict no-retry archive run exposed pre-existing flake in `test_concurrent_bootstrap_succeeds` — repaired in Task 24.1 (test-only); production unchanged
 **Depends on:** Task 23 `c89f1161968931e329f64acb350b166ec564c174`
 
 **Delivered:**
