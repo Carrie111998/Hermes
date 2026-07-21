@@ -13,6 +13,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import threading
@@ -65,11 +66,19 @@ from .mirror import (
 )
 from .models import MirrorJobState, Provider, SidebarJobState
 from .claude_skill import install_claude_skill
+from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
 from .sidebar_skill import install_sidebar_skill
-from .sidebar_executor import CodexAppServerSidebarDelivery, SidebarExecutor
+from .sidebar_executor import (
+    CodexAppServerSidebarDelivery,
+    NativeThreadUnrecoverable,
+    SidebarExecutor,
+)
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
+    SIDEBAR_TERMINAL_EVIDENCE_KIND,
+    SIDEBAR_TERMINAL_EVIDENCE_VERSION,
+    SIDEBAR_TERMINAL_RESOLUTION_CODE,
     SessionBridgeStore,
     SidebarSource,
     redact_codex_thread_id,
@@ -92,6 +101,12 @@ _CLAUDE_VISIBILITY_VERSION_OUTPUTS = frozenset({
 _CLAUDE_FORCED_TEAM_ONBOARDING = frozenset({"banner", "step"})
 _MAX_CLAUDE_AUTH_STATUS_BYTES = 16_384
 _MAX_CLAUDE_GLOBAL_CONFIG_BYTES = 4 * 1024 * 1024
+_SIDEBAR_EXECUTION_BLOCKER_ORDER = (
+    "sidebar_failed",
+    "sidebar_terminal_resolution_mismatch",
+    "sidebar_terminal_resolution_ledger_invalid",
+    "unknown_retry_code",
+)
 _SENSITIVE_KEY_FRAGMENTS = (
     "authorization",
     "bearer",
@@ -310,6 +325,13 @@ class _Backend(Protocol):
     ) -> Mapping[str, Any]: ...
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]: ...
     def sidebar_run_once(self) -> Mapping[str, Any]: ...
+    def sidebar_acknowledge_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]: ...
     def claude_visibility_status(self) -> Mapping[str, Any]: ...
     def claude_visibility_backfill(
         self, *, days: int, limit: int, apply: bool
@@ -661,6 +683,109 @@ class ProductionBackend:
             raise
         except Exception as exc:
             raise ProviderDegraded("sidebar_executor_failed") from exc
+
+    def sidebar_acknowledge_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+    ) -> Mapping[str, Any]:
+        """Prove one exact bound native task is unrecoverable, then append evidence."""
+
+        if (
+            re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", codex_thread_id)
+            is None
+            or expected_error_code != "native_create_ambiguous"
+        ):
+            raise RolloutGateBlocked("sidebar_terminal_snapshot_mismatch")
+
+        store = self._require_store()
+        try:
+            job = store.get_sidebar_job_by_id(job_id)
+            if job is None:
+                raise ValueError("missing sidebar job")
+            source_session_id = job.get("source_session_id")
+            if not isinstance(source_session_id, str):
+                raise ValueError("missing sidebar source identity")
+            expected_idempotency_key = sidebar_idempotency_key(source_session_id)
+            expected_bridge_id = sidebar_bridge_id(source_session_id)
+            expected_job_id = "sidebar-job:" + hashlib.sha256(
+                expected_idempotency_key.encode("utf-8")
+            ).hexdigest()
+            attempts = job.get("attempts")
+            next_attempt_at = job.get("next_attempt_at")
+            updated_at = job.get("updated_at")
+            if (
+                job.get("id") != job_id
+                or job_id != expected_job_id
+                or job.get("idempotency_key") != expected_idempotency_key
+                or job.get("bridge_id") != expected_bridge_id
+                or job.get("codex_thread_id") != codex_thread_id
+                or job.get("state") != SidebarJobState.FAILED.value
+                or job.get("error_code") != expected_error_code
+                or type(attempts) is not int
+                or cast(int, attempts) < 0
+                or not _is_finite_number(next_attempt_at)
+                or not _is_finite_number(updated_at)
+                or job.get("lease_digest") is not None
+                or job.get("lease_expires_at") is not None
+                or job.get("completion_digest") is not None
+                or job.get("visible_at") is not None
+            ):
+                raise ValueError("sidebar terminal snapshot mismatch")
+            reservation = store.get_sidebar_create_reservation(source_session_id)
+            if (
+                reservation is None
+                or reservation.get("job_id") != job_id
+                or reservation.get("bridge_id") != expected_bridge_id
+            ):
+                raise ValueError("sidebar terminal reservation mismatch")
+        except (TypeError, ValueError):
+            raise RolloutGateBlocked("sidebar_terminal_snapshot_mismatch") from None
+
+        delivery = self._require_sidebar_terminal_delivery()
+        try:
+            native_state = delivery.read_thread_state(
+                thread_id=codex_thread_id,
+                deadline=time.monotonic() + 240.0,
+            )
+        except NativeThreadUnrecoverable as exc:
+            if exc.thread_id != codex_thread_id:
+                raise ProviderDegraded("sidebar_terminal_probe_failed") from None
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ProviderDegraded("sidebar_terminal_probe_failed") from None
+        else:
+            del native_state
+            raise RolloutGateBlocked("native_thread_materialized")
+
+        evidence_digest = _sidebar_terminal_evidence_digest(
+            job=job,
+            reservation=reservation,
+        )
+        try:
+            result = store.acknowledge_sidebar_terminal_resolution(
+                job_id=job_id,
+                codex_thread_id=codex_thread_id,
+                expected_error_code=expected_error_code,
+                expected_attempts=job["attempts"],
+                expected_next_attempt_at=job["next_attempt_at"],
+                expected_updated_at=job["updated_at"],
+                evidence_digest=evidence_digest,
+                now=time.time(),
+            )
+        except (TypeError, ValueError):
+            raise RolloutGateBlocked("sidebar_terminal_snapshot_mismatch") from None
+        return {
+            "status": (
+                "acknowledged" if result.get("created") is True else "already_acknowledged"
+            ),
+            "error_code": "native_create_ambiguous",
+            "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
+        }
 
     def claude_visibility_status(self) -> Mapping[str, Any]:
         config = self.config.claude_visibility
@@ -1404,6 +1529,25 @@ class ProductionBackend:
             self.close()
             raise ConfigurationFailure("sidebar_executor_unavailable") from exc
 
+    def _require_sidebar_terminal_delivery(self) -> CodexAppServerSidebarDelivery:
+        """Build the narrow read/resume-only provider boundary for terminal proof."""
+
+        try:
+            if self._sidebar_codex_client is None:
+                codex_command = resolve_cli_executable("codex")
+                if len(codex_command) != 1:
+                    raise RuntimeError("codex_direct_runtime_required")
+                self._sidebar_codex_client = CodexAppServerClient(
+                    codex_bin=codex_command[0]
+                )
+            return CodexAppServerSidebarDelivery(
+                cast(Any, self._sidebar_codex_client)
+            )
+        except ConfigurationFailure:
+            raise
+        except Exception as exc:
+            raise ConfigurationFailure("sidebar_terminal_probe_unavailable") from exc
+
     def _release_provider_runtime(self) -> None:
         client, self._codex_client = self._codex_client, None
         self._coordinator = None
@@ -1498,6 +1642,27 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "sidebar-run-once",
         help="process at most one native sidebar delivery job",
+    )
+
+    sidebar_terminal = commands.add_parser(
+        "sidebar-acknowledge-unrecoverable",
+        help="acknowledge one audited unrecoverable bound Codex thread",
+    )
+    sidebar_terminal.add_argument("--job-id", type=_sidebar_terminal_job_id, required=True)
+    sidebar_terminal.add_argument(
+        "--codex-thread-id",
+        type=_sidebar_terminal_thread_id,
+        required=True,
+    )
+    sidebar_terminal.add_argument(
+        "--expected-error-code",
+        choices=("native_create_ambiguous",),
+        required=True,
+    )
+    sidebar_terminal.add_argument(
+        "--confirm",
+        choices=("native-thread-unrecoverable",),
+        required=True,
     )
 
     claude_visibility_status = commands.add_parser(
@@ -1642,6 +1807,16 @@ def main(
             return (
                 EXIT_OK if payload["status"] in {"idle", "visible"} else EXIT_DEGRADED
             )
+        if args.command == "sidebar-acknowledge-unrecoverable":
+            payload = _public_sidebar_terminal_resolution_result(
+                backend.sidebar_acknowledge_unrecoverable(
+                    job_id=args.job_id,
+                    codex_thread_id=args.codex_thread_id,
+                    expected_error_code=args.expected_error_code,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
         if args.command == "claude-visibility-status":
             payload = dict(backend.claude_visibility_status())
             _emit(payload)
@@ -2038,6 +2213,111 @@ def _public_sidebar_status(
         for state in SidebarJobState
     }
     state_counts["sidebar_excluded"] = _status_count(counts.get("sidebar_excluded", 0))
+    blocking_failed_count = _status_count(
+        raw.get(
+            "blocking_failed_count",
+            state_counts[SidebarJobState.FAILED.value],
+        )
+    )
+    terminally_resolved_failed_count = _status_count(
+        raw.get("terminally_resolved_failed_count", 0)
+    )
+    ineffective_terminal_resolution_count = _status_count(
+        raw.get("ineffective_terminal_resolution_count", 0)
+    )
+    ledger_valid_value = raw.get("terminal_resolution_ledger_valid", True)
+    if type(ledger_valid_value) is not bool:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    terminal_resolution_ledger_valid = cast(bool, ledger_valid_value)
+    raw_terminal_resolutions = raw.get("terminal_resolutions")
+    if raw_terminal_resolutions is None:
+        terminal_resolutions_source: Mapping[str, Any] = {}
+    elif isinstance(raw_terminal_resolutions, Mapping):
+        terminal_resolutions_source = raw_terminal_resolutions
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    terminal_total = _status_count(
+        terminal_resolutions_source.get(
+            "total",
+            terminally_resolved_failed_count
+            + ineffective_terminal_resolution_count,
+        )
+    )
+    terminal_effective = _status_count(
+        terminal_resolutions_source.get(
+            "effective", terminally_resolved_failed_count
+        )
+    )
+    terminal_ineffective = _status_count(
+        terminal_resolutions_source.get(
+            "ineffective", ineffective_terminal_resolution_count
+        )
+    )
+    raw_resolution_codes = terminal_resolutions_source.get("by_resolution_code")
+    if raw_resolution_codes is None:
+        resolution_codes_source: Mapping[str, Any] = {}
+    elif isinstance(raw_resolution_codes, Mapping):
+        resolution_codes_source = raw_resolution_codes
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    terminal_code_count = _status_count(
+        resolution_codes_source.get(
+            SIDEBAR_TERMINAL_RESOLUTION_CODE,
+            terminally_resolved_failed_count,
+        )
+    )
+    if (
+        blocking_failed_count
+        + terminally_resolved_failed_count
+        != state_counts[SidebarJobState.FAILED.value]
+        or terminal_total != terminal_effective + terminal_ineffective
+        or terminal_effective != terminally_resolved_failed_count
+        or terminal_ineffective != ineffective_terminal_resolution_count
+        or terminal_code_count != terminal_effective
+    ):
+        raise ConfigurationFailure("invalid_sidebar_status")
+    raw_execution_blockers = raw.get("execution_blockers")
+    if raw_execution_blockers is None:
+        execution_blockers = [
+            code
+            for code, active in (
+                ("sidebar_failed", blocking_failed_count > 0),
+                (
+                    "sidebar_terminal_resolution_mismatch",
+                    ineffective_terminal_resolution_count > 0,
+                ),
+                (
+                    "sidebar_terminal_resolution_ledger_invalid",
+                    not terminal_resolution_ledger_valid,
+                ),
+            )
+            if active
+        ]
+    elif isinstance(raw_execution_blockers, (list, tuple)):
+        execution_blockers = list(raw_execution_blockers)
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    if execution_blockers != [
+        code for code in _SIDEBAR_EXECUTION_BLOCKER_ORDER if code in execution_blockers
+    ]:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    required_execution_blockers = {
+        code
+        for code, active in (
+            ("sidebar_failed", blocking_failed_count > 0),
+            (
+                "sidebar_terminal_resolution_mismatch",
+                ineffective_terminal_resolution_count > 0,
+            ),
+            (
+                "sidebar_terminal_resolution_ledger_invalid",
+                not terminal_resolution_ledger_valid,
+            ),
+        )
+        if active
+    }
+    if not required_execution_blockers.issubset(execution_blockers):
+        raise ConfigurationFailure("invalid_sidebar_status")
     raw_providers = raw.get("eligible_by_provider")
     providers = raw_providers if isinstance(raw_providers, Mapping) else {}
     eligible_by_provider = {
@@ -2072,6 +2352,9 @@ def _public_sidebar_status(
         degraded_reasons.append("broker_heartbeat_stale")
     if overdue_work:
         degraded_reasons.append("oldest_pending_stale")
+    degraded_reasons.extend(
+        blocker for blocker in execution_blockers if blocker not in degraded_reasons
+    )
     raw_codes = raw.get("recent_error_codes")
     allowed_codes = SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
     recent_codes = (
@@ -2089,6 +2372,21 @@ def _public_sidebar_status(
         "degraded_reasons": degraded_reasons,
         "eligible_by_provider": eligible_by_provider,
         "counts": state_counts,
+        "blocking_failed_count": blocking_failed_count,
+        "terminally_resolved_failed_count": terminally_resolved_failed_count,
+        "ineffective_terminal_resolution_count": (
+            ineffective_terminal_resolution_count
+        ),
+        "terminal_resolution_ledger_valid": terminal_resolution_ledger_valid,
+        "terminal_resolutions": {
+            "total": terminal_total,
+            "effective": terminal_effective,
+            "ineffective": terminal_ineffective,
+            "by_resolution_code": {
+                SIDEBAR_TERMINAL_RESOLUTION_CODE: terminal_code_count,
+            },
+        },
+        "execution_blockers": execution_blockers,
         "oldest_pending_age_seconds": oldest_age,
         "last_heartbeat_at": heartbeat_at,
         "last_successful_heartbeat_at": heartbeat_at,
@@ -2115,10 +2413,108 @@ def _public_sidebar_execution_result(raw: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _public_sidebar_terminal_resolution_result(
+    raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    status = raw.get("status")
+    if status not in {"acknowledged", "already_acknowledged"}:
+        raise ProviderDegraded("invalid_sidebar_terminal_resolution_result")
+    if raw.get("error_code") != "native_create_ambiguous":
+        raise ProviderDegraded("invalid_sidebar_terminal_resolution_result")
+    if raw.get("resolution_code") != "native_thread_unrecoverable":
+        raise ProviderDegraded("invalid_sidebar_terminal_resolution_result")
+    return {
+        "status": status,
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_thread_unrecoverable",
+    }
+
+
+def _sidebar_terminal_evidence_digest(
+    *,
+    job: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+) -> str:
+    """Hash the exact durable snapshot and fixed provider proof, never user input."""
+
+    thread_id = job.get("codex_thread_id")
+    document = {
+        "evidence_kind": SIDEBAR_TERMINAL_EVIDENCE_KIND,
+        "evidence_version": SIDEBAR_TERMINAL_EVIDENCE_VERSION,
+        "job": {
+            key: job.get(key)
+            for key in (
+                "id",
+                "idempotency_key",
+                "source_session_id",
+                "bridge_id",
+                "state",
+                "attempts",
+                "next_attempt_at",
+                "lease_digest",
+                "lease_expires_at",
+                "completion_digest",
+                "codex_thread_id",
+                "error_code",
+                "eligible_at",
+                "created_at",
+                "updated_at",
+                "visible_at",
+            )
+        },
+        "provider_probe": [
+            {
+                "method": "thread/read",
+                "params": {"threadId": thread_id, "includeTurns": True},
+                "error": {
+                    "code": -32600,
+                    "message": f"thread not loaded: {thread_id}",
+                },
+            },
+            {
+                "method": "thread/resume",
+                "params": {"threadId": thread_id},
+                "error": {
+                    "code": -32600,
+                    "message": f"no rollout found for thread id {thread_id}",
+                },
+            },
+        ],
+        "reservation": {
+            key: reservation.get(key)
+            for key in (
+                "version",
+                "job_id",
+                "source_session_id",
+                "bridge_id",
+                "recovery_key",
+                "reserved_at",
+            )
+        },
+        "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
+    }
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _status_count(value: object) -> int:
     if type(value) is not int or value < 0:
         raise ConfigurationFailure("invalid_sidebar_status")
     return value
+
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _finite_status_number(value: object) -> float:
@@ -2207,6 +2603,18 @@ def _bounded_sidebar_limit(value: str) -> int:
     if parsed > 10:
         raise argparse.ArgumentTypeError("value must be at most 10")
     return parsed
+
+
+def _sidebar_terminal_job_id(value: str) -> str:
+    if re.fullmatch(r"sidebar-job:[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("invalid sidebar job ID")
+    return value
+
+
+def _sidebar_terminal_thread_id(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", value) is None:
+        raise argparse.ArgumentTypeError("invalid Codex thread ID")
+    return value
 
 
 def _bounded_claude_visibility_limit(value: str) -> int:

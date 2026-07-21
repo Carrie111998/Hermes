@@ -12,6 +12,7 @@ EXPECTED_BRIDGE_TABLES = {
     "session_links",
     "session_mirror_jobs",
     "session_sidebar_jobs",
+    "session_sidebar_terminal_resolutions",
     "session_context_packs",
     "session_bridge_state",
 }
@@ -70,6 +71,9 @@ EXPECTED_BRIDGE_FOREIGN_KEYS = {
     },
     "session_sidebar_jobs": {
         ("source_session_id", "sessions", "id", "NO ACTION"),
+    },
+    "session_sidebar_terminal_resolutions": {
+        ("job_id", "session_sidebar_jobs", "id", "RESTRICT"),
     },
     "session_context_packs": {
         ("source_session_id", "sessions", "id", "NO ACTION"),

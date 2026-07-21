@@ -25,6 +25,12 @@ from .store import SIDEBAR_FATAL_ERRORS, SIDEBAR_RETRYABLE_ERRORS, SessionBridge
 
 
 _PROCESS_DELIVERY_LOCK = threading.Lock()
+_SIDEBAR_EXECUTION_BLOCKER_ORDER = (
+    "sidebar_failed",
+    "sidebar_terminal_resolution_mismatch",
+    "sidebar_terminal_resolution_ledger_invalid",
+    "unknown_retry_code",
+)
 _SIGNED_MARKER_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
     r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
@@ -1047,15 +1053,12 @@ class SidebarExecutor:
                 status="unsettled",
                 error_code="bridge_temporarily_unavailable",
             )
-        valid_blocker_sets = (
-            (),
-            ("sidebar_failed",),
-            ("unknown_retry_code",),
-            ("sidebar_failed", "unknown_retry_code"),
-        )
         if (
             not isinstance(blockers, tuple)
-            or blockers not in valid_blocker_sets
+            or blockers
+            != tuple(
+                code for code in _SIDEBAR_EXECUTION_BLOCKER_ORDER if code in blockers
+            )
             or not isinstance(active_lease, bool)
         ):
             return SidebarExecutionResult(

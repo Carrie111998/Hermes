@@ -93,7 +93,7 @@ def _enqueue_claude_visibility_job(
     )
 
 
-def test_fresh_schema_has_current_version_and_sidebar_exclusions_table(db) -> None:
+def test_fresh_schema_has_current_version_and_sidebar_terminal_ledger(db) -> None:
     assert _rows(db, "SELECT version FROM schema_version") == [
         {"version": SCHEMA_VERSION}
     ]
@@ -102,6 +102,150 @@ def test_fresh_schema_has_current_version_and_sidebar_exclusions_table(db) -> No
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
         ("session_sidebar_exclusions",),
     ) == [{"name": "session_sidebar_exclusions"}]
+    assert _rows(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_sidebar_terminal_resolutions",),
+    ) == [{"name": "session_sidebar_terminal_resolutions"}]
+    assert [
+        row["name"]
+        for row in _rows(
+            db, 'PRAGMA table_info("session_sidebar_terminal_resolutions")'
+        )
+    ] == [
+        "job_id",
+        "idempotency_key",
+        "source_session_id",
+        "bridge_id",
+        "codex_thread_id",
+        "failure_state",
+        "failure_code",
+        "failure_attempts",
+        "failure_next_attempt_at",
+        "failure_updated_at",
+        "resolution_code",
+        "evidence_kind",
+        "evidence_version",
+        "evidence_digest",
+        "resolved_at",
+    ]
+    foreign_keys = _rows(
+        db, 'PRAGMA foreign_key_list("session_sidebar_terminal_resolutions")'
+    )
+    assert len(foreign_keys) == 1
+    assert foreign_keys[0]["table"] == "session_sidebar_jobs"
+    assert foreign_keys[0]["from"] == "job_id"
+    assert foreign_keys[0]["to"] == "id"
+    assert foreign_keys[0]["on_update"] == "RESTRICT"
+    assert foreign_keys[0]["on_delete"] == "RESTRICT"
+    assert {
+        ("job_id",),
+        ("idempotency_key",),
+        ("source_session_id",),
+        ("bridge_id",),
+        ("codex_thread_id",),
+    } <= _unique_column_sets(db, "session_sidebar_terminal_resolutions")
+    table_sql = _rows(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_sidebar_terminal_resolutions",),
+    )[0]["sql"]
+    normalized = " ".join(table_sql.split())
+    for required in (
+        "failure_state = 'sidebar_failed'",
+        "failure_code = 'native_create_ambiguous'",
+        "failure_attempts >= 0",
+        "resolution_code = 'native_thread_unrecoverable'",
+        "evidence_kind = 'codex_app_server_read_not_loaded_resume_no_rollout'",
+        "evidence_version = 1",
+        "length(evidence_digest) = 64",
+        "evidence_digest NOT GLOB '*[^0-9a-f]*'",
+    ):
+        assert required in normalized
+    assert {
+        row["name"]
+        for row in _rows(
+            db,
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'session_sidebar_terminal_resolutions'",
+        )
+    } == {
+        "trg_session_sidebar_terminal_resolutions_no_replacement",
+        "trg_session_sidebar_terminal_resolutions_no_update",
+        "trg_session_sidebar_terminal_resolutions_no_delete",
+    }
+
+
+def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
+    tmp_path,
+) -> None:
+    path = tmp_path / "existing-current.db"
+    first = SessionDB(path)
+    try:
+        first.ensure_session("hermes:existing-terminal-ledger", source="cli")
+        store = SessionBridgeStore(first)
+        queued = store.enqueue_sidebar_job(
+            SidebarCandidate(
+                source_session_id="hermes:existing-terminal-ledger",
+                provider=Provider.HERMES,
+                bridge_id=sidebar_bridge_id("hermes:existing-terminal-ledger"),
+                title="[Hermes] existing database",
+                cwd=str(tmp_path),
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+                eligible_at=100.0,
+            )
+        )
+        before = _rows(
+            first,
+            "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+            (queued["id"],),
+        )
+        assert _rows(first, "SELECT version FROM schema_version") == [
+            {"version": SCHEMA_VERSION}
+        ]
+    finally:
+        first.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE session_sidebar_terminal_resolutions")
+        connection.commit()
+    finally:
+        connection.close()
+
+    for _ in range(2):
+        reopened = SessionDB(path)
+        try:
+            assert _rows(reopened, "SELECT version FROM schema_version") == [
+                {"version": SCHEMA_VERSION}
+            ]
+            assert _rows(
+                reopened,
+                "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                (queued["id"],),
+            ) == before
+            assert _rows(
+                reopened,
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("session_sidebar_terminal_resolutions",),
+            ) == [{"name": "session_sidebar_terminal_resolutions"}]
+            assert {
+                row["name"]
+                for row in _rows(
+                    reopened,
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND tbl_name = 'session_sidebar_terminal_resolutions'",
+                )
+            } == {
+                "trg_session_sidebar_terminal_resolutions_no_replacement",
+                "trg_session_sidebar_terminal_resolutions_no_update",
+                "trg_session_sidebar_terminal_resolutions_no_delete",
+            }
+        finally:
+            reopened.close()
 
 
 _CLAUDE_VISIBILITY_JOB_COLUMNS = [
@@ -4018,6 +4162,58 @@ def _token_factory(*tokens: str):
     return lambda: next(iterator)
 
 
+def _failed_bound_ambiguous_sidebar(
+    db: SessionDB,
+    *,
+    native_id: str,
+    token: str,
+    thread_id: str,
+) -> tuple[SessionBridgeStore, SidebarCandidate, dict[str, object], dict[str, object]]:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(token, f"{token}-next"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=native_id)
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=f"hermes-session-bridge-create-v1:{native_id}",
+        now=110.0,
+    )
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=150.0,
+    )
+    return store, candidate, failed, reservation
+
+
+def _acknowledge_terminal_resolution(
+    store: SessionBridgeStore,
+    failed: dict[str, object],
+    *,
+    evidence_digest: str = "e" * 64,
+    now: float = 200.0,
+) -> dict[str, object]:
+    return store.acknowledge_sidebar_terminal_resolution(
+        job_id=failed["id"],
+        codex_thread_id=failed["codex_thread_id"],
+        expected_error_code=failed["error_code"],
+        expected_attempts=failed["attempts"],
+        expected_next_attempt_at=failed["next_attempt_at"],
+        expected_updated_at=failed["updated_at"],
+        evidence_digest=evidence_digest,
+        now=now,
+    )
+
+
 def _seed_sidebar_codex_target(
     store: SessionBridgeStore,
     candidate: SidebarCandidate,
@@ -4676,6 +4872,438 @@ def test_sidebar_execution_blockers_report_any_failed_row(db) -> None:
     )
 
     assert store.sidebar_execution_blockers() == ("sidebar_failed",)
+
+
+def test_sidebar_terminal_resolution_is_append_only_and_unblocks_unrelated_work(
+    db,
+) -> None:
+    store, candidate, failed, reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-resolution",
+        token="terminal-resolution-token",
+        thread_id="019f-terminal-resolution-thread",
+    )
+    before_job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    before_reservation = store.get_sidebar_create_reservation(
+        candidate.source_session_id
+    )
+    pending = _sidebar_candidate(db, native_id="terminal-resolution-pending")
+    store.enqueue_sidebar_job(pending)
+
+    resolved = _acknowledge_terminal_resolution(store, failed)
+
+    assert resolved == {
+        "job_id": failed["id"],
+        "state": SidebarJobState.FAILED.value,
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_thread_unrecoverable",
+        "created": True,
+    }
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+    assert (
+        store.get_sidebar_create_reservation(candidate.source_session_id)
+        == before_reservation
+        == reservation
+    )
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == [
+        {
+            "job_id": failed["id"],
+            "idempotency_key": failed["idempotency_key"],
+            "source_session_id": candidate.source_session_id,
+            "bridge_id": candidate.bridge_id,
+            "codex_thread_id": "019f-terminal-resolution-thread",
+            "failure_state": SidebarJobState.FAILED.value,
+            "failure_code": "native_create_ambiguous",
+            "failure_attempts": failed["attempts"],
+            "failure_next_attempt_at": failed["next_attempt_at"],
+            "failure_updated_at": failed["updated_at"],
+            "resolution_code": "native_thread_unrecoverable",
+            "evidence_kind": (
+                "codex_app_server_read_not_loaded_resume_no_rollout"
+            ),
+            "evidence_version": 1,
+            "evidence_digest": "e" * 64,
+            "resolved_at": 200.0,
+        }
+    ]
+    assert _rows(db, "SELECT * FROM session_sidebar_exclusions") == []
+    assert _rows(
+        db,
+        "SELECT * FROM session_links WHERE bridge_id = ?",
+        (candidate.bridge_id,),
+    ) == []
+    assert _rows(
+        db,
+        "SELECT * FROM external_sessions WHERE provider = 'codex' AND native_id = ?",
+        (failed["codex_thread_id"],),
+    ) == []
+    assert store.sidebar_execution_blockers() == ()
+    claimed = store.claim_sidebar_jobs(now=200.0, limit=1)
+    assert [row["source_session_id"] for row in claimed] == [
+        pending.source_session_id
+    ]
+    assert store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+
+    status = store.sidebar_delivery_status(now=200.0)
+    assert status["counts"][SidebarJobState.FAILED.value] == 1
+    assert status["blocking_failed_count"] == 0
+    assert status["terminally_resolved_failed_count"] == 1
+    assert status["terminal_resolutions"] == {
+        "total": 1,
+        "effective": 1,
+        "ineffective": 0,
+        "by_resolution_code": {"native_thread_unrecoverable": 1},
+    }
+    assert status["execution_blockers"] == []
+
+
+def test_sidebar_terminal_resolution_replay_is_idempotent_and_conflicts_fail_closed(
+    db,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-replay",
+        token="terminal-replay-token",
+        thread_id="019f-terminal-replay-thread",
+    )
+
+    first = _acknowledge_terminal_resolution(store, failed, now=200.0)
+    replay = _acknowledge_terminal_resolution(store, failed, now=300.0)
+
+    assert replay == {**first, "created": False}
+    assert _rows(
+        db,
+        "SELECT evidence_digest, resolved_at "
+        "FROM session_sidebar_terminal_resolutions",
+    ) == [{"evidence_digest": "e" * 64, "resolved_at": 200.0}]
+    with pytest.raises(ValueError, match="terminal resolution"):
+        _acknowledge_terminal_resolution(
+            store,
+            failed,
+            evidence_digest="f" * 64,
+            now=400.0,
+        )
+
+
+def test_sidebar_terminal_resolution_ledger_rows_cannot_be_changed_or_deleted(
+    db,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-immutable",
+        token="terminal-immutable-token",
+        thread_id="019f-terminal-immutable-thread",
+    )
+    _acknowledge_terminal_resolution(store, failed)
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_sidebar_terminal_resolutions SET resolved_at = 300"
+            )
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM session_sidebar_terminal_resolutions"
+            )
+        )
+    existing = _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions")[0]
+    replacement = {**existing, "evidence_digest": "f" * 64, "resolved_at": 300.0}
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                """INSERT OR REPLACE INTO session_sidebar_terminal_resolutions (
+                       job_id, idempotency_key, source_session_id, bridge_id,
+                       codex_thread_id, failure_state, failure_code,
+                       failure_attempts, failure_next_attempt_at,
+                       failure_updated_at, resolution_code, evidence_kind,
+                       evidence_version, evidence_digest, resolved_at
+                   ) VALUES (
+                       :job_id, :idempotency_key, :source_session_id, :bridge_id,
+                       :codex_thread_id, :failure_state, :failure_code,
+                       :failure_attempts, :failure_next_attempt_at,
+                       :failure_updated_at, :resolution_code, :evidence_kind,
+                       :evidence_version, :evidence_digest, :resolved_at
+                   )""",
+                replacement,
+            )
+        )
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == [
+        existing
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parameter", "replacement"),
+    (
+        ("job_id", "sidebar-job:" + "0" * 64),
+        ("codex_thread_id", "019f-wrong-terminal-thread"),
+        ("expected_error_code", "marker_conflict"),
+        ("expected_attempts", 1),
+        ("expected_next_attempt_at", 151.0),
+        ("expected_updated_at", 151.0),
+        ("evidence_digest", "INVALID"),
+    ),
+)
+def test_sidebar_terminal_resolution_cas_rejects_every_expected_snapshot_mismatch(
+    db,
+    parameter: str,
+    replacement: object,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id=f"terminal-cas-{parameter}",
+        token=f"terminal-cas-{parameter}-token",
+        thread_id=f"019f-terminal-cas-{parameter}",
+    )
+    arguments = {
+        "job_id": failed["id"],
+        "codex_thread_id": failed["codex_thread_id"],
+        "expected_error_code": failed["error_code"],
+        "expected_attempts": failed["attempts"],
+        "expected_next_attempt_at": failed["next_attempt_at"],
+        "expected_updated_at": failed["updated_at"],
+        "evidence_digest": "e" * 64,
+        "now": 200.0,
+    }
+    arguments[parameter] = replacement
+
+    with pytest.raises(ValueError):
+        store.acknowledge_sidebar_terminal_resolution(**arguments)
+
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
+    assert store.sidebar_execution_blockers() == ("sidebar_failed",)
+
+
+@pytest.mark.parametrize("materialization", ("external", "lineage"))
+def test_sidebar_terminal_resolution_becomes_ineffective_after_materialization(
+    db,
+    materialization: str,
+) -> None:
+    store, candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id=f"terminal-materialized-{materialization}",
+        token=f"terminal-materialized-{materialization}-token",
+        thread_id=f"019f-terminal-materialized-{materialization}",
+    )
+    _acknowledge_terminal_resolution(store, failed)
+    assert store.sidebar_execution_blockers() == ()
+
+    if materialization == "external":
+        _seed_sidebar_codex_target(
+            store,
+            candidate,
+            failed["codex_thread_id"],
+        )
+    else:
+        target_session_id = f"codex:terminal-lineage-{materialization}"
+        db.ensure_session(target_session_id, source="codex")
+        store.create_link(
+            SessionLink(
+                id=f"terminal-lineage-{materialization}",
+                from_session_id=candidate.source_session_id,
+                to_session_id=target_session_id,
+                relation=Relation.MIRRORS,
+                bridge_id=candidate.bridge_id,
+                source_cursor=None,
+                source_hash=None,
+                created_at=210.0,
+            )
+        )
+
+    assert store.sidebar_execution_blockers() == (
+        "sidebar_failed",
+        "sidebar_terminal_resolution_mismatch",
+    )
+    status = store.sidebar_delivery_status(now=220.0)
+    assert status["blocking_failed_count"] == 1
+    assert status["terminally_resolved_failed_count"] == 0
+    assert status["terminal_resolutions"] == {
+        "total": 1,
+        "effective": 0,
+        "ineffective": 1,
+        "by_resolution_code": {"native_thread_unrecoverable": 0},
+    }
+    with pytest.raises(ValueError, match="terminal resolution"):
+        _acknowledge_terminal_resolution(store, failed, now=230.0)
+
+
+@pytest.mark.parametrize(
+    "ledger_shape", ("missing", "malformed", "missing_immutable_trigger")
+)
+def test_sidebar_terminal_resolution_ledger_failure_is_fail_closed(
+    db,
+    ledger_shape: str,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id=f"terminal-ledger-{ledger_shape}",
+        token=f"terminal-ledger-{ledger_shape}-token",
+        thread_id=f"019f-terminal-ledger-{ledger_shape}",
+    )
+    _acknowledge_terminal_resolution(store, failed)
+
+    def _break_ledger(conn: sqlite3.Connection) -> None:
+        conn.execute("DROP TRIGGER trg_session_sidebar_terminal_resolutions_no_update")
+        if ledger_shape == "missing_immutable_trigger":
+            return
+        conn.execute("DROP TRIGGER trg_session_sidebar_terminal_resolutions_no_delete")
+        conn.execute("DROP TABLE session_sidebar_terminal_resolutions")
+        if ledger_shape == "malformed":
+            conn.execute(
+                "CREATE TABLE session_sidebar_terminal_resolutions (job_id TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO session_sidebar_terminal_resolutions (job_id) VALUES (?)",
+                (failed["id"],),
+            )
+
+    db._execute_write(_break_ledger)
+
+    assert store.sidebar_execution_blockers() == (
+        "sidebar_failed",
+        "sidebar_terminal_resolution_ledger_invalid",
+    )
+    assert store.claim_sidebar_jobs(now=300.0, limit=1) == []
+    status = store.sidebar_delivery_status(now=300.0)
+    assert status["blocking_failed_count"] == 1
+    assert status["terminally_resolved_failed_count"] == 0
+    assert status["terminal_resolutions"]["effective"] == 0
+    assert status["terminal_resolution_ledger_valid"] is False
+
+
+def test_sidebar_terminal_resolution_refuses_an_unprotected_ledger(db) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-ledger-unprotected-write",
+        token="terminal-ledger-unprotected-write-token",
+        thread_id="019f-terminal-ledger-unprotected-write",
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "DROP TRIGGER trg_session_sidebar_terminal_resolutions_no_update"
+        )
+    )
+
+    with pytest.raises(ValueError, match="terminal resolution ledger"):
+        _acknowledge_terminal_resolution(store, failed)
+
+    assert _rows(db, "SELECT * FROM session_sidebar_terminal_resolutions") == []
+    assert store.sidebar_execution_blockers() == (
+        "sidebar_failed",
+        "sidebar_terminal_resolution_ledger_invalid",
+    )
+
+
+def test_sidebar_terminal_resolution_concurrent_replay_converges_once(tmp_path) -> None:
+    path = tmp_path / "terminal-concurrent.db"
+    seed_db = SessionDB(path)
+    seed_store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        seed_db,
+        native_id="terminal-concurrent",
+        token="terminal-concurrent-token",
+        thread_id="019f-terminal-concurrent",
+    )
+    del seed_store
+    seed_db.close()
+    first_db = SessionDB(path)
+    second_db = SessionDB(path)
+    try:
+        stores = (SessionBridgeStore(first_db), SessionBridgeStore(second_db))
+        barrier = Barrier(2)
+
+        def resolve(store: SessionBridgeStore) -> dict[str, object]:
+            barrier.wait()
+            return _acknowledge_terminal_resolution(store, failed)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(resolve, stores))
+
+        assert sorted(result["created"] for result in results) == [False, True]
+        assert len(
+            _rows(first_db, "SELECT * FROM session_sidebar_terminal_resolutions")
+        ) == 1
+    finally:
+        first_db.close()
+        second_db.close()
+
+
+def test_sidebar_retry_rejects_any_job_with_terminal_resolution_history(db) -> None:
+    store, candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-retry-defense",
+        token="terminal-retry-defense-token",
+        thread_id="019f-terminal-retry-defense",
+    )
+    _acknowledge_terminal_resolution(store, failed)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET codex_thread_id = NULL "
+            "WHERE id = ?",
+            (failed["id"],),
+        )
+    )
+
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="native_create_ambiguous",
+            now=300.0,
+        )
+
+    row = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert row is not None
+    assert row["state"] == SidebarJobState.FAILED.value
+    assert row["error_code"] == "native_create_ambiguous"
+
+
+@pytest.mark.parametrize(
+    ("mutation_sql", "expected_blockers", "expected_blocking_failed"),
+    (
+        (
+            "UPDATE session_sidebar_jobs SET state = 'sidebar_pending' WHERE id = ?",
+            ("sidebar_terminal_resolution_mismatch",),
+            0,
+        ),
+        (
+            "UPDATE session_sidebar_jobs SET updated_at = updated_at + 1 WHERE id = ?",
+            ("sidebar_failed", "sidebar_terminal_resolution_mismatch"),
+            1,
+        ),
+    ),
+)
+def test_sidebar_terminal_resolution_snapshot_drift_is_an_explicit_blocker(
+    db,
+    mutation_sql: str,
+    expected_blockers: tuple[str, ...],
+    expected_blocking_failed: int,
+) -> None:
+    store, _candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="terminal-snapshot-drift",
+        token="terminal-snapshot-drift-token",
+        thread_id="019f-terminal-snapshot-drift",
+    )
+    _acknowledge_terminal_resolution(store, failed)
+    db._execute_write(
+        lambda conn: conn.execute(mutation_sql, (failed["id"],))
+    )
+
+    assert store.sidebar_execution_blockers() == expected_blockers
+    status = store.sidebar_delivery_status(now=300.0)
+    assert status["blocking_failed_count"] == expected_blocking_failed
+    assert status["terminally_resolved_failed_count"] == 0
+    assert status["ineffective_terminal_resolution_count"] == 1
+    assert status["terminal_resolutions"] == {
+        "total": 1,
+        "effective": 0,
+        "ineffective": 1,
+        "by_resolution_code": {"native_thread_unrecoverable": 0},
+    }
+    assert status["execution_blockers"] == list(expected_blockers)
+    with pytest.raises(ValueError, match="terminal resolution"):
+        _acknowledge_terminal_resolution(store, failed, now=310.0)
 
 
 def test_sidebar_execution_blockers_report_unknown_retry_code(db) -> None:

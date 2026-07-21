@@ -1669,6 +1669,12 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
     assert set(sidebar) == {
         "eligible_by_provider",
         "counts",
+        "blocking_failed_count",
+        "terminally_resolved_failed_count",
+        "ineffective_terminal_resolution_count",
+        "terminal_resolution_ledger_valid",
+        "terminal_resolutions",
+        "execution_blockers",
         "oldest_pending_age_seconds",
         "last_heartbeat_at",
         "last_visible_task_id",
@@ -1677,6 +1683,17 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
     }
     assert sidebar["eligible_by_provider"] == {"claude": 1, "hermes": 0}
     assert sidebar["counts"]["sidebar_pending"] == 1
+    assert sidebar["blocking_failed_count"] == 0
+    assert sidebar["terminally_resolved_failed_count"] == 0
+    assert sidebar["ineffective_terminal_resolution_count"] == 0
+    assert sidebar["terminal_resolution_ledger_valid"] is True
+    assert sidebar["terminal_resolutions"] == {
+        "total": 0,
+        "effective": 0,
+        "ineffective": 0,
+        "by_resolution_code": {"native_thread_unrecoverable": 0},
+    }
+    assert sidebar["execution_blockers"] == []
     assert sidebar["last_heartbeat_at"] is not None
     assert sidebar["recent_error_codes"] == []
     assert sidebar["delivery_latency_seconds"] == {

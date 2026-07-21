@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from agent.transports.codex_app_server import CodexAppServerError
+
 # The canonical runner uses ``env -i``. Windows' stdlib ignores HOME and needs
 # USERPROFILE for ``Path.home()`` during imported-module initialization.
 if os.name == "nt" and "USERPROFILE" not in os.environ:
@@ -104,6 +106,13 @@ class FakeBackend:
             "error_code": None,
         }
     )
+    sidebar_terminal_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_thread_unrecoverable",
+        }
+    )
     claude_visibility_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "enabled": False,
@@ -165,6 +174,23 @@ class FakeBackend:
     def sidebar_run_once(self) -> dict[str, Any]:
         self.calls.append(("sidebar_run_once",))
         return dict(self.sidebar_run_payload)
+
+    def sidebar_acknowledge_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            (
+                "sidebar_acknowledge_unrecoverable",
+                job_id,
+                codex_thread_id,
+                expected_error_code,
+            )
+        )
+        return dict(self.sidebar_terminal_payload)
 
     def claude_visibility_status(self) -> dict[str, Any]:
         self.calls.append(("claude_visibility_status",))
@@ -428,6 +454,346 @@ def test_sidebar_run_once_rejects_a_nonfixed_error_code_without_rendering_it(
     assert private_error not in rendered
 
 
+def test_sidebar_terminal_acknowledgement_requires_exact_operator_authority_and_sanitizes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "a" * 64
+    thread_id = "019f-operator-terminal-thread"
+    backend = FakeBackend(
+        sidebar_terminal_payload={
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_thread_unrecoverable",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "evidence_digest": "e" * 64,
+            "private_detail": "C:/private/provider-detail",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-acknowledge-unrecoverable",
+                "--job-id",
+                job_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "native_create_ambiguous",
+                "--confirm",
+                "native-thread-unrecoverable",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_acknowledge_unrecoverable",
+            job_id,
+            thread_id,
+            "native_create_ambiguous",
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "acknowledged",
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_thread_unrecoverable",
+    }
+    for private in (job_id, thread_id, "e" * 64, "private/provider-detail"):
+        assert private not in rendered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        [
+            "sidebar-acknowledge-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--codex-thread-id",
+            "019f-terminal-thread",
+            "--expected-error-code",
+            "native_create_ambiguous",
+        ],
+        [
+            "sidebar-acknowledge-unrecoverable",
+            "--job-id",
+            "not-a-full-job-id",
+            "--codex-thread-id",
+            "019f-terminal-thread",
+            "--expected-error-code",
+            "native_create_ambiguous",
+            "--confirm",
+            "native-thread-unrecoverable",
+        ],
+        [
+            "sidebar-acknowledge-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--codex-thread-id",
+            "019f-terminal-thread",
+            "--expected-error-code",
+            "marker_conflict",
+            "--confirm",
+            "native-thread-unrecoverable",
+        ],
+    ),
+)
+def test_sidebar_terminal_acknowledgement_parser_rejects_incomplete_authority(
+    argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
+class _TerminalProbeClient:
+    def __init__(self, *, scenario: str, thread_id: str) -> None:
+        self.scenario = scenario
+        self.thread_id = thread_id
+        self._initialized = False
+        self.initialize_calls = 0
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.closed = False
+
+    def initialize(self, *, timeout: float, **kwargs: object) -> dict[str, object]:
+        assert timeout > 0
+        assert kwargs == {"capabilities": {"experimentalApi": True}}
+        self.initialize_calls += 1
+        self._initialized = True
+        return {}
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, object]:
+        assert timeout > 0
+        exact_params = dict(params or {})
+        self.calls.append((method, exact_params))
+        assert exact_params["threadId"] == self.thread_id
+        if method == "thread/read":
+            assert exact_params == {
+                "threadId": self.thread_id,
+                "includeTurns": True,
+            }
+            if self.scenario in {"unrecoverable", "resume_transient"}:
+                raise CodexAppServerError(
+                    code=-32600,
+                    message=f"thread not loaded: {self.thread_id}",
+                )
+            if self.scenario == "read_transient":
+                raise TimeoutError("private provider timeout")
+            observed = (
+                "019f-different-thread"
+                if self.scenario == "malformed"
+                else self.thread_id
+            )
+            return {
+                "thread": {
+                    "id": observed,
+                    "cwd": "C:/workspace/project",
+                    "turns": [],
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "thread/resume":
+            assert exact_params == {"threadId": self.thread_id}
+            if self.scenario == "resume_transient":
+                raise TimeoutError("private resume timeout")
+            if self.scenario == "unrecoverable":
+                raise CodexAppServerError(
+                    code=-32600,
+                    message=f"no rollout found for thread id {self.thread_id}",
+                )
+        raise AssertionError(f"forbidden provider method: {method}")
+
+    def close(self, timeout: float = 3.0) -> None:
+        del timeout
+        self.closed = True
+
+
+def _production_terminal_resolution_backend(
+    tmp_path: Path,
+    *,
+    scenario: str,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+    _TerminalProbeClient,
+]:
+    db = SessionDB(tmp_path / f"terminal-{scenario}.db")
+    tokens = iter((f"terminal-{scenario}-lease",))
+    store = SessionBridgeStore(db, sidebar_token_factory=lambda: next(tokens))
+    source_session_id = f"hermes:terminal-{scenario}"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] terminal evidence",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=f"hermes-session-bridge-create-v1:terminal-{scenario}",
+        now=110.0,
+    )
+    thread_id = f"019f-terminal-provider-{scenario}"
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=150.0,
+    )
+    client = _TerminalProbeClient(scenario=scenario, thread_id=thread_id)
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    return backend, store, failed, reservation, client
+
+
+def test_production_terminal_acknowledgement_derives_exact_evidence_and_replays(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation, client = (
+        _production_terminal_resolution_backend(tmp_path, scenario="unrecoverable")
+    )
+    source_session_id = failed["source_session_id"]
+    before_job = store.get_sidebar_job_for_source(source_session_id)
+    before_reservation = store.get_sidebar_create_reservation(source_session_id)
+    try:
+        first = backend.sidebar_acknowledge_unrecoverable(
+            job_id=failed["id"],
+            codex_thread_id=failed["codex_thread_id"],
+            expected_error_code="native_create_ambiguous",
+        )
+        replay = backend.sidebar_acknowledge_unrecoverable(
+            job_id=failed["id"],
+            codex_thread_id=failed["codex_thread_id"],
+            expected_error_code="native_create_ambiguous",
+        )
+
+        assert first == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_thread_unrecoverable",
+        }
+        assert replay == {**first, "status": "already_acknowledged"}
+        assert store.get_sidebar_job_for_source(source_session_id) == before_job
+        assert (
+            store.get_sidebar_create_reservation(source_session_id)
+            == before_reservation
+            == reservation
+        )
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_terminal_resolutions"
+        ).fetchall()
+        assert len(audit["evidence_digest"]) == 64
+        assert set(audit["evidence_digest"]) <= set("0123456789abcdef")
+        assert audit["codex_thread_id"] == failed["codex_thread_id"]
+        assert client.initialize_calls == 1
+        assert [method for method, _params in client.calls] == [
+            "thread/read",
+            "thread/resume",
+            "thread/read",
+            "thread/resume",
+        ]
+    finally:
+        backend.close()
+    assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_methods", "expected_exception"),
+    (
+        ("materialized", ["thread/read"], RolloutGateBlocked),
+        ("read_transient", ["thread/read"], ProviderDegraded),
+        ("resume_transient", ["thread/read", "thread/resume"], ProviderDegraded),
+        ("malformed", ["thread/read"], ProviderDegraded),
+    ),
+)
+def test_production_terminal_acknowledgement_never_writes_without_exact_evidence(
+    tmp_path: Path,
+    scenario: str,
+    expected_methods: list[str],
+    expected_exception: type[Exception],
+) -> None:
+    backend, store, failed, _reservation, client = (
+        _production_terminal_resolution_backend(tmp_path, scenario=scenario)
+    )
+    before = store.get_sidebar_job_for_source(failed["source_session_id"])
+    try:
+        with pytest.raises(expected_exception):
+            backend.sidebar_acknowledge_unrecoverable(
+                job_id=failed["id"],
+                codex_thread_id=failed["codex_thread_id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert [method for method, _params in client.calls] == expected_methods
+        assert store.get_sidebar_job_for_source(failed["source_session_id"]) == before
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_terminal_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+def test_production_terminal_acknowledgement_rejects_noncanonical_job_before_probe(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, _reservation, client = (
+        _production_terminal_resolution_backend(tmp_path, scenario="unrecoverable")
+    )
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET idempotency_key = ? WHERE id = ?",
+            ("corrupt-terminal-idempotency", failed["id"]),
+        )
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked, match="sidebar_terminal_snapshot_mismatch"
+        ):
+            backend.sidebar_acknowledge_unrecoverable(
+                job_id=failed["id"],
+                codex_thread_id=failed["codex_thread_id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert client.calls == []
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_terminal_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
 def test_claude_visibility_exact_commands_route_with_safe_defaults(capsys) -> None:
     backend = FakeBackend()
 
@@ -688,6 +1054,100 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
         "delivery_latency_seconds": {},
     })
     assert fresh_pending.sidebar_status()["healthy"] is True
+
+
+def test_sidebar_status_preserves_raw_failures_but_waives_exact_terminal_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {"native_thread_unrecoverable": 1},
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["degraded_reasons"] == []
+    assert status["counts"]["sidebar_failed"] == 1
+    assert status["blocking_failed_count"] == 0
+    assert status["terminally_resolved_failed_count"] == 1
+    assert status["ineffective_terminal_resolution_count"] == 0
+    assert status["terminal_resolution_ledger_valid"] is True
+    assert status["terminal_resolutions"] == {
+        "total": 1,
+        "effective": 1,
+        "ineffective": 0,
+        "by_resolution_code": {"native_thread_unrecoverable": 1},
+    }
+    assert status["execution_blockers"] == []
+
+
+@pytest.mark.parametrize(
+    ("ledger_valid", "ineffective", "blockers"),
+    (
+        (
+            True,
+            1,
+            ["sidebar_failed", "sidebar_terminal_resolution_mismatch"],
+        ),
+        (
+            False,
+            0,
+            ["sidebar_failed", "sidebar_terminal_resolution_ledger_invalid"],
+        ),
+    ),
+)
+def test_sidebar_status_fails_closed_for_ineffective_or_invalid_terminal_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_valid: bool,
+    ineffective: int,
+    blockers: list[str],
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 1,
+        "terminally_resolved_failed_count": 0,
+        "ineffective_terminal_resolution_count": ineffective,
+        "terminal_resolution_ledger_valid": ledger_valid,
+        "terminal_resolutions": {
+            "total": ineffective,
+            "effective": 0,
+            "ineffective": ineffective,
+            "by_resolution_code": {"native_thread_unrecoverable": 0},
+        },
+        "execution_blockers": blockers,
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is False
+    assert status["degraded_reasons"] == blockers
+    assert status["execution_blockers"] == blockers
+    assert status["counts"]["sidebar_failed"] == 1
 
 
 def test_sidebar_status_preserves_exclusion_count_without_degradation(

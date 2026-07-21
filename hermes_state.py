@@ -1014,6 +1014,58 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     )
 );
 
+CREATE TABLE IF NOT EXISTS session_sidebar_terminal_resolutions (
+    job_id TEXT PRIMARY KEY
+        REFERENCES session_sidebar_jobs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL UNIQUE,
+    bridge_id TEXT NOT NULL UNIQUE,
+    codex_thread_id TEXT NOT NULL UNIQUE,
+    failure_state TEXT NOT NULL CHECK (failure_state = 'sidebar_failed'),
+    failure_code TEXT NOT NULL CHECK (failure_code = 'native_create_ambiguous'),
+    failure_attempts INTEGER NOT NULL CHECK (failure_attempts >= 0),
+    failure_next_attempt_at REAL NOT NULL,
+    failure_updated_at REAL NOT NULL,
+    resolution_code TEXT NOT NULL CHECK (
+        resolution_code = 'native_thread_unrecoverable'
+    ),
+    evidence_kind TEXT NOT NULL CHECK (
+        evidence_kind = 'codex_app_server_read_not_loaded_resume_no_rollout'
+    ),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    resolved_at REAL NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_replacement
+BEFORE INSERT ON session_sidebar_terminal_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_terminal_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+        OR existing.codex_thread_id = NEW.codex_thread_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_update
+BEFORE UPDATE ON session_sidebar_terminal_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_delete
+BEFORE DELETE ON session_sidebar_terminal_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions are immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     id TEXT PRIMARY KEY,
     source_session_id TEXT NOT NULL UNIQUE,

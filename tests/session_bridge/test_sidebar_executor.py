@@ -1274,7 +1274,15 @@ def test_cross_process_lock_contention_is_degraded_and_never_claims() -> None:
     assert store.jobs == [_job(SOURCE_1)]
 
 
-@pytest.mark.parametrize("blocker", ["sidebar_failed", "unknown_retry_code"])
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "sidebar_failed",
+        "sidebar_terminal_resolution_mismatch",
+        "sidebar_terminal_resolution_ledger_invalid",
+        "unknown_retry_code",
+    ],
+)
 def test_existing_hard_stop_row_prevents_claim(blocker: str) -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()

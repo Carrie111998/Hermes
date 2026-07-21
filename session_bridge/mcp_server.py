@@ -41,6 +41,7 @@ from .sidebar import (
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
+    SIDEBAR_TERMINAL_RESOLUTION_CODE,
     SessionBridgeStore,
     redact_codex_thread_id,
 )
@@ -1140,6 +1141,39 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     if type(task_id) is not str or re.fullmatch(r"task:[0-9a-f]{16}", task_id) is None:
         task_id = None
     recent = source.get("recent_error_codes")
+    failed_count = _nonnegative_status_int(
+        state_counts.get(SidebarJobState.FAILED.value), 0
+    )
+    blocking_failed_count = _nonnegative_status_int(
+        source.get("blocking_failed_count"), failed_count
+    )
+    terminally_resolved_failed_count = _nonnegative_status_int(
+        source.get("terminally_resolved_failed_count"), 0
+    )
+    ineffective_terminal_resolution_count = _nonnegative_status_int(
+        source.get("ineffective_terminal_resolution_count"), 0
+    )
+    terminal_resolution_ledger_valid = (
+        source.get("terminal_resolution_ledger_valid") is True
+    )
+    terminal_source = _status_mapping(source.get("terminal_resolutions"))
+    resolution_codes = _status_mapping(terminal_source.get("by_resolution_code"))
+    raw_blockers = source.get("execution_blockers")
+    execution_blockers = (
+        [
+            code
+            for code in _fixed_status_codes(list(raw_blockers))
+            if code
+            in {
+                "sidebar_failed",
+                "sidebar_terminal_resolution_mismatch",
+                "sidebar_terminal_resolution_ledger_invalid",
+                "unknown_retry_code",
+            }
+        ]
+        if isinstance(raw_blockers, (list, tuple))
+        else []
+    )
     return {
         "eligible_by_provider": {
             provider: _nonnegative_status_int(provider_counts.get(provider), 0)
@@ -1149,6 +1183,33 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             state.value: _nonnegative_status_int(state_counts.get(state.value), 0)
             for state in SidebarJobState
         },
+        "blocking_failed_count": blocking_failed_count,
+        "terminally_resolved_failed_count": terminally_resolved_failed_count,
+        "ineffective_terminal_resolution_count": (
+            ineffective_terminal_resolution_count
+        ),
+        "terminal_resolution_ledger_valid": terminal_resolution_ledger_valid,
+        "terminal_resolutions": {
+            "total": _nonnegative_status_int(
+                terminal_source.get("total"),
+                terminally_resolved_failed_count
+                + ineffective_terminal_resolution_count,
+            ),
+            "effective": _nonnegative_status_int(
+                terminal_source.get("effective"), terminally_resolved_failed_count
+            ),
+            "ineffective": _nonnegative_status_int(
+                terminal_source.get("ineffective"),
+                ineffective_terminal_resolution_count,
+            ),
+            "by_resolution_code": {
+                SIDEBAR_TERMINAL_RESOLUTION_CODE: _nonnegative_status_int(
+                    resolution_codes.get(SIDEBAR_TERMINAL_RESOLUTION_CODE),
+                    terminally_resolved_failed_count,
+                )
+            },
+        },
+        "execution_blockers": execution_blockers,
         "oldest_pending_age_seconds": _finite_status_number(
             source.get("oldest_pending_age_seconds")
         ),
