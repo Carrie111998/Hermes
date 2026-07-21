@@ -543,62 +543,86 @@ async def process_replay_records(
     }
 
 
+def _turn_rows(state_db: Path, *, replay_run_id: str) -> list[sqlite3.Row]:
+    if not state_db.exists():
+        return []
+    conn = sqlite3.connect(state_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list(
+            conn.execute(
+                "SELECT * FROM pa_turns WHERE replay_run_id=? ORDER BY started_at",
+                (replay_run_id,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+
 async def process_live_records(
     records: Sequence[InboxRecord],
     *,
     config_path: Path,
     state_db: Path,
 ) -> dict[str, Any]:
-    """Process live durable records sequentially with all outbound disabled.
+    """Process live durable records through the replay orchestrator.
 
-    The WhatsApp adapter is built with ``connect=False`` and therefore never
-    starts or polls the bridge.  Its existing event shaping and turn bundling
-    are reused, but the final response is deliberately not delivered.
+    This is the eval-proven machinery (turn bundling, passive-debounce parity,
+    per-run turn attribution) rather than a hand-rolled per-message path:
+
+    - ``delivery_mode="capture"``: agent responses are captured, never sent —
+      outbound remains impossible from this path regardless of trust rung.
+    - ``bypass_auth=True``: the observer/ingest scope is governed by the chat
+      allowlist + constitution selectors, NOT per-user pairing. Site workers
+      are unpaired by design; routing their group messages through the paired
+      -user auth gate silently dropped every event and produced the
+      2026-07-21 first-light no-turn crash loop.
+    - Outcome classification (activation ruling): a message a turn cites is
+      turn-produced (completed); a message the pipeline legitimately held —
+      mention-gated, debounced into a later bundle, deduped, non-content —
+      is consumed-no-turn (skipped), NOT a failure. Only genuine errors
+      (turn failed, engine mismatch, orchestrator exception) raise and mark
+      the batch failed.
     """
-    from gateway.config import Platform, PlatformConfig, load_gateway_config
+    from gateway.config import load_gateway_config
+    from gateway.replay import ReplayPlan
     from gateway.run import GatewayRunner
 
     provider, model = configured_engine(config_path)
     runner = GatewayRunner(load_gateway_config())
-    platform_config = runner.config.platforms.get(Platform.WHATSAPP)
-    if platform_config is None:
-        platform_config = PlatformConfig(enabled=True, extra={})
-    adapter, _ = await runner._build_adapter(
-        Platform.WHATSAPP, platform_config, connect=False
+    run_id = f"live-drain-{uuid.uuid4().hex[:12]}"
+    result = await runner.replay(
+        ReplayPlan(
+            platform="whatsapp",
+            messages=tuple(record.raw for record in records),
+            run_id=run_id,
+            attempt_id=f"attempt-{uuid.uuid4().hex[:12]}",
+            delivery_mode="capture",
+            bypass_require_mention=True,
+            bypass_auth=True,
+            source_path="durable-jsonl-consumer-live",
+        )
     )
-    if adapter is None:
-        raise ConsumerError("Hermes could not build the offline WhatsApp adapter")
-
     handled: list[dict[str, Any]] = []
-
-    async def _sequential(event: Any) -> None:
-        started = time.time()
-        await runner._handle_message(event)
-        row = _turn_row(state_db, started_after=started)
+    for row in _turn_rows(state_db, replay_run_id=run_id):
         turn_id = _assert_completed_turn(
             row,
             provider=provider,
             model=model,
             require_response=False,
         )
-        raw = getattr(event, "raw_message", None)
-        ids = list(raw.get("sourceMessageIds") or []) if isinstance(raw, dict) else []
-        if not ids and getattr(event, "message_id", None):
-            ids = [str(event.message_id)]
+        try:
+            refs = json.loads(row["message_refs_json"] or "[]")
+        except (TypeError, ValueError, KeyError, IndexError):
+            refs = []
+        ids = [str(ref) for ref in refs if ref]
         handled.append({"message_ids": ids, "turn_id": turn_id})
-
-    # Deliberately bypass BasePlatformAdapter.handle_message: the normal live
-    # method spawns background send tasks.  The consumer owns sequential
-    # processing and never sends a response.
-    adapter.handle_message = _sequential  # type: ignore[method-assign]
-    processed = await adapter.replay_bridge_messages(
-        [record.raw for record in records],
-        bypass_require_mention=False,
-    )
     return {
         "provider": provider,
         "model": model,
-        "processed": int(processed or 0),
+        "processed": int(result.processed or 0),
         "handled": handled,
         "outbound_sent": 0,
     }
