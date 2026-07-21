@@ -10,7 +10,6 @@ import {
   type PropsWithChildren,
   type ReactNode,
   useContext,
-  useEffect,
   useMemo,
   useRef,
   useState
@@ -40,7 +39,6 @@ import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
-import { recordPreviewArtifact } from '@/store/preview-status'
 import { sessionApprovalRequest } from '@/store/prompts'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
@@ -54,7 +52,6 @@ import {
   countDiffLineStats,
   inlineDiffFromResult,
   isFileEditTool,
-  isPreviewableTarget,
   looksRedundant,
   type SearchResultRow,
   selectMessageRunning,
@@ -385,30 +382,6 @@ function ToolEntry({ part }: ToolEntryProps) {
 
     return buildToolView(p, inlineDiff)
   }, [inlineDiff, isPending, result, stablePart])
-
-  // Surface a previewable artifact (HTML file / localhost URL) as a compact link
-  // in the composer status stack rather than a bulky inline card. Uses the same
-  // detected target the old inline card did. Idempotent + dedup'd, so re-renders
-  // don't churn.
-  const previewTarget = view.previewTarget
-  // The session whose transcript this row is IN, which is not necessarily the
-  // primary one: a tool row inside a session tile must feed that tile's composer.
-  const { $cwd: $sessionCwd, $runtimeId: $sessionRuntimeId } = useSessionView()
-
-  useEffect(() => {
-    if (isPending || !previewTarget || !isPreviewableTarget(previewTarget)) {
-      return
-    }
-
-    // Read (don't subscribe) session/cwd: this only fires when a previewable
-    // target appears, and subscribing re-rendered every tool row on any session
-    // or cwd change.
-    const sessionId = $sessionRuntimeId.get()
-
-    if (sessionId) {
-      recordPreviewArtifact(sessionId, previewTarget, $sessionCwd.get() || '')
-    }
-  }, [$sessionCwd, $sessionRuntimeId, isPending, previewTarget])
 
   const detailSections = useMemo(() => {
     if (!view.detail) {
