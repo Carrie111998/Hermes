@@ -7275,7 +7275,7 @@ def _init_session(
     cwd: str | None = None,
     session_db=None,
     source: str | None = None,
-    profile_home: str | None = None,
+    profile_home: str | Path | None = None,
 ):
     now = time.time()
     with _sessions_lock:
