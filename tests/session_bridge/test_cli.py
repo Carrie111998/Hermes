@@ -528,6 +528,7 @@ def test_claude_visibility_backfill_validation_precedes_backend_mutation(
 
 def test_claude_visibility_apply_and_run_once_use_typed_nonzero_contract(
     capsys,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FakeBackend(
         claude_visibility_payload={
@@ -553,12 +554,16 @@ def test_claude_visibility_apply_and_run_once_use_typed_nonzero_contract(
     )
     _json_output(capsys)
 
-    backend.claude_visibility_run_once = lambda: {
-        "enabled": True,
-        "status": "degraded",
-        "degraded": True,
-        "fatal": False,
-    }
+    monkeypatch.setattr(
+        backend,
+        "claude_visibility_run_once",
+        lambda: {
+            "enabled": True,
+            "status": "degraded",
+            "degraded": True,
+            "fatal": False,
+        },
+    )
     assert _run(["claude-visibility-run-once"], backend) != 0
     _json_output(capsys)
 
@@ -1671,6 +1676,131 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
     assert isinstance(captured["native"], CodexAppServerSidebarDelivery)
     assert captured["marker_secret"] == marker_key
     assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("sidebar", "expected_gate"),
+    [
+        (SidebarConfig(enabled=False, continuous=False), "sidebar_disabled"),
+        (
+            SidebarConfig(enabled=True, continuous=True),
+            "sidebar_continuous_worker_active",
+        ),
+    ],
+)
+def test_production_sidebar_run_once_refuses_before_executor_construction(
+    sidebar: SidebarConfig,
+    expected_gate: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(replace(BridgeConfig(), sidebar=sidebar))
+    executor_constructions: list[str] = []
+
+    def unexpected_executor_construction() -> None:
+        executor_constructions.append("constructed")
+        raise AssertionError("sidebar executor must not be constructed")
+
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_executor",
+        unexpected_executor_construction,
+    )
+
+    with pytest.raises(RolloutGateBlocked) as exc_info:
+        backend.sidebar_run_once()
+
+    assert exc_info.value.gate == expected_gate
+    assert executor_constructions == []
+
+
+def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_key = b"m" * 32
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            sidebar=replace(SidebarConfig(), enabled=True, continuous=False),
+        )
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+
+    class ProtocolCodexClient:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    provider_client = ProtocolCodexClient("provider")
+    sidebar_client = ProtocolCodexClient("sidebar")
+    monkeypatch.setattr(backend, "_codex_client", provider_client)
+    captured: dict[str, Any] = {}
+
+    class OneCycleExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            return SidebarExecutionResult(status="idle")
+
+    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
+        captured.update(kwargs)
+        return OneCycleExecutor()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: sidebar_client,
+    )
+    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
+
+    try:
+        assert backend.sidebar_run_once()["status"] == "idle"
+        assert captured["native"]._client is sidebar_client
+        assert captured["verifier"]._source_adapter._client is sidebar_client
+        assert backend._codex_client is provider_client
+        assert backend._sidebar_codex_client is sidebar_client
+    finally:
+        backend.close()
+
+    assert provider_client.close_count == 1
+    assert sidebar_client.close_count == 1
+
+
+def test_production_backend_close_closes_both_codex_transports_once_and_resets_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+
+    class ProtocolCodexClient:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    provider_client = ProtocolCodexClient()
+    sidebar_client = ProtocolCodexClient()
+    monkeypatch.setattr(backend, "_codex_client", provider_client)
+    monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(backend, "_sidebar_executor", object())
+
+    backend.close()
+    backend.close()
+
+    assert provider_client.close_count == 1
+    assert sidebar_client.close_count == 1
+    assert backend._codex_client is None
+    assert backend._sidebar_codex_client is None
+    assert backend._sidebar_executor is None
 
 
 def test_production_all_provider_scan_isolates_provider_startup_failure(

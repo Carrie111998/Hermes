@@ -256,13 +256,21 @@ class ProductionBackend:
         self._coordinator: SessionBridgeCoordinator | None = None
         self._claude_visibility_coordinator: ClaudeVisibilityCoordinator | None = None
         self._codex_client: CodexAppServerClient | None = None
+        self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_executor: SidebarExecutor | None = None
 
     def close(self) -> None:
-        client, self._codex_client = self._codex_client, None
+        provider_client, self._codex_client = self._codex_client, None
+        sidebar_client, self._sidebar_codex_client = (
+            self._sidebar_codex_client,
+            None,
+        )
         self._sidebar_executor = None
-        if client is not None:
-            client.close()
+        closed_clients: set[int] = set()
+        for client in (provider_client, sidebar_client):
+            if client is not None and id(client) not in closed_clients:
+                closed_clients.add(id(client))
+                client.close()
         db, self._db = self._db, None
         self._store = None
         self._catalog = None
@@ -523,6 +531,10 @@ class ProductionBackend:
         }
 
     def sidebar_run_once(self) -> Mapping[str, Any]:
+        if not self.config.sidebar.enabled:
+            raise RolloutGateBlocked("sidebar_disabled")
+        if self.config.sidebar.continuous:
+            raise RolloutGateBlocked("sidebar_continuous_worker_active")
         try:
             return asdict(self._require_sidebar_executor().run_once())
         except ConfigurationFailure:
@@ -1222,11 +1234,14 @@ class ProductionBackend:
             codex_command = resolve_cli_executable("codex")
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
-            if self._codex_client is None:
-                self._codex_client = CodexAppServerClient(
+            if self._sidebar_codex_client is None:
+                self._sidebar_codex_client = CodexAppServerClient(
                     codex_bin=codex_command[0]
                 )
-            source = CodexSourceAdapter(self._codex_client, marker_secret=marker_key)
+            source = CodexSourceAdapter(
+                self._sidebar_codex_client,
+                marker_secret=marker_key,
+            )
             verifier = SidebarThreadVerifier(
                 source,
                 marker_secret=marker_key,
@@ -1236,7 +1251,7 @@ class ProductionBackend:
                 store=self._require_store(),
                 verifier=verifier,
                 native=CodexAppServerSidebarDelivery(
-                    cast(Any, self._codex_client)
+                    cast(Any, self._sidebar_codex_client)
                 ),
                 marker_secret=marker_key,
             )
@@ -1250,7 +1265,6 @@ class ProductionBackend:
     def _release_provider_runtime(self) -> None:
         client, self._codex_client = self._codex_client, None
         self._coordinator = None
-        self._sidebar_executor = None
         if client is not None:
             client.close()
 
@@ -1484,9 +1498,7 @@ def main(
             payload = _public_sidebar_execution_result(backend.sidebar_run_once())
             _emit(payload)
             return (
-                EXIT_OK
-                if payload["status"] in {"idle", "visible"}
-                else EXIT_DEGRADED
+                EXIT_OK if payload["status"] in {"idle", "visible"} else EXIT_DEGRADED
             )
         if args.command == "claude-visibility-status":
             payload = dict(backend.claude_visibility_status())
