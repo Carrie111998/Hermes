@@ -753,18 +753,152 @@ def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _timestamp_epoch_seconds(value: Any) -> float | None:
+    """Normalize bridge/gate timestamp shapes to epoch seconds."""
+    if isinstance(value, Mapping):
+        value = value.get("low") or value.get("value") or value.get("seconds")
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    # WhatsApp exports may use milliseconds while the replay corpus commonly
+    # uses seconds.  Normalize before comparing with the ISO activation gate.
+    if numeric >= 100_000_000_000:
+        numeric /= 1000
+    return numeric
+
+
+def _fresh_management_chats(
+    records: Sequence[InboxRecord],
+    *,
+    config_path: Path,
+    gate_changed_at: str,
+) -> frozenset[str]:
+    """Return post-activation management chats in this exact processing pick."""
+    gate_epoch = _timestamp_epoch_seconds(gate_changed_at)
+    if gate_epoch is None:
+        raise ConsumerError("processing gate changed_at is not a valid timestamp")
+    management_chats = _management_selector_chats(config_path)
+    fresh: set[str] = set()
+    for record in records:
+        if record.chat_id not in management_chats:
+            continue
+        try:
+            item = _bridge_item(record.raw)
+        except ConsumerError:
+            continue
+        timestamp = _timestamp_epoch_seconds(item.get("timestamp"))
+        if timestamp is not None and timestamp >= gate_epoch:
+            fresh.add(record.chat_id)
+    return frozenset(fresh)
+
+
+def _post_typing_presence(chat_id: str, presence: str) -> bool:
+    """Best-effort presence update through the same local bridge."""
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    bridge_url = os.environ.get("TGG_REPLY_BRIDGE_URL", "http://127.0.0.1:3011").rstrip("/")
+    request = Request(
+        f"{bridge_url}/typing",
+        data=json.dumps({"chatId": chat_id, "presence": presence}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            status_code = int(getattr(response, "status", 0) or 0)
+            payload = json.loads(response.read() or b"{}")
+        if status_code == 200 and payload.get("success") is True:
+            return True
+        print(
+            "typing presence outcome NOT confirmed: "
+            f"chat={chat_id} presence={presence} http={status_code} "
+            f"payload={json.dumps(payload)[:200]}",
+            file=sys.stderr,
+        )
+    except HTTPError as exc:
+        print(
+            "typing presence REFUSED/FAILED at bridge: "
+            f"chat={chat_id} presence={presence} http={exc.code}",
+            file=sys.stderr,
+        )
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        print(
+            f"typing presence FAILED: chat={chat_id} presence={presence} error={exc}",
+            file=sys.stderr,
+        )
+    return False
+
+
+@contextlib.asynccontextmanager
+async def _management_typing_presence(
+    records: Sequence[InboxRecord],
+    *,
+    config_path: Path,
+    gate_changed_at: str,
+    reassert_seconds: float = 20,
+):
+    """Keep fresh management chats composing until processing+delivery ends."""
+    chats = _fresh_management_chats(
+        records, config_path=config_path, gate_changed_at=gate_changed_at
+    )
+    if not chats:
+        yield
+        return
+    for chat_id in chats:
+        await asyncio.to_thread(_post_typing_presence, chat_id, "composing")
+    stop = asyncio.Event()
+
+    async def reassert() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=reassert_seconds)
+                return
+            except asyncio.TimeoutError:
+                for chat_id in chats:
+                    await asyncio.to_thread(
+                        _post_typing_presence, chat_id, "composing"
+                    )
+
+    task = asyncio.create_task(reassert())
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
+        for chat_id in chats:
+            await asyncio.to_thread(_post_typing_presence, chat_id, "paused")
+
+
 def deliver_management_replies(
     inbox: DurableInbox,
     *,
     config_path: Path,
     captured_outbound: Sequence[Mapping[str, Any]],
     batch_records: Sequence[InboxRecord],
+    gate_changed_at: str,
+    handled_groups: Sequence[Mapping[str, Any]],
 ) -> dict[str, int]:
     """Deliver mgmt-selector responses through the rung-gated bridge.
 
     Contract (teren 2026-07-21 12:00 ruling):
     - delivery keys on the inbound chat's selector class: management only;
       site/ingest responses stay capture-only forever.
+    - only anchors cited by completed turns from THIS processing result and
+      whose ingress timestamp is at/after the current activation gate may
+      deliver; backlog-context output remains captured but suppressed.
     - every send goes through the bridge POST /send — the 4-layer outbound
       stack (policy, authority, lease, guarded transport) is THE enforcement;
       no allowlist logic is duplicated here and a bridge refusal is final.
@@ -782,17 +916,46 @@ def deliver_management_replies(
     ]
     if not sends:
         return summary
+    gate_epoch = _timestamp_epoch_seconds(gate_changed_at)
+    if gate_epoch is None:
+        raise ConsumerError("processing gate changed_at is not a valid timestamp")
     management_chats = _management_selector_chats(config_path)
     bridge_url = os.environ.get("TGG_REPLY_BRIDGE_URL", "http://127.0.0.1:3011").rstrip("/")
     newest_message_by_chat: dict[str, str] = {}
+    records_by_id: dict[str, InboxRecord] = {}
     for record in batch_records:
         newest_message_by_chat[record.chat_id] = record.message_id
+        records_by_id[record.message_id] = record
+    handled_message_ids = {
+        str(message_id)
+        for group in handled_groups
+        for message_id in (group.get("message_ids") or [])
+        if message_id
+    }
     for send in sends:
         chat_id = send["chat_id"]
         if chat_id not in management_chats:
             summary["suppressed"] += 1
             continue
         anchor = send["reply_to"] or newest_message_by_chat.get(chat_id)
+        anchor_record = records_by_id.get(str(anchor)) if anchor else None
+        try:
+            anchor_item = _bridge_item(anchor_record.raw) if anchor_record else None
+        except ConsumerError:
+            anchor_item = None
+        anchor_epoch = _timestamp_epoch_seconds(
+            anchor_item.get("timestamp") if anchor_item else None
+        )
+        if (
+            not anchor
+            or anchor not in handled_message_ids
+            or anchor_record is None
+            or anchor_record.chat_id != chat_id
+            or anchor_epoch is None
+            or anchor_epoch < gate_epoch
+        ):
+            summary["suppressed"] += 1
+            continue
         # Key = chat + anchor + content digest (codex round): two DISTINCT
         # responses to the same anchor each deliver once; an identical
         # response re-emitted (crash-rerun, model stutter) is refused. The
@@ -804,16 +967,6 @@ def deliver_management_replies(
             delivery_key, chat_id=chat_id, reply_to_message_id=anchor
         ):
             summary["duplicate"] += 1
-            continue
-        if not anchor:
-            print(
-                f"reply delivery undelivered (no reply anchor): chat={chat_id}",
-                file=sys.stderr,
-            )
-            inbox.record_reply_delivery(
-                delivery_key, status="undelivered", error="no-reply-anchor"
-            )
-            summary["undelivered"] += 1
             continue
         body = json.dumps(
             {
@@ -969,49 +1122,58 @@ async def run_consumer(args: argparse.Namespace) -> int:
             )
             if records:
                 inbox.claim(records)
-                try:
-                    result = await process_live_records(
-                        records, config_path=config_path, state_db=Path(args.state_db)
-                    )
-                    handled_ids = {
-                        message_id
-                        for group in result["handled"]
-                        for message_id in group["message_ids"]
-                    }
-                    turn_ids = [group["turn_id"] for group in result["handled"]]
-                    handled = [r for r in records if r.message_id in handled_ids]
-                    skipped = [r for r in records if r.message_id not in handled_ids]
-                    if handled:
-                        inbox.finish(
-                            handled,
-                            status="completed",
-                            pa_turn_id=turn_ids[-1] if turn_ids else None,
+                async with _management_typing_presence(
+                    records,
+                    config_path=config_path,
+                    gate_changed_at=str(gate.get("changed_at") or ""),
+                ):
+                    try:
+                        result = await process_live_records(
+                            records,
+                            config_path=config_path,
+                            state_db=Path(args.state_db),
                         )
-                    if skipped:
-                        inbox.finish(skipped, status="skipped")
-                except Exception as exc:
-                    inbox.finish(records, status="failed", error=str(exc))
-                    raise
-                # Management-selector reply delivery (teren 2026-07-21): runs
-                # AFTER classification is committed, outside its try, so a
-                # delivery problem can never re-mark records or fail ingest.
-                # deliver_management_replies swallows per-send errors (loud
-                # log + durable undelivered mark, never a retry); this guard
-                # covers unexpected faults in the delivery machinery itself.
-                try:
-                    delivery = deliver_management_replies(
-                        inbox,
-                        config_path=config_path,
-                        captured_outbound=result.get("captured_outbound") or [],
-                        batch_records=records,
-                    )
-                    if delivery.get("delivered") or delivery.get("undelivered"):
-                        print(f"reply deliveries: {delivery}", file=sys.stderr)
-                except Exception as exc:
-                    print(
-                        f"reply delivery machinery FAILED (ingest unaffected): {exc}",
-                        file=sys.stderr,
-                    )
+                        handled_ids = {
+                            message_id
+                            for group in result["handled"]
+                            for message_id in group["message_ids"]
+                        }
+                        turn_ids = [group["turn_id"] for group in result["handled"]]
+                        handled = [r for r in records if r.message_id in handled_ids]
+                        skipped = [r for r in records if r.message_id not in handled_ids]
+                        if handled:
+                            inbox.finish(
+                                handled,
+                                status="completed",
+                                pa_turn_id=turn_ids[-1] if turn_ids else None,
+                            )
+                        if skipped:
+                            inbox.finish(skipped, status="skipped")
+                    except Exception as exc:
+                        inbox.finish(records, status="failed", error=str(exc))
+                        raise
+                    # Management-selector reply delivery (teren 2026-07-21): runs
+                    # AFTER classification is committed, outside its try, so a
+                    # delivery problem can never re-mark records or fail ingest.
+                    # deliver_management_replies swallows per-send errors (loud
+                    # log + durable undelivered mark, never a retry); this guard
+                    # covers unexpected faults in the delivery machinery itself.
+                    try:
+                        delivery = deliver_management_replies(
+                            inbox,
+                            config_path=config_path,
+                            captured_outbound=result.get("captured_outbound") or [],
+                            batch_records=records,
+                            gate_changed_at=str(gate.get("changed_at") or ""),
+                            handled_groups=result.get("handled") or [],
+                        )
+                        if delivery.get("delivered") or delivery.get("undelivered"):
+                            print(f"reply deliveries: {delivery}", file=sys.stderr)
+                    except Exception as exc:
+                        print(
+                            f"reply delivery machinery FAILED (ingest unaffected): {exc}",
+                            file=sys.stderr,
+                        )
             _write_status(
                 status_path,
                 {

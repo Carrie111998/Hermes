@@ -18,6 +18,7 @@ import pytest
 from gateway.durable_jsonl_consumer import (
     DurableInbox,
     InboxRecord,
+    _management_typing_presence,
     _management_selector_chats,
     _parse_captured_send,
     deliver_management_replies,
@@ -25,6 +26,9 @@ from gateway.durable_jsonl_consumer import (
 
 MGMT_CHAT = "120363426509183563@g.us"
 SITE_CHAT = "120363421424519051@g.us"
+GATE_CHANGED_AT = "2026-07-21T04:00:00+00:00"
+FRESH_TS = "2026-07-21T04:01:00+00:00"
+STALE_TS = "2026-07-21T03:59:00+00:00"
 
 
 @pytest.fixture()
@@ -69,15 +73,21 @@ def _captured(chat_id: str, content: str = "reply text", reply_to: str | None = 
     }
 
 
-def _record(chat_id: str, message_id: str = "MSG1") -> InboxRecord:
+def _record(
+    chat_id: str, message_id: str = "MSG1", timestamp: str = FRESH_TS
+) -> InboxRecord:
     return InboxRecord(
         seq=1,
         message_id=message_id,
         chat_id=chat_id,
         start_offset=0,
         end_offset=1,
-        raw={"messageId": message_id, "chatId": chat_id},
+        raw={"messageId": message_id, "chatId": chat_id, "timestamp": timestamp},
     )
+
+
+def _handled(*message_ids: str) -> list[dict]:
+    return [{"message_ids": list(message_ids), "turn_id": "turn-current"}]
 
 
 def test_selector_chats_are_whatsapp_management_only(config_path: Path) -> None:
@@ -105,6 +115,8 @@ def test_site_selector_response_never_delivers(
         config_path=config_path,
         captured_outbound=[_captured(SITE_CHAT)],
         batch_records=[_record(SITE_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     assert summary == {"delivered": 0, "undelivered": 0, "suppressed": 1, "duplicate": 0}
     assert not calls
@@ -139,6 +151,8 @@ def test_mgmt_delivery_is_at_most_once(
         config_path=config_path,
         captured_outbound=[_captured(MGMT_CHAT)],
         batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     first = deliver_management_replies(inbox, **kwargs)
     second = deliver_management_replies(inbox, **kwargs)
@@ -170,6 +184,8 @@ def test_distinct_responses_to_same_anchor_each_deliver(
             _captured(MGMT_CHAT, content="second answer"),
         ],
         batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     assert summary["delivered"] == 2 and summary["duplicate"] == 0
     assert len(sent) == 2
@@ -189,6 +205,8 @@ def test_indeterminate_202_outcome_marks_undelivered(
         config_path=config_path,
         captured_outbound=[_captured(MGMT_CHAT)],
         batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     assert summary == {"delivered": 0, "undelivered": 1, "suppressed": 0, "duplicate": 0}
     # claim consumed: no retry ever re-sends the indeterminate message
@@ -197,6 +215,8 @@ def test_indeterminate_202_outcome_marks_undelivered(
         config_path=config_path,
         captured_outbound=[_captured(MGMT_CHAT)],
         batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     assert retry["duplicate"] == 1 and retry["delivered"] == 0
 
@@ -217,6 +237,8 @@ def test_bridge_refusal_marks_undelivered_and_never_raises(
         config_path=config_path,
         captured_outbound=[_captured(MGMT_CHAT)],
         batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     assert summary["undelivered"] == 1
     # the claim consumed the key: a retry never re-sends
@@ -225,5 +247,138 @@ def test_bridge_refusal_marks_undelivered_and_never_raises(
         config_path=config_path,
         captured_outbound=[_captured(MGMT_CHAT)],
         batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
     )
     assert retry == {"delivered": 0, "undelivered": 0, "suppressed": 0, "duplicate": 1}
+
+
+def test_same_content_uncited_anchor_is_suppressed_but_fresh_cited_anchor_delivers(
+    inbox: DurableInbox, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list = []
+
+    def fake_urlopen(request, timeout=0):
+        sent.append(json.loads(request.data))
+        return _FakeResponse({"success": True, "messageId": "WAMSG-FRESH"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[
+            _captured(MGMT_CHAT, content="same answer", reply_to="STALE-UNCITED"),
+            _captured(MGMT_CHAT, content="same answer", reply_to="FRESH-CITED"),
+        ],
+        batch_records=[
+            _record(MGMT_CHAT, "STALE-UNCITED"),
+            _record(MGMT_CHAT, "FRESH-CITED"),
+        ],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("FRESH-CITED"),
+    )
+    assert summary == {"delivered": 1, "undelivered": 0, "suppressed": 1, "duplicate": 0}
+    assert sent == [
+        {
+            "chatId": MGMT_CHAT,
+            "message": "same answer",
+            "replyTo": {"messageId": "FRESH-CITED"},
+        }
+    ]
+
+
+def test_preactivation_cited_anchor_is_suppressed(
+    inbox: DurableInbox, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("no send expected")),
+    )
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[_captured(MGMT_CHAT, reply_to="PREACTIVATION")],
+        batch_records=[_record(MGMT_CHAT, "PREACTIVATION", timestamp=STALE_TS)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("PREACTIVATION"),
+    )
+    assert summary == {"delivered": 0, "undelivered": 0, "suppressed": 1, "duplicate": 0}
+    assert not calls
+
+
+def test_fresh_cited_anchor_delivers_exactly_once(
+    inbox: DurableInbox, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list = []
+
+    def fake_urlopen(request, timeout=0):
+        sent.append(json.loads(request.data))
+        return _FakeResponse({"success": True, "messageId": "WAMSG-ONCE"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    kwargs = {
+        "config_path": config_path,
+        "captured_outbound": [_captured(MGMT_CHAT, reply_to="FRESH")],
+        "batch_records": [_record(MGMT_CHAT, "FRESH")],
+        "gate_changed_at": GATE_CHANGED_AT,
+        "handled_groups": _handled("FRESH"),
+    }
+    assert deliver_management_replies(inbox, **kwargs)["delivered"] == 1
+    assert deliver_management_replies(inbox, **kwargs)["duplicate"] == 1
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_typing_presence_wraps_only_fresh_management_processing(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    presence: list[dict] = []
+
+    def fake_urlopen(request, timeout=0):
+        presence.append(json.loads(request.data))
+        return _FakeResponse({"success": True})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    records = [
+        _record(MGMT_CHAT, "FRESH-MGMT"),
+        _record(MGMT_CHAT, "STALE-MGMT", timestamp=STALE_TS),
+        _record(SITE_CHAT, "FRESH-SITE"),
+    ]
+    async with _management_typing_presence(
+        records,
+        config_path=config_path,
+        gate_changed_at=GATE_CHANGED_AT,
+        reassert_seconds=60,
+    ):
+        assert presence == [{"chatId": MGMT_CHAT, "presence": "composing"}]
+    assert presence == [
+        {"chatId": MGMT_CHAT, "presence": "composing"},
+        {"chatId": MGMT_CHAT, "presence": "paused"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_typing_reasserts_and_clears_on_failure(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    presence: list[dict] = []
+
+    def fake_urlopen(request, timeout=0):
+        presence.append(json.loads(request.data))
+        return _FakeResponse({"success": True})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="delivery exploded"):
+        async with _management_typing_presence(
+            [_record(MGMT_CHAT, "FRESH-MGMT")],
+            config_path=config_path,
+            gate_changed_at=GATE_CHANGED_AT,
+            reassert_seconds=0.01,
+        ):
+            import asyncio
+
+            await asyncio.sleep(0.025)
+            raise RuntimeError("delivery exploded")
+    assert [item["presence"] for item in presence].count("composing") >= 2
+    assert presence[-1] == {"chatId": MGMT_CHAT, "presence": "paused"}
