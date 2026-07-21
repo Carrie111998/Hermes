@@ -646,9 +646,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             sessionId,
             recoverStoredSessionId,
             liveId =>
-              withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-              ),
+              withSessionBusyRetry(() => {
+                const drift = sessionDriftReason()
+
+                if (drift) {
+                  throw new SessionRecoveryAborted(drift, liveId)
+                }
+
+                return requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+              }),
             {
               requestGateway,
               driftReason: sessionDriftReason,
