@@ -8,7 +8,6 @@ from typing import Any
 
 
 VIDEO_AGENT_CORE_SKILL_ALLOWLIST: tuple[str, ...] = (
-    "workflow-router",
     "media-qa",
     "prompt-repair",
 )

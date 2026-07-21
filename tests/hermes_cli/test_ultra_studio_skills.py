@@ -17,7 +17,6 @@ from hermes_cli.ultra_studio_skills import (
 
 def test_compute_disabled_skills_keeps_only_ultra_studio_allowlist():
     installed = [
-        "workflow-router",
         "infographic-md-flow",
         "gpt-image-2-director",
         "marketing-studio-director",
@@ -38,7 +37,7 @@ def test_compute_disabled_skills_keeps_only_ultra_studio_allowlist():
 
 def test_compute_disabled_skills_accepts_discovery_rows():
     installed = [
-        {"name": "workflow-router", "category": "creative"},
+        {"name": "prompt-repair", "category": "creative"},
         {"name": "github-auth", "category": "github"},
         {"name": "media-qa", "category": "creative"},
     ]
@@ -56,14 +55,14 @@ def test_collect_skill_names_rejects_bad_rows():
 
 
 def test_build_disabled_skills_config_global():
-    config = build_disabled_skills_config(["workflow-router", "linear"])
+    config = build_disabled_skills_config(["media-qa", "linear"])
 
     assert config == {"skills": {"disabled": ["linear"]}}
 
 
 def test_build_disabled_skills_config_platform():
     config = build_disabled_skills_config(
-        ["workflow-router", "linear"],
+        ["media-qa", "linear"],
         platform="cli",
     )
 
@@ -75,7 +74,7 @@ def test_apply_ultra_studio_allowlist_is_side_effect_free():
 
     updated = apply_ultra_studio_allowlist(
         original,
-        ["workflow-router", "spotify"],
+        ["media-qa", "spotify"],
         platform="cli",
     )
 
@@ -86,7 +85,6 @@ def test_apply_ultra_studio_allowlist_is_side_effect_free():
 
 def test_default_allowlist_names_are_present():
     assert set(DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST) == {
-        "workflow-router",
         "infographic-md-flow",
         "media-qa",
         "prompt-repair",
@@ -99,7 +97,6 @@ def test_default_allowlist_names_are_present():
 
 def test_video_agent_allowlist_separates_core_from_specific_workflows():
     assert set(VIDEO_AGENT_CORE_SKILL_ALLOWLIST) == {
-        "workflow-router",
         "media-qa",
         "prompt-repair",
     }
@@ -113,7 +110,6 @@ def test_video_agent_allowlist_separates_core_from_specific_workflows():
 
 def test_ultra_allowlist_hides_unrelated_skills_from_discovery(tmp_path, monkeypatch):
     installed = [
-        "workflow-router",
         "infographic-md-flow",
         "gpt-image-2-director",
         "marketing-studio-director",
@@ -155,7 +151,7 @@ def test_apply_skill_allowlist_disables_everything_outside_allowlist(monkeypatch
         skills_config,
         "_list_all_skills",
         lambda **kwargs: [
-            {"name": "workflow-router"},
+            {"name": "media-qa"},
             {"name": "prompt-repair"},
             {"name": "ascii-video"},
         ],
@@ -173,13 +169,13 @@ def test_apply_skill_allowlist_disables_everything_outside_allowlist(monkeypatch
     )
 
     result = skills_config.apply_skill_allowlist(
-        ["workflow-router", "prompt-repair"],
+        ["media-qa", "prompt-repair"],
         platform="cli",
     )
 
     assert saved["disabled"] == {"ascii-video"}
     assert saved["platform"] == "cli"
-    assert result["enabled"] == ["prompt-repair", "workflow-router"]
+    assert result["enabled"] == ["media-qa", "prompt-repair"]
     assert result["disabled"] == ["ascii-video"]
 
 
@@ -198,7 +194,7 @@ def test_apply_skill_allowlist_fails_closed_when_discovery_errors(monkeypatch):
     monkeypatch.setattr(skills_config, "save_disabled_skills", fail_if_saved)
 
     with pytest.raises(skills_config.SkillDiscoveryError):
-        skills_config.apply_skill_allowlist(["workflow-router"])
+        skills_config.apply_skill_allowlist(["media-qa"])
 
 
 def test_video_agent_skills_command_uses_core_allowlist_and_global_platform(monkeypatch):
@@ -211,7 +207,7 @@ def test_video_agent_skills_command_uses_core_allowlist_and_global_platform(monk
         captured["platform"] = platform
         return {
             "disabled": ["ascii-video"],
-            "enabled": ["workflow-router"],
+            "enabled": ["media-qa"],
             "missing": [],
             "platform": platform,
         }

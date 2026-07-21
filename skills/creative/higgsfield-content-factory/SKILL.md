@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [creative, content-pipeline, higgsfield, marketing-studio, ugc, video-generation]
-    related_skills: [marketing-studio-director, gpt-image-2-director, workflow-router, media-qa, prompt-repair]
+    related_skills: [marketing-studio-director, gpt-image-2-director, media-qa, prompt-repair]
 ---
 
 # Higgsfield Content Factory

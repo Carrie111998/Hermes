@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [creative, qa, video-generation, image-generation, atlas, review, repair]
-    related_skills: [workflow-router, prompt-repair, infographic-md-flow]
+    related_skills: [prompt-repair, infographic-md-flow]
 ---
 
 # Media QA

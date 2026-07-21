@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [creative, prompt-engineering, repair, video-generation, image-generation, atlas, retry]
-    related_skills: [workflow-router, media-qa, infographic-md-flow]
+    related_skills: [media-qa, infographic-md-flow]
 ---
 
 # Prompt Repair

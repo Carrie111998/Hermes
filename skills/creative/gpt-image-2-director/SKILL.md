@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [creative, prompt-engineering, image-generation, gpt-image-2, mockups, infographics]
-    related_skills: [workflow-router, prompt-repair, media-qa, infographic-md-flow]
+    related_skills: [prompt-repair, media-qa, infographic-md-flow]
 ---
 
 # GPT Image 2.0 Prompt Director

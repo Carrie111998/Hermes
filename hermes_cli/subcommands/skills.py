@@ -327,7 +327,7 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_video_agent.add_argument(
         "--core-only",
         action="store_true",
-        help="Keep only workflow-router, media-qa, and prompt-repair",
+        help="Keep only media-qa and prompt-repair",
     )
     skills_video_agent.add_argument(
         "--platform",
