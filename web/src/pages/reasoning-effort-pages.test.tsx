@@ -540,6 +540,75 @@ describe("ProfilesPage reasoning effort selector", () => {
     expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "high");
   });
 
+  it.each([
+    { initialEffort: "", selectedEffort: "high", label: "sets a concrete effort" },
+    { initialEffort: "high", selectedEffort: "", label: "clears the effort" },
+  ])(
+    "allows reasoning-only saves for an unlisted stored model when it $label",
+    async ({ initialEffort, selectedEffort }) => {
+      mockedApi.getProfiles.mockResolvedValue({
+        profiles: [
+          {
+            name: "default",
+            path: "/tmp/default",
+            is_default: true,
+            model: "provider-model",
+            provider: "custom",
+            reasoning_effort: initialEffort,
+            has_env: false,
+            skill_count: 0,
+            gateway_running: false,
+            description: "",
+            description_auto: false,
+            distribution_name: null,
+            distribution_version: null,
+            distribution_source: null,
+            has_alias: false,
+          },
+        ],
+      });
+      mockedApi.getModelOptions.mockResolvedValue({
+        providers: [{ slug: "provider-a", name: "Provider A", models: ["model-a"] }],
+      });
+      mockedApi.setProfileReasoning.mockImplementation(async (_name, effort) => ({
+        ok: true,
+        reasoning_effort: effort,
+      }));
+
+      await renderPage(<ProfilesPage />);
+      const actions = container.querySelector<HTMLButtonElement>(
+        "button[aria-label='Actions']",
+      );
+      await act(async () => actions!.click());
+      const changeModel = [
+        ...container.querySelectorAll<HTMLButtonElement>("[role=menuitem]"),
+      ].find((button) => button.textContent?.includes("Change model"));
+      expect(changeModel).toBeDefined();
+      await act(async () => changeModel!.click());
+      await settle();
+
+      const selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
+      expect(selects).toHaveLength(2);
+      await chooseOption(
+        selects[1],
+        selectedEffort ? "High" : "Inherit provider default",
+      );
+      const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "Save",
+      );
+      expect(save).toBeDefined();
+      expect(save?.disabled).toBe(false);
+      await act(async () => {
+        save!.click();
+        await Promise.resolve();
+      });
+      await settle();
+
+      expect(mockedApi.setProfileModel).not.toHaveBeenCalled();
+      expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", selectedEffort);
+    },
+  );
+
   it("clears a profile reasoning override without model choices", async () => {
     mockedApi.getProfiles.mockResolvedValue({
       profiles: [

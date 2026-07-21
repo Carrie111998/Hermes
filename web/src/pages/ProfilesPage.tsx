@@ -365,6 +365,7 @@ export default function ProfilesPage() {
   // Inline model editor state
   const [editingModelFor, setEditingModelFor] = useState<string | null>(null);
   const [modelEditChoice, setModelEditChoice] = useState("");
+  const [modelEditInitialChoice, setModelEditInitialChoice] = useState("");
   const [reasoningEditChoice, setReasoningEditChoice] = useState("");
   const [modelSaving, setModelSaving] = useState(false);
 
@@ -659,7 +660,9 @@ export default function ProfilesPage() {
       setEditingSoulFor(null);
       setEditingDescFor(null);
       setEditingModelFor(p.name);
-      setModelEditChoice(modelKey(p.provider, p.model));
+      const initialChoice = modelKey(p.provider, p.model);
+      setModelEditChoice(initialChoice);
+      setModelEditInitialChoice(initialChoice);
       setReasoningEditChoice(p.reasoning_effort ?? "");
       loadModelChoices();
     },
@@ -672,7 +675,11 @@ export default function ProfilesPage() {
           (c) => `${c.provider}\u0000${c.model}` === modelEditChoice,
         )
       : undefined;
-    if (modelEditChoice && modelChoices?.length && !picked) return;
+    const unchangedUnlistedModel =
+      modelEditChoice !== "" && modelEditChoice === modelEditInitialChoice;
+    if (modelEditChoice && modelChoices?.length && !picked && !unchangedUnlistedModel) {
+      return;
+    }
     setModelSaving(true);
     try {
       if (picked) {
@@ -1351,7 +1358,8 @@ export default function ProfilesPage() {
                               !modelChoices.some(
                                 (c) =>
                                   `${c.provider}\u0000${c.model}` === modelEditChoice,
-                              ))))
+                              ) &&
+                              modelEditChoice !== modelEditInitialChoice)))
                       }
                     >
                       {modelSaving ? t.common.saving : t.common.save}
