@@ -13,6 +13,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import stat
 import subprocess
 import threading
 import time
@@ -32,7 +33,10 @@ from .characterize import (
     run_live_characterization,
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
-from .claude_registrar import ClaudeNativeRegistrar
+from .claude_registrar import (
+    ClaudeNativeRegistrar,
+    _canonical_claude_startup_settings,
+)
 from .claude_visibility import (
     build_claude_visibility_candidate,
     derive_claude_visibility_identity,
@@ -80,6 +84,14 @@ _MAX_BACKFILL_CREATE = 10
 _BACKFILL_PAGE_SIZE = 1_000
 _MAX_PLANNED_SESSIONS = 10_000
 _CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.110"
+_CLAUDE_VISIBILITY_VERSION_OUTPUTS = frozenset({
+    _CLAUDE_VISIBILITY_PINNED_VERSION,
+    f"{_CLAUDE_VISIBILITY_PINNED_VERSION} (Claude Code)",
+})
+_CLAUDE_FORCED_TEAM_ONBOARDING = frozenset({"banner", "step"})
+_MAX_CLAUDE_AUTH_STATUS_BYTES = 16_384
+_MAX_CLAUDE_GLOBAL_CONFIG_BYTES = 4 * 1024 * 1024
 _SENSITIVE_KEY_FRAGMENTS = (
     "authorization",
     "bearer",
@@ -125,8 +137,14 @@ def _claude_visibility_preflight(
     command: Sequence[str],
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    global_config_path: Path | str | None = None,
 ) -> dict[str, str] | None:
-    """Read version/auth state only; never starts a Claude conversation."""
+    """Read pinned version, auth, and startup state without starting a session."""
+
+    if os.environ.get("CLAUDE_CODE_TEAM_ONBOARDING") in (
+        _CLAUDE_FORCED_TEAM_ONBOARDING
+    ):
+        return None
 
     try:
         version = runner(
@@ -149,20 +167,106 @@ def _claude_visibility_preflight(
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    version_text = version.stdout.strip() if version.returncode == 0 else ""
-    if not version_text or authentication.returncode != 0:
+    auth_output = authentication.stdout
+    if type(auth_output) is not str:
         return None
     try:
-        auth_status = json.loads(authentication.stdout)
-    except (TypeError, json.JSONDecodeError):
+        auth_output_bytes = len(auth_output.encode("utf-8"))
+    except UnicodeEncodeError:
         return None
-    if not isinstance(auth_status, dict):
+    version_text = version.stdout.strip() if version.returncode == 0 else ""
+    if (
+        version_text not in _CLAUDE_VISIBILITY_VERSION_OUTPUTS
+        or authentication.returncode != 0
+        or auth_output_bytes > _MAX_CLAUDE_AUTH_STATUS_BYTES
+    ):
         return None
-    logged_in = auth_status.get("loggedIn")
-    authenticated = auth_status.get("authenticated")
-    if logged_in is not True and authenticated is not True:
+    auth_status = _strict_json_object(auth_output)
+    if auth_status is None or auth_status.get("loggedIn") is not True:
         return None
-    return {"version": version_text, "authentication": "available"}
+    selected_config = (
+        Path(global_config_path)
+        if global_config_path is not None
+        else _resolve_claude_global_config_path()
+    )
+    theme = _read_claude_startup_theme(selected_config)
+    if theme is None:
+        return None
+    return {
+        "version": _CLAUDE_VISIBILITY_PINNED_VERSION,
+        "authentication": "available",
+        "theme": theme,
+    }
+
+
+def _resolve_claude_global_config_path() -> Path:
+    """Mirror Claude 2.1.110's X8 global-state path resolution."""
+
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = (
+        Path(configured) if configured is not None else Path.home() / ".claude"
+    )
+    modern = config_dir / ".config.json"
+    try:
+        if modern.exists():
+            return modern
+    except OSError:
+        return modern
+    suffix = "-custom-oauth" if os.environ.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    base = Path(configured) if configured else Path.home()
+    return base / f".claude{suffix}.json"
+
+
+def _read_claude_startup_theme(global_config_path: Path) -> str | None:
+    """Read only the canonical onboarding fields from Claude's global state."""
+
+    try:
+        with global_config_path.open("rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_CLAUDE_GLOBAL_CONFIG_BYTES
+            ):
+                return None
+            payload = handle.read(_MAX_CLAUDE_GLOBAL_CONFIG_BYTES + 1)
+    except OSError:
+        return None
+    if not payload or len(payload) > _MAX_CLAUDE_GLOBAL_CONFIG_BYTES:
+        return None
+    document = _strict_json_object(payload)
+    if document is None or document.get("hasCompletedOnboarding") is not True:
+        return None
+    theme = document.get("theme")
+    try:
+        _canonical_claude_startup_settings(theme)
+    except ValueError:
+        return None
+    return cast(str, theme)
+
+
+def _strict_json_object(payload: str | bytes) -> dict[str, Any] | None:
+    """Parse one JSON object while rejecting duplicates and nonstandard numbers."""
+
+    def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("nonstandard JSON constant")
+
+    try:
+        document = json.loads(
+            payload,
+            object_pairs_hook=object_from_pairs,
+            parse_constant=reject_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return document if type(document) is dict else None
 
 
 def _production_codex_permission_preflight(cwd: str) -> bool:
@@ -255,6 +359,9 @@ class ProductionBackend:
         self._catalog: UnifiedCatalog | None = None
         self._coordinator: SessionBridgeCoordinator | None = None
         self._claude_visibility_coordinator: ClaudeVisibilityCoordinator | None = None
+        self._claude_visibility_startup_identity: tuple[tuple[str, ...], str] | None = (
+            None
+        )
         self._codex_client: CodexAppServerClient | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
         self._sidebar_executor: SidebarExecutor | None = None
@@ -271,6 +378,7 @@ class ProductionBackend:
         self._catalog = None
         self._coordinator = None
         self._claude_visibility_coordinator = None
+        self._claude_visibility_startup_identity = None
 
         first_error: BaseException | None = None
         closed_clients: set[int] = set()
@@ -664,7 +772,6 @@ class ProductionBackend:
     ) -> Mapping[str, Any]:
         if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
             raise ConfigurationFailure("live_characterization_not_enabled")
-        marker_secret = resolve_marker_key()
         source_root = (
             Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
             / "session-bridge"
@@ -672,6 +779,7 @@ class ProductionBackend:
             / "claude-visibility-sources"
         )
         if cleanup_token is not None:
+            marker_secret = resolve_marker_key()
             return cleanup_characterized_claude_visibility(
                 cleanup_token=cleanup_token,
                 source_root=source_root,
@@ -682,8 +790,10 @@ class ProductionBackend:
                 marker_secret=marker_secret,
             )
         claude_command = resolve_cli_executable("claude")
-        if _claude_visibility_preflight(claude_command) is None:
+        startup = _claude_visibility_preflight(claude_command)
+        if startup is None:
             raise ProviderDegraded("claude_visibility_preflight_failed")
+        marker_secret = resolve_marker_key()
         store = self._require_store()
         raw = store.claude_visibility_status(time.time())
         has_open_work = any(
@@ -707,6 +817,7 @@ class ProductionBackend:
             store,
             source,
             marker_secret=marker_secret,
+            startup_theme=startup["theme"],
             claude_command=claude_command,
             process_timeout=self.config.claude_visibility.process_timeout_seconds,
             discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
@@ -812,11 +923,23 @@ class ProductionBackend:
         )
 
     def _claude_visibility_runtime(self) -> ClaudeVisibilityCoordinator:
-        if self._claude_visibility_coordinator is not None:
+        try:
+            claude_command = resolve_cli_executable("claude")
+        except ConfigurationFailure:
+            raise
+        except Exception as exc:
+            raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
+        startup = _claude_visibility_preflight(claude_command)
+        if startup is None:
+            raise ProviderDegraded("claude_visibility_preflight_failed")
+        startup_identity = (tuple(claude_command), startup["theme"])
+        if (
+            self._claude_visibility_coordinator is not None
+            and self._claude_visibility_startup_identity == startup_identity
+        ):
             return self._claude_visibility_coordinator
         try:
             marker_secret = resolve_marker_key()
-            claude_command = resolve_cli_executable("claude")
             source = ClaudeSourceAdapter(
                 _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
             )
@@ -825,12 +948,13 @@ class ProductionBackend:
                 store,
                 source,
                 marker_secret=marker_secret,
+                startup_theme=startup["theme"],
                 claude_command=claude_command,
                 process_timeout=self.config.claude_visibility.process_timeout_seconds,
                 discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
             )
 
-            self._claude_visibility_coordinator = ClaudeVisibilityCoordinator(
+            coordinator = ClaudeVisibilityCoordinator(
                 config=self.config,
                 store=store,
                 inventory=lambda after: self._claude_visibility_inventory(
@@ -845,11 +969,13 @@ class ProductionBackend:
                 marker_secret=marker_secret,
                 clock=time.time,
             )
-            return self._claude_visibility_coordinator
         except ConfigurationFailure:
             raise
         except Exception as exc:
             raise ProviderDegraded("claude_visibility_runtime_unavailable") from exc
+        self._claude_visibility_coordinator = coordinator
+        self._claude_visibility_startup_identity = startup_identity
+        return coordinator
 
     def _claude_visibility_inventory(
         self,

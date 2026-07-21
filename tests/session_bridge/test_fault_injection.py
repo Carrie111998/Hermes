@@ -818,6 +818,7 @@ def test_claude_visibility_registrar_faults_reconcile_same_uuid_without_relaunch
             store,
             _ClaudeSource([None]),
             marker_secret=_REGISTRAR_SECRET,
+            startup_theme="light",
             pty_factory=launch_factory,
             clock=lambda: current[0],
             monotonic=lambda: 1.0,
@@ -848,6 +849,7 @@ def test_claude_visibility_registrar_faults_reconcile_same_uuid_without_relaunch
             store,
             _ClaudeSource([recovered]),
             marker_secret=_REGISTRAR_SECRET,
+            startup_theme="light",
             pty_factory=reconciliation_factory,
             clock=lambda: current[0],
             monotonic=lambda: 1.0,
@@ -895,6 +897,7 @@ def test_claude_visibility_identity_faults_are_detected_by_registrar_before_spaw
         store,
         _ClaudeSource([projection], **source_kwargs),
         marker_secret=_REGISTRAR_SECRET,
+        startup_theme="light",
         pty_factory=factory,
     ).process(item)
     assert result.status == "failed"
@@ -909,11 +912,12 @@ def test_claude_visibility_delayed_indexing_polls_after_one_real_registrar_launc
     item = _registrar_claim()
     factory = _ClaudeFactory()
     source = _ClaudeSource([None, _registrar_projection(item)])
-    ticks = iter([0.0, 0.0, 0.1])
+    ticks = iter([0.0, 0.0, 0.1, 0.1])
     result = ClaudeNativeRegistrar(
         _ClaudeStore(),
         source,
         marker_secret=_REGISTRAR_SECRET,
+        startup_theme="light",
         pty_factory=factory,
         clock=lambda: 100.0,
         monotonic=lambda: next(ticks),
@@ -957,6 +961,7 @@ def test_claude_visibility_restart_before_expiry_waits_then_stale_lease_reconcil
             restarted,
             _ClaudeSource([None]),
             marker_secret=_REGISTRAR_SECRET,
+            startup_theme="light",
             pty_factory=factory,
             clock=lambda: now[0],
         ).process(reconciliation)

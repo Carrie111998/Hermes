@@ -1000,6 +1000,187 @@ def test_claude_visibility_status_does_not_construct_delivery_dependencies(
     assert result["last_registrar_result"] == {"tracked": False, "value": None}
 
 
+def test_claude_visibility_preflight_blocks_before_any_runtime_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    events: list[object] = []
+
+    def resolve_executable(_name: str) -> tuple[str, ...]:
+        events.append("resolve_executable")
+        return ("claude",)
+
+    def preflight(command: tuple[str, ...]) -> None:
+        events.append(("preflight", command))
+        return None
+
+    monkeypatch.setattr("session_bridge.cli.resolve_cli_executable", resolve_executable)
+    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(AssertionError("marker resolution")),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("source construction")
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("registrar construction")
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeVisibilityCoordinator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("coordinator construction")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(AssertionError("store/claim/cost access")),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_claude_visibility_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inventory access")
+        ),
+    )
+
+    with pytest.raises(
+        ProviderDegraded, match="claude_visibility_preflight_failed"
+    ):
+        backend.claude_visibility_run_once()
+
+    assert events == ["resolve_executable", ("preflight", ("claude",))]
+    assert backend._claude_visibility_coordinator is None
+
+
+def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    events: list[object] = []
+    store = object()
+    source = object()
+    coordinator = object()
+
+    def resolve_executable(_name: str) -> tuple[str, ...]:
+        events.append("resolve_executable")
+        return ("claude",)
+
+    def preflight(command: tuple[str, ...]) -> dict[str, str]:
+        events.append(("preflight", command))
+        return {
+            "version": "2.1.110",
+            "authentication": "available",
+            "theme": "light",
+        }
+
+    def marker_key() -> bytes:
+        events.append("marker")
+        return b"m" * 32
+
+    def source_factory(*_args: Any, **_kwargs: Any) -> object:
+        events.append("source")
+        return source
+
+    def store_factory() -> object:
+        events.append("store")
+        return store
+
+    def registrar_factory(*args: Any, **kwargs: Any) -> object:
+        events.append(("registrar", args, kwargs))
+        assert kwargs["startup_theme"] == "light"
+        return object()
+
+    def coordinator_factory(**kwargs: Any) -> object:
+        events.append(("coordinator", kwargs))
+        return coordinator
+
+    monkeypatch.setattr("session_bridge.cli.resolve_cli_executable", resolve_executable)
+    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", marker_key)
+    monkeypatch.setattr("session_bridge.cli.ClaudeSourceAdapter", source_factory)
+    monkeypatch.setattr("session_bridge.cli.ClaudeNativeRegistrar", registrar_factory)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeVisibilityCoordinator", coordinator_factory
+    )
+    monkeypatch.setattr(backend, "_require_store", store_factory)
+
+    assert backend._claude_visibility_runtime() is coordinator
+
+    assert events[:5] == [
+        "resolve_executable",
+        ("preflight", ("claude",)),
+        "marker",
+        "source",
+        "store",
+    ]
+    registrar_event = events[5]
+    assert isinstance(registrar_event, tuple)
+    assert registrar_event[0] == "registrar"
+    assert events[6][0] == "coordinator"  # type: ignore[index]
+
+    events.clear()
+    assert backend._claude_visibility_runtime() is coordinator
+    assert events == ["resolve_executable", ("preflight", ("claude",))]
+
+
+def test_characterization_preflight_blocks_before_store_or_registrar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    events: list[object] = []
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+
+    def preflight(command: tuple[str, ...]) -> None:
+        events.append(("preflight", command))
+        return None
+
+    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(AssertionError("marker resolution")),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(AssertionError("store/claim/cost access")),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("registrar construction")
+        ),
+    )
+
+    with pytest.raises(
+        ProviderDegraded, match="claude_visibility_preflight_failed"
+    ):
+        backend.characterize_claude_visibility()
+
+    assert events == [("preflight", ("claude",))]
+
+
 def test_claude_visibility_status_reports_durable_open_work_while_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

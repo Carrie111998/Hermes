@@ -37,6 +37,8 @@ from .models import OriginKind, ProjectedMessage, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
+# Empty setting sources exclude user/project/local settings. Claude's managed
+# policy settings remain authoritative; Session Bridge never bypasses them.
 _CLAUDE_STARTUP_ISOLATION_ARGS = (
     "--setting-sources=",
     "--mcp-config",
@@ -44,11 +46,29 @@ _CLAUDE_STARTUP_ISOLATION_ARGS = (
     "--strict-mcp-config",
     "--no-chrome",
 )
+_CLAUDE_STARTUP_THEMES = frozenset({
+    "dark",
+    "light",
+    "dark-daltonized",
+    "light-daltonized",
+    "dark-ansi",
+    "light-ansi",
+})
 _RESPONSE_SETTLE_SECONDS = 0.5
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _CLAUDE_2110_RESUME_SCAFFOLD = "No response requested."
 _MAX_AUTH_RECOVERY_ATTEMPTS = 24
+
+
+def _canonical_claude_startup_settings(theme: object) -> str:
+    """Return the sole isolated startup setting accepted by the registrar."""
+
+    if type(theme) is not str or theme not in _CLAUDE_STARTUP_THEMES:
+        raise ValueError("invalid Claude startup theme")
+    return json.dumps(
+        {"theme": theme}, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
 
 
 def build_characterization_auth_recovery_prompt(
@@ -786,6 +806,7 @@ class ClaudeNativeRegistrar:
         source_adapter: ClaudeReadableSource,
         *,
         marker_secret: bytes,
+        startup_theme: str,
         pty_factory: InteractivePtyFactory | None = None,
         claude_command: Sequence[str] = ("claude",),
         clock: Callable[[], float] = time.time,
@@ -800,6 +821,7 @@ class ClaudeNativeRegistrar:
         self._store = store
         self._source = source_adapter
         self._secret = marker_secret
+        self._startup_settings = _canonical_claude_startup_settings(startup_theme)
         self._factory = pty_factory or WindowsConPtyFactory()
         self._command = list(claude_command)
         self._clock = clock
@@ -868,6 +890,8 @@ class ClaudeNativeRegistrar:
             *self._command,
             "--resume",
             str(native_id),
+            "--settings",
+            self._startup_settings,
             *_CLAUDE_STARTUP_ISOLATION_ARGS,
             "--model",
             "haiku",
@@ -1115,6 +1139,8 @@ class ClaudeNativeRegistrar:
             identity.claude_uuid,
             "--name",
             candidate.native_name,
+            "--settings",
+            self._startup_settings,
             *_CLAUDE_STARTUP_ISOLATION_ARGS,
             "--model",
             "haiku",

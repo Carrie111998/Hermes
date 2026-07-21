@@ -298,10 +298,12 @@ def registrar(
     store: FakeStore | None = None,
     **kwargs: Any,
 ):
+    startup_theme = kwargs.pop("startup_theme", "light")
     return ClaudeNativeRegistrar(
         store or FakeStore(),
         source,
         marker_secret=SECRET,
+        startup_theme=startup_theme,
         pty_factory=factory,
         clock=lambda: 100.0,
         monotonic=lambda: 1.0,
@@ -312,6 +314,21 @@ def registrar(
         retry_delay=5.0,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize(
+    "startup_theme",
+    [None, "", "auto", "Light", "future-theme", {"theme": "light"}],
+)
+def test_registrar_rejects_noncanonical_startup_theme_before_spawn(
+    startup_theme: Any,
+) -> None:
+    factory = FakeFactory()
+
+    with pytest.raises(ValueError, match="invalid Claude startup theme"):
+        registrar(FakeSource(), factory, startup_theme=startup_theme)
+
+    assert factory.spawns == []
 
 
 def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
@@ -333,6 +350,8 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
                 item.reserved_claude_uuid,
                 "--name",
                 item.native_name,
+                "--settings",
+                '{"theme":"light"}',
                 "--setting-sources=",
                 "--mcp-config",
                 '{"mcpServers":{}}',
@@ -467,6 +486,8 @@ def test_auth_recovery_resumes_exact_uuid_interactively_without_create() -> None
                 "claude",
                 "--resume",
                 item.reserved_claude_uuid,
+                "--settings",
+                '{"theme":"light"}',
                 "--setting-sources=",
                 "--mcp-config",
                 '{"mcpServers":{}}',
@@ -951,6 +972,7 @@ def test_delayed_exact_transcript_is_polled_without_replacement() -> None:
         FakeStore(),
         source,
         marker_secret=SECRET,
+        startup_theme="light",
         pty_factory=factory,
         clock=lambda: 100.0,
         monotonic=lambda: next(ticks),
@@ -1337,6 +1359,40 @@ def test_winpty_readiness_never_returns_on_trust_dialog_marker_alone() -> None:
 
     assert "⏵⏵ don't ask on" not in output
     assert process.writes == ["\r"]
+    assert process.reads == 2
+
+
+def test_winpty_readiness_never_accepts_theme_or_onboarding_screen() -> None:
+    theme = (
+        "\x1b[?2004h\x1b[2JWelcome to Claude Code v2.1.110\r\n"
+        "Let's get started.\r\n> 1. Dark mode\r\n2. Light mode\r\n"
+        "Syntax theme: Monokai Extended\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([theme])
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration as exc:
+                raise EOFError from exc
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert "Let's get started" in output
+    assert "don't ask on" not in output
+    assert process.writes == []
     assert process.reads == 2
 
 
@@ -1901,6 +1957,7 @@ def test_registrar_completes_genuine_interactive_conpty_flow(
         cast(Any, FakeStore()),
         cast(Any, FakeSource([None, projection])),
         marker_secret=SECRET,
+        startup_theme="light",
         pty_factory=WindowsConPtyFactory(),
         claude_command=(sys.executable, str(fixture)),
         clock=lambda: 100.0,
@@ -1982,6 +2039,7 @@ def test_real_windows_authentication_failure_is_fixed_retry_with_cleanup(
         cast(Any, FakeStore()),
         cast(Any, FakeSource()),
         marker_secret=SECRET,
+        startup_theme="light",
         pty_factory=factory,
         claude_command=(sys.executable, str(fixture)),
         clock=lambda: 100.0,
