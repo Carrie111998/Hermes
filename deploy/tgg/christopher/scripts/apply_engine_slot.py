@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import grp
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,6 +124,31 @@ def main() -> int:
 
     user = pwd.getpwnam("pclaw")
     group = grp.getgrnam("pclaw")
+    # The LIVE processing key is owned by the activation transaction
+    # (processing_activation_transaction.py flips config pa.enabled + the gate
+    # file together, both-or-neither), NOT by the slot: every slot file pins
+    # pa.enabled false as its authored disabled-state default. This script
+    # runs as ExecStartPre on EVERY service start — re-imposing the slot copy
+    # verbatim silently reverted an in-flight activation's pa.enabled=true one
+    # second after the transaction wrote it (2026-07-21 rounds 6 and 7:
+    # config false + gate true -> consumer standby -> 20s confirmation
+    # timeout -> fail-closed rollback, engine-slot receipt stamped between the
+    # transaction's write and the consumer's first read). Preserve the live
+    # value across the copy; fail-closed default when unreadable. The gate
+    # file (which this script never touches) remains the second key, so a
+    # preserved-true config alone still processes nothing.
+    live_processing_enabled = False
+    live_config_path = hermes_home / "config.yaml"
+    if live_config_path.is_file():
+        pa_match = re.search(
+            r"^pa:\s*(?:#.*)?\n((?:[ \t].*\n|\n)*)",
+            live_config_path.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        if pa_match and re.search(
+            r"^  enabled:\s*true\s*(?:#.*)?$", pa_match.group(1), flags=re.MULTILINE
+        ):
+            live_processing_enabled = True
     _atomic_copy(
         slot_root / "config.yaml",
         hermes_home / "config.yaml",
@@ -130,6 +156,23 @@ def main() -> int:
         uid=0,
         gid=group.gr_gid,
     )
+    if live_processing_enabled:
+        config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+        patched, count = re.subn(
+            r"(^pa:\s*(?:#.*)?\n  enabled:)\s*false(\s*(?:#.*)?$)",
+            r"\1 true\2",
+            config_text,
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise RuntimeError(
+                f"expected exactly one pa.enabled to re-apply the live processing key, found {count}"
+            )
+        patch_tmp = hermes_home / f".config.{os.getpid()}.tmp"
+        patch_tmp.write_text(patched, encoding="utf-8")
+        os.chmod(patch_tmp, 0o640)
+        os.chown(patch_tmp, 0, group.gr_gid)
+        os.replace(patch_tmp, hermes_home / "config.yaml")
     _atomic_copy(
         slot_root / "christopher_tgg_constitution.yaml",
         hermes_home / "christopher_tgg_constitution.yaml",
