@@ -543,6 +543,7 @@ describe("ProfilesPage reasoning effort selector", () => {
   it.each([
     { initialEffort: "", selectedEffort: "high", label: "sets a concrete effort" },
     { initialEffort: "high", selectedEffort: "", label: "clears the effort" },
+    { initialEffort: "high", selectedEffort: "none", label: "disables thinking" },
   ])(
     "allows reasoning-only saves for an unlisted stored model when it $label",
     async ({ initialEffort, selectedEffort }) => {
@@ -591,7 +592,11 @@ describe("ProfilesPage reasoning effort selector", () => {
       expect(selects).toHaveLength(2);
       await chooseOption(
         selects[1],
-        selectedEffort ? "High" : "Inherit provider default",
+        selectedEffort === "high"
+          ? "High"
+          : selectedEffort === "none"
+            ? "Off (no thinking)"
+            : "Inherit provider default",
       );
       const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
         (button) => button.textContent?.trim() === "Save",
