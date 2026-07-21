@@ -222,6 +222,16 @@ class DurableInbox:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reply_deliveries (
+                    delivery_key TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL,
+                    reply_to_message_id TEXT,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('delivered','undelivered')),
+                    bridge_message_id TEXT,
+                    error TEXT,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS ingress_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     message_id TEXT NOT NULL UNIQUE,
@@ -408,6 +418,43 @@ class DurableInbox:
                 "SELECT status,COUNT(*) AS n FROM ingress_events GROUP BY status"
             ).fetchall()
         return {str(row["status"]): int(row["n"]) for row in rows}
+
+    def claim_reply_delivery(
+        self, delivery_key: str, *, chat_id: str, reply_to_message_id: str | None
+    ) -> bool:
+        """Durably claim a reply delivery BEFORE the send (at-most-once).
+
+        Returns True when this call claimed the key. A crash between send and
+        the outcome update leaves the claim row behind, which permanently
+        refuses a re-send — undelivered-and-loud over retry-into-spam.
+        """
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO reply_deliveries(
+                    delivery_key,chat_id,reply_to_message_id,status,error,created_at
+                ) VALUES(?,?,?,'undelivered','claimed-in-flight',?)
+                """,
+                (delivery_key, chat_id, reply_to_message_id, _utc_now()),
+            )
+            return cursor.rowcount == 1
+
+    def record_reply_delivery(
+        self,
+        delivery_key: str,
+        *,
+        status: str,
+        bridge_message_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"delivered", "undelivered"}:
+            raise ValueError(f"invalid reply delivery status {status!r}")
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE reply_deliveries SET status=?, bridge_message_id=?, error=? "
+                "WHERE delivery_key=?",
+                (status, bridge_message_id, error, delivery_key),
+            )
 
 
 def processing_enabled(config_path: Path) -> bool:
@@ -625,8 +672,171 @@ async def process_live_records(
         "model": model,
         "processed": int(result.processed or 0),
         "handled": handled,
+        "captured_outbound": [dict(entry) for entry in result.outbound],
         "outbound_sent": 0,
     }
+
+
+def _management_selector_chats(config_path: Path) -> frozenset[str]:
+    """WhatsApp chats bound to the tgg_management selector class.
+
+    The reply-delivery decision keys on the SELECTOR of the inbound chat
+    (teren 2026-07-21 12:00 ruling) — never on prose or model output.
+    Ingest/site-selector chats are structurally absent from this set, so
+    their captured responses can never deliver.
+    """
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    pa = data.get("pa") if isinstance(data, dict) else None
+    constitution_raw = str((pa or {}).get("constitution_path") or "")
+    if not constitution_raw:
+        return frozenset()
+    constitution_path = Path(constitution_raw)
+    if not constitution_path.is_file():
+        return frozenset()
+    constitution = yaml.safe_load(constitution_path.read_text(encoding="utf-8")) or {}
+    chats: set[str] = set()
+    for selector in constitution.get("selectors") or []:
+        if not isinstance(selector, Mapping):
+            continue
+        match = selector.get("match") or {}
+        if (
+            selector.get("job_type") == "tgg_management"
+            and match.get("source.platform") == "whatsapp"
+            and match.get("source.chat_id")
+        ):
+            chats.add(str(match.get("source.chat_id")))
+    return frozenset(chats)
+
+
+def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract (chat_id, content, reply_to) from a captured adapter send.
+
+    Only plain text ``send`` calls are deliverable; media/confirm/clarify
+    kinds stay capture-only.
+    """
+    if not isinstance(entry, Mapping) or entry.get("kind") != "send":
+        return None
+    args = list(entry.get("args") or [])
+    kwargs = dict(entry.get("kwargs") or {})
+    chat_id = str(kwargs.get("chat_id") or (args[0] if len(args) > 0 else "") or "")
+    content = str(kwargs.get("content") or (args[1] if len(args) > 1 else "") or "")
+    reply_to = kwargs.get("reply_to") if kwargs.get("reply_to") else (
+        args[2] if len(args) > 2 else None
+    )
+    if not chat_id or not content.strip():
+        return None
+    return {
+        "chat_id": chat_id,
+        "content": content,
+        "reply_to": str(reply_to) if reply_to else None,
+    }
+
+
+def deliver_management_replies(
+    inbox: DurableInbox,
+    *,
+    config_path: Path,
+    captured_outbound: Sequence[Mapping[str, Any]],
+    batch_records: Sequence[InboxRecord],
+) -> dict[str, int]:
+    """Deliver mgmt-selector responses through the rung-gated bridge.
+
+    Contract (teren 2026-07-21 12:00 ruling):
+    - delivery keys on the inbound chat's selector class: management only;
+      site/ingest responses stay capture-only forever.
+    - every send goes through the bridge POST /send — the 4-layer outbound
+      stack (policy, authority, lease, guarded transport) is THE enforcement;
+      no allowlist logic is duplicated here and a bridge refusal is final.
+    - at-most-once per turn response: a durable claim precedes the send; a
+      failure logs loudly and records undelivered — never retries.
+    """
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
+
+    summary = {"delivered": 0, "undelivered": 0, "suppressed": 0, "duplicate": 0}
+    sends = [
+        parsed
+        for parsed in (_parse_captured_send(entry) for entry in captured_outbound)
+        if parsed is not None
+    ]
+    if not sends:
+        return summary
+    management_chats = _management_selector_chats(config_path)
+    bridge_url = os.environ.get("TGG_REPLY_BRIDGE_URL", "http://127.0.0.1:3011").rstrip("/")
+    newest_message_by_chat: dict[str, str] = {}
+    for record in batch_records:
+        newest_message_by_chat[record.chat_id] = record.message_id
+    for send in sends:
+        chat_id = send["chat_id"]
+        if chat_id not in management_chats:
+            summary["suppressed"] += 1
+            continue
+        anchor = send["reply_to"] or newest_message_by_chat.get(chat_id)
+        delivery_key = f"{chat_id}::{anchor or 'no-anchor'}"
+        if not inbox.claim_reply_delivery(
+            delivery_key, chat_id=chat_id, reply_to_message_id=anchor
+        ):
+            summary["duplicate"] += 1
+            continue
+        if not anchor:
+            print(
+                f"reply delivery undelivered (no reply anchor): chat={chat_id}",
+                file=sys.stderr,
+            )
+            inbox.record_reply_delivery(
+                delivery_key, status="undelivered", error="no-reply-anchor"
+            )
+            summary["undelivered"] += 1
+            continue
+        body = json.dumps(
+            {
+                "chatId": chat_id,
+                "message": send["content"],
+                "replyTo": {"messageId": anchor},
+            }
+        ).encode()
+        request = Request(
+            f"{bridge_url}/send",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read() or b"{}")
+            inbox.record_reply_delivery(
+                delivery_key,
+                status="delivered",
+                bridge_message_id=str(payload.get("messageId") or ""),
+            )
+            summary["delivered"] += 1
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode(errors="replace")[:300]
+            except Exception:
+                pass
+            print(
+                "reply delivery REFUSED/FAILED at bridge: "
+                f"chat={chat_id} anchor={anchor} http={exc.code} detail={detail}",
+                file=sys.stderr,
+            )
+            inbox.record_reply_delivery(
+                delivery_key,
+                status="undelivered",
+                error=f"http-{exc.code}: {detail}",
+            )
+            summary["undelivered"] += 1
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            print(
+                f"reply delivery FAILED (transport): chat={chat_id} anchor={anchor} error={exc}",
+                file=sys.stderr,
+            )
+            inbox.record_reply_delivery(
+                delivery_key, status="undelivered", error=str(exc)[:300]
+            )
+            summary["undelivered"] += 1
+    return summary
 
 
 def _write_status(path: Path, payload: Mapping[str, Any]) -> None:
@@ -720,6 +930,26 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     inbox.finish(records, status="failed", error=str(exc))
                     raise
+                # Management-selector reply delivery (teren 2026-07-21): runs
+                # AFTER classification is committed, outside its try, so a
+                # delivery problem can never re-mark records or fail ingest.
+                # deliver_management_replies swallows per-send errors (loud
+                # log + durable undelivered mark, never a retry); this guard
+                # covers unexpected faults in the delivery machinery itself.
+                try:
+                    delivery = deliver_management_replies(
+                        inbox,
+                        config_path=config_path,
+                        captured_outbound=result.get("captured_outbound") or [],
+                        batch_records=records,
+                    )
+                    if delivery.get("delivered") or delivery.get("undelivered"):
+                        print(f"reply deliveries: {delivery}", file=sys.stderr)
+                except Exception as exc:
+                    print(
+                        f"reply delivery machinery FAILED (ingest unaffected): {exc}",
+                        file=sys.stderr,
+                    )
             _write_status(
                 status_path,
                 {
