@@ -1169,7 +1169,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug"})
+#   - version: low-frequency info command; the upstream 2026-07-21 sync added
+#     enough new canonical commands to hit the 50-slot cap and clamp it off
+#     the native registry — reached via /hermes version on Slack instead.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "version"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
