@@ -241,7 +241,7 @@ def _bridge_objects(db_path: Path) -> list[tuple[str, str, str]]:
         conn.close()
 
 
-def test_fresh_database_creates_bridge_tables_indexes_and_schema_v21(tmp_path):
+def test_fresh_database_creates_bridge_tables_indexes_and_current_schema(tmp_path):
     db = hermes_state.SessionDB(tmp_path / "fresh.db")
     try:
         tables = {
@@ -253,7 +253,7 @@ def test_fresh_database_creates_bridge_tables_indexes_and_schema_v21(tmp_path):
         version = db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
 
         assert EXPECTED_BRIDGE_TABLES <= tables
-        assert version == 21
+        assert version == hermes_state.SCHEMA_VERSION
 
         for index_name, expected_columns in EXPECTED_BRIDGE_INDEXES.items():
             rows = db._conn.execute(f'PRAGMA index_info("{index_name}")').fetchall()
@@ -285,7 +285,7 @@ def test_v20_database_upgrades_without_changing_existing_rows(tmp_path):
             (message_id,),
         ).fetchone()
 
-        assert version == 21
+        assert version == hermes_state.SCHEMA_VERSION
         assert tuple(session) == ("existing-session", "cli", 1000.0)
         assert tuple(message) == (
             message_id,
@@ -318,7 +318,7 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         versions = conn.execute("SELECT version FROM schema_version").fetchall()
-        assert versions == [(21,)]
+        assert versions == [(hermes_state.SCHEMA_VERSION,)]
         assert _bridge_objects(db_path) == first_objects
         assert len(first_objects) == len(EXPECTED_BRIDGE_TABLES) + len(
             EXPECTED_BRIDGE_INDEXES
@@ -327,10 +327,10 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
         conn.close()
 
 
-def test_reopening_v21_database_repairs_missing_sidebar_indexes_without_data_loss(
+def test_reopening_current_database_repairs_missing_sidebar_indexes_without_data_loss(
     tmp_path,
 ):
-    db_path = tmp_path / "v21-missing-sidebar-digest-indexes.db"
+    db_path = tmp_path / "current-missing-sidebar-digest-indexes.db"
     db = hermes_state.SessionDB(db_path)
     try:
         _seed_sessions(db._conn, "source")
@@ -363,7 +363,7 @@ def test_reopening_v21_database_repairs_missing_sidebar_indexes_without_data_los
                FROM session_sidebar_jobs ORDER BY id"""
         ).fetchall()
         assert conn.execute("SELECT version FROM schema_version").fetchall() == [
-            (21,)
+            (hermes_state.SCHEMA_VERSION,)
         ]
         placeholders = ",".join("?" for _ in EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL)
         missing = conn.execute(
@@ -387,7 +387,7 @@ def test_reopening_v21_database_repairs_missing_sidebar_indexes_without_data_los
         versions = reopened._conn.execute(
             "SELECT version FROM schema_version"
         ).fetchall()
-        assert [tuple(row) for row in versions] == [(21,)]
+        assert [tuple(row) for row in versions] == [(hermes_state.SCHEMA_VERSION,)]
         for index_name, expected_sql in EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL.items():
             row = reopened._conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
