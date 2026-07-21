@@ -357,12 +357,32 @@ class DurableInbox:
         _atomic_write_json(cursor_path, asdict(updated))
         return len(staged)
 
-    def pending(self, *, limit: int = 10) -> list[InboxRecord]:
+    def pending(
+        self,
+        *,
+        limit: int = 10,
+        priority_chats: frozenset[str] | set[str] | None = None,
+    ) -> list[InboxRecord]:
+        """Pending records, priority chats first, then source order.
+
+        Management chats jump the drain queue (2026-07-21): a fresh mgmt
+        message must not wait behind a thousand-record site backlog for its
+        reply. Per-chat ordering stays strictly by seq within each class, and
+        chats are independent sessions, so cross-chat reordering is safe.
+        """
+        priority = sorted(priority_chats or ())
+        placeholders = ",".join("?" for _ in priority)
+        priority_clause = (
+            f"(CASE WHEN chat_id IN ({placeholders}) THEN 0 ELSE 1 END), "
+            if priority
+            else ""
+        )
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
-                "FROM ingress_events WHERE status='pending' ORDER BY seq LIMIT ?",
-                (max(1, limit),),
+                "FROM ingress_events WHERE status='pending' "
+                f"ORDER BY {priority_clause}seq LIMIT ?",
+                (*priority, max(1, limit)),
             ).fetchall()
         return [
             InboxRecord(
@@ -928,10 +948,25 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     "inbox": inbox.counts(),
                 },
             )
+            # Stage until the cursor reaches the file head: staging is
+            # disk-bound and cheap, and the mgmt-priority pick below is only
+            # meaningful when fresh messages are actually staged — otherwise
+            # a new management message waits behind the whole backlog just
+            # to enter the inbox.
             staged = inbox.stage_from_source(
                 source, cursor, max_records=args.max_records
             )
-            records = inbox.pending(limit=args.max_records)
+            while staged >= args.max_records:
+                staged = inbox.stage_from_source(
+                    source, cursor, max_records=args.max_records
+                )
+            try:
+                priority_chats = _management_selector_chats(config_path)
+            except Exception:
+                priority_chats = frozenset()
+            records = inbox.pending(
+                limit=args.max_records, priority_chats=priority_chats
+            )
             if records:
                 inbox.claim(records)
                 try:
