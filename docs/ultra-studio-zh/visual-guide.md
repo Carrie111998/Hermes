@@ -23,7 +23,6 @@
 
 - [P0 MVP 垂直切片](research-analysis/01-p0-mvp-vertical-slice)
 - [Agent Runtime Contract](product-specs/02-agent-runtime-contract)
-- [12 工作流路由器](product-specs/components/12-workflow-router)
 - [Media Job Service](product-specs/components/10-media-job-service)
 - [19 模型目录与供应商约束](product-specs/components/19-model-catalog-provider-constraints)
 
@@ -42,6 +41,7 @@
 - [控制面设计](infra-design/03-control-plane-design)
 - [数据面设计](infra-design/05-data-plane-design)
 - [安全与运维设计](infra-design/06-security-ops-design)
+- [Hermes 服务化、容器化与多用户隔离](infra-design/09-hermes-service-containerization-multi-tenant-isolation)
 
 ## 状态解释
 

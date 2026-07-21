@@ -20,7 +20,6 @@
 | [09 资产服务](09-asset-service) | 资产库的后端实体和 API，负责 media_assets、来源链路、下载、索引、collections、characters。 |
 | [10 媒体任务服务](10-media-job-service) | 把图片/视频生成从同步工具升级为可追踪 job：submit、poll、状态事件、产物入库、失败恢复。 |
 | [11 技能注册表](11-skill-registry) | 管理 agent 可见技能、渐进加载、安装守卫、Ultra allowlist、评估和版本。它决定“做视频”时 agent 应该看到哪些技能。 |
-| [12 工作流路由器](12-workflow-router) | 在真正生成前判断 intent、asset roles、缺失字段、workflow_skill 和下一步。它要先问清楚，而不是一进来就开跑。 |
 | [13 提示词编译器](13-prompt-compiler) | 把用户自然语言、技能规则、模型约束、资产引用和安全边界编译成 provider payload。不是简单润色 prompt。 |
 | [14 沙箱生命周期](14-sandbox-lifecycle) | 管理每个任务的执行环境：创建、挂载文件、运行工具、暂停、唤醒、销毁。Atlas-only P0 可以先弱化，但不能把它当已经完整。 |
 | [15 人工审批网关](15-human-approval-gateway) | 对高风险动作、付费调用、删除、外发、重试消耗等操作做明确审批。要可恢复、可检查。 |
@@ -33,7 +32,7 @@
 
 1. 先读 `01-left-nav-shell`、`02-creative-chat-ui`、`03-inspector-live-panel`，理解产品表面。
 2. 再读 `07-tasks-session-history`、`10-media-job-service`、`08/09-asset`，理解任务和资产闭环。
-3. 接着读 `11-skill-registry`、`12-workflow-router`、`13-prompt-compiler`，理解 Agent 如何选择 Skill 和工具。
+3. 接着读 `11-skill-registry`、`13-prompt-compiler`，理解 Agent 如何选择 Skill 和工具。
 4. 最后读 `14-19`，理解 Sandbox、Approval、Ledger、TokenRouter、CometAPI、Model Catalog 这些基建边界。
 
 ## 状态说明

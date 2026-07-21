@@ -45,7 +45,7 @@ features:
 6. 再看 [完整建设图谱](architecture-blueprint)，确认控制面、执行面、数据面、安全运维和路线图。
 7. 如果要排长期能力，看 [完整长期参考](long-term-reference)，里面覆盖 TokenRouter、CometAPI、Sandbox lifecycle、Asset Service、Memory、Marketplace、Ledger 和 Cloud tenant layer。
 8. 如果要核对旧资料和 Notion/Lark 来源，看 [源文档归档](source-archive/README) 和 [完整源文档清单](source-archive/inventory)。
-9. 如果要开始落地，直接进 [P0 MVP 垂直切片](research-analysis/01-p0-mvp-vertical-slice) 和 [工作流路由器](product-specs/components/12-workflow-router)。
+9. 如果要开始落地，直接进 [P0 MVP 垂直切片](research-analysis/01-p0-mvp-vertical-slice) 和 Skill Registry。
 10. 如果要上线或交接，看 [信息保留与上线说明](preservation-and-deploy)。
 
 ## 本地使用

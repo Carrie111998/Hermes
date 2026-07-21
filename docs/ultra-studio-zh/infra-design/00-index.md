@@ -53,6 +53,14 @@
 - 组件规格把每个界面/服务拆成可实施功能。
 - 基建设计定义 Gateway、Sandbox、Data Plane、Security、TokenRouter、CometAPI 的长期边界。
 - 调研分析决定 P0 应该做什么、什么必须推迟。
+- [Hermes 服务化、容器化与多用户隔离](09-hermes-service-containerization-multi-tenant-isolation) 把这些长期边界收敛成可执行的 Cell、Worker Pool、按需 sandbox 和发布门槛。
+
+## 实施专题
+
+| 专题 | 解决的问题 |
+|---|---|
+| [Hermes Fork 隔离与多租户控制面迁移](08-hermes-fork-isolation-migration) | 当前 fork 中哪些多租户、鉴权、UI 和 provider 能力应迁出或保留。 |
+| [Hermes 服务化、容器化与多用户隔离](09-hermes-service-containerization-multi-tenant-isolation) | Hermes 如何作为服务部署、何时创建 sandbox，以及用户、数据、凭证和执行环境如何隔离。 |
 
 ## 开放问题
 

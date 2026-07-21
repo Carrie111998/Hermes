@@ -66,7 +66,6 @@ User Message
 | Principal Headers / Session Scope | implemented for gateway boundary | `gateway/principal_headers.py`、`gateway/session_scope_store.py` | [权限边界](permission-boundary-design) | 接到产品 BFF 后保持 fail-closed；不要让浏览器直接伪造 principal。 |
 | Local Policy Checker | partial | `agent/ultra_security.py` | [权限边界](permission-boundary-design)、[17 TokenRouter](product-specs/components/17-tokenrouter) | P0 可先用同形接口；TokenRouter 不在 Hermes core 内补完整服务。 |
 | Creative Skill Allowlist | implemented helper | `hermes_cli/ultra_studio_skills.py`、`hermes_cli/subcommands/skills.py` | [11 技能注册表](product-specs/components/11-skill-registry) | 接到 profile/runtime，使默认 Ultra 模式只暴露聚焦技能。 |
-| workflow-router skill | partial | `skills/creative/workflow-router/SKILL.md` | [12 工作流路由器](product-specs/components/12-workflow-router) | 产出稳定结构化 handoff，不只停留在 skill 文本。 |
 | media-qa / prompt-repair | partial | `skills/creative/media-qa/SKILL.md`、`skills/creative/prompt-repair/SKILL.md` | [04 技能、工具与提示词合约](product-specs/04-skill-tool-prompt-contract) | 接到失败作业和 Inspector，而不是只作为手动技能。 |
 | Prompt Compiler | spec-only | 未发现稳定 runtime 编译器 | [13 提示词编译器](product-specs/components/13-prompt-compiler) | 把 workflow handoff 编译为工具参数，禁止自然语言裸传资产 ID。 |
 | Atlas Image Provider | implemented provider | `plugins/image_gen/atlas/__init__.py`、`plugins/image_gen/atlas/client.py` | [10 媒体任务服务](product-specs/components/10-media-job-service) | 包进 MediaJob 信封，输出交给 Asset Service finalize。 |

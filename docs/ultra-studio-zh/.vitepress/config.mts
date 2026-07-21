@@ -23,7 +23,6 @@ const componentItems = [
   { text: '09 资产服务', link: '/product-specs/components/09-asset-service' },
   { text: '10 媒体任务服务', link: '/product-specs/components/10-media-job-service' },
   { text: '11 技能注册表', link: '/product-specs/components/11-skill-registry' },
-  { text: '12 工作流路由器', link: '/product-specs/components/12-workflow-router' },
   { text: '13 提示词编译器', link: '/product-specs/components/13-prompt-compiler' },
   { text: '14 沙箱生命周期', link: '/product-specs/components/14-sandbox-lifecycle' },
   { text: '15 人工审批网关', link: '/product-specs/components/15-human-approval-gateway' },
@@ -42,7 +41,8 @@ const infraItems = [
   { text: '数据面设计', link: '/infra-design/05-data-plane-design' },
   { text: '安全与运维设计', link: '/infra-design/06-security-ops-design' },
   { text: '验证路线', link: '/infra-design/07-validation-roadmap' },
-  { text: 'Hermes Fork 隔离迁移', link: '/infra-design/08-hermes-fork-isolation-migration' }
+  { text: 'Hermes Fork 隔离迁移', link: '/infra-design/08-hermes-fork-isolation-migration' },
+  { text: 'Hermes 服务化与多用户隔离', link: '/infra-design/09-hermes-service-containerization-multi-tenant-isolation' }
 ]
 
 const researchItems = [

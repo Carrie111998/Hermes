@@ -31,7 +31,6 @@ path; planned behavior is never presented as shipped.
 | [09-asset-service.md](09-asset-service.md) | Asset Service | spec-only | Entities/APIs/indexing fully designed; no service code. |
 | [10-media-job-service.md](10-media-job-service.md) | Media Job Service | partial | Sync generation tools + Atlas submit/poll shipped; durable jobs spec-only. |
 | [11-skill-registry.md](11-skill-registry.md) | Skill Registry | partial | Discovery, progressive loading, install/guard shipped; Ultra profile + evals spec-only. |
-| [12-workflow-router.md](12-workflow-router.md) | Workflow Router | partial | Skill package + allowlist helpers exist; runtime wiring spec-only. |
 | [13-prompt-compiler.md](13-prompt-compiler.md) | Prompt Compiler | spec-only | Compile/enhance tools undefined in code; payload builders exist below. |
 | [14-sandbox-lifecycle.md](14-sandbox-lifecycle.md) | Sandbox Lifecycle | partial | Multi-backend environments shipped; product lifecycle verbs spec-only. |
 | [15-human-approval-gateway.md](15-human-approval-gateway.md) | Human Approval Gateway | partial | Approval + clarify machinery shipped; durable typed decisions spec-only. |

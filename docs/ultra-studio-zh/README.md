@@ -57,7 +57,6 @@
 - [资产服务](product-specs/components/09-asset-service)
 - [Media Job Service](product-specs/components/10-media-job-service)
 - [技能注册表](product-specs/components/11-skill-registry)
-- [12 工作流路由器](product-specs/components/12-workflow-router)
 - [提示词编译器（Prompt Compiler）](product-specs/components/13-prompt-compiler)
 - [14 沙箱生命周期](product-specs/components/14-sandbox-lifecycle)
 - [15 人工审批网关](product-specs/components/15-human-approval-gateway)
@@ -89,6 +88,7 @@
 - [安全与运维设计](infra-design/06-security-ops-design)
 - [基础设施验证路线](infra-design/07-validation-roadmap)
 - [Hermes Fork 隔离与多租户控制面迁移](infra-design/08-hermes-fork-isolation-migration)
+- [Hermes 服务化、容器化与多用户隔离](infra-design/09-hermes-service-containerization-multi-tenant-isolation)
 
 ## 独立专题
 
