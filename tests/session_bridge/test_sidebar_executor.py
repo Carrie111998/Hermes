@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import sqlite3
 import threading
-from typing import Any
+from typing import Any, Callable, cast
 
 import pytest
 
 from session_bridge.models import BridgeMarkerPayload, Provider
+from session_bridge.codex_adapter import SidebarThreadVerifier
 from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
 from session_bridge.sidebar_executor import (
     NativeCreateAmbiguous,
+    NativeCreateRejected,
     NativeThreadState,
+    NativeThreadStatus,
     SidebarExecutionResult,
     SidebarExecutor,
 )
+from session_bridge.store import SIDEBAR_FATAL_ERRORS, SessionBridgeStore
 
 
 SOURCE_1 = "claude:source-1"
@@ -67,14 +73,25 @@ class FakeStore:
         *,
         bind_error: Exception | None = None,
         commit_error: Exception | None = None,
+        candidate_error: Exception | None = None,
+        candidate_override: SidebarCandidate | None = None,
+        failure_state: str | None = None,
+        failure_error: Exception | None = None,
+        failure_result: object | None = None,
     ) -> None:
         self.events = events
         self.jobs = jobs
         self.bind_error = bind_error
         self.commit_error = commit_error
+        self.candidate_error = candidate_error
+        self.candidate_override = candidate_override
+        self.failure_state = failure_state
+        self.failure_error = failure_error
+        self.failure_result = failure_result
         self.candidates = {
-            job["source_session_id"]: _candidate(job["source_session_id"])
+            source: _candidate(source)
             for job in jobs
+            if isinstance((source := job.get("source_session_id")), str)
         }
         self.failures: list[str] = []
 
@@ -96,6 +113,10 @@ class FakeStore:
 
     def get_sidebar_candidate_for_delivery(self, source_session_id: str) -> SidebarCandidate:
         self.events.append(("candidate", source_session_id))
+        if self.candidate_error is not None:
+            raise self.candidate_error
+        if self.candidate_override is not None:
+            return self.candidate_override
         return self.candidates[source_session_id]
 
     def bind_sidebar_thread(
@@ -138,9 +159,13 @@ class FakeStore:
         del lease_token, now
         self.events.append(("fail", error_code))
         self.failures.append(error_code)
-        state = (
+        if self.failure_error is not None:
+            raise self.failure_error
+        if self.failure_result is not None:
+            return self.failure_result  # type: ignore[return-value]
+        state = self.failure_state or (
             "sidebar_failed"
-            if error_code == "native_create_ambiguous"
+            if error_code in SIDEBAR_FATAL_ERRORS
             else "sidebar_retry"
         )
         return {"state": state, "error_code": error_code}
@@ -183,6 +208,7 @@ class FakeNative:
         rename_error: Exception | None = None,
         read_thread_id: str | None = None,
         read_cwd: str = "C:/source",
+        after_create: Callable[[], None] | None = None,
     ) -> None:
         self.events = events
         self.create_result = create_result
@@ -190,19 +216,30 @@ class FakeNative:
         self.rename_error = rename_error
         self.read_thread_id = read_thread_id
         self.read_cwd = read_cwd
+        self.after_create = after_create
         self.create_calls = 0
 
-    def create_thread(self, *, prompt: str, candidate: SidebarCandidate) -> str:
+    def create_thread(
+        self,
+        *,
+        prompt: str,
+        candidate: SidebarCandidate,
+        deadline: float,
+    ) -> str:
         assert candidate.cwd == "C:/source"
         assert "Signed marker:" in prompt
-        self.events.append(("create", candidate.source_session_id))
+        self.events.append(("create", candidate.source_session_id, deadline))
         self.create_calls += 1
         if isinstance(self.create_result, Exception):
             raise self.create_result
+        if self.after_create is not None:
+            self.after_create()
         return self.create_result  # type: ignore[return-value]
 
-    def read_thread_state(self, *, thread_id: str) -> NativeThreadState | None:
-        self.events.append(("read", thread_id))
+    def read_thread_state(
+        self, *, thread_id: str, deadline: float
+    ) -> NativeThreadState | None:
+        self.events.append(("read", thread_id, deadline))
         if len(self.statuses) > 1:
             status = self.statuses.pop(0)
         else:
@@ -211,13 +248,13 @@ class FakeNative:
             return None
         return NativeThreadState(
             thread_id=self.read_thread_id or thread_id,
-            status=status,
+            status=NativeThreadStatus(status),
             cwd=self.read_cwd,
         )
 
-    def rename_thread(self, *, thread_id: str, title: str) -> None:
+    def rename_thread(self, *, thread_id: str, title: str, deadline: float) -> None:
         assert title.startswith("[Claude]")
-        self.events.append(("rename", thread_id))
+        self.events.append(("rename", thread_id, deadline))
         if self.rename_error is not None:
             raise self.rename_error
 
@@ -229,10 +266,11 @@ def _executor(
     clock: FakeClock,
     *,
     read_timeout_seconds: float = 60.0,
+    operation_budget_seconds: float = 240.0,
 ) -> SidebarExecutor:
     return SidebarExecutor(
-        store=store,
-        verifier=verifier,
+        store=cast(SessionBridgeStore, store),
+        verifier=cast(SidebarThreadVerifier, verifier),
         native=native,
         marker_secret=SECRET,
         clock=clock,
@@ -240,6 +278,7 @@ def _executor(
         sleep=clock.sleep,
         read_timeout_seconds=read_timeout_seconds,
         poll_interval=1.0,
+        operation_budget_seconds=operation_budget_seconds,
     )
 
 
@@ -314,6 +353,35 @@ def test_ambiguous_create_is_quarantined_and_never_replaced() -> None:
     assert not any(event[0] in {"bind", "read", "rename", "commit"} for event in events)
 
 
+def test_unknown_create_exception_is_fatal_ambiguity() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(events, create_result=RuntimeError())
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result.status == "failed"
+    assert result.error_code == "native_create_ambiguous"
+    assert store.failures == ["native_create_ambiguous"]
+
+
+def test_explicit_pre_dispatch_create_rejection_is_retryable() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(
+        events,
+        create_result=NativeCreateRejected("codex_tool_unavailable"),
+    )
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result.status == "retry"
+    assert result.error_code == "codex_tool_unavailable"
+    assert store.failures == ["codex_tool_unavailable"]
+
+
 @pytest.mark.parametrize("create_result", [None, "", 42])
 def test_missing_or_malformed_create_result_is_fatal_ambiguity(
     create_result: object,
@@ -356,6 +424,131 @@ def test_bind_ambiguity_releases_once_without_read_rename_or_commit() -> None:
         "bind",
         "fail",
     ]
+
+
+def test_retryable_failure_reports_failed_when_retry_budget_is_exhausted() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        bind_error=TimeoutError(),
+        failure_state="sidebar_failed",
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == "failed"
+    assert result.error_code == "bridge_temporarily_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("failure_error", "failure_result"),
+    [
+        (TimeoutError(), None),
+        (None, {"state": "not-a-sidebar-state"}),
+    ],
+)
+def test_settlement_failure_reports_unsettled_without_claiming_transition(
+    failure_error: Exception | None,
+    failure_result: object | None,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        bind_error=TimeoutError(),
+        failure_error=failure_error,
+        failure_result=failure_result,
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == "unsettled"
+    assert result.error_code == "bridge_temporarily_unavailable"
+    assert store.failures == ["bridge_temporarily_unavailable"]
+
+
+def test_candidate_lookup_corruption_settles_once_as_source_identity_mismatch() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        candidate_error=ValueError("corrupt candidate"),
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == "failed"
+    assert result.error_code == "source_identity_mismatch"
+    assert store.failures == ["source_identity_mismatch"]
+    assert [event[0] for event in events] == ["claim", "candidate", "fail"]
+
+
+def test_post_claim_parse_error_settles_once_when_lease_token_is_available() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    malformed = _job(SOURCE_1)
+    malformed["source_session_id"] = None
+    store = FakeStore(events, [malformed])
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == "failed"
+    assert result.error_code == "source_identity_mismatch"
+    assert store.failures == ["source_identity_mismatch"]
+
+
+def test_post_claim_parse_error_without_lease_token_is_explicitly_unsettled() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+
+    class MissingLeaseStore(FakeStore):
+        def claim_sidebar_jobs(
+            self, *, now: float, limit: int, lease_seconds: int
+        ) -> list[dict[str, Any]]:
+            claims = super().claim_sidebar_jobs(
+                now=now,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            )
+            claims[0]["lease_token"] = None
+            return claims
+
+    store = MissingLeaseStore(events, [_job(SOURCE_1)])
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == "unsettled"
+    assert result.error_code == "source_identity_mismatch"
+    assert store.failures == []
 
 
 def test_read_until_idle_timeout_is_retryable_and_never_renames() -> None:
@@ -420,6 +613,19 @@ def test_native_read_accepts_filesystem_equivalent_cwd() -> None:
     assert result.status == "visible"
 
 
+def test_terminal_native_state_fails_without_polling() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    native = FakeNative(events, statuses=["terminal"])
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result.status == "retry"
+    assert result.error_code == "native_task_not_indexed"
+    assert sum(event[0] == "read" for event in events) == 1
+
+
 def test_rename_failure_retries_without_commit_or_replacement() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
@@ -452,6 +658,153 @@ def test_commit_ambiguity_releases_once_without_replacement() -> None:
     assert store.failures == ["bridge_temporarily_unavailable"]
 
 
+@pytest.mark.parametrize(
+    ("stage", "store_error", "expected_code", "expected_status"),
+    [
+        (
+            "bind",
+            ValueError("conflicting Codex thread identity"),
+            "codex_thread_conflict",
+            "failed",
+        ),
+        (
+            "commit",
+            ValueError("source_identity_mismatch"),
+            "source_identity_mismatch",
+            "failed",
+        ),
+        ("bind", sqlite3.OperationalError("database is locked"), "sqlite_busy", "retry"),
+        ("commit", sqlite3.OperationalError("database is busy"), "sqlite_busy", "retry"),
+    ],
+)
+def test_store_errors_use_fixed_identity_or_transient_codes(
+    stage: str,
+    store_error: Exception,
+    expected_code: str,
+    expected_status: str,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1, thread_id=THREAD_1)],
+        bind_error=store_error if stage == "bind" else None,
+        commit_error=store_error if stage == "commit" else None,
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result.status == expected_status
+    assert result.error_code == expected_code
+    assert store.failures == [expected_code]
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [0.0, -1.0, 300.0, 301.0, math.inf],
+)
+def test_operation_budget_must_be_positive_and_strictly_shorter_than_lease(
+    budget: float,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+
+    with pytest.raises(ValueError, match="operation budget"):
+        _executor(
+            FakeStore(events, [_job(SOURCE_1)]),
+            FakeVerifier(events),
+            FakeNative(events),
+            clock,
+            operation_budget_seconds=budget,
+        )
+
+
+def test_every_native_operation_receives_one_absolute_deadline() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        FakeNative(events),
+        clock,
+        operation_budget_seconds=240.0,
+    ).run_once()
+
+    assert result.status == "visible"
+    native_deadlines = [
+        event[-1] for event in events if event[0] in {"create", "read", "rename"}
+    ]
+    assert native_deadlines == [340.0, 340.0, 340.0]
+    assert native_deadlines[0] < 400.0
+
+
+def test_budget_exhaustion_after_create_binds_then_settles_before_native_read() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(
+        events,
+        after_create=lambda: clock.sleep(240.0),
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        operation_budget_seconds=240.0,
+    ).run_once()
+
+    assert result.status == "retry"
+    assert result.error_code == "broker_time_budget"
+    assert [event[0] for event in events][-2:] == ["bind", "fail"]
+    assert not any(event[0] in {"read", "rename", "commit"} for event in events)
+
+
+def test_budget_exhaustion_after_marker_recovery_binds_exact_id_before_retry() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+
+    class SlowRecoveryVerifier(FakeVerifier):
+        def find_by_marker(
+            self, expected: BridgeMarkerPayload
+        ) -> VerifiedSidebarThread | None:
+            recovered = super().find_by_marker(expected)
+            clock.sleep(240.0)
+            return recovered
+
+    verifier = SlowRecoveryVerifier(
+        events,
+        find_result=VerifiedSidebarThread(
+            thread_id=THREAD_1,
+            source_session_id=SOURCE_1,
+            bridge_id=sidebar_bridge_id(SOURCE_1),
+        ),
+    )
+    native = FakeNative(events)
+
+    result = _executor(
+        store,
+        verifier,
+        native,
+        clock,
+        operation_budget_seconds=240.0,
+    ).run_once()
+
+    assert result.status == "retry"
+    assert result.error_code == "broker_time_budget"
+    assert [event[0] for event in events][-2:] == ["bind", "fail"]
+    assert native.create_calls == 0
+
+
 def test_run_once_claims_and_processes_only_one_job_serially() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
@@ -478,8 +831,18 @@ def test_two_executor_instances_share_one_process_wide_delivery_lock() -> None:
     clock = FakeClock()
 
     class BlockingNative(FakeNative):
-        def create_thread(self, *, prompt: str, candidate: SidebarCandidate) -> str:
-            result = super().create_thread(prompt=prompt, candidate=candidate)
+        def create_thread(
+            self,
+            *,
+            prompt: str,
+            candidate: SidebarCandidate,
+            deadline: float,
+        ) -> str:
+            result = super().create_thread(
+                prompt=prompt,
+                candidate=candidate,
+                deadline=deadline,
+            )
             entered_create.set()
             assert release_create.wait(timeout=5)
             return result
