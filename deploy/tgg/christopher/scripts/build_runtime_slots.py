@@ -469,6 +469,8 @@ def _validate(
         outbound = set(block["outbound_allowed_chats"])
         assert MGMT_INBOUND_JIDS <= outbound, sorted(MGMT_INBOUND_JIDS - outbound)
         assert not (SITE_GROUP_JIDS & outbound), sorted(SITE_GROUP_JIDS & outbound)
+        # DM policy is explicitly out of scope for this change.
+        assert block["dm_policy"] == "allowlist", block["dm_policy"]
 
     # Selector <-> allowlist alignment: every allowlisted WHATSAPP group must
     # bind to a selector of the class its partition claims — site groups to
@@ -482,8 +484,6 @@ def _validate(
         assert selector_class.get(jid) == "tgg_ops_ingest", (jid, selector_class.get(jid))
     for jid in MGMT_INBOUND_JIDS:
         assert selector_class.get(jid) == "tgg_management", (jid, selector_class.get(jid))
-        # DM policy is explicitly out of scope for this change.
-        assert block["dm_policy"] == "allowlist", block["dm_policy"]
     if effort is None:
         assert "reasoning_effort" not in config["agent"]
     else:
