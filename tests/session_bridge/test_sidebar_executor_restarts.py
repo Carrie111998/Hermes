@@ -132,8 +132,10 @@ class _NativeDelivery:
         thread_id: str,
         prompt: str,
         deadline: float,
+        fresh: bool = False,
     ) -> None:
         del prompt
+        assert isinstance(fresh, bool)
         assert deadline > self._clock()
         assert thread_id in self._world.threads
         self._world.register_calls.append(thread_id)

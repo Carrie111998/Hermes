@@ -1263,7 +1263,11 @@ class ProductionBackend:
                 store=self._require_store(),
                 verifier=verifier,
                 native=CodexAppServerSidebarDelivery(
-                    cast(Any, self._sidebar_codex_client)
+                    cast(Any, self._sidebar_codex_client),
+                    fresh_client_factory=lambda: cast(
+                        Any,
+                        CodexAppServerClient(codex_bin=codex_command[0]),
+                    ),
                 ),
                 marker_secret=marker_key,
             )

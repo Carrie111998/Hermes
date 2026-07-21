@@ -10,7 +10,9 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Literal, Mapping, Protocol, cast
+from typing import Any, Callable, Literal, Mapping, Protocol, cast
+
+from agent.transports.codex_app_server import CodexAppServerError
 
 from .codex_adapter import SidebarThreadVerifier, SidebarVerificationError
 from .models import BridgeMarkerPayload, Provider, encode_bridge_marker
@@ -47,6 +49,14 @@ class NativeCreateRejected(RuntimeError):
         super().__init__(code)
 
 
+class NativeThreadUnrecoverable(RuntimeError):
+    """A durable exact ID has no rollout and cannot be resumed."""
+
+    def __init__(self, thread_id: str) -> None:
+        self.thread_id = _required_text(thread_id, "Codex thread ID")
+        super().__init__("native_create_ambiguous")
+
+
 class NativeThreadStatus(StrEnum):
     ACTIVE = "active"
     IDLE = "idle"
@@ -79,7 +89,12 @@ class NativeSidebarDelivery(Protocol):
     ) -> NativeThreadState | None: ...
 
     def register_thread(
-        self, *, thread_id: str, prompt: str, deadline: float
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        deadline: float,
+        fresh: bool = False,
     ) -> None: ...
 
     def rename_thread(self, *, thread_id: str, title: str, deadline: float) -> None: ...
@@ -95,6 +110,20 @@ class _CodexAppServerClient(Protocol):
         timeout: float = 30.0,
     ) -> dict[str, Any]: ...
 
+    def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None: ...
+
+    def take_server_request(self, timeout: float = 0.0) -> dict[str, Any] | None: ...
+
+    def respond_error(
+        self,
+        request_id: object,
+        code: int,
+        message: str,
+        data: object | None = None,
+    ) -> None: ...
+
+    def close(self, timeout: float = 3.0) -> None: ...
+
 
 class CodexAppServerSidebarDelivery:
     """Concrete native sidebar delivery over the Codex app-server protocol."""
@@ -103,9 +132,11 @@ class CodexAppServerSidebarDelivery:
         self,
         client: _CodexAppServerClient,
         *,
+        fresh_client_factory: Callable[[], _CodexAppServerClient] | None = None,
         monotonic=time.monotonic,
     ) -> None:
         self._client = client
+        self._fresh_client_factory = fresh_client_factory
         self._monotonic = monotonic
         self._initialized = bool(getattr(client, "_initialized", False))
 
@@ -166,9 +197,9 @@ class CodexAppServerSidebarDelivery:
                 returned_recovery_key, expected_recovery_key
             ) or not _filesystem_equivalent(returned_cwd, candidate.cwd):
                 raise ValueError("thread/start response identity mismatch")
-            return thread_id
         except (AttributeError, TypeError, ValueError) as exc:
             raise NativeCreateAmbiguous() from exc
+        return thread_id
 
     def register_thread(
         self,
@@ -176,26 +207,172 @@ class CodexAppServerSidebarDelivery:
         thread_id: str,
         prompt: str,
         deadline: float,
+        fresh: bool = False,
     ) -> None:
         wanted = _required_text(thread_id, "Codex thread ID")
         marker = _registration_marker(prompt)
         self._ensure_initialized(deadline)
-        response = self._client.request(
-            "thread/read",
-            {"threadId": wanted, "includeTurns": True},
-            timeout=self._remaining(deadline),
+        if not isinstance(fresh, bool):
+            raise ValueError("fresh registration flag is malformed")
+        if not fresh:
+            thread = self._read_or_resume_thread(wanted, deadline=deadline)
+            if _thread_has_exact_marker(thread, marker):
+                return
+        # A just-started thread exists only in this app-server process until
+        # the first non-empty turn. Reading it through stored history first
+        # reproduces the missing-rollout failure this executor must avoid.
+        self._start_and_wait_for_registration(
+            thread_id=wanted,
+            prompt=prompt,
+            deadline=deadline,
         )
-        thread = _exact_thread(response, wanted)
-        if _thread_has_exact_marker(thread, marker):
-            return
-        self._client.request(
-            "turn/start",
-            {
-                "threadId": wanted,
-                "input": [{"type": "text", "text": prompt}],
-            },
-            timeout=self._remaining(deadline),
-        )
+
+    def _start_and_wait_for_registration(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        deadline: float,
+    ) -> None:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        _registration_marker(prompt)
+        try:
+            response = self._client.request(
+                "turn/start",
+                {
+                    "threadId": wanted,
+                    "input": [{"type": "text", "text": prompt}],
+                },
+                timeout=self._remaining(deadline),
+            )
+            turn_id = _started_turn_id(response)
+            self._wait_for_exact_turn_completion(
+                thread_id=wanted,
+                turn_id=turn_id,
+                deadline=deadline,
+            )
+            # Codex emits turn/completed after an attempted persistence flush,
+            # but local write errors are logged rather than surfaced. Treat the
+            # event only as a wakeup and prove durability from a new process.
+            self._verify_persisted_registration(
+                thread_id=wanted,
+                turn_id=turn_id,
+                marker=_registration_marker(prompt),
+                deadline=deadline,
+            )
+        except (NativeCreateAmbiguous, NativeThreadUnrecoverable):
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise NativeCreateAmbiguous() from exc
+
+    def _wait_for_exact_turn_completion(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        deadline: float,
+    ) -> None:
+        wanted_thread = _required_text(thread_id, "Codex thread ID")
+        wanted_turn = _required_text(turn_id, "Codex turn ID")
+        while True:
+            try:
+                remaining = self._remaining(deadline)
+                server_request = self._client.take_server_request(timeout=0.0)
+                if server_request is not None:
+                    request_id = (
+                        server_request.get("id")
+                        if isinstance(server_request, Mapping)
+                        else None
+                    )
+                    if request_id is not None:
+                        self._client.respond_error(
+                            request_id,
+                            -32600,
+                            "session bridge registration forbids server requests",
+                        )
+                    raise NativeCreateAmbiguous()
+                notification = self._client.take_notification(
+                    timeout=min(0.25, remaining)
+                )
+            except NativeCreateAmbiguous:
+                raise
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                raise NativeCreateAmbiguous() from exc
+            if notification is None:
+                continue
+            if not isinstance(notification, Mapping):
+                raise NativeCreateAmbiguous()
+            if notification.get("method") != "turn/completed":
+                continue
+            params = notification.get("params")
+            if not isinstance(params, Mapping):
+                raise NativeCreateAmbiguous()
+            observed_thread = _optional_text(params.get("threadId"))
+            turn = params.get("turn")
+            if not isinstance(turn, Mapping):
+                raise NativeCreateAmbiguous()
+            observed_turn = _optional_text(turn.get("id"))
+            if observed_thread == wanted_thread and observed_turn == wanted_turn:
+                return
+            if observed_turn == wanted_turn:
+                raise NativeCreateAmbiguous()
+
+    def _verify_persisted_registration(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        marker: str,
+        deadline: float,
+    ) -> None:
+        wanted_thread = _required_text(thread_id, "Codex thread ID")
+        wanted_turn = _required_text(turn_id, "Codex turn ID")
+        if self._fresh_client_factory is None:
+            raise NativeCreateAmbiguous()
+        client = self._fresh_client_factory()
+        if client is self._client:
+            raise NativeCreateAmbiguous()
+        try:
+            if not bool(getattr(client, "_initialized", False)):
+                client.initialize(
+                    timeout=self._remaining(deadline),
+                    capabilities={"experimentalApi": True},
+                )
+            try:
+                response = client.request(
+                    "thread/resume",
+                    {"threadId": wanted_thread},
+                    timeout=self._remaining(deadline),
+                )
+            except CodexAppServerError as exc:
+                if (
+                    exc.code == -32600
+                    and exc.message == f"no rollout found for thread id {wanted_thread}"
+                ):
+                    raise NativeThreadUnrecoverable(wanted_thread) from exc
+                raise
+            thread = _exact_thread(response, wanted_thread)
+            if not _thread_has_exact_marker(
+                thread,
+                marker,
+                turn_id=wanted_turn,
+            ):
+                raise NativeCreateAmbiguous()
+        except (NativeCreateAmbiguous, NativeThreadUnrecoverable):
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise NativeCreateAmbiguous() from exc
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def read_thread_state(
         self,
@@ -205,16 +382,42 @@ class CodexAppServerSidebarDelivery:
     ) -> NativeThreadState | None:
         wanted = _required_text(thread_id, "Codex thread ID")
         self._ensure_initialized(deadline)
-        response = self._client.request(
-            "thread/read",
-            {"threadId": wanted, "includeTurns": True},
-            timeout=self._remaining(deadline),
-        )
-        thread = _exact_thread(response, wanted)
+        thread = self._read_or_resume_thread(wanted, deadline=deadline)
         cwd = _required_text(thread.get("cwd"), "Codex thread cwd")
         turns = cast(list[object], thread["turns"])
         status = _native_thread_status(thread.get("status"), turns=turns)
         return NativeThreadState(thread_id=wanted, status=status, cwd=cwd)
+
+    def _read_or_resume_thread(
+        self,
+        thread_id: str,
+        *,
+        deadline: float,
+    ) -> Mapping[str, Any]:
+        wanted = _required_text(thread_id, "Codex thread ID")
+        try:
+            response = self._client.request(
+                "thread/read",
+                {"threadId": wanted, "includeTurns": True},
+                timeout=self._remaining(deadline),
+            )
+        except CodexAppServerError as exc:
+            if exc.code != -32600 or exc.message != f"thread not loaded: {wanted}":
+                raise
+            try:
+                response = self._client.request(
+                    "thread/resume",
+                    {"threadId": wanted},
+                    timeout=self._remaining(deadline),
+                )
+            except CodexAppServerError as resume_exc:
+                if (
+                    resume_exc.code == -32600
+                    and resume_exc.message == f"no rollout found for thread id {wanted}"
+                ):
+                    raise NativeThreadUnrecoverable(wanted) from resume_exc
+                raise
+        return _exact_thread(response, wanted)
 
     def rename_thread(
         self,
@@ -421,6 +624,7 @@ class SidebarExecutor:
                 else _required_text(raw_thread_id, "Codex thread ID")
             )
             thread_was_prebound = thread_id is not None
+            thread_was_created_here = False
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -644,6 +848,7 @@ class SidebarExecutor:
                                 raw_created_thread_id,
                                 "created Codex thread ID",
                             )
+                            thread_was_created_here = True
                         except ValueError:
                             return self._settle(
                                 job_id=job_id,
@@ -699,9 +904,17 @@ class SidebarExecutor:
                 thread_id=thread_id,
                 prompt=prompt,
                 deadline=operation_deadline,
+                fresh=thread_was_created_here,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
+        except NativeThreadUnrecoverable:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="native_create_ambiguous",
+            )
         except Exception:
             return self._settle(
                 job_id=job_id,
@@ -1039,6 +1252,17 @@ def _registration_marker(prompt: object) -> str:
     return matches[0]
 
 
+def _started_turn_id(response: object) -> str:
+    if not isinstance(response, dict):
+        raise ValueError("turn/start response is malformed")
+    response_map = cast(dict[str, object], response)
+    turn = response_map.get("turn")
+    if not isinstance(turn, dict):
+        raise ValueError("turn/start response has no turn")
+    turn_map = cast(dict[str, object], turn)
+    return _required_text(turn_map.get("id"), "started Codex turn ID")
+
+
 def _exact_thread(response: object, thread_id: str) -> dict[str, object]:
     if not isinstance(response, dict):
         raise ValueError("thread/read response is malformed")
@@ -1055,13 +1279,22 @@ def _exact_thread(response: object, thread_id: str) -> dict[str, object]:
     return thread
 
 
-def _thread_has_exact_marker(thread: Mapping[str, object], marker: str) -> bool:
+def _thread_has_exact_marker(
+    thread: Mapping[str, object],
+    marker: str,
+    *,
+    turn_id: str | None = None,
+) -> bool:
     turns = thread.get("turns")
     assert isinstance(turns, list)
     for turn in turns:
         if not isinstance(turn, dict):
             continue
         turn = cast(dict[str, object], turn)
+        if turn.get("status") != "completed":
+            continue
+        if turn_id is not None and turn.get("id") != turn_id:
+            continue
         items = turn.get("items")
         if not isinstance(items, list):
             continue

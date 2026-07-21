@@ -10,6 +10,7 @@ from typing import Any, Callable, cast
 
 import pytest
 
+from agent.transports.codex_app_server import CodexAppServerError
 import session_bridge.sidebar_executor as sidebar_executor_module
 from session_bridge.models import BridgeMarkerPayload, Provider, encode_bridge_marker
 from session_bridge.codex_adapter import SidebarThreadVerifier
@@ -25,6 +26,7 @@ from session_bridge.sidebar_executor import (
     NativeCreateRejected,
     NativeThreadState,
     NativeThreadStatus,
+    NativeThreadUnrecoverable,
     SidebarExecutionResult,
     SidebarExecutor,
 )
@@ -35,6 +37,7 @@ SOURCE_1 = "claude:source-1"
 SOURCE_2 = "claude:source-2"
 THREAD_1 = "11111111-1111-4111-8111-111111111111"
 THREAD_2 = "22222222-2222-4222-8222-222222222222"
+TURN_1 = "33333333-3333-4333-8333-333333333333"
 SECRET = b"sidebar-executor-test-secret"
 RECOVERY_KEY = "hermes-session-bridge-create-v1:" + "a" * 64
 
@@ -50,11 +53,19 @@ class FakeCodexAppServerClient:
         responses: dict[str, list[object]],
         *,
         initialize_error: Exception | None = None,
+        notifications: list[object] | None = None,
+        server_requests: list[object] | None = None,
     ) -> None:
         self.responses = {method: list(values) for method, values in responses.items()}
         self.calls: list[tuple[str, dict[str, object], float]] = []
         self.initialize_timeouts: list[float] = []
         self.initialize_error = initialize_error
+        self.notifications = list(notifications or [])
+        self.server_requests = list(server_requests or [])
+        self.notification_timeouts: list[float] = []
+        self.server_request_timeouts: list[float] = []
+        self.response_errors: list[tuple[object, int, str]] = []
+        self.close_calls = 0
         self._initialized = False
 
     def initialize(self, *, timeout: float, **_kwargs: object) -> dict[str, object]:
@@ -76,6 +87,81 @@ class FakeCodexAppServerClient:
             raise response
         return cast(dict[str, Any], response)
 
+    def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None:
+        self.notification_timeouts.append(timeout)
+        if not self.notifications:
+            return None
+        notification = self.notifications.pop(0)
+        if isinstance(notification, BaseException):
+            raise notification
+        return cast(dict[str, Any], notification)
+
+    def take_server_request(self, timeout: float = 0.0) -> dict[str, Any] | None:
+        self.server_request_timeouts.append(timeout)
+        if not self.server_requests:
+            return None
+        request = self.server_requests.pop(0)
+        if isinstance(request, BaseException):
+            raise request
+        return cast(dict[str, Any], request)
+
+    def respond_error(
+        self,
+        request_id: object,
+        code: int,
+        message: str,
+        data: object | None = None,
+    ) -> None:
+        assert data is None
+        self.response_errors.append((request_id, code, message))
+
+    def close(self, timeout: float = 3.0) -> None:
+        assert timeout == 3.0
+        self.close_calls += 1
+
+
+def _turn_completed(
+    *,
+    thread_id: str = THREAD_1,
+    turn_id: str = TURN_1,
+    status: str = "completed",
+) -> dict[str, object]:
+    return {
+        "method": "turn/completed",
+        "params": {
+            "threadId": thread_id,
+            "turn": {"id": turn_id, "status": status, "items": []},
+        },
+    }
+
+
+def _persisted_registration(
+    prompt: str,
+    *,
+    thread_id: str = THREAD_1,
+    turn_id: str = TURN_1,
+    status: str = "completed",
+) -> dict[str, object]:
+    return {
+        "thread": {
+            "id": thread_id,
+            "cwd": "C:/source",
+            "status": {"type": "idle"},
+            "turns": [
+                {
+                    "id": turn_id,
+                    "status": status,
+                    "items": [
+                        {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": prompt}],
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+
 
 def test_codex_delivery_starts_exact_cwd_and_returns_exact_thread_id() -> None:
     clock = FakeClock()
@@ -93,7 +179,7 @@ def test_codex_delivery_starts_exact_cwd_and_returns_exact_thread_id() -> None:
     delivery = CodexAppServerSidebarDelivery(client, monotonic=clock)
 
     created = delivery.create_thread(
-        prompt="registration happens later",
+        prompt="registration happens only after durable binding",
         candidate=_candidate(SOURCE_1),
         recovery_key=RECOVERY_KEY,
         deadline=105.0,
@@ -276,6 +362,46 @@ def test_codex_delivery_registration_is_idempotent_when_exact_marker_exists() ->
     assert [method for method, _params, _timeout in client.calls] == ["thread/read"]
 
 
+def test_codex_delivery_resumes_exact_unloaded_thread_before_registration() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"thread not loaded: {THREAD_1}",
+            )
+        ],
+        "thread/resume": [
+            {
+                "thread": {
+                    "id": THREAD_1,
+                    "cwd": "C:/source",
+                    "turns": [
+                        {
+                            "status": "completed",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "content": [{"type": "text", "text": prompt}],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    delivery.register_thread(thread_id=THREAD_1, prompt=prompt, deadline=105.0)
+
+    assert [method for method, _params, _timeout in client.calls] == [
+        "thread/read",
+        "thread/resume",
+    ]
+    assert client.calls[1][1] == {"threadId": THREAD_1}
+
+
 @pytest.mark.parametrize("embedded", ["X{marker}", "{marker}X"])
 def test_codex_delivery_does_not_accept_marker_embedded_in_larger_token(
     embedded: str,
@@ -286,33 +412,43 @@ def test_codex_delivery_does_not_accept_marker_embedded_in_larger_token(
         for line in prompt.splitlines()
         if line.startswith("Signed marker: ")
     )
-    client = FakeCodexAppServerClient({
-        "thread/read": [
-            {
-                "thread": {
-                    "id": THREAD_1,
-                    "cwd": "C:/source",
-                    "turns": [
-                        {
-                            "items": [
-                                {
-                                    "type": "userMessage",
-                                    "content": [
-                                        {
-                                            "type": "text",
-                                            "text": embedded.format(marker=marker),
-                                        }
-                                    ],
-                                }
-                            ]
-                        }
-                    ],
+    client = FakeCodexAppServerClient(
+        {
+            "thread/read": [
+                {
+                    "thread": {
+                        "id": THREAD_1,
+                        "cwd": "C:/source",
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": embedded.format(marker=marker),
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
                 }
-            }
-        ],
-        "turn/start": [{"turn": {"id": "registration-turn"}}],
+            ],
+            "turn/start": [{"turn": {"id": TURN_1}}],
+        },
+        notifications=[_turn_completed()],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [_persisted_registration(prompt)]
     })
-    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
 
     delivery.register_thread(thread_id=THREAD_1, prompt=prompt, deadline=105.0)
 
@@ -320,15 +456,32 @@ def test_codex_delivery_does_not_accept_marker_embedded_in_larger_token(
         "thread/read",
         "turn/start",
     ]
+    assert client.notification_timeouts == [0.25]
+    assert [method for method, _params, _timeout in fresh_client.calls] == [
+        "thread/resume"
+    ]
+    assert fresh_client.close_calls == 1
 
 
 def test_codex_delivery_starts_registration_turn_when_exact_marker_is_absent() -> None:
     prompt = _registration_prompt()
-    client = FakeCodexAppServerClient({
-        "thread/read": [{"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}],
-        "turn/start": [{"turn": {"id": "registration-turn"}}],
+    client = FakeCodexAppServerClient(
+        {
+            "thread/read": [
+                {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
+            ],
+            "turn/start": [{"turn": {"id": TURN_1}}],
+        },
+        notifications=[_turn_completed()],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [_persisted_registration(prompt)]
     })
-    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
 
     delivery.register_thread(thread_id=THREAD_1, prompt=prompt, deadline=105.0)
 
@@ -346,6 +499,144 @@ def test_codex_delivery_starts_registration_turn_when_exact_marker_is_absent() -
             },
             5.0,
         ),
+    ]
+    assert client.notification_timeouts == [0.25]
+    assert fresh_client.calls == [("thread/resume", {"threadId": THREAD_1}, 5.0)]
+    assert fresh_client.close_calls == 1
+
+
+def test_codex_delivery_fresh_registration_never_reads_before_first_turn() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient(
+        {"turn/start": [{"turn": {"id": TURN_1}}]},
+        notifications=[_turn_completed()],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [_persisted_registration(prompt)]
+    })
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
+
+    delivery.register_thread(
+        thread_id=THREAD_1,
+        prompt=prompt,
+        deadline=105.0,
+        fresh=True,
+    )
+
+    assert [method for method, _params, _timeout in client.calls] == ["turn/start"]
+    assert [method for method, _params, _timeout in fresh_client.calls] == [
+        "thread/resume"
+    ]
+
+
+def test_codex_delivery_uses_durable_read_over_failed_completion_event() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient(
+        {"turn/start": [{"turn": {"id": TURN_1}}]},
+        notifications=[_turn_completed(status="failed")],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [_persisted_registration(prompt)]
+    })
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
+
+    delivery.register_thread(
+        thread_id=THREAD_1,
+        prompt=prompt,
+        deadline=105.0,
+        fresh=True,
+    )
+
+    assert fresh_client.close_calls == 1
+
+
+def test_codex_delivery_rejects_completion_without_durable_exact_turn() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient(
+        {"turn/start": [{"turn": {"id": TURN_1}}]},
+        notifications=[_turn_completed()],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [_persisted_registration(prompt, status="failed")]
+    })
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
+
+    with pytest.raises(NativeCreateAmbiguous):
+        delivery.register_thread(
+            thread_id=THREAD_1,
+            prompt=prompt,
+            deadline=105.0,
+            fresh=True,
+        )
+
+    assert fresh_client.close_calls == 1
+
+
+def test_codex_delivery_quarantines_fresh_registration_with_no_rollout() -> None:
+    prompt = _registration_prompt()
+    client = FakeCodexAppServerClient(
+        {"turn/start": [{"turn": {"id": TURN_1}}]},
+        notifications=[_turn_completed()],
+    )
+    fresh_client = FakeCodexAppServerClient({
+        "thread/resume": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"no rollout found for thread id {THREAD_1}",
+            )
+        ]
+    })
+    delivery = CodexAppServerSidebarDelivery(
+        client,
+        fresh_client_factory=lambda: fresh_client,
+        monotonic=lambda: 100.0,
+    )
+
+    with pytest.raises(NativeThreadUnrecoverable) as caught:
+        delivery.register_thread(
+            thread_id=THREAD_1,
+            prompt=prompt,
+            deadline=105.0,
+            fresh=True,
+        )
+
+    assert caught.value.thread_id == THREAD_1
+    assert fresh_client.close_calls == 1
+
+
+def test_codex_delivery_rejects_unexpected_registration_server_request() -> None:
+    client = FakeCodexAppServerClient(
+        {
+            "thread/read": [
+                {"thread": {"id": THREAD_1, "cwd": "C:/source", "turns": []}}
+            ],
+            "turn/start": [{"turn": {"id": TURN_1}}],
+        },
+        server_requests=[{"id": 91, "method": "item/commandExecution/requestApproval"}],
+    )
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(NativeCreateAmbiguous):
+        delivery.register_thread(
+            thread_id=THREAD_1,
+            prompt=_registration_prompt(),
+            deadline=105.0,
+        )
+
+    assert client.response_errors == [
+        (91, -32600, "session bridge registration forbids server requests")
     ]
 
 
@@ -369,6 +660,85 @@ def test_codex_delivery_reads_exact_idle_thread_with_remaining_deadline() -> Non
             5.0,
         )
     ]
+
+
+def test_codex_delivery_resumes_exact_unloaded_thread_before_reading_state() -> None:
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"thread not loaded: {THREAD_1}",
+            )
+        ],
+        "thread/resume": [
+            {
+                "thread": {
+                    "id": THREAD_1,
+                    "cwd": "C:/source",
+                    "status": {"type": "idle"},
+                    "turns": [],
+                }
+            }
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    state = delivery.read_thread_state(thread_id=THREAD_1, deadline=105.0)
+
+    assert state == NativeThreadState(
+        thread_id=THREAD_1,
+        status=NativeThreadStatus.IDLE,
+        cwd="C:/source",
+    )
+    assert [method for method, _params, _timeout in client.calls] == [
+        "thread/read",
+        "thread/resume",
+    ]
+    assert client.calls[1][1] == {"threadId": THREAD_1}
+
+
+def test_codex_delivery_quarantines_exact_id_with_no_rollout() -> None:
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"thread not loaded: {THREAD_1}",
+            )
+        ],
+        "thread/resume": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"no rollout found for thread id {THREAD_1}",
+            )
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(NativeThreadUnrecoverable) as caught:
+        delivery.register_thread(
+            thread_id=THREAD_1,
+            prompt=_registration_prompt(),
+            deadline=105.0,
+        )
+
+    assert caught.value.thread_id == THREAD_1
+
+
+def test_codex_delivery_never_resumes_when_not_loaded_error_names_other_id() -> None:
+    client = FakeCodexAppServerClient({
+        "thread/read": [
+            CodexAppServerError(
+                code=-32600,
+                message=f"thread not loaded: {THREAD_2}",
+            )
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(CodexAppServerError):
+        delivery.read_thread_state(thread_id=THREAD_1, deadline=105.0)
+
+    assert [method for method, _params, _timeout in client.calls] == ["thread/read"]
 
 
 @pytest.mark.parametrize(
@@ -767,9 +1137,11 @@ class FakeNative:
         thread_id: str,
         prompt: str,
         deadline: float,
+        fresh: bool = False,
     ) -> None:
         assert "Signed marker:" in prompt
-        self.events.append(("register", thread_id, deadline))
+        assert isinstance(fresh, bool)
+        self.events.append(("register", thread_id, deadline, fresh))
         if self.register_error is not None:
             raise self.register_error
 
@@ -845,6 +1217,7 @@ def test_recovered_exact_id_is_verified_renamed_and_committed_without_create() -
         "rename",
         "commit",
     ]
+    assert events[3][3] is False
 
 
 def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:
@@ -1029,6 +1402,7 @@ def test_zero_marker_candidates_create_bind_and_register_before_any_read() -> No
     ]
     assert events[3][1] == _expected_recovery_key(SOURCE_1)
     assert events[4][2] == _expected_recovery_key(SOURCE_1)
+    assert events[6][3] is True
 
 
 def test_existing_create_reservation_with_zero_recovery_never_creates() -> None:
@@ -1125,6 +1499,50 @@ def test_ambiguous_registration_keeps_bound_exact_id_and_retries() -> None:
     )
     assert [event[0] for event in events][-3:] == ["bind", "register", "fail"]
     assert native.create_calls == 1
+
+
+def test_unrecoverable_prebound_id_is_quarantined_without_replacement() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    native = FakeNative(
+        events,
+        register_error=NativeThreadUnrecoverable(THREAD_1),
+    )
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="native_create_ambiguous",
+    )
+    assert native.create_calls == 0
+    assert store.failure_thread_ids == [THREAD_1]
+
+
+def test_unrecoverable_fresh_id_is_quarantined_after_one_create() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(
+        events,
+        create_result=THREAD_1,
+        register_error=NativeThreadUnrecoverable(THREAD_1),
+    )
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="native_create_ambiguous",
+    )
+    assert native.create_calls == 1
+    assert [event[0] for event in events][-3:] == ["bind", "register", "fail"]
+    assert store.failure_thread_ids == [THREAD_1]
 
 
 def test_ambiguous_create_is_quarantined_and_never_replaced() -> None:
