@@ -5,7 +5,9 @@ import {
   __resetLinkTitleCache,
   ExternalLink,
   fetchLinkTitle,
+  githubPathLabel,
   hostPathLabel,
+  isJunkLinkTitle,
   isTitleFetchable,
   LinkifiedText,
   PrettyLink,
@@ -196,6 +198,67 @@ describe('external link helpers', () => {
       expect(screen.getByTitle(FORGEJO_URL).textContent).toContain('Homelab Ops Issue 101')
     })
     expect(bridge).toHaveBeenCalledTimes(1)
+  })
+
+  it('labels GitHub PR URLs as owner/repo#n without fetching og:title', async () => {
+    const bridge = vi.fn().mockResolvedValue('Page not found · GitHub')
+    installDesktopBridge({ fetchLinkTitle: bridge as unknown as Window['hermesDesktop']['fetchLinkTitle'] })
+
+    const url = 'https://github.com/Studio729/synapse/pull/76'
+    expect(githubPathLabel(url)).toBe('Studio729/synapse#76')
+    expect(isTitleFetchable(url)).toBe(false)
+    expect(isJunkLinkTitle('Page not found · GitHub')).toBe(true)
+
+    render(<PrettyLink href={url} />)
+
+    const link = screen.getByTitle(url)
+    expect(link.textContent).toContain('Studio729/synapse#76')
+    expect(link.textContent).not.toContain('Page not found')
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it('keeps authored link text ahead of the derived GitHub path label', () => {
+    const bridge = installTitleBridge('Page not found · GitHub')
+
+    // The path label is derived, so it must not overwrite text the agent
+    // authored — chat markdown passes that text as `fallbackLabel`.
+    const url = 'https://github.com/Studio729/synapse/pull/76'
+
+    render(<PrettyLink fallbackLabel="PR #76" href={url} />)
+
+    const link = screen.getByTitle(url)
+    expect(link.textContent).toContain('PR #76')
+    expect(link.textContent).not.toContain('Studio729/synapse#76')
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it('keeps non-PR GitHub path labels distinct without fetching titles', () => {
+    const bridge = vi.fn().mockResolvedValue('GitHub')
+    installDesktopBridge({ fetchLinkTitle: bridge as unknown as Window['hermesDesktop']['fetchLinkTitle'] })
+
+    const first = 'https://github.com/acme/app/blob/main/src/a.ts'
+    const second = 'https://github.com/acme/app/blob/main/src/b.ts'
+
+    expect(githubPathLabel(first)).toBe('acme/app/blob/main/src/a.ts')
+    expect(githubPathLabel(second)).toBe('acme/app/blob/main/src/b.ts')
+    expect(githubPathLabel(first)).not.toBe(githubPathLabel(second))
+    expect(isTitleFetchable(first)).toBe(false)
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it('rejects page-not-found titles even when fetch runs', async () => {
+    const bridge = vi.fn().mockResolvedValue('Page not found · GitHub · GitHub')
+    installDesktopBridge({ fetchLinkTitle: bridge as unknown as Window['hermesDesktop']['fetchLinkTitle'] })
+
+    // Non-GitHub host so fetch is allowed; junk title must still be discarded.
+    const url = 'https://example.com/missing-page'
+    render(<PrettyLink href={url} />)
+
+    const link = screen.getByTitle(url)
+    await waitFor(() => {
+      expect(bridge).toHaveBeenCalled()
+    })
+    expect(link.textContent).not.toContain('Page not found')
   })
 
   it('normalizes scheme-less links before opening', () => {

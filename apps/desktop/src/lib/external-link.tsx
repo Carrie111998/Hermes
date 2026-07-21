@@ -23,7 +23,10 @@ const SKIP_PROTO_RE = /^(?:file|data|mailto|javascript|blob|chrome|about|hermes)
 const LOCAL_HOST_RE = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?$/i
 
 const ERROR_TITLE_RE =
-  /\b(?:access denied|attention required|captcha|error|forbidden|just a moment|not found|request blocked|too many requests)\b/i
+  /\b(?:404|access denied|attention required|captcha|error|forbidden|just a moment|not found|rate limit|request blocked|sign in to github|too many requests)\b/i
+
+/** GitHub soft-404 / interstitial titles like "Page not found · GitHub". */
+const GITHUB_JUNK_TITLE_RE = /page not found|\b404\b|not found\s*[·|].*github|github\s*[·|].*not found/i
 
 export function normalizeExternalUrl(value: string): string {
   const trimmed = value.trim()
@@ -111,6 +114,34 @@ export function urlSlugTitleLabel(value: string): string {
   return hostPathLabel(value)
 }
 
+/**
+ * Prefer stable path labels for GitHub URLs (owner/repo#123) instead of
+ * fetching og:title — GitHub often returns soft-404 titles like
+ * "Page not found · GitHub" that paint junk into chat.
+ */
+export function githubPathLabel(value: string): null | string {
+  const url = parseUrl(value)
+
+  if (!url || !/^(?:www\.)?github\.com$/i.test(url.hostname)) {
+    return null
+  }
+
+  const parts = url.pathname.split('/').filter(Boolean)
+
+  if (parts.length >= 4 && (parts[2] === 'pull' || parts[2] === 'issues') && /^\d+$/.test(parts[3])) {
+    return `${parts[0]}/${parts[1]}#${parts[3]}`
+  }
+
+  if (parts.length) {
+    // Keep the complete path for non-PR targets so distinct source files,
+    // commits, releases, and other GitHub URLs never collapse to the same
+    // label merely because they share an owner/repository/route prefix.
+    return parts.join('/')
+  }
+
+  return hostPathLabel(value)
+}
+
 export function isTitleFetchable(value: string): boolean {
   if (!value || SKIP_PROTO_RE.test(value)) {
     return false
@@ -118,7 +149,26 @@ export function isTitleFetchable(value: string): boolean {
 
   const url = parseUrl(value)
 
-  return Boolean(url && /^https?:$/.test(url.protocol) && !LOCAL_HOST_RE.test(url.host))
+  if (!url || !/^https?:$/.test(url.protocol) || LOCAL_HOST_RE.test(url.host)) {
+    return false
+  }
+
+  // Never fetch GitHub HTML titles — path labels are better and avoid soft-404 junk.
+  if (/^(?:www\.)?github\.com$/i.test(url.hostname)) {
+    return false
+  }
+
+  return true
+}
+
+export function isJunkLinkTitle(title: string): boolean {
+  const clean = title.replace(/\s+/g, ' ').trim()
+
+  if (!clean) {
+    return true
+  }
+
+  return ERROR_TITLE_RE.test(clean) || GITHUB_JUNK_TITLE_RE.test(clean)
 }
 
 export function fetchLinkTitle(url: string): Promise<string> {
@@ -149,7 +199,7 @@ export function fetchLinkTitle(url: string): Promise<string> {
 
   const promise = bridge(normalizedUrl)
     .then(value => (value || '').replace(/\s+/g, ' ').trim())
-    .then(clean => (clean && !ERROR_TITLE_RE.test(clean) ? clean : ''))
+    .then(clean => (clean && !isJunkLinkTitle(clean) ? clean : ''))
     .catch(() => '')
     .then(safe => {
       titleCache.set(key, safe)
@@ -253,11 +303,14 @@ interface PrettyLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {
 
 // Title resolution is a fallback, not an override. Both props carry authored
 // text — chat markdown passes `fallbackLabel` — so either one skips the fetch.
+// A GitHub path label is derived, not authored: it outranks a fetched title
+// (and skips the fetch entirely) but still yields to text the agent wrote.
 export function PrettyLink({ className, fallbackLabel, href, label, ...rest }: PrettyLinkProps) {
   const target = useMemo(() => normalizeExternalUrl(href), [href])
   const authoredLabel = label?.trim() || fallbackLabel?.trim()
-  const fetched = useLinkTitle(authoredLabel ? null : target)
-  const display = authoredLabel || fetched || urlSlugTitleLabel(target)
+  const pathLabel = useMemo(() => githubPathLabel(target) ?? '', [target])
+  const fetched = useLinkTitle(authoredLabel || pathLabel ? null : target)
+  const display = authoredLabel || pathLabel || fetched || urlSlugTitleLabel(target)
 
   return (
     <ExternalLink className={cn('wrap-break-word', className)} href={target} title={target} {...rest}>
