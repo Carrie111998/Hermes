@@ -45,7 +45,43 @@ def task_events_path(run_id: str, base_dir: Path | None = None) -> Path:
 
 
 def approvals_path(run_id: str, base_dir: Path | None = None) -> Path:
+    """Legacy bootstrap placeholder only — not authoritative (Task 24)."""
     return run_root(run_id, base_dir) / "approvals.jsonl"
+
+
+CONTROL_DIR_NAME = ".control"
+APPROVALS_DIR_NAME = "approvals"
+
+
+def control_root(base_dir: Path | None = None) -> Path:
+    return runs_root(base_dir) / CONTROL_DIR_NAME
+
+
+def control_approvals_root(base_dir: Path | None = None) -> Path:
+    return control_root(base_dir) / APPROVALS_DIR_NAME
+
+
+def approval_control_dir(approval_id: str, base_dir: Path | None = None) -> Path:
+    _validate_path_component(approval_id, "approval_id")
+    if not validate_id(approval_id, "approval"):
+        raise ValueError(f"invalid approval_id format: {approval_id!r}")
+    return control_approvals_root(base_dir) / approval_id
+
+
+def approval_issue_path(approval_id: str, base_dir: Path | None = None) -> Path:
+    return approval_control_dir(approval_id, base_dir) / "issue.json"
+
+
+def approval_revoke_path(approval_id: str, base_dir: Path | None = None) -> Path:
+    return approval_control_dir(approval_id, base_dir) / "revoke.json"
+
+
+def approval_claim_path(approval_id: str, base_dir: Path | None = None) -> Path:
+    return approval_control_dir(approval_id, base_dir) / "claim.json"
+
+
+def approval_outcome_path(approval_id: str, base_dir: Path | None = None) -> Path:
+    return approval_control_dir(approval_id, base_dir) / "outcome.json"
 
 
 def reports_dir(run_id: str, base_dir: Path | None = None) -> Path:

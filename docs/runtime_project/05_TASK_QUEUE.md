@@ -1,16 +1,39 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-21 (Task 23 durable run write barrier checkpoint; parent Task 22 `896961d0`)
+**Last updated:** 2026-07-21 (Task 24 authoritative approval control checkpoint; parent Task 23 `c89f1161`)
 
 ---
 
 ## Active Task
 
-**Task 24 — Authoritative Approval Control** — required before Phase 2 human-gated lifecycle invoke. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Task 25 — Human-gated single-API invoke pilot** — blocked until Task 24 checkpoint ✅. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+
+**All Phase 2 lifecycle invoke remains disabled** until Task 25 is implemented.
 
 ---
 
 ## Completed
+
+### Task 24 — Authoritative Approval Control
+
+**Status:** ✅ Checkpointed (fifth Phase 2 **implementation**; parent Task 23 `c89f1161968931e329f64acb350b166ec564c174`)
+**Tests (formal Git-only isolated archive):** full HTR manifest **1487 passed** (26 files: Task 23 **1400** + approval-control **87**); **0 failed**; **0 skipped**
+**Depends on:** Task 23 `c89f1161968931e329f64acb350b166ec564c174`
+
+**Delivered:**
+
+- `htr/approval_control.py` — authoritative approval SoT at `{runs_root}/.control/approvals/{approval_id}/` with immutable `issue.json`, optional `revoke.json`, singleton `claim.json`, singleton `outcome.json`
+- Read APIs: `get_approval`, `list_approvals`, `validate_approval` (advisory only)
+- Write APIs under internal `_approval_control_barrier`: `issue_approval`, `revoke_approval`, `claim_approval`, `record_use_outcome`
+- Separate `htr.approval.digest.v1` projection; mandatory `expires_at` (max 24h); explicit `event_id` for event-appending APIs
+- `{run_root}/approvals.jsonl` documented as inert legacy bootstrap — never read/written by Task 24
+- `htr/execution_lock.py` — shared `_acquire_outer_run_marker` helper only; Task 23 `run_write_barrier` seal semantics unchanged
+- `htr/paths.py`, `htr/state.py`, `htr/__init__.py` — control-plane paths and approval error types
+- `tests/htr/test_approval_control.py` — approval-control hardening matrix (**87 tests**)
+
+**Explicitly not implemented:** lifecycle invoke (Task 25), ambiguous reconciliation (Task 26), Recovery/Successor Runs (Task 27)
+
+---
 
 ### Task 23 — Durable Run Write Barrier
 
@@ -289,6 +312,37 @@ Changes:
 ---
 
 ## Next Task (Implementer)
+
+**Task 25 — Human-gated single-API invoke pilot.** Required before any Phase 2 lifecycle invoke path is enabled (Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval control ✅).
+
+**All lifecycle invoke remains disabled** until Task 25 is implemented.
+
+See `09_PHASE2_RUNTIME_BOUNDARY.md` for Tasks 25–31.
+
+---
+
+## Task 24 — Authoritative Approval Control (checkpointed)
+
+**Status:** ✅ Checkpointed
+
+**Delivered:**
+
+- `htr/approval_control.py` — authoritative approval SoT at `{runs_root}/.control/approvals/{approval_id}/` with immutable `issue.json`, optional `revoke.json`, singleton `claim.json`, singleton `outcome.json`
+- Read APIs: `get_approval`, `list_approvals`, `validate_approval` (advisory only)
+- Write APIs under internal `_approval_control_barrier`: `issue_approval`, `revoke_approval`, `claim_approval`, `record_use_outcome`
+- Separate `htr.approval.digest.v1` projection; mandatory `expires_at` (max 24h); explicit `event_id` for event-appending APIs
+- `{run_root}/approvals.jsonl` documented as inert legacy bootstrap — never read/written by Task 24
+- `htr/execution_lock.py` — shared `_acquire_outer_run_marker` helper only; Task 23 seal semantics unchanged
+- Internal `_approval_use_session` hook for Task 25 continuous marker reuse (invoke not implemented)
+- `tests/htr/test_approval_control.py` — approval-control hardening matrix (**87 tests**)
+
+**Tests (formal Git-only isolated archive):** **1487 passed** (26 files); **0 failed**; **0 skipped**
+
+**Explicitly not implemented:** lifecycle invoke (Task 25), ambiguous reconciliation (Task 26), Recovery/Successor Runs (Task 27)
+
+---
+
+## Previous next task (superseded)
 
 **Task 24 — Authoritative Approval Control.** Required before Phase 2 human-gated lifecycle invoke (Task 22 seal ✅; Task 23 write barrier ✅).
 

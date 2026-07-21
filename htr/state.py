@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 RunStatus = str
 TaskStatus = str
@@ -161,6 +161,52 @@ class RunSealBlockedError(HTRStateError):
         self.run_id = run_id
         self.error_code = error_code
         self.reason_codes = reason_codes
+
+
+ERROR_CODE_APPROVAL_VALIDATION: Final = "APPROVAL_VALIDATION_FAILED"
+ERROR_CODE_APPROVAL_CONFLICT: Final = "APPROVAL_CONFLICT"
+ERROR_CODE_APPROVAL_FINALIZED: Final = "APPROVAL_FINALIZED_RUN_BLOCKED"
+ERROR_CODE_APPROVAL_STATE: Final = "APPROVAL_ILLEGAL_STATE"
+
+
+class ApprovalControlError(HTRStateError):
+    """Base error for Task 24 approval-control operations."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = ERROR_CODE_APPROVAL_VALIDATION,
+        approval_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.approval_id = approval_id
+
+
+class ApprovalValidationError(ApprovalControlError):
+    """Raised when approval inputs or derived validation fail."""
+
+
+class ApprovalConflictError(ApprovalControlError):
+    """Raised when an immutable record replay conflicts with existing evidence."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_APPROVAL_CONFLICT, **kwargs)
+
+
+class ApprovalFinalizedRunError(ApprovalControlError):
+    """Raised when a lifecycle approval targets a finalized original run."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_APPROVAL_FINALIZED, **kwargs)
+
+
+class ApprovalStateError(ApprovalControlError):
+    """Raised when an approval transition is not legal for current evidence."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_APPROVAL_STATE, **kwargs)
 
 
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:

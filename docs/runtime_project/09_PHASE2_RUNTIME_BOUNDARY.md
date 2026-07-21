@@ -72,16 +72,16 @@ Exceptional legal/security/data-governance correction of a finalized original ru
 
 ## 2. Write-path gate
 
-**No Phase 2 lifecycle invoke path may be enabled before authoritative approval (Task 24) and human-gated invoke (Task 25) are implemented and verified.** Task 22 immutable finalized-run enforcement ✅. Task 23 durable run write barrier ✅.
+**No Phase 2 lifecycle invoke path may be enabled before Task 25 is implemented.** Task 22 immutable finalized-run enforcement ✅. Task 23 durable run write barrier ✅. Task 24 authoritative approval control ✅.
 
-| Work | Allowed before Task 24/25? |
-|------|----------------------------|
+| Work | Status |
+|------|--------|
 | Read-only observability (Task 19) | ✅ Done |
 | Derived action plan (Task 21) | ✅ Done (read-only) |
 | Immutable finalized-run seal (Task 22) | ✅ Done |
 | Durable run write barrier (Task 23) | ✅ Done |
-| Approval persistence (Task 24) | ❌ No (operational control; still no invoke) |
-| Human-gated lifecycle invoke (Task 25) | ❌ No |
+| Approval persistence (Task 24) | ✅ Done (control plane only; invoke disabled) |
+| Human-gated lifecycle invoke (Task 25) | ❌ Not started |
 | Bounded repair / unattended automation | ❌ No |
 | Recovery/Successor Run creation | ❌ No (Task 27+) |
 
@@ -98,7 +98,7 @@ Bounded self-healing of finalized-run problems requires the Recovery/Successor R
 | **Derived action plan** | Task 21 ✅: library/stdout JSON; non-authoritative; not persisted; Hybrid D; eleven-action catalog; digests bind machine-readable state/risk/confidence/prerequisites/idempotency; `proposable` ≠ executable |
 | **Observation digest** | Canonical **semantic projection** of snapshot (exclude `observed_at`, presentation-only fields); deterministic JSON |
 | **Confidence** | Deterministic classes: `high` / `medium` / `low` / `indeterminate` + reason codes; integrity errors → non-actionable |
-| **Persisted approval** | Authoritative execution-control data (Task 24); schema task required; not lifecycle events |
+| **Persisted approval** | Task 24 ✅: `{runs_root}/.control/approvals/{approval_id}/` immutable issue/revoke/claim/outcome; `{run_root}/approvals.jsonl` inert legacy only |
 | **Repair proposal (initial)** | Derived stdout/library JSON only; finalized-run recovery proposal format deferred to Task 27 |
 
 ---
@@ -112,13 +112,15 @@ Bounded self-healing of finalized-run problems requires the Recovery/Successor R
 | Finalized original run | Yes | **Task 22: sealed** | **Task 22: sealed** |
 | Recovery/Successor Run | N/A | N/A | Task 27+ protocol |
 
-Runtime must not append events or write SoT directly. Writes only through allowlisted canonical lifecycle APIs after Task 22 seal + Task 23 write barrier + future Task 24 approval + Task 25 invoke gates pass.
+Runtime must not append events or write SoT directly. Writes only through allowlisted canonical lifecycle APIs after Task 22 seal + Task 23 write barrier + Task 24 approval + Task 25 invoke gates pass.
 
 ---
 
 ## 5. Execution lock, verification, ambiguous outcomes
 
 **Task 23 durable run write barrier (implemented):** run-scoped marker at `{runs_root}/.execution_locks/{run_id}.marker`; O_EXCL acquisition; durable initialization; authoritative revalidation after acquisition; `run_write_started` before first possible Run write; ownership-checked marker removal + directory fsync on success. Read-only preliminary classification may only produce terminal read-only outcomes or route toward write intent — preflight never authorizes a write. Literal zero-filesystem-write paths: exact final-closure replay; preliminary finalized rejection; preliminary untrusted/suspicious closure rejection — no bootstrap, `.execution_locks`, markers, events, or mtime changes. Existing marker always `occupied_unknown`; no automatic stale cleanup, takeover, force, unlock, skip, env bypass, or public release API. Same-thread/same-Run nested calls reuse outer marker; other threads/processes not reentrant; cross-key nesting rejected. Failure before `run_write_started`: no Run write claimed; owned marker cleaned when possible. Failure after `run_write_started`: marker preserved; `mutation_may_have_committed = true`; `safe_to_retry = false`. First final closure: closure JSON → private final-closure event append under active write context. Guarantees compliant single-machine HTR writer coordination on documented POSIX/Linux local-filesystem contract. Does **not** claim transactionality, atomic multi-file commit, rollback, ambiguous-outcome reconciliation, safe automatic marker recovery, distributed locking, or protection against deliberate same-user out-of-band tampering. Deferred: Task 26 ambiguous-outcome reconciliation and marker-residue handling; Task 27 Recovery/Successor Run protocol.
+
+**Task 24 authoritative approval control (checkpointed):** project-scoped SoT at `{runs_root}/.control/approvals/{approval_id}/` with immutable O_EXCL records (`issue.json`, optional `revoke.json`, singleton `claim.json`, singleton `outcome.json`); separate `htr.approval.digest.v1`; mandatory expiry (max 24h); explicit `event_id` for event-appending APIs; read validation advisory only; dedicated `_approval_control_barrier` reusing Task 23 marker without lifecycle seal bypass; internal `_approval_use_session` for Task 25 continuous marker; no lifecycle invoke; no writes to run-tree `approvals.jsonl`; no Recovery/retry/repair/marker reconciliation.
 
 **First human-gated invoke (Task 25) must include:** pre-observe, plan + approval validation, lock (Task 23 ✅), re-observe, stale rejection, one allowlisted API, **mandatory post-observe verification**, ambiguous-outcome handling, fail-stop (no blind retry). Verification cannot be deferred to a later task for the first write path.
 
@@ -163,8 +165,8 @@ read-only observability          ← Task 19 ✅
 → derived action planning        ← Task 21 ✅
 → immutable finalized-run enforcement ← Task 22 ✅
 → durable run write barrier          ← Task 23 ✅
-→ authoritative scoped approval      ← Task 24 (next)
-→ human-gated single-API invoke  ← Task 25
+→ authoritative scoped approval      ← Task 24 ✅
+→ human-gated single-API invoke  ← Task 25 (next; not started)
 → ambiguous-outcome reconciliation ← Task 26
 → Recovery/Successor Run protocol ← Task 27
 → bounded retry and repair       ← Task 28
@@ -200,8 +202,8 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 | 21 | Derived action plan (read-only) | ✅ Task 21 |
 | 22 | Immutable finalized-run enforcement | ✅ Task 22 |
 | 23 | Durable run write barrier | ✅ Task 23 |
-| 24 | Approval control schema + API | **Next** |
-| 25 | Human-gated single-API invoke pilot | Pre-finalization only; mandatory post-verify |
+| 24 | Approval control schema + API | ✅ Task 24 |
+| 25 | Human-gated single-API invoke pilot | Next (not started) |
 | 26 | Execution reconciliation / ambiguous outcomes | |
 | 27 | Recovery/Successor Run protocol | Architect schema task |
 | 28 | Bounded retry/repair framework | |
@@ -217,5 +219,6 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Phase 2 **implementation has started** (read-only foundation + immutable seal).
 - Task 20 records Policy C; Task 22 **implements finalized-run seal**; Task 23 **implements durable run write barrier**.
 - Recovery/Successor protocol remains **defined, not implemented** (Task 27+).
-- No Phase 2 lifecycle invoke path is enabled (Task 24 approval + Task 25 invoke next).
+- Task 24 **checkpointed** — authoritative approval control delivered; lifecycle invoke remains disabled until Task 25.
+- No Phase 2 lifecycle invoke path is enabled yet (Task 25 next; not started).
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

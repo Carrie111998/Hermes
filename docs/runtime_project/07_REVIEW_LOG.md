@@ -1209,7 +1209,43 @@ Committed Phase 1 `project_dir` = HTR **runs-storage root** (identical path role
 ### Non-goals confirmed
 
 - No database transactionality; no atomic multi-file commit; no rollback; no ambiguous-outcome reconciliation; no safe automatic marker recovery; no distributed locking; no protection against deliberate same-user out-of-band tampering
-- No Task 24 approval, Task 25 invoke, Task 26 reconciliation, Task 27 Recovery/Successor Run, Phase 2 lifecycle invocation
-- No superseded designs: marker-before-every-read-only decision; abstract Unix socket Phase A; expiring leases; automatic stale takeover; advisory observer lock fields
+- No Task 25 invoke, Task 26 reconciliation, Task 27 Recovery/Successor Run, Phase 2 lifecycle invocation
+- No superseded designs: marker-before-every-read-only decision; abstract Unix socket Phase A; expiring leases; automatic stale takeover; advisory observer lock fields; generic `enforce_seal` / `control_write_barrier` seal-bypass switch
 
-**Next implementation:** Task 24 — Authoritative approval control.
+**Next implementation:** Task 25 — Human-gated single-API invoke pilot.
+
+---
+
+## Task 24 — Authoritative Approval Control (2026-07-21)
+
+**Implementer:** Cursor
+**Status:** ✅ Checkpointed (fifth Phase 2 **implementation**)
+**Depends on:** Task 23 `c89f1161968931e329f64acb350b166ec564c174`
+
+### Delivered
+
+- `htr/approval_control.py` — authoritative SoT at `{runs_root}/.control/approvals/{approval_id}/` with immutable `issue.json`, optional `revoke.json`, singleton `claim.json`, singleton `outcome.json`
+- Read APIs: `get_approval`, `list_approvals`, `validate_approval` (advisory only)
+- Write APIs under internal `_approval_control_barrier` (not a lifecycle seal bypass)
+- `htr/execution_lock.py` — shared `_acquire_outer_run_marker` helper only; Task 23 `run_write_barrier` seal semantics unchanged
+- `htr/paths.py` — control-plane paths; `{run_root}/approvals.jsonl` documented inert legacy bootstrap
+- `htr/state.py` — approval control error types
+- `tests/htr/test_approval_control.py` — approval-control hardening matrix (**87 tests; 0 skipped**)
+
+### Contract enforced
+
+- One approval SoT; no mutable index; list derives from scanning `issue.json`
+- Immutable O_EXCL records with fsync file + directory; exact replay idempotent; conflicting replay fails closed
+- Issue/new claim rejected on `FINALIZED_VALID`; revoke/outcome allowed after finalization; untrusted/indeterminate seal fails closed on issue/claim
+- Singleton `claim.json`; different `claim_id` rejected after first claim; claimant must equal issue `executor_id`
+- Dedicated control barrier reuses Task 23 marker; serializes control + lifecycle writers per Run; no lifecycle seal bypass for Run SoT
+- No lifecycle invoke; no event append; no writes to run-tree `approvals.jsonl`
+
+### Non-goals confirmed
+
+- No lifecycle invocation (Task 25); no ambiguous reconciliation (Task 26); no Recovery/Successor Runs (Task 27)
+- No self-healing; no marker reconciliation; no distributed locking; no finalized-run mutation bypass
+
+**Tests (formal Git-only isolated archive):** full HTR manifest **1487 passed** (26 files); **0 failed**; **0 skipped**
+
+**Next implementation:** Task 25 — Human-gated single-API invoke pilot.

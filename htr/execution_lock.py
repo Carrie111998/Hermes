@@ -540,6 +540,42 @@ def run_mutation_boundary(
     return decorate
 
 
+def _acquire_outer_run_marker(
+    run_id: str,
+    base_dir: Path | None,
+) -> tuple[RunWriteContext, _RegistryEntry]:
+    """Acquire run marker and register ownership. No lifecycle seal policy."""
+    runs_root_fd, lock_root_fd = _bootstrap_and_pin(base_dir)
+    key = _registry_key_from_fds(runs_root_fd, run_id)
+    _close_fd_once(runs_root_fd)
+
+    with _registry_lock:
+        if key in _registry:
+            _close_fd_once(lock_root_fd)
+            raise RunExecutionLockOccupiedError(run_id=run_id)
+
+    marker_fd, token, marker_name = _acquire_marker(lock_root_fd, run_id)
+    entry = _RegistryEntry(
+        key=key,
+        token=token,
+        marker_fd=marker_fd,
+        lock_root_fd=lock_root_fd,
+        owner_pid=os.getpid(),
+        owner_thread_id=threading.get_ident(),
+        marker_name=marker_name,
+    )
+    with _registry_lock:
+        _registry[key] = entry
+    ctx = RunWriteContext(
+        run_id=run_id,
+        base_dir=base_dir,
+        key=key,
+        token=token,
+        is_outermost=True,
+    )
+    return ctx, entry
+
+
 @contextmanager
 def run_write_barrier(run_id: str, base_dir: Path | None = None) -> Iterator[RunWriteContext]:
     validate_id(run_id, "run")
@@ -574,39 +610,10 @@ def run_write_barrier(run_id: str, base_dir: Path | None = None) -> Iterator[Run
 
     ctx: RunWriteContext | None = None
     entry: _RegistryEntry | None = None
-    runs_root_fd: int | None = None
     exc_info: BaseException | None = None
     try:
         preliminary_terminal_seal_check(run_id, base_dir)
-        runs_root_fd, lock_root_fd = _bootstrap_and_pin(base_dir)
-        key = _registry_key_from_fds(runs_root_fd, run_id)
-        _close_fd_once(runs_root_fd)
-        runs_root_fd = None
-
-        with _registry_lock:
-            if key in _registry:
-                _close_fd_once(lock_root_fd)
-                raise RunExecutionLockOccupiedError(run_id=run_id)
-
-        marker_fd, token, marker_name = _acquire_marker(lock_root_fd, run_id)
-        entry = _RegistryEntry(
-            key=key,
-            token=token,
-            marker_fd=marker_fd,
-            lock_root_fd=lock_root_fd,
-            owner_pid=os.getpid(),
-            owner_thread_id=threading.get_ident(),
-            marker_name=marker_name,
-        )
-        with _registry_lock:
-            _registry[key] = entry
-        ctx = RunWriteContext(
-            run_id=run_id,
-            base_dir=base_dir,
-            key=key,
-            token=token,
-            is_outermost=True,
-        )
+        ctx, entry = _acquire_outer_run_marker(run_id, base_dir)
         from htr.finalization import assert_run_mutation_allowed
 
         assert_run_mutation_allowed(run_id, base_dir)
