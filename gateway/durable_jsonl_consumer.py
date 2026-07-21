@@ -637,6 +637,30 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 await asyncio.sleep(args.poll_seconds)
                 continue
 
+            # Confirm the open-gate state BEFORE staging/processing the batch.
+            # The first batch against a real backlog runs the model for up to
+            # max_records messages — minutes, not seconds — while the
+            # processing-activation transaction's post-start confirmation
+            # window is 20s. "Running" is true the moment both keys read open;
+            # the post-batch write below remains as the per-cycle heartbeat
+            # with fresh inbox counts. (2026-07-21 activation round 6: wait()
+            # timed out against a 1,563-event backlog and rolled back an
+            # otherwise-healthy activation.)
+            _write_status(
+                status_path,
+                {
+                    "state": "running",
+                    "processing_enabled": True,
+                    "config_enabled": True,
+                    "gate_enabled": True,
+                    "gate_generation": int(gate["generation"]),
+                    "gate_change_run_id": gate.get("change_run_id"),
+                    "pid": os.getpid(),
+                    "source_opened": True,
+                    "cursor_advanced": False,
+                    "inbox": inbox.counts(),
+                },
+            )
             staged = inbox.stage_from_source(
                 source, cursor, max_records=args.max_records
             )
