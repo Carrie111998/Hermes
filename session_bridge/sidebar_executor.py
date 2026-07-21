@@ -22,7 +22,12 @@ from .sidebar import (
     sidebar_create_recovery_key,
     validate_sidebar_create_reservation,
 )
-from .store import SIDEBAR_FATAL_ERRORS, SIDEBAR_RETRYABLE_ERRORS, SessionBridgeStore
+from .store import (
+    SIDEBAR_FATAL_ERRORS,
+    SIDEBAR_RETRYABLE_ERRORS,
+    SessionBridgeStore,
+    SidebarNativeTaskNotIndexed,
+)
 
 
 _PROCESS_DELIVERY_LOCK = threading.Lock()
@@ -1028,34 +1033,70 @@ class SidebarExecutor:
                 thread_id=thread_id,
                 error_code="broker_time_budget",
             )
-        try:
-            committed = self._store.commit_sidebar_job_with_lineage(
-                lease_token=lease_token,
-                codex_thread_id=thread_id,
-                source_session_id=source_session_id,
-                bridge_id=bridge_id,
-                now=_finite_time(self._clock()),
-            )
-            if (
-                not isinstance(committed, Mapping)
-                or committed.get("state") != "sidebar_visible"
-                or committed.get("codex_thread_id") != thread_id
-            ):
-                raise ValueError("sidebar executor commit is malformed")
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:
+        commit_error = self._commit_when_indexed(
+            lease_token=lease_token,
+            thread_id=thread_id,
+            source_session_id=source_session_id,
+            bridge_id=bridge_id,
+            operation_deadline=operation_deadline,
+            lease_expires_at=lease_expires_at,
+        )
+        if commit_error is not None:
             return self._settle(
                 job_id=job_id,
                 lease_token=lease_token,
                 thread_id=thread_id,
-                error_code=_store_error_code(exc),
+                error_code=commit_error,
             )
         return SidebarExecutionResult(
             status="visible",
             job_id=job_id,
             thread_id=thread_id,
         )
+
+    def _commit_when_indexed(
+        self,
+        *,
+        lease_token: str,
+        thread_id: str,
+        source_session_id: str,
+        bridge_id: str,
+        operation_deadline: float,
+        lease_expires_at: float,
+    ) -> str | None:
+        index_deadline = min(
+            operation_deadline,
+            _finite_time(self._monotonic()) + self._read_timeout_seconds,
+        )
+        while True:
+            if not self._has_budget(operation_deadline, lease_expires_at):
+                return "broker_time_budget"
+            try:
+                committed = self._store.commit_sidebar_job_with_lineage(
+                    lease_token=lease_token,
+                    codex_thread_id=thread_id,
+                    source_session_id=source_session_id,
+                    bridge_id=bridge_id,
+                    now=_finite_time(self._clock()),
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except SidebarNativeTaskNotIndexed:
+                pass
+            except Exception as exc:
+                return _store_error_code(exc)
+            else:
+                if (
+                    not isinstance(committed, Mapping)
+                    or committed.get("state") != "sidebar_visible"
+                    or committed.get("codex_thread_id") != thread_id
+                ):
+                    return "bridge_temporarily_unavailable"
+                return None
+            now = _finite_time(self._monotonic())
+            if now >= index_deadline:
+                return "native_task_not_indexed"
+            self._sleep(min(self._poll_interval, index_deadline - now))
 
     def _store_gate(self, *, now: float) -> SidebarExecutionResult | None:
         try:

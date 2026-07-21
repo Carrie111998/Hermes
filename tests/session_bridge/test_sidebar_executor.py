@@ -30,7 +30,11 @@ from session_bridge.sidebar_executor import (
     SidebarExecutionResult,
     SidebarExecutor,
 )
-from session_bridge.store import SIDEBAR_FATAL_ERRORS, SessionBridgeStore
+from session_bridge.store import (
+    SIDEBAR_FATAL_ERRORS,
+    SessionBridgeStore,
+    SidebarNativeTaskNotIndexed,
+)
 
 
 SOURCE_1 = "claude:source-1"
@@ -1937,6 +1941,96 @@ def test_commit_ambiguity_releases_once_without_replacement() -> None:
     assert native.create_calls == 0
     assert [event[0] for event in events][-2:] == ["commit", "fail"]
     assert store.failures == ["bridge_temporarily_unavailable"]
+
+
+def test_commit_waits_for_fresh_thread_lineage_index_without_releasing_lease() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+
+    class EventuallyIndexedStore(FakeStore):
+        commit_attempts = 0
+
+        def commit_sidebar_job_with_lineage(
+            self,
+            *,
+            lease_token: str,
+            codex_thread_id: str,
+            source_session_id: str,
+            bridge_id: str,
+            now: float,
+        ) -> dict[str, Any]:
+            self.commit_attempts += 1
+            if self.commit_attempts == 1:
+                self.events.append(("commit", codex_thread_id))
+                raise SidebarNativeTaskNotIndexed()
+            return super().commit_sidebar_job_with_lineage(
+                lease_token=lease_token,
+                codex_thread_id=codex_thread_id,
+                source_session_id=source_session_id,
+                bridge_id=bridge_id,
+                now=now,
+            )
+
+    store = EventuallyIndexedStore(events, [_job(SOURCE_1)])
+    native = FakeNative(events)
+
+    result = _executor(store, FakeVerifier(events), native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="visible",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+    )
+    assert native.create_calls == 1
+    assert store.commit_attempts == 2
+    assert store.failures == []
+    assert clock.now == 101.0
+    assert [event[0] for event in events][-3:] == ["rename", "commit", "commit"]
+
+
+def test_commit_index_wait_timeout_retains_exact_thread_without_recreating() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+
+    class NeverIndexedStore(FakeStore):
+        commit_attempts = 0
+
+        def commit_sidebar_job_with_lineage(
+            self,
+            *,
+            lease_token: str,
+            codex_thread_id: str,
+            source_session_id: str,
+            bridge_id: str,
+            now: float,
+        ) -> dict[str, Any]:
+            del lease_token, source_session_id, bridge_id, now
+            self.commit_attempts += 1
+            self.events.append(("commit", codex_thread_id))
+            raise SidebarNativeTaskNotIndexed()
+
+    store = NeverIndexedStore(events, [_job(SOURCE_1)])
+    native = FakeNative(events)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        read_timeout_seconds=2.0,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="native_task_not_indexed",
+    )
+    assert native.create_calls == 1
+    assert store.commit_attempts == 3
+    assert store.failure_thread_ids == [THREAD_1]
+    assert store.failures == ["native_task_not_indexed"]
+    assert clock.now == 102.0
 
 
 @pytest.mark.parametrize(

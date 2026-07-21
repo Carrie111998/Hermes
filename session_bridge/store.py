@@ -212,6 +212,15 @@ SIDEBAR_PRECREATE_EVIDENCE_KIND = (
     "codex_inventory_marker_and_recovery_zero_no_rollout"
 )
 SIDEBAR_PRECREATE_EVIDENCE_VERSION = 1
+
+
+class SidebarNativeTaskNotIndexed(ValueError):
+    """A verified native Codex task is not yet present in bridge inventory."""
+
+    def __init__(self) -> None:
+        super().__init__("native_task_not_indexed")
+
+
 _SIDEBAR_TERMINAL_LEDGER_COLUMNS = (
     "job_id",
     "idempotency_key",
@@ -7625,7 +7634,7 @@ def _ensure_sidebar_lineage_row(
         (Provider.CODEX.value, codex_thread_id),
     ).fetchone()
     if target is None:
-        raise ValueError("native_task_not_indexed")
+        raise SidebarNativeTaskNotIndexed()
     if (
         target["origin_kind"] != OriginKind.BRIDGE_PLACEHOLDER.value
         or target["origin_bridge_id"] != bridge_id
@@ -9669,4 +9678,4 @@ def _mirror_state(job_states: Sequence[str], links: Sequence[dict[str, Any]]) ->
     return "catalog_only"
 
 
-__all__ = ["SessionBridgeStore"]
+__all__ = ["SessionBridgeStore", "SidebarNativeTaskNotIndexed"]
