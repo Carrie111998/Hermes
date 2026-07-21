@@ -512,6 +512,8 @@ class ProductionBackend:
             )
         except RolloutGateBlocked:
             raise
+        except ConfigurationFailure:
+            raise
         except (OSError, PermissionError, ValueError) as exc:
             raise ConfigurationFailure("service_configuration_failed") from exc
         except RuntimeError as exc:

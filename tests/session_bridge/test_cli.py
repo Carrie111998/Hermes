@@ -2365,6 +2365,30 @@ def test_production_serve_applies_sidebar_create_cutover_before_public_mcp(
     assert events == ["cutover", "provider_runtime"]
 
 
+def test_production_serve_preserves_sidebar_cutover_configuration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ConfigurationFailure("sidebar_create_reservation_cutover_invalid")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_provider_runtime",
+        lambda **_kwargs: pytest.fail("provider runtime must not start"),
+    )
+
+    with pytest.raises(
+        ConfigurationFailure,
+        match="^sidebar_create_reservation_cutover_invalid$",
+    ):
+        backend.serve()
+
+
 def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
     calls: list[str] = []
     waits: list[float] = []
