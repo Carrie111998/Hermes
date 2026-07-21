@@ -1391,6 +1391,150 @@ def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
         bus.close()
 
 
+class TestBatchAgeSurvivesRestart:
+    """Restart-churn starvation fix (confirmed live 2026-07-21): batch age
+    must be measured from a persisted wall-clock first-buffered timestamp,
+    not re-stamped with the new process's time.monotonic() on every
+    __init__. Under ~20-30 min gateway lifetimes the old behavior meant a
+    3600s batch window NEVER elapsed — messages buffered at 18:07Z were
+    still undelivered at 00:44Z."""
+
+    def _write_configs(self, tmp_path):
+        (tmp_path / "telegram").mkdir(exist_ok=True)
+        (tmp_path / "telegram" / "topics.json").write_text(
+            '{"group_chat_id": "-1", "topics": {"system": {"thread_id": 15}}}')
+        (tmp_path / "telegram" / "verbosity.json").write_text(
+            '{"system": {"mode": "all"}}')
+
+    def _write_batch_state(self, tmp_path, state):
+        path = tmp_path / "notifications" / "notifier_batch.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+
+    def test_restored_batch_with_old_started_at_flushes_immediately(
+        self, tmp_path, monkeypatch,
+    ):
+        """A buffer restored with a 2h-old persisted started_at is already
+        past the 3600s window: the FIRST _flush_stale_batches call must
+        flush it, without the new process having to survive another hour."""
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_configs(tmp_path)
+        two_hours_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).isoformat()
+        self._write_batch_state(tmp_path, {
+            "buffer": {"-1:15": ["starved msg 1", "starved msg 2"]},
+            "started_at": {"-1:15": two_hours_ago},
+        })
+
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            sent = []
+            notifier = TelegramNotifier(
+                bus, send_fn=lambda chat_id, thread_id, msg: sent.append(msg))
+            notifier._flush_stale_batches()  # default max_age=3600s
+
+            assert len(sent) == 1, (
+                f"restored 2h-old batch must flush on first stale sweep; "
+                f"sent={sent!r}"
+            )
+            assert "Batched (2 events)" in sent[0]
+            # The synthetic batch_flush ledger row (18891230c) must survive
+            # the restore path too.
+            delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+            assert len(delivered) == 1
+            assert delivered[0].payload["original_event_type"] == "batch_flush"
+            assert delivered[0].payload["batch_count"] == 2
+        finally:
+            bus.close()
+
+    def test_restored_batch_with_fresh_started_at_does_not_flush_early(
+        self, tmp_path, monkeypatch,
+    ):
+        """A just-persisted batch restored after a quick restart keeps its
+        remaining age — it must NOT flush before the window elapses."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_configs(tmp_path)
+        self._write_batch_state(tmp_path, {
+            "buffer": {"-1:15": ["fresh msg"]},
+            "started_at": {"-1:15": datetime.now(timezone.utc).isoformat()},
+        })
+
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            sent = []
+            notifier = TelegramNotifier(
+                bus, send_fn=lambda chat_id, thread_id, msg: sent.append(msg))
+            notifier._flush_stale_batches()
+            assert sent == [], "fresh restored batch must wait out the window"
+            assert notifier._batch_buffer.get("-1:15") == ["fresh msg"]
+        finally:
+            bus.close()
+
+    def test_legacy_buffer_only_state_loads_and_seeds_now(
+        self, tmp_path, monkeypatch,
+    ):
+        """Backward compat: a pre-fix state file ({"buffer": {...}} with no
+        started_at) still restores; with no persisted age the key seeds at
+        now (old behavior — no crash, no premature flush)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_configs(tmp_path)
+        self._write_batch_state(tmp_path, {
+            "buffer": {"-1:15": ["legacy msg"]},
+        })
+
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            sent = []
+            notifier = TelegramNotifier(
+                bus, send_fn=lambda chat_id, thread_id, msg: sent.append(msg))
+            assert notifier._batch_buffer.get("-1:15") == ["legacy msg"]
+            notifier._flush_stale_batches()
+            assert sent == []
+        finally:
+            bus.close()
+
+    def test_persist_writes_wall_clock_started_at(
+        self, bus, topics_config, verbosity_config, tmp_path, monkeypatch,
+    ):
+        """Buffering a message must persist a parseable wall-clock
+        started_at for the key alongside the buffer, and flushing must
+        remove both."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda *a, **k: None,
+        )
+        # JOB_DISCOVERED at LOW is TRACE → batches (same witness as the
+        # TestLowPriorityBatching cases).
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+        assert notifier._batch_buffer, "event must have batched"
+        state_path = tmp_path / "notifications" / "notifier_batch.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert set(state["started_at"]) == set(state["buffer"])
+        for iso in state["started_at"].values():
+            parsed = datetime.fromisoformat(iso)
+            assert parsed.tzinfo is not None, (
+                "started_at must be timezone-aware wall clock")
+            age = (datetime.now(timezone.utc) - parsed).total_seconds()
+            assert 0 <= age < 60
+
+        notifier._flush_stale_batches(max_age=0)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["buffer"] == {}
+        assert state["started_at"] == {}
+
+
 class TestNotificationDeliveredReverseSignal:
     """NOTIFICATION_DELIVERED + NOTIFICATION_FAILED reverse-signal layer
     (2026-04-30, design at docs/superpowers/specs/2026-04-30-notification-

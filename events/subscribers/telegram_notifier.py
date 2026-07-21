@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -134,12 +134,40 @@ class TelegramNotifier(BaseSubscriber):
         self.topics: Dict[str, Dict[str, Any]] = {}
         self._verbosity: Dict[str, Dict[str, str]] = {}
         self._batch_buffer: Dict[str, List[str]] = {}  # topic_key → messages
+        # topic_key → wall-clock ISO of the first buffered message. Persisted
+        # alongside the buffer so batch AGE survives restarts: seeding the
+        # monotonic timestamps at plain now() on every __init__ meant a batch
+        # only flushed if one gateway process survived the full 3600s window —
+        # under 2026-07-20's ~20-30 min restart churn, messages starved 6.5h
+        # undelivered (confirmed live 2026-07-21 00:44Z).
+        self._batch_started_at: Dict[str, str] = {}
         saved = load_state(notifier_batch_path(), default={})
         if isinstance(saved.get("buffer"), dict):
             self._batch_buffer = {k: list(v) for k, v in saved["buffer"].items()}
-        import time
-        now = time.monotonic()
-        self._batch_timestamps: Dict[str, float] = {k: now for k in self._batch_buffer}  # topic_key → first batch time
+        saved_started = saved.get("started_at")
+        if not isinstance(saved_started, dict):
+            saved_started = {}  # legacy buffer-only state file (pre-fix shape)
+        now_mono = time.monotonic()
+        now_wall = datetime.now(timezone.utc)
+        # topic_key → first batch time. Monotonic drives in-process aging;
+        # each restored key is seeded BACK by its persisted wall-clock age so
+        # already-stale batches flush on the first _flush_stale_batches pass.
+        self._batch_timestamps: Dict[str, float] = {}
+        for k in self._batch_buffer:
+            elapsed = 0.0
+            iso = saved_started.get(k)
+            if iso:
+                try:
+                    elapsed = max(
+                        0.0,
+                        (now_wall - datetime.fromisoformat(iso)).total_seconds(),
+                    )
+                    self._batch_started_at[k] = iso
+                except (TypeError, ValueError):
+                    pass  # unparseable/naive timestamp → treat as freshly buffered
+            if k not in self._batch_started_at:
+                self._batch_started_at[k] = now_wall.isoformat()
+            self._batch_timestamps[k] = now_mono - elapsed
         self._verbosity_mtime: float = 0.0  # mtime of verbosity.json for hot-reload
 
         # AGENT_FAILURE_CLUSTER dedup cache (source, 30-min bucket) -> True.
@@ -330,6 +358,7 @@ class TelegramNotifier(BaseSubscriber):
             if key not in self._batch_buffer:
                 self._batch_buffer[key] = []
                 self._batch_timestamps[key] = time.monotonic()
+                self._batch_started_at[key] = datetime.now(timezone.utc).isoformat()
             self._batch_buffer[key].append(message)
             if len(self._batch_buffer[key]) >= BATCH_MAX_MESSAGES:
                 self._flush_batch_key(key)
@@ -788,6 +817,7 @@ class TelegramNotifier(BaseSubscriber):
         """Deliver and clear one thread's batch buffer."""
         messages = self._batch_buffer.pop(key, [])
         self._batch_timestamps.pop(key, None)
+        self._batch_started_at.pop(key, None)
         if not messages:
             return
         parts = key.split(":", 1)
@@ -804,6 +834,13 @@ class TelegramNotifier(BaseSubscriber):
         try:
             save_state(notifier_batch_path(), {
                 "buffer": {k: list(v) for k, v in self._batch_buffer.items()},
+                # Wall-clock first-buffered stamps: what lets the NEXT process
+                # resume aging instead of restarting the 3600s window. Only
+                # keys still buffered are persisted (flushes pop both dicts).
+                "started_at": {
+                    k: v for k, v in self._batch_started_at.items()
+                    if k in self._batch_buffer
+                },
             })
         except Exception:
             logger.exception("TelegramNotifier: failed to persist batch buffer")
