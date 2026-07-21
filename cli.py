@@ -12125,7 +12125,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     @_cm
                     def _sentry_txn(**_kw):
                         yield None
-                _msg_preview = (agent_message[:80] + "...") if len(agent_message) > 80 else agent_message
+                _msg_preview_str = agent_message if isinstance(agent_message, str) else "[multimodal message]"
+                _msg_preview = (_msg_preview_str[:80] + "...") if len(_msg_preview_str) > 80 else _msg_preview_str
                 _txn_tags = {
                     "session_id": self.session_id or "",
                     "model": getattr(self, "model", "") or "",
