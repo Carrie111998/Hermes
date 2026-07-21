@@ -98,7 +98,6 @@ def handle_workflow_start(
     resume: bool = False,
     scope: str = "project",
     single_flight: bool = False,
-    delivery_target: str = "",
     inputs: Optional[Dict[str, Any]] = None,
     board: str = "",
     **kwargs: Any,
@@ -108,13 +107,15 @@ def handle_workflow_start(
     Mode ``"predefined"`` (default):
         Reads a YAML pipeline definition from ``docs/fleet-pipelines/``,
         validates it, and dispatches via the kanban engine.  Creates
-        kanban cards for layer-0 nodes, monitors them, and advances the
-        DAG as cards complete.  Returns a final summary keyed by node_id.
+        kanban cards for layer-0 nodes and returns immediately — the
+        engine monitors layer completion on a background thread.
+        Always fire-and-forget; use ``workflow_status`` to check progress.
 
     Mode ``"dynamic"``:
         Delegates to ``dynamic_bridge.run_dynamic_workflow()`` which
         creates an ad-hoc DAG at runtime from the objective and node
-        list passed in *context*.
+        list passed in *context*.  Also fire-and-forget — each node is
+        dispatched via ``delegate_task(background=True)``.
 
     ``board`` overrides the kanban board for this run.  When empty,
     the engine uses the YAML ``kanban_board`` field or auto-creates
@@ -132,7 +133,6 @@ def handle_workflow_start(
             context=context,
             scope=scope,
             single_flight=single_flight,
-            delivery_target=delivery_target,
             dry_run=dry_run,
             board=board,
             **kwargs,
@@ -160,7 +160,17 @@ def _handle_workflow_start_predefined(
     board: str = "",
 ) -> str:
     """Predefined mode: look up YAML in docs/fleet-pipelines/, validate,
-    dispatch via engine."""
+    dispatch via engine.
+
+    Always fire-and-forget.  Creates kanban cards for all nodes and
+    subscribes the final-layer card(s) for notification — the gateway
+    notifier pushes terminal events (completed, blocked, etc.) back
+    to the originating session.  No monitoring loop, no delegate_task,
+    no daemon thread.
+
+    Use ``workflow_status`` to check progress and ``workflow_list`` to
+    discover available pipelines.
+    """
     try:
         engine = _engine()
     except Exception as exc:
@@ -184,15 +194,40 @@ def _handle_workflow_start_predefined(
                     hint="wait for the current run to finish, or call workflow_status to inspect",
                 )
 
+    # Dry-run is always synchronous — no cards created, no monitoring needed.
+    if dry_run:
+        try:
+            result = engine.execute(
+                workflow_name=workflow,
+                context=context or {},
+                start_node=node,
+                dry_run=True,
+                resume=resume,
+                inputs=inputs,
+                board=board,
+            )
+        except FileNotFoundError as exc:
+            return _err(f"workflow not found: {workflow}", hint=str(exc))
+        except Exception as exc:
+            logger.exception("workflow_start dry-run failed for %s", workflow)
+            return _err(f"dry-run failed: {exc}")
+        return _ok(result)
+
+    # Fire-and-forget: create all kanban cards and subscribe the final
+    # layer for notifications.  The kanban dispatcher picks up ready
+    # cards and spawns workers; the gateway notifier pushes terminal
+    # events back to the originating session.  No monitoring loop,
+    # no delegate_task, no daemon thread.
     try:
         result = engine.execute(
             workflow_name=workflow,
             context=context or {},
             start_node=node,
-            dry_run=dry_run,
+            dry_run=False,
             resume=resume,
             inputs=inputs,
             board=board,
+            fire_and_forget=True,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))
@@ -200,7 +235,11 @@ def _handle_workflow_start_predefined(
         logger.exception("workflow_start failed for %s", workflow)
         return _err(f"execution failed: {exc}")
 
-    return _ok(result)
+    return _ok({
+        "status": "dispatched",
+        "workflow": workflow,
+        "message": f"Workflow '{workflow}' started — cards created, final node will notify on completion",
+    })
 
 
 def _handle_workflow_start_dynamic(
@@ -208,7 +247,6 @@ def _handle_workflow_start_dynamic(
     context: Optional[Dict[str, Any]] = None,
     scope: str = "project",
     single_flight: bool = False,
-    delivery_target: str = "",
     dry_run: bool = False,
     board: str = "",
     **kwargs: Any,
@@ -261,7 +299,6 @@ def _handle_workflow_start_dynamic(
             "node_count": len(nodes),
             "scope": scope,
             "single_flight": single_flight,
-            "delivery_target": delivery_target,
             "board": board,
         })
 
@@ -274,7 +311,6 @@ def _handle_workflow_start_dynamic(
             scope=scope,
             single_flight=single_flight,
             dispatch_ready=True,
-            delivery_target=delivery_target,
             board=board,
         )
     except Exception as exc:
@@ -443,7 +479,6 @@ def handle_workflow_dynamic_start(
     context: Optional[Dict[str, Any]] = None,
     scope: str = "project",
     single_flight: bool = False,
-    delivery_target: str = "",
     dry_run: bool = False,
     **kwargs: Any,
 ) -> str:
@@ -458,7 +493,6 @@ def handle_workflow_dynamic_start(
         mode="dynamic",
         scope=scope,
         single_flight=single_flight,
-        delivery_target=delivery_target,
         dry_run=dry_run,
         **kwargs,
     )
@@ -550,14 +584,6 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                     "In predefined mode, also checks the YAML single_flight flag."
                 ),
                 "default": False,
-            },
-            "delivery_target": {
-                "type": "string",
-                "description": (
-                    "Optional delivery target (e.g. 'discord:CHANNEL_ID'). "
-                    "When set, the workflow summary is posted on completion. "
-                    "Dynamic mode only."
-                ),
             },
             "inputs": {
                 "type": "object",
@@ -714,8 +740,7 @@ DYNAMIC_WORKFLOW_SCHEMA: Dict[str, Any] = {
         "  - project (default): creates kanban cards on the dynamic-workflows board\n"
         "  - global: in-memory only, no kanban\n"
         "  - durable: persists node state to ~/.hermes/workflow-logs/\n\n"
-        "Use workflow_status to query progress, or pass delivery_target to "
-        "route the final summary to Discord/Telegram."
+        "Use workflow_status to query progress."
     ),
     "parameters": {
         "type": "object",
@@ -753,13 +778,6 @@ DYNAMIC_WORKFLOW_SCHEMA: Dict[str, Any] = {
                     "with the same workflow_id is already in progress."
                 ),
                 "default": False,
-            },
-            "delivery_target": {
-                "type": "string",
-                "description": (
-                    "Optional delivery target (e.g. 'discord:CHANNEL_ID'). "
-                    "When set, the workflow summary is posted on completion."
-                ),
             },
             "dry_run": {
                 "type": "boolean",
