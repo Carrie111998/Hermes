@@ -141,6 +141,10 @@ def _claude_visibility_preflight(
 ) -> dict[str, str] | None:
     """Read pinned version, auth, and startup state without starting a session."""
 
+    # Transcript discovery is fixed to ~/.claude/projects. An alternate config
+    # root would make the startup state and transcript roots disagree.
+    if "CLAUDE_CONFIG_DIR" in os.environ:
+        return None
     if os.environ.get("CLAUDE_CODE_TEAM_ONBOARDING") in (
         _CLAUDE_FORCED_TEAM_ONBOARDING
     ):
@@ -187,7 +191,7 @@ def _claude_visibility_preflight(
     selected_config = (
         Path(global_config_path)
         if global_config_path is not None
-        else _resolve_claude_global_config_path()
+        else _resolve_default_claude_global_config_path()
     )
     theme = _read_claude_startup_theme(selected_config)
     if theme is None:
@@ -199,22 +203,18 @@ def _claude_visibility_preflight(
     }
 
 
-def _resolve_claude_global_config_path() -> Path:
-    """Mirror Claude 2.1.110's X8 global-state path resolution."""
+def _resolve_default_claude_global_config_path() -> Path:
+    """Resolve Claude 2.1.110 global state for the fixed default config root."""
 
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = (
-        Path(configured) if configured is not None else Path.home() / ".claude"
-    )
-    modern = config_dir / ".config.json"
+    home = Path.home()
+    modern = home / ".claude" / ".config.json"
     try:
         if modern.exists():
             return modern
     except OSError:
         return modern
     suffix = "-custom-oauth" if os.environ.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
-    base = Path(configured) if configured else Path.home()
-    return base / f".claude{suffix}.json"
+    return home / f".claude{suffix}.json"
 
 
 def _read_claude_startup_theme(global_config_path: Path) -> str | None:
@@ -264,7 +264,7 @@ def _strict_json_object(payload: str | bytes) -> dict[str, Any] | None:
             object_pairs_hook=object_from_pairs,
             parse_constant=reject_constant,
         )
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         return None
     return document if type(document) is dict else None
 

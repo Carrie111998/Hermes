@@ -20,10 +20,7 @@ from session_bridge.characterize import (
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
 )
-from session_bridge.cli import (
-    _claude_visibility_preflight,
-    _resolve_claude_global_config_path,
-)
+from session_bridge.cli import _claude_visibility_preflight
 from session_bridge.cli import main
 from session_bridge.config import BridgeConfig
 from session_bridge.claude_registrar import ClaudeRegistrarOutcome
@@ -834,6 +831,56 @@ def test_claude_preflight_surrogate_auth_output_fails_closed(tmp_path: Path) -> 
     )
 
 
+def test_claude_preflight_deeply_nested_auth_json_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    global_config = tmp_path / ".claude.json"
+    global_config.write_text(
+        '{"hasCompletedOnboarding":true,"theme":"light"}', encoding="utf-8"
+    )
+    nested = "[" * 3_000 + "null" + "]" * 3_000
+    auth_payload = f'{{"loggedIn":true,"nested":{nested}}}'
+    assert len(auth_payload.encode("utf-8")) < 16_384
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
+        stdout = "2.1.110" if argv[-1] == "--version" else auth_payload
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    assert (
+        _claude_visibility_preflight(
+            ("claude",), runner=runner, global_config_path=global_config
+        )
+        is None
+    )
+
+
+def test_claude_preflight_deeply_nested_global_json_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    global_config = tmp_path / ".claude.json"
+    nested = "[" * 3_000 + "null" + "]" * 3_000
+    global_payload = (
+        '{"hasCompletedOnboarding":true,"theme":"light","nested":'
+        f"{nested}"
+        "}"
+    )
+    assert len(global_payload.encode("utf-8")) < 4 * 1024 * 1024
+    global_config.write_text(global_payload, encoding="utf-8")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
+        stdout = "2.1.110" if argv[-1] == "--version" else '{"loggedIn":true}'
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    assert (
+        _claude_visibility_preflight(
+            ("claude",), runner=runner, global_config_path=global_config
+        )
+        is None
+    )
+
+
 def test_claude_preflight_does_not_treat_user_settings_theme_as_onboarding_state(
     tmp_path: Path,
 ) -> None:
@@ -914,23 +961,70 @@ def test_claude_preflight_rejects_forced_team_onboarding_before_commands(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "config_dir",
+    [
+        "",
+        "relative/.claude",
+        str(Path.home() / ".claude"),
+        "配置/claudé",
+        str(Path.home() / "custom-claude-root"),
+    ],
+    ids=["empty", "relative", "explicit-default", "unicode", "custom"],
+)
+def test_claude_preflight_rejects_any_claude_config_dir_before_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_dir: str,
+) -> None:
+    global_config = tmp_path / ".claude.json"
+    global_config.write_text(
+        '{"hasCompletedOnboarding":true,"theme":"light"}', encoding="utf-8"
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", config_dir)
+
+    def runner(argv: list[str], **_kwargs: Any) -> Any:
+        calls.append(argv)
+        stdout = "2.1.110" if argv[-1] == "--version" else '{"loggedIn":true}'
+        return type("Result", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    assert (
+        _claude_visibility_preflight(
+            ("claude",), runner=runner, global_config_path=global_config
+        )
+        is None
+    )
+    assert calls == []
+
+
 @pytest.mark.parametrize("modern_config", [True, False])
-def test_claude_preflight_resolves_claude_config_dir_like_pinned_cli(
+def test_claude_preflight_resolves_default_custom_oauth_global_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     modern_config: bool,
 ) -> None:
-    config_dir = tmp_path / "isolated-claude-home"
-    config_dir.mkdir()
-    selected = config_dir / (".config.json" if modern_config else ".claude.json")
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    selected = (
+        claude_dir / ".config.json"
+        if modern_config
+        else tmp_path / ".claude-custom-oauth.json"
+    )
     selected.write_text(
         '{"hasCompletedOnboarding":true,"theme":"dark-ansi"}', encoding="utf-8"
     )
     if modern_config:
-        (config_dir / ".claude.json").write_text(
+        (tmp_path / ".claude-custom-oauth.json").write_text(
             '{"hasCompletedOnboarding":false,"theme":null}', encoding="utf-8"
         )
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    else:
+        (tmp_path / ".claude.json").write_text(
+            '{"hasCompletedOnboarding":false,"theme":null}', encoding="utf-8"
+        )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://oauth.example.test")
     monkeypatch.delenv("CLAUDE_CODE_TEAM_ONBOARDING", raising=False)
 
     def runner(argv: list[str], **kwargs: Any) -> Any:
@@ -943,19 +1037,6 @@ def test_claude_preflight_resolves_claude_config_dir_like_pinned_cli(
         "authentication": "available",
         "theme": "dark-ansi",
     }
-
-
-def test_claude_global_config_empty_override_matches_pinned_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")
-
-    assert _resolve_claude_global_config_path() == Path.home() / ".claude.json"
-
-    (tmp_path / ".config.json").write_text("{}", encoding="utf-8")
-
-    assert _resolve_claude_global_config_path() == Path(".config.json")
 
 
 def test_characterize_claude_visibility_json_dispatches_once(
