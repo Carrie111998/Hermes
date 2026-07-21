@@ -1720,7 +1720,7 @@ class SessionBridgeStore:
     def requeue_failed_claude_visibility_reconciliation(
         self, job_id: str, reserved_claude_uuid: str
     ) -> dict[str, Any]:
-        """Repair a known provider-limit failure without authorizing creation."""
+        """Repair an exact reviewed failure without changing its native UUID."""
 
         normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
         normalized_uuid = _exact_nonempty_text(
@@ -1746,14 +1746,20 @@ class SessionBridgeStore:
                        lease_kind = NULL,
                        error_code = 'creation_ambiguous',
                        error_detail =
-                           'provider limit requires exact UUID reconciliation',
+                           'operator authorized exact UUID reconciliation',
                        updated_at = ?
                    WHERE id = ? AND reserved_claude_uuid = ?
                      AND state = 'claude_failed'
-                     AND error_code = 'bridge_conflict'
-                     AND error_detail IN (
-                         'registration response malformed',
-                         'exact transcript conflict'
+                     AND (
+                         (error_code = 'bridge_conflict'
+                          AND error_detail IN (
+                              'registration response malformed',
+                              'exact transcript conflict'
+                          ))
+                         OR
+                         (error_code = 'max_attempts_exhausted'
+                          AND error_detail =
+                              'maximum paid launch attempts exhausted')
                      )
                      AND attempts > 0""",
                 (

@@ -37,6 +37,13 @@ from .models import OriginKind, ProjectedMessage, Provider, SessionProjection
 
 
 _MAX_RESPONSE_CHARS = 65_536
+_CLAUDE_STARTUP_ISOLATION_ARGS = (
+    "--setting-sources=",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--strict-mcp-config",
+    "--no-chrome",
+)
 _RESPONSE_SETTLE_SECONDS = 0.5
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -839,6 +846,7 @@ class ClaudeNativeRegistrar:
             *self._command,
             "--resume",
             str(native_id),
+            *_CLAUDE_STARTUP_ISOLATION_ARGS,
             "--model",
             "haiku",
             "--tools",
@@ -1080,6 +1088,7 @@ class ClaudeNativeRegistrar:
             identity.claude_uuid,
             "--name",
             candidate.native_name,
+            *_CLAUDE_STARTUP_ISOLATION_ARGS,
             "--model",
             "haiku",
             "--tools",

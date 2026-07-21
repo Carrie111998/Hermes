@@ -329,6 +329,11 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
                 item.reserved_claude_uuid,
                 "--name",
                 item.native_name,
+                "--setting-sources=",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+                "--strict-mcp-config",
+                "--no-chrome",
                 "--model",
                 "haiku",
                 "--tools",
@@ -441,6 +446,11 @@ def test_auth_recovery_resumes_exact_uuid_interactively_without_create() -> None
                 "claude",
                 "--resume",
                 item.reserved_claude_uuid,
+                "--setting-sources=",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+                "--strict-mcp-config",
+                "--no-chrome",
                 "--model",
                 "haiku",
                 "--tools",
@@ -1216,6 +1226,26 @@ def test_raw_winpty_empty_read_after_exit_is_eof() -> None:
         _close_raw_registrar_process(process)
 
 
+def test_winpty_readiness_ignores_conpty_prologue_and_matches_split_marker() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    "\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H",
+                    "\x1b[?20",
+                    "04h",
+                ]
+            )
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            return next(self.chunks)
+
+    output = _WinPtyProcess(Process()).read_until_ready(1.0)
+
+    assert output.startswith("\x1b[?9001h\x1b[?1004h\x1b[?25l")
+    assert output.endswith("\x1b[?2004h")
+
+
 def test_winpty_reader_timeout_is_bounded_when_underlying_read_blocks() -> None:
     release = threading.Event()
 
@@ -1711,6 +1741,8 @@ def test_real_windows_conpty_fixture_exit_and_cleanup(
         if scenario == "registered"
         else "registration prompt"
     )
+    startup = process.read_until_ready(10.0)
+    assert "\x1b[?2004h" in startup
     process.write(f"\x1b[200~{registration_prompt}\x1b[201~\r")
     output = process.read_until(10.0, prompt=registration_prompt)
     process.write("/exit\r")

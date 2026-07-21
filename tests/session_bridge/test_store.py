@@ -6443,6 +6443,51 @@ def test_claude_visibility_exact_absence_at_max_terminalizes_without_usage(
     assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 1
 
 
+def test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_history(
+    db: SessionDB,
+) -> None:
+    clock = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock[0], local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("max-operator-recovery")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    launch = store.claim_claude_visibility_job(100.0, 60, 25, "1.00", "0.02", 1)
+    store.retry_claude_visibility_job(
+        identity.job_id, launch.lease_digest, "creation_ambiguous", 100.0, "unknown"
+    )
+    reconciliation = store.claim_claude_visibility_job(
+        100.0, 60, 25, "1.00", "0.02", 1
+    )
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "a" * 64,
+    )
+    clock[0] = 86_500.0
+    exhausted = store.claim_claude_visibility_job(
+        86_500.0, 60, 25, "1.00", "0.02", 1
+    )
+    assert exhausted.status == "max_attempts_exhausted"
+
+    repaired = store.requeue_failed_claude_visibility_reconciliation(
+        identity.job_id, identity.claude_uuid
+    )
+    assert repaired["state"] == "claude_retry"
+    assert repaired["reserved_claude_uuid"] == identity.claude_uuid
+    assert repaired["attempts"] == 1
+    assert repaired["error_detail"] == "operator authorized exact UUID reconciliation"
+
+    same_id_launch = store.claim_claude_visibility_job(
+        86_500.0, 60, 25, "1.00", "0.02", 2
+    )
+    assert same_id_launch.status == "claimed"
+    assert same_id_launch.lease_kind == "launch"
+    assert same_id_launch.reserved_claude_uuid == identity.claude_uuid
+    assert same_id_launch.attempt_ordinal == 2
+    assert len(_rows(db, "SELECT * FROM session_claude_registration_usage")) == 2
+
+
 def test_claude_visibility_concurrent_exhaustion_has_one_terminal_transition(
     tmp_path,
 ) -> None:
