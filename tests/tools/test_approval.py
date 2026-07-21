@@ -612,6 +612,52 @@ class TestSensitiveInPlaceEditPattern:
         assert key is None
 
 
+class TestPatchBinaryGap:
+    """Detect patch command targeting sensitive paths via explicit CLI argument.
+
+    The `patch` binary can apply diffs directly to files. When a sensitive path
+    is given as an explicit argument (the target file), it should require
+    approval — same rationale as sed/perl/ruby/awk in-place edit patterns.
+    However, `patch -p1 < repo.patch` (no explicit target) derives its targets
+    from diff headers and must remain safe."""
+
+    def test_patch_etc_hosts_dangerous(self):
+        dangerous, key, desc = detect_dangerous_command("patch /etc/hosts < changes.patch")
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "patch" in desc.lower()
+
+    def test_patch_private_etc_sudoers_dangerous(self):
+        dangerous, key, desc = detect_dangerous_command("patch /private/etc/sudoers < sudoers.patch")
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "patch" in desc.lower()
+
+    def test_patch_ssh_authorized_keys_dangerous(self):
+        dangerous, key, desc = detect_dangerous_command("patch ~/.ssh/authorized_keys < keys.patch")
+        assert dangerous is True
+        assert key is not None
+        assert "sensitive" in desc.lower() or "ssh" in desc.lower() or "patch" in desc.lower()
+
+    def test_patch_hermes_config_dangerous(self):
+        dangerous, key, desc = detect_dangerous_command("patch ~/.hermes/config.yaml < settings.patch")
+        assert dangerous is True
+        assert key is not None
+        assert "hermes" in desc.lower() or "patch" in desc.lower()
+
+    def test_patch_regular_source_file_safe(self):
+        dangerous, key, desc = detect_dangerous_command("patch src/main.py < changes.patch")
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+    def test_patch_stdin_no_explicit_target_safe(self):
+        dangerous, key, desc = detect_dangerous_command("patch -p1 < repo.patch")
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+
 class TestWindowsAbsolutePathFolding:
     """Windows absolute home / Hermes-home prefixes must fold to ~/ and
     ~/.hermes/ in dangerous-command detection.
