@@ -28,7 +28,7 @@ All in `activation-orchestrator.js`:
 | **pre-live check RETIRED** | **87** | `const retired = await ops.retirePreCheck({ preRunId: preRun.runId })` |
 | first post-flip pass | 112 | `requirePass(...)` |
 | rung released | 148 | `requirePass(...)` |
-| **post-flip check retired (rollback path)** | **242** | `const evidence = await ops.retirePostCheck()` |
+| **post-flip check retired** | **242 AND 478** | `const evidence = await ops.retirePostCheck()` — TWO call sites, not one |
 
 Line numbers drift. The **call names** (`retirePreCheck`, `retirePostCheck`,
 `requirePass`) are the durable handles — grep those, not the numbers.
