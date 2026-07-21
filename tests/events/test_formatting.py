@@ -437,3 +437,56 @@ def test_resource_pressure_has_distinct_icon():
     icon = event_icon(e)
     assert icon, "RESOURCE_PRESSURE must have a non-empty icon"
     assert icon not in PRIORITY_EMOJI.values()
+
+
+class TestCodeDriftBody:
+    def _payload(self, **kw):
+        p = {
+            "status": "drifting", "state": "behind",
+            "head": "aaaaaaaaa", "main": "bbbbbbbbb",
+            "behind_count": 3, "ahead_count": 0, "dirty": False,
+            "missed_subjects": ["c1 fix one", "c2 fix two"],
+            "repo": "C:/Users/diego/.hermes/agent-src",
+        }
+        p.update(kw)
+        return p
+
+    def test_behind_body_is_plain_language(self):
+        from events.formatting import code_drift_body
+        body = code_drift_body(self._payload())
+        assert "LAGS main by 3 commit(s)" in body
+        assert "c1 fix one" in body
+        assert "merge --ff-only main" in body
+        assert "restart the gateway" in body
+        # No raw dict/list splat.
+        assert "{" not in body and "[" not in body
+
+    def test_dirty_flag_rendered(self):
+        from events.formatting import code_drift_body
+        assert "DIRTY" in code_drift_body(self._payload(dirty=True))
+
+    def test_ahead_body(self):
+        from events.formatting import code_drift_body
+        body = code_drift_body(self._payload(
+            state="ahead", behind_count=0, ahead_count=2, missed_subjects=[]))
+        assert "AHEAD of main by 2 commit(s)" in body
+
+    def test_diverged_body(self):
+        from events.formatting import code_drift_body
+        body = code_drift_body(self._payload(state="diverged"))
+        assert "DIVERGED" in body
+
+    def test_resolved_body(self):
+        from events.formatting import code_drift_body
+        body = code_drift_body({"status": "resolved", "head": "bbbbbbbbb",
+                                "main": "bbbbbbbbb", "repo": "x"})
+        assert "back in sync" in body
+        assert "bbbbbbbbb" in body
+
+    def test_resolved_header_dot_is_green(self):
+        """A CODE_DRIFT resolution reads as green, mirroring the
+        GATEWAY_HEALTH 'up' override — recovery, not an alert."""
+        from events.formatting import header_dot
+        e = _make_event(EventType.CODE_DRIFT, source="system",
+                        payload={"status": "resolved"})
+        assert header_dot(e) == PRIORITY_EMOJI[Priority.LOW]

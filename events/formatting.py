@@ -178,6 +178,9 @@ def header_dot(event: Event) -> str:
     if event.event_type == EventType.GATEWAY_HEALTH:
         if (event.payload or {}).get("status") == "up":
             return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
+    if event.event_type == EventType.CODE_DRIFT:
+        if (event.payload or {}).get("status") == "resolved":
+            return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
     return priority_dot(event.priority)
 
 
@@ -533,4 +536,43 @@ def partial_backlog_body(payload: dict, *, max_ids: int = 10) -> str:
         except (TypeError, ValueError):
             scope = str(len(shown))
         lines.append(f"Sample jobs ({scope}): {', '.join(shown)}")
+    return "\n".join(lines)
+
+
+def code_drift_body(p: dict) -> str:
+    """Plain-language CODE_DRIFT body (2026-07-21).
+
+    The generic fallback would splat missed_subjects as a raw list; this is
+    the operator's phone-facing diagnosis + remediation line.
+    """
+    p = p or {}
+    repo = p.get("repo", "~/.hermes/agent-src")
+    if p.get("status") == "resolved":
+        return f"Deployed checkout back in sync with main @ {p.get('main', '?')}"
+
+    state = p.get("state", "?")
+    lines = []
+    if state == "behind":
+        lines.append(
+            f"Deployed checkout LAGS main by {p.get('behind_count', '?')} "
+            "commit(s) — landed fixes are NOT running."
+        )
+        for subj in (p.get("missed_subjects") or [])[:5]:
+            lines.append(f"  missed: {subj}")
+    elif state == "ahead":
+        lines.append(
+            f"Deployed checkout is AHEAD of main by {p.get('ahead_count', '?')} "
+            "commit(s) — the working tree carries unlanded state."
+        )
+    else:
+        lines.append(
+            f"Deployed checkout has DIVERGED from main "
+            f"(HEAD {p.get('head', '?')} vs main {p.get('main', '?')})."
+        )
+    if p.get("dirty"):
+        lines.append("Working tree is DIRTY (uncommitted changes).")
+    if state == "behind":
+        lines.append(
+            f"Fix: git -C {repo} merge --ff-only main, then restart the gateway."
+        )
     return "\n".join(lines)

@@ -522,6 +522,12 @@ class TelegramNotifier(BaseSubscriber):
             from events.formatting import partial_backlog_body
             return partial_backlog_body(p)
 
+        if et == EventType.CODE_DRIFT:
+            # 2026-07-21: the generic fallback would splat missed_subjects
+            # as a raw list — render the plain-language diagnosis instead.
+            from events.formatting import code_drift_body
+            return code_drift_body(p)
+
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
 
