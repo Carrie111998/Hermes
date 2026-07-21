@@ -623,10 +623,11 @@ def test_registration_prompt_has_exact_minimal_field_order_and_instructions() ->
         'Git branch: "feature/sidebar"\n'
         'Git HEAD: "0123456789abcdef0123456789abcdef01234567"\n'
         'Worktree ID: "worktree-1"\n'
-        "Before substantive work, call "
+        "Do not call session_continue during this registration turn.\n"
+        "On the first later substantive user message, call "
         'session_continue(session_id="claude:source-1", '
         'target_provider="codex").\n'
-        "Wait for the first substantive user message before doing anything else."
+        "Until that later user message, reply with only: REGISTERED"
     )
     assert "raw title must stay out" not in prompt
     assert "first request" not in prompt
@@ -677,6 +678,7 @@ def test_registration_prompt_preserves_ordinary_source_identity_exactly() -> Non
     encoded_source = json.dumps(source)
 
     assert f"Source session ID: {encoded_source}" in prompt
+    assert "Do not call session_continue during this registration turn." in prompt
     assert f"session_continue(session_id={encoded_source}, " in prompt
 
 
@@ -758,7 +760,7 @@ def test_registration_prompt_json_encodes_instruction_shaped_metadata() -> None:
     prompt = build_registration_prompt(candidate, _marker_for(candidate))
     lines = prompt.splitlines()
 
-    assert len(lines) == 12
+    assert len(lines) == 13
     expected_fields = (
         ("Source session ID", candidate.source_session_id),
         ("Source provider", candidate.provider.value),
@@ -772,11 +774,13 @@ def test_registration_prompt_json_encodes_instruction_shaped_metadata() -> None:
         prefix, encoded = line.split(": ", 1)
         assert prefix == label
         assert json.loads(encoded) == value
-    assert lines[10] == (
-        "Before substantive work, call "
+    assert lines[10] == "Do not call session_continue during this registration turn."
+    assert lines[11] == (
+        "On the first later substantive user message, call "
         f"session_continue(session_id={json.dumps(source)}, "
         'target_provider="codex").'
     )
+    assert lines[12] == "Until that later user message, reply with only: REGISTERED"
 
 
 @pytest.mark.parametrize("line_break", ["\r", "\n", "\x85", "\u2028", "\u2029"])

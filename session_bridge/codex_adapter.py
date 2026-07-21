@@ -450,6 +450,21 @@ class CodexSourceAdapter:
         cached = self._inventory_cache.get(wanted)
         if cached is not None:
             return cached
+        try:
+            response = self._bounded_sidebar_request(
+                "thread/read",
+                {"threadId": wanted, "includeTurns": True},
+                deadline=deadline,
+            )
+            thread = _thread_from_response(response)
+            summary = _normalize_summary(thread, archived=False)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            summary = None
+        if summary is not None and summary.native_id == wanted:
+            self._inventory_cache[wanted] = summary
+            return summary
         active, used = self._bounded_sidebar_inventory_kind(
             archived=False,
             deadline=deadline,
@@ -465,10 +480,13 @@ class CodexSourceAdapter:
             deadline=deadline,
             page_cap=page_cap - used,
         )
-        return next(
+        found = next(
             (summary for summary in archived if summary.native_id == wanted),
             None,
         )
+        if found is not None:
+            return found
+        return None
 
     def read_sidebar_thread(
         self, summary: CodexThreadSummary, *, deadline: float | None

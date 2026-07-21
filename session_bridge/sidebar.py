@@ -195,9 +195,10 @@ def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:
         f"Git branch: {git_branch}",
         f"Git HEAD: {git_head}",
         f"Worktree ID: {worktree_id}",
-        "Before substantive work, call "
+        "Do not call session_continue during this registration turn.",
+        "On the first later substantive user message, call "
         f'session_continue(session_id={source}, target_provider="codex").',
-        "Wait for the first substantive user message before doing anything else.",
+        "Until that later user message, reply with only: REGISTERED",
     ))
 
 
@@ -360,13 +361,15 @@ def _is_exact_registration_block(value: object) -> bool:
     if not isinstance(value, str):
         return False
     lines = value.split("\n")
-    if len(lines) != 12 or lines[:2] != [
+    if len(lines) != 13 or lines[:2] != [
         "This is a Hermes Session Bridge placeholder registration.",
         "Do not perform project work during registration.",
     ]:
         return False
-    if lines[11] != (
-        "Wait for the first substantive user message before doing anything else."
+    if lines[10] != "Do not call session_continue during this registration turn.":
+        return False
+    if lines[12] != (
+        "Until that later user message, reply with only: REGISTERED"
     ):
         return False
 

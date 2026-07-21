@@ -456,6 +456,18 @@ def _codex_signed_read(
     )
 
 
+def _codex_direct_read(read: dict[str, Any]) -> dict[str, Any]:
+    direct = deepcopy(read)
+    direct["thread"].update({
+        "title": "Mirror title",
+        "cwd": "C:/valid",
+        "createdAt": 100.0,
+        "updatedAt": 101.0,
+        "revision": "revision-1",
+    })
+    return direct
+
+
 def _codex_adapter(
     responses: dict[str, list[dict[str, Any] | Exception]],
     **kwargs: Any,
@@ -491,9 +503,12 @@ def _sidebar_expected(
 
 
 def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None:
+    direct = _codex_signed_read()
+    direct["thread"]["createdAt"] = 100.0
+    direct["thread"]["updatedAt"] = 101.0
     client = FakeRequestClient({
         "thread/list": [_codex_inventory()],
-        "thread/read": [_codex_signed_read()],
+        "thread/read": [direct, direct],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -512,13 +527,53 @@ def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None
         bridge_id="bridge-1",
     )
     assert [method for method, _, _ in client.calls] == [
-        "thread/list",
+        "thread/read",
         "thread/read",
     ]
     assert all(
         method not in {"thread/start", "thread/name/set"}
         for method, _, _ in client.calls
     )
+
+
+def test_find_sidebar_thread_reads_known_exact_id_before_inventory() -> None:
+    direct = _codex_signed_read()
+    direct["thread"]["createdAt"] = 100.0
+    direct["thread"]["updatedAt"] = 101.0
+    client = FakeRequestClient({"thread/read": [direct]})
+    source = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    found = source.find_sidebar_thread(CODEX_ID, deadline=None, page_cap=2)
+
+    assert found is not None
+    assert found.native_id == CODEX_ID
+    assert [method for method, _, _ in client.calls] == ["thread/read"]
+
+
+def test_sidebar_thread_verifier_falls_back_to_exact_read_for_fresh_thread() -> None:
+    direct = _codex_signed_read()
+    direct["thread"]["createdAt"] = 100.0
+    direct["thread"]["updatedAt"] = 101.0
+    client = FakeRequestClient({
+        "thread/list": [{"data": []}, {"data": []}],
+        "thread/read": [direct, direct],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    verified = verifier.verify_thread(
+        thread_id=CODEX_ID,
+        expected=_sidebar_expected(),
+    )
+
+    assert verified.thread_id == CODEX_ID
+    assert [method for method, _, _ in client.calls] == [
+        "thread/read",
+        "thread/read",
+    ]
 
 
 def test_sidebar_thread_verifier_accepts_structural_read_only_inventory() -> None:
@@ -769,9 +824,9 @@ def test_sidebar_snapshot_ttl_is_capped_below_lease_retry_window() -> None:
 def test_sidebar_thread_verifier_rejects_wrong_authenticated_lineage(
     read: dict[str, Any], code: str
 ) -> None:
+    direct = _codex_direct_read(read)
     client = FakeRequestClient({
-        "thread/list": [_codex_inventory()],
-        "thread/read": [read],
+        "thread/read": [direct, read],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -791,24 +846,22 @@ def test_sidebar_thread_verifier_rejects_invalid_signature_and_duplicate_marker(
     valid = encode_bridge_marker(_sidebar_expected(), SECRET)
     invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
     for content in (invalid, f"{valid}\n{valid}"):
-        client = FakeRequestClient({
-            "thread/list": [_codex_inventory()],
-            "thread/read": [
-                _codex_read(
-                    turns=[
+        read = _codex_read(
+            turns=[
+                {
+                    "id": "registration",
+                    "items": [
                         {
-                            "id": "registration",
-                            "items": [
-                                {
-                                    "type": "userMessage",
-                                    "id": "item-1",
-                                    "content": [{"type": "text", "text": content}],
-                                }
-                            ],
+                            "type": "userMessage",
+                            "id": "item-1",
+                            "content": [{"type": "text", "text": content}],
                         }
-                    ]
-                )
-            ],
+                    ],
+                }
+            ]
+        )
+        client = FakeRequestClient({
+            "thread/read": [_codex_direct_read(read), read],
         })
         verifier = SidebarThreadVerifier(
             CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1239,7 +1292,11 @@ def test_sidebar_thread_verifier_bounds_not_indexed_polling() -> None:
 
     assert raised.value.code == "native_task_not_indexed"
     assert sleeps == [1.0, 1.0]
-    assert [method for method, _, _ in client.calls] == ["thread/list"] * 4
+    assert [method for method, _, _ in client.calls] == [
+        "thread/read",
+        "thread/list",
+        "thread/list",
+    ] * 2
 
 
 def test_placeholder_result_is_the_frozen_common_contract() -> None:
