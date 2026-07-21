@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from htr import paths
+from htr.execution_lock import begin_run_write, run_mutation_boundary
 from htr.io import atomic_write_json, ensure_dir, read_json, sha256_file
 from htr.schemas import validate as validate_schema
 
@@ -57,6 +58,7 @@ def make_task_card(
     return task_card
 
 
+@run_mutation_boundary
 def write_task_card(
     run_id: str,
     task_id: str,
@@ -64,13 +66,11 @@ def write_task_card(
     base_dir: Path | None = None,
 ) -> Path:
     """Atomically write *task_card* to the task workspace."""
-    from htr.finalization import assert_run_mutation_allowed
-
-    assert_run_mutation_allowed(run_id, base_dir)
     validate_schema(task_card, "task_card")
     if task_card["run_id"] != run_id or task_card["task_id"] != task_id:
         raise ValueError("task_card run_id/task_id do not match write target")
     target = task_card_json_path(run_id, task_id, base_dir)
+    begin_run_write()
     ensure_dir(target.parent)
     atomic_write_json(target, task_card)
     return target

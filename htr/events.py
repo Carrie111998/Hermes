@@ -66,6 +66,16 @@ from htr.finalization import (
     evaluate_run_seal,
     matches_run_final_closure_recorded_event,
 )
+from htr.execution_lock import (
+    RunExecutionLockBoundaryViolationError,
+    RunExecutionLockOccupiedError,
+    begin_run_write,
+    bind_active_write_context,
+    get_active_write_context,
+    marker_present_noncreating,
+    run_mutation_boundary,
+    run_write_barrier,
+)
 from htr.schemas import validate as validate_schema
 from htr.state import (
     ATTEMPT_HEAL_REQUIRED,
@@ -158,8 +168,15 @@ VERIFICATION_RECORDED_STATUSES: frozenset[str] = frozenset(
 
 
 def _guard_run_mutation(run_id: str, base_dir: Path | None = None) -> None:
-    """Fail closed when *run_id* is sealed or closure state blocks mutation."""
-    assert_run_mutation_allowed(run_id, base_dir)
+    """Revalidate seal inside an active write barrier (nested call sites)."""
+    ctx = get_active_write_context()
+    if ctx is None:
+        raise RunExecutionLockBoundaryViolationError(
+            "_guard_run_mutation requires active run_write_barrier"
+        )
+    if ctx.run_id != run_id:
+        raise RunExecutionLockBoundaryViolationError("run_id mismatch in active write barrier")
+    ctx.revalidate_mutation_allowed()
 
 
 def _append_run_event_internal(
@@ -168,6 +185,9 @@ def _append_run_event_internal(
     base_dir: Path | None = None,
 ) -> None:
     """Append a run-level lifecycle event without seal guard (internal only)."""
+    from htr.execution_lock import require_closure_append_context
+
+    require_closure_append_context(run_id, base_dir)
     validate_schema(event, "event")
     _validate_event_ids(event)
     if event["run_id"] != run_id:
@@ -290,6 +310,7 @@ def make_run_event(
     return event
 
 
+@run_mutation_boundary
 def append_task_event(
     run_id: str,
     event: dict[str, Any],
@@ -300,7 +321,7 @@ def append_task_event(
     _validate_event_ids(event)
     if event["run_id"] != run_id:
         raise ValueError("event run_id does not match append target run_id")
-    _guard_run_mutation(run_id, base_dir)
+    begin_run_write()
     append_jsonl(paths.task_events_path(run_id, base_dir), event)
 
 
@@ -320,8 +341,11 @@ def append_run_event(
         raise InvalidTransition(
             "run_final_closure_recorded events must use record_run_final_closure"
         )
-    _guard_run_mutation(run_id, base_dir)
-    append_jsonl(paths.task_events_path(run_id, base_dir), event)
+    with run_write_barrier(run_id, base_dir) as wb:
+        with bind_active_write_context(wb):
+            wb.revalidate_mutation_allowed()
+            begin_run_write()
+            append_jsonl(paths.task_events_path(run_id, base_dir), event)
 
 
 def read_task_events(
@@ -371,12 +395,15 @@ def _ensure_run_and_task_workspace(
 ) -> None:
     manifest_path = paths.run_manifest_path(run_id, base_dir)
     if not manifest_path.exists():
+        begin_run_write()
         create_run_workspace(run_id, base_dir)
     task_status_path = paths.task_status_path(run_id, task_id, base_dir)
     if not task_status_path.exists():
+        begin_run_write()
         create_task_workspace(run_id, task_id, base_dir)
 
 
+@run_mutation_boundary
 def apply_task_transition(
     run_id: str,
     task_id: str,
@@ -388,7 +415,6 @@ def apply_task_transition(
 ) -> dict[str, Any]:
     """Append a task status event, then update ``task_status.json`` snapshot."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     _ensure_run_and_task_workspace(run_id, task_id, base_dir)
 
@@ -412,15 +438,18 @@ def apply_task_transition(
     if existing is not None:
         return existing
 
+    begin_run_write()
     append_task_event(run_id, candidate, base_dir)
 
     updated = dict(current)
     updated["status"] = new_status
     validate_schema(updated, "task_status")
+    begin_run_write()
     atomic_write_json(status_path, updated)
     return candidate
 
 
+@run_mutation_boundary
 def register_attempt(
     run_id: str,
     task_id: str,
@@ -432,7 +461,6 @@ def register_attempt(
 ) -> dict[str, Any]:
     """Bootstrap attempt workspace, append event, then register in task status."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     _ensure_run_and_task_workspace(run_id, task_id, base_dir)
@@ -458,6 +486,7 @@ def register_attempt(
             f"attempt_id {attempt_id!r} is already registered for task {task_id!r}"
         )
 
+    begin_run_write()
     create_attempt_workspace(run_id, task_id, attempt_id, base_dir)
     append_task_event(run_id, candidate, base_dir)
 
@@ -467,10 +496,12 @@ def register_attempt(
         attempts.append(attempt_id)
     updated["attempts"] = attempts
     validate_schema(updated, "task_status")
+    begin_run_write()
     atomic_write_json(status_path, updated)
     return candidate
 
 
+@run_mutation_boundary
 def apply_attempt_transition(
     run_id: str,
     task_id: str,
@@ -483,7 +514,6 @@ def apply_attempt_transition(
 ) -> dict[str, Any]:
     """Append an attempt status event, then update ``attempt_status.json``."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     _ensure_run_and_task_workspace(run_id, task_id, base_dir)
@@ -516,11 +546,13 @@ def apply_attempt_transition(
     if existing is not None:
         return existing
 
+    begin_run_write()
     append_task_event(run_id, candidate, base_dir)
 
     updated = dict(current)
     updated["status"] = new_status
     validate_schema(updated, "attempt_status")
+    begin_run_write()
     atomic_write_json(attempt_status_path, updated)
     return candidate
 
@@ -549,6 +581,7 @@ def _matches_result_submitted_replay(
     )
 
 
+@run_mutation_boundary
 def submit_attempt_result(
     run_id: str,
     task_id: str,
@@ -561,7 +594,6 @@ def submit_attempt_result(
 ) -> dict[str, Any]:
     """Write attempt result, append event, and move status to result_submitted."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     validate_schema(result, "attempt_result")
@@ -640,6 +672,7 @@ def submit_attempt_result(
     if existing is not None:
         return existing
 
+    begin_run_write()
     ensure_dir(result_path.parent)
     atomic_write_json(result_path, result)
     append_task_event(run_id, candidate, base_dir)
@@ -647,6 +680,7 @@ def submit_attempt_result(
     updated = dict(current)
     updated["status"] = ATTEMPT_RESULT_SUBMITTED
     validate_schema(updated, "attempt_status")
+    begin_run_write()
     atomic_write_json(attempt_status_path, updated)
     return candidate
 
@@ -679,6 +713,7 @@ def _matches_manual_verification_replay(
     )
 
 
+@run_mutation_boundary
 def submit_manual_verification(
     run_id: str,
     task_id: str,
@@ -708,7 +743,6 @@ def submit_manual_verification(
         )
 
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
 
     submitted_fingerprint = verification_fingerprint(verification_result)
     verification_path = verification_result_json_path(
@@ -782,6 +816,7 @@ def submit_manual_verification(
     if existing is not None:
         return existing
 
+    begin_run_write()
     ensure_dir(verification_path.parent)
     atomic_write_json(verification_path, verification_result)
     append_task_event(run_id, candidate, base_dir)
@@ -789,6 +824,7 @@ def submit_manual_verification(
     updated = dict(current)
     updated["status"] = target_status
     validate_schema(updated, "attempt_status")
+    begin_run_write()
     atomic_write_json(attempt_status_path, updated)
     return candidate
 
@@ -832,6 +868,7 @@ def _matches_manual_task_completed_replay(
     )
 
 
+@run_mutation_boundary
 def complete_task_manually(
     run_id: str,
     task_id: str,
@@ -844,7 +881,6 @@ def complete_task_manually(
 ) -> dict[str, Any]:
     """Manually mark a task completed after *attempt_id* has verification_passed."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_id(task_id, "task")
     validate_id(attempt_id, "attempt")
     validate_schema(completion_record, "task_completion_record")
@@ -938,6 +974,7 @@ def complete_task_manually(
     if existing is not None:
         return existing
 
+    begin_run_write()
     ensure_dir(completion_record_path.parent)
     atomic_write_json(completion_record_path, completion_record)
     append_task_event(run_id, candidate, base_dir)
@@ -945,6 +982,7 @@ def complete_task_manually(
     updated_task_status = dict(current_task_status)
     updated_task_status["status"] = TASK_COMPLETED
     validate_schema(updated_task_status, "task_status")
+    begin_run_write()
     atomic_write_json(task_status_path, updated_task_status)
     return candidate
 
@@ -986,6 +1024,7 @@ def _matches_manual_run_completed_replay(
     )
 
 
+@run_mutation_boundary
 def complete_run_manually(
     run_id: str,
     completion_record: dict[str, Any],
@@ -996,7 +1035,6 @@ def complete_run_manually(
 ) -> dict[str, Any]:
     """Manually mark a run completed after listed tasks are already completed."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(completion_record, "run_completion_record")
     if completion_record["run_id"] != run_id:
         raise ValueError("completion_record run_id does not match submission target")
@@ -1006,6 +1044,7 @@ def complete_run_manually(
 
     manifest_path = paths.run_manifest_path(run_id, base_dir)
     if not manifest_path.exists():
+        begin_run_write()
         create_run_workspace(run_id, base_dir)
 
     for task_id in completion_record["completed_task_ids"]:
@@ -1077,6 +1116,7 @@ def complete_run_manually(
         _require_record_json_for_idempotent_replay(completion_record_path)
         return existing
 
+    begin_run_write()
     ensure_dir(completion_record_path.parent)
     atomic_write_json(completion_record_path, completion_record)
     append_run_event(run_id, candidate, base_dir)
@@ -1084,6 +1124,7 @@ def complete_run_manually(
     updated_run_manifest = dict(current_run_manifest)
     updated_run_manifest["status"] = RUN_COMPLETED
     validate_schema(updated_run_manifest, "run_manifest")
+    begin_run_write()
     atomic_write_json(manifest_path, updated_run_manifest)
     return candidate
 
@@ -1110,6 +1151,7 @@ def _matches_manual_run_reviewed_replay(
     )
 
 
+@run_mutation_boundary
 def review_run_manually(
     run_id: str,
     review_record: dict[str, Any],
@@ -1120,7 +1162,6 @@ def review_run_manually(
 ) -> dict[str, Any]:
     """Manually record a human review decision for a completed run."""
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(review_record, "run_review_record")
     if review_record["run_id"] != run_id:
         raise ValueError("review_record run_id does not match submission target")
@@ -1181,6 +1222,7 @@ def review_run_manually(
         _require_record_json_for_idempotent_replay(review_record_path)
         return existing
 
+    begin_run_write()
     ensure_dir(review_record_path.parent)
     atomic_write_json(review_record_path, review_record)
     append_run_event(run_id, candidate, base_dir)
@@ -1212,6 +1254,7 @@ def _matches_manual_run_followup_planned_replay(
     )
 
 
+@run_mutation_boundary
 def plan_run_followup(
     run_id: str,
     followup_plan_record: dict[str, Any],
@@ -1226,7 +1269,6 @@ def plan_run_followup(
     This API only validates, stores, and audits the plan; it does not execute it.
     """
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(followup_plan_record, "run_followup_plan_record")
     if followup_plan_record["run_id"] != run_id:
         raise ValueError(
@@ -1304,6 +1346,7 @@ def plan_run_followup(
         _require_record_json_for_idempotent_replay(followup_plan_record_path)
         return followup_plan_record
 
+    begin_run_write()
     ensure_dir(followup_plan_record_path.parent)
     atomic_write_json(followup_plan_record_path, followup_plan_record)
     append_run_event(run_id, candidate, base_dir)
@@ -1335,6 +1378,7 @@ def _matches_run_execution_requested_replay(
     )
 
 
+@run_mutation_boundary
 def request_run_execution(
     run_id: str,
     execution_request_record: dict[str, Any],
@@ -1349,7 +1393,6 @@ def request_run_execution(
     This API prepares controlled automation; it does not execute work.
     """
     validate_id(run_id, "run")
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(execution_request_record, "run_execution_request_record")
     if execution_request_record["run_id"] != run_id:
         raise ValueError(
@@ -1447,6 +1490,7 @@ def request_run_execution(
         _require_record_json_for_idempotent_replay(execution_request_record_path)
         return execution_request_record
 
+    begin_run_write()
     ensure_dir(execution_request_record_path.parent)
     atomic_write_json(execution_request_record_path, execution_request_record)
     append_run_event(run_id, candidate, base_dir)
@@ -1478,6 +1522,7 @@ def _matches_run_execution_completed_replay(
     )
 
 
+@run_mutation_boundary(project_as_base=True)
 def execute_run_execution_request(
     project_dir: Path | str,
     run_id: str,
@@ -1495,7 +1540,6 @@ def execute_run_execution_request(
     """
     validate_id(run_id, "run")
     base_dir = Path(project_dir)
-    _guard_run_mutation(run_id, base_dir)
     if not isinstance(executor, str) or not executor:
         raise ValueError("executor must be a non-empty string")
 
@@ -1625,6 +1669,7 @@ def execute_run_execution_request(
         _require_record_json_for_idempotent_replay(execution_result_record_path)
         return execution_result_record
 
+    begin_run_write()
     ensure_dir(execution_result_record_path.parent)
     atomic_write_json(execution_result_record_path, execution_result_record)
     append_run_event(run_id, candidate, base_dir)
@@ -1665,6 +1710,7 @@ def _matches_run_execution_verification_replay(
     )
 
 
+@run_mutation_boundary(project_as_base=True)
 def verify_run_execution_result(
     project_dir: Path | str,
     run_id: str,
@@ -1680,7 +1726,6 @@ def verify_run_execution_result(
     """
     validate_id(run_id, "run")
     base_dir = Path(project_dir)
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(verification_record, "run_execution_verification_record")
     if verification_record["run_id"] != run_id:
         raise ValueError(
@@ -1804,6 +1849,7 @@ def verify_run_execution_result(
         _require_record_json_for_idempotent_replay(verification_record_path)
         return verification_record
 
+    begin_run_write()
     ensure_dir(verification_record_path.parent)
     atomic_write_json(verification_record_path, verification_record)
     append_run_event(run_id, candidate, base_dir)
@@ -1837,6 +1883,7 @@ def _matches_run_post_verification_followup_planned_replay(
     )
 
 
+@run_mutation_boundary(project_as_base=True)
 def plan_post_verification_followup(
     project_dir: Path | str,
     run_id: str,
@@ -1852,7 +1899,6 @@ def plan_post_verification_followup(
     """
     validate_id(run_id, "run")
     base_dir = Path(project_dir)
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(plan_record, "run_post_verification_followup_plan_record")
     if plan_record["run_id"] != run_id:
         raise ValueError("plan_record run_id does not match submission target")
@@ -2003,6 +2049,7 @@ def plan_post_verification_followup(
         _require_record_json_for_idempotent_replay(plan_record_path)
         return plan_record
 
+    begin_run_write()
     ensure_dir(plan_record_path.parent)
     atomic_write_json(plan_record_path, plan_record)
     append_run_event(run_id, candidate, base_dir)
@@ -2038,6 +2085,7 @@ def _matches_run_post_verification_execution_requested_replay(
     )
 
 
+@run_mutation_boundary(project_as_base=True)
 def request_post_verification_execution(
     project_dir: Path | str,
     run_id: str,
@@ -2054,7 +2102,6 @@ def request_post_verification_execution(
     """
     validate_id(run_id, "run")
     base_dir = Path(project_dir)
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(
         run_post_verification_execution_request_record,
         "run_post_verification_execution_request_record",
@@ -2271,10 +2318,12 @@ def request_post_verification_execution(
         _require_record_json_for_idempotent_replay(request_record_path)
         return run_post_verification_execution_request_record
 
+    begin_run_write()
     ensure_dir(request_record_path.parent)
     atomic_write_json(
         request_record_path, run_post_verification_execution_request_record
     )
+    begin_run_write()
     append_run_event(run_id, candidate, base_dir)
     return run_post_verification_execution_request_record
 
@@ -2311,6 +2360,7 @@ def _matches_run_post_verification_execution_result_recorded_replay(
     )
 
 
+@run_mutation_boundary(project_as_base=True)
 def record_post_verification_execution_result(
     project_dir: Path | str,
     run_id: str,
@@ -2327,7 +2377,6 @@ def record_post_verification_execution_result(
     """
     validate_id(run_id, "run")
     base_dir = Path(project_dir)
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(
         run_post_verification_execution_result_record,
         "run_post_verification_execution_result_record",
@@ -2607,10 +2656,12 @@ def record_post_verification_execution_result(
         _require_record_json_for_idempotent_replay(result_record_path)
         return run_post_verification_execution_result_record
 
+    begin_run_write()
     ensure_dir(result_record_path.parent)
     atomic_write_json(
         result_record_path, run_post_verification_execution_result_record
     )
+    begin_run_write()
     append_run_event(run_id, candidate, base_dir)
     return run_post_verification_execution_result_record
 
@@ -2652,6 +2703,7 @@ def _matches_run_post_verification_execution_verification_recorded_replay(
     )
 
 
+@run_mutation_boundary(project_as_base=True)
 def record_post_verification_execution_verification(
     project_dir: Path | str,
     run_id: str,
@@ -2668,7 +2720,6 @@ def record_post_verification_execution_verification(
     """
     validate_id(run_id, "run")
     base_dir = Path(project_dir)
-    _guard_run_mutation(run_id, base_dir)
     validate_schema(
         run_post_verification_execution_verification_record,
         "run_post_verification_execution_verification_record",
@@ -3041,11 +3092,13 @@ def record_post_verification_execution_verification(
         _require_record_json_for_idempotent_replay(verification_record_path)
         return run_post_verification_execution_verification_record
 
+    begin_run_write()
     ensure_dir(verification_record_path.parent)
     atomic_write_json(
         verification_record_path,
         run_post_verification_execution_verification_record,
     )
+    begin_run_write()
     append_run_event(run_id, candidate, base_dir)
     return run_post_verification_execution_verification_record
 
@@ -3075,6 +3128,8 @@ def record_run_final_closure(
     base_dir = Path(project_dir)
     seal = evaluate_run_seal(run_id, base_dir)
     if seal.state == SealState.FINALIZED_VALID:
+        if marker_present_noncreating(base_dir, run_id):
+            raise RunExecutionLockOccupiedError(run_id=run_id)
         closure_record_path = run_final_closure_record_json_path(run_id, base_dir)
         existing_closure_record = read_json(closure_record_path)
         validate_schema(existing_closure_record, "run_final_closure_record")
@@ -3104,6 +3159,45 @@ def record_run_final_closure(
             reason_codes=seal.reason_codes,
         )
 
+    with run_write_barrier(run_id, base_dir) as wb:
+        wb.revalidate_mutation_allowed()
+        with bind_active_write_context(wb):
+            prepared = _record_run_final_closure_write_body(
+                run_id=run_id,
+                base_dir=base_dir,
+                run_final_closure_record=run_final_closure_record,
+                actor=actor,
+                event_id=event_id,
+                submitted_fingerprint=submitted_fingerprint,
+            )
+            if not isinstance(prepared, tuple):
+                return prepared
+            run_final_closure_record, candidate = prepared
+            begin_run_write()
+            ensure_dir(
+                run_final_closure_record_json_path(run_id, base_dir).parent
+            )
+            atomic_write_json(
+                run_final_closure_record_json_path(run_id, base_dir),
+                run_final_closure_record,
+            )
+            wb.activate_closure_append_marker()
+            try:
+                _append_run_event_internal(run_id, candidate, base_dir)
+            finally:
+                wb.deactivate_closure_append_marker()
+            return run_final_closure_record
+
+
+def _record_run_final_closure_write_body(
+    *,
+    run_id: str,
+    base_dir: Path,
+    run_final_closure_record: dict[str, Any],
+    actor: str,
+    event_id: str | None,
+    submitted_fingerprint: str,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
     closure_record_path = run_final_closure_record_json_path(run_id, base_dir)
     post_verification_execution_verification_record_path = (
         run_post_verification_execution_verification_record_json_path(run_id, base_dir)
@@ -3618,7 +3712,4 @@ def record_run_final_closure(
         _require_record_json_for_idempotent_replay(closure_record_path)
         return run_final_closure_record
 
-    ensure_dir(closure_record_path.parent)
-    atomic_write_json(closure_record_path, run_final_closure_record)
-    _append_run_event_internal(run_id, candidate, base_dir)
-    return run_final_closure_record
+    return run_final_closure_record, candidate

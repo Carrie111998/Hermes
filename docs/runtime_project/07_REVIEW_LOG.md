@@ -1176,3 +1176,40 @@ Committed Phase 1 `project_dir` = HTR **runs-storage root** (identical path role
 - No new lifecycle schemas/records/events; no edits to `htr/schemas.py`, `htr/observe.py`, `htr/action_plan.py`
 
 **Next implementation:** Task 23 — Execution lock/lease.
+
+---
+
+## Task 23 — Durable Run Write Barrier (2026-07-21)
+
+**Implementer:** Cursor
+**Status:** ✅ Checkpointed (fourth Phase 2 **implementation**; parent Task 22 `896961d0`)
+**Tests (candidate Git-only workspace):** focused execution-lock **37 passed**; finalization **59 passed**; finalization + Task 19/21 **175 passed**; full tracked `tests/htr/` **1400 passed** (25 files)
+**Depends on:** Task 22 `896961d0cfbd5a5cce97fc44ad88bf23ec0619eb`
+
+### Delivered
+
+- `htr/execution_lock.py` — run-scoped durable write marker at `{runs_root}/.execution_locks/{run_id}.marker`; O_EXCL acquisition; `@run_mutation_boundary`; `run_write_barrier`; `begin_run_write()`; closure-append guard; ownership-checked release with directory fsync
+- All 25 public/run-aware mutators wired: workspace (3), task/attempt (7), artifacts (2), events (`append_run_event`, `record_run_final_closure` + run-chain APIs)
+- `tests/htr/test_execution_lock.py` — runtime write-path 25/25; subprocess O_EXCL race, crash phases, fork isolation, first-closure interleaving; path alias/isolation/symlink/bootstrap/release tests; literal zero-write
+- `tests/htr/test_finalization.py` — literal project zero-write for finalized/untrusted/replay rejection
+
+### Contract enforced
+
+- Read-only preliminary classification allowed only for terminal read-only outcomes or routing toward write intent; preflight never authorizes a write
+- Literal zero-filesystem-write: exact final-closure replay; preliminary finalized rejection; preliminary suspicious/untrusted closure rejection — no bootstrap, `.execution_locks`, markers, events, or mtime changes
+- Write path: preliminary classification → bootstrap → O_EXCL marker → durability → authoritative revalidation → `run_write_started` before first possible Run write → mutation → verified marker cleanup + directory fsync
+- Existing marker always `occupied_unknown`; no stale cleanup, takeover, force, unlock, skip, env bypass, or public release API
+- Same-thread/same-Run nested reuse; other threads/processes not reentrant; cross-key nesting rejected
+- Before `run_write_started`: no Run write claimed; owned marker cleaned when possible; cleanup uncertainty fails closed
+- After `run_write_started`: marker preserved; `mutation_may_have_committed = true`; `safe_to_retry = false`
+- First closure: closure JSON → private `_append_run_event_internal` under active write context with narrow closure-append guard
+- Observe and plan remain lock-free and read-only
+- Single-machine HTR writer coordination on documented POSIX/Linux local-filesystem contract only
+
+### Non-goals confirmed
+
+- No database transactionality; no atomic multi-file commit; no rollback; no ambiguous-outcome reconciliation; no safe automatic marker recovery; no distributed locking; no protection against deliberate same-user out-of-band tampering
+- No Task 24 approval, Task 25 invoke, Task 26 reconciliation, Task 27 Recovery/Successor Run, Phase 2 lifecycle invocation
+- No superseded designs: marker-before-every-read-only decision; abstract Unix socket Phase A; expiring leases; automatic stale takeover; advisory observer lock fields
+
+**Next implementation:** Task 24 — Authoritative approval control.

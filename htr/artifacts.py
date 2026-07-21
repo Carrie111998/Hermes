@@ -17,6 +17,7 @@ def _check_artifact_path_safe(path_str: str, attempt_dir: Path) -> str:
         raise ValueError(f"artifact path escapes attempt workspace: {path_str!r}")
     return str(resolved)
 
+from htr.execution_lock import begin_run_write, run_mutation_boundary
 from htr.io import atomic_write_json, read_json
 from htr.schemas import validate as validate_schema
 
@@ -77,6 +78,7 @@ def read_artifact_manifest(
     )
 
 
+@run_mutation_boundary
 def write_artifact_manifest(
     run_id: str,
     task_id: str,
@@ -85,9 +87,6 @@ def write_artifact_manifest(
     base_dir: Path | None = None,
 ) -> Path:
     """Atomically write *manifest* to the attempt workspace."""
-    from htr.finalization import assert_run_mutation_allowed
-
-    assert_run_mutation_allowed(run_id, base_dir)
     normalized = _normalize_manifest(
         manifest,
         run_id=run_id,
@@ -95,6 +94,7 @@ def write_artifact_manifest(
         attempt_id=attempt_id,
     )
     target = paths.artifact_manifest_path(run_id, task_id, attempt_id, base_dir)
+    begin_run_write()
     atomic_write_json(target, normalized)
     return target
 
@@ -110,6 +110,7 @@ def list_artifacts(
     return list(manifest["artifacts"])
 
 
+@run_mutation_boundary
 def add_artifact(
     run_id: str,
     task_id: str,
@@ -123,9 +124,6 @@ def add_artifact(
     base_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Append an artifact entry to the manifest when not already present."""
-    from htr.finalization import assert_run_mutation_allowed
-
-    assert_run_mutation_allowed(run_id, base_dir)
     if metadata is None:
         metadata = {}
     if not isinstance(metadata, dict):
@@ -155,5 +153,6 @@ def add_artifact(
 
     artifacts.append(candidate)
     manifest["artifacts"] = artifacts
+    begin_run_write()
     write_artifact_manifest(run_id, task_id, attempt_id, manifest, base_dir)
     return candidate

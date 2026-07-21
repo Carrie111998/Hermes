@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from htr import paths
+from htr.execution_lock import begin_run_write, run_mutation_boundary
 from htr.schemas import SchemaName, validate
 
 
@@ -168,15 +169,14 @@ def _init_json_if_missing(
     atomic_write_json(path, data)
 
 
+@run_mutation_boundary
 def create_run_workspace(run_id: str, base_dir: Path | None = None) -> Path:
     """Create run-level directories and bootstrap files when missing.
 
     Idempotent: existing ``run_manifest.json`` and JSONL files are never
     overwritten or truncated. Repeated calls only ensure directories exist.
     """
-    from htr.finalization import assert_run_mutation_allowed
-
-    assert_run_mutation_allowed(run_id, base_dir)
+    begin_run_write()
     root = paths.run_root(run_id, base_dir)
     ensure_dir(root)
     ensure_dir(paths.reports_dir(run_id, base_dir))
@@ -198,6 +198,7 @@ def create_run_workspace(run_id: str, base_dir: Path | None = None) -> Path:
     return root
 
 
+@run_mutation_boundary
 def create_task_workspace(
     run_id: str,
     task_id: str,
@@ -210,13 +211,11 @@ def create_task_workspace(
     Reserved path (not created here):
     - ``task_card.yaml`` — created by Task Card schema / task lifecycle (Task 2+).
     """
-    from htr.finalization import assert_run_mutation_allowed
-
-    assert_run_mutation_allowed(run_id, base_dir)
     manifest_path = paths.run_manifest_path(run_id, base_dir)
     if not manifest_path.exists():
         create_run_workspace(run_id, base_dir)
 
+    begin_run_write()
     task_root = paths.task_dir(run_id, task_id, base_dir)
     ensure_dir(task_root)
     ensure_dir(paths.attempts_dir(run_id, task_id, base_dir))
@@ -234,6 +233,7 @@ def create_task_workspace(
     return task_root
 
 
+@run_mutation_boundary
 def create_attempt_workspace(
     run_id: str,
     task_id: str,
@@ -249,13 +249,11 @@ def create_attempt_workspace(
     - ``output/result.json`` — written by attempt execution, not bootstrap.
     - ``task_card.yaml`` — see :func:`create_task_workspace`.
     """
-    from htr.finalization import assert_run_mutation_allowed
-
-    assert_run_mutation_allowed(run_id, base_dir)
     task_status_path = paths.task_status_path(run_id, task_id, base_dir)
     if not task_status_path.exists():
         create_task_workspace(run_id, task_id, base_dir)
 
+    begin_run_write()
     attempt_root = paths.attempt_dir(run_id, task_id, attempt_id, base_dir)
     for maker in (
         paths.input_dir,

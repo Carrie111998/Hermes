@@ -1,16 +1,45 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-20 (Task 22 immutable finalized-run enforcement checkpoint; parent Task 21 `798bc1ea`)
+**Last updated:** 2026-07-21 (Task 23 durable run write barrier checkpoint; parent Task 22 `896961d0`)
 
 ---
 
 ## Active Task
 
-**Task 23 — Execution Lock/Lease** — mandatory before any Phase 2 lifecycle write/invoke path. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Task 24 — Authoritative Approval Control** — required before Phase 2 human-gated lifecycle invoke. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
 
 ---
 
 ## Completed
+
+### Task 23 — Durable Run Write Barrier
+
+**Status:** ✅ Checkpointed (fourth Phase 2 **implementation**; parent Task 22 `896961d0cfbd5a5cce97fc44ad88bf23ec0619eb`)
+**Tests (candidate Git-only workspace):** focused execution-lock **37 passed**; finalization **59 passed**; finalization + Task 19/21 **175 passed**; full tracked `tests/htr/` **1400 passed** (25 files)
+**Depends on:** Task 22 `896961d0cfbd5a5cce97fc44ad88bf23ec0619eb`
+
+**Delivered:**
+
+- `htr/execution_lock.py` — run-scoped durable write marker (`{runs_root}/.execution_locks/{run_id}.marker`); O_EXCL acquisition; `@run_mutation_boundary` / `run_write_barrier`; `begin_run_write()`; closure-append guard; ownership-checked release
+- `htr/events.py`, `htr/io.py`, `htr/contracts.py`, `htr/artifacts.py` — all 25 public/run-aware mutators wired through the barrier
+- `tests/htr/test_execution_lock.py` — runtime write-path matrix (25/25); subprocess crash/race/fork tests; path/release tests; literal zero-write proofs
+- `tests/htr/test_finalization.py` — literal project zero-write snapshots for finalized/untrusted/replay rejection
+
+**Contract (Task 23):**
+
+- Run-scoped durable write barrier for all 25 committed public/run-aware mutators on supported POSIX/Linux local filesystem
+- Read-only preliminary seal classification may only produce terminal read-only outcomes or route toward write intent; preflight never authorizes a write
+- Literal zero-filesystem-write paths: exact final-closure replay; preliminary finalized rejection; preliminary suspicious/untrusted closure rejection — no bootstrap, `.execution_locks`, markers, events, or mtime changes
+- Write path: read-only preliminary classification → bootstrap → O_EXCL marker → durability → authoritative revalidation → `run_write_started` before first possible Run write → mutation → ownership-checked marker removal + directory fsync
+- Existing marker always `occupied_unknown`; no automatic stale cleanup, takeover, force, unlock, skip, env bypass, or public release API
+- Same-thread/same-Run nested calls reuse outer marker; other threads/processes not reentrant; cross-key nesting rejected
+- Failure before `run_write_started`: no Run write claimed; owned marker cleaned when possible; cleanup uncertainty fails closed
+- Failure after `run_write_started`: marker preserved; `mutation_may_have_committed = true`; `safe_to_retry = false`
+- First final closure: closure JSON → private final-closure event append while holding active write context; `_append_run_event_internal` requires active ownership, PID/thread/key/token match, positive nested depth, `run_write_started`, and narrow closure-append context
+- Observe and plan remain lock-free, read-only, unchanged
+- Does **not** claim: database transactionality; atomic multi-file commit; rollback; ambiguous-outcome reconciliation; safe automatic marker recovery; distributed locking; protection against deliberate same-user out-of-band tampering
+
+**Explicitly not implemented:** Task 24 approval, Task 25 invoke, Task 26 reconciliation/marker-residue handling, Task 27 Recovery/Successor Run, Phase 2 lifecycle invocation.
 
 ### Task 22 — Immutable Finalized-Run Enforcement
 
@@ -261,11 +290,11 @@ Changes:
 
 ## Next Task (Implementer)
 
-**Task 23 — Execution Lock/Lease.** Mandatory before any Phase 2 lifecycle write or invoke path.
+**Task 24 — Authoritative Approval Control.** Required before Phase 2 human-gated lifecycle invoke (Task 22 seal ✅; Task 23 write barrier ✅).
 
-**Blocked until Task 23:** any Phase 2 lifecycle write or invoke path (Task 22 seal ✅).
+**Blocked until Task 24:** human-gated lifecycle invoke (Task 25).
 
-See `09_PHASE2_RUNTIME_BOUNDARY.md` for Tasks 23–31.
+See `09_PHASE2_RUNTIME_BOUNDARY.md` for Tasks 24–31.
 
 ---
 

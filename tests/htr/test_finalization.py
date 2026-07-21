@@ -69,6 +69,64 @@ def _file_mtimes(run_root: Path) -> dict[str, int]:
     }
 
 
+def _full_project_snapshot(base_dir: Path, *, run_id: str | None = None) -> dict[str, Any]:
+    files: dict[str, str] = {}
+    file_mtimes: dict[str, int] = {}
+    dir_mtimes: dict[str, int] = {}
+    root_exists = base_dir.exists()
+    locks_root = base_dir / ".execution_locks"
+    locks_exists = locks_root.exists()
+    locks_files: dict[str, str] = {}
+    locks_file_mtimes: dict[str, int] = {}
+    locks_dir_mtimes: dict[str, int] = {}
+    if root_exists:
+        for path in sorted(base_dir.rglob("*")):
+            rel = str(path.relative_to(base_dir))
+            if path.is_file():
+                files[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+                file_mtimes[rel] = path.stat().st_mtime_ns
+            elif path.is_dir():
+                dir_mtimes[rel] = path.stat().st_mtime_ns
+        dir_mtimes["."] = base_dir.stat().st_mtime_ns
+    if locks_exists:
+        for path in sorted(locks_root.rglob("*")):
+            rel = str(path.relative_to(base_dir))
+            if path.is_file():
+                locks_files[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+                locks_file_mtimes[rel] = path.stat().st_mtime_ns
+            elif path.is_dir():
+                locks_dir_mtimes[rel] = path.stat().st_mtime_ns
+        locks_dir_mtimes[".execution_locks"] = locks_root.stat().st_mtime_ns
+    event_count = (
+        len(events.read_task_events(run_id, base_dir=base_dir)) if run_id else None
+    )
+    return {
+        "root_exists": root_exists,
+        "files": files,
+        "file_mtimes": file_mtimes,
+        "dir_mtimes": dir_mtimes,
+        "locks_exists": locks_exists,
+        "locks_files": locks_files,
+        "locks_file_mtimes": locks_file_mtimes,
+        "locks_dir_mtimes": locks_dir_mtimes,
+        "event_count": event_count,
+    }
+
+
+def _assert_full_project_snapshot_unchanged(
+    before: dict[str, Any], after: dict[str, Any]
+) -> None:
+    assert after["root_exists"] == before["root_exists"]
+    assert after["files"] == before["files"]
+    assert after["file_mtimes"] == before["file_mtimes"]
+    assert after["dir_mtimes"] == before["dir_mtimes"]
+    assert after["locks_exists"] == before["locks_exists"]
+    assert after["locks_files"] == before["locks_files"]
+    assert after["locks_file_mtimes"] == before["locks_file_mtimes"]
+    assert after["locks_dir_mtimes"] == before["locks_dir_mtimes"]
+    assert after["event_count"] == before["event_count"]
+
+
 @dataclass(frozen=True)
 class RunSnapshot:
     digest: dict[str, str]
@@ -950,4 +1008,49 @@ def test_guard_uses_new_attempt_id_for_register_attempt_on_sealed_run(tmp_path):
         task_ids[0],
         fresh_attempt,
         actor="human",
+    )
+
+
+def test_finalized_preliminary_rejection_has_literal_project_zero_write(tmp_path):
+    run_id, _, _, _ = _finalize_run(tmp_path)
+    before = _full_project_snapshot(tmp_path, run_id=run_id)
+    with pytest.raises(RunFinalizedError):
+        io.create_run_workspace(run_id, base_dir=tmp_path)
+    _assert_full_project_snapshot_unchanged(
+        before, _full_project_snapshot(tmp_path, run_id=run_id)
+    )
+
+
+def test_untrusted_preliminary_rejection_has_literal_project_zero_write(tmp_path):
+    chain = TASK16._run_with_post_verification_execution_verification(tmp_path)
+    run_id = chain[0]
+    record = TASK16._run_final_closure_record(run_id, *chain[3:13])
+    io.atomic_write_json(
+        contracts.run_final_closure_record_json_path(run_id, tmp_path), record
+    )
+    assert evaluate_run_seal(run_id, tmp_path).state == SealState.CLOSURE_PRESENT_UNTRUSTED
+    before = _full_project_snapshot(tmp_path, run_id=run_id)
+    with pytest.raises(RunSealBlockedError):
+        io.create_run_workspace(run_id, base_dir=tmp_path)
+    _assert_full_project_snapshot_unchanged(
+        before, _full_project_snapshot(tmp_path, run_id=run_id)
+    )
+
+
+def test_exact_closure_replay_has_literal_project_zero_write(tmp_path):
+    chain = TASK16._run_with_post_verification_execution_verification(tmp_path)
+    run_id = chain[0]
+    record = TASK16._run_final_closure_record(run_id, *chain[3:13])
+    events.record_run_final_closure(tmp_path, run_id, record, actor="human")
+    event_id = [
+        e["event_id"]
+        for e in events.read_task_events(run_id, base_dir=tmp_path)
+        if e.get("event_type") == events.EVENT_TYPE_RUN_FINAL_CLOSURE_RECORDED
+    ][0]
+    before = _full_project_snapshot(tmp_path, run_id=run_id)
+    events.record_run_final_closure(
+        tmp_path, run_id, record, actor="human", event_id=event_id
+    )
+    _assert_full_project_snapshot_unchanged(
+        before, _full_project_snapshot(tmp_path, run_id=run_id)
     )
