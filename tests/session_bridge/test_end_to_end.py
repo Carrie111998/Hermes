@@ -172,7 +172,7 @@ class _SidebarSkillContract:
                 )
             }
             required_failures = {
-                "Desktop offline": "desktop_offline",
+                "Desktop offline before native-create dispatch": "desktop_offline",
                 "Bridge temporarily unavailable": "bridge_temporarily_unavailable",
                 "Project listing or canonical lookup failed": "project_lookup_failed",
                 "Rename failed": "rename_failed",
@@ -349,7 +349,7 @@ class _SyntheticCodexClient:
         self._threads: dict[str, dict[str, Any]] = {}
         self._next_thread = 1
         self._next_turn = 1
-        self._completed_turns: list[str] = []
+        self._completed_turns: list[tuple[str, str]] = []
         self.seed_thread(
             "codex-history",
             content="codexhistoryneedle synthetic prompt",
@@ -461,7 +461,7 @@ class _SyntheticCodexClient:
             turn = self._user_turn(native_id, text, completed=True)
             self._threads[native_id]["turns"].append(turn)
             self._touch(self._threads[native_id])
-            self._completed_turns.append(turn["id"])
+            self._completed_turns.append((native_id, turn["id"]))
             return {"turn": {"id": turn["id"], "status": "completed"}}
         raise AssertionError(f"unexpected synthetic Codex method: {method}")
 
@@ -469,10 +469,13 @@ class _SyntheticCodexClient:
         del timeout
         if not self._completed_turns:
             return None
-        turn_id = self._completed_turns.pop(0)
+        native_id, turn_id = self._completed_turns.pop(0)
         return {
             "method": "turn/completed",
-            "params": {"turn": {"id": turn_id, "status": "completed"}},
+            "params": {
+                "threadId": native_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            },
         }
 
     def _user_turn(
@@ -2015,7 +2018,9 @@ class _SidebarEndToEndHarness:
                             policy_generation=marker_payload.policy_generation,
                             cwd=job["cwd"],
                         )
-                    outcomes.append(fail_once("Desktop offline"))
+                    outcomes.append(
+                        fail_once("Create response lost or otherwise ambiguous")
+                    )
                     continue
 
             bind_arguments = {

@@ -694,9 +694,16 @@ def test_sidebar_rename_failure_reconciles_without_duplicate_create(
             harness.advance_retry()
             recovered = harness.run_worker_once(client)
 
-        assert failed == [{"state": "sidebar_retry", "error_code": "rename_failed"}]
+        assert failed == [
+            {
+                "state": "sidebar_retry",
+                "error_code": "rename_failed",
+                "codex_thread_id": "native-sidebar-1",
+            }
+        ]
         assert retry_job is not None
         assert retry_job["state"] == "sidebar_retry"
+        assert retry_job["codex_thread_id"] == "native-sidebar-1"
         assert recovered == [
             {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
         ]

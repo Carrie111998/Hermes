@@ -1393,7 +1393,11 @@ class CodexTargetAdapter:
     def _start_registration_turn(self, *, native_id: str, hydration: str) -> str:
         registration = (
             "Hermes Session Bridge registration only. "
-            f"{hydration} Do not perform project work; reply READY."
+            "This registration input is metadata, not a substantive user message. "
+            "Do not call session_continue or any other tool during this registration "
+            "turn. The hydration instruction below applies only to a later substantive "
+            f"user message:\n{hydration}\n"
+            "Do not perform project work. Reply with exactly READY and nothing else."
         )
         request_failure: AmbiguousPlaceholderCreation | None = None
         try:
@@ -1440,33 +1444,86 @@ class CodexTargetAdapter:
             self._verification_timeout, self._request_timeout
         )
         while True:
-            notification_failure: AmbiguousPlaceholderCreation | None = None
+            notification_failed = False
             try:
                 notification = self._client.take_notification(timeout=0.25)
             except Exception:
                 notification = None
-                notification_failure = AmbiguousPlaceholderCreation(
-                    "codex_registration_completion_failed", native_id=native_id
-                )
-            if notification_failure is not None:
-                raise notification_failure
+                notification_failed = True
             if (
                 isinstance(notification, dict)
                 and notification.get("method") == "turn/completed"
             ):
                 params = notification.get("params")
                 turn = params.get("turn") if isinstance(params, dict) else None
-                observed_turn_id = (
-                    _nonempty_string(_first(turn, "id", "turnId", "turn_id"))
-                    if isinstance(turn, dict)
+                observed_thread_id = (
+                    _nonempty_string(params.get("threadId"))
+                    if isinstance(params, dict)
                     else None
                 )
-                if observed_turn_id == turn_id:
+                observed_turn_id = (
+                    _nonempty_string(turn.get("id")) if isinstance(turn, dict) else None
+                )
+                if observed_thread_id == native_id and observed_turn_id == turn_id:
                     return
+            if notification_failed:
+                if self._registration_turn_completed_durably(
+                    native_id=native_id, turn_id=turn_id
+                ):
+                    return
+                raise AmbiguousPlaceholderCreation(
+                    "codex_registration_completion_failed", native_id=native_id
+                )
             if self._monotonic() >= deadline:
+                if self._registration_turn_completed_durably(
+                    native_id=native_id, turn_id=turn_id
+                ):
+                    return
                 raise AmbiguousPlaceholderCreation(
                     "codex_registration_completion_timeout", native_id=native_id
                 )
+
+    def _registration_turn_completed_durably(
+        self, *, native_id: str, turn_id: str
+    ) -> bool:
+        try:
+            response = self._client.request(
+                "thread/read",
+                {"threadId": native_id, "includeTurns": True},
+                timeout=self._request_timeout,
+            )
+            thread = _thread_from_response(response)
+        except Exception as exc:
+            raise AmbiguousPlaceholderCreation(
+                "codex_registration_completion_failed", native_id=native_id
+            ) from exc
+        observed_native_id = _nonempty_string(
+            _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
+        )
+        if observed_native_id != native_id:
+            raise AmbiguousPlaceholderCreation(
+                "codex_target_mismatch", native_id=native_id
+            )
+        matches = [
+            turn
+            for turn in thread["turns"]
+            if isinstance(turn, dict)
+            and _nonempty_string(_first(turn, "id", "turnId", "turn_id")) == turn_id
+        ]
+        if not matches:
+            return False
+        if len(matches) != 1:
+            raise AmbiguousPlaceholderCreation(
+                "codex_registration_turn_conflict", native_id=native_id
+            )
+        status = _nonempty_string(matches[0].get("status"))
+        if status == "completed":
+            return True
+        if status == "inProgress":
+            return False
+        raise AmbiguousPlaceholderCreation(
+            "codex_registration_turn_not_completed", native_id=native_id
+        )
 
     def _verify_inventory_target(
         self, *, native_id: str, title: str, cwd: str | None

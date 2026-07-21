@@ -205,6 +205,7 @@ class FakeRequestClient:
         return {
             "method": "turn/completed",
             "params": {
+                "threadId": CODEX_ID,
                 "turn": {
                     "id": self.last_started_turn_id,
                     "status": "completed",
@@ -229,7 +230,7 @@ class CompletionAwareFakeRequestClient(FakeRequestClient):
     def __init__(
         self,
         responses: dict[str, list[dict[str, Any] | Exception]],
-        notifications: list[dict[str, Any] | None],
+        notifications: list[dict[str, Any] | Exception | None],
     ) -> None:
         super().__init__(responses)
         self.notifications = list(notifications)
@@ -243,7 +244,10 @@ class CompletionAwareFakeRequestClient(FakeRequestClient):
 
     def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None:
         self.events.append("notification")
-        return deepcopy(self.notifications.pop(0))
+        notification = self.notifications.pop(0)
+        if isinstance(notification, Exception):
+            raise notification
+        return deepcopy(notification)
 
 
 class FakeCodexRpcError(RuntimeError):
@@ -2794,6 +2798,37 @@ def test_codex_registration_turn_fallback_is_exactly_once_and_verified() -> None
     assert result.used_registration_turn is True
 
 
+def test_codex_registration_turn_is_non_substantive_tool_free_metadata() -> None:
+    adapter, client = _codex_adapter(
+        {
+            "thread/start": [{"thread": {"id": CODEX_ID}}],
+            "thread/name/set": [{}],
+            "turn/start": [{"turn": {"id": "turn-registration"}}],
+            "thread/list": [_codex_inventory()],
+            "thread/read": [_codex_signed_read()],
+        },
+        require_registration_turn=True,
+    )
+
+    adapter.create_placeholder(
+        title="Mirror title",
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    hydration = client.calls[0][1]["baseInstructions"]
+    registration = client.calls[2][1]["input"][0]["text"]
+    assert registration == (
+        "Hermes Session Bridge registration only. "
+        "This registration input is metadata, not a substantive user message. "
+        "Do not call session_continue or any other tool during this registration turn. "
+        "The hydration instruction below applies only to a later substantive user "
+        f"message:\n{hydration}\n"
+        "Do not perform project work. Reply with exactly READY and nothing else."
+    )
+
+
 def test_codex_production_default_waits_for_exact_registration_turn_completion() -> (
     None
 ):
@@ -2810,12 +2845,21 @@ def test_codex_production_default_waits_for_exact_registration_turn_completion()
             {
                 "method": "turn/completed",
                 "params": {
+                    "threadId": "wrong-thread",
+                    "turn": {"id": exact_turn_id, "status": "completed"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": CODEX_ID,
                     "turn": {"id": "unrelated-turn", "status": "completed"},
                 },
             },
             {
                 "method": "turn/completed",
                 "params": {
+                    "threadId": CODEX_ID,
                     "turn": {"id": exact_turn_id, "status": "completed"},
                 },
             },
@@ -2844,9 +2888,286 @@ def test_codex_production_default_waits_for_exact_registration_turn_completion()
         "request:turn/start",
         "notification",
         "notification",
+        "notification",
         "request:thread/list",
         "request:thread/read",
     ]
+
+
+def test_codex_registration_reconciles_durable_completion_without_notification() -> (
+    None
+):
+    turn_id = "turn-registration-durable"
+    client = CompletionAwareFakeRequestClient(
+        {
+            "thread/start": [{"thread": {"id": CODEX_ID}}],
+            "thread/name/set": [{}],
+            "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
+            "thread/read": [
+                _codex_signed_read(turn_id=turn_id),
+                _codex_signed_read(turn_id=turn_id),
+            ],
+            "thread/list": [_codex_inventory()],
+        },
+        notifications=[None],
+    )
+    times = iter([0.0, 1.0, 2.0])
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        request_timeout=0.1,
+        verification_timeout=0.0,
+        monotonic=times.__next__,
+    )
+
+    result = adapter.create_placeholder(
+        title="Mirror title",
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    assert result.used_registration_turn is True
+    assert [method for method, _, _ in client.calls] == [
+        "thread/start",
+        "thread/name/set",
+        "turn/start",
+        "thread/read",
+        "thread/list",
+        "thread/read",
+    ]
+
+
+def test_codex_registration_notification_requires_exact_thread_id_field() -> None:
+    turn_id = "turn-registration-alias-thread"
+    client = CompletionAwareFakeRequestClient(
+        {
+            "thread/start": [{"thread": {"id": CODEX_ID}}],
+            "thread/name/set": [{}],
+            "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
+            "thread/read": [
+                _codex_signed_read(turn_id=turn_id),
+                _codex_signed_read(turn_id=turn_id),
+            ],
+            "thread/list": [_codex_inventory()],
+        },
+        notifications=[
+            {
+                "method": "turn/completed",
+                "params": {
+                    "sessionId": CODEX_ID,
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
+            }
+        ],
+    )
+    times = iter([0.0, 1.0, 2.0])
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        request_timeout=0.1,
+        verification_timeout=0.0,
+        monotonic=times.__next__,
+    )
+
+    result = adapter.create_placeholder(
+        title="Mirror title",
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    assert result.used_registration_turn is True
+    assert [method for method, _, _ in client.calls].count("thread/read") == 2
+
+
+def test_codex_registration_durable_read_rejects_wrong_thread_id() -> None:
+    turn_id = "turn-registration-wrong-thread"
+    client = FakeRequestClient({
+        "thread/read": [_codex_signed_read(native_id="wrong-thread", turn_id=turn_id)]
+    })
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+    )
+
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_target_mismatch"
+    ) as raised:
+        adapter._registration_turn_completed_durably(
+            native_id=CODEX_ID, turn_id=turn_id
+        )
+
+    assert raised.value.native_id == CODEX_ID
+
+
+def test_codex_registration_durable_read_rejects_duplicate_exact_turns() -> None:
+    turn_id = "turn-registration-duplicate"
+    read = _codex_signed_read(turn_id=turn_id)
+    read["thread"]["turns"].append(deepcopy(read["thread"]["turns"][0]))
+    client = FakeRequestClient({"thread/read": [read]})
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+    )
+
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_registration_turn_conflict"
+    ):
+        adapter._registration_turn_completed_durably(
+            native_id=CODEX_ID, turn_id=turn_id
+        )
+
+
+def test_codex_registration_durable_read_missing_exact_turn_is_incomplete() -> None:
+    turn_id = "turn-registration-missing"
+    client = FakeRequestClient({
+        "thread/read": [_codex_signed_read(turn_id="different-turn")]
+    })
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+    )
+
+    assert (
+        adapter._registration_turn_completed_durably(
+            native_id=CODEX_ID, turn_id=turn_id
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("status", ["failed", "interrupted"])
+def test_codex_registration_durable_read_rejects_terminal_status(
+    status: str,
+) -> None:
+    turn_id = f"turn-registration-direct-{status}"
+    client = FakeRequestClient({
+        "thread/read": [_codex_signed_read(turn_id=turn_id, turn_status=status)]
+    })
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+    )
+
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_registration_turn_not_completed"
+    ):
+        adapter._registration_turn_completed_durably(
+            native_id=CODEX_ID, turn_id=turn_id
+        )
+
+
+def test_codex_registration_timeout_reads_exact_inprogress_turn_before_failing() -> (
+    None
+):
+    turn_id = "turn-registration-in-progress"
+    client = CompletionAwareFakeRequestClient(
+        {
+            "thread/start": [{"thread": {"id": CODEX_ID}}],
+            "thread/name/set": [{}],
+            "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
+            "thread/read": [
+                _codex_signed_read(turn_id=turn_id, turn_status="inProgress")
+            ],
+        },
+        notifications=[None],
+    )
+    times = iter([0.0, 1.0])
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        request_timeout=0.1,
+        verification_timeout=0.0,
+        monotonic=times.__next__,
+    )
+
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_registration_completion_timeout"
+    ) as raised:
+        adapter.create_placeholder(
+            title="Mirror title",
+            source_session_id="claude:source-1",
+            bridge_id="bridge-1",
+            policy_generation=1,
+        )
+
+    assert raised.value.native_id == CODEX_ID
+    assert [method for method, _, _ in client.calls].count("thread/read") == 1
+
+
+def test_codex_registration_reconciles_durable_completion_after_notification_error() -> (
+    None
+):
+    turn_id = "turn-registration-notification-error"
+    client = CompletionAwareFakeRequestClient(
+        {
+            "thread/start": [{"thread": {"id": CODEX_ID}}],
+            "thread/name/set": [{}],
+            "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
+            "thread/read": [
+                _codex_signed_read(turn_id=turn_id),
+                _codex_signed_read(turn_id=turn_id),
+            ],
+            "thread/list": [_codex_inventory()],
+        },
+        notifications=[RuntimeError("notification transport closed")],
+    )
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+    )
+
+    result = adapter.create_placeholder(
+        title="Mirror title",
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    assert result.native_id == CODEX_ID
+    assert [method for method, _, _ in client.calls].count("thread/read") == 2
+
+
+def test_codex_registration_notification_error_reads_exact_inprogress_turn() -> None:
+    turn_id = "turn-registration-notification-error-in-progress"
+    client = CompletionAwareFakeRequestClient(
+        {
+            "thread/start": [{"thread": {"id": CODEX_ID}}],
+            "thread/name/set": [{}],
+            "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
+            "thread/read": [
+                _codex_signed_read(turn_id=turn_id, turn_status="inProgress")
+            ],
+        },
+        notifications=[RuntimeError("notification transport closed")],
+    )
+    adapter = CodexTargetAdapter(
+        client,
+        source_adapter=CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+    )
+
+    with pytest.raises(
+        AmbiguousPlaceholderCreation, match="codex_registration_completion_failed"
+    ) as raised:
+        adapter.create_placeholder(
+            title="Mirror title",
+            source_session_id="claude:source-1",
+            bridge_id="bridge-1",
+            policy_generation=1,
+        )
+
+    assert raised.value.native_id == CODEX_ID
+    assert [method for method, _, _ in client.calls].count("thread/read") == 1
 
 
 def test_codex_registration_rejects_marker_on_a_different_returned_turn() -> None:
@@ -2862,7 +3183,10 @@ def test_codex_registration_rejects_marker_on_a_different_returned_turn() -> Non
         notifications=[
             {
                 "method": "turn/completed",
-                "params": {"turn": {"id": returned_turn_id, "status": "completed"}},
+                "params": {
+                    "threadId": CODEX_ID,
+                    "turn": {"id": returned_turn_id, "status": "completed"},
+                },
             }
         ],
     )
@@ -2900,7 +3224,10 @@ def test_codex_registration_uses_noncompleted_notification_as_wakeup(
         notifications=[
             {
                 "method": "turn/completed",
-                "params": {"turn": {"id": turn_id, "status": status}},
+                "params": {
+                    "threadId": CODEX_ID,
+                    "turn": {"id": turn_id, "status": status},
+                },
             }
         ],
     )
@@ -2938,7 +3265,10 @@ def test_codex_registration_rejects_noncompleted_exact_turn_in_thread_read(
         notifications=[
             {
                 "method": "turn/completed",
-                "params": {"turn": {"id": turn_id, "status": "completed"}},
+                "params": {
+                    "threadId": CODEX_ID,
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
             }
         ],
     )
@@ -2979,7 +3309,10 @@ def test_codex_registration_durable_terminal_status_fails_without_retry(
         notifications=[
             {
                 "method": "turn/completed",
-                "params": {"turn": {"id": turn_id, "status": "completed"}},
+                "params": {
+                    "threadId": CODEX_ID,
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
             }
         ],
     )
@@ -3537,7 +3870,7 @@ def test_codex_resume_polls_until_exact_started_turn_is_read() -> None:
     assert [method for method, _, _ in client.calls].count("turn/start") == 1
     turn_input = client.calls[1][1]["input"]
     assert turn_input[0]["text"].count(nonce) == 1
-    assert waited == [(CODEX_ID, "turn-resume-exact", 180.0)]
+    assert waited == [(CODEX_ID, "turn-resume-exact", 1.0)]
     assert sleeps == []
 
 
@@ -3591,7 +3924,7 @@ def test_codex_resume_proves_baseline_thread_completion_and_exact_nonce() -> Non
         "turn/start",
         "thread/read",
     ]
-    assert waited == [(CODEX_ID, turn_id, 180.0)]
+    assert waited == [(CODEX_ID, turn_id, 1.0)]
     prompt = client.calls[1][1]["input"][0]["text"]
     assert prompt.count(nonce) == 1
 
@@ -3624,7 +3957,10 @@ def test_codex_resume_uses_noncompleted_notification_as_wakeup(status: str) -> N
         notifications=[
             {
                 "method": "turn/completed",
-                "params": {"turn": {"id": turn_id, "status": status}},
+                "params": {
+                    "threadId": CODEX_ID,
+                    "turn": {"id": turn_id, "status": status},
+                },
             }
         ],
     )
@@ -3640,6 +3976,80 @@ def test_codex_resume_uses_noncompleted_notification_as_wakeup(status: str) -> N
 
     assert result == turn_id
     assert client.events.count("notification") == 1
+
+
+def test_codex_resume_reconciles_durable_completion_after_missed_notification() -> None:
+    nonce = "f" * 32
+    turn_id = "turn-resume-missed-notification"
+    client = FakeRequestClient({
+        "thread/read": [
+            _codex_read(turns=[]),
+            _codex_read(
+                turns=[
+                    {
+                        "id": turn_id,
+                        "status": "completed",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": nonce}],
+                            }
+                        ],
+                    }
+                ]
+            ),
+        ],
+        "turn/start": [{"turn": {"id": turn_id, "status": "inProgress"}}],
+    })
+
+    result = characterize_module._resume_codex_characterization(
+        client,
+        native_id=CODEX_ID,
+        resume_nonce=nonce,
+        request_timeout=45.0,
+        verification_timeout=0.0,
+        verification_poll_interval=0.1,
+        completion_waiter=lambda *args: (_ for _ in ()).throw(TimeoutError()),
+    )
+
+    assert result == turn_id
+    assert [method for method, _, _ in client.calls] == [
+        "thread/read",
+        "turn/start",
+        "thread/read",
+    ]
+
+
+def test_codex_completion_waiter_ignores_wrong_thread_envelope() -> None:
+    turn_id = "turn-resume-exact-envelope"
+    client = CompletionAwareFakeRequestClient(
+        {},
+        notifications=[
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "wrong-thread",
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": CODEX_ID,
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
+            },
+        ],
+    )
+
+    characterize_module._wait_for_turn_completion(
+        client,
+        expected_thread_id=CODEX_ID,
+        expected_turn_id=turn_id,
+        timeout=1.0,
+    )
+
+    assert client.events == ["notification", "notification"]
 
 
 @pytest.mark.parametrize("status", ["failed", "interrupted"])

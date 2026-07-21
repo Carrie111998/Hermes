@@ -761,7 +761,7 @@ async def test_target_failure_uses_fixed_sanitized_health_code() -> None:
     assert target_secret not in repr(store.retries)
 
 
-def test_sidebar_expired_lease_stale_worker_cannot_commit(
+def test_sidebar_expired_lease_stale_worker_cannot_commit_but_retains_exact_thread(
     tmp_path: Path,
 ) -> None:
     harness = _SidebarEndToEndHarness(tmp_path)
@@ -803,7 +803,7 @@ def test_sidebar_expired_lease_stale_worker_cannot_commit(
         assert response["result"]["isError"] is True
         assert durable is not None
         assert durable["state"] == "sidebar_retry"
-        assert durable["codex_thread_id"] is None
+        assert durable["codex_thread_id"] == thread_id
         assert harness.store.sidebar_job_counts()["sidebar_visible"] == 0
     finally:
         harness.close()
@@ -838,7 +838,7 @@ def test_sidebar_empty_control_and_ack_sessions_create_no_jobs(
             pending = _sidebar_call_tool(
                 client,
                 "session_sidebar_pending",
-                {"limit": 5},
+                {"limit": 1},
             )
 
         assert summary.queued == 0

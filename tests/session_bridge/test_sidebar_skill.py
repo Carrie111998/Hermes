@@ -447,10 +447,11 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
     required_rules = (
-        "Unavailable native tool -> `codex_tool_unavailable`",
-        "Desktop explicitly offline -> `desktop_offline`",
-        "Definite create failure -> `native_task_not_indexed`",
-        "ambiguous create failure -> `native_create_ambiguous`",
+        "Unavailable native tool before native-create dispatch, or during a "
+        "non-create native operation -> `codex_tool_unavailable`",
+        "Desktop explicitly offline before native-create dispatch -> `desktop_offline`",
+        "A native-create rejection proven before invoking `create_thread` -> "
+        "`native_task_not_indexed`",
         "Unavailable or not-yet-indexed reconciliation read -> "
         "`native_task_not_indexed`",
         "Successfully returned thread-ID or marker mismatch, or multiple exact "
@@ -473,10 +474,29 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
 def test_sidebar_skill_quarantines_ambiguous_create_without_retrying_creation() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "ambiguous create failure -> `native_create_ambiguous`" in skill
+    assert (
+        "every raised error or missing or uncertain response, including an explicit "
+        "desktop-offline tool error, is `native_create_ambiguous`"
+    ) in skill
     assert "`native_create_ambiguous`" in skill
     assert "requires an operator audit before the failed job may be requeued" in skill
     assert "Never create a replacement after commit ambiguity" in skill
+
+
+def test_sidebar_skill_treats_every_post_dispatch_create_error_as_ambiguous() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert (
+        "After `session_sidebar_reserve` succeeds and `create_thread` is invoked, "
+        "every raised error or missing or uncertain response, including an explicit "
+        "desktop-offline tool error, is `native_create_ambiguous`."
+    ) in skill
+    assert ("`desktop_offline` applies only before native-create dispatch.") in skill
+    assert (
+        "Native Codex task/project operation unavailable before native-create "
+        "dispatch, or during a non-create native operation"
+    ) in skill
+    assert "Desktop offline before native-create dispatch" in skill
 
 
 def test_sidebar_skill_verification_requires_exactly_one_settlement_attempt() -> None:

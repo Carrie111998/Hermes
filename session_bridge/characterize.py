@@ -2307,15 +2307,19 @@ def _resume_codex_characterization(
     turn_id = _turn_identity(turn)
     if turn_id in baseline_ids:
         raise RuntimeError("codex_resume_turn_preexisting")
-    if completion_waiter is None:
-        _wait_for_turn_completion(
-            client,
-            expected_thread_id=native_id,
-            expected_turn_id=turn_id,
-            timeout=180.0,
-        )
-    else:
-        completion_waiter(client, native_id, turn_id, 180.0)
+    wakeup_timeout = max(0.25, min(request_timeout, verification_timeout))
+    try:
+        if completion_waiter is None:
+            _wait_for_turn_completion(
+                client,
+                expected_thread_id=native_id,
+                expected_turn_id=turn_id,
+                timeout=wakeup_timeout,
+            )
+        else:
+            completion_waiter(client, native_id, turn_id, wakeup_timeout)
+    except TimeoutError:
+        pass
 
     deadline = monotonic() + verification_timeout
     while True:
@@ -2526,8 +2530,9 @@ def _wait_for_turn_completion(
             continue
         params = notification.get("params")
         turn = params.get("turn") if isinstance(params, dict) else None
+        observed_thread = params.get("threadId") if isinstance(params, dict) else None
         observed = turn.get("id") if isinstance(turn, dict) else None
-        if expected_turn_id is None or observed == expected_turn_id:
+        if observed_thread == expected_thread_id and observed == expected_turn_id:
             return
     raise TimeoutError("codex_turn_completion_timeout")
 

@@ -676,7 +676,7 @@ def test_sidebar_provider_parser_failures_are_isolated_bidirectionally(
         harness.close()
 
 
-def test_sidebar_codex_desktop_offline_keeps_durable_retry_and_recovers(
+def test_sidebar_post_reservation_desktop_offline_is_quarantined_without_replacement(
     tmp_path: Path,
 ) -> None:
     harness = _SidebarEndToEndHarness(tmp_path)
@@ -690,19 +690,20 @@ def test_sidebar_codex_desktop_offline_keeps_durable_retry_and_recovers(
         harness.native.available = False
 
         with harness.client() as client:
-            offline = harness.run_worker_once(client)
+            ambiguous = harness.run_worker_once(client)
             durable = harness.store.get_sidebar_job_for_source(source_id)
             harness.native.available = True
             harness.advance_retry()
-            recovered = harness.run_worker_once(client)
+            no_replacement = harness.run_worker_once(client)
 
-        assert offline == [{"state": "sidebar_retry", "error_code": "desktop_offline"}]
-        assert durable is not None
-        assert durable["state"] == "sidebar_retry"
-        assert recovered == [
-            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        assert ambiguous == [
+            {"state": "sidebar_failed", "error_code": "native_create_ambiguous"}
         ]
-        assert len(harness.native.create_calls) == 1
+        assert durable is not None
+        assert durable["state"] == "sidebar_failed"
+        assert harness.store.get_sidebar_create_reservation(source_id) is not None
+        assert no_replacement == []
+        assert harness.native.create_calls == []
     finally:
         harness.close()
 
@@ -717,7 +718,7 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
         app_server_calls.append(kwargs)
         raise AssertionError("sidebar delivery must not call app-server creation")
 
-    harness = _SidebarEndToEndHarness(tmp_path)
+    harness = _SidebarEndToEndHarness(tmp_path / "guarded")
     try:
         coordinator = harness.install_production_runtime(monkeypatch)
         codex_target = coordinator._target_adapters[Provider.CODEX]
@@ -738,25 +739,44 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
         with harness.client() as client:
             guarded = harness.run_worker_once(client)
 
-            harness.seed_source(
-                Provider.HERMES,
-                "fallback-mutation",
-                cwd=tmp_path / "fallback-mutation",
-            )
-            harness.register()
-            harness.allow_forbidden_app_server_fallback_for_mutation = True
-            with pytest.raises(
-                AssertionError,
-                match="sidebar delivery must not call app-server creation",
-            ):
-                harness.run_worker_once(client)
-
-        assert guarded == [{"state": "sidebar_retry", "error_code": "desktop_offline"}]
-        assert len(app_server_calls) == 1
+        assert guarded == [
+            {"state": "sidebar_failed", "error_code": "native_create_ambiguous"}
+        ]
+        assert app_server_calls == []
         assert harness.native.app_server_create_calls == []
         assert harness.native.create_calls == []
     finally:
         harness.close()
+
+    fallback = _SidebarEndToEndHarness(tmp_path / "fallback-control")
+    try:
+        coordinator = fallback.install_production_runtime(monkeypatch)
+        codex_target = coordinator._target_adapters[Provider.CODEX]
+        assert isinstance(codex_target, CodexTargetAdapter)
+        monkeypatch.setattr(
+            codex_target,
+            "create_placeholder",
+            forbidden_app_server_create,
+        )
+        fallback.seed_source(
+            Provider.HERMES,
+            "fallback-mutation",
+            cwd=tmp_path / "fallback-mutation",
+        )
+        fallback.register()
+        fallback.native.available = False
+        fallback.allow_forbidden_app_server_fallback_for_mutation = True
+
+        with fallback.client() as client:
+            with pytest.raises(
+                AssertionError,
+                match="sidebar delivery must not call app-server creation",
+            ):
+                fallback.run_worker_once(client)
+
+        assert len(app_server_calls) == 1
+    finally:
+        fallback.close()
 
 
 @pytest.mark.parametrize(
