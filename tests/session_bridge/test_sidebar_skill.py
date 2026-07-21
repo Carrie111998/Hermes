@@ -163,13 +163,21 @@ def test_sidebar_skill_metadata_matches_the_personal_codex_contract() -> None:
     )
 
 
-def test_sidebar_skill_encodes_the_bounded_parallel_native_delivery_protocol() -> None:
+def test_sidebar_skill_encodes_the_single_lease_sequential_delivery_protocol() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
-    assert "session_sidebar_pending(limit=3)" in skill
-    assert "at most three" in skill
-    assert "concurrently across leases" in skill
-    assert "preserve the procedure order within each lease" in skill
+    assert "session_sidebar_pending(limit=1)" in skill
+    assert "pending --limit 1" in skill
+    assert "at most one job per wake" in skill
+    assert "Process that one lease sequentially to completion" in skill
+    assert "Never run `create_thread` concurrently" in skill
+    assert "never run native delivery operations concurrently" in skill
+    assert "Do not claim or process another lease in the same wake" in skill
+    assert "session_sidebar_pending(limit=3)" not in skill
+    assert "pending --limit 3" not in skill
+    assert "concurrently across leases" not in skill
+    assert "continue with the next leased job" not in skill
+    assert "Continue settling the other leases" not in skill
     assert "exactly once" in skill
     assert "no user-facing message" in skill
     assert "list" in skill.casefold() and "projects" in skill.casefold()
@@ -188,7 +196,7 @@ def test_sidebar_skill_encodes_the_bounded_parallel_native_delivery_protocol() -
     assert "error_code=<fixed code>" in skill
     assert "never `code`" in skill
     assert "exception text" in skill
-    assert "every unfinished lease" in skill
+    assert "the unfinished lease" in skill
 
 
 def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() -> None:
@@ -196,13 +204,15 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
 
     assert skill.index("session_status") < skill.index("list_projects({})")
     assert skill.index("list_projects({})") < skill.index(
-        "session_sidebar_pending(limit=3)"
+        "session_sidebar_pending(limit=1)"
     )
     assert "do not call `session_sidebar_pending`" in skill
     assert "no job attempt is consumed" in skill
 
 
-def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missing() -> None:
+def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missing() -> (
+    None
+):
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
     assert "Authenticated Local Transport Fallback" in skill
@@ -375,7 +385,7 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
         "If the fail/release call itself fails",
         "exhausts settlement for that lease in this batch",
         "never call `session_sidebar_fail` for that lease again",
-        "continue with the next leased job",
+        "end this wake after that single settlement attempt",
         "never expose raw exception text",
     )
     for rule in required_rules:
@@ -388,9 +398,7 @@ def test_sidebar_skill_quarantines_ambiguous_create_without_retrying_creation() 
 
     assert "ambiguous create failure -> `native_create_ambiguous`" in skill
     assert "`native_create_ambiguous`" in skill
-    assert (
-        "requires an operator audit before the failed job may be requeued" in skill
-    )
+    assert "requires an operator audit before the failed job may be requeued" in skill
     assert "Never create a replacement after commit ambiguity" in skill
 
 
@@ -399,7 +407,7 @@ def test_sidebar_skill_verification_requires_exactly_one_settlement_attempt() ->
     verification = skill.split("\n## Verification\n", 1)[1]
 
     assert (
-        "every noncommitted lease had exactly one fail/release attempt with a "
+        "the noncommitted lease had exactly one fail/release attempt with a "
         "fixed code, whether successful, failed, or ambiguous"
     ) in verification
     assert "every other lease was failed/released" not in verification
