@@ -71,7 +71,8 @@ def main() -> int:
         sys.stdout.write("Authentication required\r\n")
         sys.stdout.flush()
         return _exit(scenario, 1)
-    sys.stdout.write("\x1b[?2004h")
+    # Match the main-only footer emitted by the production argv's dontAsk mode.
+    sys.stdout.write("\x1b[?2004h\x1b[2m⏵⏵ don't ask on\x1b[0m")
     sys.stdout.flush()
     frame = _read_frame()
     _record(event="stdin", frame=frame)

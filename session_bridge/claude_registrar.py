@@ -65,7 +65,9 @@ def build_characterization_auth_recovery_prompt(
 
 
 class InteractivePty(Protocol):
-    def read_until_ready(self, timeout: float) -> str: ...
+    def read_until_ready(
+        self, timeout: float, *, accept_workspace_trust: bool = False
+    ) -> str: ...
 
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str: ...
     def write(self, data: str) -> None: ...
@@ -525,14 +527,18 @@ class _WinPtyProcess:
             if candidate_seen:
                 settle_deadline = time.monotonic() + _RESPONSE_SETTLE_SECONDS
 
-    def read_until_ready(self, timeout: float) -> str:
-        """Wait for Claude's event-driven bracketed-paste readiness signal."""
+    def read_until_ready(
+        self, timeout: float, *, accept_workspace_trust: bool = False
+    ) -> str:
+        """Wait until Claude's main REPL, never an onboarding dialog, owns input."""
 
         timed_read = getattr(self._process, "read_with_timeout", None)
         if not callable(timed_read):
             raise RuntimeError("PTY readiness read unavailable")
         deadline = time.monotonic() + timeout
         chunks: list[str] = []
+        workspace_trust_submitted = False
+        workspace_trust_submit_offset: int | None = None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -554,7 +560,23 @@ class _WinPtyProcess:
             joined = "".join(chunks)
             if len(joined) > _MAX_RESPONSE_CHARS:
                 raise RuntimeError("PTY readiness output exceeded limit")
-            if "\x1b[?2004h" in joined:
+            if (
+                accept_workspace_trust
+                and not workspace_trust_submitted
+                and _workspace_trust_prompt_visible(joined)
+            ):
+                self.write("\r")
+                workspace_trust_submitted = True
+                workspace_trust_submit_offset = len(joined)
+            readiness_output = (
+                joined[workspace_trust_submit_offset:]
+                if workspace_trust_submit_offset is not None
+                else joined
+            )
+            if (
+                "\x1b[?2004h" in readiness_output
+                and _claude_main_repl_ready(readiness_output)
+            ):
                 return joined
 
     def _read_until_cancellable(
@@ -870,13 +892,18 @@ class ClaudeNativeRegistrar:
         try:
             process = self._factory.spawn(argv, cwd=str(source_cwd))
             deadline = self._monotonic() + self._process_timeout
-            startup = process.read_until_ready(self._remaining_process_time(deadline))
+            startup = process.read_until_ready(
+                self._remaining_process_time(deadline), accept_workspace_trust=True
+            )
             if _is_authentication_failure(startup):
                 pending = (
                     "claude_authentication_unavailable",
                     "Claude authentication unavailable",
                 )
-            elif "\x1b[?2004h" not in startup:
+            elif (
+                "\x1b[?2004h" not in startup
+                or not _claude_main_repl_ready(startup)
+            ):
                 pending = ("creation_ambiguous", "Claude TUI readiness unavailable")
             else:
                 process.write(_interactive_prompt_frame(prompt))
@@ -1105,7 +1132,9 @@ class ClaudeNativeRegistrar:
             process = self._factory.spawn(argv, cwd=candidate.source_cwd)
             launched = True
             deadline = self._monotonic() + self._process_timeout
-            startup = process.read_until_ready(self._remaining_process_time(deadline))
+            startup = process.read_until_ready(
+                self._remaining_process_time(deadline), accept_workspace_trust=True
+            )
             if _is_authentication_failure(startup):
                 pending = (
                     "retry",
@@ -1119,7 +1148,10 @@ class ClaudeNativeRegistrar:
                     "creation_ambiguous",
                     "Claude provider limit interrupted registration",
                 )
-            elif "\x1b[?2004h" not in startup:
+            elif (
+                "\x1b[?2004h" not in startup
+                or not _claude_main_repl_ready(startup)
+            ):
                 pending = (
                     "retry",
                     "creation_ambiguous",
@@ -1512,6 +1544,29 @@ def _fileno_closed(resource: object) -> bool:
         return int(resource.fileno()) < 0  # type: ignore[attr-defined]
     except Exception:
         return False
+
+
+def _workspace_trust_prompt_visible(output: str) -> bool:
+    """Recognize only Claude's native two-choice trust gate before submitting."""
+
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    collapsed = " ".join(cleaned.split())
+    return all(
+        value in collapsed
+        for value in (
+            "Accessing workspace:",
+            "Yes, I trust this folder",
+            "No, exit",
+            "Security guide",
+        )
+    )
+
+
+def _claude_main_repl_ready(output: str) -> bool:
+    """Match the main-only footer forced by ``--permission-mode dontAsk``."""
+
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    return "⏵⏵ don't ask on" in " ".join(cleaned.split())
 
 
 def _normalized_terminal_output(output: str, prompt: str | None) -> str:

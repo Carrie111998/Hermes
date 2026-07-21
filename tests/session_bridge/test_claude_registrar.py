@@ -196,7 +196,7 @@ class FakePty:
         output: str = "REGISTERED\r\n",
         exit_code: int = 0,
         read_error: Exception | None = None,
-        ready_output: str = "\x1b[?2004h",
+        ready_output: str = "\x1b[?2004h\x1b[2m⏵⏵ don't ask on\x1b[0m",
         ready_error: Exception | None = None,
         write_error_at: int | None = None,
         wait_error: Exception | None = None,
@@ -214,9 +214,13 @@ class FakePty:
         self.closed = False
         self.cleanup_result = PtyCleanupResult(True, True, True, exit_code)
         self.ready_waits: list[float] = []
+        self.ready_trust_acceptances: list[bool] = []
 
-    def read_until_ready(self, timeout: float) -> str:
+    def read_until_ready(
+        self, timeout: float, *, accept_workspace_trust: bool = False
+    ) -> str:
         self.ready_waits.append(timeout)
+        self.ready_trust_acceptances.append(accept_workspace_trust)
         if self.ready_error is not None:
             raise self.ready_error
         return self.ready_output
@@ -351,6 +355,7 @@ def test_launch_uses_interactive_mode_and_writes_prompt_then_exit() -> None:
     assert process.writes == [f"\x1b[200~{expected}\x1b[201~\r", "/exit\r"]
     assert "tool_calls" not in expected
     assert process.ready_waits == [2.0]
+    assert process.ready_trust_acceptances == [True]
     assert process.closed and process.waits == [1.0]
 
 
@@ -398,6 +403,22 @@ def test_malformed_interactive_response_never_sends_exit_command() -> None:
 
 def test_tui_readiness_timeout_never_writes_registration_prompt() -> None:
     process = FakePty(ready_error=TimeoutError())
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert process.writes == []
+    assert process.terminated and process.closed
+
+
+def test_tui_dialog_marker_without_main_repl_never_writes_registration_prompt() -> None:
+    process = FakePty(
+        ready_output=(
+            "\x1b[?2004hAccessing workspace: Yes, I trust this folder "
+            "No, exit Security guide"
+        )
+    )
 
     result = registrar(FakeSource(), FakeFactory(process)).process(claim())
 
@@ -466,6 +487,7 @@ def test_auth_recovery_resumes_exact_uuid_interactively_without_create() -> None
     assert prompt not in factory.spawns[0][0]
     assert "--no-session-persistence" not in factory.spawns[0][0]
     assert process.writes == [f"\x1b[200~{prompt}\x1b[201~\r", "/exit\r"]
+    assert process.ready_trust_acceptances == [True]
 
 
 def test_auth_recovery_durably_marks_call_started_before_spawn() -> None:
@@ -1226,7 +1248,7 @@ def test_raw_winpty_empty_read_after_exit_is_eof() -> None:
         _close_raw_registrar_process(process)
 
 
-def test_winpty_readiness_ignores_conpty_prologue_and_matches_split_marker() -> None:
+def test_winpty_readiness_ignores_conpty_prologue_and_requires_main_repl() -> None:
     class Process:
         def __init__(self) -> None:
             self.chunks = iter(
@@ -1234,6 +1256,7 @@ def test_winpty_readiness_ignores_conpty_prologue_and_matches_split_marker() -> 
                     "\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H",
                     "\x1b[?20",
                     "04h",
+                    "\x1b[2m⏵⏵ don't ask on\x1b[0m",
                 ]
             )
 
@@ -1243,7 +1266,78 @@ def test_winpty_readiness_ignores_conpty_prologue_and_matches_split_marker() -> 
     output = _WinPtyProcess(Process()).read_until_ready(1.0)
 
     assert output.startswith("\x1b[?9001h\x1b[?1004h\x1b[?25l")
-    assert output.endswith("\x1b[?2004h")
+    assert "\x1b[?2004h" in output
+    assert "⏵⏵ don't ask on" in output
+
+
+def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
+    trust = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                [
+                    "\x1b[?2004h",
+                    trust,
+                    trust,
+                    "\x1b[?2004h",
+                    "\x1b[2m⏵⏵ don't ask on\x1b[0m",
+                ]
+            )
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            self.reads += 1
+            return next(self.chunks)
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert "\x1b[?2004h" in output
+    assert "⏵⏵ don't ask on" in output
+    assert process.writes == ["\r"]
+    assert process.reads == 5
+
+
+def test_winpty_readiness_never_returns_on_trust_dialog_marker_alone() -> None:
+    trust = (
+        "\x1b[?2004h\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([trust])
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration as exc:
+                raise EOFError from exc
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert "⏵⏵ don't ask on" not in output
+    assert process.writes == ["\r"]
+    assert process.reads == 2
 
 
 def test_winpty_reader_timeout_is_bounded_when_underlying_read_blocks() -> None:
