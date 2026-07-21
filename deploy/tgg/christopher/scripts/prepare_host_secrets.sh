@@ -34,6 +34,10 @@ for key in keys:
     if value:
         lines.append(f"{key}={json.dumps(value)}")
 lines.append(f"GEMINI_API_KEY_PCL_PA_SHARED={json.dumps(os.environ['GEMINI_API_KEY'])}")
+# The current deployment boundary is management-only until Teren explicitly
+# releases the site drain.  Keep the containment in the generated env so a
+# routine deploy cannot silently remove it while replacing the secret file.
+lines.append("TGG_DEMO_MANAGEMENT_ONLY=true")
 pathlib.Path(sys.argv[1]).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 
