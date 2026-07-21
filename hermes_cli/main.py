@@ -468,6 +468,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.serve_restart_marker import write_restart_markers
 
 
 def _require_tty(command_name: str) -> None:
@@ -7047,11 +7048,14 @@ def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
     *,
     restart_managed: bool = False,
+    restart_hint: bool = False,
 ) -> None:
     """Kill running ``hermes dashboard`` processes.
 
-    Called at the end of ``hermes update`` (default ``reason``) and also
-    from ``hermes dashboard --stop`` (which overrides ``reason``).  The
+    Called at the end of ``hermes update`` (default ``reason`` with
+    ``restart_managed=True`` and ``restart_hint=True``) and also from
+    ``hermes dashboard --stop`` (which overrides ``reason`` and requests
+    neither a managed restart nor a supervisor restart).  The
     dashboard has no service manager, so after a code update the running
     process is guaranteed to be serving stale Python against a
     freshly-updated JS bundle.  Leaving it alive produces silent
@@ -7067,6 +7071,12 @@ def _kill_stale_dashboard_processes(
     When ``restart_managed`` is true (the ``hermes update`` path), a detected
     ``hermes-dashboard.service`` is restarted through systemd instead of
     raw-killing its main PID.
+
+    ``restart_hint`` covers the supervisors that unit lookup cannot reach: a
+    systemd unit under a different name, s6/runit, or a container restart
+    policy.  It leaves a marker so the terminated process exits non-zero and
+    its supervisor brings it back; otherwise the printed manual hint remains
+    the recovery path.
     """
     if restart_managed and _restart_managed_dashboard_service(reason):
         return
@@ -7094,6 +7104,9 @@ def _kill_stale_dashboard_processes(
     pids = _find_stale_dashboard_pids(exclude_pids=exclude)
     if not pids:
         return
+
+    if restart_hint:
+        write_restart_markers(pids)
 
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
@@ -7487,7 +7500,7 @@ def _update_via_zip(args):
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
     else:
-        _kill_stale_dashboard_processes(restart_managed=True)
+        _kill_stale_dashboard_processes(restart_managed=True, restart_hint=True)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -13027,7 +13040,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("  ℹ Leaving running dashboard process(es) untouched because the")
             print("    Node.js dependency refresh did not complete.")
         else:
-            _kill_stale_dashboard_processes(restart_managed=True)
+            _kill_stale_dashboard_processes(restart_managed=True, restart_hint=True)
 
         print()
         print("Tip: You can now select a provider and model:")
