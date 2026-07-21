@@ -3,6 +3,17 @@
 from pathlib import Path
 import tomllib
 
+from packaging.requirements import Requirement
+from packaging.version import Version
+
+
+def _load_project_dependencies():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+    return project["dependencies"]
+
+
 def _load_optional_dependencies():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as handle:
@@ -98,6 +109,32 @@ def _exact_pins(specs):
         package = package.split("[", 1)[0].lower().replace("_", "-")
         pins[package] = version
     return pins
+
+
+def test_root_web_dependencies_enforce_security_floors():
+    """Lean root installs must not resolve vulnerable dashboard packages."""
+    requirements = {
+        requirement.name.lower().replace("_", "-"): requirement
+        for spec in _load_project_dependencies()
+        if (requirement := Requirement(spec)).marker is None
+    }
+    patched_floors = {
+        "fastapi": Version("0.133.1"),
+        "starlette": Version("1.3.1"),
+        "python-multipart": Version("0.0.32"),
+    }
+
+    for package, patched_floor in patched_floors.items():
+        assert package in requirements, f"root dependencies must include {package}"
+        lower_bounds = [
+            Version(specifier.version)
+            for specifier in requirements[package].specifier
+            if specifier.operator in {">=", ">", "==", "==="}
+        ]
+        assert lower_bounds and max(lower_bounds) >= patched_floor, (
+            f"root {package} requirement must enforce a lower bound at or "
+            f"above {patched_floor}; found {requirements[package]}"
+        )
 
 
 
