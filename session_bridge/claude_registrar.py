@@ -55,8 +55,17 @@ _CLAUDE_STARTUP_THEMES = frozenset({
     "light-ansi",
 })
 _RESPONSE_SETTLE_SECONDS = 0.5
+_READINESS_SETTLE_SECONDS = 0.5
+_CLAUDE_FORCED_ONBOARDING = frozenset({"banner", "step"})
+_CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
+    "CLAUDE_CODE_POWERUP_ONBOARDING",
+    "CLAUDE_CODE_TEAM_ONBOARDING",
+)
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_CLAUDE_MAIN_REPL_FOOTER_RE = re.compile(
+    "\u23f5\u23f5\\s*don't\\s*ask\\s*on", re.IGNORECASE
+)
 _CLAUDE_2110_RESUME_SCAFFOLD = "No response requested."
 _MAX_AUTH_RECOVERY_ATTEMPTS = 24
 
@@ -218,10 +227,15 @@ class WindowsConPtyFactory:
             raise RuntimeError("pty unavailable") from exc
 
     def _spawn_process(self, argv: list[str], *, cwd: str) -> object:
-        process_type = _registrar_pywinpty_process_type()
         child_env = os.environ.copy()
+        if "CLAUDE_CONFIG_DIR" in child_env or any(
+            child_env.get(name) in _CLAUDE_FORCED_ONBOARDING
+            for name in _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS
+        ):
+            raise RuntimeError("unsafe Claude launch environment")
         child_env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
         child_env["DISABLE_UPDATES"] = "1"
+        process_type = _registrar_pywinpty_process_type()
         return process_type.spawn(
             argv, cwd=cwd, env=child_env, dimensions=(24, 120)
         )
@@ -560,13 +574,27 @@ class _WinPtyProcess:
         chunks: list[str] = []
         workspace_trust_submitted = False
         workspace_trust_submit_offset: int | None = None
+        ready_settle_deadline: float | None = None
+        readiness_output = ""
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            wake_at = (
+                deadline
+                if ready_settle_deadline is None
+                else min(deadline, ready_settle_deadline)
+            )
+            remaining = wake_at - now
             if remaining <= 0:
+                if (
+                    ready_settle_deadline is not None
+                    and now >= ready_settle_deadline
+                    and _claude_main_input_ready(readiness_output)
+                ):
+                    return "".join(chunks)
                 raise TimeoutError
             try:
                 value = timed_read(4096, remaining)
-            except EOFError:
+            except (EOFError, StopIteration):
                 return "".join(chunks)
             except Exception as exc:
                 raise RuntimeError("PTY readiness read unavailable") from exc
@@ -594,11 +622,12 @@ class _WinPtyProcess:
                 if workspace_trust_submit_offset is not None
                 else joined
             )
-            if (
-                "\x1b[?2004h" in readiness_output
-                and _claude_main_repl_ready(readiness_output)
-            ):
-                return joined
+            if _claude_main_input_ready(readiness_output):
+                ready_settle_deadline = (
+                    time.monotonic() + _READINESS_SETTLE_SECONDS
+                )
+            else:
+                ready_settle_deadline = None
 
     def _read_until_cancellable(
         self,
@@ -925,10 +954,7 @@ class ClaudeNativeRegistrar:
                     "claude_authentication_unavailable",
                     "Claude authentication unavailable",
                 )
-            elif (
-                "\x1b[?2004h" not in startup
-                or not _claude_main_repl_ready(startup)
-            ):
+            elif not _claude_main_input_ready(startup):
                 pending = ("creation_ambiguous", "Claude TUI readiness unavailable")
             else:
                 process.write(_interactive_prompt_frame(prompt))
@@ -1175,10 +1201,7 @@ class ClaudeNativeRegistrar:
                     "creation_ambiguous",
                     "Claude provider limit interrupted registration",
                 )
-            elif (
-                "\x1b[?2004h" not in startup
-                or not _claude_main_repl_ready(startup)
-            ):
+            elif not _claude_main_input_ready(startup):
                 pending = (
                     "retry",
                     "creation_ambiguous",
@@ -1593,7 +1616,36 @@ def _claude_main_repl_ready(output: str) -> bool:
     """Match the main-only footer forced by ``--permission-mode dontAsk``."""
 
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
-    return "⏵⏵don'taskon" in "".join(cleaned.split())
+    matches = tuple(_CLAUDE_MAIN_REPL_FOOTER_RE.finditer(cleaned))
+    if not matches:
+        return False
+    return not _known_claude_input_modal_visible(cleaned[matches[-1].end() :])
+
+
+def _claude_main_input_ready(output: str) -> bool:
+    return _bracketed_paste_enabled(output) and _claude_main_repl_ready(output)
+
+
+def _bracketed_paste_enabled(output: str) -> bool:
+    return output.rfind("\x1b[?2004h") > output.rfind("\x1b[?2004l")
+
+
+def _known_claude_input_modal_visible(output: str) -> bool:
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
+    folded = " ".join(cleaned.casefold().split())
+    return any(
+        all(value in folded for value in signature)
+        for signature in (
+            (
+                "accessing workspace:",
+                "yes, i trust this folder",
+                "no, exit",
+                "security guide",
+            ),
+            ("let's get started.", "dark mode", "light mode", "syntax theme:"),
+            ("standard part of your max plan", "yes, try it", "not now"),
+        )
+    )
 
 
 def _normalized_terminal_output(output: str, prompt: str | None) -> str:

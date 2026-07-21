@@ -447,6 +447,39 @@ def test_tui_dialog_marker_without_main_repl_never_writes_registration_prompt() 
     assert process.terminated and process.closed
 
 
+def test_tui_disabled_bracketed_paste_after_footer_never_writes_prompt() -> None:
+    process = FakePty(
+        ready_output=(
+            "\x1b[?2004h\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+            "\x1b[?2004l"
+        )
+    )
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert process.writes == []
+    assert process.terminated and process.closed
+
+
+def test_tui_product_modal_after_footer_never_writes_prompt() -> None:
+    process = FakePty(
+        ready_output=(
+            "\x1b[?2004h\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+            "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+            "1. Yes, try it\r\n2. Not now\r\n"
+        )
+    )
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert process.writes == []
+    assert process.terminated and process.closed
+
+
 def test_print_mode_transcript_can_never_commit_native_visibility() -> None:
     item = claim()
     source = FakeSource(
@@ -1310,6 +1343,61 @@ def test_winpty_readiness_accepts_claude_216_compact_main_footer() -> None:
     assert "\u23f5\u23f5don't ask on" in output
 
 
+def test_winpty_readiness_waits_for_footer_then_product_modal() -> None:
+    modal = (
+        "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+        "1. Yes, try it\r\n2. Not now\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([
+                "\x1b[?2004h\x1b[2m\u23f5\u23f5don't ask on\x1b[0m",
+                modal,
+            ])
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration as exc:
+                raise EOFError from exc
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(1.0)
+
+    assert "Not now" in output
+    assert process.reads == 3
+
+
+def test_winpty_readiness_rejects_footer_and_product_modal_in_same_chunk() -> None:
+    modal = (
+        "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+        "1. Yes, try it\r\n2. Not now\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([
+                "\x1b[?2004h\x1b[2m\u23f5\u23f5don't ask on\x1b[0m" + modal
+            ])
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration as exc:
+                raise EOFError from exc
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(1.0)
+
+    assert "Not now" in output
+    assert process.reads == 2
+
+
 def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
     trust = (
         "\x1b[2JAccessing workspace:\r\n"
@@ -1345,7 +1433,7 @@ def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
     assert "\x1b[?2004h" in output
     assert "⏵⏵ don't ask on" in output
     assert process.writes == ["\r"]
-    assert process.reads == 5
+    assert process.reads == 6
 
 
 def test_winpty_readiness_never_returns_on_trust_dialog_marker_alone() -> None:
@@ -1540,6 +1628,45 @@ def test_factory_sets_cli_entrypoint_and_update_lock_only_in_child_environment(
     assert observed["env"]["DISABLE_UPDATES"] == "1"
     assert "CLAUDE_CODE_ENTRYPOINT" not in os.environ
     assert "DISABLE_UPDATES" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    [
+        ("CLAUDE_CONFIG_DIR", "C:/reintroduced-config-root"),
+        ("CLAUDE_CODE_POWERUP_ONBOARDING", "banner"),
+        ("CLAUDE_CODE_POWERUP_ONBOARDING", "step"),
+        ("CLAUDE_CODE_TEAM_ONBOARDING", "banner"),
+        ("CLAUDE_CODE_TEAM_ONBOARDING", "step"),
+    ],
+)
+def test_factory_rejects_unsafe_environment_reintroduced_after_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
+    environment_value: str,
+) -> None:
+    spawns: list[list[str]] = []
+
+    class ProcessType:
+        @staticmethod
+        def spawn(argv: list[str], **_kwargs: Any) -> object:
+            spawns.append(argv)
+            return object()
+
+    factory = WindowsConPtyFactory()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_POWERUP_ONBOARDING", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_TEAM_ONBOARDING", raising=False)
+    monkeypatch.setattr(
+        "session_bridge.claude_registrar._registrar_pywinpty_process_type",
+        lambda: ProcessType,
+    )
+    monkeypatch.setenv(environment_name, environment_value)
+
+    with pytest.raises(RuntimeError, match="unsafe Claude launch environment"):
+        factory._spawn_process(["claude"], cwd="C:/exact")
+
+    assert spawns == []
 
 
 def test_factory_validation_failure_reclaims_spawned_child_and_descriptors() -> None:
