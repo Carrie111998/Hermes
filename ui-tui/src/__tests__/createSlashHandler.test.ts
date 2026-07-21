@@ -1127,7 +1127,16 @@ const buildComposer = () => ({
   openEditor: vi.fn(async () => {}),
   paste: vi.fn(),
   queueRef: { current: [] as string[] },
-  selection: { copySelection: vi.fn(async () => '') },
+  selection: {
+    captureScrolledRows: vi.fn(),
+    clearSelection: vi.fn(),
+    copySelection: vi.fn(async () => ''),
+    copySelectionNoClear: vi.fn(async () => ''),
+    getState: vi.fn(() => ({})),
+    shiftAnchor: vi.fn(),
+    shiftSelection: vi.fn(),
+    version: vi.fn(() => 0)
+  },
   setInput: vi.fn()
 })
 
