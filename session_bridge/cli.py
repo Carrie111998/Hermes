@@ -93,14 +93,19 @@ _MAX_BACKFILL_CREATE = 10
 _BACKFILL_PAGE_SIZE = 1_000
 _MAX_PLANNED_SESSIONS = 10_000
 _CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
-_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.110"
+_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.216"
 _CLAUDE_VISIBILITY_VERSION_OUTPUTS = frozenset({
     _CLAUDE_VISIBILITY_PINNED_VERSION,
     f"{_CLAUDE_VISIBILITY_PINNED_VERSION} (Claude Code)",
 })
-_CLAUDE_FORCED_TEAM_ONBOARDING = frozenset({"banner", "step"})
+_CLAUDE_FORCED_ONBOARDING = frozenset({"banner", "step"})
+_CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
+    "CLAUDE_CODE_POWERUP_ONBOARDING",
+    "CLAUDE_CODE_TEAM_ONBOARDING",
+)
 _MAX_CLAUDE_AUTH_STATUS_BYTES = 16_384
 _MAX_CLAUDE_GLOBAL_CONFIG_BYTES = 4 * 1024 * 1024
+_MAX_CLAUDE_USER_SETTINGS_BYTES = 4 * 1024 * 1024
 _SIDEBAR_EXECUTION_BLOCKER_ORDER = (
     "sidebar_failed",
     "sidebar_terminal_resolution_mismatch",
@@ -153,6 +158,7 @@ def _claude_visibility_preflight(
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     global_config_path: Path | str | None = None,
+    user_settings_path: Path | str | None = None,
 ) -> dict[str, str] | None:
     """Read pinned version, auth, and startup state without starting a session."""
 
@@ -160,11 +166,14 @@ def _claude_visibility_preflight(
     # root would make the startup state and transcript roots disagree.
     if "CLAUDE_CONFIG_DIR" in os.environ:
         return None
-    if os.environ.get("CLAUDE_CODE_TEAM_ONBOARDING") in (
-        _CLAUDE_FORCED_TEAM_ONBOARDING
+    if any(
+        os.environ.get(name) in _CLAUDE_FORCED_ONBOARDING
+        for name in _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS
     ):
         return None
 
+    child_env = os.environ.copy()
+    child_env["DISABLE_UPDATES"] = "1"
     try:
         version = runner(
             [*command, "--version"],
@@ -174,6 +183,7 @@ def _claude_visibility_preflight(
             stdin=subprocess.DEVNULL,
             shell=False,
             check=False,
+            env=child_env,
         )
         authentication = runner(
             [*command, "auth", "status", "--json"],
@@ -183,6 +193,7 @@ def _claude_visibility_preflight(
             stdin=subprocess.DEVNULL,
             shell=False,
             check=False,
+            env=child_env,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -208,7 +219,14 @@ def _claude_visibility_preflight(
         if global_config_path is not None
         else _resolve_default_claude_global_config_path()
     )
-    theme = _read_claude_startup_theme(selected_config)
+    if not _read_claude_completed_onboarding(selected_config):
+        return None
+    selected_settings = (
+        Path(user_settings_path)
+        if user_settings_path is not None
+        else Path.home() / ".claude" / "settings.json"
+    )
+    theme = _read_claude_startup_theme(selected_settings)
     if theme is None:
         return None
     return {
@@ -219,7 +237,7 @@ def _claude_visibility_preflight(
 
 
 def _resolve_default_claude_global_config_path() -> Path:
-    """Resolve Claude 2.1.110 global state for the fixed default config root."""
+    """Resolve Claude 2.1.216 global state for the fixed default config root."""
 
     home = Path.home()
     modern = home / ".claude" / ".config.json"
@@ -232,24 +250,22 @@ def _resolve_default_claude_global_config_path() -> Path:
     return home / f".claude{suffix}.json"
 
 
-def _read_claude_startup_theme(global_config_path: Path) -> str | None:
-    """Read only the canonical onboarding fields from Claude's global state."""
+def _read_claude_completed_onboarding(global_config_path: Path) -> bool:
+    """Read only Claude's exact global onboarding-complete flag."""
 
-    try:
-        with global_config_path.open("rb") as handle:
-            metadata = os.fstat(handle.fileno())
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > _MAX_CLAUDE_GLOBAL_CONFIG_BYTES
-            ):
-                return None
-            payload = handle.read(_MAX_CLAUDE_GLOBAL_CONFIG_BYTES + 1)
-    except OSError:
-        return None
-    if not payload or len(payload) > _MAX_CLAUDE_GLOBAL_CONFIG_BYTES:
-        return None
-    document = _strict_json_object(payload)
-    if document is None or document.get("hasCompletedOnboarding") is not True:
+    document = _read_strict_claude_json(
+        global_config_path, max_bytes=_MAX_CLAUDE_GLOBAL_CONFIG_BYTES
+    )
+    return document is not None and document.get("hasCompletedOnboarding") is True
+
+
+def _read_claude_startup_theme(user_settings_path: Path) -> str | None:
+    """Read only the allowlisted theme from Claude's default user settings."""
+
+    document = _read_strict_claude_json(
+        user_settings_path, max_bytes=_MAX_CLAUDE_USER_SETTINGS_BYTES
+    )
+    if document is None:
         return None
     theme = document.get("theme")
     try:
@@ -257,6 +273,22 @@ def _read_claude_startup_theme(global_config_path: Path) -> str | None:
     except ValueError:
         return None
     return cast(str, theme)
+
+
+def _read_strict_claude_json(path: Path, *, max_bytes: int) -> dict[str, Any] | None:
+    """Read one bounded regular JSON object without exposing unrelated fields."""
+
+    try:
+        with path.open("rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+                return None
+            payload = handle.read(max_bytes + 1)
+    except OSError:
+        return None
+    if not payload or len(payload) > max_bytes:
+        return None
+    return _strict_json_object(payload)
 
 
 def _strict_json_object(payload: str | bytes) -> dict[str, Any] | None:

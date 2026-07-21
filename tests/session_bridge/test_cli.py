@@ -1546,7 +1546,7 @@ def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
     def preflight(command: tuple[str, ...]) -> dict[str, str]:
         events.append(("preflight", command))
         return {
-            "version": "2.1.110",
+            "version": "2.1.216",
             "authentication": "available",
             "theme": "light",
         }

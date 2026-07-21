@@ -1753,6 +1753,50 @@ def test_claude_target_resolves_recognized_npm_shim_to_literal_node_argv(
     assert kwargs["shell"] is False
 
 
+@pytest.mark.parametrize("suffix", [".cmd", ".ps1"])
+def test_claude_target_resolves_216_npm_shim_to_native_executable(
+    tmp_path: Path, suffix: str
+) -> None:
+    npm_root = tmp_path / "npm & literal"
+    native = (
+        npm_root
+        / "node_modules"
+        / "@anthropic-ai"
+        / "claude-code"
+        / "bin"
+        / "claude.exe"
+    )
+    shim = npm_root / f"claude{suffix}"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"")
+    shim.write_text("recognized npm shim", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((list(args), dict(kwargs)))
+        return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
+    ClaudeTargetAdapter(
+        FakeClaudeSource(),
+        marker_secret=SECRET,
+        claude_executable=str(shim),
+        runner=runner,
+        monotonic=lambda: 1.0,
+        sleep=lambda _: None,
+    ).create_placeholder(
+        native_id=CLAUDE_ID,
+        title="Mirror title",
+        source_session_id="codex:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    args, kwargs = calls[0]
+    assert args[0] == str(native.resolve())
+    assert args[-1].count("HERMES_SESSION_BRIDGE_V1:") == 1
+    assert kwargs["shell"] is False
+
+
 @pytest.mark.parametrize("suffix", [".cmd", ".ps1", ".bat"])
 def test_claude_target_rejects_unrecognized_explicit_shell_shim(
     tmp_path: Path, suffix: str

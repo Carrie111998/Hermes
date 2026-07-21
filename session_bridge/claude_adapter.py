@@ -662,7 +662,11 @@ def resolve_claude_command(
         raise RuntimeError("unsupported_shell_shim")
 
     npm_root = candidate.parent
-    cli = npm_root / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+    package_root = npm_root / "node_modules" / "@anthropic-ai" / "claude-code"
+    native = package_root / "bin" / "claude.exe"
+    if native.is_file():
+        return (str(native.resolve()),)
+    cli = package_root / "cli.js"
     local_node = npm_root / "node.exe"
     resolved_node = (
         local_node

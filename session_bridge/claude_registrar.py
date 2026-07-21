@@ -221,6 +221,7 @@ class WindowsConPtyFactory:
         process_type = _registrar_pywinpty_process_type()
         child_env = os.environ.copy()
         child_env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+        child_env["DISABLE_UPDATES"] = "1"
         return process_type.spawn(
             argv, cwd=cwd, env=child_env, dimensions=(24, 120)
         )
@@ -1592,7 +1593,7 @@ def _claude_main_repl_ready(output: str) -> bool:
     """Match the main-only footer forced by ``--permission-mode dontAsk``."""
 
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
-    return "⏵⏵ don't ask on" in " ".join(cleaned.split())
+    return "⏵⏵don'taskon" in "".join(cleaned.split())
 
 
 def _normalized_terminal_output(output: str, prompt: str | None) -> str:

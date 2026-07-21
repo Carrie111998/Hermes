@@ -1292,6 +1292,24 @@ def test_winpty_readiness_ignores_conpty_prologue_and_requires_main_repl() -> No
     assert "⏵⏵ don't ask on" in output
 
 
+def test_winpty_readiness_accepts_claude_216_compact_main_footer() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([
+                "\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H",
+                "\x1b[?2004h",
+                "\x1b[2m\u23f5\u23f5don't ask on (shift+tab to cycle)\x1b[0m",
+            ])
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            return next(self.chunks)
+
+    output = _WinPtyProcess(Process()).read_until_ready(1.0)
+
+    assert "\x1b[?2004h" in output
+    assert "\u23f5\u23f5don't ask on" in output
+
+
 def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
     trust = (
         "\x1b[2JAccessing workspace:\r\n"
@@ -1487,7 +1505,7 @@ def test_winpty_unknown_private_resource_layout_fails_closed() -> None:
         _WinPtyProcess(object(), require_supported_layout=True)
 
 
-def test_factory_sets_cli_entrypoint_only_in_child_environment(
+def test_factory_sets_cli_entrypoint_and_update_lock_only_in_child_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed: dict[str, Any] = {}
@@ -1510,6 +1528,7 @@ def test_factory_sets_cli_entrypoint_only_in_child_environment(
             return object()
 
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.delenv("DISABLE_UPDATES", raising=False)
     monkeypatch.setattr(
         "session_bridge.claude_registrar._registrar_pywinpty_process_type",
         lambda: ProcessType,
@@ -1518,7 +1537,9 @@ def test_factory_sets_cli_entrypoint_only_in_child_environment(
     WindowsConPtyFactory()._spawn_process(["claude"], cwd="C:/exact")
 
     assert observed["env"]["CLAUDE_CODE_ENTRYPOINT"] == "cli"
+    assert observed["env"]["DISABLE_UPDATES"] == "1"
     assert "CLAUDE_CODE_ENTRYPOINT" not in os.environ
+    assert "DISABLE_UPDATES" not in os.environ
 
 
 def test_factory_validation_failure_reclaims_spawned_child_and_descriptors() -> None:
