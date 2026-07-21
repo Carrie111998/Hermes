@@ -173,7 +173,12 @@ def _bridge_item(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ConsumerError("durable JSONL record is not an object")
     candidates = [value]
-    for key in ("message", "event", "payload", "data"):
+    # "normalized" is the live capture-bridge envelope (whatsapp_capture_event
+    # records in events.jsonl nest the bridge item there); the flat shape and
+    # the other wrapper keys cover fixtures and replay corpora. Missing
+    # "normalized" put the live consumer in a poison-record crash loop on the
+    # first real capture record at activation (2026-07-21, first-light).
+    for key in ("normalized", "message", "event", "payload", "data"):
         nested = value.get(key)
         if isinstance(nested, Mapping):
             candidates.append(nested)
