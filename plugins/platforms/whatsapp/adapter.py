@@ -369,6 +369,7 @@ def _bridge_access_policy_hash(
     allowed_users,
     group_policy: str,
     group_allowed_users,
+    forward_owner_messages: bool,
 ) -> str:
     """Fingerprint access settings that are snapshotted by the Node bridge."""
     import hashlib
@@ -379,6 +380,7 @@ def _bridge_access_policy_hash(
         _serialize_bridge_allowlist(allowed_users),
         str(group_policy or "pairing").strip().lower(),
         _serialize_bridge_allowlist(group_allowed_users),
+        "true" if forward_owner_messages else "false",
     )
     return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()[:16]
 
@@ -675,12 +677,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "_group_allow_from",
                 self._coerce_allow_list(_wenv("WHATSAPP_GROUP_ALLOWED_USERS", "")),
             )
+            effective_forward_owner_messages = _wenv(
+                "WHATSAPP_FORWARD_OWNER_MESSAGES", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"}
             expected_policy_hash = _bridge_access_policy_hash(
                 mode=whatsapp_mode,
                 dm_policy=effective_dm_policy,
                 allowed_users=effective_allowed_users,
                 group_policy=effective_group_policy,
                 group_allowed_users=effective_group_allowed_users,
+                forward_owner_messages=effective_forward_owner_messages,
             )
             import aiohttp
             try:
@@ -748,18 +754,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # can use it without the user needing to set a separate env var.
             # with_hermes_node_path() copies os.environ when called with no arg.
             bridge_env = with_hermes_node_path()
-            # Always pass the adapter's effective access policy to Node. Values
-            # may originate in config.yaml rather than os.environ; relying on a
-            # copied process environment can therefore make Node and Python
-            # enforce different policies.
-            bridge_env["WHATSAPP_DM_POLICY"] = effective_dm_policy
-            bridge_env["WHATSAPP_ALLOWED_USERS"] = _serialize_bridge_allowlist(
-                effective_allowed_users
-            )
-            bridge_env["WHATSAPP_GROUP_POLICY"] = effective_group_policy
-            bridge_env["WHATSAPP_GROUP_ALLOWED_USERS"] = _serialize_bridge_allowlist(
-                effective_group_allowed_users
-            )
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
@@ -789,6 +783,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 _v = _wenv(_key)
                 if _v:
                     bridge_env[_key] = _v
+            # Config-derived access values are authoritative over copied/profile
+            # environment values and must exactly match the policy fingerprint.
+            bridge_env["WHATSAPP_DM_POLICY"] = effective_dm_policy
+            bridge_env["WHATSAPP_ALLOWED_USERS"] = _serialize_bridge_allowlist(
+                effective_allowed_users
+            )
+            bridge_env["WHATSAPP_GROUP_POLICY"] = effective_group_policy
+            bridge_env["WHATSAPP_GROUP_ALLOWED_USERS"] = _serialize_bridge_allowlist(
+                effective_group_allowed_users
+            )
+            bridge_env["WHATSAPP_FORWARD_OWNER_MESSAGES"] = (
+                "true" if effective_forward_owner_messages else "false"
+            )
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it.  Without these the bridge
             # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges

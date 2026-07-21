@@ -116,6 +116,7 @@ def _default_policy_hash() -> str:
         allowed_users=set(),
         group_policy="pairing",
         group_allowed_users=set(),
+        forward_owner_messages=False,
     )
 
 
@@ -154,6 +155,23 @@ class TestFileContentHash:
         # Node side: createHash('sha256').update(bytes).digest('hex').slice(0, 16)
         expected = hashlib.sha256(b"const x = 1;\n").hexdigest()[:16]
         assert _file_content_hash(f) == expected
+
+
+    def test_policy_hash_changes_with_owner_forwarding(self):
+        from plugins.platforms.whatsapp.adapter import _bridge_access_policy_hash
+
+        common = {
+            "mode": "bot",
+            "dm_policy": "pairing",
+            "allowed_users": set(),
+            "group_policy": "allowlist",
+            "group_allowed_users": {"120363001234567890@g.us"},
+        }
+        assert _bridge_access_policy_hash(
+            **common, forward_owner_messages=False
+        ) != _bridge_access_policy_hash(
+            **common, forward_owner_messages=True
+        )
 
 
 class TestStaleBridgeHandshake:
@@ -425,7 +443,8 @@ class TestDepRefreshStamp:
 
 class TestCacheDirEnvPassthrough:
     @pytest.mark.asyncio
-    async def test_bridge_spawn_env_has_cache_dirs(self, tmp_path):
+    async def test_bridge_spawn_env_has_cache_dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WHATSAPP_FORWARD_OWNER_MESSAGES", "true")
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
         adapter = _make_adapter(
@@ -469,3 +488,4 @@ class TestCacheDirEnvPassthrough:
             "120363001234567890@g.us,120363009999999999@g.us"
         )
         assert env["WHATSAPP_SEND_READ_RECEIPTS"] == "true"
+        assert env["WHATSAPP_FORWARD_OWNER_MESSAGES"] == "true"

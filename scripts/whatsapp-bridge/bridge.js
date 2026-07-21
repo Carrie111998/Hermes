@@ -30,7 +30,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesInboundWhatsAppGroup, matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { classifyInboundAccessBeforeMedia, matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -129,6 +129,7 @@ const POLICY_HASH = createHash('sha256')
     ALLOWED_USERS_RAW,
     WHATSAPP_GROUP_POLICY,
     GROUP_ALLOWED_USERS_RAW,
+    String(FORWARD_OWNER_MESSAGES),
   ].join('\0'))
   .digest('hex')
   .slice(0, 16);
@@ -653,38 +654,43 @@ async function startSocket() {
       // themselves — stranger DMs / group pings must never reach the
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
-      if (!msg.key.fromMe) {
-        if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
-        const intakeAllowed = isGroup
-          ? matchesInboundWhatsAppGroup({
-              chatId,
-              groupPolicy: WHATSAPP_GROUP_POLICY,
-              groupAllowedUsers: GROUP_ALLOWED_USERS,
-              sessionDir: SESSION_DIR,
-            })
-          : WHATSAPP_DM_POLICY === 'pairing'
-            || matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
-        if (!intakeAllowed) {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: isGroup ? 'group_policy_rejected' : 'allowlist_mismatch',
-              chatId,
-              senderId,
-            }));
-          } catch {}
-          continue;
-        }
+      if (!msg.key.fromMe && WHATSAPP_MODE === 'self-chat') {
+        try {
+          console.log(JSON.stringify({
+            event: 'ignored',
+            reason: 'self_chat_mode_rejects_non_self',
+            chatId,
+            senderId,
+          }));
+        } catch {}
+        continue;
+      }
+
+      // Apply group policy before extractBridgeEvent() for ordinary inbound
+      // group messages. fromMe groups retain the existing early rejection.
+      // Python repeats this gate as defense in depth, but that later check is
+      // too late to prevent blocked-group media from touching the local cache.
+      const inboundAccess = classifyInboundAccessBeforeMedia({
+        isGroup,
+        fromMe: !!msg.key.fromMe,
+        chatId,
+        senderId,
+        dmPolicy: WHATSAPP_DM_POLICY,
+        allowedUsers: ALLOWED_USERS,
+        groupPolicy: WHATSAPP_GROUP_POLICY,
+        groupAllowedUsers: GROUP_ALLOWED_USERS,
+        sessionDir: SESSION_DIR,
+      });
+      if (!inboundAccess.allowed) {
+        try {
+          console.log(JSON.stringify({
+            event: 'ignored',
+            reason: inboundAccess.reason,
+            chatId,
+            senderId,
+          }));
+        } catch {}
+        continue;
       }
 
       const messageContent = getMessageContent(msg);

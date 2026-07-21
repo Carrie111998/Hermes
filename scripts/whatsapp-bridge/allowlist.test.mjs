@@ -5,6 +5,7 @@ import path from 'node:path';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 
 import {
+  classifyInboundAccessBeforeMedia,
   expandWhatsAppIdentifiers,
   matchesInboundWhatsAppGroup,
   matchesAllowedUser,
