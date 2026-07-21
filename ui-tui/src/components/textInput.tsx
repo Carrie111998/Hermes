@@ -1166,6 +1166,20 @@ export function TextInput({
         if (k.shift || k.ctrl || preserveBareLineFeed || (isMac ? isActionMod(k) : k.meta)) {
           commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
         } else {
+          // Cancel any pending fast-echo parent update — otherwise the 16ms
+          // debounce timer can fire *after* the submit handler clears the
+          // input (clearIn → setInput('')), overwriting it with stale text
+          // and keeping vRef.current out of sync.
+          if (parentChangeTimer.current) {
+            clearTimeout(parentChangeTimer.current)
+            parentChangeTimer.current = null
+          }
+          pendingParentValue.current = null
+          // Mark the next value prop change as external so the useEffect
+          // resets vRef.current from the cleared value rather than skipping
+          // it (self.current = true from the fast-echo commit).
+          self.current = false
+
           cbSubmit.current?.(vRef.current)
         }
 
