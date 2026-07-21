@@ -574,6 +574,7 @@ class _WinPtyProcess:
         chunks: list[str] = []
         workspace_trust_submitted = False
         workspace_trust_submit_offset: int | None = None
+        trust_redraw_pending = False
         post_trust_modal_seen = False
         ready_settle_deadline: float | None = None
         readiness_output = ""
@@ -589,6 +590,7 @@ class _WinPtyProcess:
                 if (
                     ready_settle_deadline is not None
                     and now >= ready_settle_deadline
+                    and not trust_redraw_pending
                     and not post_trust_modal_seen
                     and _claude_launch_input_ready(readiness_output)
                 ):
@@ -629,16 +631,27 @@ class _WinPtyProcess:
                 post_trust_modal_seen = post_trust_modal_seen or (
                     _known_claude_input_modal_visible(post_submit_output)
                 )
-                trust_redraw_end = _workspace_trust_prompt_end(post_submit_output)
-                if trust_redraw_end is not None:
-                    workspace_trust_submit_offset += trust_redraw_end
+                trust_redraw_start = _workspace_trust_prompt_prefix_start(
+                    post_submit_output
+                )
+                if trust_redraw_start is not None:
+                    workspace_trust_submit_offset += trust_redraw_start
+                    trust_redraw_pending = True
+                    trust_redraw_end = _workspace_trust_prompt_end(
+                        joined[workspace_trust_submit_offset:]
+                    )
+                    if trust_redraw_end is not None:
+                        workspace_trust_submit_offset += trust_redraw_end
+                        trust_redraw_pending = False
             readiness_output = (
                 joined[workspace_trust_submit_offset:]
                 if workspace_trust_submit_offset is not None
                 else joined
             )
-            if not post_trust_modal_seen and _claude_launch_input_ready(
-                readiness_output
+            if (
+                not trust_redraw_pending
+                and not post_trust_modal_seen
+                and _claude_launch_input_ready(readiness_output)
             ):
                 ready_settle_deadline = (
                     time.monotonic() + _READINESS_SETTLE_SECONDS
@@ -1622,22 +1635,7 @@ def _workspace_trust_prompt_visible(output: str) -> bool:
 def _workspace_trust_prompt_end(output: str) -> int | None:
     """Return the raw offset after the latest complete native trust frame."""
 
-    cleaned: list[str] = []
-    raw_ends: list[int] = []
-    cursor = 0
-    while cursor < len(output):
-        escape = _ANSI_OSC_RE.match(output, cursor) or _ANSI_CSI_RE.match(
-            output, cursor
-        )
-        if escape is not None:
-            cursor = escape.end()
-            continue
-        if output[cursor] != "\r":
-            cleaned.append(output[cursor])
-            raw_ends.append(cursor + 1)
-        cursor += 1
-
-    text = "".join(cleaned)
+    text, _, raw_ends = _terminal_text_with_raw_offsets(output)
     signature = (
         "Accessing workspace:",
         "Yes, I trust this folder",
@@ -1659,6 +1657,38 @@ def _workspace_trust_prompt_end(output: str) -> int | None:
         else:
             latest_end = raw_ends[frame_cursor - 1]
         search_from = frame_start + len(signature[0])
+
+
+def _workspace_trust_prompt_prefix_start(output: str) -> int | None:
+    """Return the raw start of the latest exact native trust-frame prefix."""
+
+    text, raw_starts, _ = _terminal_text_with_raw_offsets(output)
+    prefix_start = text.rfind("Accessing workspace:")
+    return None if prefix_start < 0 else raw_starts[prefix_start]
+
+
+def _terminal_text_with_raw_offsets(
+    output: str,
+) -> tuple[str, list[int], list[int]]:
+    """Strip terminal framing while retaining raw offsets for every text character."""
+
+    cleaned: list[str] = []
+    raw_starts: list[int] = []
+    raw_ends: list[int] = []
+    cursor = 0
+    while cursor < len(output):
+        escape = _ANSI_OSC_RE.match(output, cursor) or _ANSI_CSI_RE.match(
+            output, cursor
+        )
+        if escape is not None:
+            cursor = escape.end()
+            continue
+        if output[cursor] != "\r":
+            cleaned.append(output[cursor])
+            raw_starts.append(cursor)
+            raw_ends.append(cursor + 1)
+        cursor += 1
+    return "".join(cleaned), raw_starts, raw_ends
 
 
 def _claude_main_repl_ready(output: str) -> bool:

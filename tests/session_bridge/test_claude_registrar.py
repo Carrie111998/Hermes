@@ -1594,6 +1594,83 @@ def test_winpty_readiness_keeps_post_trust_product_modal_sticky_across_redraw() 
     assert process.writes == ["\r"]
 
 
+def test_winpty_readiness_partial_post_trust_prefix_invalidates_old_footer() -> None:
+    trust = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n"
+    )
+    footer = "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"
+    partial_redraw = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\n"
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([trust, footer, partial_redraw])
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    with pytest.raises(TimeoutError):
+        _WinPtyProcess(process).read_until_ready(
+            1.0, accept_workspace_trust=True
+        )
+
+    assert process.writes == ["\r"]
+    assert process.reads == 4
+
+
+def test_winpty_readiness_partial_trust_redraw_completes_before_new_footer() -> None:
+    trust = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\nNo, exit\r\nSecurity guide\r\n"
+    )
+    footer = "\x1b[?2004h\x1b[2m\u23f5\u23f5 don't ask on\x1b[0m"
+    partial_redraw = (
+        "\x1b[2JAccessing workspace:\r\n"
+        "Yes, I trust this folder\r\n"
+    )
+    redraw_tail = "No, exit\r\nSecurity guide\r\n" + footer
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([trust, footer, partial_redraw, redraw_tail])
+            self.writes: list[str] = []
+            self.reads = 0
+
+        def read_with_timeout(self, _size: int, timeout: float) -> str | None:
+            self.reads += 1
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                time.sleep(timeout)
+                return None
+
+        def write(self, data: str) -> None:
+            self.writes.append(data)
+
+    process = Process()
+    output = _WinPtyProcess(process).read_until_ready(
+        1.0, accept_workspace_trust=True
+    )
+
+    assert redraw_tail in output
+    assert process.writes == ["\r"]
+    assert process.reads == 5
+
+
 def test_winpty_readiness_eof_before_settle_fails_closed() -> None:
     class Process:
         def __init__(self) -> None:
@@ -1609,6 +1686,22 @@ def test_winpty_readiness_eof_before_settle_fails_closed() -> None:
 
     with pytest.raises(RuntimeError, match="closed before readiness"):
         _WinPtyProcess(Process()).read_until_ready(1.0)
+
+
+def test_winpty_readiness_classifies_provider_limit_eof_before_main_repl() -> None:
+    provider_limit = "You've hit your limit · resets 5am"
+
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter([provider_limit])
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str:
+            try:
+                return next(self.chunks)
+            except StopIteration as exc:
+                raise EOFError from exc
+
+    assert _WinPtyProcess(Process()).read_until_ready(1.0) == provider_limit
 
 
 def test_winpty_readiness_never_returns_on_trust_dialog_marker_alone() -> None:
