@@ -6,10 +6,11 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from events.paths import (
     audit_log_path, events_db_path, quiet_hours_path,
@@ -32,8 +33,96 @@ def _check(name: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+# The gateway's editable install imports the WORKING TREE of this checkout,
+# which is deliberately kept on a detached HEAD so worktree agents can land
+# commits onto the `main` ref via `git branch -f`.  A commit landed on main
+# therefore does NOT run until the detached checkout is fast-forwarded and
+# the gateway restarted — on 2026-07-20/21 three restart cycles ran stale
+# code while every session believed the fix was live because "main tip
+# moved".  This check makes that drift loud.
+_AGENT_SRC_DEFAULT = Path.home() / ".hermes" / "agent-src"
+
+
+def _agent_src_root() -> Path:
+    return Path(os.getenv("HERMES_AGENT_SRC") or _AGENT_SRC_DEFAULT)
+
+
+def _git(repo: Path, *args: str) -> Tuple[int, str]:
+    """Run a read-only git command; returns (returncode, stdout)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=15,
+        )
+        return proc.returncode, proc.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def check_code_drift(repo_path: Optional[Path] = None) -> int:
+    """Compare the deployed checkout's HEAD against the landed `main` ref.
+
+    Read-only — never mutates the repo.  Returns the number of issues found
+    (0 or 1).  A missing repo/ref degrades to a skip note, not a failure,
+    so the doctor stays usable on boxes without the shared checkout.
+    """
+    repo = repo_path or _agent_src_root()
+    # .git is a directory in a normal checkout and a file in a worktree.
+    if not (repo / ".git").exists():
+        print(f"[--] code drift -- skipped ({repo} is not a git checkout)")
+        return 0
+
+    rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
+    rc_main, main = _git(repo, "rev-parse", "--verify", "refs/heads/main")
+    if rc_head != 0 or rc_main != 0:
+        which = "HEAD" if rc_head != 0 else "main ref"
+        print(f"[--] code drift -- skipped (cannot resolve {which} in {repo})")
+        return 0
+    head, main = head.strip(), main.strip()
+
+    dirty = bool(_git(repo, "status", "--porcelain")[1].strip())
+    if dirty:
+        print(f"[NOTE] code drift: working tree at {repo} is DIRTY "
+              "(uncommitted changes -- inspect manually, never auto-fixed)")
+
+    if head == main:
+        _check("code drift (HEAD vs main)", True, f"in sync @ {head[:9]}")
+        return 0
+
+    head_behind = _git(repo, "merge-base", "--is-ancestor", "HEAD", "refs/heads/main")[0] == 0
+    head_ahead = _git(repo, "merge-base", "--is-ancestor", "refs/heads/main", "HEAD")[0] == 0
+
+    if head_behind:
+        count = _git(repo, "rev-list", "--count", "HEAD..refs/heads/main")[1].strip()
+        subjects = _git(repo, "log", "--format=  missed: %h %s", "-5",
+                        "HEAD..refs/heads/main")[1].rstrip()
+        print(f"[WARN] code drift: working tree LAGS main by {count} commit(s) "
+              "-- landed fixes are NOT running")
+        if subjects:
+            print(subjects)
+        print("  remediation: FF the detached checkout: "
+              f"git -C {repo} merge --ff-only main "
+              "(safe -- checkout is detached; check for a clean tree first), "
+              "then restart the gateway")
+        return 1
+
+    if head_ahead:
+        count = _git(repo, "rev-list", "--count", "refs/heads/main..HEAD")[1].strip()
+        print(f"[WARN] code drift: HEAD is AHEAD of main by {count} commit(s) "
+              "(working tree carries unlanded state -- land it on main or "
+              "move the checkout back to the main tip)")
+        return 1
+
+    print("[WARN] code drift: HEAD has DIVERGED from main "
+          f"(HEAD {head[:9]} vs main {main[:9]}, neither is an ancestor "
+          "of the other -- reconcile manually)")
+    return 1
+
+
 def run_doctor(check_telegram_api: bool = True) -> int:
     issues = 0
+
+    issues += check_code_drift()
 
     db = events_db_path()
     if not _check("events db exists", db.exists(), str(db)):
