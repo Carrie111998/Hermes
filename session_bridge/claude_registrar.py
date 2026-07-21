@@ -588,7 +588,7 @@ class _WinPtyProcess:
                 if (
                     ready_settle_deadline is not None
                     and now >= ready_settle_deadline
-                    and _claude_main_input_ready(readiness_output)
+                    and _claude_launch_input_ready(readiness_output)
                 ):
                     return "".join(chunks)
                 raise TimeoutError
@@ -622,7 +622,7 @@ class _WinPtyProcess:
                 if workspace_trust_submit_offset is not None
                 else joined
             )
-            if _claude_main_input_ready(readiness_output):
+            if _claude_launch_input_ready(readiness_output):
                 ready_settle_deadline = (
                     time.monotonic() + _READINESS_SETTLE_SECONDS
                 )
@@ -1616,14 +1616,21 @@ def _claude_main_repl_ready(output: str) -> bool:
     """Match the main-only footer forced by ``--permission-mode dontAsk``."""
 
     cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output)).replace("\r", "")
-    matches = tuple(_CLAUDE_MAIN_REPL_FOOTER_RE.finditer(cleaned))
-    if not matches:
-        return False
-    return not _known_claude_input_modal_visible(cleaned[matches[-1].end() :])
+    return bool(_CLAUDE_MAIN_REPL_FOOTER_RE.search(cleaned)) and not (
+        _known_claude_input_modal_visible(cleaned)
+    )
 
 
 def _claude_main_input_ready(output: str) -> bool:
     return _bracketed_paste_enabled(output) and _claude_main_repl_ready(output)
+
+
+def _claude_launch_input_ready(output: str) -> bool:
+    """Reject an unaccepted trust gate before recognizing the main input."""
+
+    return not _workspace_trust_prompt_visible(output) and _claude_main_input_ready(
+        output
+    )
 
 
 def _bracketed_paste_enabled(output: str) -> bool:
@@ -1636,12 +1643,6 @@ def _known_claude_input_modal_visible(output: str) -> bool:
     return any(
         all(value in folded for value in signature)
         for signature in (
-            (
-                "accessing workspace:",
-                "yes, i trust this folder",
-                "no, exit",
-                "security guide",
-            ),
             ("let's get started.", "dark mode", "light mode", "syntax theme:"),
             ("standard part of your max plan", "yes, try it", "not now"),
         )

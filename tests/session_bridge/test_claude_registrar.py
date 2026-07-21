@@ -26,6 +26,7 @@ from session_bridge.claude_registrar import (
     PtyCleanupResult,
     WindowsConPtyFactory,
     _WinPtyProcess,
+    _claude_main_repl_ready,
     _registrar_pywinpty_process_type,
 )
 from session_bridge.claude_visibility import (
@@ -471,6 +472,38 @@ def test_tui_product_modal_after_footer_never_writes_prompt() -> None:
             "1. Yes, try it\r\n2. Not now\r\n"
         )
     )
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert process.writes == []
+    assert process.terminated and process.closed
+
+
+@pytest.mark.parametrize(
+    "ready_output",
+    [
+        (
+            "\x1b[?2004h\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+            "1. Yes, try it\r\n2. Not now\r\n"
+            "\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+        ),
+        (
+            "\x1b[?2004h\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+            "1. Yes, try it\r\n2. Not now\r\n"
+            "\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+            "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+            "1. Yes, try it\r\n2. Not now\r\n"
+            "\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+        ),
+    ],
+    ids=["modal-before-footer", "repeated-modal-footer-redraw"],
+)
+def test_tui_modal_history_before_latest_footer_never_writes_prompt(
+    ready_output: str,
+) -> None:
+    process = FakePty(ready_output=ready_output)
 
     result = registrar(FakeSource(), FakeFactory(process)).process(claim())
 
@@ -1396,6 +1429,26 @@ def test_winpty_readiness_rejects_footer_and_product_modal_in_same_chunk() -> No
 
     assert "Not now" in output
     assert process.reads == 2
+
+
+def test_main_repl_readiness_rejects_product_modal_before_footer() -> None:
+    output = (
+        "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+        "1. Yes, try it\r\n2. Not now\r\n"
+        "\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+    )
+
+    assert not _claude_main_repl_ready(output)
+
+
+def test_main_repl_readiness_rejects_repeated_modal_footer_redraws() -> None:
+    modal = (
+        "\x1b[2JFable 5 is now a standard part of your Max plan\r\n"
+        "1. Yes, try it\r\n2. Not now\r\n"
+    )
+    footer = "\x1b[2m\u23f5\u23f5don't ask on\x1b[0m"
+
+    assert not _claude_main_repl_ready(modal + footer + modal + footer)
 
 
 def test_winpty_readiness_crosses_exact_workspace_trust_gate_once() -> None:
