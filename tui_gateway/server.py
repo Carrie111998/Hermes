@@ -2185,7 +2185,24 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _on_compute_host_turn_done(
+    rid: str,
+    sid: str,
+    session: dict,
+    frame: dict,
+    *,
+    host_request_id: str | None = None,
+) -> None:
+    if host_request_id is not None:
+        # Claim only the generation this callback submitted. A late/busy/error
+        # terminal frame from an older host request must never settle a newer
+        # source turn that happens to use the same parent JSON-RPC request id.
+        if str(frame.get("request_id") or "") != host_request_id:
+            return
+        with session["history_lock"]:
+            if session.get("_compute_host_request_id") != host_request_id:
+                return
+            session.pop("_compute_host_request_id", None)
     is_error = frame.get("type") == "turn.error"
     # Mirror the authoritative child transcript before the source is marked
     # idle or a detached terminal notification can expose source activation.
@@ -2222,6 +2239,16 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         _finish_detached_dispatch(sid, session, only_if_idle=True)
 
 
+def _compute_host_dispatch_lock(session: dict) -> threading.RLock:
+    """Return the per-session lock that orders child turn/interrupt writes."""
+    with session["history_lock"]:
+        lock = session.get("_compute_host_dispatch_lock")
+        if lock is None:
+            lock = threading.RLock()
+            session["_compute_host_dispatch_lock"] = lock
+        return lock
+
+
 def _submit_prompt_to_compute_host(
     rid: str,
     sid: str,
@@ -2231,14 +2258,16 @@ def _submit_prompt_to_compute_host(
     queued_prompt_generation: int | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
+    host_request_id = uuid.uuid4().hex
     frame = _compute_host_turn_frame(
-        rid,
+        host_request_id,
         sid,
         session,
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
     )
+    dispatch_lock = _compute_host_dispatch_lock(session)
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -2247,15 +2276,39 @@ def _submit_prompt_to_compute_host(
         # duplicate terminal error.
         if done.get("reason") == "send_failed":
             return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        _on_compute_host_turn_done(
+            rid,
+            sid,
+            session,
+            done,
+            host_request_id=host_request_id,
+        )
 
-    try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
-    with session["history_lock"]:
-        session["_compute_host_active"] = True
-        if image_paths is None:
+    with dispatch_lock:
+        with session["history_lock"]:
+            if session.get("_turn_cancel_requested"):
+                session["running"] = False
+                session["turn_settled"] = True
+                _clear_inflight_turn(session)
+                return _ok(
+                    rid, {"status": "interrupted", "turn_isolation": True}
+                )
+            session["_compute_host_request_id"] = host_request_id
+        try:
+            # Keep the dispatch lock through the pipe write. session.interrupt
+            # and busy-input interrupts use the same lock, so either turn.start
+            # is written first and stop follows, or cancellation wins and this
+            # submission never reaches the child.
+            _get_compute_host_supervisor(cfg).submit_turn(
+                frame, on_complete=_complete
+            )
+        except Exception as exc:
+            with session["history_lock"]:
+                if session.get("_compute_host_request_id") == host_request_id:
+                    session.pop("_compute_host_request_id", None)
+            return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        with session["history_lock"]:
+            session["_compute_host_active"] = True
             session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
@@ -7276,6 +7329,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | Path | None = None,
+    initial_session_state: dict | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -7311,6 +7365,12 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        if initial_session_state:
+            # Compute-host admission must be visible before any poller or
+            # dispatcher can observe the freshly initialized session.
+            for state_key, state_value in initial_session_state.items():
+                if str(state_key).startswith("_compute_host_"):
+                    _sessions[sid][state_key] = state_value
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -8146,6 +8206,36 @@ def _enqueue_prompt(
     session["queued_prompt"] = queued
 
 
+def _interrupt_call_pending(session: dict) -> bool:
+    return int(session.get("_interrupt_call_count") or 0) > 0
+
+
+def _finish_interrupt_call(sid: str, session: dict) -> None:
+    """Release one provider interrupt and dispatch a waiting successor safely."""
+
+    with session["history_lock"]:
+        count = max(0, int(session.get("_interrupt_call_count") or 0) - 1)
+        if count:
+            session["_interrupt_call_count"] = count
+        else:
+            session.pop("_interrupt_call_count", None)
+        should_drain = bool(
+            count == 0
+            and session.get("queued_prompt")
+            and not session.get("running")
+        )
+    if should_drain:
+        try:
+            _drain_queued_prompt(
+                f"interrupt-finished-{uuid.uuid4().hex}", sid, session
+            )
+        except Exception:
+            logger.debug(
+                "queued prompt drain after interrupt failed",
+                exc_info=True,
+            )
+
+
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     """Interrupt a busy turn without blocking the RPC reader or session lock.
 
@@ -8161,22 +8251,44 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     if not use_agent and not use_compute_host:
         return
 
+    compute_host_request_id = ""
     with session["history_lock"]:
-        if session.get("_busy_interrupt_pending"):
+        if _interrupt_call_pending(session):
             return
+        if use_compute_host:
+            # Bind this best-effort interrupt to the turn that was busy when the
+            # prompt was accepted. A delayed worker must not stop a successor
+            # that has already replaced it under the same UI session id.
+            compute_host_request_id = str(
+                session.get("_compute_host_request_id") or ""
+            )
+            if not compute_host_request_id:
+                return
         session["_busy_interrupt_pending"] = True
+        session["_interrupt_call_count"] = (
+            int(session.get("_interrupt_call_count") or 0) + 1
+        )
 
     def interrupt() -> None:
         try:
             if use_agent:
                 agent.interrupt()
             else:
-                _get_compute_host_supervisor().interrupt(sid)
+                dispatch_lock = _compute_host_dispatch_lock(session)
+                with dispatch_lock:
+                    with session["history_lock"]:
+                        if (
+                            session.get("_compute_host_request_id")
+                            != compute_host_request_id
+                        ):
+                            return
+                    _get_compute_host_supervisor().interrupt(sid)
         except Exception:
             pass
         finally:
             with session["history_lock"]:
                 session["_busy_interrupt_pending"] = False
+            _finish_interrupt_call(sid, session)
 
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
@@ -8206,7 +8318,9 @@ def _handle_busy_submit(
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
-        if not session.get("running"):
+        running = bool(session.get("running"))
+        interrupt_pending = _interrupt_call_pending(session)
+        if not running and not interrupt_pending:
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
@@ -8220,7 +8334,7 @@ def _handle_busy_submit(
             session["attached_images"] = []
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
+    if mode == "steer" and running and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
         try:
             if agent.steer(plain_text):
                 with session["history_lock"]:
@@ -8251,9 +8365,12 @@ def _handle_busy_submit(
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
     with session["history_lock"]:
-        if not session.get("running"):
+        if not session.get("running") and not _interrupt_call_pending(session):
             if image_paths:
-                session["attached_images"] = image_paths + list(session.get("attached_images", []))
+                session["attached_images"] = image_paths + list(
+                    session.get("attached_images", [])
+                )
+            return None
             return None
         _enqueue_prompt(session, text, transport, image_paths=image_paths)
         session["last_active"] = time.time()
@@ -8276,6 +8393,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
+        if _interrupt_call_pending(session):
+            # A delayed interrupt must settle before a successor starts.
+            return True
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
@@ -8283,6 +8403,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session.pop("queued_prompts", None)
         session["running"] = True
         session["turn_settled"] = False
+        # Stop deliberately clears every prompt that predates it. Therefore a
+        # queued prompt that still exists here was accepted afterwards and owns
+        # a fresh turn; do not let the old turn's cancellation discard it.
+        session["_turn_cancel_requested"] = False
         # The retained task describes the turn that just settled, not this
         # already-accepted successor. Keep the registry record for its owner,
         # but release the source-side pointer before the next dispatch.
@@ -10016,11 +10140,24 @@ def _notification_poller_loop(
             # quiescent snapshot and clears it only after turn.end is on the
             # wire. Treat that window as busy so this autonomous poller cannot
             # install a successor behind the parent's terminal state.
-            if session.get("running") or session.get("_compute_host_terminal_pending"):
+            if (
+                session.get("running")
+                or _interrupt_call_pending(session)
+                or session.get("queued_prompt")
+                or session.get("_compute_host_terminal_pending")
+                or session.get("_compute_host_terminal_successor_pending")
+                or session.get("_compute_host_turn_admission")
+                or session.get("_compute_host_control_pending")
+            ):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
                 session["running"] = True
+                # Completion events arrive after the Stop that may have
+                # cancelled the originating turn. This is fresh work, so it
+                # must not inherit that turn's cancellation state.
+                session["_turn_cancel_requested"] = False
+                session["turn_settled"] = False
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -10101,10 +10238,22 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:
-            if session.get("running") or session.get("_compute_host_terminal_pending"):
+            if (
+                session.get("running")
+                or _interrupt_call_pending(session)
+                or session.get("queued_prompt")
+                or session.get("_compute_host_terminal_pending")
+                or session.get("_compute_host_terminal_successor_pending")
+                or session.get("_compute_host_turn_admission")
+                or session.get("_compute_host_control_pending")
+            ):
                 process_registry.completion_queue.put(evt)
                 break
             session["running"] = True
+            # Mirror the live-loop claim: shutdown draining also starts fresh
+            # work that must not inherit a prior turn's Stop flag.
+            session["_turn_cancel_requested"] = False
+            session["turn_settled"] = False
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -10264,11 +10413,14 @@ def _run_prompt_submit(
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
-            and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
+            and int(session.get("_queued_prompt_generation", 0))
+            != queued_prompt_generation
         ):
             session["running"] = False
             return
-        session["turn_settled"] = False
+        agent = session["agent"]
+        cancelled_before_start = bool(session.get("_turn_cancel_requested"))
+        session["turn_settled"] = cancelled_before_start
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         if image_paths is None:
@@ -10276,17 +10428,22 @@ def _run_prompt_submit(
             session["attached_images"] = []
         else:
             images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        agent = session["agent"]
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
+        if cancelled_before_start:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        else:
+            inflight = session.get("inflight_turn")
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            # Serialize clear_interrupt with the cancellation flag. A stop that
+            # wins this lock is never erased by startup.
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    agent.clear_interrupt()
+                except Exception:
+                    pass
+    if cancelled_before_start:
+        return
     _emit("message.start", sid)
 
     def run():
@@ -11053,6 +11210,12 @@ def _run_prompt_submit(
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
+                    # Mirror the poller claims: this notification is fresh work
+                    # and must not inherit the finished turn's Stop flag, or
+                    # _run_prompt_submit would drop the event as
+                    # cancelled-before-start after message.start was emitted.
+                    session["_turn_cancel_requested"] = False
+                    session["turn_settled"] = False
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
