@@ -902,6 +902,34 @@ def test_sidebar_marker_lookup_recovers_one_exact_thread_read_only() -> None:
     ]
 
 
+def test_sidebar_terminal_marker_lookup_includes_archived_without_changing_delivery_lookup() -> (
+    None
+):
+    client = FakeRequestClient({
+        "thread/list": [{"data": []}, _codex_inventory()],
+        "thread/read": [_codex_signed_read()],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) is None
+    assert verifier.find_by_marker_including_archived(
+        _sidebar_expected()
+    ) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
+    ]
+
+
 def test_sidebar_recovery_key_lookup_returns_one_exact_native_thread(
     tmp_path: Path,
 ) -> None:

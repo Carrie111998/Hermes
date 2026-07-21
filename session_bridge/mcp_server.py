@@ -42,6 +42,7 @@ from .sidebar import (
 )
 from .store import (
     SIDEBAR_FATAL_ERRORS,
+    SIDEBAR_PRECREATE_RESOLUTION_CODE,
     SIDEBAR_RETRYABLE_ERRORS,
     SIDEBAR_TERMINAL_RESOLUTION_CODE,
     SessionBridgeStore,
@@ -1258,11 +1259,42 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     ineffective_terminal_resolution_count = _nonnegative_status_int(
         source.get("ineffective_terminal_resolution_count"), 0
     )
+    terminal_source = _status_mapping(source.get("terminal_resolutions"))
+    raw_resolution_codes = terminal_source.get("by_resolution_code")
+    resolution_codes = _status_mapping(raw_resolution_codes)
+    terminal_effective = _nonnegative_status_int(
+        terminal_source.get("effective"), terminally_resolved_failed_count
+    )
+    fixed_resolution_codes = (
+        SIDEBAR_TERMINAL_RESOLUTION_CODE,
+        SIDEBAR_PRECREATE_RESOLUTION_CODE,
+    )
+    shaped_resolution_codes = {
+        code: _nonnegative_status_int(
+            resolution_codes.get(code),
+            terminally_resolved_failed_count
+            if code == SIDEBAR_TERMINAL_RESOLUTION_CODE
+            else 0,
+        )
+        for code in fixed_resolution_codes
+    }
+    resolution_codes_valid = (
+        isinstance(raw_resolution_codes, Mapping)
+        and all(
+            type(code) is str and code in fixed_resolution_codes
+            for code in resolution_codes
+        )
+        and all(
+            type(count) is int and count >= 0
+            for code, count in resolution_codes.items()
+            if code in fixed_resolution_codes
+        )
+        and sum(shaped_resolution_codes.values()) == terminal_effective
+    )
     terminal_resolution_ledger_valid = (
         source.get("terminal_resolution_ledger_valid") is True
+        and resolution_codes_valid
     )
-    terminal_source = _status_mapping(source.get("terminal_resolutions"))
-    resolution_codes = _status_mapping(terminal_source.get("by_resolution_code"))
     raw_blockers = source.get("execution_blockers")
     execution_blockers = (
         [
@@ -1279,6 +1311,11 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         if isinstance(raw_blockers, (list, tuple))
         else []
     )
+    if (
+        not resolution_codes_valid
+        and "sidebar_terminal_resolution_ledger_invalid" not in execution_blockers
+    ):
+        execution_blockers.append("sidebar_terminal_resolution_ledger_invalid")
     return {
         "eligible_by_provider": {
             provider: _nonnegative_status_int(provider_counts.get(provider), 0)
@@ -1300,19 +1337,12 @@ def _sidebar_status(value: object) -> dict[str, Any]:
                 terminally_resolved_failed_count
                 + ineffective_terminal_resolution_count,
             ),
-            "effective": _nonnegative_status_int(
-                terminal_source.get("effective"), terminally_resolved_failed_count
-            ),
+            "effective": terminal_effective,
             "ineffective": _nonnegative_status_int(
                 terminal_source.get("ineffective"),
                 ineffective_terminal_resolution_count,
             ),
-            "by_resolution_code": {
-                SIDEBAR_TERMINAL_RESOLUTION_CODE: _nonnegative_status_int(
-                    resolution_codes.get(SIDEBAR_TERMINAL_RESOLUTION_CODE),
-                    terminally_resolved_failed_count,
-                )
-            },
+            "by_resolution_code": shaped_resolution_codes,
         },
         "execution_blockers": execution_blockers,
         "oldest_pending_age_seconds": _finite_status_number(

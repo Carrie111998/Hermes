@@ -25,6 +25,7 @@ from session_bridge.coordinator import (
 from session_bridge.mcp_server import (
     EXPECTED_TOOLS,
     _claude_visibility_status_payload,
+    _sidebar_status,
     _validate_windows_token_acl,
     create_app,
     resolve_bearer_token,
@@ -1942,7 +1943,10 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "total": 0,
         "effective": 0,
         "ineffective": 0,
-        "by_resolution_code": {"native_thread_unrecoverable": 0},
+        "by_resolution_code": {
+            "native_thread_unrecoverable": 0,
+            "precutover_create_unrecoverable": 0,
+        },
     }
     assert sidebar["execution_blockers"] == []
     assert sidebar["last_heartbeat_at"] is not None
@@ -1952,6 +1956,82 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "p95": None,
         "p99": None,
     }
+
+
+def test_sidebar_status_preserves_both_fixed_terminal_resolution_codes() -> None:
+    status = _sidebar_status({
+        "counts": {"sidebar_failed": 2},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 2,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 2,
+            "effective": 2,
+            "ineffective": 0,
+            "by_resolution_code": {
+                "native_thread_unrecoverable": 1,
+                "precutover_create_unrecoverable": 1,
+            },
+        },
+        "execution_blockers": [],
+    })
+
+    assert status["terminal_resolution_ledger_valid"] is True
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 1,
+        "precutover_create_unrecoverable": 1,
+    }
+    assert status["execution_blockers"] == []
+
+
+@pytest.mark.parametrize(
+    ("by_resolution_code", "effective"),
+    (
+        (
+            {
+                "native_thread_unrecoverable": 1,
+                "precutover_create_unrecoverable": 0,
+                "future_resolution_code": 0,
+            },
+            1,
+        ),
+        (
+            {
+                "native_thread_unrecoverable": 1,
+                "precutover_create_unrecoverable": 0,
+            },
+            2,
+        ),
+    ),
+)
+def test_sidebar_status_rejects_unknown_or_mismatched_resolution_counts(
+    by_resolution_code: dict[str, int],
+    effective: int,
+) -> None:
+    status = _sidebar_status({
+        "counts": {"sidebar_failed": 2},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": effective,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": effective,
+            "effective": effective,
+            "ineffective": 0,
+            "by_resolution_code": by_resolution_code,
+        },
+        "execution_blockers": [],
+    })
+
+    assert status["terminal_resolution_ledger_valid"] is False
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 1,
+        "precutover_create_unrecoverable": 0,
+    }
+    assert status["execution_blockers"] == [
+        "sidebar_terminal_resolution_ledger_invalid"
+    ]
 
 
 @pytest.mark.parametrize(

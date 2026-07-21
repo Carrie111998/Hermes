@@ -51,6 +51,7 @@ from session_bridge.models import (
     ProjectedMessage,
     Provider,
     SessionProjection,
+    SidebarJobState,
     encode_bridge_marker,
 )
 from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
@@ -116,6 +117,13 @@ class FakeBackend:
             "status": "acknowledged",
             "error_code": "native_create_ambiguous",
             "resolution_code": "native_thread_unrecoverable",
+        }
+    )
+    sidebar_precreate_terminal_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "precutover_create_unrecoverable",
         }
     )
     claude_visibility_payload: dict[str, Any] = field(
@@ -200,6 +208,19 @@ class FakeBackend:
             expected_error_code,
         ))
         return dict(self.sidebar_terminal_payload)
+
+    def sidebar_acknowledge_precreate_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_acknowledge_precreate_unrecoverable",
+            job_id,
+            expected_error_code,
+        ))
+        return dict(self.sidebar_precreate_terminal_payload)
 
     def claude_visibility_status(self) -> dict[str, Any]:
         self.calls.append(("claude_visibility_status",))
@@ -576,6 +597,93 @@ def test_sidebar_terminal_acknowledgement_parser_rejects_incomplete_authority(
         main(argv)
 
 
+def test_sidebar_precreate_acknowledgement_requires_exact_operator_authority_and_sanitizes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "b" * 64
+    backend = FakeBackend(
+        sidebar_precreate_terminal_payload={
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "precutover_create_unrecoverable",
+            "job_id": job_id,
+            "recovery_key": "hermes-session-bridge-create-v1:private",
+            "evidence_digest": "f" * 64,
+            "private_detail": "C:/private/provider-detail",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-acknowledge-precreate-unrecoverable",
+                "--job-id",
+                job_id,
+                "--expected-error-code",
+                "native_create_ambiguous",
+                "--confirm",
+                "precutover-create-unrecoverable",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_acknowledge_precreate_unrecoverable",
+            job_id,
+            "native_create_ambiguous",
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "acknowledged",
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "precutover_create_unrecoverable",
+    }
+    for private in (job_id, "hermes-session-bridge-create-v1", "f" * 64, "private"):
+        assert private not in rendered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        [
+            "sidebar-acknowledge-precreate-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "b" * 64,
+            "--expected-error-code",
+            "native_create_ambiguous",
+        ],
+        [
+            "sidebar-acknowledge-precreate-unrecoverable",
+            "--job-id",
+            "not-a-full-job-id",
+            "--expected-error-code",
+            "native_create_ambiguous",
+            "--confirm",
+            "precutover-create-unrecoverable",
+        ],
+        [
+            "sidebar-acknowledge-precreate-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "b" * 64,
+            "--expected-error-code",
+            "marker_conflict",
+            "--confirm",
+            "precutover-create-unrecoverable",
+        ],
+    ),
+)
+def test_sidebar_precreate_acknowledgement_parser_rejects_incomplete_authority(
+    argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
 class _TerminalProbeClient:
     def __init__(self, *, scenario: str, thread_id: str) -> None:
         self.scenario = scenario
@@ -815,6 +923,314 @@ def test_production_terminal_acknowledgement_rejects_noncanonical_job_before_pro
             ).fetchone()[0]
             == 0
         )
+    finally:
+        backend.close()
+
+
+class _PrecreateProbeVerifier:
+    def __init__(self, scenario: str) -> None:
+        self.scenario = scenario
+        self.marker_calls: list[BridgeMarkerPayload] = []
+        self.terminal_marker_calls: list[BridgeMarkerPayload] = []
+        self.recovery_calls: list[tuple[str, str, float]] = []
+        self.create_calls: list[object] = []
+
+    def find_by_marker(self, expected: BridgeMarkerPayload) -> object | None:
+        self.marker_calls.append(expected)
+        if self.scenario == "marker_error":
+            raise TimeoutError("private marker probe timeout")
+        if self.scenario == "marker_match":
+            return object()
+        return None
+
+    def find_by_marker_including_archived(
+        self,
+        expected: BridgeMarkerPayload,
+    ) -> object | None:
+        self.terminal_marker_calls.append(expected)
+        if self.scenario == "marker_error":
+            raise TimeoutError("private marker probe timeout")
+        if self.scenario in {"marker_match", "archived_marker_match"}:
+            return object()
+        return None
+
+    @property
+    def all_marker_calls(self) -> list[BridgeMarkerPayload]:
+        return [*self.marker_calls, *self.terminal_marker_calls]
+
+    def find_by_recovery_key(
+        self,
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        self.recovery_calls.append((recovery_key, expected_cwd, deadline))
+        if self.scenario == "recovery_error":
+            raise TimeoutError("private recovery probe timeout")
+        if self.scenario == "recovery_match":
+            return "019f-private-recovered-thread"
+        return None
+
+    def create_thread(self, *_args: object, **_kwargs: object) -> None:
+        self.create_calls.append(object())
+        raise AssertionError("precreate terminal proof must never create")
+
+
+def _production_precreate_resolution_backend(
+    tmp_path: Path,
+    *,
+    marker_secret: bytes,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    SidebarCandidate,
+]:
+    db = SessionDB(tmp_path / "precreate-terminal.db")
+    tokens = iter(("precreate-terminal-token",))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    source_session_id = "hermes:precreate-terminal"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] precreate terminal evidence",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    queued = store.enqueue_sidebar_job(candidate)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET state = ?, next_attempt_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (SidebarJobState.RETRY.value, 105.0, 105.0, queued["id"]),
+        )
+    )
+    store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=110.0,
+    )
+    lease = store.claim_sidebar_jobs(now=120.0, limit=1)[0]
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=130.0,
+    )
+    reservation = store.get_sidebar_create_reservation(source_session_id)
+    cutover = store.get_state(
+        "session-bridge:sidebar:create-reservation-cutover:v1"
+    )
+    assert reservation is not None
+    assert cutover is not None
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    return backend, store, failed, reservation, cutover, candidate
+
+
+def test_production_precreate_acknowledgement_probes_exact_identities_and_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, reservation, _cutover, candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    before_job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        first = backend.sidebar_acknowledge_precreate_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+        replay = backend.sidebar_acknowledge_precreate_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+
+        assert first == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "precutover_create_unrecoverable",
+        }
+        assert replay == {**first, "status": "already_acknowledged"}
+        assert verifier.all_marker_calls == [
+            BridgeMarkerPayload(
+                bridge_id=candidate.bridge_id,
+                source_session_id=candidate.source_session_id,
+                target_provider=Provider.CODEX,
+                policy_generation=1,
+            )
+        ] * 2
+        assert [
+            (recovery_key, cwd)
+            for recovery_key, cwd, _deadline in verifier.recovery_calls
+        ] == [(reservation["recovery_key"], candidate.cwd)] * 2
+        assert all(
+            isinstance(deadline, float) and deadline > 0
+            for _recovery_key, _cwd, deadline in verifier.recovery_calls
+        )
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_precreate_resolutions"
+        ).fetchall()
+        assert audit["resolution_code"] == "precutover_create_unrecoverable"
+        assert len(audit["evidence_digest"]) == 64
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_exception", "expected_recovery_calls"),
+    (
+        ("marker_match", RolloutGateBlocked, 0),
+        ("recovery_match", RolloutGateBlocked, 1),
+        ("marker_error", ProviderDegraded, 0),
+        ("recovery_error", ProviderDegraded, 1),
+    ),
+)
+def test_production_precreate_acknowledgement_never_writes_without_two_zero_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_exception: type[Exception],
+    expected_recovery_calls: int,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, _reservation, _cutover, candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier(scenario)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        with pytest.raises(expected_exception):
+            backend.sidebar_acknowledge_precreate_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert len(verifier.all_marker_calls) == 1
+        assert len(verifier.recovery_calls) == expected_recovery_calls
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_precreate_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+def test_production_precreate_acknowledgement_archived_marker_blocks_without_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, _reservation, _cutover, candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("archived_marker_match")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+    )
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        with pytest.raises(RolloutGateBlocked, match="native_thread_materialized"):
+            backend.sidebar_acknowledge_precreate_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert verifier.marker_calls == []
+        assert len(verifier.terminal_marker_calls) == 1
+        assert verifier.recovery_calls == []
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_precreate_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+def test_production_precreate_acknowledgement_rejects_cutover_drift_before_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, _reservation, cutover, _candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    cutover["quarantined_job_ids"] = []
+    store.set_state(
+        "session-bridge:sidebar:create-reservation-cutover:v1",
+        cutover,
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_precreate_snapshot_mismatch",
+        ):
+            backend.sidebar_acknowledge_precreate_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert verifier.marker_calls == []
+        assert verifier.recovery_calls == []
     finally:
         backend.close()
 
@@ -1462,9 +1878,49 @@ def test_sidebar_status_preserves_raw_failures_but_waives_exact_terminal_resolut
         "total": 1,
         "effective": 1,
         "ineffective": 0,
-        "by_resolution_code": {"native_thread_unrecoverable": 1},
+        "by_resolution_code": {
+            "native_thread_unrecoverable": 1,
+            "precutover_create_unrecoverable": 0,
+        },
     }
     assert status["execution_blockers"] == []
+
+
+def test_sidebar_status_accepts_and_preserves_precreate_terminal_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 1},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {
+                "native_thread_unrecoverable": 0,
+                "precutover_create_unrecoverable": 1,
+            },
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 0,
+        "precutover_create_unrecoverable": 1,
+    }
 
 
 @pytest.mark.parametrize(

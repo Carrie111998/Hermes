@@ -55,6 +55,7 @@ from session_bridge.store import (
     SIDEBAR_EXCLUSION_REASONS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
+    sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
 )
 from session_bridge.worktree import WorktreeSnapshot, capture_worktree_snapshot
@@ -350,7 +351,7 @@ def _seed_unlinked_claude_visibility_lineage(
     return candidate, identity
 
 
-def test_fresh_schema_has_current_version_and_sidebar_terminal_ledger(db) -> None:
+def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> None:
     assert _rows(db, "SELECT version FROM schema_version") == [
         {"version": SCHEMA_VERSION}
     ]
@@ -431,6 +432,47 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledger(db) -> Non
         "trg_session_sidebar_terminal_resolutions_no_replacement",
         "trg_session_sidebar_terminal_resolutions_no_update",
         "trg_session_sidebar_terminal_resolutions_no_delete",
+        "trg_session_sidebar_terminal_resolutions_no_precreate_overlap",
+    }
+    assert _rows(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_sidebar_precreate_resolutions",),
+    ) == [{"name": "session_sidebar_precreate_resolutions"}]
+    assert [
+        row["name"]
+        for row in _rows(
+            db, 'PRAGMA table_info("session_sidebar_precreate_resolutions")'
+        )
+    ] == [
+        "job_id",
+        "idempotency_key",
+        "source_session_id",
+        "bridge_id",
+        "failure_state",
+        "failure_code",
+        "failure_attempts",
+        "failure_next_attempt_at",
+        "failure_updated_at",
+        "cutover_applied_at",
+        "reservation_reserved_at",
+        "resolution_code",
+        "evidence_kind",
+        "evidence_version",
+        "evidence_digest",
+        "resolved_at",
+    ]
+    assert {
+        row["name"]
+        for row in _rows(
+            db,
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'session_sidebar_precreate_resolutions'",
+        )
+    } == {
+        "trg_session_sidebar_precreate_resolutions_no_replacement",
+        "trg_session_sidebar_precreate_resolutions_no_update",
+        "trg_session_sidebar_precreate_resolutions_no_delete",
     }
 
 
@@ -470,6 +512,7 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
     connection = sqlite3.connect(path)
     try:
         connection.execute("DROP TABLE session_sidebar_terminal_resolutions")
+        connection.execute("DROP TABLE session_sidebar_precreate_resolutions")
         connection.commit()
     finally:
         connection.close()
@@ -504,6 +547,24 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
                 "trg_session_sidebar_terminal_resolutions_no_replacement",
                 "trg_session_sidebar_terminal_resolutions_no_update",
                 "trg_session_sidebar_terminal_resolutions_no_delete",
+                "trg_session_sidebar_terminal_resolutions_no_precreate_overlap",
+            }
+            assert _rows(
+                reopened,
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("session_sidebar_precreate_resolutions",),
+            ) == [{"name": "session_sidebar_precreate_resolutions"}]
+            assert {
+                row["name"]
+                for row in _rows(
+                    reopened,
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND tbl_name = 'session_sidebar_precreate_resolutions'",
+                )
+            } == {
+                "trg_session_sidebar_precreate_resolutions_no_replacement",
+                "trg_session_sidebar_precreate_resolutions_no_update",
+                "trg_session_sidebar_precreate_resolutions_no_delete",
             }
         finally:
             reopened.close()
@@ -6832,6 +6893,200 @@ def test_sidebar_execution_blockers_report_any_failed_row(db) -> None:
     assert store.sidebar_execution_blockers() == ("sidebar_failed",)
 
 
+def test_precreate_cutover_resolution_is_append_only_and_unblocks_without_native_id(
+    db,
+) -> None:
+    marker_secret = b"precreate-cutover-terminal-secret"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("precreate-terminal-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="precreate-terminal")
+    queued = store.enqueue_sidebar_job(candidate)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET state = ?, next_attempt_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (SidebarJobState.RETRY.value, 105.0, 105.0, queued["id"]),
+        )
+    )
+    assert store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=110.0,
+    ) == {
+        "version": 1,
+        "applied_at": 110.0,
+        "quarantined": 1,
+        "replayed": False,
+    }
+    lease = store.claim_sidebar_jobs(now=120.0, limit=1)[0]
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=130.0,
+    )
+    assert failed["codex_thread_id"] is None
+    assert failed["attempts"] == 0
+    reservation = store.get_sidebar_create_reservation(candidate.source_session_id)
+    assert reservation is not None
+    cutover = store.get_state(
+        "session-bridge:sidebar:create-reservation-cutover:v1"
+    )
+    assert cutover is not None
+    reservation_key = (
+        "session-bridge:sidebar-create:"
+        + hashlib.sha256(candidate.source_session_id.encode("utf-8")).hexdigest()
+    )
+    forged_reservation = {
+        **reservation,
+        "recovery_key": "hermes-session-bridge-create-v1:forged-cutover-key",
+    }
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
+            (
+                json.dumps(
+                    forged_reservation,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                reservation_key,
+            ),
+        )
+    )
+    forged_evidence = sidebar_precreate_terminal_evidence_digest(
+        job=failed,
+        reservation=forged_reservation,
+        cutover=cutover,
+        candidate=candidate,
+    )
+    with pytest.raises(ValueError, match="precreate resolution"):
+        store.acknowledge_sidebar_precreate_resolution(
+            job_id=failed["id"],
+            expected_error_code=failed["error_code"],
+            expected_attempts=failed["attempts"],
+            expected_next_attempt_at=failed["next_attempt_at"],
+            expected_updated_at=failed["updated_at"],
+            evidence_digest=forged_evidence,
+            marker_secret=marker_secret,
+            now=135.0,
+        )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
+            (
+                json.dumps(
+                    reservation,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                reservation_key,
+            ),
+        )
+    )
+    evidence = sidebar_precreate_terminal_evidence_digest(
+        job=failed,
+        reservation=reservation,
+        cutover=cutover,
+        candidate=candidate,
+    )
+
+    first = store.acknowledge_sidebar_precreate_resolution(
+        job_id=failed["id"],
+        expected_error_code=failed["error_code"],
+        expected_attempts=failed["attempts"],
+        expected_next_attempt_at=failed["next_attempt_at"],
+        expected_updated_at=failed["updated_at"],
+        evidence_digest=evidence,
+        marker_secret=marker_secret,
+        now=140.0,
+    )
+    replay = store.acknowledge_sidebar_precreate_resolution(
+        job_id=failed["id"],
+        expected_error_code=failed["error_code"],
+        expected_attempts=failed["attempts"],
+        expected_next_attempt_at=failed["next_attempt_at"],
+        expected_updated_at=failed["updated_at"],
+        evidence_digest=evidence,
+        marker_secret=marker_secret,
+        now=150.0,
+    )
+
+    assert first == {
+        "job_id": failed["id"],
+        "state": SidebarJobState.FAILED.value,
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "precutover_create_unrecoverable",
+        "created": True,
+    }
+    assert replay == {**first, "created": False}
+    [audit] = _rows(db, "SELECT * FROM session_sidebar_precreate_resolutions")
+    assert audit["job_id"] == failed["id"]
+    assert audit["resolution_code"] == "precutover_create_unrecoverable"
+    assert audit["evidence_digest"] == evidence
+    assert store.sidebar_execution_blockers() == ()
+    status = store.sidebar_delivery_status(now=160.0)
+    assert status["blocking_failed_count"] == 0
+    assert status["terminally_resolved_failed_count"] == 1
+    assert status["terminal_resolutions"] == {
+        "total": 1,
+        "effective": 1,
+        "ineffective": 0,
+        "by_resolution_code": {
+            "native_thread_unrecoverable": 0,
+            "precutover_create_unrecoverable": 1,
+        },
+    }
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="native_create_ambiguous",
+            now=170.0,
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_sidebar_precreate_resolutions "
+                "SET resolved_at = 180.0 WHERE job_id = ?",
+                (failed["id"],),
+            )
+        )
+    delivery_key = (
+        "session-bridge:sidebar-delivery:"
+        + hashlib.sha256(candidate.source_session_id.encode("utf-8")).hexdigest()
+    )
+    delivery_snapshot = store.get_state(delivery_key)
+    assert delivery_snapshot is not None
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
+            (
+                json.dumps(
+                    {**delivery_snapshot, "cwd": "C:/workspace/drifted"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                delivery_key,
+            ),
+        )
+    )
+    drifted = store.sidebar_delivery_status(now=190.0)
+    assert drifted["blocking_failed_count"] == 1
+    assert drifted["terminally_resolved_failed_count"] == 0
+    assert drifted["ineffective_terminal_resolution_count"] == 1
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM session_sidebar_precreate_resolutions WHERE job_id = ?",
+                (failed["id"],),
+            )
+        )
+
+
 def test_sidebar_terminal_resolution_is_append_only_and_unblocks_unrelated_work(
     db,
 ) -> None:
@@ -7295,6 +7550,58 @@ def test_sidebar_terminal_resolution_ledger_failure_is_fail_closed(
     assert status["blocking_failed_count"] == 1
     assert status["terminally_resolved_failed_count"] == 0
     assert status["terminal_resolutions"]["effective"] == 0
+    assert status["terminal_resolution_ledger_valid"] is False
+
+
+@pytest.mark.parametrize(
+    ("trigger_name", "replacement_sql"),
+    (
+        (
+            "trg_session_sidebar_precreate_resolutions_no_replacement",
+            """CREATE TRIGGER trg_session_sidebar_precreate_resolutions_no_replacement
+               BEFORE INSERT ON session_sidebar_precreate_resolutions
+               WHEN EXISTS (SELECT 1 FROM session_sidebar_terminal_resolutions)
+               BEGIN
+                   SELECT RAISE(ABORT, 'sidebar precreate resolutions are immutable');
+               END""",
+        ),
+        (
+            "trg_session_sidebar_precreate_resolutions_no_update",
+            """CREATE TRIGGER trg_session_sidebar_precreate_resolutions_no_update
+               BEFORE UPDATE ON session_sidebar_precreate_resolutions
+               WHEN 0
+               BEGIN
+                   SELECT RAISE(ABORT, 'sidebar precreate resolutions are immutable');
+               END""",
+        ),
+        (
+            "trg_session_sidebar_precreate_resolutions_no_delete",
+            """CREATE TRIGGER trg_session_sidebar_precreate_resolutions_no_delete
+               BEFORE DELETE ON session_sidebar_precreate_resolutions
+               WHEN 0
+               BEGIN
+                   SELECT RAISE(ABORT, 'sidebar precreate resolutions are immutable');
+               END""",
+        ),
+    ),
+)
+def test_sidebar_precreate_resolution_rejects_weakened_immutable_trigger(
+    db,
+    trigger_name: str,
+    replacement_sql: str,
+) -> None:
+    store = SessionBridgeStore(db)
+
+    def _weaken(conn: sqlite3.Connection) -> None:
+        conn.execute(f'DROP TRIGGER "{trigger_name}"')
+        conn.execute(replacement_sql)
+
+    db._execute_write(_weaken)
+
+    assert store.sidebar_execution_blockers() == (
+        "sidebar_terminal_resolution_ledger_invalid",
+    )
+    status = store.sidebar_delivery_status(now=300.0)
     assert status["terminal_resolution_ledger_valid"] is False
 
 

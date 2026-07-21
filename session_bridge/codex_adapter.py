@@ -261,6 +261,22 @@ class SidebarThreadVerifier:
     def find_by_marker(
         self, expected: BridgeMarkerPayload
     ) -> VerifiedSidebarThread | None:
+        return self._find_by_marker(expected, include_archived=False)
+
+    def find_by_marker_including_archived(
+        self,
+        expected: BridgeMarkerPayload,
+    ) -> VerifiedSidebarThread | None:
+        """Find signed marker evidence across active and archived inventory."""
+
+        return self._find_by_marker(expected, include_archived=True)
+
+    def _find_by_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        include_archived: bool,
+    ) -> VerifiedSidebarThread | None:
         expected = _validated_sidebar_marker_payload(expected)
         try:
             supports_search = getattr(
@@ -290,7 +306,7 @@ class SidebarThreadVerifier:
             raise SidebarVerificationError("bridge_temporarily_unavailable") from None
         matches: dict[str, VerifiedSidebarThread] = {}
         for projection in projections:
-            if projection.native_status == "archived":
+            if not include_archived and projection.native_status == "archived":
                 continue
             verified = _verified_sidebar_projection(
                 projection,
