@@ -47,8 +47,6 @@ EXPECTED_PS_SCOPES = frozenset(
         "observations:write",
         "attention:write",
         "state:write",
-        "christopher:read",
-        "christopher:write",
         "agent-config:read",
         "agent-config:write",
     }
