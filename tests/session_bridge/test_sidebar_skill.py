@@ -643,6 +643,42 @@ def test_install_sidebar_skill_revalidates_parent_identity_before_copy_mutations
     assert (destination / "old.txt").read_text(encoding="utf-8") == "preserve"
 
 
+def test_install_sidebar_skill_allows_benign_windows_directory_attribute_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    real_copy = sidebar_skill._copy_packaged_skill
+    real_lstat = os.lstat
+    attributes_drifted = False
+
+    def arm_attribute_drift(staging: Path, *guard: object) -> None:
+        nonlocal attributes_drifted
+        attributes_drifted = True
+        real_copy(staging, *guard)
+
+    def drifting_lstat(path: os.PathLike[str] | str):
+        info = real_lstat(path)
+        if attributes_drifted and Path(path).absolute() == skills.absolute():
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_file_attributes=getattr(info, "st_file_attributes", 0) ^ 0x20,
+                st_dev=info.st_dev,
+                st_ino=info.st_ino,
+            )
+        return info
+
+    monkeypatch.setattr(sidebar_skill, "_copy_packaged_skill", arm_attribute_drift)
+    monkeypatch.setattr(os, "lstat", drifting_lstat)
+
+    installed = sidebar_skill.install_sidebar_skill(codex_home)
+
+    assert installed == skills / "session-sidebar-sync"
+    assert (installed / "SKILL.md").is_file()
+
+
 def test_install_sidebar_skill_reports_operation_and_cleanup_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

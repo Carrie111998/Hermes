@@ -263,18 +263,20 @@ class _PathIdentity:
     device: int
     inode: int
     file_type: int
-    attributes: int
+    reparse_attribute: int
 
     @classmethod
     def capture(cls, path: Path) -> _PathIdentity:
         _assert_not_redirect(path, "installer path")
         info = os.lstat(path)
+        attributes = getattr(info, "st_file_attributes", 0)
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         return cls(
             path=path,
             device=info.st_dev,
             inode=info.st_ino,
             file_type=stat.S_IFMT(info.st_mode),
-            attributes=getattr(info, "st_file_attributes", 0),
+            reparse_attribute=attributes & reparse,
         )
 
     def revalidate(self) -> None:
@@ -285,13 +287,20 @@ class _PathIdentity:
             raise PermissionError(
                 f"installer path identity changed: {self.path}"
             ) from error
+        attributes = getattr(info, "st_file_attributes", 0)
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         current = (
             info.st_dev,
             info.st_ino,
             stat.S_IFMT(info.st_mode),
-            getattr(info, "st_file_attributes", 0),
+            attributes & reparse,
         )
-        expected = (self.device, self.inode, self.file_type, self.attributes)
+        expected = (
+            self.device,
+            self.inode,
+            self.file_type,
+            self.reparse_attribute,
+        )
         if current != expected:
             raise PermissionError(f"installer path identity changed: {self.path}")
 
