@@ -190,6 +190,7 @@
     "deploy/tgg/christopher/scripts/build_pa_agent_manifest.py",
     "deploy/tgg/christopher/scripts/build_runtime_slots.py",
     "deploy/tgg/christopher/scripts/deploy_runtime.sh",
+    "deploy/tgg/christopher/scripts/ensure_processing_gate.py",
     "deploy/tgg/christopher/scripts/prepare_host_secrets.sh",
     "deploy/tgg/christopher/scripts/processing_activation_transaction.py",
     "deploy/tgg/christopher/scripts/run_isolated_smoke.py",
