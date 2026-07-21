@@ -321,7 +321,6 @@ function ToolEntry({ part }: ToolEntryProps) {
     return buildToolView(p, inlineDiff)
   }, [inlineDiff, isPending, result, stablePart])
 
-
   const detailSections = useMemo(() => {
     if (!view.detail) {
       return { body: '', summary: '' }
@@ -756,9 +755,7 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
     s.message.parts
       .slice(Math.max(0, startIndex), endIndex + 1)
       .map((part, offset) =>
-        part.type === 'tool-call'
-          ? toolPartPageKey(messageId, Math.max(0, startIndex) + offset, part.toolCallId)
-          : ''
+        part.type === 'tool-call' ? toolPartPageKey(messageId, Math.max(0, startIndex) + offset, part.toolCallId) : ''
       )
       .filter(Boolean)
       .join('\n')
@@ -782,8 +779,8 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
 
   const showTurnPager = Boolean(
     turnPagination &&
-      turnPagination.hiddenCount > 0 &&
-      visibleChildren.some(item => item.key === turnPagination.pagerKey)
+    turnPagination.hiddenCount > 0 &&
+    visibleChildren.some(item => item.key === turnPagination.pagerKey)
   )
 
   const { contentRef, faded, onScroll, scrollRef } = useToolWindow(bounded)
