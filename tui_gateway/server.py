@@ -573,6 +573,31 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return None
 
 
+def _claim_active_session_slot_for_profile(
+    session_key: str,
+    *,
+    live_session_id: str,
+    surface: str = "tui",
+    profile_home: str | Path | None = None,
+) -> tuple[Any, str | None]:
+    """Claim an active-session slot under the given profile's HERMES_HOME.
+
+    The registry claim must read the same profile's cap/config and create its
+    entry in that profile's registry, so the config override and the claim
+    itself have to share one profile for the duration of the call.
+    """
+    token = set_hermes_home_override(str(profile_home)) if profile_home else None
+    try:
+        return _claim_active_session_slot(
+            session_key,
+            live_session_id=live_session_id,
+            surface=surface,
+        )
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
 def _release_active_session_slot(session: dict | None) -> None:
     if not session:
         return
