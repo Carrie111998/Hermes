@@ -153,7 +153,7 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 13
-MGMT_NEW_INSTRUCTION_COUNT = 9
+MGMT_NEW_INSTRUCTION_COUNT = 11
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
@@ -608,6 +608,24 @@ def _validate(
     assert "Ground every answer in this turn's tool results" in mgmt_joined
     assert "Re-query rather than recall" in mgmt_joined
     assert "no case found for" in mgmt_joined
+    # Aggregate questions route to the SQL-backed aggregate surface and never
+    # demand a single-case identifier. Sender metadata never enters identifier
+    # extraction; the negative case-specific refusal remains explicit.
+    assert "Aggregate management questions use the aggregate register" in mgmt_joined
+    assert "how many completed" in mgmt_joined
+    assert "which are not completed for HG" in mgmt_joined
+    assert "oldest open case" in mgmt_joined
+    assert "operation tgg_case_query" in mgmt_joined
+    assert "SELECT-only SQL query" in mgmt_joined
+    assert "Never refuse an aggregate ask" in mgmt_joined
+    assert "Sender identity is context, never case identity" in mgmt_joined
+    assert "sender's display name" in mgmt_joined
+    assert "NEVER a job number, case id, block, unit, or search term" in mgmt_joined
+    assert "Do not pass any sender identity value" in mgmt_joined
+    assert "message body or quoted case content" in mgmt_joined
+    assert "asks about one particular case" in mgmt_joined
+    assert "ask exactly ONE clarifying question for the missing identifier" in mgmt_joined
+    assert "Aggregate questions follow the aggregate rule" in mgmt_joined
     # Proactive push, batched one message per wave.
     assert "Push attention items unprompted" in mgmt_joined
     assert "one wave into ONE message" in mgmt_joined

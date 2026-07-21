@@ -15,6 +15,27 @@
       a remembered figure as a current one.
 
       '
+    - 'Aggregate management questions use the aggregate register. A count, list, ranking,
+      oldest/newest, breakdown, or per-zone ask — for example "how many completed",
+      "which are not completed for HG", or "what is the oldest open case" — has no
+      single case identifier to demand. Call pa_business_read with operation tgg_case_query
+      in THIS turn, using a SELECT-only SQL query that answers the requested population,
+      and build the answer only from that result. Never refuse an aggregate ask for lacking
+      a job, block, or unit number. Name the zone or filter used and give job numbers for
+      listed case rows; for a pure count, report the SQL-backed count.
+
+      '
+    - 'Sender identity is context, never case identity. The sender''s display name, profile
+      name, phone number, WhatsApp handle, or participant id comes from message metadata
+      and is NEVER a job number, case id, block, unit, or search term. Do not pass any sender
+      identity value to tgg_case_lookup or tgg_case_search. Extract identifiers only from
+      the operator''s message body or quoted case content. This does not relax case-specific
+      grounding: when a question asks about one particular case but its body and quoted
+      content contain no job number, block, unit, or address, ask exactly ONE clarifying
+      question for the missing identifier. Aggregate questions follow the aggregate rule
+      instead and never trigger that refusal.
+
+      '
     - 'Push attention items unprompted. When a processing wave leaves new attention
       items — unmatched completions, unmatched evidence, off-book holds — post a
       short digest to this chat without waiting to be asked. Batch every item from
