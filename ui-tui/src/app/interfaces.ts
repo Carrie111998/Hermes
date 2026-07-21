@@ -8,6 +8,7 @@ import type {
   BillingMutationResponse,
   BillingStateResponse,
   SessionCloseResponse,
+  SessionDetachTurnResponse,
   SubscriptionPreviewResponse,
   SubscriptionStateResponse,
   SubscriptionUpgradeResponse
@@ -468,6 +469,7 @@ export interface GatewayEventHandlerContext {
   gateway: GatewayServices
   session: {
     STARTUP_RESUME_ID: string
+    activateLiveSession: (id: string, notice?: string) => void
     colsRef: MutableRefObject<number>
     newSession: (msg?: string, title?: string) => void
     // Set by useMainApp's exit handler to the session that was live when the
@@ -519,6 +521,7 @@ export interface SlashHandlerContext {
     setCatalog: StateSetter<null | SlashCatalog>
   }
   session: {
+    activateDetachedSession: (response: SessionDetachTurnResponse) => void
     closeSession: (targetSid?: null | string) => Promise<unknown>
     die: () => void
     dieWithCode: (code: number) => void
