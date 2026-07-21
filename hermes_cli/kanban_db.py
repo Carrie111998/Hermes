@@ -4584,6 +4584,47 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _cleanup_auto_commit_worktree(path: str, task_id: str) -> None:
+    """Resolve the actual worktree checkout dir and auto-commit changes.
+
+    The DB stores the anchor *repo* path for worktree tasks, but the
+    actual checkout lives at ``<repo>/.worktrees/<task_id>`` (or is
+    itself a linked checkout).  Find the real dir and delegate to
+    ``_git_auto_commit_worktree``.
+    """
+    anchor = Path(path).expanduser().resolve(strict=False)
+    # If the anchor itself is already a linked worktree checkout, use it.
+    try:
+        if anchor.exists() and _is_linked_worktree_checkout(anchor):
+            _git_auto_commit_worktree(
+                str(anchor), task_id,
+                reason="auto-commit on completion",
+            )
+            return
+    except Exception:
+        pass
+    # Standard convention: worktree at <repo>/.worktrees/<task_id>
+    candidate = anchor / ".worktrees" / task_id
+    try:
+        if candidate.is_dir():
+            _git_auto_commit_worktree(
+                str(candidate), task_id,
+                reason="auto-commit on completion",
+            )
+            return
+    except Exception:
+        pass
+    # Fallback: try the anchor path itself (may be a worktree-like checkout)
+    try:
+        if anchor.is_dir():
+            _git_auto_commit_worktree(
+                str(anchor), task_id,
+                reason="auto-commit on completion",
+            )
+    except Exception:
+        pass
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -4602,6 +4643,13 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
         if kind != "scratch" or not path:
+            # Worktree: auto-commit uncommitted changes so the worker's
+            # output survives into git history even if the worker forgot
+            # to commit (or timed out before doing so).  The DB stores
+            # the anchor repo path, not the actual checkout, so we must
+            # resolve the worktree dir.
+            if kind == "worktree" and path:
+                _cleanup_auto_commit_worktree(path, task_id)
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
@@ -5736,6 +5784,67 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _git_auto_commit_worktree(
+    workspace_path: Optional[str],
+    task_id: str,
+    *,
+    reason: str = "auto-commit on completion",
+) -> None:
+    """Best-effort auto-commit of uncommitted changes in a git worktree.
+
+    Checks if ``workspace_path`` is inside a git repo and has uncommitted
+    changes. If so, runs ``git add -A && git commit`` with a descriptive
+    message.  Designed as a safety net for worktree kanban tasks whose
+    worker forgot (or timed out before) committing.
+
+    Always best-effort — errors are logged and swallowed so the caller's
+    flow (completion, reclaim) is never blocked.
+    """
+    if not workspace_path:
+        return
+    wdir = Path(workspace_path).expanduser()
+    if not wdir.is_dir():
+        return
+    # Is the workspace inside a git repo?
+    toplevel = _git_toplevel(wdir)
+    if toplevel is None:
+        return
+    # Check for uncommitted changes (tracked or untracked).
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(wdir), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return  # clean — nothing to commit
+    lines = (result.stdout or "").strip().splitlines()
+    if not lines:
+        return
+    # We have uncommitted changes — commit them.
+    branch = _git_current_branch(wdir) or "unknown"
+    msg = f"wt/{task_id}: {reason} ({len(lines)} file{'s' if len(lines) != 1 else ''} dirty)"
+    try:
+        subprocess.run(
+            ["git", "-C", str(wdir), "add", "-A"],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(wdir), "commit", "-m", msg],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        _log.info(
+            "auto-committed %d dirty file(s) in worktree %s for task %s: %s",
+            len(lines), wdir, task_id, msg,
+        )
+    except Exception as exc:
+        _log.warning(
+            "auto-commit failed for worktree %s task %s: %s",
+            wdir, task_id, exc,
+        )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -6462,7 +6571,8 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, "
+        "       t.workspace_kind, t.workspace_path "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -6482,6 +6592,22 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        # Best-effort auto-commit worktree changes before killing the worker.
+        # The worker's changes are on disk but uncommitted — this ensures
+        # they survive into git history even on timeout.
+        _ws_kind: Optional[str] = row["workspace_kind"]
+        _ws_path: Optional[str] = row["workspace_path"]
+        if _ws_kind == "worktree" and _ws_path:
+            try:
+                _git_auto_commit_worktree(
+                    _ws_path, tid,
+                    reason="auto-commit on timeout",
+                )
+            except Exception:
+                _log.warning(
+                    "auto-commit failed on timeout for worktree task %s", tid,
+                    exc_info=True,
+                )
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.

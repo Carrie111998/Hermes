@@ -4959,3 +4959,61 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_complete_task_auto_commits_worktree(kanban_home, tmp_path):
+    """complete_task auto-commits the worktree when the worker left files dirty.
+
+    Regression guard: workers that finish their work (build, test) but forget
+    to commit should have their work auto-committed on completion, so the
+    rescue pattern (Claude: git add -A && commit) becomes unnecessary.
+    """
+    # ── 1. Create a git repo and a worktree task ──
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="test auto-commit",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+
+    # ── 2. Write an uncommitted file in the worktree (worker forgot to commit) ──
+    dirty_file = ws / "feature.py"
+    dirty_file.write_text("print('hello')\n")
+    # Verify: git sees it as untracked
+    status = subprocess.run(
+        ["git", "-C", str(ws), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "feature.py" in status.stdout, (
+        "prerequisite failed: file should be dirty before complete_task"
+    )
+
+    # ── 3. Complete the task ──
+    with kb.connect() as conn:
+        ok = kb.complete_task(conn, tid, result="done")
+    assert ok, "complete_task should succeed"
+
+    # ── 4. Verify: worktree is now clean (auto-commit happened) ──
+    status = subprocess.run(
+        ["git", "-C", str(ws), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert status.stdout.strip() == "", (
+        "worktree should be clean after complete_task, "
+        f"but got: {status.stdout.strip()!r}"
+    )
+    # Verify the commit exists with our expected message
+    log = subprocess.run(
+        ["git", "-C", str(ws), "log", "--oneline", "-1"],
+        capture_output=True, text=True, check=True,
+    )
+    assert f"wt/{tid}" in log.stdout, (
+        f"expected commit message to contain wt/{tid}, "
+        f"got: {log.stdout.strip()!r}"
+    )
