@@ -286,7 +286,8 @@ PY
 full_report="$TEST_HOME/latest-full-verification.json"
 runuser -u pclaw -- env \
   HERMES_HOME="$HERMES_HOME" \
-  "$APP_ROOT/.venv/bin/python" "$DEPLOY_ROOT/scripts/run_isolated_smoke.py" \
+  PYTHONPATH="$APP_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$APP_ROOT/.venv/bin/python" "$DEPLOY_ROOT/scripts/run_isolated_smoke.py" \
   --app-root "$APP_ROOT" \
   --live-home "$HERMES_HOME" \
   --test-root "$TEST_HOME" \
