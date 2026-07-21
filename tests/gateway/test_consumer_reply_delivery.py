@@ -111,8 +111,9 @@ def test_site_selector_response_never_delivers(
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, status: int = 200):
         self._payload = json.dumps(payload).encode()
+        self.status = status
 
     def read(self) -> bytes:
         return self._payload
@@ -149,6 +150,55 @@ def test_mgmt_delivery_is_at_most_once(
         "message": "reply text",
         "replyTo": {"messageId": "MSG1"},
     }
+
+
+def test_distinct_responses_to_same_anchor_each_deliver(
+    inbox: DurableInbox, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list = []
+
+    def fake_urlopen(request, timeout=0):
+        sent.append(json.loads(request.data))
+        return _FakeResponse({"success": True, "messageId": f"WAMSG{len(sent)}"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[
+            _captured(MGMT_CHAT, content="first answer"),
+            _captured(MGMT_CHAT, content="second answer"),
+        ],
+        batch_records=[_record(MGMT_CHAT)],
+    )
+    assert summary["delivered"] == 2 and summary["duplicate"] == 0
+    assert len(sent) == 2
+
+
+def test_indeterminate_202_outcome_marks_undelivered(
+    inbox: DurableInbox, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout=0: _FakeResponse(
+            {"outcome": "unknown", "retrySafe": False}, status=202
+        ),
+    )
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[_captured(MGMT_CHAT)],
+        batch_records=[_record(MGMT_CHAT)],
+    )
+    assert summary == {"delivered": 0, "undelivered": 1, "suppressed": 0, "duplicate": 0}
+    # claim consumed: no retry ever re-sends the indeterminate message
+    retry = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[_captured(MGMT_CHAT)],
+        batch_records=[_record(MGMT_CHAT)],
+    )
+    assert retry["duplicate"] == 1 and retry["delivered"] == 0
 
 
 def test_bridge_refusal_marks_undelivered_and_never_raises(

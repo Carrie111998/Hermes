@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
@@ -772,7 +773,13 @@ def deliver_management_replies(
             summary["suppressed"] += 1
             continue
         anchor = send["reply_to"] or newest_message_by_chat.get(chat_id)
-        delivery_key = f"{chat_id}::{anchor or 'no-anchor'}"
+        # Key = chat + anchor + content digest (codex round): two DISTINCT
+        # responses to the same anchor each deliver once; an identical
+        # response re-emitted (crash-rerun, model stutter) is refused. The
+        # synthetic replay message_id is per-run and would collide across
+        # runs ('replay-1'), so the content digest carries the identity.
+        content_digest = hashlib.sha256(send["content"].encode()).hexdigest()[:16]
+        delivery_key = f"{chat_id}::{anchor or 'no-anchor'}::{content_digest}"
         if not inbox.claim_reply_delivery(
             delivery_key, chat_id=chat_id, reply_to_message_id=anchor
         ):
@@ -803,13 +810,33 @@ def deliver_management_replies(
         )
         try:
             with urlopen(request, timeout=30) as response:
+                status_code = int(getattr(response, "status", 0) or 0)
                 payload = json.loads(response.read() or b"{}")
-            inbox.record_reply_delivery(
-                delivery_key,
-                status="delivered",
-                bridge_message_id=str(payload.get("messageId") or ""),
-            )
-            summary["delivered"] += 1
+            # Strict success only (codex round): the bridge signals
+            # indeterminate sends as HTTP 202 {"outcome":"unknown",
+            # "retrySafe":false} — urllib does not raise for 202, and an
+            # unknown outcome must NEVER be recorded delivered (nor retried:
+            # the claim stays consumed).
+            if status_code == 200 and payload.get("success") is True:
+                inbox.record_reply_delivery(
+                    delivery_key,
+                    status="delivered",
+                    bridge_message_id=str(payload.get("messageId") or ""),
+                )
+                summary["delivered"] += 1
+            else:
+                print(
+                    "reply delivery outcome NOT confirmed: "
+                    f"chat={chat_id} anchor={anchor} http={status_code} "
+                    f"payload={json.dumps(payload)[:200]}",
+                    file=sys.stderr,
+                )
+                inbox.record_reply_delivery(
+                    delivery_key,
+                    status="undelivered",
+                    error=f"http-{status_code}-unconfirmed: {json.dumps(payload)[:200]}",
+                )
+                summary["undelivered"] += 1
         except HTTPError as exc:
             detail = ""
             try:
