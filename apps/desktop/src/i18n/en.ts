@@ -2608,7 +2608,8 @@ export const en: Translations = {
   assistant: {
     thread: {
       loadingSession: 'Loading session',
-      showEarlier: 'Show earlier messages',
+      showEarlierMessages: 'Show earlier messages',
+      showEarlierToolCalls: 'Show earlier tool calls',
       loadingResponse: 'Hermes is loading a response',
       resumeWhenBackgroundDone: count =>
         count === 1

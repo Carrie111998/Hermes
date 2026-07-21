@@ -95,8 +95,10 @@ export const Thread: FC<{
       <ThreadMessageList
         clampToComposer={clampToComposer}
         components={messageComponents}
+        cwd={cwd}
         emptyPlaceholder={emptyPlaceholder}
         loadingIndicator={<BackgroundResumeNotice />}
+        sessionId={sessionId}
         sessionKey={sessionKey}
       />
       {loading === 'session' && <CenteredThreadSpinner />}

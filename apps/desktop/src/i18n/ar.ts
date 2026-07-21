@@ -2238,7 +2238,8 @@ export const ar = defineLocale({
   assistant: {
     thread: {
       loadingSession: 'جار تحميل الجلسة...',
-      showEarlier: 'عرض الرسائل الأقدم',
+      showEarlierMessages: 'عرض الرسائل الأقدم',
+      showEarlierToolCalls: 'عرض استدعاءات الأدوات الأقدم',
       loadingResponse: 'جار تحميل الرد...',
       resumeWhenBackgroundDone: count =>
         count === 1 ? 'سيُستأنف عند انتهاء المهمة الخلفية' : `سيُستأنف عند انتهاء ${count} مهام خلفية`,
