@@ -84,11 +84,14 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, NoReturn, Optional, Sequence
+
+import yaml
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1022,6 +1025,7 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_pid_started: Optional[int]
     worker_pgid: Optional[int]
     worker_sid: Optional[int]
     worker_boot_id: Optional[str]
@@ -1052,6 +1056,12 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_pid_started=(
+                int(row["worker_pid_started"])
+                if "worker_pid_started" in keys
+                and row["worker_pid_started"] is not None
+                else None
+            ),
             worker_pgid=row["worker_pgid"] if "worker_pgid" in keys else None,
             worker_sid=row["worker_sid"] if "worker_sid" in keys else None,
             worker_boot_id=(
@@ -1103,6 +1113,101 @@ class Attachment:
     size: int
     uploaded_by: Optional[str]
     created_at: int
+
+
+@dataclass(frozen=True)
+class ContinuationPR:
+    """Canonical PR identity and the exact head authorized for repair."""
+
+    owner: str
+    repo: str
+    number: int
+    head_sha: str
+
+    @property
+    def canonical_url(self) -> str:
+        return f"https://github.com/{self.owner}/{self.repo}/pull/{self.number}"
+
+    @property
+    def tuple_text(self) -> str:
+        return f"{self.owner}/{self.repo}#{self.number}@{self.head_sha}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "repo": self.repo,
+            "number": self.number,
+            "head_sha": self.head_sha,
+            "url": self.canonical_url,
+        }
+
+
+@dataclass(frozen=True)
+class GitHubPRState:
+    """Verifier result for one exact GitHub pull request."""
+
+    canonical_url: str
+    state: str
+    is_draft: bool
+    head_sha: str
+
+
+@dataclass
+class ContinuationAuthorization:
+    """Auditable one-shot authorization to continue work on active PRs."""
+
+    id: int
+    task_id: str
+    prs: tuple[ContinuationPR, ...]
+    reason: str
+    authorized_profile: str
+    authorized_provider: str
+    authorized_by: str
+    created_at: int
+    expires_at: int
+    consumed_at: Optional[int] = None
+    consumed_run_id: Optional[int] = None
+    revoked_at: Optional[int] = None
+    revoked_reason: Optional[str] = None
+
+    def status(self, *, now: Optional[int] = None) -> str:
+        current = int(time.time()) if now is None else int(now)
+        if self.consumed_at is not None:
+            return "consumed"
+        if self.revoked_at is not None:
+            return "revoked"
+        if self.expires_at <= current:
+            return "expired"
+        return "active"
+
+    def to_dict(self, *, now: Optional[int] = None) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "prs": [pr.to_dict() for pr in self.prs],
+            "reason": self.reason,
+            "authorized_profile": self.authorized_profile,
+            "authorized_provider": self.authorized_provider,
+            "authorized_by": self.authorized_by,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "consumed_at": self.consumed_at,
+            "consumed_run_id": self.consumed_run_id,
+            "revoked_at": self.revoked_at,
+            "revoked_reason": self.revoked_reason,
+            "status": self.status(now=now),
+        }
+
+
+@dataclass(frozen=True)
+class RespawnGuardDecision:
+    """Detailed guard result used to carry a validated grant into claim."""
+
+    reason: Optional[str] = None
+    continuation_authorization_id: Optional[int] = None
+    continuation_denial: Optional[str] = None
+    authorized_profile: Optional[str] = None
+    authorized_provider: Optional[str] = None
 
 
 @dataclass
@@ -1245,16 +1350,13 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
-    -- Durable process identity for this attempt. A launch wrapper may exit
-    -- while another member of its process group/session keeps running; PID
-    -- alone is therefore not sufficient proof that a run is dead. The start
-    -- time fences PID reuse.
+    -- Keep both authority and lifecycle process generations. The integer
+    -- start tick is used for fail-closed worker/operator provenance, while the
+    -- float timestamps preserve boardd's descendant/group ownership model.
+    worker_pid_started  INTEGER,
     worker_pgid         INTEGER,
     worker_sid          INTEGER,
     worker_boot_id      TEXT,
-    -- Current worker PID incarnation and original process-group generation
-    -- are tracked separately: rebinding worker_pid to a surviving descendant
-    -- must not move the lower bound used to prove the original group identity.
     worker_started_at   REAL,
     worker_group_started_at REAL,
     max_runtime_seconds INTEGER,
@@ -1302,16 +1404,64 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- One-shot, exact authorization for a dispatcher to continue repairing an
+-- already-open PR without weakening the normal active_pr respawn guard.
+-- Rows are append-only history: successful claims mark consumed_at/run_id;
+-- replacement marks revoked_at/reason. Nothing deletes prior intent.
+CREATE TABLE IF NOT EXISTS continuation_authorizations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    pr_tuples           TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    authorized_profile  TEXT NOT NULL,
+    authorized_provider TEXT NOT NULL,
+    authorized_by       TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    expires_at          INTEGER NOT NULL,
+    consumed_at         INTEGER,
+    consumed_run_id     INTEGER,
+    revoked_at          INTEGER,
+    revoked_reason      TEXT
+);
+
+-- Normalized, indexed PR ownership derived from append-only comments. This
+-- separates all-time duplicate-card ownership from the 24-hour active-PR
+-- respawn window and avoids regex-scanning the full comment ledger while a
+-- claim holds BEGIN IMMEDIATE.
+CREATE TABLE IF NOT EXISTS task_pr_ownership (
+    task_id        TEXT NOT NULL,
+    canonical_url  TEXT NOT NULL,
+    first_seen_at  INTEGER NOT NULL,
+    last_seen_at   INTEGER NOT NULL,
+    source_comment_id INTEGER,
+    PRIMARY KEY (task_id, canonical_url)
+);
+
+-- Idempotent one-shot data migrations that cannot be expressed as additive
+-- DDL are recorded here. Values are implementation-owned strings.
+CREATE TABLE IF NOT EXISTS kanban_schema_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_comments_created_at   ON task_comments(created_at, task_id);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_continuation_auth_task
+    ON continuation_authorizations(task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_pr_ownership_url
+    ON task_pr_ownership(canonical_url, task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuation_auth_one_live
+    ON continuation_authorizations(task_id)
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
 """
 
 
@@ -1888,6 +2038,87 @@ def init_db(
     return path
 
 
+def _canonical_pr_urls_from_text(body: str) -> tuple[str, ...]:
+    """Return ordered, de-duplicated canonical GitHub PR URLs in ``body``."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body or ""):
+        url = (
+            f"https://github.com/{match.group('owner').casefold()}/"
+            f"{match.group('repo').casefold()}/pull/{int(match.group('number'))}"
+        )
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return tuple(urls)
+
+
+def _record_task_pr_ownership(
+    conn: sqlite3.Connection,
+    task_id: str,
+    body: str,
+    *,
+    observed_at: int,
+    source_comment_id: Optional[int],
+) -> None:
+    """Upsert normalized PR ownership for one task comment."""
+    for url in _canonical_pr_urls_from_text(body):
+        conn.execute(
+            "INSERT INTO task_pr_ownership ("
+            "task_id, canonical_url, first_seen_at, last_seen_at, source_comment_id"
+            ") VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, canonical_url) DO UPDATE SET "
+            "last_seen_at = MAX(last_seen_at, excluded.last_seen_at), "
+            "source_comment_id = CASE "
+            "WHEN excluded.last_seen_at >= last_seen_at "
+            "THEN excluded.source_comment_id ELSE source_comment_id END",
+            (
+                task_id,
+                url,
+                int(observed_at),
+                int(observed_at),
+                source_comment_id,
+            ),
+        )
+
+
+def _backfill_task_pr_ownership(conn: sqlite3.Connection) -> None:
+    """One-time, idempotent normalization of historical PR comments."""
+    present = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ("
+            "'kanban_schema_state', 'task_pr_ownership', 'task_comments')"
+        ).fetchall()
+    }
+    if present != {"kanban_schema_state", "task_pr_ownership", "task_comments"}:
+        return
+    marker = "task_pr_ownership_v1"
+    row = conn.execute(
+        "SELECT value FROM kanban_schema_state WHERE key = ?",
+        (marker,),
+    ).fetchone()
+    if row is not None and row["value"] == "complete":
+        return
+    with write_txn(conn):
+        for comment in conn.execute(
+            "SELECT id, task_id, body, created_at FROM task_comments "
+            "ORDER BY id ASC"
+        ).fetchall():
+            _record_task_pr_ownership(
+                conn,
+                str(comment["task_id"]),
+                str(comment["body"] or ""),
+                observed_at=int(comment["created_at"]),
+                source_comment_id=int(comment["id"]),
+            )
+        conn.execute(
+            "INSERT INTO kanban_schema_state (key, value) VALUES (?, 'complete') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (marker,),
+        )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2055,9 +2286,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
 
     # task_runs originally tracked only the immediate Popen PID. Keep the
-    # process group/session + incarnation start time on the run so crash and
-    # reclaim paths can prove that the whole owned worker tree is gone before
-    # releasing the task back to the dispatcher.
+    # authority start tick plus process group/session lifecycle generations on
+    # the run. This fences PID reuse without dropping descendant ownership.
     run_table_exists = conn.execute(
         "SELECT 1 FROM sqlite_master "
         "WHERE type = 'table' AND name = 'task_runs'"
@@ -2066,29 +2296,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         run_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
         }
-        if "worker_pgid" not in run_cols:
-            _add_column_if_missing(
-                conn, "task_runs", "worker_pgid", "worker_pgid INTEGER"
-            )
-        if "worker_sid" not in run_cols:
-            _add_column_if_missing(
-                conn, "task_runs", "worker_sid", "worker_sid INTEGER"
-            )
-        if "worker_boot_id" not in run_cols:
-            _add_column_if_missing(
-                conn, "task_runs", "worker_boot_id", "worker_boot_id TEXT"
-            )
-        if "worker_started_at" not in run_cols:
-            _add_column_if_missing(
-                conn, "task_runs", "worker_started_at", "worker_started_at REAL"
-            )
-        if "worker_group_started_at" not in run_cols:
-            _add_column_if_missing(
-                conn,
-                "task_runs",
-                "worker_group_started_at",
-                "worker_group_started_at REAL",
-            )
+        run_identity_columns = {
+            "worker_pid_started": "INTEGER",
+            "worker_pgid": "INTEGER",
+            "worker_sid": "INTEGER",
+            "worker_boot_id": "TEXT",
+            "worker_started_at": "REAL",
+            "worker_group_started_at": "REAL",
+        }
+        for name, column_type in run_identity_columns.items():
+            if name not in run_cols:
+                _add_column_if_missing(
+                    conn,
+                    "task_runs",
+                    name,
+                    f"{name} {column_type}",
+                )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -2173,6 +2396,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _backfill_task_pr_ownership(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2204,15 +2428,18 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
         " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
+        (
+            "CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",
+            "CREATE INDEX idx_comments_created_at ON task_comments(created_at, task_id)",
+        ),
     ),
     "task_runs": (
         "CREATE TABLE task_runs ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, worker_pgid INTEGER, worker_sid INTEGER,"
-        " worker_boot_id TEXT,"
+        " worker_pid INTEGER, worker_pid_started INTEGER,"
+        " worker_pgid INTEGER, worker_sid INTEGER, worker_boot_id TEXT,"
         " worker_started_at REAL, worker_group_started_at REAL,"
         " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
@@ -3015,6 +3242,13 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
+        _record_task_pr_ownership(
+            conn,
+            task_id,
+            body,
+            observed_at=now,
+            source_comment_id=int(cur.lastrowid or 0),
+        )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
 
@@ -3293,7 +3527,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -3303,11 +3537,14 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cursor = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    if cursor.lastrowid is None:  # pragma: no cover - SQLite invariant
+        raise RuntimeError("task event insert did not return an id")
+    return int(cursor.lastrowid)
 
 
 def _end_run(
@@ -3564,16 +3801,220 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    operator_override_reason: Optional[str] = None,
+    continuation_authorization_id: Optional[int] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    override_reason: Optional[str] = None
+    operator_authorizer: Optional[str] = None
+    if operator_override_reason is not None:
+        override_reason = _normalize_visible_audit_reason(operator_override_reason)
+        denial: Optional[str] = None
+        operator_profiles: tuple[str, ...] = ()
+        worker_task_id: Optional[str] = None
+        try:
+            operator_authorizer, operator_profiles, worker_task_id = (
+                _continuation_operator_context(conn)
+            )
+        except ContinuationAuthorizationError as exc:
+            operator_authorizer = ""
+            denial = exc.code
+        if not override_reason:
+            denial = "operator_override_reason_required"
+        elif denial is None:
+            denial = _continuation_operator_denial(
+                conn,
+                task_id,
+                operator_authorizer,
+                operator_profiles,
+                invoking_worker_task_id=worker_task_id,
+            )
+        if denial is not None:
+            if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        task_id,
+                        "operator_claim_denied",
+                        {"operator": operator_authorizer, "reason": denial},
+                    )
+            raise ContinuationAuthorizationError(denial)
+
+    # The claim API itself enforces the respawn guard so callers cannot bypass
+    # active-PR continuation controls by skipping dispatch_once. Dispatchers
+    # pass the exact grant selected by their already-recorded guard decision;
+    # direct callers without such a decision evaluate here. In either case the
+    # selected grant is revalidated under the writer lock and consumed inside
+    # that same transaction after the run row is created. Never replace an
+    # explicitly selected grant with a newer authorization minted meanwhile.
+    has_active_pr = bool(
+        _canonical_pr_urls_from_comments(
+            conn,
+            task_id,
+            cutoff=int(time.time()) - _RESPAWN_GUARD_PR_WINDOW,
+        )
+    )
+    guard_decision = RespawnGuardDecision(
+        continuation_authorization_id=continuation_authorization_id
+    )
+    if has_active_pr:
+        if continuation_authorization_id is None:
+            guard_decision = evaluate_respawn_guard(
+                conn,
+                task_id,
+            )
+        else:
+            # Dispatch already selected the exact grant G. Revalidate that
+            # grant here without consulting "latest", which could supersede G
+            # with an authorization minted after dispatch's guard decision.
+            selected_authorization = get_continuation_authorization(
+                conn,
+                continuation_authorization_id,
+            )
+            if selected_authorization is not None:
+                # Dispatch already completed local policy evaluation for G.
+                # Repeat only the remote exact-head check here; authorization
+                # status/task/local evidence are re-read transactionally below
+                # and any race is audited as claim_race.
+                remote_denial = _verify_continuation_prs(
+                    selected_authorization.prs
+                )
+                if remote_denial is not None:
+                    guard_decision = RespawnGuardDecision(
+                        reason="active_pr",
+                        continuation_denial=remote_denial,
+                        continuation_authorization_id=(
+                            continuation_authorization_id
+                        ),
+                    )
+    if guard_decision.reason is not None and override_reason is None:
+        record_respawn_guard_decision(
+            conn,
+            task_id,
+            guard_decision,
+            phase="claim",
+        )
+        return None
+
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Re-read wall time after waiting for BEGIN IMMEDIATE. An authorization
+        # that expires while this writer is queued must not be accepted using
+        # the stale pre-lock timestamp above.
+        authorization_now = int(time.time())
+        continuation_authorization: Optional[ContinuationAuthorization] = None
+        if override_reason is not None:
+            try:
+                fresh_authorizer, fresh_profiles, fresh_worker = (
+                    _continuation_operator_context(conn)
+                )
+            except ContinuationAuthorizationError as exc:
+                denial = exc.code
+            else:
+                if fresh_authorizer != operator_authorizer:
+                    denial = "operator_identity_changed"
+                else:
+                    denial = _continuation_operator_denial(
+                        conn,
+                        task_id,
+                        fresh_authorizer,
+                        fresh_profiles,
+                        invoking_worker_task_id=fresh_worker,
+                    )
+            if denial is not None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "operator_claim_denied",
+                    {"operator": operator_authorizer, "reason": denial},
+                )
+                return None
+        else:
+            # Re-read active PR ownership after BEGIN IMMEDIATE. A PR comment
+            # inserted between the unlocked guard precheck and this point must
+            # force a fresh guarded tick, never slip through as an ordinary
+            # claim.
+            active_urls = _canonical_pr_urls_from_comments(
+                conn,
+                task_id,
+                cutoff=authorization_now - _RESPAWN_GUARD_PR_WINDOW,
+            )
+            if active_urls:
+                authorization_id = guard_decision.continuation_authorization_id
+                denial = "missing_authorization"
+                if authorization_id is not None:
+                    continuation_authorization = get_continuation_authorization(
+                        conn,
+                        authorization_id,
+                    )
+                    denial = "authorization_missing"
+                    if continuation_authorization is not None:
+                        if continuation_authorization.task_id != task_id:
+                            denial = "authorization_task_mismatch"
+                        else:
+                            status = continuation_authorization.status(
+                                now=authorization_now
+                            )
+                            if status != "active":
+                                denial = f"authorization_{status}"
+                            else:
+                                denial = _continuation_local_denial(
+                                    conn,
+                                    task_id,
+                                    continuation_authorization.prs,
+                                    continuation_authorization.authorized_profile,
+                                    continuation_authorization.authorized_provider,
+                                    continuation_authorization.authorized_by,
+                                    now=authorization_now,
+                                )
+                if denial is not None:
+                    _record_continuation_denial(
+                        conn,
+                        task_id,
+                        denial,
+                        phase="claim_race",
+                        authorization_id=authorization_id,
+                    )
+                    return None
+                if continuation_authorization is not None:
+                    # Post-lock remote revalidation (TOCTOU fence). The
+                    # pre-lock guard evaluation verified GitHub state/head,
+                    # but the PR owner can close or force-push while this
+                    # writer was queued on BEGIN IMMEDIATE. Re-run the bounded
+                    # exact URL/state/head verification INSIDE the writer
+                    # transaction, immediately before the ready -> running CAS
+                    # and one-shot consume. Any drift records an audited
+                    # claim_race denial, leaves the task ready, and leaves the
+                    # grant unconsumed.
+                    remote_denial = _verify_continuation_prs(
+                        continuation_authorization.prs
+                    )
+                    if remote_denial is not None:
+                        _record_continuation_denial(
+                            conn,
+                            task_id,
+                            remote_denial,
+                            phase="claim_race",
+                            authorization_id=authorization_id,
+                        )
+                        return None
+            elif guard_decision.continuation_authorization_id is not None:
+                # The exact active set changed after the external head check.
+                # Do not consume a grant for a different local state.
+                _record_continuation_denial(
+                    conn,
+                    task_id,
+                    "active_pr_missing",
+                    phase="claim_race",
+                    authorization_id=guard_decision.continuation_authorization_id,
+                )
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3664,6 +4105,47 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        if continuation_authorization is not None:
+            consumed = conn.execute(
+                "UPDATE continuation_authorizations "
+                "SET consumed_at = ?, consumed_run_id = ? "
+                "WHERE id = ? AND task_id = ? AND consumed_at IS NULL "
+                "AND revoked_at IS NULL AND expires_at > ?",
+                (
+                    authorization_now,
+                    run_id,
+                    continuation_authorization.id,
+                    task_id,
+                    authorization_now,
+                ),
+            )
+            if consumed.rowcount != 1:
+                # The whole write transaction rolls back, including the task
+                # CAS and run insert. A grant can never be half-consumed.
+                raise ContinuationAuthorizationError("authorization_consume_race")
+            _append_event(
+                conn,
+                task_id,
+                "continuation_consumed",
+                {
+                    "authorization_id": continuation_authorization.id,
+                    "run_id": run_id,
+                    "prs": [pr.tuple_text for pr in continuation_authorization.prs],
+                },
+                run_id=run_id,
+            )
+        if override_reason is not None:
+            _append_event(
+                conn,
+                task_id,
+                "respawn_guard_bypassed",
+                {
+                    "operator": operator_authorizer,
+                    "reason": override_reason,
+                    "guard_reason": guard_decision.reason,
+                },
+                run_id=run_id,
+            )
         _claim_payload = {"lock": lock, "expires": expires, "run_id": run_id}
         _m = _worker_model()
         if _m:
@@ -5780,6 +6262,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM continuation_authorizations WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.execute("DELETE FROM task_pr_ownership WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -5803,6 +6290,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "DELETE FROM continuation_authorizations WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.execute("DELETE FROM task_pr_ownership WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
@@ -6208,11 +6700,1114 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
-# Pattern matching a GitHub PR URL in task comments.
+# Continuation grants are deliberately short-lived. They authorize one exact
+# claim, not an open-ended exemption from the active-PR guard.
+DEFAULT_CONTINUATION_AUTH_TTL_SECONDS = 15 * 60
+MIN_CONTINUATION_AUTH_TTL_SECONDS = 60
+MAX_CONTINUATION_AUTH_TTL_SECONDS = 60 * 60
+
+# Pattern matching a canonicalizable GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/"
+    r"(?P<number>\d+)",
     re.IGNORECASE,
 )
+
+_CONTINUATION_PR_TUPLE_RE = re.compile(
+    r"^(?:(?:https?://github\.com/)?"
+    r"(?P<url_owner>[A-Za-z0-9_.-]+)/(?P<url_repo>[A-Za-z0-9_.-]+)/pull/"
+    r"(?P<url_number>\d+)|"
+    r"(?P<short_owner>[A-Za-z0-9_.-]+)/(?P<short_repo>[A-Za-z0-9_.-]+)#"
+    r"(?P<short_number>\d+))@(?P<sha>[0-9a-fA-F]{40})$",
+    re.IGNORECASE,
+)
+
+class ContinuationAuthorizationError(ValueError):
+    """Raised when a continuation authorization fails closed."""
+
+    def __init__(self, code: str, message: Optional[str] = None):
+        self.code = code
+        super().__init__(message or code.replace("_", " "))
+
+
+def parse_continuation_pr_tuple(raw: str | ContinuationPR) -> ContinuationPR:
+    """Parse ``owner/repo#N@40-char-sha`` (or canonical URL form)."""
+    if isinstance(raw, ContinuationPR):
+        candidate = raw.tuple_text
+    else:
+        candidate = str(raw or "").strip()
+    match = _CONTINUATION_PR_TUPLE_RE.fullmatch(candidate)
+    if match is None:
+        raise ContinuationAuthorizationError(
+            "invalid_pr_tuple",
+            "PR tuples must be owner/repo#number@<40-char-sha> "
+            "(repeat --pr for multiple PRs)",
+        )
+    owner = match.group("url_owner") or match.group("short_owner")
+    repo = match.group("url_repo") or match.group("short_repo")
+    number = match.group("url_number") or match.group("short_number")
+    return ContinuationPR(
+        owner=owner.casefold(),
+        repo=repo.casefold(),
+        number=int(number),
+        head_sha=match.group("sha").casefold(),
+    )
+
+
+def _continuation_authorization_from_row(
+    row: sqlite3.Row,
+) -> ContinuationAuthorization:
+    try:
+        raw_prs = json.loads(row["pr_tuples"])
+        if not isinstance(raw_prs, list):
+            raise ValueError("not a list")
+        prs = tuple(parse_continuation_pr_tuple(item) for item in raw_prs)
+    except Exception:
+        # Preserve readback of a corrupt/legacy row. Validation treats an empty
+        # tuple as invalid and fails closed; operators can still inspect it.
+        prs = ()
+    return ContinuationAuthorization(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        prs=prs,
+        reason=row["reason"],
+        authorized_profile=row["authorized_profile"],
+        authorized_provider=row["authorized_provider"],
+        authorized_by=row["authorized_by"],
+        created_at=int(row["created_at"]),
+        expires_at=int(row["expires_at"]),
+        consumed_at=(
+            int(row["consumed_at"]) if row["consumed_at"] is not None else None
+        ),
+        consumed_run_id=(
+            int(row["consumed_run_id"])
+            if row["consumed_run_id"] is not None
+            else None
+        ),
+        revoked_at=(
+            int(row["revoked_at"]) if row["revoked_at"] is not None else None
+        ),
+        revoked_reason=row["revoked_reason"],
+    )
+
+
+def list_continuation_authorizations(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[ContinuationAuthorization]:
+    """Return the full, immutable authorization history newest first."""
+    rows = conn.execute(
+        "SELECT * FROM continuation_authorizations "
+        "WHERE task_id = ? ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    return [_continuation_authorization_from_row(row) for row in rows]
+
+
+def get_continuation_authorization(
+    conn: sqlite3.Connection,
+    authorization_id: int,
+) -> Optional[ContinuationAuthorization]:
+    row = conn.execute(
+        "SELECT * FROM continuation_authorizations WHERE id = ?",
+        (int(authorization_id),),
+    ).fetchone()
+    return _continuation_authorization_from_row(row) if row is not None else None
+
+
+def _latest_continuation_authorization(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[ContinuationAuthorization]:
+    row = conn.execute(
+        "SELECT * FROM continuation_authorizations "
+        "WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return _continuation_authorization_from_row(row) if row is not None else None
+
+
+def _canonical_pr_urls_from_comments(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    cutoff: int,
+) -> tuple[str, ...]:
+    """Extract ordered, de-duplicated canonical PR URLs from task comments."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    rows = conn.execute(
+        "SELECT body FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
+        (task_id, int(cutoff)),
+    ).fetchall()
+    for row in rows:
+        for url in _canonical_pr_urls_from_text(row["body"] or ""):
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return tuple(urls)
+
+
+def _continuation_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return unresolved operator-review or kernel-run repair evidence."""
+    latest_success = conn.execute(
+        "SELECT MAX(ended_at) FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'completed' AND ended_at IS NOT NULL",
+        (task_id,),
+    ).fetchone()[0]
+    latest_consume = conn.execute(
+        "SELECT consumed_at, consumed_run_id FROM continuation_authorizations "
+        "WHERE task_id = ? AND consumed_at IS NOT NULL "
+        "ORDER BY consumed_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    latest_consume_at = int(latest_consume["consumed_at"] or 0) if latest_consume else 0
+    latest_consumed_run_id = (
+        int(latest_consume["consumed_run_id"])
+        if latest_consume and latest_consume["consumed_run_id"] is not None
+        else None
+    )
+    resolved_at = max(int(latest_success or 0), latest_consume_at)
+
+    repair_run = conn.execute(
+        "SELECT id, outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? "
+        "AND outcome IN ('timed_out', 'blocked', 'gave_up', 'spawn_failed') "
+        "AND ended_at IS NOT NULL AND ended_at >= ? "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id, resolved_at),
+    ).fetchone()
+
+    unresolved_fix: Optional[tuple[int, int]] = None
+    latest_resolution_at = resolved_at
+    for row in conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'continuation_reviewed' "
+        "AND created_at >= ? ORDER BY created_at ASC, id ASC",
+        (task_id, resolved_at),
+    ).fetchall():
+        try:
+            payload = json.loads(row["payload"] or "null")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        verdict = str(payload.get("verdict") or "").strip().casefold()
+        if not str(payload.get("reviewed_by") or "").strip():
+            continue
+        if verdict == "fix_required":
+            unresolved_fix = (int(row["id"]), int(row["created_at"]))
+        elif verdict == "resolved":
+            # Row order (created_at, id) makes same-second review updates
+            # deterministic; a later authorized review resolves an earlier one
+            # even when a different allowlisted operator records it.
+            unresolved_fix = None
+            latest_resolution_at = max(
+                latest_resolution_at,
+                int(row["created_at"]),
+            )
+
+    candidates: list[dict[str, Any]] = []
+    if (
+        repair_run is not None
+        and (
+            int(repair_run["ended_at"]) > latest_resolution_at
+            or (
+                int(repair_run["ended_at"]) == latest_consume_at
+                and int(repair_run["id"]) == latest_consumed_run_id
+            )
+        )
+    ):
+        candidates.append(
+            {
+                "kind": str(repair_run["outcome"]),
+                "at": int(repair_run["ended_at"]),
+                "run_id": int(repair_run["id"]),
+            }
+        )
+    if unresolved_fix is not None:
+        candidates.append(
+            {
+                "kind": "fix_required",
+                "at": unresolved_fix[1],
+                "event_id": unresolved_fix[0],
+            }
+        )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: int(item["at"]))
+
+
+def _default_profile_provider_resolver(profile: str) -> Optional[str]:
+    """Resolve the configured provider for a named capability route."""
+    from hermes_cli.profiles import _read_config_model, get_profile_dir
+
+    _model, provider = _read_config_model(get_profile_dir(profile))
+    normalized = str(provider or "").strip().casefold()
+    if not normalized or normalized == "auto":
+        return None
+    return normalized
+
+
+def _default_github_pr_verifier(pr: ContinuationPR) -> GitHubPRState:
+    """Read live PR state through the authenticated GitHub CLI."""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                pr.canonical_url,
+                "--json",
+                "url,state,isDraft,headRefOid",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ContinuationAuthorizationError("verifier_failure") from exc
+    if result.returncode != 0:
+        raise ContinuationAuthorizationError("verifier_failure")
+    try:
+        payload = json.loads(result.stdout)
+        draft = payload["isDraft"]
+        if type(draft) is not bool:
+            raise TypeError("isDraft must be boolean")
+        return GitHubPRState(
+            canonical_url=str(payload["url"]),
+            state=str(payload["state"]),
+            is_draft=draft,
+            head_sha=str(payload["headRefOid"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ContinuationAuthorizationError("verifier_failure") from exc
+
+
+def _coerce_github_pr_state(value: Any) -> GitHubPRState:
+    if isinstance(value, GitHubPRState):
+        return value
+    if isinstance(value, dict):
+        try:
+            draft = value["is_draft"] if "is_draft" in value else value["isDraft"]
+            if type(draft) is not bool:
+                raise TypeError("draft flag must be boolean")
+            return GitHubPRState(
+                canonical_url=str(value.get("canonical_url") or value["url"]),
+                state=str(value["state"]),
+                is_draft=draft,
+                head_sha=str(value.get("head_sha") or value["headRefOid"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContinuationAuthorizationError("verifier_failure") from exc
+    raise ContinuationAuthorizationError("verifier_failure")
+
+
+def _verify_continuation_prs(
+    prs: Sequence[ContinuationPR],
+) -> Optional[str]:
+    for pr in prs:
+        try:
+            state = _coerce_github_pr_state(_default_github_pr_verifier(pr))
+        except Exception:
+            return "verifier_failure"
+        match = _RESPAWN_GUARD_PR_URL_RE.fullmatch(state.canonical_url.strip())
+        if match is None:
+            return "verifier_identity_mismatch"
+        canonical = (
+            f"https://github.com/{match.group('owner').casefold()}/"
+            f"{match.group('repo').casefold()}/pull/{int(match.group('number'))}"
+        )
+        if canonical != pr.canonical_url:
+            return "verifier_identity_mismatch"
+        if state.state.strip().upper() != "OPEN":
+            return "pr_not_open"
+        head = state.head_sha.strip().casefold()
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            return "missing_exact_head"
+        if head != pr.head_sha:
+            return "head_mismatch"
+    return None
+
+
+def _duplicate_continuation_pr_owner(
+    conn: sqlite3.Connection,
+    task_id: str,
+    prs: Sequence[ContinuationPR],
+) -> Optional[str]:
+    wanted = {pr.canonical_url for pr in prs}
+    if not wanted:
+        return None
+    placeholders = ",".join("?" for _ in wanted)
+    owner = conn.execute(
+        "SELECT o.task_id FROM task_pr_ownership o "
+        "JOIN tasks t ON t.id = o.task_id "
+        f"WHERE o.task_id <> ? AND o.canonical_url IN ({placeholders}) "
+        "AND t.status NOT IN ('done', 'archived') "
+        "ORDER BY o.first_seen_at ASC, o.task_id ASC LIMIT 1",
+        (task_id, *sorted(wanted)),
+    ).fetchone()
+    if owner is not None:
+        return str(owner["task_id"])
+
+    for row in conn.execute(
+        "SELECT a.task_id, a.pr_tuples FROM continuation_authorizations a "
+        "JOIN tasks t ON t.id = a.task_id "
+        "WHERE a.task_id <> ? AND t.status NOT IN ('done', 'archived') "
+        "AND a.consumed_at IS NULL AND a.revoked_at IS NULL "
+        "AND a.expires_at > ?",
+        (task_id, int(time.time())),
+    ).fetchall():
+        try:
+            other = {
+                parse_continuation_pr_tuple(item).canonical_url
+                for item in json.loads(row["pr_tuples"])
+            }
+        except Exception:
+            # A malformed record makes ownership ambiguous. Continuing would
+            # silently permit duplicate work, so ambiguity itself owns the PR.
+            return f"ambiguous:{row['task_id']}"
+        if wanted & other:
+            return row["task_id"]
+    return None
+
+
+def _continuation_local_denial(
+    conn: sqlite3.Connection,
+    task_id: str,
+    prs: Sequence[ContinuationPR],
+    authorized_profile: str,
+    authorized_provider: str,
+    authorized_by: str,
+    *,
+    now: int,
+) -> Optional[str]:
+    task = conn.execute(
+        "SELECT status, assignee, claim_lock, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return "task_missing"
+    if task["status"] != "ready":
+        return "task_not_ready"
+    if (
+        task["claim_lock"] is not None
+        or task["worker_pid"] is not None
+        or task["current_run_id"] is not None
+    ):
+        return "live_writer"
+    unfinished = conn.execute(
+        "SELECT 1 FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if unfinished is not None:
+        return "live_writer"
+
+    assignee = str(task["assignee"] or "").strip().casefold()
+    if not assignee or assignee != authorized_profile.strip().casefold():
+        return "assignee_mismatch"
+    try:
+        actual_provider = str(
+            _default_profile_provider_resolver(authorized_profile) or ""
+        ).strip().casefold()
+    except Exception:
+        return "provider_verifier_failure"
+    if not actual_provider:
+        return "provider_unresolved"
+    if actual_provider != authorized_provider.strip().casefold():
+        return "provider_mismatch"
+
+    if not prs or any(not pr.head_sha for pr in prs):
+        return "missing_exact_head"
+    expected_urls = tuple(pr.canonical_url for pr in prs)
+    active_urls = _canonical_pr_urls_from_comments(
+        conn,
+        task_id,
+        cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if not active_urls:
+        return "active_pr_missing"
+    if active_urls != expected_urls:
+        return "active_pr_set_mismatch"
+    if _continuation_evidence(conn, task_id) is None:
+        return "repair_evidence_missing"
+    duplicate_owner = _duplicate_continuation_pr_owner(
+        conn,
+        task_id,
+        prs,
+    )
+    if duplicate_owner is not None:
+        return f"duplicate_pr_owner:{duplicate_owner}"
+    return None
+
+
+def _record_continuation_denial(
+    conn: sqlite3.Connection,
+    task_id: str,
+    code: str,
+    *,
+    phase: str,
+    authorization_id: Optional[int] = None,
+) -> None:
+    payload = {
+        "authorization_id": authorization_id,
+        "phase": phase,
+        "reason": code,
+    }
+    previous = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'continuation_denied' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if previous is not None:
+        try:
+            previous_payload = json.loads(previous["payload"] or "null")
+        except (TypeError, json.JSONDecodeError):
+            previous_payload = None
+        if previous_payload == payload:
+            material_change = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+                "AND kind IN ('continuation_authorized', 'continuation_consumed', "
+                "'continuation_revoked', 'claimed', 'spawned', 'spawn_failed', "
+                "'gave_up', 'blocked', 'unblocked', 'reclaimed', 'assigned', "
+                "'status', 'commented') "
+                "LIMIT 1",
+                (task_id, int(previous["id"])),
+            ).fetchone()
+            if material_change is None:
+                return
+    _append_event(
+        conn,
+        task_id,
+        "continuation_denied",
+        payload,
+    )
+
+
+def _current_process_ancestry_pids() -> Optional[tuple[int, ...]]:
+    """Return this process and its ancestors, or ``None`` if unverifiable."""
+    try:
+        import psutil
+
+        process = psutil.Process(os.getpid())
+        pids = [process.pid, *(parent.pid for parent in process.parents())]
+        return tuple(dict.fromkeys(pids))
+    except Exception:
+        # Authorization is security-sensitive. Callers distinguish ``None``
+        # from an empty ancestry and fail closed rather than treating a process
+        # inspection failure as proof that the caller is not a worker.
+        return None
+
+
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    pid: int
+    pid_started: Optional[int]
+    boot_id: Optional[str]
+    sid: Optional[int]
+    pgid: Optional[int]
+
+
+def _process_identity(pid: int) -> _ProcessIdentity:
+    """Read kernel-backed process identity fields without trusting env state."""
+    try:
+        from gateway.status import get_process_start_time
+
+        started = get_process_start_time(int(pid))
+    except Exception:
+        started = None
+    boot_id: Optional[str] = None
+    if os.name == "posix":
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="utf-8"
+            ).strip() or None
+        except OSError:
+            boot_id = None
+    sid: Optional[int] = None
+    pgid: Optional[int] = None
+    if os.name == "posix":
+        try:
+            sid = int(os.getsid(int(pid)))
+            pgid = int(os.getpgid(int(pid)))
+        except (AttributeError, OSError, ProcessLookupError):
+            sid = None
+            pgid = None
+    return _ProcessIdentity(
+        pid=int(pid),
+        pid_started=started,
+        boot_id=boot_id,
+        sid=sid,
+        pgid=pgid,
+    )
+
+
+def _invoking_worker_task_id(conn: sqlite3.Connection) -> Optional[str]:
+    """Identify a dispatched worker from env plus persisted kernel identity."""
+    env_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if env_task_id:
+        return env_task_id
+    ancestry = _current_process_ancestry_pids()
+    if ancestry is None:
+        return "process_ancestry_unverifiable"
+    if not ancestry:
+        return None
+    placeholders = ",".join("?" for _ in ancestry)
+    rows = conn.execute(
+        "SELECT task_id, worker_pid, worker_pid_started, ended_at "
+        f"FROM task_runs WHERE worker_pid IN ({placeholders}) "
+        "ORDER BY id DESC",
+        tuple(ancestry),
+    ).fetchall()
+    for row in rows:
+        live_identity = _process_identity(int(row["worker_pid"]))
+        recorded_started = row["worker_pid_started"]
+        if recorded_started is not None:
+            if live_identity.pid_started == int(recorded_started):
+                return str(row["task_id"])
+        elif row["ended_at"] is None:
+            # Legacy active runs lack a PID start fingerprint. The PID is still
+            # in our live ancestry, so fail closed instead of assuming reuse.
+            return str(row["task_id"])
+
+    current = _process_identity(os.getpid())
+    if current.boot_id and (current.sid is not None or current.pgid is not None):
+        scoped = conn.execute(
+            "SELECT task_id FROM task_runs WHERE worker_boot_id = ? AND ("
+            "(worker_sid IS NOT NULL AND worker_sid = ?) OR "
+            "(worker_pgid IS NOT NULL AND worker_pgid = ?)) "
+            "ORDER BY id DESC LIMIT 1",
+            (current.boot_id, current.sid, current.pgid),
+        ).fetchone()
+        if scoped is not None:
+            return str(scoped["task_id"])
+    return None
+
+
+def _continuation_operator_denial(
+    conn: sqlite3.Connection,
+    task_id: str,
+    authorized_by: str,
+    operator_profiles: Iterable[str],
+    *,
+    invoking_worker_task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Validate the advisory operator boundary for guarded mutations."""
+    authorizer = str(authorized_by or "").strip().casefold()
+    worker_task_id = invoking_worker_task_id or _invoking_worker_task_id(conn)
+    if worker_task_id:
+        return "worker_authorization_forbidden"
+    if not authorizer:
+        return "authorizer_required"
+    allowed = {
+        str(profile).strip().casefold()
+        for profile in operator_profiles
+        if str(profile).strip()
+    }
+    if authorizer not in allowed:
+        return "authorizer_not_allowed"
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return "task_missing"
+    assignee = str(row["assignee"] or "").strip().casefold()
+    if assignee and assignee == authorizer:
+        return "self_authorization_forbidden"
+    return None
+
+
+# Unicode Default_Ignorable_Code_Point ranges (Unicode 14+, inclusive).  The
+# stdlib's ``unicodedata`` module does not expose derived properties, and a
+# category-only check is insufficient: variation selectors and COMBINING
+# GRAPHEME JOINER are Mn, while Hangul fillers are Lo.  Keep the derived
+# property explicit so audit validation does not depend on an optional regex
+# package or on the host's Unicode database version.
+_DEFAULT_IGNORABLE_REASON_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+
+# Characters outside Default_Ignorable_Code_Point that render as an empty
+# advance under common terminal/browser fonts.  U+2800 is a symbol (So), so
+# neither whitespace nor general-category checks catch it.
+_BLANK_REASON_CODEPOINTS = frozenset({0x2800})
+
+
+def _is_default_ignorable_reason_char(char: str) -> bool:
+    codepoint = ord(char)
+    return any(
+        first <= codepoint <= last
+        for first, last in _DEFAULT_IGNORABLE_REASON_RANGES
+    )
+
+
+def _normalize_visible_audit_reason(value: Any) -> str:
+    """Return the stripped reason only when it contains visible base ink.
+
+    Shared by every privileged audit-reason gate (continuation review,
+    authorization, and operator claim override).  A reason composed solely of
+    separators, controls, combining marks, Unicode default-ignorables, or
+    known blank glyphs is not reliable audit text and is rejected.  Requiring
+    one L/N/P/S base character preserves ordinary CJK, accented text, emoji,
+    and punctuation while rejecting isolated marks/fillers/selectors.  Once a
+    visible base exists, the accepted original Unicode text is returned
+    stripped but otherwise unchanged (so valid emoji/combining sequences are
+    preserved).
+    """
+    text = str(value or "").strip()
+    for char in text:
+        codepoint = ord(char)
+        if codepoint in _BLANK_REASON_CODEPOINTS:
+            continue
+        if _is_default_ignorable_reason_char(char):
+            continue
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N", "P", "S"}:
+            return text
+    return ""
+
+
+def _continuation_authority_root(conn: sqlite3.Connection) -> Optional[Path]:
+    """Resolve authority only from the opened board's canonical SQLite path.
+
+    ``HERMES_HOME`` is intentionally ignored. Docker/custom installs remain
+    supported because their board path itself identifies the root; authority is
+    then positively bound to that root's live gateway process below.
+    """
+    try:
+        main = next(
+            row
+            for row in conn.execute("PRAGMA database_list").fetchall()
+            if row["name"] == "main"
+        )
+        raw_path = str(main["file"] or "").strip()
+        if not raw_path:
+            return None
+        db_path = Path(raw_path).resolve()
+        if db_path.name != "kanban.db":
+            return None
+        if (
+            db_path.parent.parent.name == "boards"
+            and db_path.parent.parent.parent.name == "kanban"
+        ):
+            board_root = db_path.parents[3]
+        else:
+            board_root = db_path.parent
+
+        return board_root.resolve()
+    except (OSError, StopIteration, sqlite3.Error):
+        return None
+
+
+def _operator_control_plane_active() -> bool:
+    """True only inside the root gateway's opaque control-plane context.
+
+    The ContextVar contains the exact opaque token captured by the running
+    gateway's private lock lease and is armed only through the closure retained
+    on its GatewayRunner. The public context-manager API cannot arm it.
+    """
+    try:
+        from gateway.status import gateway_control_plane_active
+
+        return bool(gateway_control_plane_active())
+    except Exception:
+        return False
+
+
+def _operator_gateway_lock_owned(authority_root: Path) -> bool:
+    """True only when THIS process owns the retained gateway lock for root.
+
+    Proof is by closure-private acquire-time provenance: owner PID/start,
+    retained file-description identity and immutable file stamp/payload. It is
+    never derived from assignable module state, ``gateway.pid``, or argv.
+    """
+    try:
+        from gateway.status import process_owns_gateway_runtime_lock
+
+        return bool(process_owns_gateway_runtime_lock(authority_root))
+    except Exception:
+        return False
+
+
+def _continuation_operator_profiles(
+    conn: sqlite3.Connection,
+) -> tuple[str, ...]:
+    """Read the continuation operator allowlist bound to the opened board.
+
+    This deliberately lives in the DB/API layer rather than accepting an
+    allowlist from callers. A dispatched lane's profile-local configuration is
+    not authoritative for this gate, and a caller-controlled ``HERMES_HOME``
+    cannot redirect the lookup away from the board's real root.
+    """
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    raw = DEFAULT_CONFIG.get("kanban", {}).get(
+        "continuation_operator_profiles", "default"
+    )
+    authority_root = _continuation_authority_root(conn)
+    if authority_root is None:
+        return ()
+    config_path = authority_root / "config.yaml"
+    try:
+        if config_path.exists():
+            payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(payload, dict):
+                return ()
+            kanban_config = payload.get("kanban") or {}
+            if not isinstance(kanban_config, dict):
+                return ()
+            configured = kanban_config.get(
+                "continuation_operator_profiles"
+            )
+            if configured is not None:
+                raw = configured
+    except (OSError, yaml.YAMLError):
+        return ()
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(item).strip().casefold()
+            for item in raw
+            if str(item).strip()
+        )
+    )
+
+
+def _continuation_operator_context(
+    conn: sqlite3.Connection,
+) -> tuple[str, tuple[str, ...], Optional[str]]:
+    """Resolve operator identity and root allowlist at point of mutation."""
+    from hermes_cli.profiles import get_active_profile_name
+
+    authority_root = _continuation_authority_root(conn)
+    if authority_root is None:
+        raise ContinuationAuthorizationError("operator_authority_root_unresolved")
+    if not _operator_control_plane_active():
+        # Authorization executes only inside the root gateway's privately
+        # armed ``/kanban`` dispatch context. The public status API cannot mint
+        # the opaque lock-lease token, and fork children discard it at fork.
+        raise ContinuationAuthorizationError("operator_gateway_context_required")
+    if not _operator_gateway_lock_owned(authority_root):
+        # The process must also prove closure-private acquire-time provenance
+        # for this board root. Assigning a fake handle, rewriting PID/start
+        # records, or inheriting a handle across fork cannot confer authority.
+        raise ContinuationAuthorizationError("operator_gateway_process_required")
+    profile = str(get_active_profile_name() or "").strip().casefold()
+    if not profile or profile == "custom":
+        raise ContinuationAuthorizationError("operator_profile_unresolved")
+    return (
+        profile,
+        _continuation_operator_profiles(conn),
+        _invoking_worker_task_id(conn),
+    )
+
+
+def record_continuation_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verdict: str,
+    reason: str,
+) -> int:
+    """Record authoritative FIX-REQUIRED/resolved evidence for continuation."""
+    normalized_verdict = str(verdict or "").strip().casefold().replace("-", "_")
+    if normalized_verdict not in {"fix_required", "resolved"}:
+        raise ContinuationAuthorizationError("invalid_review_verdict")
+    normalized_reason = _normalize_visible_audit_reason(reason)
+    if not normalized_reason:
+        raise ContinuationAuthorizationError("review_reason_required")
+
+    try:
+        authorizer, operator_profiles, worker_task_id = (
+            _continuation_operator_context(conn)
+        )
+    except ContinuationAuthorizationError as exc:
+        _reject_continuation_authorization(conn, task_id, exc.code, str(exc))
+    denial = _continuation_operator_denial(
+        conn,
+        task_id,
+        authorizer,
+        operator_profiles,
+        invoking_worker_task_id=worker_task_id,
+    )
+    if denial is not None:
+        _reject_continuation_authorization(conn, task_id, denial)
+
+    raced_denial: Optional[str] = None
+    event_id: Optional[int] = None
+    with write_txn(conn):
+        try:
+            fresh_authorizer, fresh_profiles, fresh_worker = (
+                _continuation_operator_context(conn)
+            )
+        except ContinuationAuthorizationError as exc:
+            raced_denial = exc.code
+        else:
+            if fresh_authorizer != authorizer:
+                raced_denial = "operator_identity_changed"
+            else:
+                raced_denial = _continuation_operator_denial(
+                    conn,
+                    task_id,
+                    fresh_authorizer,
+                    fresh_profiles,
+                    invoking_worker_task_id=fresh_worker,
+                )
+        if raced_denial is not None:
+            _record_continuation_denial(
+                conn,
+                task_id,
+                raced_denial,
+                phase="review_race",
+            )
+        else:
+            event_id = _append_event(
+                conn,
+                task_id,
+                "continuation_reviewed",
+                {
+                    "reviewed_by": authorizer,
+                    "verdict": normalized_verdict,
+                    "reason": normalized_reason,
+                },
+            )
+    if raced_denial is not None:
+        raise ContinuationAuthorizationError(raced_denial)
+    if event_id is None:  # pragma: no cover - transaction invariant
+        raise RuntimeError("continuation review event was not durable")
+    return event_id
+
+
+def _reject_continuation_authorization(
+    conn: sqlite3.Connection,
+    task_id: str,
+    code: str,
+    message: Optional[str] = None,
+) -> NoReturn:
+    """Audit a failed authorization when the target exists, then raise."""
+    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+        with write_txn(conn):
+            _record_continuation_denial(conn, task_id, code, phase="authorize")
+    raise ContinuationAuthorizationError(code, message)
+
+
+def authorize_continuation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pr_tuples: Iterable[str | ContinuationPR],
+    *,
+    reason: str,
+    authorized_profile: str,
+    authorized_provider: str,
+    ttl_seconds: int = DEFAULT_CONTINUATION_AUTH_TTL_SECONDS,
+) -> ContinuationAuthorization:
+    """Create an exact, auditable, one-shot active-PR continuation grant."""
+    normalized_reason = _normalize_visible_audit_reason(reason)
+    profile = str(authorized_profile or "").strip().casefold()
+    provider = str(authorized_provider or "").strip().casefold()
+    try:
+        authorizer, operator_profiles, invoking_worker_task_id = (
+            _continuation_operator_context(conn)
+        )
+    except ContinuationAuthorizationError as exc:
+        _reject_continuation_authorization(conn, task_id, exc.code, str(exc))
+    operator_denial = _continuation_operator_denial(
+        conn,
+        task_id,
+        authorizer,
+        operator_profiles,
+        invoking_worker_task_id=invoking_worker_task_id,
+    )
+    if operator_denial is not None:
+        _reject_continuation_authorization(conn, task_id, operator_denial)
+    if not normalized_reason:
+        _reject_continuation_authorization(conn, task_id, "reason_required")
+    if not profile:
+        _reject_continuation_authorization(conn, task_id, "profile_required")
+    if not provider:
+        _reject_continuation_authorization(conn, task_id, "provider_required")
+    try:
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        _reject_continuation_authorization(
+            conn,
+            task_id,
+            "invalid_expiry",
+            f"expiry must be {MIN_CONTINUATION_AUTH_TTL_SECONDS}-"
+            f"{MAX_CONTINUATION_AUTH_TTL_SECONDS} seconds",
+        )
+    if not MIN_CONTINUATION_AUTH_TTL_SECONDS <= ttl <= MAX_CONTINUATION_AUTH_TTL_SECONDS:
+        _reject_continuation_authorization(
+            conn,
+            task_id,
+            "invalid_expiry",
+            f"expiry must be {MIN_CONTINUATION_AUTH_TTL_SECONDS}-"
+            f"{MAX_CONTINUATION_AUTH_TTL_SECONDS} seconds",
+        )
+    try:
+        prs = tuple(parse_continuation_pr_tuple(item) for item in pr_tuples)
+    except ContinuationAuthorizationError as exc:
+        _reject_continuation_authorization(conn, task_id, exc.code, str(exc))
+    if not prs:
+        _reject_continuation_authorization(conn, task_id, "pr_required")
+    identities = [pr.canonical_url for pr in prs]
+    if len(identities) != len(set(identities)):
+        _reject_continuation_authorization(conn, task_id, "duplicate_pr_tuple")
+
+    now = int(time.time())
+    denial = _continuation_local_denial(
+        conn,
+        task_id,
+        prs,
+        profile,
+        provider,
+        authorizer,
+        now=now,
+    )
+    if denial is None:
+        denial = _verify_continuation_prs(prs)
+    if denial is not None:
+        _reject_continuation_authorization(conn, task_id, denial)
+
+    authorization_id: Optional[int] = None
+    raced_denial: Optional[str] = None
+    created_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    with write_txn(conn):
+        # TTL starts only after BEGIN IMMEDIATE is acquired. A busy board can
+        # never commit a grant whose entire lifetime elapsed while queued.
+        created_at = int(time.time())
+        expires_at = created_at + ttl
+        try:
+            fresh_authorizer, fresh_profiles, fresh_worker = (
+                _continuation_operator_context(conn)
+            )
+        except ContinuationAuthorizationError as exc:
+            raced_denial = exc.code
+        else:
+            if fresh_authorizer != authorizer:
+                raced_denial = "operator_identity_changed"
+            else:
+                raced_denial = _continuation_operator_denial(
+                    conn,
+                    task_id,
+                    fresh_authorizer,
+                    fresh_profiles,
+                    invoking_worker_task_id=fresh_worker,
+                )
+        # Re-check all local state under SQLite's single-writer lock. GitHub is
+        # intentionally checked immediately before this transaction so no
+        # database transaction is held across network I/O; claim_task
+        # re-verifies the exact live URL/state/head inside its own writer
+        # transaction immediately before the ready -> running CAS and one-shot
+        # consume, closing the lock-queue TOCTOU gap.
+        if raced_denial is None:
+            raced_denial = _continuation_local_denial(
+                conn,
+                task_id,
+                prs,
+                profile,
+                provider,
+                authorizer,
+                now=created_at,
+            )
+        if raced_denial is not None:
+            _record_continuation_denial(
+                conn, task_id, raced_denial, phase="authorize_race"
+            )
+        else:
+            superseded = conn.execute(
+                "SELECT id FROM continuation_authorizations "
+                "WHERE task_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                (task_id,),
+            ).fetchall()
+            conn.execute(
+                "UPDATE continuation_authorizations "
+                "SET revoked_at = ?, revoked_reason = 'superseded' "
+                "WHERE task_id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                (created_at, task_id),
+            )
+            for prior in superseded:
+                _append_event(
+                    conn,
+                    task_id,
+                    "continuation_revoked",
+                    {
+                        "authorization_id": int(prior["id"]),
+                        "reason": "superseded",
+                        "revoked_at": created_at,
+                    },
+                )
+            cursor = conn.execute(
+                "INSERT INTO continuation_authorizations ("
+                "task_id, pr_tuples, reason, authorized_profile, "
+                "authorized_provider, authorized_by, created_at, expires_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    json.dumps([pr.tuple_text for pr in prs]),
+                    normalized_reason,
+                    profile,
+                    provider,
+                    authorizer,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            authorization_id = int(cursor.lastrowid)
+            _append_event(
+                conn,
+                task_id,
+                "continuation_authorized",
+                {
+                    "authorization_id": authorization_id,
+                    "authorized_by": authorizer,
+                    "authorized_profile": profile,
+                    "authorized_provider": provider,
+                    "expires_at": expires_at,
+                    "prs": [pr.tuple_text for pr in prs],
+                    "reason": normalized_reason,
+                },
+            )
+    if raced_denial is not None:
+        raise ContinuationAuthorizationError(raced_denial)
+    if authorization_id is None:  # pragma: no cover - transaction invariant
+        raise RuntimeError("continuation authorization insert did not return an id")
+    if created_at is None or expires_at is None:  # pragma: no cover
+        raise RuntimeError("continuation authorization timestamps were not assigned")
+    authorization = get_continuation_authorization(conn, authorization_id)
+    if authorization is None:  # pragma: no cover - transaction invariant
+        raise RuntimeError("continuation authorization insert was not durable")
+    return authorization
 
 
 @dataclass
@@ -8516,6 +10111,9 @@ def _set_worker_pid(
     is anchored to the attempt's process group/session and incarnation start
     time. This lets a descendant retain ownership when a launch wrapper exits.
     """
+    # Preserve both authorities: kernel-backed start ticks for worker/operator
+    # provenance and boardd's spawn-boundary identity for lifecycle ownership.
+    identity = _process_identity(int(pid))
     observed_pgid, observed_sid, observed_started = _read_worker_process_identity(pid)
     if worker_pgid is None:
         # Only infer a durable process group for the new-session shape used by
@@ -8537,6 +10135,9 @@ def _set_worker_pid(
         worker_started_at = observed_started
     if worker_boot_id is None and worker_started_at is not None:
         worker_boot_id = _read_host_boot_id()
+    # The authority path never trusts a caller-supplied boot generation when
+    # the kernel-backed identity is available.
+    worker_boot_id = identity.boot_id or worker_boot_id
     if worker_group_started_at is None:
         worker_group_started_at = (
             worker_started_at
@@ -8567,12 +10168,13 @@ def _set_worker_pid(
         if cur.rowcount != 1:
             return
         conn.execute(
-            "UPDATE task_runs SET worker_pid = ?, worker_pgid = ?, "
-            "worker_sid = ?, worker_boot_id = ?, worker_started_at = ?, "
-            "worker_group_started_at = ? "
+            "UPDATE task_runs SET worker_pid = ?, worker_pid_started = ?, "
+            "worker_pgid = ?, worker_sid = ?, worker_boot_id = ?, "
+            "worker_started_at = ?, worker_group_started_at = ? "
             "WHERE id = ? AND status = 'running'",
             (
                 int(pid),
+                identity.pid_started,
                 int(worker_pgid) if worker_pgid is not None else None,
                 int(worker_sid) if worker_sid is not None else None,
                 worker_boot_id,
@@ -8645,16 +10247,44 @@ def _release_post_claim_live_worker_guard(
                 int(run_id),
             ),
         )
+        consumed_authorization = conn.execute(
+            "SELECT id FROM continuation_authorizations "
+            "WHERE task_id = ? AND consumed_run_id = ? "
+            "AND consumed_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        guard_payload: dict[str, Any] = {
+            "reason": "live_worker_process",
+            "phase": phase,
+            "guard": "post_claim",
+            "holder_pids": holder_pids,
+        }
+        if consumed_authorization is not None:
+            authorization_id = int(consumed_authorization["id"])
+            guard_payload.update(
+                {
+                    "continuation_authorization_id": authorization_id,
+                    "continuation_consumed_without_spawn": True,
+                    "continuation_reauthorization_required": True,
+                }
+            )
+            _append_event(
+                conn,
+                task_id,
+                "continuation_consumed_without_spawn",
+                {
+                    "authorization_id": authorization_id,
+                    "run_id": int(run_id),
+                    "reason": "post_claim_live_worker_process",
+                    "reauthorization_required": True,
+                },
+                run_id=int(run_id),
+            )
         _append_event(
             conn,
             task_id,
             "respawn_guarded",
-            {
-                "reason": "live_worker_process",
-                "phase": phase,
-                "guard": "post_claim",
-                "holder_pids": holder_pids,
-            },
+            guard_payload,
             run_id=int(run_id),
         )
     return True
@@ -8682,70 +10312,68 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(
+def _evaluate_continuation_authorization(
+    conn: sqlite3.Connection,
+    task_id: str,
+    authorization: ContinuationAuthorization,
+    *,
+    now: int,
+) -> RespawnGuardDecision:
+    """Validate one exact grant without replacing it with a newer grant."""
+    denial: Optional[str]
+    if authorization.task_id != task_id:
+        denial = "authorization_task_mismatch"
+    else:
+        auth_status = authorization.status(now=now)
+        denial = (
+            f"authorization_{auth_status}"
+            if auth_status != "active"
+            else _continuation_local_denial(
+                conn,
+                task_id,
+                authorization.prs,
+                authorization.authorized_profile,
+                authorization.authorized_provider,
+                authorization.authorized_by,
+                now=now,
+            )
+        )
+    if denial is None:
+        denial = _verify_continuation_prs(authorization.prs)
+    if denial is not None:
+        return RespawnGuardDecision(
+            reason="active_pr",
+            continuation_denial=denial,
+            continuation_authorization_id=authorization.id,
+        )
+    return RespawnGuardDecision(
+        continuation_authorization_id=authorization.id,
+        authorized_profile=authorization.authorized_profile,
+        authorized_provider=authorization.authorized_provider,
+    )
+
+
+def evaluate_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     process_snapshot: Optional[Iterable[_WorkerProcessSnapshot]] = None,
-) -> Optional[str]:
-    """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
+) -> RespawnGuardDecision:
+    """Evaluate respawn safety and carry an exact continuation grant.
 
-    Called per ready task in ``dispatch_once`` before any claim attempt.
-    Returning a reason defers the spawn this tick; the task stays in
-    ``ready`` and gets another chance on the next dispatcher tick.
-
-    Checks in priority order:
-
-    ``"live_worker_process"``
-        A local process still carries ``HERMES_KANBAN_TASK`` for this card.
-        This is the last line of defense against a stale/crashed DB transition
-        spawning a second workspace writer while the first run survives.
-
-    ``"rate_limit_cooldown"``
-        The task's most recent run ended with the ``rate_limited`` outcome
-        (a worker bailed on a provider quota wall via the EX_TEMPFAIL
-        sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
-        quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
-        BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
-        quota-flavored ``last_failure_error`` that would otherwise match the
-        auth-blocker regex and park the task forever (the rate-limit path
-        never increments ``consecutive_failures``, so the breaker can't free
-        it). Once the cooldown elapses the task falls through and respawns.
-
-    ``"blocker_auth"``
-        The task's last failure error matches a quota / authentication
-        pattern. Retrying immediately is unlikely to help (rate limits
-        reset on a timer; auth needs human action), so we defer to the
-        next tick. The existing ``consecutive_failures`` counter still
-        trips the auto-block circuit breaker after ``failure_limit``
-        consecutive failures, so a persistent auth error eventually
-        blocks via the normal path — but a transient 429 gets a few
-        ticks of recovery first.
-
-    ``"recent_success"``
-        A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
-        seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning. Bypassed when an
-        explicit re-queue event (status change, promote, unblock, reclaim)
-        arrives AFTER that completion — that's a deliberate re-run request.
-
-    ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
-
-    Stale / dead claim locks are NOT a guard reason — they are handled
-    by ``release_stale_claims`` and ``detect_crashed_workers`` which
-    reset the task to ``ready`` only after verifying the lock is
-    genuinely dead (no live PID on this host).
+    Live process ownership wins over historical/database heuristics. The
+    ordinary rate-limit, auth, and recent-success guards remain unchanged. An
+    ``active_pr`` is bypassed only when the latest one-shot authorization is
+    active and every task-local, route, evidence, ownership, and live GitHub
+    invariant verifies. The returned authorization id must be consumed by
+    :func:`claim_task`; merely evaluating this function never consumes it.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
-        return None
+        return RespawnGuardDecision()
 
     # Process ownership wins over every historical/database heuristic. Even a
     # task row incorrectly reset to ``ready`` must not spawn beside a surviving
@@ -8758,20 +10386,9 @@ def check_respawn_guard(
         board_db=board_db,
         board_slug=board_slug,
     ):
-        return "live_worker_process"
+        return RespawnGuardDecision(reason="live_worker_process")
 
     now = int(time.time())
-
-    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
-    #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
-    #    rate-limit requeue stamps a quota-flavored last_failure_error that
-    #    the regex would otherwise match → defer forever (no failure counter
-    #    increment on this path means the breaker can never free it).
-    #
-    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
-    #    newer crash/completion superseded the rate-limit run, this guard
-    #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
@@ -8779,36 +10396,25 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if (
-        latest_run is not None
-        and latest_run["outcome"] == "rate_limited"
-    ):
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, and skip the
-            # blocker_auth regex so the stamped rate-limit text doesn't
-            # re-trap the task.
-            return None
+    if latest_run is not None and latest_run["outcome"] == "rate_limited":
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — allow the respawn. Return early so the
-        # blocker_auth check below doesn't catch the rate-limit text we
-        # stamped on the task; this path intentionally retries forever
-        # (cheaply, spaced by the cooldown) until quota returns or a real
-        # crash/completion supersedes it.
-        return None
+        if (
+            rl_cooldown > 0
+            and ended_at is not None
+            and (now - int(ended_at)) < rl_cooldown
+        ):
+            return RespawnGuardDecision(reason="rate_limit_cooldown")
+        # Cooldown disabled/elapsed: preserve the pre-continuation cheap-probe
+        # contract. Rate-limited workers intentionally retry forever, including
+        # when they already opened a PR, until quota returns or a newer outcome
+        # supersedes the throttle. Falling through would strand them behind an
+        # authorization they cannot mint from rate-limit evidence.
+        return RespawnGuardDecision()
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+        return RespawnGuardDecision(reason="blocker_auth")
 
-    # 3. Completed run within guard window — proof of recent success.
-    #    Exception: an explicit re-queue AFTER that success (an operator
-    #    dragging done→ready, a dependency re-promotion, an unblock, a
-    #    reclaim) is a deliberate "run it again" — honor it instead of
-    #    deferring. Without this, a manual done→ready just sits there,
-    #    silently held by the guard, until the window elapses.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
@@ -8821,23 +10427,75 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "'continuation_authorized') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
-            return "recent_success"
+            return RespawnGuardDecision(reason="recent_success")
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    active_urls = _canonical_pr_urls_from_comments(
+        conn,
+        task_id,
+        cutoff=now - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if not active_urls:
+        return RespawnGuardDecision()
 
-    return None
+    authorization = _latest_continuation_authorization(conn, task_id)
+    if authorization is None:
+        return RespawnGuardDecision(
+            reason="active_pr",
+            continuation_denial="missing_authorization",
+        )
+    return _evaluate_continuation_authorization(
+        conn,
+        task_id,
+        authorization,
+        now=now,
+    )
+
+
+def check_respawn_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    process_snapshot: Optional[Iterable[_WorkerProcessSnapshot]] = None,
+) -> Optional[str]:
+    """Backward-compatible reason-only view of :func:`evaluate_respawn_guard`."""
+    return evaluate_respawn_guard(
+        conn,
+        task_id,
+        process_snapshot=process_snapshot,
+    ).reason
+
+
+def record_respawn_guard_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    decision: RespawnGuardDecision,
+    *,
+    phase: str = "dispatch",
+) -> None:
+    """Append explicit guard/continuation denial audit events in one txn."""
+    if decision.reason is None:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "respawn_guarded",
+            {"reason": decision.reason},
+        )
+        if decision.continuation_denial is not None:
+            _record_continuation_denial(
+                conn,
+                task_id,
+                decision.continuation_denial,
+                phase=phase,
+                authorization_id=decision.continuation_authorization_id,
+            )
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -9226,22 +10884,18 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(
+        guard_decision = evaluate_respawn_guard(
             conn,
             row["id"],
             process_snapshot=ready_process_snapshot,
         )
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
+        if guard_decision.reason is not None:
+            result.respawn_guarded.append((row["id"], guard_decision.reason))
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
-                with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                record_respawn_guard_decision(conn, row["id"], guard_decision)
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -9249,7 +10903,34 @@ def _dispatch_once_locked(
                 row["id"]
             )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        try:
+            claimed = claim_task(
+                conn,
+                row["id"],
+                ttl_seconds=ttl_seconds,
+                continuation_authorization_id=(
+                    guard_decision.continuation_authorization_id
+                ),
+            )
+        except ContinuationAuthorizationError as exc:
+            # A consume/expiry race rolls the claim transaction back. Treat it
+            # like the guard denial it is instead of aborting the whole tick
+            # and starving unrelated ready tasks.
+            raced = RespawnGuardDecision(
+                reason="active_pr",
+                continuation_authorization_id=(
+                    guard_decision.continuation_authorization_id
+                ),
+                continuation_denial=exc.code,
+            )
+            result.respawn_guarded.append((row["id"], "active_pr"))
+            record_respawn_guard_decision(
+                conn,
+                row["id"],
+                raced,
+                phase="claim_exception",
+            )
+            continue
         if claimed is None:
             continue
         if _release_post_claim_live_worker_guard(
@@ -10839,12 +12520,16 @@ def latest_summaries(
 # did ``from ... import <fn>`` bind to the rebound function. No effect when the
 # flag is unset.
 #
-# Only the exactly-once-sensitive HOT ops are rebound to native broker ops
-# (applied_ops dedup). Every OTHER write_txn function (create_task, complete_task,
+# Only native broker ops whose full policy signatures are preserved are rebound
+# (applied_ops dedup). claim_task deliberately stays on this real implementation:
+# its continuation authorization id, operator override, post-lock active-PR
+# recheck, consume CAS, and audit payload cannot be represented by boardd's
+# legacy native claim payload. It therefore follows create_task, complete_task,
 # block_task, unblock_task, promote_task, reclaim_task, schedule_task, decompose,
-# ...) runs UNCHANGED and atomically through the broker's INTERACTIVE TRANSACTION
-# when — and only when — the connection is a fleet BrokerConnection; no lifecycle
-# policy is reimplemented. _check_file_length_invariant is neutered client-side
+# and the other write_txn functions UNCHANGED and atomically through the broker's
+# INTERACTIVE TRANSACTION when — and only when — the connection is a fleet
+# BrokerConnection; no lifecycle policy is reimplemented.
+# _check_file_length_invariant is neutered client-side
 # (it reads the raw db FILE, decoupled from the broker's connection view under WAL
 # -> false torn-extend); the broker runs the authoritative check on its own
 # connection. See boardd_shim.py + INVENTORY §A.
@@ -10859,7 +12544,6 @@ if os.environ.get("HERMES_KANBAN_BROKER") == "1":
         connect = _boardd_shim.connect
         connect_closing = _boardd_shim.connect_closing
         add_comment = _boardd_shim.add_comment
-        claim_task = _boardd_shim.claim_task
         heartbeat_worker = _boardd_shim.heartbeat_worker
         set_workspace_path = _boardd_shim.set_workspace_path
         set_branch_name = _boardd_shim.set_branch_name

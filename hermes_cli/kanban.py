@@ -26,7 +26,6 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.profiles import get_active_profile_name
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +511,89 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
+    p_claim.add_argument(
+        "--operator-override-reason",
+        default=None,
+        metavar="REASON",
+        help=(
+            "Audited operator-only respawn-guard bypass. Invoke through the "
+            "live root gateway; caller must be allowlisted in "
+            "kanban.continuation_operator_profiles and must not be a Kanban "
+            "worker or the task assignee"
+        ),
+    )
+
+    # --- guarded one-shot active-PR continuation ---
+    p_continuation = sub.add_parser(
+        "continuation",
+        help="Authorize/read one-shot repair continuation for exact active PR heads",
+        description=(
+            "Review/authorize are control-plane mutations: invoke them as "
+            "/kanban commands through the live root gateway. Direct shell, "
+            "TUI slash-worker, and Kanban worker processes fail closed."
+        ),
+    )
+    continuation_sub = p_continuation.add_subparsers(dest="continuation_action")
+    p_cont_authorize = continuation_sub.add_parser(
+        "authorize",
+        help="Authorize one exact ready-task claim after live fail-closed checks",
+    )
+    p_cont_authorize.add_argument("task_id")
+    p_cont_authorize.add_argument(
+        "--pr",
+        action="append",
+        required=True,
+        dest="prs",
+        metavar="OWNER/REPO#N@SHA",
+        help="Exact PR tuple with a full 40-character head SHA (repeatable)",
+    )
+    p_cont_authorize.add_argument(
+        "--reason",
+        required=True,
+        help="Non-empty repair reason recorded in the immutable audit trail",
+    )
+    p_cont_authorize.add_argument(
+        "--profile",
+        required=True,
+        help="Exact task assignee/profile authorized to continue",
+    )
+    p_cont_authorize.add_argument(
+        "--provider",
+        required=True,
+        help="Exact provider configured for the authorized profile route",
+    )
+    p_cont_authorize.add_argument(
+        "--expires-in",
+        type=int,
+        default=kb.DEFAULT_CONTINUATION_AUTH_TTL_SECONDS,
+        metavar="SECONDS",
+        help="Short expiry in seconds (default: 900; allowed: 60-3600)",
+    )
+    p_cont_authorize.add_argument("--json", action="store_true")
+    p_cont_review = continuation_sub.add_parser(
+        "review",
+        help="Record authoritative FIX-REQUIRED or resolved repair evidence",
+    )
+    p_cont_review.add_argument("task_id")
+    p_cont_review.add_argument(
+        "--verdict",
+        required=True,
+        choices=["fix-required", "resolved"],
+        help="Review state; a later allowlisted resolved verdict clears prior FIX-REQUIRED",
+    )
+    p_cont_review.add_argument(
+        "--reason",
+        required=True,
+        help="Non-empty review rationale stored in the task event ledger",
+    )
+    p_cont_review.add_argument("--json", action="store_true")
+    p_cont_show = continuation_sub.add_parser(
+        "show",
+        aliases=["status"],
+        help="Read full authorization history, including expiry/consumption",
+    )
+    p_cont_show.add_argument("task_id")
+    p_cont_show.add_argument("--json", action="store_true")
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
@@ -971,6 +1053,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
+            "continuation": _cmd_continuation,
             "comment":  _cmd_comment,
             "attach":   _cmd_attach,
             "attachments": _cmd_attachments,
@@ -1837,18 +1920,118 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_continuation(args: argparse.Namespace) -> int:
+    """Authorize or read exact one-shot active-PR continuation grants."""
+    action = getattr(args, "continuation_action", None)
+    if action == "review":
+        with kb.connect_closing() as conn:
+            event_id = kb.record_continuation_review(
+                conn,
+                args.task_id,
+                verdict=args.verdict,
+                reason=args.reason,
+            )
+        payload = {
+            "event_id": event_id,
+            "task_id": args.task_id,
+            "verdict": args.verdict.replace("-", "_"),
+            "reason": args.reason.strip(),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                f"Recorded continuation review {event_id} for {args.task_id}: "
+                f"{payload['verdict']}"
+            )
+        return 0
+
+    if action == "authorize":
+        with kb.connect_closing() as conn:
+            authorization = kb.authorize_continuation(
+                conn,
+                args.task_id,
+                args.prs,
+                reason=args.reason,
+                authorized_profile=args.profile,
+                authorized_provider=args.provider,
+                ttl_seconds=args.expires_in,
+            )
+        payload = authorization.to_dict()
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                f"Authorized continuation {authorization.id} for {args.task_id} "
+                f"until {_fmt_ts(authorization.expires_at)}"
+            )
+            print(
+                f"Route: {authorization.authorized_profile} "
+                f"({authorization.authorized_provider})"
+            )
+            for pr in authorization.prs:
+                print(f"PR: {pr.tuple_text}")
+        return 0
+
+    if action in {"show", "status"}:
+        now = int(time.time())
+        with kb.connect_closing() as conn:
+            if kb.get_task(conn, args.task_id) is None:
+                print(f"no such task: {args.task_id}", file=sys.stderr)
+                return 1
+            history = kb.list_continuation_authorizations(conn, args.task_id)
+        payload = [item.to_dict(now=now) for item in history]
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        elif not history:
+            print(f"No continuation authorizations for {args.task_id}")
+        else:
+            for item in history:
+                consumed = (
+                    f" run={item.consumed_run_id} at {_fmt_ts(item.consumed_at)}"
+                    if item.consumed_at is not None
+                    else ""
+                )
+                print(
+                    f"{item.id}  {item.status(now=now):8s}  "
+                    f"expires={_fmt_ts(item.expires_at)}{consumed}"
+                )
+                print(
+                    f"  route={item.authorized_profile}/"
+                    f"{item.authorized_provider} by={item.authorized_by}"
+                )
+                for pr in item.prs:
+                    print(f"  pr={pr.tuple_text}")
+                print(f"  reason={item.reason}")
+        return 0
+
+    print(
+        "usage: hermes kanban continuation <review|authorize|show> ...",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
+    override_reason = getattr(args, "operator_override_reason", None)
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            operator_override_reason=override_reason,
+        )
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
                 print(f"no such task: {args.task_id}", file=sys.stderr)
                 return 1
+            decision = kb.evaluate_respawn_guard(conn, args.task_id)
+            guard = f" guard={decision.reason}" if decision.reason else ""
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
-                f"lock={existing.claim_lock or '(none)'}",
+                f"lock={existing.claim_lock or '(none)'}{guard}",
                 file=sys.stderr,
             )
             return 1

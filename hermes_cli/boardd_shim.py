@@ -13,8 +13,11 @@ kanban_db's own import, before any dependent module finishes `from … import �
 
 Coverage (delegated to boardd, exactly-once via op_id):
   connect / connect_closing (→ BrokerConnection) and the core op functions
-  create_task, add_comment, claim_task, heartbeat_worker, set_workspace_path,
-  set_branch_name. Lifecycle hooks fire CLIENT-SIDE (off the broker DB thread).
+  create_task, add_comment, heartbeat_worker, set_workspace_path, set_branch_name.
+  claim_task deliberately remains the real kanban_db implementation over a
+  BrokerConnection: continuation grants and operator overrides require its full
+  policy/CAS transaction and must never be reduced to boardd's legacy native
+  claim payload. Lifecycle hooks fire CLIENT-SIDE (off the broker DB thread).
 
 Anything NOT yet covered fails LOUDLY (NotImplementedError) instead of silently
 corrupting: a raw multi-statement write_txn on a BrokerConnection, create_task
@@ -107,7 +110,7 @@ def _cov(op):
         site = f"{os.path.basename(fr.filename)}:{fr.lineno}:{fr.name}"
         break
     try:
-        with open(_COV_PATH, "a") as fh:
+        with open(_COV_PATH, "a", encoding="utf-8") as fh:
             fh.write(f"{op}\t{site}\n")
     except Exception:
         pass
@@ -423,33 +426,40 @@ def heartbeat_worker(conn, task_id, *, note=None, expected_run_id=None):
     return bool(_c().heartbeat(task_id, note=note).get("ok", False))
 
 
-# NOTE: create_task is deliberately NOT rebound. The REAL create_task (with its
-# full signature — parents/task_links, idempotency_key, tenant, skills, project
-# linking, goal_mode, …) runs through the interactive-transaction path on a
-# BrokerConnection. Delegating it natively would either drop those kwargs
-# silently or raise on `parents=` (breaking the dispatcher's decompose). Its
-# idempotency_key check makes it idempotent under retry; parents use write_txn
-# link inserts, which the interactive txn carries faithfully.
+# NOTE: create_task and claim_task are deliberately NOT rebound. Their REAL
+# implementations run through the interactive-transaction path on a
+# BrokerConnection. create_task needs its full signature (parents/task_links,
+# idempotency_key, tenant, skills, project linking, goal_mode, …). claim_task
+# needs continuation_authorization_id, operator_override_reason, the post-lock
+# active-PR recheck, one-shot consume CAS, and model-aware audit payload. The
+# broker's legacy native claim endpoint cannot express those contracts; routing
+# through it would silently bypass guarded continuation. Both real functions
+# retain their policy and atomicity because write_txn composes over the broker's
+# tokenized interactive transaction.
 
 
-def claim_task(conn, task_id, *, ttl_seconds=None, claimer=None):
-    _cov("claim_task")
-    import hermes_cli.kanban_db as kdb  # for Task type + hook (client-side)
-    r = _c().claim(task_id, claimer=claimer, ttl_seconds=ttl_seconds or 7200)
-    if not r.get("won"):
-        return None
-    task = _row_to_task(kdb, _c().get_task(task_id))
-    # Fire the lifecycle hook CLIENT-SIDE (off the broker DB thread), preserving
-    # the original post-commit side effect (notifications) while keeping the
-    # broker's DB path free of external calls (HARD RULE).
-    try:
-        board = getattr(kdb, "get_current_board", lambda: None)()
-        kdb._fire_kanban_lifecycle_hook(
-            "kanban_task_claimed", task_id, board=board,
-            assignee=(task.assignee if task else None), run_id=r.get("run_id"))
-    except Exception:
-        pass
-    return task
+def claim_task(
+    conn,
+    task_id,
+    *,
+    ttl_seconds=None,
+    claimer=None,
+    operator_override_reason=None,
+    continuation_authorization_id=None,
+):
+    """Fail closed if a caller tries the obsolete native claim delegate.
+
+    Production intentionally leaves ``kanban_db.claim_task`` unrebound so its
+    full continuation policy executes over ``BrokerConnection``. Keeping this
+    named guard makes stale direct imports fail loudly instead of silently
+    dropping authorization or override arguments through boardd's legacy
+    native ``claim`` payload.
+    """
+    _cov("claim_task_rejected")
+    raise RuntimeError(
+        "boardd_shim.claim_task is disabled: use hermes_cli.kanban_db.claim_task "
+        "over BrokerConnection so continuation policy is preserved"
+    )
 
 
 def _row_to_task(kdb, row):
@@ -468,12 +478,13 @@ def _row_to_task(kdb, row):
 
 
 # Names the kanban_db end-block rebinds to (kept in one place for the patch).
-# create_task is intentionally absent (runs as the real function via the
-# interactive txn — full signature incl. parents/idempotency). Everything else
-# not listed here (complete/block/unblock/promote/reclaim/schedule/decompose/…)
-# also runs as the real function via the interactive txn on the BrokerConnection.
+# create_task and claim_task are intentionally absent (both run as the real
+# functions via the interactive txn with their complete policy signatures).
+# Everything else not listed here (complete/block/unblock/promote/reclaim/
+# schedule/decompose/…) also runs as the real function via the interactive txn
+# on the BrokerConnection.
 REBIND_NAMES = (
-    "connect", "connect_closing", "add_comment", "claim_task",
+    "connect", "connect_closing", "add_comment",
     "heartbeat_worker", "set_workspace_path", "set_branch_name",
 )
 
@@ -491,7 +502,6 @@ def install_rebind(kdb):
     kdb.connect = connect
     kdb.connect_closing = connect_closing
     kdb.add_comment = add_comment
-    kdb.claim_task = claim_task
     kdb.heartbeat_worker = heartbeat_worker
     kdb.set_workspace_path = set_workspace_path
     kdb.set_branch_name = set_branch_name

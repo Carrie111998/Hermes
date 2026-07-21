@@ -11,12 +11,15 @@ that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
 
+import contextlib
+import contextvars
 import hashlib
 import json
 import logging
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -38,6 +41,9 @@ _LOCKS_DIRNAME = "gateway-locks"
 _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
+# Compatibility tombstone only.  Runtime-lock authority is intentionally kept
+# in a closure below so assigning a file-like object to this historical module
+# attribute cannot manufacture ownership provenance.
 _gateway_lock_handle = None
 # Windows byte-range locks are mandatory for other readers. Lock a byte well
 # past the JSON payload so runtime status / PID readers can still read the file
@@ -253,6 +259,47 @@ def _get_process_start_time(pid: int) -> Optional[int]:
 def get_process_start_time(pid: int) -> Optional[int]:
     """Public wrapper for retrieving a process start time when available."""
     return _get_process_start_time(pid)
+
+
+def _get_boot_identity(
+    _open_file=open, _platform: str = sys.platform
+) -> str:
+    """Return a stable identifier for the current OS boot.
+
+    Linux exposes a kernel-generated UUID which is shared by every process in
+    this boot and changes across reboot.  The psutil fallback gives the same
+    property on macOS and Windows.  A deliberately coarse final fallback is
+    still process-stable, but Linux is the security-critical path: its boot ID
+    identity is also part of the kernel authority-anchor name below.
+    """
+    try:
+        with _open_file(
+            "/proc/sys/kernel/random/boot_id", "r", encoding="utf-8"
+        ) as boot_id_file:
+            boot_id = boot_id_file.read().strip()
+        if boot_id:
+            return f"linux:{boot_id}"
+    except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError):
+        pass
+
+    try:
+        import psutil  # type: ignore
+
+        return f"{_platform}:{int(round(psutil.boot_time() * 100))}"
+    except Exception:
+        return f"{_platform}:boot-id-unavailable"
+
+
+def _get_process_security_identity(
+    _getuid=getattr(os, "getuid", None), _environ=os.environ
+) -> str:
+    """Return the OS account identity used to scope the authority anchor."""
+    if _getuid is not None:
+        try:
+            return f"uid:{int(_getuid())}"
+        except (OSError, TypeError, ValueError):
+            pass
+    return f"user:{_environ.get('USERNAME') or _environ.get('USER') or 'unknown'}"
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
@@ -787,53 +834,446 @@ def _release_file_lock(handle) -> None:
         pass
 
 
-def acquire_gateway_runtime_lock() -> bool:
-    """Claim the cross-process runtime lock for the gateway.
+def _build_gateway_runtime_lock_manager():
+    """Create process-private runtime-lock state and authority operations.
 
-    Unlike the PID file, the lock is owned by the live process itself. If the
-    process dies abruptly, the OS releases the lock automatically.
+    The state deliberately lives in this closure, not in an assignable module
+    global.  A helper may import ``gateway.status`` and assign the historical
+    ``_gateway_lock_handle`` name, but it cannot thereby alter the retained
+    handle, acquire-time owner identity, immutable file stamp, kernel authority
+    anchor, or opaque control-plane token used by these operations.
+
+    On Linux, the authority anchor is a retained abstract AF_UNIX socket bound
+    to a name derived from the canonical authority root, OS account, and boot
+    identity.  Unlike ``gateway.lock``'s directory entry, the abstract socket
+    name cannot be unlinked or replaced by a same-account helper while the real
+    gateway retains it.  The file lock remains the public singleton/liveness
+    mechanism; the kernel anchor is the non-replaceable provenance required for
+    privileged board mutations.
     """
-    global _gateway_lock_handle
-    if _gateway_lock_handle is not None:
-        return True
 
-    path = _get_gateway_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+", encoding="utf-8")
-    if not _try_acquire_file_lock(handle):
-        handle.close()
-        return False
-    _write_gateway_lock_record(handle)
-    _gateway_lock_handle = handle
-    _clear_running_pid_cache()
-    return True
+    # Capture security-critical primitives once when this module builds the
+    # manager. Reassigning module helpers (the same attack class as assigning
+    # ``_gateway_lock_handle``) must not change the live manager's issuer or
+    # verifier after import.
+    read_boot_identity = _get_boot_identity
+    read_security_identity = _get_process_security_identity
+    read_process_start_time = _get_process_start_time
+    read_gateway_lock_record = _read_gateway_lock_record
+    gateway_lock_path = _get_gateway_lock_path
+    try_acquire_file_lock = _try_acquire_file_lock
+    write_gateway_lock_record = _write_gateway_lock_record
+    socket_factory = socket.socket
+    socket_family = getattr(socket, "AF_UNIX", None)
+    socket_stream = socket.SOCK_STREAM
+    sha256 = hashlib.sha256
+    fstat = os.fstat
+    getpid = os.getpid
+    open_fd = os.open
+    close_fd = os.close
+    path_stat = os.stat
+    directory_open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    posix_directory_anchor_required = sys.platform != "win32"
+    linux_anchor_required = sys.platform.startswith("linux") and socket_family is not None
+
+    state_lock = threading.RLock()
+    state: dict[str, Any] = {"lease": None}
+    control_plane_token: contextvars.ContextVar[object | None] = (
+        contextvars.ContextVar("hermes_gateway_control_plane_token", default=None)
+    )
+
+    def _authority_anchor_name(
+        lock_path: Path, boot_identity: str, security_identity: str
+    ) -> bytes:
+        identity = "\0".join(
+            (str(lock_path), boot_identity, security_identity)
+        ).encode("utf-8")
+        digest = sha256(identity).hexdigest()[:48].encode("ascii")
+        # Linux's leading-NUL abstract namespace is kernel-owned and has no
+        # filesystem directory entry for another process to replace.
+        return b"\0hermes-gateway-authority-" + digest
+
+    def _acquire_directory_anchor(
+        lock_path: Path,
+    ) -> tuple[int, tuple[int, int]] | None:
+        """Lock the authority-root directory's open file description.
+
+        This is the non-pathname fallback on POSIX systems without Linux's
+        abstract AF_UNIX namespace.  Replacing ``gateway.lock`` leaves the
+        directory inode and this retained flock unchanged, so another process
+        cannot acquire an authoritative replacement lease.
+        """
+        if not posix_directory_anchor_required:
+            return None
+        try:
+            directory_fd = open_fd(str(lock_path.parent), directory_open_flags)
+        except OSError:
+            return None
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stat_result = fstat(directory_fd)
+            return directory_fd, (
+                int(stat_result.st_dev),
+                int(stat_result.st_ino),
+            )
+        except (BlockingIOError, OSError):
+            close_fd(directory_fd)
+            return None
+
+    def _close_directory_anchor(
+        directory_fd: int | None, *, unlock: bool
+    ) -> None:
+        if directory_fd is None:
+            return
+        if unlock:
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            close_fd(directory_fd)
+        except OSError:
+            pass
+
+    def _acquire_authority_anchor(
+        lock_path: Path, boot_identity: str, security_identity: str
+    ) -> tuple[socket.socket, bytes, tuple[int, int]] | None:
+        if not linux_anchor_required:
+            # Windows does not permit replacing an open, byte-range-locked file
+            # under the sharing mode used here.  macOS has no abstract AF_UNIX
+            # namespace; retain the existing descriptor/path proof there.
+            return None
+
+        address = _authority_anchor_name(
+            lock_path, boot_identity, security_identity
+        )
+        assert socket_family is not None  # narrowed by linux_anchor_required
+        anchor = None
+        try:
+            anchor = socket_factory(socket_family, socket_stream)
+            anchor.bind(address)
+            stat_result = fstat(anchor.fileno())
+            stamp = (int(stat_result.st_dev), int(stat_result.st_ino))
+            return anchor, address, stamp
+        except OSError:
+            if anchor is not None:
+                anchor.close()
+            return None
+
+    def _authority_anchor_required() -> bool:
+        return linux_anchor_required
+
+    def _file_stamp(handle) -> tuple[int, int, int, int, int]:
+        stat_result = fstat(handle.fileno())
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+            int(stat_result.st_ctime_ns),
+        )
+
+    def _payload_digest(handle) -> str:
+        position = handle.tell()
+        try:
+            handle.seek(0)
+            payload = handle.read()
+        finally:
+            handle.seek(position)
+        return sha256(str(payload).encode("utf-8")).hexdigest()
+
+    def owns(
+        authority_root: Optional[Path] = None,
+        *,
+        authority_token: Optional[object] = None,
+    ) -> bool:
+        with state_lock:
+            lease = state["lease"]
+            if lease is None:
+                return False
+            handle = lease["handle"]
+            try:
+                if handle.closed or lease["owner_pid"] != getpid():
+                    return False
+                if lease["boot_identity"] != read_boot_identity():
+                    return False
+                if lease["security_identity"] != read_security_identity():
+                    return False
+                current_start = read_process_start_time(getpid())
+                if (
+                    lease["owner_start"] is not None
+                    and current_start is not None
+                    and lease["owner_start"] != current_start
+                ):
+                    return False
+                if authority_token is not None and authority_token is not lease["token"]:
+                    return False
+                anchor = lease["authority_anchor"]
+                if anchor is not None:
+                    if anchor.fileno() < 0:
+                        return False
+                    if anchor.getsockname() != lease["authority_anchor_name"]:
+                        return False
+                    anchor_stat = fstat(anchor.fileno())
+                    if (int(anchor_stat.st_dev), int(anchor_stat.st_ino)) != lease[
+                        "authority_anchor_stamp"
+                    ]:
+                        return False
+                elif _authority_anchor_required():
+                    return False
+                lock_path = lease["lock_path"]
+                directory_fd = lease["directory_anchor_fd"]
+                if directory_fd is not None:
+                    directory_stat = fstat(directory_fd)
+                    if (
+                        int(directory_stat.st_dev),
+                        int(directory_stat.st_ino),
+                    ) != lease["directory_anchor_stamp"]:
+                        return False
+                    published_directory_stat = path_stat(lock_path.parent)
+                    if (
+                        int(published_directory_stat.st_dev),
+                        int(published_directory_stat.st_ino),
+                    ) != lease["directory_anchor_stamp"]:
+                        return False
+                elif posix_directory_anchor_required:
+                    return False
+                if authority_root is not None:
+                    expected = (Path(authority_root).resolve() / _GATEWAY_LOCK_FILENAME)
+                    if expected != lock_path:
+                        return False
+                # Both the retained descriptor and the published path must
+                # remain the exact file acquired by this process.
+                if _file_stamp(handle) != lease["file_stamp"]:
+                    return False
+                published_path_stat = path_stat(lock_path)
+                if (int(published_path_stat.st_dev), int(published_path_stat.st_ino)) != (
+                    lease["file_stamp"][0],
+                    lease["file_stamp"][1],
+                ):
+                    return False
+                if _payload_digest(handle) != lease["payload_digest"]:
+                    return False
+                record = read_gateway_lock_record(lock_path)
+                if record is None or _pid_from_record(record) != lease["owner_pid"]:
+                    return False
+                if record.get("start_time") != lease["owner_start"]:
+                    return False
+            except (OSError, ValueError, TypeError):
+                return False
+            return True
+
+    def acquire() -> bool:
+        with state_lock:
+            if state["lease"] is not None:
+                return owns()
+            path = gateway_lock_path().resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            boot_identity = read_boot_identity()
+            security_identity = read_security_identity()
+            directory_anchor_result = _acquire_directory_anchor(path)
+            if (
+                posix_directory_anchor_required
+                and directory_anchor_result is None
+            ):
+                return False
+            if directory_anchor_result is None:
+                directory_anchor_fd = None
+                directory_anchor_stamp = None
+            else:
+                directory_anchor_fd, directory_anchor_stamp = (
+                    directory_anchor_result
+                )
+            anchor_result = _acquire_authority_anchor(
+                path, boot_identity, security_identity
+            )
+            if _authority_anchor_required() and anchor_result is None:
+                _close_directory_anchor(directory_anchor_fd, unlock=True)
+                return False
+            if anchor_result is None:
+                authority_anchor = None
+                authority_anchor_name = None
+                authority_anchor_stamp = None
+            else:
+                (
+                    authority_anchor,
+                    authority_anchor_name,
+                    authority_anchor_stamp,
+                ) = anchor_result
+            try:
+                handle = open(path, "a+", encoding="utf-8")
+            except Exception:
+                if authority_anchor is not None:
+                    authority_anchor.close()
+                _close_directory_anchor(directory_anchor_fd, unlock=True)
+                raise
+            if not try_acquire_file_lock(handle):
+                handle.close()
+                if authority_anchor is not None:
+                    authority_anchor.close()
+                _close_directory_anchor(directory_anchor_fd, unlock=True)
+                return False
+            try:
+                write_gateway_lock_record(handle)
+                state["lease"] = {
+                    "handle": handle,
+                    "lock_path": path,
+                    "owner_pid": getpid(),
+                    "owner_start": read_process_start_time(getpid()),
+                    "boot_identity": boot_identity,
+                    "security_identity": security_identity,
+                    "file_stamp": _file_stamp(handle),
+                    "payload_digest": _payload_digest(handle),
+                    "authority_anchor": authority_anchor,
+                    "authority_anchor_name": authority_anchor_name,
+                    "authority_anchor_stamp": authority_anchor_stamp,
+                    "directory_anchor_fd": directory_anchor_fd,
+                    "directory_anchor_stamp": directory_anchor_stamp,
+                    "token": object(),
+                }
+            except Exception:
+                _release_file_lock(handle)
+                handle.close()
+                if authority_anchor is not None:
+                    authority_anchor.close()
+                _close_directory_anchor(directory_anchor_fd, unlock=True)
+                raise
+            return True
+
+    def release() -> None:
+        with state_lock:
+            lease = state["lease"]
+            state["lease"] = None
+            if lease is None:
+                return
+            handle = lease["handle"]
+            _release_file_lock(handle)
+            try:
+                handle.close()
+            except OSError:
+                pass
+            authority_anchor = lease["authority_anchor"]
+            if authority_anchor is not None:
+                try:
+                    authority_anchor.close()
+                except OSError:
+                    pass
+            _close_directory_anchor(lease["directory_anchor_fd"], unlock=True)
+
+    def after_fork_child() -> None:
+        """Drop inherited authority without unlocking the parent's OFD."""
+        # Do not acquire state_lock here: another thread could have owned the
+        # inherited RLock at fork time and no such thread exists in the child
+        # to release it. The child is single-threaded at this callback point.
+        lease = state["lease"]
+        state["lease"] = None
+        if lease is not None:
+            try:
+                # Never call LOCK_UN here: flock state belongs to the open file
+                # description shared with the parent. Closing only the child's
+                # duplicate preserves the parent's lock.
+                lease["handle"].close()
+            except OSError:
+                pass
+            authority_anchor = lease["authority_anchor"]
+            if authority_anchor is not None:
+                try:
+                    # Closing the child's inherited duplicate does not release
+                    # the parent's bound abstract socket.
+                    authority_anchor.close()
+                except OSError:
+                    pass
+            # Like the file lock, the directory flock belongs to an open file
+            # description shared with the parent. Close only the child copy.
+            _close_directory_anchor(lease["directory_anchor_fd"], unlock=False)
+        control_plane_token.set(None)
+
+    def has_retained_lock_for(lock_path: Path) -> bool:
+        with state_lock:
+            lease = state["lease"]
+            if lease is None:
+                return False
+            try:
+                return Path(lock_path).resolve() == lease["lock_path"] and owns()
+            except OSError:
+                return False
+
+    def claim_control_plane_context():
+        with state_lock:
+            lease = state["lease"]
+            if lease is None or not owns():
+                raise RuntimeError("gateway-owned runtime-lock provenance is required")
+            authority_token = lease["token"]
+
+        @contextlib.contextmanager
+        def arm():
+            if not owns(authority_token=authority_token):
+                raise RuntimeError("gateway-owned runtime-lock provenance is no longer valid")
+            reset_token = control_plane_token.set(authority_token)
+            try:
+                if not owns(authority_token=authority_token):
+                    raise RuntimeError(
+                        "gateway-owned runtime-lock provenance changed while arming"
+                    )
+                yield
+            finally:
+                control_plane_token.reset(reset_token)
+
+        return arm
+
+    def control_plane_active() -> bool:
+        try:
+            token = control_plane_token.get()
+        except Exception:
+            return False
+        return token is not None and owns(authority_token=token)
+
+    return (
+        acquire,
+        release,
+        owns,
+        has_retained_lock_for,
+        after_fork_child,
+        claim_control_plane_context,
+        control_plane_active,
+    )
+
+
+(
+    _acquire_gateway_runtime_lock,
+    _release_gateway_runtime_lock,
+    _process_owns_gateway_runtime_lock,
+    _has_retained_gateway_runtime_lock_for,
+    _drop_gateway_runtime_authority_after_fork,
+    _claim_gateway_control_plane_context,
+    _gateway_control_plane_active,
+) = _build_gateway_runtime_lock_manager()
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_gateway_runtime_authority_after_fork)
+
+
+def acquire_gateway_runtime_lock() -> bool:
+    """Claim the OS lock and capture non-assignable ownership provenance."""
+    acquired = bool(_acquire_gateway_runtime_lock())
+    if acquired:
+        _clear_running_pid_cache()
+    return acquired
 
 
 def release_gateway_runtime_lock() -> None:
-    """Release the gateway runtime lock when owned by this process."""
-    global _gateway_lock_handle
-    handle = _gateway_lock_handle
-    if handle is None:
-        return
-    _gateway_lock_handle = None
-    _release_file_lock(handle)
-    try:
-        handle.close()
-    except OSError:
-        pass
+    """Release the gateway runtime lock and destroy its authority token."""
+    _release_gateway_runtime_lock()
     _clear_running_pid_cache()
 
 
 def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     """Return True when some process currently owns the gateway runtime lock."""
-    global _gateway_lock_handle
     resolved_lock_path = lock_path or _get_gateway_lock_path()
-    if _gateway_lock_handle is not None and resolved_lock_path == _get_gateway_lock_path():
+    if _has_retained_gateway_runtime_lock_for(resolved_lock_path):
         return True
-
     if not resolved_lock_path.exists():
         return False
-
     handle = open(resolved_lock_path, "a+", encoding="utf-8")
     try:
         if _try_acquire_file_lock(handle):
@@ -845,6 +1285,25 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             handle.close()
         except OSError:
             pass
+
+
+@contextlib.contextmanager
+def gateway_control_plane_context():
+    """Deprecated public API that deliberately cannot arm gateway authority."""
+    raise RuntimeError(
+        "gateway-owned control-plane context is private to the running gateway"
+    )
+    yield  # pragma: no cover - keeps this a context manager
+
+
+def gateway_control_plane_active() -> bool:
+    """Return True only for the opaque token captured by the real gateway."""
+    return bool(_gateway_control_plane_active())
+
+
+def process_owns_gateway_runtime_lock(authority_root: Optional[Path] = None) -> bool:
+    """Prove ownership from captured acquire-time state, never module globals."""
+    return bool(_process_owns_gateway_runtime_lock(authority_root))
 
 
 def write_pid_file() -> None:
