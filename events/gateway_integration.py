@@ -23,6 +23,7 @@ from events.paths import (
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
+from events.producers.code_drift_monitor import CodeDriftMonitor
 from events.producers.partial_backlog_monitor import PartialBacklogMonitor
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
@@ -91,6 +92,7 @@ _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
 _resource_monitor: Optional[ResourcePressureMonitor] = None
+_code_drift_monitor: Optional[CodeDriftMonitor] = None
 _partial_backlog_monitor: Optional[PartialBacklogMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
@@ -116,7 +118,7 @@ _gateway_started_at_monotonic: Optional[float] = None
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _resource_monitor, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _code_drift_monitor, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -128,6 +130,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
     _resource_monitor = ResourcePressureMonitor(_bus)
+    _code_drift_monitor = CodeDriftMonitor(_bus)
     # Always-on tracker partial/ backlog alert (independent of the re-drive flag).
     # Construction is side-effect-free (stores the path; counts only on check()).
     _partial_backlog_monitor = PartialBacklogMonitor(
@@ -337,6 +340,11 @@ def get_health_monitor() -> Optional[GatewayHealthMonitor]:
 def get_resource_monitor() -> Optional[ResourcePressureMonitor]:
     """Get the resource-pressure monitor (commit/pagefile/disk sampling)."""
     return _resource_monitor
+
+
+def get_code_drift_monitor() -> Optional[CodeDriftMonitor]:
+    """Get the code-drift monitor (checkout-vs-main probe)."""
+    return _code_drift_monitor
 
 
 def get_partial_backlog_monitor() -> Optional[PartialBacklogMonitor]:
@@ -757,6 +765,16 @@ def _subscriber_poll_loop() -> None:
                 except Exception:
                     logger.exception("Resource pressure check failed")
                 last_resource_check = now
+
+            # Code-drift probe — the deployed detached checkout vs the landed
+            # main ref (2026-07-20/21 stale-restart incident). The monitor
+            # self-gates to one read-only git sample per 15 min, so the
+            # per-tick call is a clock comparison.
+            if _code_drift_monitor:
+                try:
+                    _code_drift_monitor.check()
+                except Exception:
+                    logger.exception("Code drift check failed")
 
             # Tracker partial-backlog check every 60s — counts
             # mailbox/tracker/partial/ and emits TRACKER_PARTIAL_BACKLOG on the

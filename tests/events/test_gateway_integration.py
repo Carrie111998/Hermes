@@ -393,6 +393,23 @@ class TestResourceMonitorWiring:
         assert ResourcePressureMonitor(bus)._sampler is sample_resources
 
 
+class TestCodeDriftMonitorWiring:
+    """CodeDriftMonitor (2026-07-21 stale-checkout remediation) must be
+    constructed at startup and probed by the poll loop. Asserted statically
+    for the same reasons as TestResourceMonitorWiring above."""
+
+    def test_getter_returns_module_global(self):
+        assert gi.get_code_drift_monitor() is gi._code_drift_monitor
+
+    def test_startup_constructs_code_drift_monitor(self):
+        src = inspect.getsource(gi.startup)
+        assert "_code_drift_monitor = CodeDriftMonitor(_bus)" in src
+
+    def test_poll_loop_probes_code_drift(self):
+        src = inspect.getsource(gi._subscriber_poll_loop)
+        assert "_code_drift_monitor.check()" in src
+
+
 class TestDedicatedApplierThread:
     """The tracker-intent-applier must run on its OWN daemon thread, decoupled
     from the shared serial subscriber poll loop.
