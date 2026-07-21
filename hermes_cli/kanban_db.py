@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -1021,6 +1022,11 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_pgid: Optional[int]
+    worker_sid: Optional[int]
+    worker_boot_id: Optional[str]
+    worker_started_at: Optional[float]
+    worker_group_started_at: Optional[float]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1032,6 +1038,7 @@ class Run:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        keys = set(row.keys())
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
@@ -1045,6 +1052,25 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_pgid=row["worker_pgid"] if "worker_pgid" in keys else None,
+            worker_sid=row["worker_sid"] if "worker_sid" in keys else None,
+            worker_boot_id=(
+                row["worker_boot_id"]
+                if "worker_boot_id" in keys and row["worker_boot_id"]
+                else None
+            ),
+            worker_started_at=(
+                float(row["worker_started_at"])
+                if "worker_started_at" in keys
+                and row["worker_started_at"] is not None
+                else None
+            ),
+            worker_group_started_at=(
+                float(row["worker_group_started_at"])
+                if "worker_group_started_at" in keys
+                and row["worker_group_started_at"] is not None
+                else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1219,6 +1245,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    -- Durable process identity for this attempt. A launch wrapper may exit
+    -- while another member of its process group/session keeps running; PID
+    -- alone is therefore not sufficient proof that a run is dead. The start
+    -- time fences PID reuse.
+    worker_pgid         INTEGER,
+    worker_sid          INTEGER,
+    worker_boot_id      TEXT,
+    -- Current worker PID incarnation and original process-group generation
+    -- are tracked separately: rebinding worker_pid to a surviving descendant
+    -- must not move the lower bound used to prove the original group identity.
+    worker_started_at   REAL,
+    worker_group_started_at REAL,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -2016,6 +2054,42 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # task_runs originally tracked only the immediate Popen PID. Keep the
+    # process group/session + incarnation start time on the run so crash and
+    # reclaim paths can prove that the whole owned worker tree is gone before
+    # releasing the task back to the dispatcher.
+    run_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "worker_pgid" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_pgid", "worker_pgid INTEGER"
+            )
+        if "worker_sid" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_sid", "worker_sid INTEGER"
+            )
+        if "worker_boot_id" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_boot_id", "worker_boot_id TEXT"
+            )
+        if "worker_started_at" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_started_at", "worker_started_at REAL"
+            )
+        if "worker_group_started_at" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "worker_group_started_at",
+                "worker_group_started_at REAL",
+            )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2137,7 +2211,10 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_pgid INTEGER, worker_sid INTEGER,"
+        " worker_boot_id TEXT,"
+        " worker_started_at REAL, worker_group_started_at REAL,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -3587,9 +3664,13 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        _claim_payload = {"lock": lock, "expires": expires, "run_id": run_id}
+        _m = _worker_model()
+        if _m:
+            _claim_payload["model"] = _m
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            _claim_payload,
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -3669,10 +3750,14 @@ def claim_review_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        _rv_payload = {"lock": lock, "expires": expires, "run_id": run_id,
+                       "source_status": "review"}
+        _rvm = _worker_model()
+        if _rvm:
+            _rv_payload["model"] = _rvm
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+            _rv_payload,
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -3742,13 +3827,26 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    board_db, board_slug = _connection_worker_board_identity(conn)
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
+        "       t.last_heartbeat_at, t.current_run_id, "
+        "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
+        "       r.worker_started_at, r.worker_group_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
+    stale_snapshot = _snapshot_worker_processes(
+        task_ids={row["id"] for row in stale},
+        process_groups={
+            int(row["worker_pgid"])
+            for row in stale
+            if row["worker_pgid"] is not None
+        },
+    ) if stale else []
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
@@ -3761,12 +3859,25 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
-        if (
-            host_local
-            and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
-            and not heartbeat_stale
-        ):
+        owned = _owned_worker_processes(
+            stale_snapshot,
+            task_id=row["id"],
+            run_id=row["current_run_id"],
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_group_started_at=row["worker_group_started_at"],
+            board_db=board_db,
+            board_slug=board_slug,
+        )
+        worker_alive = _recorded_worker_alive(
+            row["worker_pid"],
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_started_at=row["worker_started_at"],
+        ) or bool(owned)
+        if host_local and worker_alive and not heartbeat_stale:
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
                 cur = conn.execute(
@@ -3774,8 +3885,15 @@ def release_stale_claims(
                     "WHERE id = ? AND status = 'running' "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
-                    "  AND claim_expires < ?",
-                    (new_expires, row["id"], row["claim_lock"], now),
+                    "  AND claim_expires < ? "
+                    "  AND current_run_id IS ?",
+                    (
+                        new_expires,
+                        row["id"],
+                        row["claim_lock"],
+                        now,
+                        row["current_run_id"],
+                    ),
                 )
                 if cur.rowcount != 1:
                     continue
@@ -3789,7 +3907,10 @@ def release_stale_claims(
                     conn, row["id"], "claim_extended",
                     {
                         "reason": "pid_alive",
-                        "worker_pid": int(row["worker_pid"]),
+                        "worker_pid": (
+                            int(row["worker_pid"])
+                            if row["worker_pid"] is not None else None
+                        ),
                         "claim_lock": row["claim_lock"],
                         "claim_expires_was": int(row["claim_expires"]),
                         "claim_expires_now": new_expires,
@@ -3804,7 +3925,18 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            task_id=row["id"],
+            run_id=row["current_run_id"],
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_started_at=row["worker_started_at"],
+            worker_group_started_at=row["worker_group_started_at"],
+            board_db=board_db,
+            board_slug=board_slug,
+            signal_fn=signal_fn,
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -3812,6 +3944,7 @@ def release_stale_claims(
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                expected_run_id=row["current_run_id"],
             )
             continue
         with write_txn(conn):
@@ -3819,8 +3952,12 @@ def release_stale_claims(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                "AND current_run_id IS ?",
+                (
+                    row["id"], row["claim_lock"], now,
+                    row["current_run_id"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -3874,7 +4011,12 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT t.status, t.claim_lock, t.worker_pid, t.current_run_id, "
+        "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
+        "       r.worker_started_at, r.worker_group_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -3883,16 +4025,60 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    board_db, board_slug = _connection_worker_board_identity(conn)
+    termination_kwargs = {
+        "task_id": task_id,
+        "run_id": row["current_run_id"],
+        "worker_pgid": row["worker_pgid"],
+        "worker_sid": row["worker_sid"],
+        "worker_boot_id": row["worker_boot_id"],
+        "worker_started_at": row["worker_started_at"],
+        "worker_group_started_at": row["worker_group_started_at"],
+        "board_db": board_db,
+        "board_slug": board_slug,
+        "signal_fn": signal_fn,
+    }
+    # Keep operator/plugin test adapters written against the older private
+    # two-argument helper working while production receives the full identity
+    # fence. Do not catch TypeError from inside the helper itself.
+    try:
+        import inspect
+
+        signature = inspect.signature(_terminate_reclaimed_worker)
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            termination_kwargs = {
+                key: value
+                for key, value in termination_kwargs.items()
+                if key in signature.parameters
+            }
+    except (TypeError, ValueError):
+        pass
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"],
+        prev_lock,
+        **termination_kwargs,
     )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_worker_alive",
+            expected_run_id=row["current_run_id"],
+        )
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ?",
+            (task_id, prev_lock, row["current_run_id"]),
         )
         if cur.rowcount != 1:
             return False
@@ -4161,6 +4347,14 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # boardd rev5 #1: hoist artifact FS I/O (chunked file COPIES + stat) OUT of
+    # write_txn so it never holds the broker's single DB thread. _persist reads
+    # workspace_path (still present pre-completion) + copies files BEFORE BEGIN;
+    # the in-txn block then only does fast DB inserts of the staged paths. Edge:
+    # a completion that then fails the CAS may orphan a few copied files in the
+    # attachment dir (an error path — acceptable).
+    if isinstance(metadata, dict):
+        _persist_scratch_completion_artifacts(conn, task_id, metadata)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4200,7 +4394,7 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            # (artifact files already copied OUTSIDE this txn — see hoist above)
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
                 _insert_completion_attachment(
@@ -6046,9 +6240,11 @@ class DispatchResult:
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
-    """Tasks deferred this tick because their assignee is already at
-    ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
-    ``(task_id, assignee, current_running_count)``. NOT an
+    """Tasks deferred because their assignee owns another active card.
+
+    The dispatcher enforces one active *card* per profile even when the global
+    limit is greater than one. Each entry is ``(task_id, assignee,
+    current_active_card_count)``. NOT an
     operator-actionable failure — the task will be picked up on a
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
@@ -6247,23 +6443,716 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+class _SpawnedWorkerPid(int):
+    """An ``int`` PID carrying identity captured at the Popen boundary.
+
+    Keeping this an int subclass preserves the long-standing ``spawn_fn`` API
+    while avoiding a race where a tiny wrapper exits before ``_set_worker_pid``
+    can query the process group that its surviving descendants still belong to.
+    """
+
+    worker_pgid: Optional[int]
+    worker_sid: Optional[int]
+    worker_boot_id: Optional[str]
+    worker_started_at: Optional[float]
+    worker_group_started_at: Optional[float]
+
+    def __new__(
+        cls,
+        pid: int,
+        *,
+        pgid: Optional[int],
+        sid: Optional[int],
+        boot_id: Optional[str],
+        started_at: Optional[float],
+    ) -> "_SpawnedWorkerPid":
+        value = int.__new__(cls, int(pid))
+        value.worker_pgid = pgid
+        value.worker_sid = sid
+        value.worker_boot_id = boot_id
+        value.worker_started_at = started_at
+        value.worker_group_started_at = started_at
+        return value
+
+
+@dataclass(frozen=True)
+class _WorkerProcessSnapshot:
+    """Host process identity used to prove task/run ownership.
+
+    ``task_id``/``run_id`` come from the environment inherited by every
+    dispatcher-spawned worker descendant. ``pgid``/``sid`` provide a durable
+    fallback when an intermediate wrapper exits or a descendant sanitizes its
+    environment. ``create_time`` fences PID/process-group reuse.
+    """
+
+    pid: int
+    task_id: Optional[str]
+    run_id: Optional[int]
+    pgid: Optional[int]
+    sid: Optional[int]
+    create_time: Optional[float]
+    board_db: Optional[str] = None
+    board_slug: Optional[str] = None
+    boot_id: Optional[str] = None
+
+
+_PROCESS_IDENTITY_TOLERANCE_SECONDS = 0.02
+
+
+def _read_host_boot_id() -> Optional[str]:
+    """Return the current kernel boot identity when the platform exposes it."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _canonical_worker_db_identity(value: Optional[str]) -> Optional[str]:
+    """Canonicalize a worker's board DB path for cross-process comparison."""
+    if not value:
+        return None
+    try:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(str(value))))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _connection_worker_board_identity(
+    conn: sqlite3.Connection,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the canonical DB path and best-effort board slug for ``conn``."""
+    row = next(
+        (
+            item
+            for item in conn.execute("PRAGMA database_list").fetchall()
+            if item[1] == "main"
+        ),
+        None,
+    )
+    db_identity = _canonical_worker_db_identity(row[2] if row else None)
+    board_slug: Optional[str] = None
+    if db_identity:
+        db_path = Path(db_identity)
+        if db_path.parent.parent.name == "boards":
+            try:
+                board_slug = _normalize_board_slug(db_path.parent.name)
+            except ValueError:
+                board_slug = None
+        elif db_path.name == "kanban.db":
+            board_slug = "default"
+    return db_identity, board_slug
+
+
+def _snapshot_matches_worker_board(
+    proc: _WorkerProcessSnapshot,
+    *,
+    board_db: Optional[str],
+    board_slug: Optional[str],
+    require_positive_match: bool,
+) -> bool:
+    """Fence task/run env ownership to the board that owns the DB row.
+
+    Exact environment ownership requires a positive DB/board match. Process-
+    group fallback may accept an unreadable environment, but an explicitly
+    different DB or board is always rejected.
+    """
+    proc_board_db = getattr(proc, "board_db", None)
+    proc_board_slug = getattr(proc, "board_slug", None)
+    if board_db is not None and proc_board_db is not None:
+        if proc_board_db != board_db:
+            return False
+    if board_slug is not None and proc_board_slug is not None:
+        if proc_board_slug != board_slug:
+            return False
+    if not require_positive_match:
+        return True
+    if board_db is not None:
+        return proc_board_db == board_db
+    return bool(board_slug is not None and proc_board_slug == board_slug)
+
+
+def _read_worker_process_identity(
+    pid: Optional[int],
+) -> tuple[Optional[int], Optional[int], Optional[float]]:
+    """Return ``(pgid, sid, create_time)`` for a live process, best effort."""
+    if not pid or int(pid) <= 0:
+        return (None, None, None)
+
+    pgid: Optional[int] = None
+    sid: Optional[int] = None
+    started: Optional[float] = None
+    try:
+        import psutil
+
+        proc = psutil.Process(int(pid))
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return (None, None, None)
+        started = float(proc.create_time())
+    except Exception:
+        # psutil is a core Hermes dependency, but identity collection must not
+        # make spawning fail on a restricted platform/container.
+        pass
+
+    if os.name != "nt":
+        try:
+            pgid = int(os.getpgid(int(pid)))
+        except (AttributeError, ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            sid = int(os.getsid(int(pid)))
+        except (AttributeError, ProcessLookupError, PermissionError, OSError):
+            pass
+    return (pgid, sid, started)
+
+
+def _snapshot_worker_processes(
+    *,
+    task_ids: Optional[set[str]] = None,
+    process_groups: Optional[set[int]] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Snapshot live host processes relevant to tasks or process groups.
+
+    Environment ownership is the cross-platform source of truth. On POSIX we
+    also retain members of known worker process groups so a descendant remains
+    attributable after a short-lived launch wrapper exits, even if that
+    descendant cannot expose its environment to the dispatcher.
+    """
+    wanted_tasks = {str(value) for value in (task_ids or set()) if value}
+    wanted_groups = {
+        int(value) for value in (process_groups or set()) if value is not None
+    }
+    snapshots: list[_WorkerProcessSnapshot] = []
+    try:
+        import psutil
+    except Exception:
+        return snapshots
+
+    host_boot_id = _read_host_boot_id()
+    for proc in psutil.process_iter(["pid", "create_time", "status"]):
+        try:
+            pid = int(proc.info["pid"])
+            if proc.info.get("status") == psutil.STATUS_ZOMBIE:
+                continue
+            pgid: Optional[int] = None
+            sid: Optional[int] = None
+            if os.name != "nt":
+                try:
+                    pgid = int(os.getpgid(pid))
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                try:
+                    sid = int(os.getsid(pid))
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+
+            task_id: Optional[str] = None
+            run_id: Optional[int] = None
+            board_db: Optional[str] = None
+            board_slug: Optional[str] = None
+            try:
+                env = proc.environ()
+                task_id = env.get("HERMES_KANBAN_TASK") or None
+                raw_run_id = env.get("HERMES_KANBAN_RUN_ID")
+                if raw_run_id:
+                    try:
+                        run_id = int(raw_run_id)
+                    except (TypeError, ValueError):
+                        run_id = None
+                board_db = _canonical_worker_db_identity(
+                    env.get("HERMES_KANBAN_DB")
+                )
+                raw_board = env.get("HERMES_KANBAN_BOARD")
+                if raw_board:
+                    try:
+                        board_slug = _normalize_board_slug(raw_board)
+                    except ValueError:
+                        board_slug = None
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                pass
+
+            task_match = bool(task_id and (
+                not wanted_tasks or task_id in wanted_tasks
+            ))
+            group_match = bool(pgid is not None and pgid in wanted_groups)
+            if wanted_tasks or wanted_groups:
+                if not task_match and not group_match:
+                    continue
+            elif not task_id:
+                # With no filters, this is a lightweight snapshot of Kanban
+                # worker env holders, not every process on the machine.
+                continue
+
+            created = proc.info.get("create_time")
+            snapshots.append(
+                _WorkerProcessSnapshot(
+                    pid=pid,
+                    task_id=task_id,
+                    run_id=run_id,
+                    pgid=pgid,
+                    sid=sid,
+                    create_time=float(created) if created is not None else None,
+                    board_db=board_db,
+                    board_slug=board_slug,
+                    boot_id=host_boot_id,
+                )
+            )
+        except (
+            psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            psutil.ZombieProcess,
+            OSError,
+            ValueError,
+        ):
+            continue
+    return snapshots
+
+
+def _verified_worker_group_members(
+    snapshot: Iterable[_WorkerProcessSnapshot],
+    *,
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_group_started_at: Optional[float] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Return members of a process group whose original leader is still live.
+
+    A numeric PGID is reusable. A leaderless group may be the original orphaned
+    worker tree, or a later group whose leader already exited; it is therefore
+    hold-only and never signal authority. This helper grants authority only
+    when the live leader's creation time and boot identity match the generation
+    captured at spawn.
+    """
+    if worker_pgid is None or worker_group_started_at is None:
+        return []
+
+    pgid = int(worker_pgid)
+    group_started = float(worker_group_started_at)
+    candidates = [
+        proc
+        for proc in snapshot
+        if proc.pgid == pgid
+        and (worker_sid is None or proc.sid == int(worker_sid))
+        and (worker_boot_id is None or getattr(proc, "boot_id", None) == worker_boot_id)
+        and _snapshot_matches_worker_board(
+            proc,
+            board_db=board_db,
+            board_slug=board_slug,
+            require_positive_match=False,
+        )
+    ]
+    if not candidates:
+        return []
+
+    leader = next((proc for proc in candidates if proc.pid == pgid), None)
+    if leader is None or (
+        leader.create_time is None
+        or abs(float(leader.create_time) - group_started)
+        > _PROCESS_IDENTITY_TOLERANCE_SECONDS
+    ):
+        return []
+
+    return sorted(
+        (
+            proc
+            for proc in candidates
+            if proc.create_time is not None
+            and float(proc.create_time) >= group_started - 1.0
+        ),
+        key=lambda item: item.pid,
+    )
+
+
+def _ambiguous_worker_group_members(
+    snapshot: Iterable[_WorkerProcessSnapshot],
+    *,
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_group_started_at: Optional[float] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Return leaderless group members that conservatively hold the claim.
+
+    These members prevent a duplicate writer, but are deliberately excluded
+    from signal authority and rebound selection because their PGID generation
+    cannot be proved after the leader exits.
+    """
+    if worker_pgid is None or worker_group_started_at is None:
+        return []
+    pgid = int(worker_pgid)
+    group_started = float(worker_group_started_at)
+    candidates = [
+        proc
+        for proc in snapshot
+        if proc.pgid == pgid
+        and (worker_sid is None or proc.sid == int(worker_sid))
+        and (worker_boot_id is None or getattr(proc, "boot_id", None) == worker_boot_id)
+        and _snapshot_matches_worker_board(
+            proc,
+            board_db=board_db,
+            board_slug=board_slug,
+            require_positive_match=False,
+        )
+    ]
+    if not candidates or any(proc.pid == pgid for proc in candidates):
+        return []
+    return sorted(
+        (
+            proc
+            for proc in candidates
+            if proc.create_time is not None
+            and float(proc.create_time) >= group_started - 1.0
+        ),
+        key=lambda item: item.pid,
+    )
+
+
+def _exact_worker_env_members(
+    snapshot: Iterable[_WorkerProcessSnapshot],
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    worker_boot_id: Optional[str] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Return exact task/run holders positively scoped to this board."""
+    return sorted(
+        (
+            proc
+            for proc in snapshot
+            if proc.task_id == task_id
+            and (run_id is None or proc.run_id == int(run_id))
+            and (worker_boot_id is None or getattr(proc, "boot_id", None) == worker_boot_id)
+            and _snapshot_matches_worker_board(
+                proc,
+                board_db=board_db,
+                board_slug=board_slug,
+                require_positive_match=True,
+            )
+        ),
+        key=lambda item: item.pid,
+    )
+
+
+def _signalable_worker_processes(
+    snapshot: Iterable[_WorkerProcessSnapshot],
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_group_started_at: Optional[float] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Return exact env holders plus members of a live verified group."""
+    values = list(snapshot)
+    signalable = {
+        proc.pid: proc
+        for proc in _exact_worker_env_members(
+            values,
+            task_id=task_id,
+            run_id=run_id,
+            worker_boot_id=worker_boot_id,
+            board_db=board_db,
+            board_slug=board_slug,
+        )
+    }
+    for proc in _verified_worker_group_members(
+        values,
+        worker_pgid=worker_pgid,
+        worker_sid=worker_sid,
+        worker_boot_id=worker_boot_id,
+        worker_group_started_at=worker_group_started_at,
+        board_db=board_db,
+        board_slug=board_slug,
+    ):
+        signalable[proc.pid] = proc
+    return sorted(signalable.values(), key=lambda item: item.pid)
+
+
+def _owned_worker_processes(
+    snapshot: Iterable[_WorkerProcessSnapshot],
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_group_started_at: Optional[float] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Return signalable owners plus ambiguous descendants that hold the claim."""
+    values = list(snapshot)
+    owned = {
+        proc.pid: proc
+        for proc in _signalable_worker_processes(
+            values,
+            task_id=task_id,
+            run_id=run_id,
+            worker_pgid=worker_pgid,
+            worker_sid=worker_sid,
+            worker_boot_id=worker_boot_id,
+            worker_group_started_at=worker_group_started_at,
+            board_db=board_db,
+            board_slug=board_slug,
+        )
+    }
+    for proc in _ambiguous_worker_group_members(
+        values,
+        worker_pgid=worker_pgid,
+        worker_sid=worker_sid,
+        worker_boot_id=worker_boot_id,
+        worker_group_started_at=worker_group_started_at,
+        board_db=board_db,
+        board_slug=board_slug,
+    ):
+        owned[proc.pid] = proc
+    return sorted(owned.values(), key=lambda item: item.pid)
+
+
+def _recorded_worker_alive(
+    pid: Optional[int],
+    *,
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_started_at: Optional[float] = None,
+) -> bool:
+    """PID liveness with process-incarnation checks when identity is known."""
+    if not _pid_alive(pid):
+        return False
+    if (
+        worker_pgid is None
+        and worker_sid is None
+        and worker_boot_id is None
+        and worker_started_at is None
+    ):
+        # Legacy rows may conservatively hold a claim, but callers must not use
+        # this raw PID as signal authority because the number may be recycled.
+        return True
+    if worker_boot_id is not None and _read_host_boot_id() != worker_boot_id:
+        return False
+    pgid, sid, started = _read_worker_process_identity(pid)
+    if worker_pgid is not None and pgid != int(worker_pgid):
+        return False
+    if worker_sid is not None and sid != int(worker_sid):
+        return False
+    if worker_started_at is not None:
+        if (
+            started is None
+            or abs(started - float(worker_started_at))
+            > _PROCESS_IDENTITY_TOLERANCE_SECONDS
+        ):
+            return False
+    return True
+
+
+def _recorded_worker_signal_authorized(
+    pid: Optional[int],
+    *,
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_started_at: Optional[float] = None,
+) -> bool:
+    """True only when a captured creation identity authorizes signaling PID."""
+    return bool(
+        worker_started_at is not None
+        and _recorded_worker_alive(
+            pid,
+            worker_pgid=worker_pgid,
+            worker_sid=worker_sid,
+            worker_boot_id=worker_boot_id,
+            worker_started_at=worker_started_at,
+        )
+    )
+
+
+def _best_rebound_owner(
+    owned: Iterable[_WorkerProcessSnapshot],
+    *,
+    task_id: str,
+    run_id: int,
+) -> Optional[_WorkerProcessSnapshot]:
+    """Prefer an exact task/run env holder over a process-group-only member."""
+    values = list(owned)
+    exact = [
+        proc for proc in values
+        if proc.task_id == task_id and proc.run_id == int(run_id)
+    ]
+    candidates = exact or values
+    return min(candidates, key=lambda item: item.pid) if candidates else None
+
+
+def _live_task_env_holders(
+    task_id: str,
+    *,
+    snapshot: Optional[Iterable[_WorkerProcessSnapshot]] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
+) -> list[_WorkerProcessSnapshot]:
+    """Return live local env holders positively scoped to this task's board."""
+    values = list(snapshot) if snapshot is not None else _snapshot_worker_processes(
+        task_ids={task_id}
+    )
+    return [
+        proc
+        for proc in values
+        if proc.task_id == task_id
+        and _snapshot_matches_worker_board(
+            proc,
+            board_db=board_db,
+            board_slug=board_slug,
+            require_positive_match=bool(board_db or board_slug),
+        )
+    ]
+
+
+def _pidfd_open_worker(pid: int) -> int:
+    """Open a Linux pidfd through Python or libc, failing closed elsewhere."""
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is not None:
+        return int(pidfd_open(int(pid), 0))
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    pidfd_open = getattr(libc, "pidfd_open", None)
+    if pidfd_open is None:
+        raise NotImplementedError("pidfd_open is unavailable")
+    pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+    pidfd_open.restype = ctypes.c_int
+    handle = int(pidfd_open(int(pid), 0))
+    if handle < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return handle
+
+
+def _pidfd_send_worker_signal(handle: int, sig: int) -> None:
+    """Send a signal through a pidfd using Python or libc."""
+    import signal
+
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_send_signal is not None:
+        pidfd_send_signal(int(handle), int(sig), None, 0)
+        return
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    pidfd_send_signal = getattr(libc, "pidfd_send_signal", None)
+    if pidfd_send_signal is None:
+        raise NotImplementedError("pidfd_send_signal is unavailable")
+    pidfd_send_signal.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    ]
+    pidfd_send_signal.restype = ctypes.c_int
+    if int(pidfd_send_signal(int(handle), int(sig), None, 0)) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def _signal_worker_snapshot(
+    proc: _WorkerProcessSnapshot,
+    sig: int,
+    *,
+    signal_fn=None,
+) -> bool:
+    """Signal one process incarnation without a numeric-PID reuse race.
+
+    Production uses Linux pidfds. Opening the handle and then rechecking the
+    captured creation time ensures a PID recycled after the snapshot is never
+    signaled. Platforms without pidfds fail closed; the caller keeps the claim
+    instead of risking another process.
+    """
+    if signal_fn is not None:
+        try:
+            signal_fn(int(proc.pid), sig)
+            return True
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+
+    if proc.create_time is None:
+        return False
+    try:
+        handle = _pidfd_open_worker(int(proc.pid))
+    except (NotImplementedError, ProcessLookupError, PermissionError, OSError):
+        return False
+    try:
+        _pgid, _sid, started = _read_worker_process_identity(proc.pid)
+        if (
+            started is None
+            or abs(float(started) - float(proc.create_time))
+            > _PROCESS_IDENTITY_TOLERANCE_SECONDS
+        ):
+            return False
+        if proc.boot_id is not None and _read_host_boot_id() != proc.boot_id:
+            return False
+        _pidfd_send_worker_signal(handle, sig)
+        return True
+    except ProcessLookupError:
+        return True
+    except (NotImplementedError, PermissionError, OSError):
+        return False
+    finally:
+        os.close(handle)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    task_id: Optional[str] = None,
+    run_id: Optional[int] = None,
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_started_at: Optional[float] = None,
+    worker_group_started_at: Optional[float] = None,
+    board_db: Optional[str] = None,
+    board_slug: Optional[str] = None,
     signal_fn=None,
+    group_signal_fn=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort termination of the complete host-local worker ownership set.
+
+    New task/run-aware callers signal exact board-scoped env owners and members
+    of a live, generation-verified group through incarnation-safe handles, then
+    rescan before releasing the claim. Leaderless groups and legacy raw PIDs
+    can hold a claim but are never signal authority.
+    """
     import signal
 
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
+        "process_group": int(worker_pgid) if worker_pgid is not None else None,
         "host_local": False,
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "owned_pids": [],
+        "signal_authorized_pids": [],
+        "ambiguous_pids": [],
+        "surviving_pids": [],
     }
-    if not pid or pid <= 0 or not claim_lock:
+    if not claim_lock:
         return info
 
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -6271,57 +7160,278 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
+    # Numeric killpg is deliberately not a production fallback: a leaderless
+    # PGID can be reused between snapshot and signal. Tests may provide an
+    # explicit group hook after constructing a live verified leader.
+    kill_group = group_signal_fn
+    task_aware = bool(task_id)
+    process_groups = (
+        {int(worker_pgid)} if worker_pgid is not None else set()
     )
-    if kill is None:
-        return info
+    latest_snapshot: list[_WorkerProcessSnapshot] = []
+    latest_signalable: list[_WorkerProcessSnapshot] = []
+    authorized_incarnations: dict[int, tuple[float, Optional[str]]] = {}
+    legacy_identity: tuple[Optional[int], Optional[int], Optional[float]] = (
+        None,
+        None,
+        None,
+    )
+    if not task_aware and _pid_alive(pid):
+        legacy_identity = _read_worker_process_identity(pid)
+        if legacy_identity[0] is not None:
+            process_groups.add(int(legacy_identity[0]))
 
-    info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
+    def _retain_signal_authority(
+        owned: Iterable[_WorkerProcessSnapshot],
+        newly_signalable: Iterable[_WorkerProcessSnapshot],
+    ) -> list[_WorkerProcessSnapshot]:
+        """Keep per-incarnation authority across leader exit during this kill."""
+        owned_values = list(owned)
+        signalable = {proc.pid: proc for proc in newly_signalable}
+        for proc in signalable.values():
+            if proc.create_time is not None:
+                authorized_incarnations[int(proc.pid)] = (
+                    float(proc.create_time),
+                    getattr(proc, "boot_id", None),
+                )
+        for proc in owned_values:
+            expected = authorized_incarnations.get(int(proc.pid))
+            if expected is None or proc.create_time is None:
+                continue
+            expected_started, expected_boot = expected
+            if (
+                abs(float(proc.create_time) - expected_started)
+                > _PROCESS_IDENTITY_TOLERANCE_SECONDS
+            ):
+                continue
+            if expected_boot != getattr(proc, "boot_id", None):
+                continue
+            signalable[int(proc.pid)] = proc
+        return sorted(signalable.values(), key=lambda item: item.pid)
+
+    def _survivors() -> list[_WorkerProcessSnapshot]:
+        nonlocal latest_snapshot, latest_signalable
+        if not task_aware:
+            pgid, sid, started = legacy_identity
+            snapshot = _snapshot_worker_processes(
+                process_groups={int(pgid)} if pgid is not None else set(),
+            )
+            latest_snapshot = snapshot
+            boot_id = _read_host_boot_id()
+            verified = _verified_worker_group_members(
+                snapshot,
+                worker_pgid=pgid,
+                worker_sid=sid,
+                worker_boot_id=boot_id,
+                worker_group_started_at=started,
+            )
+            held = {
+                proc.pid: proc
+                for proc in (
+                    verified
+                    + _ambiguous_worker_group_members(
+                        snapshot,
+                        worker_pgid=pgid,
+                        worker_sid=sid,
+                        worker_boot_id=boot_id,
+                        worker_group_started_at=started,
+                    )
+                )
+            }
+            if _pid_alive(pid):
+                assert pid is not None
+                live_pid = int(pid)
+                current_pgid, current_sid, current_started = (
+                    _read_worker_process_identity(live_pid)
+                )
+                if (
+                    started is not None
+                    and current_started is not None
+                    and abs(float(current_started) - float(started))
+                    <= _PROCESS_IDENTITY_TOLERANCE_SECONDS
+                ):
+                    held[live_pid] = _WorkerProcessSnapshot(
+                        pid=live_pid,
+                        task_id=None,
+                        run_id=None,
+                        pgid=current_pgid,
+                        sid=current_sid,
+                        create_time=current_started,
+                        boot_id=boot_id,
+                    )
+                    if not verified:
+                        verified = [held[live_pid]]
+            owned = sorted(held.values(), key=lambda item: item.pid)
+            latest_signalable = _retain_signal_authority(owned, verified)
+            return owned
+
+        snapshot = _snapshot_worker_processes(
+            task_ids={str(task_id)},
+            process_groups=process_groups,
+        )
+        latest_snapshot = snapshot
+        latest_signalable = _signalable_worker_processes(
+            snapshot,
+            task_id=str(task_id),
+            run_id=run_id,
+            worker_pgid=worker_pgid,
+            worker_sid=worker_sid,
+            worker_boot_id=worker_boot_id,
+            worker_group_started_at=worker_group_started_at,
+            board_db=board_db,
+            board_slug=board_slug,
+        )
+        owned = _owned_worker_processes(
+            snapshot,
+            task_id=str(task_id),
+            run_id=run_id,
+            worker_pgid=worker_pgid,
+            worker_sid=worker_sid,
+            worker_boot_id=worker_boot_id,
+            worker_group_started_at=worker_group_started_at,
+            board_db=board_db,
+            board_slug=board_slug,
+        )
+        # A recorded PID may be unreadable through process env enumeration.
+        # Creation-time identity can still authorize a pidfd signal. A legacy
+        # identity-null PID may only hold the claim; it is never added to the
+        # signalable set because the numeric PID could have been recycled.
+        if pid and not any(proc.pid == int(pid) for proc in owned):
+            recorded_alive = _recorded_worker_alive(
+                pid,
+                worker_pgid=worker_pgid,
+                worker_sid=worker_sid,
+                worker_boot_id=worker_boot_id,
+                worker_started_at=worker_started_at,
+            )
+            if recorded_alive:
+                pgid, sid, started = _read_worker_process_identity(pid)
+                authorized = _recorded_worker_signal_authorized(
+                    pid,
+                    worker_pgid=worker_pgid,
+                    worker_sid=worker_sid,
+                    worker_boot_id=worker_boot_id,
+                    worker_started_at=worker_started_at,
+                )
+                recorded = _WorkerProcessSnapshot(
+                    pid=int(pid),
+                    task_id=str(task_id) if authorized else None,
+                    run_id=run_id if authorized else None,
+                    pgid=pgid,
+                    sid=sid,
+                    create_time=started,
+                    board_db=board_db if authorized else None,
+                    board_slug=board_slug if authorized else None,
+                    boot_id=_read_host_boot_id(),
+                )
+                owned.append(recorded)
+                if authorized:
+                    latest_signalable.append(recorded)
+        owned_by_pid = {proc.pid: proc for proc in owned}
+        owned = sorted(owned_by_pid.values(), key=lambda item: item.pid)
+        latest_signalable = _retain_signal_authority(owned, latest_signalable)
+        return owned
+
+    owned = _survivors()
+    info["owned_pids"] = [int(proc.pid) for proc in owned]
+    signalable_ids = {int(proc.pid) for proc in latest_signalable}
+    info["signal_authorized_pids"] = sorted(signalable_ids)
+    info["ambiguous_pids"] = [
+        int(proc.pid) for proc in owned if int(proc.pid) not in signalable_ids
+    ]
+    if not owned:
+        # No process incarnation owned by this run remains. Never synthesize a
+        # task-aware signal for a dead/legacy PID: absence is success, not signal
+        # authority. Legacy PID-only callers retain their historical test hook.
+        if not task_aware and signal_fn is not None and pid and int(pid) > 0:
+            info["termination_attempted"] = True
+            try:
+                signal_fn(int(pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
         info["terminated"] = True
         return info
-    except OSError:
+
+    test_signal_hook = signal_fn is not None and group_signal_fn is None
+
+    def _send(sig: int) -> bool:
+        sent = False
+        grouped_pids: set[int] = set()
+        if worker_pgid is not None and kill_group is not None:
+            grouped_pids = {
+                int(proc.pid)
+                for proc in _verified_worker_group_members(
+                    latest_snapshot,
+                    worker_pgid=worker_pgid,
+                    worker_sid=worker_sid,
+                    worker_boot_id=worker_boot_id,
+                    worker_group_started_at=worker_group_started_at,
+                    board_db=board_db,
+                    board_slug=board_slug,
+                )
+            }
+            if grouped_pids:
+                try:
+                    kill_group(int(worker_pgid), sig)
+                    sent = True
+                except ProcessLookupError:
+                    sent = True
+                except OSError:
+                    pass
+
+        # Production signals each verified incarnation through a pidfd. The
+        # explicit group hook above exists only for tests/platform adapters and
+        # is never inferred from a leaderless numeric PGID.
+        for proc in latest_signalable:
+            if int(proc.pid) in grouped_pids:
+                continue
+            if _signal_worker_snapshot(proc, sig, signal_fn=signal_fn):
+                sent = True
+        if sent:
+            info["termination_attempted"] = True
+        return sent
+
+    if not _send(signal.SIGTERM):
+        info["surviving_pids"] = [int(proc.pid) for proc in owned]
+        return info
+
+    # ``signal_fn`` is the established test hook: callers use a no-op recorder
+    # to model successful delivery without killing pytest itself. Preserve that
+    # contract while production and explicit group-hook tests always rescan.
+    if test_signal_hook:
+        info["terminated"] = True
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        owned = _survivors()
+        if not owned:
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
-        try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
-        except (ProcessLookupError, OSError):
-            return info
-
-    info["terminated"] = not _pid_alive(pid)
+    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if _send(_sigkill):
+        info["sigkill"] = True
+    owned = _survivors()
+    info["surviving_pids"] = [int(proc.pid) for proc in owned]
+    info["terminated"] = not owned
     return info
 
 
 def _worker_survived_termination(termination: dict) -> bool:
     """True when we tried to kill our own host-local worker and it is still alive.
 
-    Reclaiming in this state would release the claim and let the dispatcher
-    spawn a second worker while the first is still running — the duplication
-    loop. Only host-local workers we actually signalled count: a non-local
-    claim lock or a no-op attempt (no ``os.kill`` available) must fall through
-    to the normal release path, since we cannot manage that worker anyway.
+    A verified host-local ownership set always holds the claim until gone. This
+    includes platforms where no signal primitive is available: releasing there
+    would be less safe than deferring because it permits a duplicate writer.
     """
+    ownership_seen = bool(
+        termination.get("owned_pids") or termination.get("surviving_pids")
+    )
     return bool(
-        termination.get("termination_attempted")
-        and termination.get("host_local")
+        termination.get("host_local")
         and not termination.get("terminated")
+        and (termination.get("termination_attempted") or ownership_seen)
     )
 
 
@@ -6333,6 +7443,7 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    expected_run_id: Optional[int] = None,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -6344,14 +7455,26 @@ def _defer_reclaim_for_live_worker(
     """
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
-        )
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+                (grace, task_id, claim_lock),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "  AND current_run_id = ?",
+                (grace, task_id, claim_lock, int(expected_run_id)),
+            )
         if cur.rowcount != 1:
             return
-        run_id = _current_run_id(conn, task_id)
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
+        )
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
@@ -6364,6 +7487,40 @@ def _defer_reclaim_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+@lru_cache(maxsize=32)
+def _worker_model_for_home(hermes_home: str) -> Optional[str]:
+    """Best-effort: resolve the loop model from a profile's config.yaml.
+
+    Workers are spawned with HERMES_HOME pointing at their profile dir
+    (see _default_spawn), so ``$HERMES_HOME/config.yaml`` ``model.default``
+    is the model this worker actually runs on. Read once per home, cached.
+    Local operator patch (2026-07-08): stamp the model into claimed/heartbeat
+    events so the board shows which model is doing the work.
+    """
+    try:
+        cfg = Path(hermes_home) / "config.yaml"
+        in_model = False
+        with cfg.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.startswith((" ", "\t")):
+                    in_model = line.strip() == "model:"
+                    continue
+                if in_model:
+                    s = line.strip()
+                    if s.startswith("default:"):
+                        val = s.split(":", 1)[1].strip().strip("'\"")
+                        return val or None
+    except Exception:
+        return None
+    return None
+
+
+def _worker_model() -> Optional[str]:
+    """Model identity of the CURRENT process's worker, or None."""
+    home = os.environ.get("HERMES_HOME", "").strip()
+    return _worker_model_for_home(home) if home else None
 
 
 def heartbeat_worker(
@@ -6409,9 +7566,13 @@ def heartbeat_worker(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
             )
+        hb_payload: dict = {"note": note} if note else {}
+        _model = _worker_model()
+        if _model:
+            hb_payload["model"] = _model
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            hb_payload or None,
             run_id=run_id,
         )
     return True
@@ -6434,15 +7595,17 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    board_db, board_slug = _connection_worker_board_identity(conn)
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, "
+        "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
+        "       r.worker_started_at, r.worker_group_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -6462,31 +7625,33 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid,
+            row["claim_lock"],
+            task_id=tid,
+            run_id=row["current_run_id"],
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_started_at=row["worker_started_at"],
+            worker_group_started_at=row["worker_group_started_at"],
+            board_db=board_db,
+            board_slug=board_slug,
+            signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        # Never make the task spawnable until every process owned by the
+        # timed-out run is actually gone.
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="max_runtime_worker_alive",
+                expected_run_id=row["current_run_id"],
+            )
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
@@ -6494,16 +7659,18 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND current_run_id IS ?",
+                (tid, pid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount == 1:
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
+                    "sigkill": bool(termination.get("sigkill")),
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -6526,7 +7693,10 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={
+                    "pid": pid,
+                    "sigkill": bool(termination.get("sigkill")),
+                },
             )
     return timed_out
 
@@ -6572,10 +7742,14 @@ def detect_stale_running(
 
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    board_db, board_slug = _connection_worker_board_identity(conn)
     reclaimed: list[str] = []
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, r.worker_pgid, r.worker_sid, "
+        "       r.worker_boot_id, r.worker_started_at, "
+        "       r.worker_group_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -6600,9 +7774,20 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        # Terminate the worker if it's still host-local.
+        # Terminate the complete owned worker group if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid,
+            lock,
+            task_id=tid,
+            run_id=row["current_run_id"],
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_started_at=row["worker_started_at"],
+            worker_group_started_at=row["worker_group_started_at"],
+            board_db=board_db,
+            board_slug=board_slug,
+            signal_fn=signal_fn,
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -6611,6 +7796,7 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                expected_run_id=row["current_run_id"],
             )
             continue
 
@@ -6620,8 +7806,8 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                "  AND claim_lock IS ? AND current_run_id IS ?",
+                (tid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -6787,26 +7973,134 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-        for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
+    board_db, board_slug = _connection_worker_board_identity(conn)
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.claim_lock, t.current_run_id, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
+        "       r.worker_started_at, r.worker_group_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    candidates: list[sqlite3.Row] = []
+    for row in rows:
+        # Only check liveness for claims owned by this host.
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        # Grace is per attempt. ``tasks.started_at`` is intentionally sticky
+        # across retries and made a fresh retry look hours old (#t_86a7e7a9).
+        started_at = row["active_started_at"]
+        if started_at is not None:
+            grace = _resolve_crash_grace_seconds()
+            if time.time() - float(started_at) < grace:
                 continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
+        if _recorded_worker_alive(
+            row["worker_pid"],
+            worker_pgid=row["worker_pgid"],
+            worker_sid=row["worker_sid"],
+            worker_boot_id=row["worker_boot_id"],
+            worker_started_at=row["worker_started_at"],
+        ):
+            continue
+        candidates.append(row)
+
+    process_snapshot = _snapshot_worker_processes(
+        task_ids={row["id"] for row in candidates},
+        process_groups={
+            int(row["worker_pgid"])
+            for row in candidates
+            if row["worker_pgid"] is not None
+        },
+    ) if candidates else []
+
+    with write_txn(conn):
+        for row in candidates:
+            run_id = (
+                int(row["current_run_id"])
+                if row["current_run_id"] is not None else None
+            )
+            owned = _owned_worker_processes(
+                process_snapshot,
+                task_id=row["id"],
+                run_id=run_id,
+                worker_pgid=row["worker_pgid"],
+                worker_sid=row["worker_sid"],
+                worker_boot_id=row["worker_boot_id"],
+                worker_group_started_at=row["worker_group_started_at"],
+                board_db=board_db,
+                board_slug=board_slug,
+            )
+            if owned:
+                # A surviving exact env holder or live verified group member can
+                # become the durable diagnostic owner. Leaderless-group members
+                # are hold-only: keep the claim but never rebind to an identity
+                # whose process-group generation cannot be proved.
+                signalable = _signalable_worker_processes(
+                    process_snapshot,
+                    task_id=row["id"],
+                    run_id=run_id,
+                    worker_pgid=row["worker_pgid"],
+                    worker_sid=row["worker_sid"],
+                    worker_boot_id=row["worker_boot_id"],
+                    worker_group_started_at=row["worker_group_started_at"],
+                    board_db=board_db,
+                    board_slug=board_slug,
+                )
+                owner = _best_rebound_owner(
+                    signalable, task_id=row["id"], run_id=run_id or 0,
+                )
+                if owner is None:
                     continue
-            if _pid_alive(row["worker_pid"]):
+                cur = conn.execute(
+                    "UPDATE tasks SET worker_pid = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND worker_pid = ? AND claim_lock IS ? "
+                    "  AND current_run_id IS ?",
+                    (
+                        int(owner.pid), row["id"], int(row["worker_pid"]),
+                        row["claim_lock"], row["current_run_id"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    continue
+                if run_id is not None:
+                    conn.execute(
+                        "UPDATE task_runs SET worker_pid = ?, "
+                        "worker_started_at = ?, "
+                        "worker_pgid = COALESCE(worker_pgid, ?), "
+                        "worker_sid = COALESCE(worker_sid, ?), "
+                        "worker_boot_id = COALESCE(worker_boot_id, ?), "
+                        "worker_group_started_at = "
+                        "COALESCE(worker_group_started_at, ?) WHERE id = ?",
+                        (
+                            int(owner.pid),
+                            owner.create_time,
+                            owner.pgid,
+                            owner.sid,
+                            owner.boot_id,
+                            owner.create_time,
+                            run_id,
+                        ),
+                    )
+                _append_event(
+                    conn,
+                    row["id"],
+                    "worker_rebound",
+                    {
+                        "previous_pid": int(row["worker_pid"]),
+                        "worker_pid": int(owner.pid),
+                        "worker_pgid": row["worker_pgid"],
+                        "worker_sid": row["worker_sid"],
+                        "owner_pgid": owner.pgid,
+                        "owner_sid": owner.sid,
+                        "owned_pids": [int(proc.pid) for proc in owned],
+                        "reason": "launch_pid_exited_owner_survives",
+                    },
+                    run_id=run_id,
+                )
                 continue
 
             pid = int(row["worker_pid"])
@@ -6877,8 +8171,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND current_run_id IS ?",
+                (
+                    row["id"], pid, row["claim_lock"],
+                    row["current_run_id"],
+                ),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7025,7 +8323,7 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
@@ -7190,7 +8488,7 @@ def _record_spawn_failure(
     task_id: str,
     error: str,
     *,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -7201,25 +8499,165 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    worker_pgid: Optional[int] = None,
+    worker_sid: Optional[int] = None,
+    worker_boot_id: Optional[str] = None,
+    worker_started_at: Optional[float] = None,
+    worker_group_started_at: Optional[float] = None,
+) -> None:
+    """Record the spawned process and its durable ownership identity.
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    The immediate PID remains useful for diagnostics, but crash/reclaim safety
+    is anchored to the attempt's process group/session and incarnation start
+    time. This lets a descendant retain ownership when a launch wrapper exits.
     """
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+    observed_pgid, observed_sid, observed_started = _read_worker_process_identity(pid)
+    if worker_pgid is None:
+        # Only infer a durable process group for the new-session shape used by
+        # _default_spawn. Persisting pytest's/shell's shared PGID would claim
+        # unrelated siblings as worker descendants and could authorize signals
+        # outside the task. Explicit spawn-boundary identity remains accepted.
+        worker_pgid = (
+            observed_pgid
+            if observed_pgid == int(pid) and observed_sid == int(pid)
+            else None
         )
+    if worker_sid is None:
+        worker_sid = (
+            observed_sid
+            if observed_pgid == int(pid) and observed_sid == int(pid)
+            else None
+        )
+    if worker_started_at is None:
+        worker_started_at = observed_started
+    if worker_boot_id is None and worker_started_at is not None:
+        worker_boot_id = _read_host_boot_id()
+    if worker_group_started_at is None:
+        worker_group_started_at = (
+            worker_started_at
+            if worker_pgid is not None and worker_sid is not None
+            else None
+        )
+
+    payload: dict[str, Any] = {"pid": int(pid)}
+    if worker_pgid is not None:
+        payload["pgid"] = int(worker_pgid)
+    if worker_sid is not None:
+        payload["sid"] = int(worker_sid)
+    if worker_boot_id is not None:
+        payload["boot_id"] = worker_boot_id
+    if worker_started_at is not None:
+        payload["process_started_at"] = float(worker_started_at)
+    if worker_group_started_at is not None:
+        payload["process_group_started_at"] = float(worker_group_started_at)
+    with write_txn(conn):
         run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        if run_id is None:
+            return
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+            (int(pid), task_id, int(run_id)),
+        )
+        if cur.rowcount != 1:
+            return
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, worker_pgid = ?, "
+            "worker_sid = ?, worker_boot_id = ?, worker_started_at = ?, "
+            "worker_group_started_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (
+                int(pid),
+                int(worker_pgid) if worker_pgid is not None else None,
+                int(worker_sid) if worker_sid is not None else None,
+                worker_boot_id,
+                (
+                    float(worker_started_at)
+                    if worker_started_at is not None else None
+                ),
+                (
+                    float(worker_group_started_at)
+                    if worker_group_started_at is not None else None
+                ),
+                run_id,
+            ),
+        )
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
+
+
+def _release_post_claim_live_worker_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    *,
+    restore_status: str,
+    board_db: Optional[str],
+    board_slug: Optional[str],
+    phase: str,
+) -> bool:
+    """Undo our claim if a fresh post-claim scan finds an existing owner.
+
+    The queue snapshot used by the pre-claim guard can become stale before the
+    claim CAS runs.  In particular, a launch wrapper may exit while its durable
+    descendant is only just becoming visible in the host process snapshot.  A
+    second scan after the claim closes that lifecycle race.  The unwind is
+    itself CAS-fenced to the exact run opened by this dispatcher, so a worker or
+    operator transition that wins concurrently is never overwritten.
+    """
+    if run_id is None:
+        return False
+    holders = _live_task_env_holders(
+        task_id,
+        board_db=board_db,
+        board_slug=board_slug,
+    )
+    if not holders:
+        return False
+
+    now = int(time.time())
+    holder_pids = sorted({int(proc.pid) for proc in holders})
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+            "AND worker_pid IS NULL",
+            (restore_status, task_id, int(run_id)),
+        )
+        if cur.rowcount != 1:
+            # The holder is still authoritative even if a concurrent worker or
+            # operator transition won the task-row CAS. Returning True tells
+            # the caller to suppress spawning without overwriting that winner.
+            return True
+        conn.execute(
+            "UPDATE task_runs SET status = 'released', outcome = 'released', "
+            "summary = ?, ended_at = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+            (
+                "dispatch suppressed: live worker process appeared after claim",
+                now,
+                int(run_id),
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "respawn_guarded",
+            {
+                "reason": "live_worker_process",
+                "phase": phase,
+                "guard": "post_claim",
+                "holder_pids": holder_pids,
+            },
+            run_id=int(run_id),
+        )
+    return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7244,7 +8682,12 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def check_respawn_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    process_snapshot: Optional[Iterable[_WorkerProcessSnapshot]] = None,
+) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
@@ -7252,6 +8695,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``ready`` and gets another chance on the next dispatcher tick.
 
     Checks in priority order:
+
+    ``"live_worker_process"``
+        A local process still carries ``HERMES_KANBAN_TASK`` for this card.
+        This is the last line of defense against a stale/crashed DB transition
+        spawning a second workspace writer while the first run survives.
 
     ``"rate_limit_cooldown"``
         The task's most recent run ended with the ``rate_limited`` outcome
@@ -7298,6 +8746,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone()
     if row is None:
         return None
+
+    # Process ownership wins over every historical/database heuristic. Even a
+    # task row incorrectly reset to ``ready`` must not spawn beside a surviving
+    # worker or tool child that still owns the same card. Ownership is scoped to
+    # the concrete board DB so identical task IDs on other boards do not collide.
+    board_db, board_slug = _connection_worker_board_identity(conn)
+    if _live_task_env_holders(
+        task_id,
+        snapshot=process_snapshot,
+        board_db=board_db,
+        board_slug=board_slug,
+    ):
+        return "live_worker_process"
 
     now = int(time.time())
 
@@ -7549,6 +9010,7 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    board_db, board_slug = _connection_worker_board_identity(conn)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
@@ -7608,26 +9070,59 @@ def _dispatch_once_locked(
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
     spawned = 0
-    # Per-profile concurrency cap (#21582): when set, track how many
-    # workers each assignee already has in flight, and refuse to spawn
-    # when this would push that assignee past the cap. Prevents
-    # fan-out workloads from melting a single profile's local model /
-    # API quota / browser pool while leaving other profiles idle.
+    # One-active-card-per-profile invariant (#21582, hardened by R13): track
+    # which distinct cards each assignee already has in flight, and refuse to
+    # spawn a second card for that assignee. This is unconditional: a global
+    # max greater than one must be filled by different profiles, never by
+    # fanning two cards into the same profile. ``max_in_progress_per_profile``
+    # remains accepted for configuration compatibility, but values above one
+    # cannot relax this safety invariant.
     # Tasks blocked this way go to skipped_per_profile_capped (not
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
-    _per_profile_cap = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
-    _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    _per_profile_active_cards: dict[str, set[str]] = {}
+    _profile_rows = conn.execute(
+        "SELECT t.id, t.assignee, t.status, t.current_run_id, "
+        "       r.worker_pgid, r.worker_sid, r.worker_boot_id, "
+        "       r.worker_group_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.assignee IS NOT NULL "
+        "  AND t.status NOT IN ('done', 'archived')"
+    ).fetchall()
+    _profile_process_snapshot = _snapshot_worker_processes(
+        task_ids={prow["id"] for prow in _profile_rows},
+        process_groups={
+            int(prow["worker_pgid"])
+            for prow in _profile_rows
+            if prow["worker_pgid"] is not None
+        },
+    ) if _profile_rows else []
+    # Reuse the one all-unresolved-cards host snapshot for both ready and review
+    # preclaim guards. Besides keeping the scan bounded to once per tick, this
+    # preserves R12's mandatory fresh *post*-claim scan as the next ownership
+    # observation that closes the snapshot-to-claim race.
+    ready_process_snapshot = _profile_process_snapshot
+    for prow in _profile_rows:
+        # A surviving descendant holds profile capacity even if a wrapper exit
+        # caused the task row to be restored to ready/review. Reuse R12's
+        # board-, run-, boot-, and process-group-fenced ownership proof rather
+        # than introducing a weaker PID/env-only signal.
+        owns_live_process = bool(_owned_worker_processes(
+            _profile_process_snapshot,
+            task_id=prow["id"],
+            run_id=prow["current_run_id"],
+            worker_pgid=prow["worker_pgid"],
+            worker_sid=prow["worker_sid"],
+            worker_boot_id=prow["worker_boot_id"],
+            worker_group_started_at=prow["worker_group_started_at"],
+            board_db=board_db,
+            board_slug=board_slug,
+        ))
+        if prow["status"] == "running" or owns_live_process:
+            _per_profile_active_cards.setdefault(prow["assignee"], set()).add(
+                prow["id"]
+            )
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -7714,19 +9209,15 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
-        # Per-profile concurrency cap (#21582): even if there's global
-        # headroom, refuse to spawn for an assignee that's already at
-        # its in-flight cap. Prevents one profile's local model / API
-        # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
+        # A live owner for THIS card is left to the same-card respawn guard
+        # below. Only a distinct active card profile-caps this candidate.
+        active_cards = _per_profile_active_cards.get(row_assignee, set())
+        other_active_cards = active_cards - {row["id"]}
+        if other_active_cards:
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, len(active_cards))
+            )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -7735,7 +9226,11 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
+        guard_reason = check_respawn_guard(
+            conn,
+            row["id"],
+            process_snapshot=ready_process_snapshot,
+        )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was
@@ -7750,17 +9245,25 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
-            # Increment per-profile counter even in dry_run so the cap
-            # check sees the would-be spawn on subsequent iterations.
-            # Without this, dry_run reports every task as spawnable and
-            # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
-                )
+            _per_profile_active_cards.setdefault(row_assignee, set()).add(
+                row["id"]
+            )
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        if _release_post_claim_live_worker_guard(
+            conn,
+            claimed.id,
+            claimed.current_run_id,
+            restore_status="ready",
+            board_db=board_db,
+            board_slug=board_slug,
+            phase="ready",
+        ):
+            result.respawn_guarded.append(
+                (claimed.id, "live_worker_process")
+            )
             continue
         try:
             resolved_branch_name = None
@@ -7796,7 +9299,18 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    int(pid),
+                    worker_pgid=getattr(pid, "worker_pgid", None),
+                    worker_sid=getattr(pid, "worker_sid", None),
+                    worker_boot_id=getattr(pid, "worker_boot_id", None),
+                    worker_started_at=getattr(pid, "worker_started_at", None),
+                    worker_group_started_at=getattr(
+                        pid, "worker_group_started_at", None
+                    ),
+                )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -7806,12 +9320,9 @@ def _dispatch_once_locked(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            # Track the new in-flight count for this profile so later
-            # iterations in this same tick respect the per-profile cap
-            # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
-                _per_profile_running[claimed.assignee] = (
-                    _per_profile_running.get(claimed.assignee, 0) + 1
+            if claimed.assignee:
+                _per_profile_active_cards.setdefault(claimed.assignee, set()).add(
+                    claimed.id
                 )
         except Exception as exc:
             auto = _record_spawn_failure(
@@ -7835,6 +9346,7 @@ def _dispatch_once_locked(
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    review_process_snapshot = _profile_process_snapshot
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -7848,11 +9360,52 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        active_cards = _per_profile_active_cards.get(row["assignee"], set())
+        other_active_cards = active_cards - {row["id"]}
+        if other_active_cards:
+            result.skipped_per_profile_capped.append(
+                (row["id"], row["assignee"], len(active_cards))
+            )
+            continue
+        if _live_task_env_holders(
+            row["id"],
+            snapshot=review_process_snapshot,
+            board_db=board_db,
+            board_slug=board_slug,
+        ):
+            result.respawn_guarded.append(
+                (row["id"], "live_worker_process")
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "respawn_guarded",
+                        {"reason": "live_worker_process", "phase": "review"},
+                    )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            _per_profile_active_cards.setdefault(row["assignee"], set()).add(
+                row["id"]
+            )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        if _release_post_claim_live_worker_guard(
+            conn,
+            claimed.id,
+            claimed.current_run_id,
+            restore_status="review",
+            board_db=board_db,
+            board_slug=board_slug,
+            phase="review",
+        ):
+            result.respawn_guarded.append(
+                (claimed.id, "live_worker_process")
+            )
             continue
         try:
             resolved_branch_name = None
@@ -7891,9 +9444,24 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    int(pid),
+                    worker_pgid=getattr(pid, "worker_pgid", None),
+                    worker_sid=getattr(pid, "worker_sid", None),
+                    worker_boot_id=getattr(pid, "worker_boot_id", None),
+                    worker_started_at=getattr(pid, "worker_started_at", None),
+                    worker_group_started_at=getattr(
+                        pid, "worker_group_started_at", None
+                    ),
+                )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if claimed.assignee:
+                _per_profile_active_cards.setdefault(claimed.assignee, set()).add(
+                    claimed.id
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8352,7 +9920,22 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    # ``start_new_session=True`` guarantees PGID/SID == child PID on POSIX.
+    # Capture that contract here, before a short-lived wrapper can disappear;
+    # descendants inherit the group even after its leader exits.
+    pgid, sid, started_at = _read_worker_process_identity(proc.pid)
+    if started_at is None:
+        started_at = time.time()
+    if os.name != "nt":
+        pgid = pgid if pgid is not None else int(proc.pid)
+        sid = sid if sid is not None else int(proc.pid)
+    return _SpawnedWorkerPid(
+        proc.pid,
+        pgid=pgid,
+        sid=sid,
+        boot_id=_read_host_boot_id(),
+        started_at=started_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9244,3 +10827,45 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# --- boardd single-writer broker shim (HERMES_KANBAN_BROKER=1) ----------------
+# Rebinds the public board functions to broker-backed delegates so callers that
+# touch the FLEET board route through boardd. connect()/connect_closing() are
+# FLEET-GATED (rev7, council GO-FLEET-ONLY): they route to the broker ONLY when
+# the requested open resolves to the fleet DB, and pass every other board
+# (per-seat legacy, default) straight through to the ORIGINAL local sqlite
+# connect. Because this runs at the END of module import, dependent modules that
+# did ``from ... import <fn>`` bind to the rebound function. No effect when the
+# flag is unset.
+#
+# Only the exactly-once-sensitive HOT ops are rebound to native broker ops
+# (applied_ops dedup). Every OTHER write_txn function (create_task, complete_task,
+# block_task, unblock_task, promote_task, reclaim_task, schedule_task, decompose,
+# ...) runs UNCHANGED and atomically through the broker's INTERACTIVE TRANSACTION
+# when — and only when — the connection is a fleet BrokerConnection; no lifecycle
+# policy is reimplemented. _check_file_length_invariant is neutered client-side
+# (it reads the raw db FILE, decoupled from the broker's connection view under WAL
+# -> false torn-extend); the broker runs the authoritative check on its own
+# connection. See boardd_shim.py + INVENTORY §A.
+if os.environ.get("HERMES_KANBAN_BROKER") == "1":
+    try:
+        import sys as _sys
+        from hermes_cli import boardd_shim as _boardd_shim
+        # Capture the GENUINE connect/connect_closing (+ this module, for route
+        # resolution) BEFORE repointing the public names, so the fleet-gate's
+        # non-fleet pass-through calls the real implementation.
+        _boardd_shim._capture_original(_sys.modules[__name__])
+        connect = _boardd_shim.connect
+        connect_closing = _boardd_shim.connect_closing
+        add_comment = _boardd_shim.add_comment
+        claim_task = _boardd_shim.claim_task
+        heartbeat_worker = _boardd_shim.heartbeat_worker
+        set_workspace_path = _boardd_shim.set_workspace_path
+        set_branch_name = _boardd_shim.set_branch_name
+        _check_file_length_invariant = _boardd_shim.noop_flen
+    except Exception as _boardd_shim_err:  # never break the module on shim import
+        import logging as _logging
+        _logging.getLogger("kanban_db").error(
+            "boardd shim install FAILED (%s); DO NOT enable cutover perms while "
+            "this log line is present.", _boardd_shim_err)
