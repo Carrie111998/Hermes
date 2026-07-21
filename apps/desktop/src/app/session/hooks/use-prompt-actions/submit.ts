@@ -58,6 +58,7 @@ interface SubmitPromptDeps {
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
+  getSelectionGeneration: () => number
   requestGateway: GatewayRequest
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
@@ -103,6 +104,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
     getRoutedStoredSessionId,
     getRuntimeIdForStoredSession,
     getRouteToken,
+    getSelectionGeneration,
     requestGateway,
     resumeStoredSession,
     selectedStoredSessionIdRef,
@@ -258,6 +260,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         : (selectedStoredSessionId ?? routedStoredSessionId)
 
       let startingRouteToken = getRouteToken()
+      let startingSelectionGeneration = getSelectionGeneration()
 
       // Reason string (or null) for why the session context genuinely drifted
       // under this in-flight submit. sessionContextDrift ignores the churn a
@@ -271,21 +274,23 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // pipeline's own re-home) is never counted as drift.
       const sessionDriftReason = (): string | null =>
         targetStartedInCurrentView
-          ? sessionContextDrift({
-              startRouteToken: startingRouteToken,
-              nowRouteToken: getRouteToken(),
-              startSelectedStoredId: startingStoredSessionId,
-              nowSelectedStoredId: selectedStoredSessionIdRef.current,
-              submitTargetStoredId: startingStoredSessionId,
-              composerScope: options?.composerScope,
-              // The composer keys drafts/attachments on the durable lineage
-              // root (survives auto-compression tip rotation), while
-              // startingStoredSessionId is the live tip — resolve the target
-              // into the same lineage-root domain before comparing, or every
-              // submit into a session that has ever compressed would
-              // false-positive-abort.
-              submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
-            })
+          ? getSelectionGeneration() !== startingSelectionGeneration
+            ? 'selection generation changed'
+            : sessionContextDrift({
+                startRouteToken: startingRouteToken,
+                nowRouteToken: getRouteToken(),
+                startSelectedStoredId: startingStoredSessionId,
+                nowSelectedStoredId: selectedStoredSessionIdRef.current,
+                submitTargetStoredId: startingStoredSessionId,
+                composerScope: options?.composerScope,
+                // The composer keys drafts/attachments on the durable lineage
+                // root (survives auto-compression tip rotation), while
+                // startingStoredSessionId is the live tip — resolve the target
+                // into the same lineage-root domain before comparing, or every
+                // submit into a session that has ever compressed would
+                // false-positive-abort.
+                submitTargetComposerScope: resolveComposerSessionKey(startingStoredSessionId, $sessions.get())
+              })
           : null
 
       const targetIsCurrentView = (): boolean => targetStartedInCurrentView && !sessionDriftReason()
@@ -581,6 +586,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // pipeline; the closures (seedOptimistic et al) see the new value.
         startingStoredSessionId = selectedStoredSessionIdRef.current
         startingRouteToken = getRouteToken()
+        startingSelectionGeneration = getSelectionGeneration()
 
         seedOptimistic(sessionId)
       }
@@ -748,6 +754,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       getRoutedStoredSessionId,
       getRuntimeIdForStoredSession,
       getRouteToken,
+      getSelectionGeneration,
       requestGateway,
       resumeStoredSession,
       scope,

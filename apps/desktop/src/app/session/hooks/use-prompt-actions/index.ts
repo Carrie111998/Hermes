@@ -223,6 +223,7 @@ interface PromptActionsOptions {
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
+  getSelectionGeneration: () => number
   handleSkinCommand: (arg: string) => string
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
@@ -254,6 +255,7 @@ export function usePromptActions({
   getRoutedStoredSessionId,
   getRuntimeIdForStoredSession,
   getRouteToken,
+  getSelectionGeneration,
   handleSkinCommand,
   openMemoryGraph,
   refreshSessions,
@@ -474,6 +476,7 @@ export function usePromptActions({
     getRoutedStoredSessionId,
     getRuntimeIdForStoredSession,
     getRouteToken,
+    getSelectionGeneration,
     requestGateway,
     resumeStoredSession,
     selectedStoredSessionIdRef,
@@ -628,6 +631,16 @@ export function usePromptActions({
     // The ref is updated via useEffect on every activeSessionId change, so it
     // always reflects the current session — same pattern submitText uses.
     const sessionId = activeSessionIdRef.current
+    let expectedRuntimeSessionId = sessionId
+    const startingStoredSessionId = selectedStoredSessionIdRef.current
+    const startingRouteToken = getRouteToken()
+    const startingSelectionGeneration = getSelectionGeneration()
+
+    const stopContextDrifted = () =>
+      activeSessionIdRef.current !== expectedRuntimeSessionId ||
+      selectedStoredSessionIdRef.current !== startingStoredSessionId ||
+      getRouteToken() !== startingRouteToken ||
+      getSelectionGeneration() !== startingSelectionGeneration
 
     const releaseBusy = () => {
       setMutableRef(busyRef, false)
@@ -675,22 +688,38 @@ export function usePromptActions({
     try {
       await withSessionNotFoundResume(
         sessionId,
-        selectedStoredSessionIdRef.current,
+        startingStoredSessionId,
         liveId => requestGateway('session.interrupt', { session_id: liveId }),
         {
           requestGateway,
+          driftReason: () => (stopContextDrifted() ? 'interrupt context changed' : null),
           onRecovered: recoveredId => {
+            expectedRuntimeSessionId = recoveredId
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
           }
         }
       )
-      releaseBusy()
+      if (!stopContextDrifted()) {
+        releaseBusy()
+      }
     } catch (err) {
+      if (stopContextDrifted()) {
+        return
+      }
       releaseBusy()
       notifyError(err, copy.stopFailed)
     }
-  }, [activeSessionIdRef, busyRef, copy.stopFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState])
+  }, [
+    activeSessionIdRef,
+    busyRef,
+    copy.stopFailed,
+    getRouteToken,
+    getSelectionGeneration,
+    requestGateway,
+    selectedStoredSessionIdRef,
+    updateSessionState
+  ])
 
   // The desktop steering action is an immediate correction: the core cancels
   // model generation and rebuilds the live turn with displayed reasoning and
