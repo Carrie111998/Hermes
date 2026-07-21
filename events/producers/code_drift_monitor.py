@@ -145,5 +145,143 @@ def sample_code_drift(repo: Optional[Path] = None) -> Optional[DriftSample]:
     )
 
 
-class CodeDriftMonitor:  # implemented in the next commit
-    pass
+class CodeDriftMonitor:
+    """Probes checkout-vs-main drift and emits CODE_DRIFT on the edge.
+
+    Call check() from the gateway subscriber poll loop (any cadence — it
+    self-gates to one git probe per ``check_interval_seconds``). Sampler,
+    wall clock, and state path are injectable so the edge core is fully
+    testable without git, sleeps, or live ~/.hermes I/O.
+    """
+
+    def __init__(
+        self,
+        bus: EventBus,
+        *,
+        repo_path: Optional[Path] = None,
+        sampler: Optional[Callable[[], Optional[DriftSample]]] = None,
+        clock: Optional[Callable[[], float]] = None,
+        state_path: Optional[Path] = None,
+        check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
+        re_alert_cooldown_seconds: float = DEFAULT_RE_ALERT_COOLDOWN_SECONDS,
+    ):
+        self.bus = bus
+        self._repo_path = Path(repo_path) if repo_path else None
+        self._sampler = sampler or (lambda: sample_code_drift(self._repo_path))
+        # WALL clock, not monotonic: last_emit is persisted across restarts.
+        self._clock = clock or time.time
+        self._state_path = Path(state_path) if state_path else code_drift_state_path()
+        self.check_interval_seconds = check_interval_seconds
+        self.re_alert_cooldown_seconds = re_alert_cooldown_seconds
+
+        self._last_check: Optional[float] = None
+        state = load_state(self._state_path, {})
+        self._alerting: bool = bool(state.get("alerting"))
+        last_emit = state.get("last_emit_wall")
+        self._last_emit: Optional[float] = (
+            float(last_emit) if isinstance(last_emit, (int, float)) else None
+        )
+        last_shape = state.get("last_shape")
+        self._last_shape: Optional[List] = (
+            list(last_shape) if isinstance(last_shape, list) else None
+        )
+
+    def check(self) -> Optional[str]:
+        """Probe if the interval elapsed; emit if an edge fired.
+
+        Swallows sampler failures — a git hiccup must never crash the
+        gateway poll loop, and must not fabricate drift or recovery.
+        """
+        now = self._clock()
+        if (self._last_check is not None
+                and now - self._last_check < self.check_interval_seconds):
+            return None
+        self._last_check = now
+        try:
+            sample = self._sampler()
+        except Exception:
+            logger.exception("CodeDriftMonitor: sampler raised")
+            return None
+        if sample is None:
+            return None
+        return self.evaluate(sample, now)
+
+    def evaluate(self, sample: DriftSample, now: float) -> Optional[str]:
+        """Pure edge core given (sample, wall-clock now) + persisted state."""
+        if sample.state == "in_sync":
+            if not self._alerting:
+                return None
+            # Falling edge: the episode alerted, so close the loop.
+            self._alerting = False
+            self._last_shape = None
+            self._last_emit = None  # next rising edge fires immediately
+            self._save()
+            return self._emit_resolved(sample)
+
+        shape = sample.shape
+        rising_edge = not self._alerting
+        shape_changed = self._last_shape is not None and shape != self._last_shape
+        cooldown_elapsed = (
+            self._last_emit is None
+            or (now - self._last_emit) >= self.re_alert_cooldown_seconds
+        )
+        self._alerting = True
+        if not (rising_edge or shape_changed or cooldown_elapsed):
+            return None
+
+        self._last_emit = now
+        self._last_shape = shape
+        self._save()
+        return self._emit_drift(sample)
+
+    def _save(self) -> None:
+        try:
+            save_state(self._state_path, {
+                "alerting": self._alerting,
+                "last_emit_wall": self._last_emit,
+                "last_shape": self._last_shape,
+            })
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("CodeDriftMonitor: state persist failed")
+
+    def _repo_str(self) -> str:
+        return str(self._repo_path or _agent_src_root())
+
+    def _emit_drift(self, sample: DriftSample) -> str:
+        logger.warning(
+            "Code drift: checkout %s main (behind %d / ahead %d, dirty=%s) "
+            "— HEAD %s vs main %s",
+            sample.state, sample.behind_count, sample.ahead_count,
+            sample.dirty, sample.head[:9], sample.main[:9],
+        )
+        return self.bus.emit(
+            event_type=EventType.CODE_DRIFT,
+            source="system",
+            payload={
+                "status": "drifting",
+                "state": sample.state,
+                "head": sample.head[:9],
+                "main": sample.main[:9],
+                "behind_count": sample.behind_count,
+                "ahead_count": sample.ahead_count,
+                "dirty": sample.dirty,
+                "missed_subjects": list(sample.missed_subjects),
+                "repo": self._repo_str(),
+            },
+            tags=["code", "drift", sample.state],
+        )
+
+    def _emit_resolved(self, sample: DriftSample) -> str:
+        logger.info("Code drift resolved: checkout back in sync @ %s",
+                    sample.main[:9])
+        return self.bus.emit(
+            event_type=EventType.CODE_DRIFT,
+            source="system",
+            payload={
+                "status": "resolved",
+                "head": sample.head[:9],
+                "main": sample.main[:9],
+                "repo": self._repo_str(),
+            },
+            tags=["code", "drift", "resolved"],
+        )
