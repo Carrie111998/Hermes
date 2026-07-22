@@ -2579,3 +2579,46 @@ class TestBlockNotification:
             engine._try_block_notify(
                 wf, "a", states["a"], "blocked", context
             )
+
+
+# ── Path resolution tests ───────────────────────────────────────
+
+class TestPathResolution:
+
+    def test_engine_resolves_hermes_home_workflows(self, tmp_path):
+        """Engine resolves workflow dir from HERMES_HOME/workflows/."""
+        from plugins.workflow.engine import WorkflowEngine
+        workflows = tmp_path / "workflows"
+        workflows.mkdir()
+        (workflows / "test.yaml").write_text("name: test\nnodes: {}\n")
+
+        engine = WorkflowEngine(workflows_dir=str(workflows))
+        assert engine.workflows_dir == workflows
+
+    def test_engine_resolves_explicit_dir(self, tmp_path):
+        """Engine uses explicit workflows_dir when provided."""
+        from plugins.workflow.engine import WorkflowEngine
+        engine = WorkflowEngine(workflows_dir=str(tmp_path))
+        assert engine.workflows_dir == tmp_path
+
+    def test_config_loader_reads_from_workflows(self, tmp_path, monkeypatch):
+        """Config loader reads from HERMES_HOME/workflows/config.yaml."""
+        import plugins.workflow as wf_mod
+        monkeypatch.setattr(wf_mod, "_CONFIG", None)  # reset cache
+        workflows = tmp_path / "workflows"
+        workflows.mkdir()
+        (workflows / "config.yaml").write_text("auto_discovery: false\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        config = wf_mod.load_config()
+        assert config["auto_discovery"] is False
+
+    def test_config_loader_uses_defaults_when_missing(self, tmp_path, monkeypatch):
+        """Config loader returns defaults when config.yaml doesn't exist."""
+        import plugins.workflow as wf_mod
+        monkeypatch.setattr(wf_mod, "_CONFIG", None)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        config = wf_mod.load_config()
+        assert config["auto_discovery"] is True
+        assert config["max_nodes_per_workflow"] == 256
