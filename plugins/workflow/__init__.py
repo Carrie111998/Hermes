@@ -76,7 +76,7 @@ def get_config() -> Dict[str, Any]:
 
 
 def register(ctx):
-    """Register workflow tools and the workflow_analyst auxiliary."""
+    """Register workflow tools, the workflow_analyst auxiliary, and kanban lifecycle hooks."""
     ctx.register_auxiliary_task(
         key="workflow_analyst",
         display_name="Workflow analyst",
@@ -121,3 +121,61 @@ def register(ctx):
             handler=handler,
             check_fn=check_workflow_requirements,
         )
+
+    # Register kanban lifecycle hooks to update the job log DB
+    ctx.register_hook("kanban_task_completed", _on_kanban_task_completed)
+    ctx.register_hook("kanban_task_blocked", _on_kanban_task_blocked)
+
+
+def _on_kanban_task_completed(*, task_id: str, **kwargs):
+    """Update the job log DB when a workflow node card completes."""
+    _update_node_card_db(task_id, "done")
+
+
+def _on_kanban_task_blocked(*, task_id: str, **kwargs):
+    """Update the job log DB when a workflow node card is blocked."""
+    _update_node_card_db(task_id, "blocked")
+
+
+def _update_node_card_db(card_id: str, status: str):
+    """Update a node card's status and check if the run is complete."""
+    try:
+        import sqlite3
+        from pathlib import Path
+        db_path = Path.home() / ".hermes" / "workflows" / "executions.db"
+        if not db_path.exists():
+            return
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                "UPDATE workflow_node_cards SET status = ? WHERE card_id = ?",
+                (status, card_id)
+            )
+            # Check if all cards for this run are terminal
+            row = conn.execute(
+                "SELECT run_id FROM workflow_node_cards WHERE card_id = ?",
+                (card_id,)
+            ).fetchone()
+            if not row:
+                return
+            run_id = row[0]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ?",
+                (run_id,)
+            ).fetchone()[0]
+            done = conn.execute(
+                "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ? AND status IN ('done','failed')",
+                (run_id,)
+            ).fetchone()[0]
+            if done >= total:
+                has_failed = conn.execute(
+                    "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ? AND status = 'failed'",
+                    (run_id,)
+                ).fetchone()[0]
+                final = "failed" if has_failed > 0 else "completed"
+                from datetime import datetime, timezone
+                conn.execute(
+                    "UPDATE workflow_executions SET status = ?, finished_at = ? WHERE run_id = ?",
+                    (final, datetime.now(timezone.utc).isoformat(), run_id)
+                )
+    except Exception:
+        pass  # Non-fatal — state files still work

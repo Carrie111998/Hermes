@@ -1120,7 +1120,7 @@ class WorkflowEngine:
     # ── State persistence ──────────────────────────────────────
 
     def _init_exec_db(self) -> None:
-        """Create the workflow executions table if it doesn't exist."""
+        """Create the workflow executions and node_cards tables if they don't exist."""
         try:
             import sqlite3
             with sqlite3.connect(str(self._exec_db_path)) as conn:
@@ -1140,6 +1140,16 @@ class WorkflowEngine:
                 """)
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_we_status ON workflow_executions(status)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_we_name ON workflow_executions(workflow_name)")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS workflow_node_cards (
+                        card_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        FOREIGN KEY (run_id) REFERENCES workflow_executions(run_id)
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_wnc_run ON workflow_node_cards(run_id)")
         except Exception:
             pass  # Non-fatal — state files still work
 
@@ -1188,6 +1198,55 @@ class WorkflowEngine:
                     f"UPDATE workflow_executions SET {', '.join(updates)} WHERE run_id = ?",
                     params
                 )
+        except Exception:
+            pass
+
+    def _record_node_card(self, card_id: str, run_id: str, node_id: str) -> None:
+        """Record a card→run→node mapping in the job log DB."""
+        try:
+            import sqlite3
+            with sqlite3.connect(str(self._exec_db_path)) as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO workflow_node_cards (card_id, run_id, node_id, status) VALUES (?, ?, ?, 'pending')",
+                    (card_id, run_id, node_id)
+                )
+        except Exception:
+            pass
+
+    def _update_node_card_status(self, card_id: str, status: str) -> None:
+        """Update a node card's status (called from kanban hooks)."""
+        try:
+            import sqlite3
+            with sqlite3.connect(str(self._exec_db_path)) as conn:
+                conn.execute(
+                    "UPDATE workflow_node_cards SET status = ? WHERE card_id = ?",
+                    (status, card_id)
+                )
+                # Check if all cards for this run are terminal
+                row = conn.execute(
+                    "SELECT run_id FROM workflow_node_cards WHERE card_id = ?",
+                    (card_id,)
+                ).fetchone()
+                if row:
+                    run_id = row[0]
+                    total = conn.execute(
+                        "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ?",
+                        (run_id,)
+                    ).fetchone()[0]
+                    done = conn.execute(
+                        "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ? AND status IN ('done','failed')",
+                        (run_id,)
+                    ).fetchone()[0]
+                    if done >= total:
+                        final = "failed" if conn.execute(
+                            "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ? AND status = 'failed'",
+                            (run_id,)
+                        ).fetchone()[0] > 0 else "completed"
+                        from datetime import datetime, timezone
+                        conn.execute(
+                            "UPDATE workflow_executions SET status = ?, finished_at = ? WHERE run_id = ?",
+                            (final, datetime.now(timezone.utc).isoformat(), run_id)
+                        )
         except Exception:
             pass
 
@@ -2050,6 +2109,8 @@ class WorkflowEngine:
                                 print(f"   ⊙ {nid} → in-process (scope: global)")
                                 continue
                             state.kanban_card_id = card_id
+                            if card_id and workflow.run_id:
+                                self._record_node_card(card_id, workflow.run_id, nid)
                             if layer == layers[-1]:
                                 last_layer_card_ids.append(card_id)
                             print(f"   ✓ {nid} → card {card_id}")
@@ -2201,6 +2262,8 @@ class WorkflowEngine:
                         print(f"   ⊙ {nid} → in-process (scope: global)")
                         continue
                     state.kanban_card_id = card_id
+                    if card_id and workflow.run_id:
+                        self._record_node_card(card_id, workflow.run_id, nid)
                     # Initialize heartbeat so the sweep doesn't auto-block
                     # the card before the worker picks it up.
                     try:
@@ -2265,6 +2328,8 @@ class WorkflowEngine:
                             print(f"   ⊙ {nid} → in-process (scope: global)")
                             continue
                         state.kanban_card_id = card_id
+                        if card_id and workflow.run_id:
+                            self._record_node_card(card_id, workflow.run_id, nid)
                         print(f"   ✓ {nid} → card {card_id} (unblocked)")
                         running_nodes.append(nid)
                     except Exception as e:
@@ -2322,6 +2387,8 @@ class WorkflowEngine:
                             print(f"   ⊙ {revision_nid} → in-process (scope: global)")
                             continue
                         rev_state.kanban_card_id = card_id
+                        if card_id and workflow.run_id:
+                            self._record_node_card(card_id, workflow.run_id, revision_nid)
                         print(f"   ✓ {revision_nid} → card {card_id}")
                     except Exception as e:
                         rev_state.status = "failed"

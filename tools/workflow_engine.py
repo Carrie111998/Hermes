@@ -1853,25 +1853,32 @@ def main():
         if not db_path.exists():
             print("No workflow executions found.")
             return
-        query = "SELECT run_id, workflow_name, status, started_at, finished_at, current_layer, total_layers, error FROM workflow_executions"
+        query = """
+            SELECT w.run_id, w.workflow_name, w.status,
+                   w.started_at, w.finished_at,
+                   w.current_layer, w.total_layers, w.error,
+                   (SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = w.run_id AND status = 'done') as nodes_done,
+                   (SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = w.run_id) as nodes_total
+            FROM workflow_executions w
+        """
         params = []
         if args.status:
-            query += " WHERE status = ?"
+            query += " WHERE w.status = ?"
             params.append(args.status)
-        query += " ORDER BY started_at DESC LIMIT ?"
+        query += " ORDER BY w.started_at DESC LIMIT ?"
         params.append(args.limit)
         with sqlite3.connect(str(db_path)) as conn:
             rows = conn.execute(query, params).fetchall()
         if not rows:
             print("No workflow executions found.")
             return
-        print(f"{'RUN ID':<30} {'WORKFLOW':<20} {'STATUS':<12} {'STARTED':<22} {'LAYER':<8} {'ERROR'}")
+        print(f"{'RUN ID':<30} {'WORKFLOW':<20} {'STATUS':<12} {'STARTED':<22} {'NODES':<10} {'ERROR'}")
         print("-" * 120)
         for row in rows:
-            run_id, name, status, started, finished, layer, total, err = row
-            layer_str = f"{layer}/{total}" if total else str(layer)
+            run_id, name, status, started, finished, layer, total, err, nd, nt = row
+            nodes_str = f"{nd}/{nt}" if nt else "-"
             err_str = (err[:40] + "...") if err and len(err) > 40 else (err or "")
-            print(f"{run_id:<30} {name:<20} {status:<12} {started or '':<22} {layer_str:<8} {err_str}")
+            print(f"{run_id:<30} {name:<20} {status:<12} {started or '':<22} {nodes_str:<10} {err_str}")
 
     elif args.command == "show":
         workflow = engine.load_workflow(args.workflow)
