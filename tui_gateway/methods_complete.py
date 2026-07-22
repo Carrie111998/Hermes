@@ -215,6 +215,45 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"items": items})
 
 
+@method("complete.suggest")
+def _(rid, params: dict) -> dict:
+    """Return deterministic ghost-text replies for an empty composer."""
+    session = _sessions.get(params.get("session_id") or "")
+    if session is None:
+        return _ok(rid, {"candidates": [], "history_version": 0})
+    if not bool(
+        (_load_cfg().get("display") or {}).get("composer_suggestions", True)
+    ):
+        return _ok(rid, {"candidates": [], "history_version": 0})
+
+    lock = session.get("history_lock")
+    try:
+        if lock is not None:
+            with lock:
+                history = list(session.get("history", []))
+                version = int(session.get("history_version", 0))
+        else:
+            history = list(session.get("history", []))
+            version = int(session.get("history_version", 0))
+
+        assistant_text = ""
+        for msg in reversed(history):
+            if msg.get("role") == "assistant":
+                assistant_text = _coerce_message_text(msg.get("content")) or ""
+                break
+
+        from tui_gateway.suggest import extract_suggestions
+
+        candidates = [
+            {"text": candidate.text, "kind": candidate.kind}
+            for candidate in extract_suggestions(assistant_text)
+        ]
+        return _ok(rid, {"candidates": candidates, "history_version": version})
+    except Exception:
+        # Suggestions are decorative and must never break the composer.
+        return _ok(rid, {"candidates": [], "history_version": 0})
+
+
 @method("complete.slash")
 def _(rid, params: dict) -> dict:
     text = params.get("text", "")
