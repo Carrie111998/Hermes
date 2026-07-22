@@ -1514,7 +1514,7 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
             # A source-native job sheet is direct observed evidence, not an
             # inferred candidate. Keep the backend decision gate explicit even
             # when the model omits this mechanical classification.
-            payload.setdefault("confidence", "observed")
+            payload.setdefault("confidence", "high")
 
     # Alias coercion: the model sometimes invents sibling names for the job
     # number param (PG day-26 run passed reportedJobNo); the backend only
@@ -1595,7 +1595,7 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
                 current_refs = _current_turn_source_refs()
                 if current_refs:
                     payload["evidenceMessageRefs"] = current_refs
-                    payload.setdefault("confidence", "observed")
+                    payload.setdefault("confidence", "high")
         # Recover only declared path params accidentally placed beside the
         # generic payload object; arbitrary top-level args never cross over.
         if configured is not None:
