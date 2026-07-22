@@ -593,6 +593,14 @@ async def get_session_messages(
     include_compacted: bool = False,
     from_end: bool = False,
 ):
+    """Return persisted session messages.
+
+    ``from_end`` is a one-shot tail selector: when true, ``offset`` is ignored
+    and the response contains the newest page. The returned pagination offset
+    is absolute; clients page backward by subtracting their next page size and
+    omitting ``from_end``.
+    """
+
     def _read():
         db = _open_session_db_for_profile(profile)
         try:
