@@ -163,7 +163,7 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 14
-MGMT_NEW_INSTRUCTION_COUNT = 12
+MGMT_NEW_INSTRUCTION_COUNT = 13
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
