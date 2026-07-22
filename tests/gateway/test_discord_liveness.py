@@ -173,7 +173,7 @@ def test_platform_config_extra_overrides_process_liveness_bridge(monkeypatch):
 async def _connect(adapter: DiscordAdapter, monkeypatch, bot_factory):
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
     intents = SimpleNamespace(

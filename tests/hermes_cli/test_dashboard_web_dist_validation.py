@@ -9,10 +9,19 @@ the dist has no index.html, and proceed when it does.
 Design credit: PR #17845 (@Caelier).
 """
 
+from pathlib import Path
 import sys
 import types
 
 import pytest
+
+# Fork's cmd_dashboard also does `from hermes_cli.web_server import WEB_DIST`
+# (main.py, 2026-04-17 already-built check) before it ever reaches the
+# HERMES_WEB_DIST validation these tests pin, so the stub module must expose
+# it. Value is irrelevant to these tests (a nonexistent path just makes the
+# already-built short-circuit evaluate False, same as production on a clean
+# checkout) -- only its presence (avoiding ImportError) matters.
+_STUB_WEB_DIST = Path("nonexistent-hermes-web-dist-stub")
 
 
 @pytest.fixture()
@@ -70,7 +79,9 @@ def test_env_dist_without_index_exits(main_mod, monkeypatch, tmp_path, capsys):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.web_server",
-        types.SimpleNamespace(start_server=lambda **k: started.append(k)),
+        types.SimpleNamespace(
+            start_server=lambda **k: started.append(k), WEB_DIST=_STUB_WEB_DIST
+        ),
     )
     builds = []
     monkeypatch.setattr(
@@ -100,7 +111,9 @@ def test_env_dist_with_index_starts_server(main_mod, monkeypatch, tmp_path):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.web_server",
-        types.SimpleNamespace(start_server=lambda **k: started.append(k)),
+        types.SimpleNamespace(
+            start_server=lambda **k: started.append(k), WEB_DIST=_STUB_WEB_DIST
+        ),
     )
     builds = []
     monkeypatch.setattr(
@@ -122,12 +135,18 @@ def test_env_dist_tilde_expanded_for_web_server(main_mod, monkeypatch, tmp_path)
     dist.mkdir(parents=True)
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    # ntpath.expanduser() checks USERPROFILE before HOME (posixpath only
+    # checks HOME, so this is a no-op there) -- without it, Path("~/mydist")
+    # .expanduser() resolves against the real Windows user profile instead
+    # of the fixture's fake home, and this test's tilde-expansion assertion
+    # observes the developer's real HOME dir path instead of tmp_path.
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HERMES_WEB_DIST", "~/mydist")
 
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.web_server",
-        types.SimpleNamespace(start_server=lambda **k: None),
+        types.SimpleNamespace(start_server=lambda **k: None, WEB_DIST=_STUB_WEB_DIST),
     )
 
     main_mod.cmd_dashboard(_args())

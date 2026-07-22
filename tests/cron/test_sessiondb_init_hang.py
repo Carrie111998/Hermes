@@ -205,7 +205,7 @@ class TestDispatchGuardReleasedAfterHang:
                      },
                  ), \
                  patch("run_agent.AIAgent") as mock_agent_cls, \
-                 patch.object(sched, "get_due_jobs", return_value=[job]), \
+                 patch.object(sched, "get_due_and_skipped_jobs", return_value=([job], [])), \
                  patch.object(sched, "advance_next_run"), \
                  patch.object(sched, "save_job_output", return_value="/tmp/out"), \
                  patch.object(sched, "mark_job_run"), \
