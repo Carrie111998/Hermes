@@ -22812,6 +22812,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         )
         return False
     try:
+        # Capture the private control-plane armer from the exact lock lease
+        # this gateway just acquired. It is kept on the live runner instance,
+        # never exported through the public status API.
+        from gateway.status import _claim_gateway_control_plane_context
+
+        runner._gateway_control_plane_context = (
+            _claim_gateway_control_plane_context()
+        )
+    except Exception:
+        release_gateway_runtime_lock()
+        logger.exception("Could not bind gateway control-plane authority")
+        return False
+    try:
         write_pid_file()
     except FileExistsError:
         release_gateway_runtime_lock()

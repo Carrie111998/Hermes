@@ -28,6 +28,47 @@ def kanban_home(tmp_path, monkeypatch):
 # Workspace flag parsing
 # ---------------------------------------------------------------------------
 
+
+def test_continuation_operator_allowlist_reads_root_config(kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  continuation_operator_profiles: default,fable\n",
+        encoding="utf-8",
+    )
+    with kb.connect() as conn:
+        assert kb._continuation_operator_profiles(conn) == ("default", "fable")
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["- not-a-mapping\n", "kanban: not-a-mapping\n"],
+)
+def test_continuation_operator_allowlist_malformed_root_config_fails_closed(
+    kanban_home, malformed
+):
+    (kanban_home / "config.yaml").write_text(malformed, encoding="utf-8")
+    with kb.connect() as conn:
+        assert kb._continuation_operator_profiles(conn) == ()
+
+
+def test_continuation_operator_allowlist_cannot_be_redirected_by_env(
+    kanban_home, monkeypatch
+):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  continuation_operator_profiles: default,fable\n",
+        encoding="utf-8",
+    )
+    with kb.connect() as conn:
+        attacker_root = kanban_home.parent / "attacker-root"
+        attacker_root.mkdir()
+        (attacker_root / "config.yaml").write_text(
+            "kanban:\n  continuation_operator_profiles: engineer\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(attacker_root))
+
+        assert kb._continuation_operator_profiles(conn) == ("default", "fable")
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [
@@ -165,6 +206,96 @@ def test_run_slash_json_output(kanban_home):
     assert payload["title"] == "jsontask"
     assert payload["assignee"] == "alice"
     assert payload["status"] == "ready"
+
+
+def test_run_slash_continuation_repeated_prs_and_consumed_readback(
+    kanban_home, monkeypatch
+):
+    sha_a = "a" * 40
+    sha_b = "b" * 40
+    pr_a = f"o269/omnia#568@{sha_a}"
+    pr_b = f"o269/omnia-v2#198@{sha_b}"
+
+    monkeypatch.setattr(
+        kb,
+        "_default_github_pr_verifier",
+        lambda pr: kb.GitHubPRState(
+            canonical_url=pr.canonical_url,
+            state="OPEN",
+            is_draft=True,
+            head_sha=pr.head_sha,
+        ),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_default_profile_provider_resolver",
+        lambda _profile: "openai-codex",
+    )
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(
+        kb,
+        "_continuation_operator_context",
+        lambda _conn: ("fable", ("default", "fable"), None),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="repair", assignee="engineer")
+        for raw in (pr_a, pr_b):
+            pr = kb.parse_continuation_pr_tuple(raw)
+            kb.add_comment(conn, task_id, "worker", f"Opened {pr.canonical_url}")
+
+    reviewed = json.loads(
+        kc.run_slash(
+            f"continuation review {task_id} --verdict fix-required "
+            "--reason 'repair both exact heads' --json"
+        )
+    )
+    assert reviewed["verdict"] == "fix_required"
+
+    authorized = json.loads(
+        kc.run_slash(
+            f"continuation authorize {task_id} "
+            f"--pr {pr_a} --pr {pr_b} "
+            "--reason 'repair exact review findings' "
+            "--profile engineer --provider openai-codex --json"
+        )
+    )
+    assert authorized["status"] == "active"
+    assert [pr["head_sha"] for pr in authorized["prs"]] == [sha_a, sha_b]
+    assert authorized["authorized_by"] == "fable"
+
+    assert "Claimed" in kc.run_slash(f"claim {task_id}")
+    history = json.loads(kc.run_slash(f"continuation show {task_id} --json"))
+    assert history[0]["status"] == "consumed"
+    assert history[0]["consumed_run_id"] is not None
+    assert history[0]["expires_at"] > history[0]["created_at"]
+
+
+def test_run_slash_operator_claim_override_is_supported(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr(
+        kb,
+        "_continuation_operator_context",
+        lambda _conn: ("fable", ("fable",), None),
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="follow up", assignee="engineer")
+        kb.add_comment(
+            conn,
+            task_id,
+            "engineer",
+            "PR merged: https://github.com/o269/omnia/pull/568",
+        )
+
+    denied = kc.run_slash(f"claim {task_id}")
+    assert "guard=active_pr" in denied
+    claimed = kc.run_slash(
+        f"claim {task_id} --operator-override-reason 'verify merged follow-up'"
+    )
+    assert "Claimed" in claimed
+    with kb.connect() as conn:
+        events = kb.list_events(conn, task_id)
+    assert any(event.kind == "respawn_guard_bypassed" for event in events)
 
 
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
@@ -335,6 +466,7 @@ def test_kanban_in_autocomplete_table():
     subs = SUBCOMMANDS.get("/kanban") or []
     assert "create" in subs
     assert "dispatch" in subs
+    assert "continuation" in subs
 
 
 def test_kanban_autocomplete_includes_live_subcommands():
@@ -565,3 +697,55 @@ def test_run_slash_board_override_does_not_change_boards_show_current(kanban_hom
     out = kc.run_slash("--board beta boards show")
 
     assert "Current board: alpha" in out
+
+
+# ---------------------------------------------------------------------------
+# Privileged audit-reason visibility (Unicode-invisible rejection)
+# ---------------------------------------------------------------------------
+
+_INVISIBLE_CLI_AUDIT_REASONS = [
+    "\u200b",
+    "\ufeff",
+    "\u2060",
+    "\u034f",
+    "\ufe00",
+    "\U000e0100",
+    "\u115f",
+    "\u1160",
+    "\u3164",
+    "\uffa0",
+    "\u2800",
+    "\u0301",
+    " \u034f \ufe00 \U000e0100 ",
+]
+
+
+@pytest.mark.parametrize("invisible", _INVISIBLE_CLI_AUDIT_REASONS)
+def test_run_slash_continuation_review_rejects_invisible_reason(kanban_home, invisible):
+    import re
+
+    out = kc.run_slash("create 'invisible review' --assignee engineer")
+    task_id = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    out = kc.run_slash(
+        f"continuation review {task_id} --verdict fix-required --reason '{invisible}'"
+    )
+
+    assert "review reason required" in out
+    with kb.connect() as conn:
+        events = kb.list_events(conn, task_id)
+        assert not [e for e in events if e.kind == "continuation_reviewed"]
+
+
+@pytest.mark.parametrize("invisible", _INVISIBLE_CLI_AUDIT_REASONS)
+def test_run_slash_claim_operator_override_rejects_invisible_reason(kanban_home, invisible):
+    import re
+
+    out = kc.run_slash("create 'invisible override' --assignee engineer")
+    task_id = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    out = kc.run_slash(f"claim {task_id} --operator-override-reason '{invisible}'")
+
+    assert "operator override reason required" in out
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "ready"

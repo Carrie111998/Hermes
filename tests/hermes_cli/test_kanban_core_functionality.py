@@ -1230,7 +1230,10 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765}
+        payload = spawned[0].payload
+        assert payload is not None
+        assert payload["pid"] == 98765
+        assert payload["boot_id"]
     finally:
         conn.close()
 
@@ -4114,7 +4117,6 @@ def test_complete_prose_scan_ignores_existing_ids(kanban_home):
 def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
     """Manual reclaim releases the claim, resets status, and emits a
     ``reclaimed`` event even when claim_expires has not passed."""
-    import signal
     import time
     import secrets
     import hermes_cli.kanban_db as _kb
@@ -4125,14 +4127,12 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
         future = int(time.time()) + 3600
         killed: list[int] = []
-        state = {"alive": True}
 
         def _signal(pid, sig):
             killed.append(sig)
-            if sig == signal.SIGTERM:
-                state["alive"] = False
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        # A dead legacy PID is absence of an owner, not signal authority.
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -4172,9 +4172,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
+        assert reclaim_evs[0].get("termination_attempted") is False
         assert reclaim_evs[0].get("terminated") is True
-        assert killed == [signal.SIGTERM]
+        assert killed == []
     finally:
         conn.close()
 
@@ -4312,14 +4312,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
     the Forbidden-Seeds-reported gap where timeout loops never capped.
     """
     import hermes_cli.kanban_db as _kb
-    state = {"sent_term": False}
-    def _alive(pid):
-        return not state["sent_term"]
-    def _signal(pid, sig):
-        import signal as _sig
-        if sig == _sig.SIGTERM:
-            state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
 
     conn = kb.connect()
     try:
@@ -4335,12 +4328,11 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
             with kb.write_txn(conn):
                 conn.execute(
                     "UPDATE tasks SET status='running', claim_lock=?, "
-                    "claim_expires=?, worker_pid=?, started_at=? "
+                    "claim_expires=?, worker_pid=99999, started_at=? "
                     "WHERE id=?",
                     (
                         f"{_kb._claimer_id().split(':', 1)[0]}:lock",
                         int(time.time()) + 3600,
-                        os.getpid(),
                         int(time.time()) - 30,
                         tid,
                     ),
@@ -4348,12 +4340,11 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
                 conn.execute(
                     "INSERT INTO task_runs (task_id, status, claim_lock, "
                     "claim_expires, worker_pid, started_at) "
-                    "VALUES (?, 'running', ?, ?, ?, ?)",
+                    "VALUES (?, 'running', ?, ?, 99999, ?)",
                     (
                         tid,
                         f"{_kb._claimer_id().split(':', 1)[0]}:lock",
                         int(time.time()) + 3600,
-                        os.getpid(),
                         int(time.time()) - 30,
                     ),
                 )
@@ -4362,10 +4353,9 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
                     "UPDATE tasks SET current_run_id=? WHERE id=?",
                     (rid, tid),
                 )
-            state["sent_term"] = False
             # Lower the threshold by monkeypatching the default.
             monkeypatch.setattr(_kb, "DEFAULT_FAILURE_LIMIT", 3)
-            kb.enforce_max_runtime(conn, signal_fn=_signal)
+            kb.enforce_max_runtime(conn)
 
         final = kb.get_task(conn, tid)
         # After 3 consecutive timeouts with failure_limit=3, task should

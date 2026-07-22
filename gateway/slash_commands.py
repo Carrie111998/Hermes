@@ -89,6 +89,10 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+    # Installed exactly once by start_gateway after it has acquired the real
+    # runtime lock.  Partial test instances and non-gateway callers have no
+    # armer and therefore cannot mint privileged board authority.
+    _gateway_control_plane_context: Any = None
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -459,7 +463,17 @@ class GatewaySlashCommandsMixin:
         is_create = action == "create"
 
         try:
-            output = await asyncio.to_thread(run_slash, text)
+            # The armer is a private closure captured from the gateway-owned
+            # runtime-lock lease at startup.  Importing gateway.status, calling
+            # the legacy public context manager, or assigning a fake handle
+            # cannot obtain its opaque token. asyncio.to_thread propagates the
+            # armed ContextVar and the closure resets it on exit.
+            arm_control_plane = self._gateway_control_plane_context
+            if arm_control_plane is None:
+                output = await asyncio.to_thread(run_slash, text)
+            else:
+                with arm_control_plane():
+                    output = await asyncio.to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
 
@@ -4131,9 +4145,9 @@ class GatewaySlashCommandsMixin:
         """Handle /topup -- show the Nous balance and hand off to the portal.
 
         Renders the balance block + identity line + a tappable portal URL that
-        opens the billing page. Terminal billing is managed on the portal: the
-        terminal does NOT charge, confirm, or track payment here — everything
-        happens in the browser and the next /topup shows the new balance. The
+        opens the billing page. Remote spending is managed on the portal: this
+        messaging command does NOT charge, confirm, or track payment here —
+        everything happens in the browser and the next /topup shows the new balance. The
         tappable URL is the affordance and works on every platform (button-capable
         or plain text like SMS/email). Fetched off the event loop; fail-open.
         """

@@ -12,6 +12,8 @@ empty ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes.
 
 from __future__ import annotations
 
+import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -23,8 +25,10 @@ from hermes_cli import kanban_db as kb
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "profiles" / "w").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_BROKER", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
@@ -101,3 +105,74 @@ def test_reentrant_same_path_lock_is_exclusive(conn):
         assert held_a is True
         with kb._dispatch_tick_lock(db_path) as held_b:
             assert held_b is False, "same-board lock must be exclusive"
+
+
+def _dispatch_lock_holder(home: str, entered, release, output) -> None:
+    os.environ["HERMES_HOME"] = home
+    os.environ["HERMES_KANBAN_HOME"] = home
+    os.environ["HERMES_KANBAN_BROKER"] = "0"
+    from hermes_cli import kanban_db as child_kb
+
+    def blocking_spawn(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(10)
+        return 99101
+
+    with child_kb.connect() as child_conn:
+        result = child_kb.dispatch_once(child_conn, spawn_fn=blocking_spawn)
+    output.put((result.skipped_locked, len(result.spawned)))
+
+
+def _dispatch_lock_contender(home: str, output) -> None:
+    os.environ["HERMES_HOME"] = home
+    os.environ["HERMES_KANBAN_HOME"] = home
+    os.environ["HERMES_KANBAN_BROKER"] = "0"
+    from hermes_cli import kanban_db as child_kb
+
+    with child_kb.connect() as child_conn:
+        result = child_kb.dispatch_once(
+            child_conn, spawn_fn=lambda *_args, **_kwargs: 99102
+        )
+    output.put((result.skipped_locked, len(result.spawned)))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-lock regression")
+def test_two_concurrent_dispatcher_processes_allow_only_lock_holder(
+    conn, kanban_home
+):
+    """The losing invocation must perform no claim, run creation, or spawn."""
+    task_id = kb.create_task(conn, title="one", assignee="w")
+    ctx = multiprocessing.get_context("spawn")
+    entered = ctx.Event()
+    release = ctx.Event()
+    holder_output = ctx.Queue()
+    contender_output = ctx.Queue()
+    holder = ctx.Process(
+        target=_dispatch_lock_holder,
+        args=(str(kanban_home), entered, release, holder_output),
+    )
+    contender = ctx.Process(
+        target=_dispatch_lock_contender,
+        args=(str(kanban_home), contender_output),
+    )
+    holder.start()
+    assert entered.wait(10), "holder never reached spawn while owning dispatch lock"
+    contender.start()
+    contender.join(10)
+    assert contender.exitcode == 0
+    release.set()
+    holder.join(10)
+    assert holder.exitcode == 0
+    assert holder_output.get(timeout=2) == (False, 1)
+    assert contender_output.get(timeout=2) == (True, 0)
+    # Re-open after cross-process writes; the fixture connection may retain a
+    # pre-fork read snapshot under WAL.
+    with kb.connect() as verify_conn:
+        row = verify_conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        run_count = verify_conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+    assert row["status"] == "running" and row["current_run_id"]
+    assert run_count == 1
