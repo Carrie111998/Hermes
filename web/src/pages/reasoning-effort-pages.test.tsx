@@ -590,6 +590,7 @@ describe("ProfilesPage reasoning effort selector", () => {
 
       const selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
       expect(selects).toHaveLength(2);
+      expect(selects[0].textContent).toContain("custom · provider-model");
       await chooseOption(
         selects[1],
         selectedEffort === "high"

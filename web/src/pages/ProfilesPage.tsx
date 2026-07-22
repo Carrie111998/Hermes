@@ -669,6 +669,16 @@ export default function ProfilesPage() {
     [closeEditor, editingModelFor, loadModelChoices],
   );
 
+  // Keep a persisted custom/unknown model visible in the picker even when the
+  // dashboard catalog has no matching option. It remains a display-only
+  // option: the save path below still only writes catalog selections.
+  const unlistedInitialModel =
+    modelChoices !== null &&
+    modelEditInitialChoice !== "" &&
+    !modelChoices.some(
+      (c) => `${c.provider}\u0000${c.model}` === modelEditInitialChoice,
+    );
+
   const handleSaveModel = async (name: string) => {
     const picked = modelEditChoice
       ? modelChoices?.find(
@@ -1315,6 +1325,11 @@ export default function ProfilesPage() {
                       }
                       onValueChange={setModelEditChoice}
                     >
+                      {unlistedInitialModel && (
+                        <SelectOption value={modelEditInitialChoice}>
+                          {modelEditInitialChoice.replace("\u0000", " · ")}
+                        </SelectOption>
+                      )}
                       {(modelChoices ?? []).map((c) => (
                         <SelectOption
                           key={`${c.provider}\u0000${c.model}`}
