@@ -869,6 +869,18 @@ DANGEROUS_PATTERNS = [
     # The trailing `[^\s"\']*` consumes the rest of the destination filename
     # (e.g. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
+    # ln with force-capable flags (-f, combined flags containing f like -sf/-bf,
+    # --force, --backup) can silently overwrite the destination file. Gate the
+    # same sensitive target classes as cp/mv/install: user credentials/SSH/shell-rc,
+    # system config, and Hermes config/env. Anchor to _COMMAND_TAIL so a sensitive
+    # SOURCE (first ln arg) does not trigger — only the DESTINATION (last arg).
+    # Use [^;|&\n]* instead of .* to stay within the same shell command segment.
+    (rf'\bln\b[^;|&\n]*(?:^|\s)-(?!-)[^\s]*f[^;|&\n]*\s["\']?(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*["\']?{_COMMAND_TAIL}', "force-link into sensitive credential/SSH/shell-rc path"),
+    (rf'\bln\b[^;|&\n]*(?:^|\s)--(?:force|backup)\b[^;|&\n]*\s["\']?(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*["\']?{_COMMAND_TAIL}', "force-link into sensitive credential/SSH/shell-rc path (long flag)"),
+    (rf'\bln\b[^;|&\n]*(?:^|\s)-(?!-)[^\s]*f[^;|&\n]*\s["\']?{_SYSTEM_CONFIG_PATH}[^\s"\']*["\']?{_COMMAND_TAIL}', "force-link into system config path"),
+    (rf'\bln\b[^;|&\n]*(?:^|\s)--(?:force|backup)\b[^;|&\n]*\s["\']?{_SYSTEM_CONFIG_PATH}[^\s"\']*["\']?{_COMMAND_TAIL}', "force-link into system config path (long flag)"),
+    (rf'\bln\b[^;|&\n]*(?:^|\s)-(?!-)[^\s]*f[^;|&\n]*\s["\']?(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})["\']?{_COMMAND_TAIL}', "force-link into Hermes config/env"),
+    (rf'\bln\b[^;|&\n]*(?:^|\s)--(?:force|backup)\b[^;|&\n]*\s["\']?(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})["\']?{_COMMAND_TAIL}', "force-link into Hermes config/env (long flag)"),
     # In-place edits mutate the target file directly, bypassing redirection,
     # tee, and copy/move/install coverage. Gate the same user-controlled
     # startup/credential files so `sed -i ... ~/.bashrc` and `perl -i ...

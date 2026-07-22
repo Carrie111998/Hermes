@@ -656,6 +656,48 @@ class TestPatchBinaryGap:
         assert desc is None
 
 
+class TestLnForceOverwritePattern:
+    """ln with force-capable flags (-f, -sf, -bf, --force, --backup) can silently
+    overwrite destination files. These must require approval for sensitive paths
+    (credentials/SSH/shell-rc, system config, Hermes config/env) just like
+    cp/mv/install."""
+
+    def test_ln_sf_user_sensitive(self):
+        """Force-symlink to a user-sensitive credential path is dangerous."""
+        dangerous, key, desc = detect_dangerous_command("ln -sf /tmp/evil ~/.ssh/authorized_keys")
+        assert dangerous is True
+        assert key is not None
+        assert "force-link" in desc.lower() or "sensitive" in desc.lower()
+
+    def test_ln_force_system_config(self):
+        """Force overwrite to /etc path is dangerous."""
+        dangerous, key, desc = detect_dangerous_command("ln -f /tmp/hosts /etc/hosts")
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "force-link" in desc.lower()
+
+    def test_ln_force_hermes_env(self):
+        """Force overwrite to ~/.hermes/.env is dangerous."""
+        dangerous, key, desc = detect_dangerous_command("ln -f /tmp/env ~/.hermes/.env")
+        assert dangerous is True
+        assert key is not None
+        assert "hermes" in desc.lower() or "force-link" in desc.lower()
+
+    def test_ln_no_force_is_safe(self):
+        """ln without force to arbitrary temp path is safe."""
+        dangerous, key, desc = detect_dangerous_command("ln -s /tmp/source /tmp/link")
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+    def test_ln_sf_hermes_config(self):
+        """Force-symlink to ~/.hermes/config.yaml is dangerous."""
+        dangerous, key, desc = detect_dangerous_command("ln -sf /tmp/config ~/.hermes/config.yaml")
+        assert dangerous is True
+        assert key is not None
+        assert "hermes" in desc.lower() or "force-link" in desc.lower()
+
+
 class TestWindowsAbsolutePathFolding:
     """Windows absolute home / Hermes-home prefixes must fold to ~/ and
     ~/.hermes/ in dangerous-command detection.
