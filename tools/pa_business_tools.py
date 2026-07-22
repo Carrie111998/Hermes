@@ -1589,6 +1589,13 @@ def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> 
         effective_operation = canonical or operation
         if effective_operation == "tgg_case_observation":
             payload = _bind_observation_source_refs(payload)
+        elif effective_operation == "tgg_case_create":
+            payload = dict(payload)
+            if not payload.get("evidenceMessageRefs") and not payload.get("evidence_message_refs"):
+                current_refs = _current_turn_source_refs()
+                if current_refs:
+                    payload["evidenceMessageRefs"] = current_refs
+                    payload.setdefault("confidence", "observed")
         # Recover only declared path params accidentally placed beside the
         # generic payload object; arbitrary top-level args never cross over.
         if configured is not None:
