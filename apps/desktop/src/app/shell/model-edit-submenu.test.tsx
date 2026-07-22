@@ -7,10 +7,25 @@ import {
   DropdownMenuSub,
   DropdownMenuSubTrigger
 } from '@/components/ui/dropdown-menu'
+import type * as HermesApi from '@/hermes'
 import { $modelPresets, getModelPreset } from '@/store/model-presets'
-import { $activeSessionId } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentFastMode,
+  $currentReasoningEffort,
+  getCurrentModelSource,
+  setCurrentFastMode,
+  setCurrentModelSource,
+  setCurrentReasoningEffort
+} from '@/store/session'
 
 import { type FastControl, ModelEditSubmenu } from './model-edit-submenu'
+
+vi.mock('@/hermes', async importOriginal => {
+  const actual = await importOriginal<typeof HermesApi>()
+
+  return { ...actual, setApiRequestProfile: vi.fn() }
+})
 
 // Radix calls these on open; jsdom doesn't implement them.
 beforeAll(() => {
@@ -22,6 +37,9 @@ beforeAll(() => {
 beforeEach(() => {
   $modelPresets.set({})
   $activeSessionId.set(null)
+  setCurrentFastMode(false)
+  setCurrentModelSource('')
+  setCurrentReasoningEffort('')
 })
 
 afterEach(() => {
@@ -58,11 +76,14 @@ function renderSubmenu(opts: { fastControl: FastControl; reasoning: boolean; req
 describe('ModelEditSubmenu no-session guard', () => {
   it('param fast: is draft-only and skips the gateway without a session', () => {
     const requestGateway = vi.fn().mockResolvedValue({})
-    renderSubmenu({ fastControl: { kind: 'param', on: false }, reasoning: false, requestGateway })
+    setCurrentFastMode(true)
+    renderSubmenu({ fastControl: { kind: 'param', on: true }, reasoning: false, requestGateway })
 
     fireEvent.click(screen.getByRole('switch'))
 
     expect(getModelPreset('p1', 'm1').fast).toBeUndefined()
+    expect($currentFastMode.get()).toBe(false)
+    expect(getCurrentModelSource()).toBe('manual')
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
@@ -74,6 +95,8 @@ describe('ModelEditSubmenu no-session guard', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(getModelPreset('p1', 'm1').effort).toBe('none')
+    expect($currentReasoningEffort.get()).toBe('none')
+    expect(getCurrentModelSource()).toBe('manual')
     expect(requestGateway).not.toHaveBeenCalled()
   })
 

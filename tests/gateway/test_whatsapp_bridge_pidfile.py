@@ -16,6 +16,7 @@ line names node + this session). A recycled PID is left alone.
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -158,7 +159,7 @@ class TestKillPortProcess:
             client.wait()
             srv.close()
 
-    def test_kill_port_spares_client_process(self):
+    def test_kill_port_spares_unrelated_listener_and_client(self):
         # Listener in a SEPARATE process — the legitimate kill target. This
         # pytest process is the CLIENT: if port cleanup matched clients it would
         # SIGTERM the test runner, so simply reaching the asserts proves the
@@ -191,9 +192,9 @@ class TestKillPortProcess:
                     last_err = e
                     time.sleep(0.05)
             assert cli is not None, f"could not connect to listener: {last_err}"
-            _kill_port_process(port)
+            _kill_port_process(port, Path("/whatsapp/session"))
             assert _pid_exists(os.getpid()), "client (test process) must survive"
-            assert _wait_dead(listener, timeout=5.0), "stale listener should be killed"
+            assert listener.poll() is None, "unrelated listener must survive"
             cli.close()
         finally:
             if listener.poll() is None:

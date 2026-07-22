@@ -290,6 +290,46 @@ def test_start_whatsapp_onboarding_returns_before_bridge_spawn(monkeypatch, tmp_
     ws._whatsapp_onboarding_sessions.clear()
 
 
+def test_start_whatsapp_onboarding_honors_query_profile(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    from hermes_cli import web_server as ws
+
+    profiles = []
+
+    @contextmanager
+    def profile_scope(profile):
+        profiles.append(profile)
+        yield
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    ws._whatsapp_onboarding_sessions.clear()
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: tmp_path / "work-session")
+    monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda size: "profile-pairing")
+    monkeypatch.setattr(ws.threading, "Thread", FakeThread)
+
+    result = asyncio.run(
+        ws.start_whatsapp_onboarding(
+            ws.WhatsAppOnboardingStart(mode="bot", allowed_users=""),
+            profile="work",
+        )
+    )
+
+    assert result["pairing_id"] == "profile-pairing"
+    assert profiles == ["work"]
+    record = ws._whatsapp_onboarding_sessions["profile-pairing"]
+    assert record.profile == "work"
+    assert record.session_path == str(tmp_path / "work-session")
+    ws._whatsapp_onboarding_sessions.clear()
+
+
 def test_spawn_whatsapp_pairing_process_uses_json_mode(monkeypatch, tmp_path):
     from gateway.platforms import whatsapp_common
     from hermes_cli import web_server as ws

@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { hasValidBridgeToken } from './bridge_http_security.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -119,6 +120,7 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+const BRIDGE_TOKEN = String(process.env.WHATSAPP_BRIDGE_TOKEN || '').trim();
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -433,7 +435,7 @@ async function startSocket() {
       if (reason === DisconnectReason.loggedOut) {
         emitPairEvent({ event: 'error', error: 'logged_out', reason });
         if (!PAIR_JSON) {
-          console.log('❌ Logged out. Delete session and restart to re-authenticate.');
+          console.log('❌ Logged out. Run `hermes whatsapp` to pair this device again.');
         }
         process.exit(WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE);
       } else {
@@ -772,7 +774,6 @@ async function startSocket() {
 
 // HTTP server
 const app = express();
-app.use(express.json());
 
 // Host-header validation — defends against DNS rebinding.
 // The bridge binds loopback-only (127.0.0.1) but a victim browser on
@@ -804,6 +805,23 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// Managed gateways authenticate every stateful/read-sensitive bridge request.
+// Keep /health unauthenticated for local process supervision and preserve
+// compatibility with manually launched legacy bridges that have no token.
+app.use((req, res, next) => {
+  if (req.path === '/health' || !BRIDGE_TOKEN) {
+    return next();
+  }
+  if (!hasValidBridgeToken(BRIDGE_TOKEN, req.headers.authorization)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
+// Bound JSON parsing explicitly. This keeps malformed or oversized local
+// requests from consuming unbounded memory before endpoint validation.
+app.use(express.json({ limit: '1mb', strict: true }));
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
@@ -1103,7 +1121,7 @@ if (PAIR_ONLY) {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
-      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+      console.log(`🔒 Allowed users configured: ${ALLOWED_USERS.size}`);
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
     } else if (WHATSAPP_MODE === 'bot' && WHATSAPP_DM_POLICY === 'pairing') {

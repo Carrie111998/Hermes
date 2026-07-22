@@ -83,7 +83,7 @@ def test_readonly_install_mirrors_to_hermes_home(tmp_path, monkeypatch):
 
 
 def test_readonly_install_reuses_existing_mirror(tmp_path, monkeypatch):
-    """If the HERMES_HOME mirror already exists, return it without re-copying."""
+    """Refresh bridge source while preserving installed dependencies."""
     install_root = tmp_path / "install"
     install_bridge = install_root / "scripts" / "whatsapp-bridge"
     _seed_install_tree(install_bridge)
@@ -91,6 +91,8 @@ def test_readonly_install_reuses_existing_mirror(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     mirror = hermes_home / "scripts" / "whatsapp-bridge"
     mirror.mkdir(parents=True)
+    (mirror / "bridge.js").write_text("// stale bridge\n")
+    (mirror / "package.json").write_text('{"name": "stale-bridge"}\n')
     # A sentinel file proves the resolver returned the EXISTING mirror
     # rather than wiping/recopying it.
     (mirror / "node_modules").mkdir()
@@ -116,5 +118,7 @@ def test_readonly_install_reuses_existing_mirror(tmp_path, monkeypatch):
     resolved = whatsapp_common.resolve_whatsapp_bridge_dir()
 
     assert resolved == mirror
-    # Existing node_modules left intact (no destructive re-copy).
+    # Security/runtime source is refreshed, while expensive dependencies survive.
+    assert (mirror / "bridge.js").read_text() == "// bridge\n"
+    assert (mirror / "package.json").read_text() == '{"name": "whatsapp-bridge"}\n'
     assert (mirror / "node_modules" / "sentinel").read_text() == "keep me\n"
