@@ -4552,6 +4552,12 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
     replaced = []
 
     class _FakeDB:
+        def get_messages_as_conversation(
+            self, _session_id, repair_alternation=False
+        ):
+            assert repair_alternation is True
+            return list(history)
+
         def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
             replaced.append((key, list(messages)))
 
@@ -4639,6 +4645,12 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             self._target()
 
     class _FakeDB:
+        def get_messages_as_conversation(
+            self, _session_id, repair_alternation=False
+        ):
+            assert repair_alternation is True
+            return list(history)
+
         def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
             replaced.append((key, list(messages)))
 
@@ -9619,6 +9631,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             self.replaced = []
 
         def get_messages_as_conversation(self, session_id, repair_alternation=False):
+            assert repair_alternation is True
             return list(original_history)
 
         def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
@@ -9732,7 +9745,7 @@ def test_prompt_submit_truncate_ordinal_refreshes_external_writes(monkeypatch):
 
     class _Agent:
         def run_conversation(
-            self, prompt, conversation_history=None, stream_callback=None
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
             seen["prompt"] = prompt
             seen["history"] = conversation_history
@@ -9774,7 +9787,8 @@ def test_prompt_submit_truncate_ordinal_refreshes_external_writes(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def get_messages_as_conversation(self, session_id):
+        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+            assert repair_alternation is True
             return list(fresh_history)
 
         def replace_messages(self, session_id, messages):
@@ -9833,7 +9847,9 @@ def test_prompt_submit_truncate_ordinal_excludes_display_ancestors(monkeypatch, 
     seen = {}
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
             seen["history"] = list(conversation_history or [])
             return {
                 "final_response": "edited reply",
@@ -9902,7 +9918,8 @@ def test_prompt_submit_truncate_fails_closed_when_fresh_read_fails(monkeypatch):
     replaced = []
 
     class _StubDb:
-        def get_messages_as_conversation(self, session_id):
+        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+            assert repair_alternation is True
             raise RuntimeError("database unavailable")
 
         def replace_messages(self, session_id, messages):
@@ -9950,7 +9967,8 @@ def test_prompt_submit_truncate_fails_closed_when_replace_fails(monkeypatch):
     ]
 
     class _StubDb:
-        def get_messages_as_conversation(self, session_id):
+        def get_messages_as_conversation(self, session_id, repair_alternation=False):
+            assert repair_alternation is True
             return list(history)
 
         def replace_messages(self, session_id, messages):
