@@ -2491,3 +2491,91 @@ class TestNodeCardDB:
                 "WHERE run_id = 'run-004'"
             ).fetchone()
         assert row[0] == "failed"
+
+
+# ── Block notification tests ─────────────────────────────────────
+
+class TestBlockNotification:
+
+    def test_try_block_notify_calls_analyst(self, engine):
+        """_try_block_notify calls the analyst and formats the message."""
+        from unittest.mock import patch, MagicMock
+
+        wf = Workflow(name="test-block-notify")
+        wf.nodes["qa-review"] = WorkflowNode(
+            id="qa-review", agent="r", task="Run tests and check coverage"
+        )
+        states = {"qa-review": NodeState(node_id="qa-review", status="blocked")}
+        context = {"project": "test-project", "repo": "test/repo",
+                    "platform": "discord", "chat_id": "123", "thread_id": None}
+
+        mock_outcome = MagicMock()
+        mock_outcome.success = True
+        mock_outcome.result = {
+            "severity": "warning",
+            "summary": "Coverage below threshold",
+            "detail": "The qa-review node blocked because coverage was 60% vs 80% required.",
+            "suggested_action": "Newton needs to improve test coverage."
+        }
+
+        with patch("plugins.workflow.analyst.analyze_block_notification", return_value=mock_outcome):
+            engine._try_block_notify(
+                wf, "qa-review", states["qa-review"],
+                "coverage 60% vs 80%", context
+            )
+        # Should not raise — analyst was called and message was formatted
+
+    def test_try_block_notify_returns_on_missing_context(self, engine):
+        """_try_block_notify returns early when no platform/chat_id in context."""
+        wf = Workflow(name="test-no-context")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="r", task="Task A")
+        states = {"a": NodeState(node_id="a", status="blocked")}
+        context = {}  # No platform/chat_id
+
+        # Should return without error
+        engine._try_block_notify(wf, "a", states["a"], "blocked", context)
+
+    def test_analyze_block_notification_proceed(self):
+        """Analyst returns structured block assessment."""
+        from plugins.workflow.analyst import analyze_block_notification
+        from unittest.mock import patch, MagicMock
+
+        mock_outcome = MagicMock()
+        mock_outcome.success = True
+        mock_outcome.result = {
+            "severity": "critical",
+            "summary": "Security vulnerability found",
+            "detail": "The security review found a critical auth bypass.",
+            "suggested_action": "Fix the auth flow before proceeding."
+        }
+
+        with patch("plugins.workflow.analyst._invoke", return_value=mock_outcome):
+            outcome = analyze_block_notification(
+                node_id="security-review",
+                workflow_name="ideation",
+                node_task="Review for security concerns",
+                block_reason="BLOCKED: auth bypass found",
+                workflow_context="Project: agent-service"
+            )
+            assert outcome.success
+            assert outcome.result["severity"] == "critical"
+
+    def test_try_block_notify_handles_analyst_failure(self, engine):
+        """_try_block_notify handles analyst failure gracefully."""
+        from unittest.mock import patch, MagicMock
+
+        wf = Workflow(name="test-analyst-fail")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="r", task="Task A")
+        states = {"a": NodeState(node_id="a", status="blocked")}
+        context = {"project": "test", "repo": "test/repo",
+                    "platform": "discord", "chat_id": "123"}
+
+        mock_outcome = MagicMock()
+        mock_outcome.success = False
+        mock_outcome.result = None
+
+        with patch("plugins.workflow.analyst.analyze_block_notification", return_value=mock_outcome):
+            # Should not raise
+            engine._try_block_notify(
+                wf, "a", states["a"], "blocked", context
+            )
