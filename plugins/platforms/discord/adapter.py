@@ -1046,6 +1046,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
             logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
+            self._set_fatal_error("missing_dependency", "discord.py not installed", retryable=False)
             return False
 
         # Load opus codec for voice channel support
@@ -1082,6 +1083,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not self.config.token:
             logger.error("[%s] No bot token configured", self.name)
+            self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
 
         try:
@@ -6561,6 +6563,7 @@ class DiscordAdapter(BasePlatformAdapter):
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
         allow_permanent: bool = True,
+        allow_session: bool = True,
         smart_denied: bool = False,
     ) -> SendResult:
         """
@@ -6636,6 +6639,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 require_admin=require_admin,
                 admin_user_ids=admin_user_ids,
                 allow_permanent=allow_permanent,
+                allow_session=allow_session,
                 smart_denied=smart_denied,
             )
 
@@ -7900,6 +7904,7 @@ def _define_discord_view_classes() -> None:
             require_admin: bool = False,
             admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True,
+            allow_session: bool = True,
             smart_denied: bool = False,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
@@ -7914,7 +7919,7 @@ def _define_discord_view_classes() -> None:
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
             self.resolved = False
-            if smart_denied:
+            if smart_denied or not allow_session:
                 self.remove_item(self.allow_session)
                 self.remove_item(self.allow_always)
             elif not allow_permanent:
