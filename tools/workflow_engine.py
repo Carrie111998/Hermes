@@ -1785,6 +1785,7 @@ def main():
     start.add_argument("--dry-run", action="store_true", help="Print plan without executing")
     start.add_argument("--node", help="Start from a specific node (partial execution)")
     start.add_argument("--resume", action="store_true", help="Resume from saved state")
+    start.add_argument("--run-id", help="Specific run ID to resume (used by supervisor subprocess)")
 
     # validate
     validate = sub.add_parser("validate", help="Validate a workflow without executing")
@@ -1817,7 +1818,8 @@ def main():
                 inputs[k] = v
         engine.execute(args.workflow, context=context, start_node=args.node,
                       dry_run=args.dry_run, resume=args.resume,
-                      board=args.board, inputs=inputs or None)
+                      board=args.board, inputs=inputs or None,
+                      run_id=args.run_id)
 
     elif args.command == "validate":
         result = engine.validate(args.workflow)

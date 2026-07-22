@@ -416,6 +416,16 @@ class WorkflowEngine:
                 return nid
         return None
 
+    def _find_loop_zones(self, workflow: Workflow, layers: list[list[str]]) -> list[int]:
+        """Return sorted layer indices that contain verify nodes (nodes with revision dependents)."""
+        loop_layers: list[int] = []
+        for i, layer in enumerate(layers):
+            for nid in layer:
+                if self._find_revision_node(workflow, nid) is not None:
+                    loop_layers.append(i)
+                    break
+        return loop_layers
+
     def _find_layer_for_node(self, layers: list[list[str]], node_id: str) -> int:
         """Find which layer a node belongs to."""
         for i, layer in enumerate(layers):
@@ -428,7 +438,8 @@ class WorkflowEngine:
     def create_kanban_card(self, node: WorkflowNode, context: dict = None,
                             *, workflow: Optional["Workflow"] = None,
                             states: Optional[dict] = None,
-                            layers: Optional[list] = None) -> str:
+                            layers: Optional[list] = None,
+                            initial_status: str = "ready") -> str:
         """Create a kanban card for a workflow node. Returns card ID.
 
         Refuses to create a card for a synthetic gate node — those are
@@ -496,6 +507,8 @@ class WorkflowEngine:
             cmd.extend(["--model", node.model])
         if node.triage:
             cmd.append("--triage")
+        if initial_status != "ready":
+            cmd.extend(["--initial-status", initial_status])
         # Real agents start in their own persistent workspace so files
         # they write (e.g. council artifacts) survive card completion.
         # Synthetic/gate nodes have no agent and get the default scratch.
@@ -539,7 +552,8 @@ class WorkflowEngine:
         return card_id
 
     def dispatch_node(self, state: NodeState, node: WorkflowNode, context: dict,
-                       workflow: "Workflow", states: dict, layers: list) -> Optional[str]:
+                       workflow: "Workflow", states: dict, layers: list,
+                       initial_status: str = "ready") -> Optional[str]:
         """Dispatch a node to kanban, or mark it done in-process.
 
         For ``scope: global`` workflows (maintenance, notifications, heartbeat)
@@ -550,6 +564,11 @@ class WorkflowEngine:
 
         For ``scope: project`` (default), this delegates straight to
         :meth:`create_kanban_card` and returns the card ID.
+
+        ``initial_status`` controls the card's initial kanban status.
+        ``"ready"`` (default) makes the card immediately available to the
+        dispatcher. ``"pending"`` hides it from the dispatcher until the
+        supervisor flips it.
         """
         if workflow is not None and getattr(workflow, "scope", "project") == "global":
             state.status = "done"
@@ -559,7 +578,63 @@ class WorkflowEngine:
         return self.create_kanban_card(
             node, context,
             workflow=workflow, states=states, layers=layers,
+            initial_status=initial_status,
         )
+
+    def _subscribe_final_cards(self, card_ids: list[str]) -> None:
+        """Subscribe the originating session to final-layer cards."""
+        if not card_ids:
+            return
+        try:
+            from hermes_cli import kanban_db as _kb
+            from gateway.session_context import get_session_env
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            if platform and chat_id:
+                thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+                user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                notifier_profile = (
+                    get_session_env("HERMES_SESSION_PROFILE", "")
+                    or os.environ.get("HERMES_PROFILE")
+                )
+                with _kb.connect(board=self.kanban_board) as _conn:
+                    for cid in card_ids:
+                        _kb.add_notify_sub(
+                            _conn, task_id=cid,
+                            platform=platform, chat_id=chat_id,
+                            thread_id=thread_id, user_id=user_id,
+                            notifier_profile=notifier_profile,
+                        )
+                print(f"   🔔 subscribed {len(card_ids)} final card(s) for notifications")
+        except Exception:
+            print("   ⚠ failed to subscribe final-layer cards for notifications")
+
+    def _spawn_supervisor(self, workflow_name: str, run_id: str) -> None:
+        """Spawn a detached subprocess to supervise loop zones.
+
+        The subprocess runs ``python -m tools.workflow_engine start <name> --resume``
+        which loads the saved state and enters the monitoring loop for the
+        loop zone layers.  It exits when the loop zone resolves.
+        """
+        try:
+            import subprocess as _sp
+            cmd = [
+                sys.executable, "-m", "tools.workflow_engine", "start", workflow_name,
+                "--resume",
+                "--board", self.kanban_board,
+            ]
+            if run_id:
+                cmd.extend(["--run-id", run_id])
+            _sp.Popen(
+                cmd,
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                stdin=_sp.DEVNULL,
+                start_new_session=True,
+            )
+            print(f"   👤 supervisor spawned for {workflow_name} (run: {run_id})")
+        except Exception as e:
+            print(f"   ⚠ failed to spawn supervisor: {e}")
 
 
 
@@ -1047,7 +1122,7 @@ class WorkflowEngine:
 
     def _save_state(self, workflow_name: str, states: dict, results: dict,
                     current_layer: int, layers: list[list[str]],
-                    run_id: str = None):
+                    run_id: str = None, context: dict = None):
         """Persist engine state for crash recovery."""
         # Telemetry: capture duration_seconds + error_count for any node
         # that has reached a terminal status but hasn't been recorded yet.
@@ -1059,6 +1134,7 @@ class WorkflowEngine:
             "workflow_name": workflow_name,
             "current_layer": current_layer,
             "layers": layers,
+            "context": context or {},
             "states": {nid: {
                 "node_id": s.node_id,
                 "status": s.status,
@@ -1738,7 +1814,8 @@ class WorkflowEngine:
                 start_node: str = None, dry_run: bool = False,
                 resume: bool = False, board: str = None,
                 inputs: dict = None,
-                fire_and_forget: bool = False) -> dict:
+                fire_and_forget: bool = False,
+                run_id: Optional[str] = None) -> dict:
         """
         Run a workflow to completion. Supports revision loops via
         the LOOP:<target> convention in block reasons.
@@ -1809,6 +1886,11 @@ class WorkflowEngine:
                 print(f"Resuming {workflow_name} from layer {saved['current_layer']}")
                 layer_idx = saved["current_layer"]
                 results = saved["results"]
+                # Restore context from saved state so the supervisor
+                # subprocess has the original context for template
+                # substitution when creating downstream cards.
+                if context is None and "context" in saved:
+                    context = saved["context"]
                 states = {
                     nid: NodeState(
                         node_id=s["node_id"],
@@ -1853,72 +1935,62 @@ class WorkflowEngine:
             print("  FIRE-AND-FORGET — creating all cards, no monitoring loop")
         print()
 
-        # ── Fire-and-forget: create all cards, subscribe final layer, return ──
+        # ── Fire-and-forget: create cards, detect loop zones, spawn supervisor ──
         if fire_and_forget:
-            last_layer_card_ids: list[str] = []
-            for layer in layers:
-                for nid in layer:
-                    node = workflow.nodes[nid]
-                    state = states[nid]
-                    if state.status in ("done", "skipped"):
-                        continue
-                    if node.synthetic:
-                        state.status = "done"
-                        state.completed_at = datetime.now(timezone.utc).isoformat()
-                        results[nid] = "done"
-                        print(f"   🔓 {nid} — SYNTHETIC (auto-complete)")
-                        continue
-                    state.status = "running"
-                    state.started_at = datetime.now(timezone.utc).isoformat()
-                    try:
-                        card_id = self.dispatch_node(
-                            state, node, context,
-                            workflow=workflow, states=states, layers=layers,
-                        )
-                        if card_id is None:
-                            results[nid] = "done"
-                            print(f"   ⊙ {nid} → in-process (scope: global)")
+            loop_layers = self._find_loop_zones(workflow, layers)
+            has_loops = len(loop_layers) > 0
+
+            if not has_loops:
+                # Simple path: no loop zones — create all cards at once
+                last_layer_card_ids: list[str] = []
+                for layer in layers:
+                    for nid in layer:
+                        node = workflow.nodes[nid]
+                        state = states[nid]
+                        if state.status in ("done", "skipped"):
                             continue
-                        state.kanban_card_id = card_id
-                        # Track last-layer card IDs for notification subscription
-                        if layer == layers[-1]:
-                            last_layer_card_ids.append(card_id)
-                        print(f"   ✓ {nid} → card {card_id}")
-                    except Exception as e:
-                        state.status = "failed"
-                        state.error = str(e)
-                        results[nid] = "failed"
-                        print(f"   ✗ {nid} → failed: {e}")
+                        if node.synthetic:
+                            state.status = "done"
+                            state.completed_at = datetime.now(timezone.utc).isoformat()
+                            results[nid] = "done"
+                            print(f"   🔓 {nid} — SYNTHETIC (auto-complete)")
+                            continue
+                        state.status = "running"
+                        state.started_at = datetime.now(timezone.utc).isoformat()
+                        try:
+                            card_id = self.dispatch_node(
+                                state, node, context,
+                                workflow=workflow, states=states, layers=layers,
+                            )
+                            if card_id is None:
+                                results[nid] = "done"
+                                print(f"   ⊙ {nid} → in-process (scope: global)")
+                                continue
+                            state.kanban_card_id = card_id
+                            if layer == layers[-1]:
+                                last_layer_card_ids.append(card_id)
+                            print(f"   ✓ {nid} → card {card_id}")
+                        except Exception as e:
+                            state.status = "failed"
+                            state.error = str(e)
+                            results[nid] = "failed"
+                            print(f"   ✗ {nid} → failed: {e}")
 
-            # Subscribe the originating session to final-layer cards so the
-            # gateway notifier pushes terminal events back to the caller.
-            if last_layer_card_ids:
-                try:
-                    from hermes_cli import kanban_db as _kb
-                    from gateway.session_context import get_session_env
-                    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-                    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-                    if platform and chat_id:
-                        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-                        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-                        notifier_profile = (
-                            get_session_env("HERMES_SESSION_PROFILE", "")
-                            or os.environ.get("HERMES_PROFILE")
-                        )
-                        with _kb.connect(board=self.kanban_board) as _conn:
-                            for cid in last_layer_card_ids:
-                                _kb.add_notify_sub(
-                                    _conn, task_id=cid,
-                                    platform=platform, chat_id=chat_id,
-                                    thread_id=thread_id, user_id=user_id,
-                                    notifier_profile=notifier_profile,
-                                )
-                        print(f"   🔔 subscribed {len(last_layer_card_ids)} final card(s) for notifications")
-                except Exception:
-                    print("   ⚠ failed to subscribe final-layer cards for notifications")
+                # Subscribe final-layer cards
+                if last_layer_card_ids:
+                    self._subscribe_final_cards(last_layer_card_ids)
 
-            self._save_state(workflow_name, states, results, len(layers) - 1, layers,
-                            run_id=workflow.run_id)
+                self._save_state(workflow_name, states, results, len(layers) - 1, layers,
+                                run_id=workflow.run_id, context=context)
+                return results
+
+            # ── Has loop zones: save state, spawn supervisor, return ──
+            # The supervisor subprocess runs the existing layer-by-layer
+            # monitoring loop, creating cards as it goes and handling LOOPs.
+            # The calling agent gets an immediate response.
+            self._save_state(workflow_name, states, results, 0, layers,
+                            run_id=workflow.run_id, context=context)
+            self._spawn_supervisor(workflow_name, workflow.run_id)
             return results
 
         # ── Main execution loop (layer-based with loop support) ──
@@ -2061,7 +2133,7 @@ class WorkflowEngine:
 
             # Save state after dispatching layer
             self._save_state(workflow_name, states, results, layer_idx, layers,
-                            run_id=workflow.run_id)
+                            run_id=workflow.run_id, context=context)
 
             # Monitor completion for this layer. Synthetic nodes were
             # auto-completed in the dispatch loop above (state.status
