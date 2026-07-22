@@ -1446,6 +1446,42 @@ class WorkflowEngine:
             print(f"   ⚠  Escalation analysis unavailable — "
                   f"Sherlock must review manually")
 
+    def _try_loop_decision(self, verify_node: "WorkflowNode",
+                           revision_node: "WorkflowNode",
+                           rejection: str) -> str:
+        """Ask the analyst whether a LOOP rejection is genuine.
+
+        Returns ``"loop"`` (re-dispatch revision) or ``"proceed"``
+        (mark verify as done and advance).  Falls back to ``"loop"``
+        when the analyst is unavailable or returns an unparseable
+        response — conservative default that preserves the existing
+        mechanical behaviour.
+        """
+        try:
+            from plugins.workflow.analyst import analyze_loop_decision
+        except Exception:
+            return "loop"
+
+        outcome = analyze_loop_decision(
+            verify_task=verify_node.task,
+            rejection=rejection,
+            revision_task=revision_node.task,
+        )
+
+        if outcome.success and isinstance(outcome.result, dict):
+            decision = outcome.result.get("decision", "loop")
+            reason = outcome.result.get("reason", "")
+            confidence = outcome.result.get("confidence", "low")
+            if decision == "proceed":
+                print(f"   🧠 Analyst: proceed — {reason} (confidence: {confidence})")
+                return "proceed"
+            else:
+                print(f"   🧠 Analyst: loop — {reason} (confidence: {confidence})")
+                return "loop"
+
+        # Fall back to mechanical loop
+        return "loop"
+
     def _try_failure_analysis(self, node: WorkflowNode, state: NodeState,
                                elapsed_sec: float):
         """Try LLM diagnosis of a node failure. Best-effort — silent on failure."""
@@ -2367,6 +2403,22 @@ class WorkflowEngine:
                     )
                     layer_idx += 1  # Advance past this layer
                 else:
+                    # Ask the analyst whether this LOOP is genuine
+                    verify_node = workflow.nodes[verify_nid]
+                    revision_node = workflow.nodes[revision_nid]
+                    rejection = verify_state.error or ""
+                    analyst_decision = self._try_loop_decision(
+                        verify_node, revision_node, rejection
+                    )
+
+                    if analyst_decision == "proceed":
+                        print(f"   🧠 Analyst: rejection does not match criteria — proceeding")
+                        verify_state.status = "done"
+                        verify_state.completed_at = datetime.now(timezone.utc).isoformat()
+                        results[verify_nid] = "done"
+                        layer_idx += 1
+                        continue
+
                     # Run the revision node
                     print(f"\n   ↩  LOOP #{verify_state.loop_count}: "
                           f"{verify_nid} → {revision_nid} → {verify_nid}")

@@ -194,7 +194,67 @@ If the objective appears to be met, return an empty array.
 Only suggest nodes that are NOT already in the existing_nodes list."""
 
 
-# ── Outcome dataclass ──────────────────────────────────────────────
+# ── Mode: loop decision ─────────────────────────────────────
+
+_LOOP_DECISION_SYSTEM = """You are the workflow loop decision analyst for the Hermes Agent fleet.
+
+A verify node has rejected a worker's output. You must decide whether to loop back
+for revision or proceed to the next phase. You are given:
+
+1. The verify node's task body — contains the pass/fail criteria
+2. The rejection reason — what the verifier reported
+3. The revision node's task — what the fix would do
+
+Evaluate the rejection against the criteria. Consider:
+- Does the rejection genuinely violate the criteria?
+- Could the verifier have made a mistake (false positive)?
+- Is the rejection a matter of interpretation rather than a clear failure?
+
+Output a single JSON object:
+
+  {
+    "decision": "loop" | "proceed",
+    "reason": "<one-sentence explanation>",
+    "confidence": "high" | "medium" | "low"
+  }
+
+Rules:
+- "loop" = the rejection is valid, send back for revision
+- "proceed" = the rejection does not match the criteria, or the output is acceptable
+- Be conservative: if unsure, prefer "loop" so the verifier's judgment is respected
+- No preamble, no code fences. Output only the JSON object."""
+
+_LOOP_DECISION_USER = """Verify node task body (contains pass/fail criteria):
+{verify_task}
+
+Rejection reason:
+{rejection}
+
+Revision node task (what the fix would do):
+{revision_task}
+
+Based on the criteria in the verify node's task body, should we loop back for revision or proceed?"""
+
+
+def analyze_loop_decision(
+    *,
+    verify_task: str = "",
+    rejection: str = "",
+    revision_task: str = "",
+    timeout: Optional[int] = None,
+) -> AnalystOutcome:
+    """Evaluate a LOOP rejection against the verify node's criteria and decide whether to loop or proceed."""
+    user_msg = _LOOP_DECISION_USER.format(
+        verify_task=verify_task,
+        rejection=rejection,
+        revision_task=revision_task,
+    )
+    return _invoke(
+        mode="loop_decision",
+        system_prompt=_LOOP_DECISION_SYSTEM,
+        user_message=user_msg,
+        timeout=timeout,
+    )
 
 @dataclass
 class AnalystOutcome:
