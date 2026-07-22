@@ -423,7 +423,11 @@ const ComposerPane = memo(function ComposerPane({
                   onChange={composer.updateInput}
                   onPaste={composer.handleTextPaste}
                   onSubmit={composer.submit}
-                  placeholder={composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
+                  // Ghost suggestion borrows the placeholder slot: when the
+                  // gateway proposed a likely reply (complete.suggest), it
+                  // replaces the idle hint until accepted (Tab), dismissed
+                  // (Esc), or the user types.
+                  placeholder={composer.empty ? composer.ghost || PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
                   // Exactly the "(and N more toolsets…)" tone. `muted` is a
                   // MID-luminance family tone, so it reads receded on both
                   // poles even when polarity detection is wrong (transparent

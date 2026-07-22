@@ -10,6 +10,7 @@ import { useCallback, useMemo, useState } from 'react'
 import type { PasteEvent } from '../components/textInput.js'
 import type { ImageAttachResponse, InputDetectDropResponse } from '../gatewayTypes.js'
 import { useCompletion } from '../hooks/useCompletion.js'
+import { useGhostSuggestion } from '../hooks/useGhostSuggestion.js'
 import { useInputHistory } from '../hooks/useInputHistory.js'
 import { useQueue } from '../hooks/useQueue.js'
 import { isUsableClipboardText, readClipboardText } from '../lib/clipboard.js'
@@ -124,6 +125,8 @@ export function useComposerState({
 
   const { historyRef, historyIdx, setHistoryIdx, historyDraftRef, pushHistory } = useInputHistory()
   const { completions, compIdx, setCompIdx, compReplace } = useCompletion(input, isBlocked, gw)
+  const getGhostSid = useCallback(() => getUiState().sid, [])
+  const { acceptGhost, dismissGhost, ghost } = useGhostSuggestion(input, isBlocked, gw, getGhostSid)
 
   const clearIn = useCallback(() => {
     setInput('')
@@ -301,8 +304,10 @@ export function useComposerState({
 
   const actions = useMemo(
     () => ({
+      acceptGhost,
       clearIn,
       dequeue,
+      dismissGhost,
       enqueue,
       handleTextPaste,
       openEditor,
@@ -318,8 +323,10 @@ export function useComposerState({
       syncQueue
     }),
     [
+      acceptGhost,
       clearIn,
       dequeue,
+      dismissGhost,
       enqueue,
       handleTextPaste,
       openEditor,
@@ -349,6 +356,7 @@ export function useComposerState({
       compIdx,
       compReplace,
       completions,
+      ghost,
       historyIdx,
       input,
       inputBuf,
@@ -356,7 +364,7 @@ export function useComposerState({
       queueEditIdx,
       queuedDisplay
     }),
-    [compIdx, compReplace, completions, historyIdx, input, inputBuf, pasteSnips, queueEditIdx, queuedDisplay]
+    [compIdx, compReplace, completions, ghost, historyIdx, input, inputBuf, pasteSnips, queueEditIdx, queuedDisplay]
   )
 
   return {

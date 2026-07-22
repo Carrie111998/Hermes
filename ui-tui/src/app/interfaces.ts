@@ -364,8 +364,10 @@ export interface ComposerPasteResult {
 export type MaybePromise<T> = Promise<T> | T
 
 export interface ComposerActions {
+  acceptGhost: () => null | string
   clearIn: () => void
   dequeue: () => string | undefined
+  dismissGhost: () => boolean
   enqueue: (text: string) => void
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   openEditor: () => Promise<void>
@@ -393,6 +395,8 @@ export interface ComposerState {
   compIdx: number
   compReplace: number
   completions: CompletionItem[]
+  /** Ghost-text reply suggestion for the empty composer ('' when hidden). */
+  ghost: string
   historyIdx: null | number
   input: string
   inputBuf: string[]
@@ -558,6 +562,8 @@ export interface AppLayoutComposerProps {
   compIdx: number
   completions: CompletionItem[]
   empty: boolean
+  /** Ghost-text reply suggestion for the empty composer ('' when hidden). */
+  ghost: string
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   input: string
   inputBuf: string[]
