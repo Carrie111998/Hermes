@@ -61,8 +61,14 @@ def _apply_skill_ranking(proposal: dict) -> tuple[bool, str, Optional[Path]]:
     """Delegate to graphs.critic._execute_skill_ranking which already handles
     the full bump-and-reverse logic.
     """
+    import importlib.util
     import sys
-    sys.path.insert(0, str(HERMES / "agent-src"))
+
+    # Fallback only — never shadow an active checkout (C26 casualty class):
+    # only add the live agent-src tree when ``graphs`` isn't already
+    # importable, and append rather than insert(0).
+    if importlib.util.find_spec("graphs") is None:
+        sys.path.append(str(HERMES / "agent-src"))
     from graphs.critic import _execute_skill_ranking  # type: ignore
 
     ok, note, record = _execute_skill_ranking(proposal)

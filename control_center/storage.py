@@ -325,9 +325,14 @@ def resume_graph(thread_id: str, decision: str, reason: str = "") -> dict:
     history entry records that Diego clicked a UI button, not that the
     graph-internal approval_hitl returned.
     """
+    import importlib.util
     import sys
 
-    sys.path.insert(0, str(HERMES / "agent-src"))
+    # Fallback only — never shadow an active checkout (C26 casualty class):
+    # only add the live agent-src tree when ``graphs`` isn't already
+    # importable, and append rather than insert(0).
+    if importlib.util.find_spec("graphs") is None:
+        sys.path.append(str(HERMES / "agent-src"))
     from graphs import resume_full  # type: ignore
 
     payload = {

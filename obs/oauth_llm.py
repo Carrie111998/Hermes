@@ -38,10 +38,28 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Ensure agent-src is on path so we can import hermes_cli.auth
+# Ensure agent-src is importable so standalone runs (laptop-monitor scripts,
+# ad-hoc `python obs/oauth_llm.py`-style probes) can reach hermes_cli.auth.
+#
+# FALLBACK ONLY — never shadow an active checkout. The old unconditional
+# ``sys.path.insert(0, ...)`` made the LIVE deployment tree at
+# ~/.hermes/agent-src take priority over whichever repo the process actually
+# runs from: in the 0.19.0 upgrade worktree, importing this module first
+# (tests/obs/test_oauth_llm_jwt.py in a batched pytest run) cached the STALE
+# live ``agent`` package into sys.modules via the ``agent.openai_codex_compat``
+# import below, so tests/agent/test_error_classifier.py exercised 0.18.2 code
+# and 5 upstream-new tests failed (Phase 5 matrix row C26). Only add the live
+# tree when the target package is not already importable, and append so it can
+# never win over an editable install / repo root already on sys.path.
+import importlib.util as _importlib_util
+
 _AGENT_SRC = Path.home() / ".hermes" / "agent-src"
-if str(_AGENT_SRC) not in sys.path:
-    sys.path.insert(0, str(_AGENT_SRC))
+if (
+    _importlib_util.find_spec("hermes_cli") is None
+    and _AGENT_SRC.is_dir()
+    and str(_AGENT_SRC) not in sys.path
+):
+    sys.path.append(str(_AGENT_SRC))
 
 # Guard the openai SDK against the ChatGPT Codex backend's response.output=None
 # completion snapshot, which otherwise crashes parse_response inside the
