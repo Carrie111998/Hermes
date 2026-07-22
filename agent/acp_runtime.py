@@ -30,6 +30,7 @@ def _inject_hermes_history_to_acp(agent, hermes_session_id, provider, cwd, mappe
     (un-injected) ``session/new``. ``redact=False`` is intentional -- the
     transcript is written to a local file for context continuity, not uploaded.
     """
+    import json
     import re
     import uuid as _uuid
     from pathlib import Path
@@ -73,6 +74,25 @@ def _inject_hermes_history_to_acp(agent, hermes_session_id, provider, cwd, mappe
     project_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = project_dir / f"{acp_session_id}.jsonl"
     transcript_path.write_text(jsonl + "\n", encoding="utf-8")
+
+    # Defensive: verify file is non-empty and sessionId matches filename.
+    # Tolerates a malformed first line (unexpected shapes) -- only raises
+    # when a real sessionId is present and disagrees with the file stem.
+    if transcript_path.stat().st_size == 0:
+        raise ValueError(f"JSONL file is empty: {transcript_path}")
+    try:
+        _first_line = json.loads(
+            transcript_path.read_text(encoding="utf-8").split("\n", 1)[0]
+        )
+    except ValueError:
+        _first_line = None
+    embedded = (
+        _first_line.get("sessionId") if isinstance(_first_line, dict) else None
+    )
+    if embedded is not None and embedded != acp_session_id:
+        raise ValueError(
+            f"sessionId mismatch: file stem={acp_session_id}, embedded={embedded}"
+        )
 
     mapper.bind(ACPSessionBinding(
         hermes_session_id=hermes_session_id,
@@ -278,6 +298,14 @@ def run_acp_client_turn(
             # Mirrors codex_runtime.py's crash-return contract.
             "agent_persisted": True,
         }
+
+    # Defensive: warn on potential silent resume failure
+    if turn and not turn.final_text and not turn.error:
+        logger.warning(
+            "ACP session may have silently failed to load context: "
+            "empty response with no error (session=%s)",
+            getattr(agent._acp_session, '_session_id', '?'),
+        )
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, subprocess exited, protocol error), retire the session so

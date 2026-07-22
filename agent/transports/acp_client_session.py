@@ -311,6 +311,12 @@ class ACPClientSession:
                         "cwd": cwd or binding.cwd,
                     })
                     self._session_id = binding.acp_session_id
+                    # Defensive: confirm subprocess survived the resume
+                    if not self._client.is_alive():
+                        raise RuntimeError(
+                            f"ACP subprocess died after session/resume "
+                            f"(session={binding.acp_session_id})"
+                        )
                     self._pin_model_and_permission()
                     self._mapper.update_activity(self._hermes_session_id)
                     return self._session_id
