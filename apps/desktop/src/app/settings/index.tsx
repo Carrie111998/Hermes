@@ -33,6 +33,7 @@ import { SKILLS_ROUTE } from '../routes'
 import { AboutSettings } from './about-settings'
 import { AppearanceSettings } from './appearance-settings'
 import { BillingSettings } from './billing'
+import { SettingsSearch } from './settings-search'
 import { ConfigSettings } from './config-settings'
 import { SECTIONS } from './constants'
 import { GatewaySettings } from './gateway-settings'
@@ -295,6 +296,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
 
   return (
     <OverlayView closeLabel={t.settings.closeSettings} onClose={onClose}>
+      <SettingsSearch />
       <OverlaySplitLayout>
         <OverlayNav footer={navFooter} groups={navGroups} />
 
