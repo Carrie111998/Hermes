@@ -1632,6 +1632,7 @@ export const ja = defineLocale({
       handoffOrigin: platform => `${platform} から引き継ぎ`,
       ownedByProfile: profile => `プロファイル: ${profile}`,
       bridgeProvider: provider => `プロバイダー: ${provider}`,
+      sessionDriver: driver => `操作エージェント: ${driver}`,
       bridgeMirrorState: state => `ミラー状態: ${state}`,
       bridgeCatalogOnly: 'カタログのみ',
       bridgeContinued: '継続',

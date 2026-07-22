@@ -371,6 +371,10 @@ export interface SessionInfo {
   bridge_native_id?: null | string
   bridge_origin_kind?: 'bridge_continuation' | 'bridge_placeholder' | 'native' | null
   bridge_provider?: 'claude' | 'codex' | 'hermes' | null
+  /** Agent that drove this local session (from origin_json at creation),
+   *  e.g. 'claude-code' — distinct from bridge_provider (whose transcript
+   *  a catalog row mirrors). */
+  driver?: null | string
   bridge_sidebar_codex_thread_id?: null | string
   bridge_sidebar_error?: 'delivery_degraded' | null
   bridge_sidebar_stale?: boolean

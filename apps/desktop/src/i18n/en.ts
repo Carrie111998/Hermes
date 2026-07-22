@@ -1708,6 +1708,7 @@ export const en: Translations = {
       handoffOrigin: platform => `Handed off from ${platform}`,
       ownedByProfile: profile => `Profile: ${profile}`,
       bridgeProvider: provider => `Provider: ${provider}`,
+      sessionDriver: driver => `Driven by ${driver}`,
       bridgeMirrorState: state => `Mirror state: ${state}`,
       bridgeCatalogOnly: 'Catalog only',
       bridgeContinued: 'Continued',

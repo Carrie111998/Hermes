@@ -15,6 +15,7 @@ import {
   bridgeProviderLabel,
   bridgeSidebarStateLabel,
   handoffOriginSource,
+  sessionDriverLabel,
   sessionSourceLabel
 } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
@@ -92,6 +93,10 @@ export function SidebarSessionRow({
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
   const bridgeProvider = bridgeProviderLabel(session.bridge_provider)
+  // Who drove this local session (an agent shelling into hermes). Suppressed
+  // when a bridge provider badge is present — one harness badge per row.
+  const driverBadge = bridgeProvider ? null : sessionDriverLabel(session.driver)
+  const driverDescription = driverBadge ? r.sessionDriver(driverBadge) : null
 
   const bridgeMirrorState = session.bridge_mirror_state
     ? {
@@ -286,6 +291,15 @@ export function SidebarSessionRow({
               title={bridgeProviderDescription ?? undefined}
             >
               {bridgeProvider}
+            </span>
+          ) : null}
+          {driverBadge ? (
+            <span
+              aria-label={driverDescription ?? undefined}
+              className="shrink-0 rounded-[3px] border border-(--ui-border) px-1 py-px text-[0.5625rem] font-medium leading-none text-(--ui-text-tertiary)"
+              title={driverDescription ?? undefined}
+            >
+              {driverBadge}
             </span>
           ) : null}
           {bridgeMirrorState ? (

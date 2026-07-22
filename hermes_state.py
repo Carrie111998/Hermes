@@ -30,7 +30,7 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,35 @@ _last_init_error_lock = threading.Lock()
 # filesystem-incompat warning on every connection, filling errors.log.
 _wal_fallback_warned_paths: set[str] = set()
 _wal_fallback_warned_lock = threading.Lock()
+
+# Interactive local transports where the hermes process is spawned directly by
+# whoever is driving it — the only sources where process environment reliably
+# identifies the driver. Gateway-created rows (messaging platforms, desktop)
+# inherit the gateway's environment, not the driver's, and are never stamped.
+_DRIVER_STAMPED_SOURCES = frozenset({"cli", "tui"})
+_SESSION_DRIVER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def detect_session_driver(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Identify the agent driving this process, if any.
+
+    ``HERMES_SESSION_DRIVER`` is the explicit override (for harnesses without
+    ambient markers, e.g. a Codex config exporting it); otherwise Claude Code
+    is recognized by the environment it exports into child processes. Returns
+    a normalized slug or None — never raises.
+    """
+    env = os.environ if environ is None else environ
+    override = (env.get("HERMES_SESSION_DRIVER") or "").strip().lower()
+    if override:
+        return override if _SESSION_DRIVER_PATTERN.match(override) else None
+    if (env.get("CLAUDECODE") or "").strip() or (
+        env.get("CLAUDE_CODE_ENTRYPOINT") or ""
+    ).strip():
+        return "claude-code"
+    return None
+
 
 _FTS_TRIGGERS = (
     "messages_fts_insert",
@@ -3330,7 +3359,38 @@ class SessionDB:
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
+        if source in _DRIVER_STAMPED_SOURCES:
+            driver = detect_session_driver()
+            if driver:
+                self._stamp_session_driver(session_id, driver)
         return session_id
+
+    @staticmethod
+    def _attach_session_driver(row: Dict[str, Any]) -> None:
+        """Derive a top-level ``driver`` field from origin_json for listings."""
+        driver = None
+        raw = row.get("origin_json")
+        if raw:
+            try:
+                candidate = json.loads(raw).get("driver")
+            except (ValueError, TypeError, AttributeError):
+                candidate = None
+            if isinstance(candidate, str) and candidate:
+                driver = candidate
+        row["driver"] = driver
+
+    def _stamp_session_driver(self, session_id: str, driver: str) -> None:
+        """Record the driving agent in origin_json, never clobbering routing
+        metadata an earlier writer already persisted."""
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET origin_json = json_object('driver', ?)
+                   WHERE id = ? AND origin_json IS NULL""",
+                (driver, session_id),
+            )
+
+        self._execute_write(_do)
 
     def record_gateway_session_peer(
         self,
@@ -5312,6 +5372,7 @@ class SessionDB:
         sessions = []
         for row in rows:
             s = dict(row)
+            self._attach_session_driver(s)
             # Build the preview from the raw substring
             raw = s.pop("_preview_raw", "").strip()
             if raw:

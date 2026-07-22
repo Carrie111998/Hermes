@@ -1580,6 +1580,7 @@ export const zhHant = defineLocale({
       handoffOrigin: platform => `從 ${platform} 轉接`,
       ownedByProfile: profile => `設定檔：${profile}`,
       bridgeProvider: provider => `提供者：${provider}`,
+      sessionDriver: driver => `驅動者：${driver}`,
       bridgeMirrorState: state => `鏡像狀態：${state}`,
       bridgeCatalogOnly: '僅目錄',
       bridgeContinued: '已繼續',

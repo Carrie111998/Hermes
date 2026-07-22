@@ -12,6 +12,7 @@ import {
   bridgeSidebarStateSearchTerms,
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
+  sessionDriverLabel,
   sessionSourceLabel,
   sessionSourceSearchTerms
 } from './session-source'
@@ -68,6 +69,57 @@ describe('Codex sidebar delivery metadata', () => {
         expect.arrayContaining(['codex sidebar', state])
       )
     }
+  })
+})
+
+describe('Session driver attribution', () => {
+  it('maps driver slugs to harness labels', () => {
+    expect(sessionDriverLabel('claude-code')).toBe('Claude')
+    expect(sessionDriverLabel('codex')).toBe('Codex')
+    expect(sessionDriverLabel(null)).toBeNull()
+    expect(sessionDriverLabel(undefined)).toBeNull()
+    expect(sessionDriverLabel('some-agent')).toBe('Some Agent')
+  })
+
+  it('renders a driven-by badge for agent-driven local sessions', () => {
+    render(
+      createElement(SidebarSessionRow, {
+        isPinned: false,
+        isSelected: false,
+        isWorking: false,
+        onArchive: () => {},
+        onDelete: () => {},
+        onPin: () => {},
+        onResume: () => {},
+        session: makeSession({ driver: 'claude-code', source: 'cli' })
+      })
+    )
+
+    const badge = screen.getByText('Claude')
+    expect(badge.getAttribute('title')).toBe('Driven by Claude')
+    expect(screen.getByLabelText('Driven by Claude')).toBe(badge)
+  })
+
+  it('suppresses the driver badge when a bridge provider badge is shown', () => {
+    render(
+      createElement(SidebarSessionRow, {
+        isPinned: false,
+        isSelected: false,
+        isWorking: false,
+        onArchive: () => {},
+        onDelete: () => {},
+        onPin: () => {},
+        onResume: () => {},
+        session: makeSession({
+          bridge_provider: 'claude',
+          driver: 'claude-code',
+          source: 'cli'
+        })
+      })
+    )
+
+    expect(screen.getAllByText('Claude')).toHaveLength(1)
+    expect(screen.queryByLabelText('Driven by Claude')).toBeNull()
   })
 })
 
