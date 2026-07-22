@@ -666,10 +666,13 @@ def test_bounded_live_refuses_while_ordinary_consumer_holds_lock(
         dry_run=False, lock_file=str(lock_file),
     )
     before = inbox.counts()
+    before_file = (inbox.db_path.read_bytes(), inbox.db_path.stat().st_mtime_ns)
     with consumer.SingletonLock(lock_file):
         with pytest.raises(consumer.ConsumerError, match="singleton"):
             asyncio.run(consumer.run_bounded_backplay(args))
     assert inbox.counts() == before
+    after_file = (inbox.db_path.read_bytes(), inbox.db_path.stat().st_mtime_ns)
+    assert after_file == before_file
     assert not Path(args.audit).exists()
 
 

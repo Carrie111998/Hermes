@@ -1969,7 +1969,7 @@ def _business_audit_delta(path: Path, *, after_rowid: int) -> list[dict[str, Any
 async def run_bounded_backplay(args: argparse.Namespace) -> int:
     """One-shot, capture-only execution over an existing inbox window."""
     dry_run = bool(args.dry_run)
-    inbox = DurableInbox(Path(args.inbox).resolve(), read_only=dry_run)
+    inbox_path = Path(args.inbox).resolve()
     state_db = Path(args.state_db).resolve()
     case_db = Path(args.case_db).resolve()
     config_path = Path(args.config).resolve()
@@ -1986,6 +1986,10 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
         else SingletonLock(Path(args.lock_file).resolve())
     )
     with lock_context:
+        # A write-mode DurableInbox initializes schema metadata.  Construct it
+        # only after exclusivity is held so an ordinary consumer holding the
+        # same lock sees zero state change from a refused bounded run.
+        inbox = DurableInbox(inbox_path, read_only=dry_run)
         selected = inbox.bounded_window(chat_ids=chat_ids, cutoff=cutoff)
         statuses_before = inbox.window_statuses(selected)
         preflight = {
