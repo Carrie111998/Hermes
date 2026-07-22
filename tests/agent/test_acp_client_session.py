@@ -27,6 +27,7 @@ from agent.transports.acp_client_session import (
     _extract_text_from_update,
     _is_tool_iteration,
     _pick_allow_option,
+    _stringify_tool_payload,
     _translate_mcp_servers,
 )
 
@@ -1325,6 +1326,260 @@ class TestRunTurn:
         assert len(result.projected_messages) == 1
         assert result.projected_messages[0]["role"] == "assistant"
         assert result.projected_messages[0]["content"] == "Answer here."
+
+
+# ---------------------------------------------------------------------------
+# Tests: tool call capture -- assistant+tool message pairs from session/update
+# ---------------------------------------------------------------------------
+
+
+def _tool_call_note(
+    *,
+    session_id: str = "s",
+    kind: str = "tool_call",
+    tool_call_id: str = "tc-1",
+    title: str = "bash",
+    status: Optional[str] = None,
+    raw_input: Any = None,
+    raw_output: Any = None,
+) -> dict:
+    """Build a session/update notification carrying a tool-call lifecycle event.
+
+    Field names mirror the ACP schema (ToolCallStart / ToolCallProgress): the
+    payload lives under ``params.update`` with camelCase aliases.
+    """
+    update: dict = {"sessionUpdate": kind, "toolCallId": tool_call_id}
+    if title is not None:
+        update["title"] = title
+    if status is not None:
+        update["status"] = status
+    if raw_input is not None:
+        update["rawInput"] = raw_input
+    if raw_output is not None:
+        update["rawOutput"] = raw_output
+    return {
+        "method": "session/update",
+        "params": {"sessionId": session_id, "update": update},
+    }
+
+
+def _text_chunk_note(text: str, session_id: str = "s") -> dict:
+    return {
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            },
+        },
+    }
+
+
+class TestToolCallCapture:
+    """Capture tool-call lifecycle events into OpenAI-shaped message pairs.
+
+    A ``tool_call`` start records the pending call and ticks
+    ``tool_iterations`` once; a terminal ``tool_call_update`` pops it and
+    appends an assistant(tool_calls) + tool result pair to
+    ``projected_messages``, ahead of the final assistant text message.
+    """
+
+    @staticmethod
+    def _run_with_notifications(notes: list) -> TurnResult:
+        """Drive run_turn with a fixed list of notifications then a sentinel None."""
+        session, mock_client = _make_session()
+
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
+            if method == "session/new":
+                return {"sessionId": "sess-tool"}
+            if method == "session/prompt":
+                time.sleep(0.05)  # let the main loop drain notifications first
+                return {"stopReason": "end_turn"}
+            return {}
+
+        mock_client.request.side_effect = req_side_effect
+
+        notes_iter = iter(list(notes) + [None, None])
+        mock_client.take_notification.side_effect = lambda timeout=0.0: next(notes_iter, None)
+
+        return session.run_turn("use a tool", cwd="/tmp")
+
+    def test_start_then_complete_builds_message_pair(self):
+        """tool_call start + tool_call_update(completed) -> assistant+tool pair."""
+        result = self._run_with_notifications([
+            _tool_call_note(
+                kind="tool_call",
+                title="bash",
+                raw_input={"command": "ls -la"},
+                status="in_progress",
+            ),
+            _tool_call_note(
+                kind="tool_call_update",
+                status="completed",
+                raw_output="file1\nfile2",
+            ),
+        ])
+
+        # tool_iterations ticks once per call (at start), not per notification.
+        assert result.tool_iterations == 1
+
+        msgs = result.projected_messages
+        assert len(msgs) == 2
+
+        assistant_call = msgs[0]
+        assert assistant_call["role"] == "assistant"
+        assert assistant_call["content"] is None
+        tc = assistant_call["tool_calls"][0]
+        assert tc["id"] == "tc-1"
+        assert tc["function"]["name"] == "bash"
+        # dict rawInput is JSON-encoded into the arguments string
+        assert tc["function"]["arguments"] == '{"command": "ls -la"}'
+
+        tool_result = msgs[1]
+        assert tool_result["role"] == "tool"
+        assert tool_result["tool_call_id"] == "tc-1"
+        assert tool_result["content"] == "file1\nfile2"
+        assert tool_result["tool_name"] == "bash"
+
+    def test_pair_lands_before_final_assistant_text(self):
+        """The tool pair is projected before the final assistant text message."""
+        result = self._run_with_notifications([
+            _tool_call_note(kind="tool_call", title="bash", raw_input={"command": "pwd"}),
+            _tool_call_note(kind="tool_call_update", status="completed", raw_output="/tmp"),
+            _text_chunk_note("All done."),
+        ])
+
+        roles = [m["role"] for m in result.projected_messages]
+        assert roles == ["assistant", "tool", "assistant"]
+        # The trailing assistant message is the assembled text reply.
+        assert result.projected_messages[-1]["content"] == "All done."
+
+    def test_in_progress_update_does_not_emit_pair(self):
+        """A non-terminal tool_call_update (in_progress) emits no pair and keeps
+        the call pending until the terminal update arrives."""
+        result = self._run_with_notifications([
+            _tool_call_note(kind="tool_call", title="bash", raw_input={"command": "ls"}),
+            _tool_call_note(kind="tool_call_update", status="in_progress"),
+            _tool_call_note(kind="tool_call_update", status="completed", raw_output="ok"),
+        ])
+
+        assert result.tool_iterations == 1
+        msgs = result.projected_messages
+        assert len(msgs) == 2  # only the terminal update produced a pair
+        assert msgs[0]["role"] == "assistant"
+        assert msgs[1]["role"] == "tool"
+        assert msgs[1]["content"] == "ok"
+
+    def test_failed_status_is_terminal(self):
+        """A 'failed' status also closes the call and projects the pair."""
+        result = self._run_with_notifications([
+            _tool_call_note(kind="tool_call", title="bash", raw_input={"command": "bad"}),
+            _tool_call_note(kind="tool_call_update", status="failed", raw_output="command not found"),
+        ])
+
+        assert result.tool_iterations == 1
+        assert len(result.projected_messages) == 2
+        assert result.projected_messages[1]["content"] == "command not found"
+
+    def test_terminal_update_without_start_is_skipped(self):
+        """A terminal update with no matching start does not fabricate a pair."""
+        result = self._run_with_notifications([
+            _tool_call_note(
+                kind="tool_call_update",
+                tool_call_id="orphan",
+                status="completed",
+                raw_output="ghost",
+            ),
+        ])
+
+        assert result.tool_iterations == 0
+        assert result.projected_messages == []
+
+    def test_dict_raw_input_json_encoded_empty_becomes_empty_object(self):
+        """Missing rawInput -> arguments defaults to '{}' (valid JSON), not ''."""
+        result = self._run_with_notifications([
+            _tool_call_note(kind="tool_call", title="noop", raw_input=None),
+            _tool_call_note(kind="tool_call_update", status="completed", raw_output=None),
+        ])
+
+        assistant_call = result.projected_messages[0]
+        assert assistant_call["tool_calls"][0]["function"]["arguments"] == "{}"
+        tool_result = result.projected_messages[1]
+        assert tool_result["content"] == ""  # None rawOutput -> empty string
+
+    def test_multiple_distinct_tool_calls_each_projected(self):
+        """Two independent tool calls produce two separate pairs, in order."""
+        result = self._run_with_notifications([
+            _tool_call_note(kind="tool_call", tool_call_id="a", title="ls", raw_input={}),
+            _tool_call_note(kind="tool_call_update", tool_call_id="a", status="completed", raw_output="a-out"),
+            _tool_call_note(kind="tool_call", tool_call_id="b", title="cat", raw_input={"path": "x"}),
+            _tool_call_note(kind="tool_call_update", tool_call_id="b", status="completed", raw_output="b-out"),
+        ])
+
+        assert result.tool_iterations == 2
+        ids = [
+            m["tool_calls"][0]["id"]
+            for m in result.projected_messages
+            if m.get("role") == "assistant"
+        ]
+        assert ids == ["a", "b"]
+
+    def test_pending_tool_calls_cleared_between_turns(self):
+        """A tool call that starts but never completes does not leak into the
+        next turn's projected history."""
+        session, mock_client = _make_session()
+
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
+            if method == "session/new":
+                return {"sessionId": "sess-clear"}
+            if method == "session/prompt":
+                time.sleep(0.03)
+                return {"stopReason": "end_turn"}
+            return {}
+
+        mock_client.request.side_effect = req_side_effect
+
+        # Turn 1: a tool call starts but never reaches a terminal update.
+        notes1 = iter([
+            _tool_call_note(kind="tool_call", tool_call_id="leak", title="bash", raw_input={}),
+            None, None,
+        ])
+        mock_client.take_notification.side_effect = lambda timeout=0.0: next(notes1, None)
+        result1 = session.run_turn("interrupt me", cwd="/tmp")
+        assert result1.tool_iterations == 1
+        assert result1.projected_messages == []  # no completion -> no pair
+        assert "leak" in session._pending_tool_calls  # dangling in-turn
+
+        # Turn 2: clean -- no stale pair from the leaked pending entry.
+        notes2 = iter([None, None])
+        mock_client.take_notification.side_effect = lambda timeout=0.0: next(notes2, None)
+        result2 = session.run_turn("fresh turn", cwd="/tmp")
+        assert result2.tool_iterations == 0
+        assert result2.projected_messages == []
+        assert session._pending_tool_calls == {}
+
+
+class TestStringifyToolPayload:
+    """Unit tests for the rawInput/rawOutput -> string coercion helper."""
+
+    def test_none_returns_empty_string(self):
+        assert _stringify_tool_payload(None) == ""
+
+    def test_string_passed_through(self):
+        assert _stringify_tool_payload("plain text") == "plain text"
+
+    def test_dict_json_encoded(self):
+        assert _stringify_tool_payload({"a": 1, "b": "x"}) == '{"a": 1, "b": "x"}'
+
+    def test_list_json_encoded(self):
+        assert _stringify_tool_payload([1, 2, 3]) == "[1, 2, 3]"
+
+    def test_int_stringified(self):
+        assert _stringify_tool_payload(42) == "42"
+
+    def test_unicode_preserved(self):
+        assert _stringify_tool_payload({"city": "Zürich"}) == '{"city": "Zürich"}'
 
 
 # ---------------------------------------------------------------------------

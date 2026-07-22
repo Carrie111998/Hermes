@@ -23,6 +23,7 @@ blocking-with-timeout queues that this adapter polls in a loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -62,6 +63,12 @@ _UPDATE_AGENT_MESSAGE = "agent_message_chunk"
 _UPDATE_AGENT_THOUGHT = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call_update"
 _UPDATE_TOOL_CALL_START = "tool_call"
+
+# Terminal ToolCallStatus values (the ACP Literal is
+# "pending" | "in_progress" | "completed" | "failed"). A "tool_call" start
+# notification opens a call; a "tool_call_update" carrying one of these
+# statuses closes it and emits the assistant+tool message pair.
+_TOOL_CALL_TERMINAL_STATUSES = {"completed", "failed"}
 
 # How many trailing stderr lines to show in error messages
 _STDERR_TAIL_LINES = 12
@@ -112,6 +119,28 @@ def _is_tool_iteration(params: dict) -> bool:
     update = params.get("update") or {}
     kind = update.get("sessionUpdate") or update.get("session_update") or ""
     return kind in {_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_START}
+
+
+def _stringify_tool_payload(value: Any) -> str:
+    """Coerce a tool rawInput/rawOutput value into an OpenAI-shaped string.
+
+    ACP carries rawInput/rawOutput as ``Optional[Any]`` — usually a dict of
+    arguments for input, a string for output, but legally any JSON value.
+    OpenAI tool_calls.function.arguments and the tool-role message content
+    must be strings, so dicts/lists are JSON-encoded (``ensure_ascii=False``
+    to keep multilingual tool arguments readable) and any other non-string
+    value is stringified. ``None`` -> ``""``. Mirrors the arguments coercion
+    in codex_responses_adapter so ACP-projected turns are byte-compatible
+    with native/codex turns for DB persistence and runtime switching.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 class ACPClientSession:
@@ -239,6 +268,13 @@ class ACPClientSession:
         self._client: Optional[ACPClient] = None
         self._session_id: Optional[str] = None
         self._closed = False
+        # In-flight tool calls awaiting a terminal "tool_call_update", keyed
+        # by toolCallId. Captured on the "tool_call" start notification and
+        # consumed when the matching update arrives with a terminal status,
+        # so the full assistant+tool message pair can be projected for DB
+        # persistence and runtime switching (ACP -> Native). Cleared at the
+        # start of each run_turn() to avoid stale state across turns.
+        self._pending_tool_calls: dict[str, dict] = {}
 
     # ---------- lifecycle ----------
 
@@ -631,6 +667,10 @@ class ACPClientSession:
         Returns a TurnResult. Sets should_retire=True on crash/timeout.
         """
         result = TurnResult()
+        # Reset in-flight tool-call tracking so a tool call that started but
+        # never completed in a previous (interrupted) turn does not leak into
+        # this turn's projected history.
+        self._pending_tool_calls.clear()
         # Ensure session is open (lazy start on first turn)
         try:
             self.ensure_started(cwd=cwd)
@@ -745,7 +785,7 @@ class ACPClientSession:
                     except Exception:
                         logger.debug("on_delta callback raised", exc_info=True)
             if _is_tool_iteration(params):
-                result.tool_iterations += 1
+                self._capture_tool_call_event(params, result)
             return True
 
         # Drain notifications while waiting for the prompt response.
@@ -843,6 +883,86 @@ class ACPClientSession:
         return result
 
     # ---------- internals ----------
+
+    def _capture_tool_call_event(self, params: dict, result: TurnResult) -> None:
+        """Capture one tool-call lifecycle event from a session/update.
+
+        ACP streams a tool call as two notifications on the same id:
+
+        * ``tool_call`` (start) -- opens the call, carries ``title`` (the
+          tool name) and ``rawInput``.
+        * ``tool_call_update`` (progress) -- closes the call when it reaches
+          a terminal ``status`` ("completed"/"failed"), carrying
+          ``rawOutput``.
+
+        On start we tick ``tool_iterations`` (once per call, matching the
+        codex transport's per-item semantics) and stash the title/rawInput
+        keyed by ``toolCallId``. On a terminal update we pop the pending
+        entry and append an OpenAI-shaped assistant+tool message pair to
+        ``projected_messages``. The pair lands before the final assistant
+        text message because notifications arrive in order and the final
+        text is projected at the very end of ``run_turn``.
+
+        ACP delivers notifications in order on a single JSON-RPC stream, so
+        a terminal update is always preceded by its start. If a terminal
+        update has no pending entry (e.g. an unexpected id), the pair is
+        skipped rather than fabricated. Entries left dangling by an
+        interrupted turn are cleared at the start of the next run_turn.
+        """
+        update = params.get("update") or {}
+        kind = update.get("sessionUpdate") or update.get("session_update") or ""
+        tool_call_id = update.get("toolCallId") or ""
+
+        if kind == _UPDATE_TOOL_CALL_START:
+            # A new tool call is beginning. Count it once here -- not again
+            # on the terminal update -- so tool_iterations reflects actual
+            # tool calls (acp_runtime uses it for skill-nudge counting).
+            result.tool_iterations += 1
+            if tool_call_id:
+                self._pending_tool_calls[tool_call_id] = {
+                    "tool_name": update.get("title") or "",
+                    "raw_input": update.get("rawInput"),
+                }
+            return
+
+        if kind != _UPDATE_TOOL_CALL:
+            return
+
+        # tool_call_update: only the terminal statuses close a call. Non-
+        # terminal updates (in_progress) refresh transient fields we do not
+        # persist, so they are ignored.
+        if update.get("status") not in _TOOL_CALL_TERMINAL_STATUSES:
+            return
+
+        if not tool_call_id:
+            return
+
+        pending = self._pending_tool_calls.pop(tool_call_id, None)
+        if not pending:
+            # No start seen for this id (start notification dropped or an
+            # id we never opened). Do not fabricate a pair -- skip it.
+            return
+
+        arguments = _stringify_tool_payload(pending.get("raw_input")) or "{}"
+        output = _stringify_tool_payload(update.get("rawOutput"))
+
+        result.projected_messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": tool_call_id,
+                "function": {
+                    "name": pending["tool_name"],
+                    "arguments": arguments,
+                },
+            }],
+        })
+        result.projected_messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": output,
+            "tool_name": pending["tool_name"],
+        })
 
     def _handle_server_request(self, req: dict) -> None:
         """Handle server-initiated requests from the ACP agent.
