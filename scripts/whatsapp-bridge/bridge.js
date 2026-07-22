@@ -156,6 +156,17 @@ const MAX_MESSAGES_PER_CHAT = 200;
 const chatMessageStore = ENABLE_HISTORY_API ? new Map() : null;
 const contactStore = ENABLE_HISTORY_API ? new Map() : null;
 
+// Normalise a Baileys timestamp (number | protobuf Long | undefined) to
+// a plain Unix-second integer.  In Baileys `messaging-history.set`, the
+// timestamp arrives as a protobuf Long object (e.g. `{ low, high }`),
+// not a plain number; storing it raw breaks sort comparisons.
+function toNumberSafe(raw) {
+  if (raw == null) return Math.floor(Date.now() / 1000);
+  if (typeof raw === 'object' && typeof raw.toNumber === 'function') return raw.toNumber();
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : Math.floor(Date.now() / 1000);
+}
+
 function storeMessage(chatId, event) {
   if (!ENABLE_HISTORY_API || !chatId || !chatMessageStore) return;
   let msgs = chatMessageStore.get(chatId);
@@ -530,7 +541,7 @@ async function startSocket() {
 
   // Handle history sync (contacts, chats, initial messages) — only active
   // when WHATSAPP_SYNC_FULL_HISTORY=true AND WHATSAPP_ENABLE_HISTORY_API=true.
-  if (ENABLE_HISTORY_API) {
+  if (ENABLE_HISTORY_API && SYNC_FULL_HISTORY) {
     sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
       // Store contacts
       for (const contact of contacts || []) {
@@ -560,7 +571,7 @@ async function startSocket() {
           fromMe: !!msg.key.fromMe,
           body: textContent,
           hasMedia: !!msg.message?.imageMessage || !!msg.message?.videoMessage || !!msg.message?.documentMessage,
-          timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
+          timestamp: toNumberSafe(msg.messageTimestamp),
         };
         storeMessage(chatId, entry);
       }
@@ -1219,7 +1230,10 @@ if (ENABLE_HISTORY_API) {
   // GET /chat/:id/messages?limit=N — Fetch stored messages for a chat
   app.get('/chat/:id/messages', (req, res) => {
     const chatId = req.params.id;
-    const limit = Math.min(parseInt(req.query.limit, 10) || 50, MAX_MESSAGES_PER_CHAT);
+    const parsedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(parsedLimit, MAX_MESSAGES_PER_CHAT))
+      : 50;
     const msgs = chatMessageStore ? chatMessageStore.get(chatId) : undefined;
     if (!msgs) {
       return res.json({ messages: [], total: 0 });
@@ -1250,7 +1264,7 @@ if (ENABLE_HISTORY_API) {
 
   // GET /contacts?q=search — Search or list WhatsApp contacts
   app.get('/contacts', (req, res) => {
-    const query = (req.query.q || '').toLowerCase().trim();
+    const query = String(req.query.q || '').toLowerCase().trim();
     let results = [];
     if (contactStore) {
       for (const contact of contactStore.values()) {
