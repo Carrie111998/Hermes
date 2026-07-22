@@ -5534,3 +5534,47 @@ async def test_reconcile_rejects_non_deterministic_claude_attempt_sidecar(
     assert store.completions == []
     assert not any(operation[0] == "find_origin" for operation in store.operations)
     assert store.manual_failure_calls[0]["code"] == "attempt_sidecar_invalid"
+
+
+@pytest.mark.parametrize("continuous", (False, True))
+@pytest.mark.asyncio
+async def test_successful_scan_runs_mirror_float_only_in_continuous_mode(
+    continuous: bool,
+) -> None:
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    event_loop_thread = get_ident()
+    float_threads: list[int] = []
+
+    class RecordingFloatWorker:
+        def run_once(self) -> dict[str, int]:
+            float_threads.append(get_ident())
+            return {"examined": 0, "floated": 0, "skipped": 0}
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=continuous),
+        store=store,
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        mirror_float=RecordingFloatWorker(),
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert len(float_threads) == int(continuous)
+    if continuous:
+        assert float_threads[0] != event_loop_thread
+
+
+def test_mirror_float_must_provide_run_once() -> None:
+    with pytest.raises(TypeError, match="mirror_float must provide run_once"):
+        SessionBridgeCoordinator(
+            config=_sidebar_config(),
+            store=_SidebarScanStore(),
+            adapters={},
+            target_adapters={},
+            clock=lambda: 0.0,
+            mirror_float=object(),
+        )

@@ -92,6 +92,7 @@ class ClaudeVisibilityConfig:
     emergency_daily_cost_usd: Decimal = Decimal("0.50")
     process_timeout_seconds: int = 120
     discovery_timeout_seconds: int = 30
+    float_activity: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ class BridgeConfig:
                 "emergency_daily_cost_usd",
                 "process_timeout_seconds",
                 "discovery_timeout_seconds",
+                "float_activity",
             }),
             scope="session_bridge.claude_visibility",
         )
@@ -488,6 +490,13 @@ class BridgeConfig:
                 ),
                 "session_bridge.claude_visibility.discovery_timeout_seconds",
                 minimum=1,
+            ),
+            float_activity=_toml_bool(
+                claude_visibility.get(
+                    "float_activity",
+                    claude_visibility_defaults.float_activity,
+                ),
+                "session_bridge.claude_visibility.float_activity",
             ),
         )
         if claude_visibility_config.continuous_batch_limit != 1:
