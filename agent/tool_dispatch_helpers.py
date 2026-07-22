@@ -353,26 +353,17 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
         body = args.get("patch") or ""
         if not isinstance(body, str) or not body:
             return []
+        from tools.patch_parser import parse_v4a_patch
+
+        operations, parse_error = parse_v4a_patch(body)
+        if parse_error:
+            return []
         paths: List[str] = []
-        for _m in re.finditer(
-            r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            p = _m.group(1).strip()
-            if p:
-                paths.append(p)
-        for _m in re.finditer(
-            r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-            body,
-            re.MULTILINE,
-        ):
-            src = _m.group(1).strip()
-            dst = _m.group(2).strip()
-            if src:
-                paths.append(src)
-            if dst:
-                paths.append(dst)
+        for op in operations:
+            if op.file_path:
+                paths.append(op.file_path)
+            if op.operation.value == "move" and op.new_path:
+                paths.append(op.new_path)
         return paths
     return []
 

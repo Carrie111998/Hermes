@@ -89,6 +89,17 @@ class TestExtractFileMutationTargets:
         assert _extract_file_mutation_targets("patch", {"mode": "patch"}) == []
         assert _extract_file_mutation_targets("patch", {"mode": "patch", "patch": ""}) == []
 
+    def test_malformed_patch_header_without_hunks_is_not_a_mutation_target(self):
+        body = (
+            "*** Begin" " Patch\n"
+            "*** Update" " File: /tmp/grep app Wilt?\n"
+            "*** End" " Patch\n"
+        )
+
+        assert _extract_file_mutation_targets(
+            "patch", {"mode": "patch", "patch": body},
+        ) == []
+
 
 # ---------------------------------------------------------------------------
 # _extract_error_preview
