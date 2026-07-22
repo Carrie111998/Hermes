@@ -587,6 +587,20 @@ class TestPrompt:
 
         assert captured.get("child") == resp.session_id
 
+    def test_title_update_does_not_create_coroutine_after_loop_closes(self, agent):
+        class ClosedLoop:
+            def call_soon_threadsafe(self, _callback):
+                raise RuntimeError("event loop is closed")
+
+        agent._send_session_info_update = MagicMock()
+
+        agent._schedule_session_info_update_from_thread(
+            ClosedLoop(),
+            "closed-session",
+        )
+
+        agent._send_session_info_update.assert_not_called()
+
 
 
 
