@@ -306,6 +306,43 @@ class EventType(Enum):
     #   thresholds (dict)                — the limits that were evaluated
     RESOURCE_PRESSURE = ("resource_pressure", Priority.HIGH)
 
+    # Tracker-intent-applier partial-backlog early-warning — added 2026-07-14.
+    # On 2026-07-13 thirteen APPROVAL_INTENT partials piled up in
+    # ~/.hermes/mailbox/tracker/partial/ and sat ~a day unnoticed. A partial is
+    # an intent whose pipeline.json write succeeded but whose Postgres mirror
+    # (:4100 step 4) did not; the idempotency key is unburned so it stays
+    # re-drivable. Emitted by events.producers.partial_backlog_monitor.
+    # PartialBacklogMonitor, which read-only counts partial/ on the shared
+    # subscriber poll loop and fires on the rising edge of count > threshold
+    # (default 3). HIGH so it survives significant_only / digest_only verbosity;
+    # routed to jobflow_decisions (the human-action lane). Payload:
+    #   count (int)                — partial *_INTENT_*.json files right now
+    #   threshold (int)            — the alert threshold that was crossed
+    #   oldest_age_seconds (float) — age of the oldest partial (entered-partial mtime)
+    #   capped_count (int)         — number of job IDs in sample_job_ids
+    #   sample_job_ids (list[str]) — up to SAMPLE_CAP job IDs for triage
+    TRACKER_PARTIAL_BACKLOG = ("tracker_partial_backlog", Priority.HIGH)
+
+    # Agent-src code-drift alert — added 2026-07-21. The gateway's editable
+    # install imports the WORKING TREE of ~/.hermes/agent-src, which is
+    # deliberately kept on a detached HEAD so worktree agents can land
+    # commits onto the `main` ref via `git branch -f`. A commit landed on
+    # main therefore does NOT run until the checkout is fast-forwarded and
+    # the gateway restarted — on 2026-07-20/21 three restart cycles ran
+    # stale code while every session believed the fix was live. Emitted by
+    # events.producers.code_drift_monitor.CodeDriftMonitor (read-only git
+    # probe every 15 min on the subscriber poll loop; rising edge / shape
+    # change / 6h re-ping, plus a falling-edge status="resolved" event).
+    # HIGH so it survives significant_only / digest_only verbosity. Payload:
+    #   status (str)            — "drifting" | "resolved"
+    #   state (str)             — "behind" | "ahead" | "diverged" (drifting only)
+    #   head / main (str)       — short SHAs
+    #   behind_count / ahead_count (int)
+    #   dirty (bool)            — uncommitted changes in the checkout
+    #   missed_subjects (list[str]) — up to 5 "<sha> <subject>" lines (behind)
+    #   repo (str)              — checkout path probed
+    CODE_DRIFT = ("code_drift", Priority.HIGH)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

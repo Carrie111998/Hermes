@@ -143,9 +143,19 @@ class EventBus:
         """Execute a write operation under the lock."""
         with self._lock:
             conn = self._get_conn()
-            cursor = conn.execute(sql, params)
-            conn.commit()
-            return cursor
+            try:
+                cursor = conn.execute(sql, params)
+                conn.commit()
+                return cursor
+            except Exception:
+                # A failed write must not leave this thread-local connection in an
+                # open transaction: the poll loop reuses the connection, a later
+                # SELECT would pin a stale read snapshot, and every subsequent write
+                # would then fail SQLITE_BUSY_SNAPSHOT until the connection is reset
+                # (the 2026-07-14 subscriber-ack wedge). Roll back so a transient
+                # BUSY cannot poison the connection.
+                conn.rollback()
+                raise
 
     def emit(
         self,
@@ -375,13 +385,25 @@ class EventBus:
                                r["event_id"], e)
         return events
 
-    def checkpoint(self) -> None:
-        """Run a passive WAL checkpoint so external readers see recent data."""
+    def checkpoint(self, mode: str = "PASSIVE") -> Optional[tuple]:
+        """Run a WAL checkpoint; returns (busy, log_frames, checkpointed_frames).
+
+        PASSIVE backfills pages but by definition never RESETS the WAL, so
+        journal_size_limit (ADR-0018) never applies through this path.
+        TRUNCATE additionally resets the WAL to zero bytes when it wins; when
+        readers block it the PRAGMA RETURNS busy=1 rather than raising, so
+        callers must inspect the tuple. Returns None on hard SQLite errors.
+        """
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"invalid checkpoint mode: {mode}")
         with self._lock:
             try:
-                self._get_conn().execute("PRAGMA wal_checkpoint(PASSIVE)")
+                return self._get_conn().execute(
+                    f"PRAGMA wal_checkpoint({mode})"
+                ).fetchone()
             except sqlite3.Error as e:
-                logger.warning("WAL checkpoint failed: %s", e)
+                logger.warning("WAL checkpoint(%s) failed: %s", mode, e)
+                return None
 
     def close(self) -> None:
         """Close the thread-local SQLite connection."""

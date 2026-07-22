@@ -5025,34 +5025,40 @@ class TestDuplicateFireGuard:
         return {"id": job_id, "name": name, "deliver": "local"}
 
     def test_concurrent_duplicate_fire_emits_skip_and_blocks_second_run_job(self):
-        """Canonical 2026-04-30 sentinel triple-fire scenario.
+        """Canonical 2026-04-30 sentinel triple-fire scenario (cross-tick race).
 
-        Two _process_job calls land for the same job_id; the first wins the
-        in-flight slot and proceeds, the second emits CRON_SKIPPED_DUPLICATE
-        and never reaches run_job (which is what would have collided on the
-        Chrome browser-harness lock).
+        The production duplicate is the trigger_job()-vs-tick race: a fire from
+        an earlier tick is still in flight -- claimed in BOTH the submit-time
+        running set (_running_job_ids, upstream's 0.16.0 non-blocking-dispatch
+        dedup) AND Guard #3's _in_flight registry (with its cron_started
+        event_id) -- when a second fire for the same job_id is dispatched on a
+        later tick. That second fire must be blocked before it reaches run_job
+        (which is what collided on the Chrome browser-harness lock) and must
+        emit exactly one CRON_SKIPPED_DUPLICATE correlated to the live fire.
+
+        Modelled deterministically (no threads/barriers): the winner "ran" on
+        the prior tick, so we seed it as already-in-flight and dispatch only the
+        duplicate. Regression guard: the running-set guard lands BEFORE
+        _process_job, so before the fix it rejected the duplicate silently and
+        Guard #3's emit seam was dead (the second fire's skip event was lost).
         """
-        import threading
         import time
+        from cron import scheduler as sch
         from events.schema import EventType
 
-        release = threading.Event()
-        run_job_call_count = 0
-        run_job_lock = threading.Lock()
-
-        def blocking_run_job(job):
-            nonlocal run_job_call_count
-            with run_job_lock:
-                run_job_call_count += 1
-            # Hold the slot long enough that the parallel second fire's
-            # _process_job is guaranteed to have crossed the guard.
-            release.wait(timeout=5)
-            return (True, "# output", "response", None)
+        # Winner from an earlier tick, still running: claimed in the submit-time
+        # running set AND Guard #3's registry, with its cron_started event_id.
+        sch._running_job_ids.add("092f4ed7657c")
+        sch._in_flight["092f4ed7657c"] = sch._InFlightRecord(
+            start_monotonic=time.monotonic(),
+            job_name="sentinel-vip-morning",
+            cron_started_event_id="4edcb4b1-aa07-4dbb-b799-8af167d4f92e",
+        )
 
         emitter = MagicMock()
-        # Give on_job_started a deterministic event_id so we can assert it
-        # propagates into prior_cron_started_event_id on the skip event.
-        emitter.on_job_started.return_value = "4edcb4b1-aa07-4dbb-b799-8af167d4f92e"
+        # If the duplicate wrongly started its own fire, on_job_started would be
+        # called -- assert below that it is NOT.
+        emitter.on_job_started.return_value = "should-not-be-emitted"
 
         skip_calls = []
 
@@ -5061,38 +5067,39 @@ class TestDuplicateFireGuard:
             return "skip-evt-id"
         emitter.on_job_skipped_duplicate.side_effect = capture_skip
 
-        # Schedule release once both fires have had a chance to enter
-        # _process_job. The second fire returns False quickly via the
-        # guard; the first is then released to complete normally.
-        def release_after_delay():
-            time.sleep(0.4)
-            release.set()
-        threading.Thread(target=release_after_delay, daemon=True).start()
+        run_job_calls = []
 
-        # Two due-job entries with the SAME job_id reproduce the
-        # trigger_job race observed in production (mirroring trigger_job
-        # firing twice within one tick window).
+        def blocking_run_job(job):
+            run_job_calls.append(job)
+            return (True, "# output", "response", None)
+
         job = self._job()
 
-        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([dict(job), dict(job)], [])), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
-             patch("cron.scheduler.run_job", side_effect=blocking_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"), \
-             patch("cron.jobs.load_jobs", return_value=[
-                 {"id": "092f4ed7657c", "consecutive_errors": 0}
-             ]):
-            from cron.scheduler import tick
-            tick(verbose=False)
+        try:
+            with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([dict(job)], [])), \
+                 patch("cron.scheduler.advance_next_run"), \
+                 patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+                 patch("cron.scheduler.run_job", side_effect=blocking_run_job), \
+                 patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+                 patch("cron.scheduler._deliver_result", return_value=None), \
+                 patch("cron.scheduler.mark_job_run"), \
+                 patch("cron.jobs.load_jobs", return_value=[
+                     {"id": "092f4ed7657c", "consecutive_errors": 0}
+                 ]):
+                from cron.scheduler import tick
+                tick(verbose=False)
+        finally:
+            # The autouse fixture clears _in_flight; the running set has no such
+            # fixture, so release our seeded claim to keep tests independent.
+            sch._running_job_ids.discard("092f4ed7657c")
 
-        # Exactly one fire reached run_job -- the second was blocked.
-        assert run_job_call_count == 1, (
-            f"Expected exactly one run_job invocation; got {run_job_call_count}"
+        # The duplicate fire was blocked before run_job (the winner ran on the
+        # prior tick we seeded) -- this is what protected the browser-harness.
+        assert run_job_calls == [], (
+            f"duplicate must not reach run_job; got {run_job_calls!r}"
         )
-        # Exactly one cron_started -- the duplicate must NOT have emitted one.
-        assert emitter.on_job_started.call_count == 1, (
+        # The duplicate must NOT emit its own cron_started.
+        assert emitter.on_job_started.call_count == 0, (
             f"on_job_started called {emitter.on_job_started.call_count}x; "
             "duplicate fire emitted cron_started anyway"
         )

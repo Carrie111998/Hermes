@@ -490,11 +490,12 @@ def test_heartbeat_age_detects_staleness(tmp_path, monkeypatch):
     """A heartbeat written far in the past reads back as a large age."""
     import cron.jobs as jobs
 
+    # cron.jobs resolves the heartbeat file dynamically from HERMES_HOME, so
+    # point HERMES_HOME at tmp_path and write to the resolved location.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cron_dir = tmp_path / "cron"
     cron_dir.mkdir(parents=True)
     hb = cron_dir / "ticker_heartbeat"
-    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
-    monkeypatch.setattr(jobs, "TICKER_HEARTBEAT_FILE", hb)
 
     import time as _t
     hb.write_text(str(_t.time() - 10_000), encoding="utf-8")
@@ -513,11 +514,9 @@ def test_heartbeat_write_failure_is_silent(tmp_path, monkeypatch):
 
     blocker = tmp_path / "not_a_dir"
     blocker.write_text("i am a file, not a directory")
-    bad_cron_dir = blocker / "cron"  # parent is a file -> mkdir/mkstemp fail
-    monkeypatch.setattr(jobs, "CRON_DIR", bad_cron_dir)
-    monkeypatch.setattr(jobs, "OUTPUT_DIR", bad_cron_dir / "output")
-    monkeypatch.setattr(jobs, "TICKER_HEARTBEAT_FILE", bad_cron_dir / "ticker_heartbeat")
-    monkeypatch.setattr(jobs, "TICKER_SUCCESS_FILE", bad_cron_dir / "ticker_last_success")
+    # Point HERMES_HOME *under a regular file* so the dynamically-resolved cron
+    # dir (<home>/cron) cannot be created and mkdir/mkstemp genuinely fail.
+    monkeypatch.setenv("HERMES_HOME", str(blocker))
 
     jobs.record_ticker_heartbeat(success=True)  # must not raise
 

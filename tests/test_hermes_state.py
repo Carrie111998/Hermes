@@ -2163,6 +2163,58 @@ class TestPruneSessions:
         for sid in ("X", "Y", "Z"):
             assert db.get_session(sid) is None
 
+    def _make_old_ended_n(self, db, n, days_old=100):
+        for i in range(n):
+            sid = f"batch_old_{i}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - days_old * 86400, sid),
+            )
+        db._conn.commit()
+
+    def test_prune_max_batch_deletes_all_in_chunks(self, db):
+        self._make_old_ended_n(db, 5)
+        pruned = db.prune_sessions(older_than_days=90, max_batch=2)
+        assert pruned == 5
+        for i in range(5):
+            assert db.get_session(f"batch_old_{i}") is None
+
+    def test_prune_max_batch_commits_between_chunks(self, db, monkeypatch):
+        """5 rows / batch of 2 -> 3 write transactions (2, 2, 1)."""
+        self._make_old_ended_n(db, 5)
+        calls = {"n": 0}
+        real = db._execute_write
+        def _counting(fn):
+            calls["n"] += 1
+            return real(fn)
+        monkeypatch.setattr(db, "_execute_write", _counting)
+        pruned = db.prune_sessions(older_than_days=90, max_batch=2)
+        assert pruned == 5
+        assert calls["n"] == 3
+
+    def test_prune_max_batch_none_is_single_transaction(self, db, monkeypatch):
+        self._make_old_ended_n(db, 4)
+        calls = {"n": 0}
+        real = db._execute_write
+        def _counting(fn):
+            calls["n"] += 1
+            return real(fn)
+        monkeypatch.setattr(db, "_execute_write", _counting)
+        pruned = db.prune_sessions(older_than_days=90)  # max_batch defaults None
+        assert pruned == 4
+        assert calls["n"] == 1
+
+    def test_prune_max_batch_zero_terminates_and_prunes(self, db):
+        """A misconfigured max_batch<=0 must not infinite-loop; it clamps to
+        chunk size 1 and still prunes the whole backlog."""
+        self._make_old_ended_n(db, 3)
+        pruned = db.prune_sessions(older_than_days=90, max_batch=0)
+        assert pruned == 3
+        for i in range(3):
+            assert db.get_session(f"batch_old_{i}") is None
+
 
 class TestPruneSessionFilters:
     """Extended filter surface shared by prune/archive/list_prune_candidates."""
@@ -4467,6 +4519,43 @@ class TestAutoMaintenance:
         assert not (sessions_dir / "request_dump_old1_001.json").exists()
         # Active session's transcript is untouched
         assert (sessions_dir / "new.jsonl").exists()
+
+    def test_marker_recorded_even_when_prune_raises(self, db, monkeypatch):
+        """Defect #1 fix: a transient prune failure must still record the
+        last-run marker so it can't error-loop on every startup."""
+        def _boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(db, "prune_sessions", _boom)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result.get("error") is not None
+        assert db.get_meta("last_auto_prune") is not None
+
+    def test_marker_not_recorded_when_skipped(self, db):
+        """A skip (within min_interval) must NOT rewrite the marker."""
+        self._make_old_ended(db, "old", days_old=100)
+        db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
+        first_marker = db.get_meta("last_auto_prune")
+        second = db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
+        assert second["skipped"] is True
+        assert db.get_meta("last_auto_prune") == first_marker  # unchanged
+
+    def test_max_batch_passed_through_to_prune(self, db, monkeypatch):
+        seen = {}
+        real = db.prune_sessions
+        def _spy(*a, **k):
+            seen.update(k)
+            return real(*a, **k)
+        monkeypatch.setattr(db, "prune_sessions", _spy)
+        db.maybe_auto_prune_and_vacuum(retention_days=90, max_batch=200)
+        assert seen.get("max_batch") == 200
+
+    def test_online_style_no_vacuum_even_with_prunes(self, db):
+        """vacuum=False path used by online callers never VACUUMs."""
+        self._make_old_ended(db, "old", days_old=100)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90, vacuum=False)
+        assert result["pruned"] == 1
+        assert result["vacuumed"] is False
+        assert db.get_meta("last_auto_prune") is not None
 
     def test_auto_prune_without_sessions_dir_preserves_files(self, db, tmp_path):
         """Backward-compat: no sessions_dir = DB-only cleanup (legacy behavior)."""

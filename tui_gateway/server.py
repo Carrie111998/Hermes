@@ -1254,6 +1254,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         worker = None
         notify_registered = False
         home_token = None
+        essential_ready = False
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -1330,6 +1331,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 pass
 
             _wire_callbacks(sid)
+            # The agent is now usable. Optional enrichment below includes a
+            # synchronous websocket emit, so it must not define whether agent
+            # initialization succeeded when the event loop is congested.
+            essential_ready = True
+            ready.set()
             # Surface the self-improvement review's "💾 …" summary as an event
             # the TUI/desktop render in-transcript, honoring
             # display.memory_notifications. _init_session wires this for the
@@ -1369,8 +1375,29 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            if essential_ready:
+                # Post-ready enrichment is fail-open: the attached agent and
+                # callbacks remain valid even if a poller, hook, or transport
+                # notification fails.
+                logger.warning(
+                    "agent post-ready setup failed for %s: %s",
+                    sid,
+                    e,
+                    exc_info=True,
+                )
+            else:
+                current["agent_error"] = str(e)
+                # Unblock RPC waiters before reporting over the same transport
+                # that may already be backpressured.
+                ready.set()
+                try:
+                    _emit("error", sid, {"message": f"agent init failed: {e}"})
+                except Exception:
+                    logger.debug(
+                        "failed to emit agent init error for %s",
+                        sid,
+                        exc_info=True,
+                    )
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)

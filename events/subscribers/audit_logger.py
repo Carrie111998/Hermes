@@ -1,13 +1,32 @@
 """AuditLogger subscriber — append-only JSONL event trail.
 
-Records every event for debugging and replay.  Rotated weekly into
-the audit/ archive directory, retained for 90 days.
+Records every event for debugging and replay.
+
+Rotation of the live audit.jsonl is OWNED by the external daily cron
+``audit-rotate`` (~/.hermes/scripts/audit_rotate.py): a tail-preserving trim
+that keeps the newest ~16 days live and moves older lines into per-day
+archives (events/audit/audit-YYYY-MM-DD.jsonl). Tail consumers — curator
+heartbeat_bootstrap (needs >=10 days), critic_retro (14), cron_stall_detector
+/ scribe_digest / effort tuner (7) — read that window from the live file, so
+this subscriber must never rotate it wholesale in normal operation.
+
+The only rotation kept here is the 256 MiB size cap, as an emergency
+backstop. It is unreachable while the cron runs (steady-state file ~40 MB),
+and it bare-renames the file into the archive dir — emptying the live tail —
+so it firing means the cron is broken: fix the cron, don't rely on the cap.
+(A weekly age arm existed 2026-04-16..2026-07-13 but was dead code from
+birth — handle() refreshed st_mtime microseconds before every check, so age
+was always ~0. It was removed rather than fixed to avoid a second active
+rotation mechanism.)
+
+Archives older than 90 days are purged here (hourly-gated), in parity with
+the cron's filename-date retention.
 """
 
 import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -17,12 +36,11 @@ from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-ROTATION_INTERVAL = 604800  # 7 days in seconds
 RETENTION_DAYS = 90
-# Force rotation if the live audit.jsonl exceeds this size, regardless of age.
-# Set to 256 MiB after the 2026-04-28 incident produced a 459 MB file inside
-# the 7-day age window. Operators can scan a 256 MB rotated file in a reasonable
-# time; anything larger is a sign of a flood that should be visible per-day.
+# Emergency backstop only — NOT the normal rotation path (see module
+# docstring). Sized at 256 MiB after the 2026-04-28 incident produced a
+# 459 MB file in 7 days; the audit-rotate cron keeps the steady-state file
+# more than 6x below this.
 SIZE_CAP_BYTES = 256 * 1024 * 1024  # 256 MiB
 
 
@@ -81,24 +99,22 @@ class AuditLogger(BaseSubscriber):
             self._last_rotation_check = now
 
     def _rotate_if_needed(self) -> None:
-        """Rotate audit.jsonl weekly into the archive directory."""
+        """Emergency size-cap backstop — NOT the normal rotation path.
+
+        The external audit-rotate cron owns rotation (daily tail-preserving
+        trim). This bare-rename empties the live tail that curator / critic /
+        scribe consumers read, so it must only ever fire if the cron has been
+        broken long enough for the file to blow past SIZE_CAP_BYTES.
+        """
         if not self.audit_path.exists():
             return
         try:
-            stat = self.audit_path.stat()
-            age = time.time() - stat.st_mtime
-            # Rotate when EITHER (a) age exceeds the weekly interval OR (b) size
-            # exceeds the safety cap. The size cap was added 2026-04-28 after a
-            # subscriber re-fire loop produced 459 MB inside the 7-day window.
-            if age < ROTATION_INTERVAL and stat.st_size < SIZE_CAP_BYTES:
-                return
-            if stat.st_size == 0:
+            if self.audit_path.stat().st_size < SIZE_CAP_BYTES:
                 return
 
             self._archive_dir.mkdir(parents=True, exist_ok=True)
             date_str = datetime.now().strftime("%Y-%m-%d")
-            archive_name = f"audit-{date_str}.jsonl"
-            dest = self._archive_dir / archive_name
+            dest = self._archive_dir / f"audit-{date_str}.jsonl"
 
             # Avoid overwriting
             counter = 1
@@ -107,7 +123,12 @@ class AuditLogger(BaseSubscriber):
                 counter += 1
 
             self.audit_path.rename(dest)
-            logger.info("AuditLogger: rotated to %s", dest.name)
+            logger.warning(
+                "AuditLogger: size-cap backstop rotated to %s — the audit-rotate "
+                "cron should have trimmed the file long before this; check why "
+                "it isn't running",
+                dest.name,
+            )
         except Exception as e:
             logger.warning("AuditLogger: rotation failed: %s", e)
 

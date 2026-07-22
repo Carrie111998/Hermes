@@ -1,6 +1,7 @@
 """Tests for events.bus -- SQLite-backed EventBus."""
 
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -369,6 +370,37 @@ class TestWalPragmas:
         )
 
 
+class TestExecuteRollsBackOnError:
+    """A failed write must roll back so the thread-local connection is not left
+    mid-transaction — otherwise a later SELECT pins a stale read snapshot and
+    every subsequent write fails SQLITE_BUSY_SNAPSHOT until the connection is
+    reset (the 2026-07-14 subscriber-ack wedge)."""
+
+    def test_execute_rolls_back_on_error(self, bus):
+        bus.emit(EventType.CRON_STARTED, "test", {})
+        conn = bus._get_conn()
+        conn.execute("PRAGMA busy_timeout=100")  # fail fast; don't wait the 5s default
+        holder = sqlite3.connect(str(bus.db_path))
+        try:
+            holder.execute("BEGIN IMMEDIATE")  # hold the write lock, uncommitted
+            holder.execute(
+                "INSERT INTO handled_events (subscriber_id, event_id) VALUES ('h', 'h1')"
+            )
+            with pytest.raises(sqlite3.OperationalError):
+                bus._execute(
+                    "INSERT OR IGNORE INTO handled_events (subscriber_id, event_id) "
+                    "VALUES (?, ?)",
+                    ("s", "e1"),
+                )
+            assert bus._get_conn().in_transaction is False, (
+                "a failed write left the connection mid-transaction; a later SELECT "
+                "would pin a stale snapshot and wedge every subsequent write"
+            )
+        finally:
+            holder.rollback()
+            holder.close()
+
+
 class TestDeadLetters:
     """SR-109 dead-letter table — records per-(event, subscriber) handler failures."""
 
@@ -593,3 +625,27 @@ class TestSubscribeUnknownEventType:
         assert any("some_future_type" in m for m in warning_msgs), (
             f"Expected warning mentioning unknown event_type; got: {warning_msgs}"
         )
+
+
+class TestCheckpointModes:
+    def test_truncate_resets_wal_and_reports(self, tmp_path):
+        bus = EventBus(tmp_path / "bus.db")
+        for i in range(50):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+        wal = tmp_path / "bus.db-wal"
+        assert wal.stat().st_size > 0
+        result = bus.checkpoint("TRUNCATE")
+        assert result is not None
+        assert result[0] == 0            # busy flag clear - reset happened
+        assert wal.stat().st_size == 0   # WAL truncated to zero bytes
+
+    def test_invalid_mode_rejected(self, tmp_path):
+        bus = EventBus(tmp_path / "bus.db")
+        with pytest.raises(ValueError):
+            bus.checkpoint("EVIL")
+
+    def test_passive_default_returns_tuple(self, tmp_path):
+        bus = EventBus(tmp_path / "bus.db")
+        bus.emit(EventType.GATEWAY_STARTED, "test", {})
+        result = bus.checkpoint()
+        assert result is not None and len(result) == 3

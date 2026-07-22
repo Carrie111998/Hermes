@@ -7,8 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from events.bus import EventBus
+from events.routing_policy import _POLICY, classify
 from events.schema import Event, EventType, Priority
-from events.subscribers.telegram_notifier import TelegramNotifier, TOPIC_ROUTING
+from events.subscribers.telegram_notifier import TelegramNotifier
 
 
 @pytest.fixture
@@ -61,9 +62,11 @@ def verbosity_config(tmp_path):
 
 class TestTopicRouting:
     def test_all_event_types_have_routing(self):
+        # v3: the event→topic table lives in events.routing_policy._POLICY
+        # (single source of truth both delivery subscribers consult).
         for et in EventType:
-            assert et.type_string in TOPIC_ROUTING, \
-                f"EventType {et.type_string} missing from TOPIC_ROUTING"
+            assert et in _POLICY, \
+                f"EventType {et.type_string} missing from routing_policy._POLICY"
 
 
 class TestAgentIterationRouting:
@@ -98,14 +101,17 @@ class TestAgentIterationRouting:
         target = notifier.resolve_target(self._make_event("critic"))
         assert target[2] == "108"
 
-    def test_curator_routes_to_curator_digest(
+    def test_curator_routes_to_agents_memory(
         self, bus, topics_config, verbosity_config,
     ):
+        # v3: curator joined the agents_memory domain topic; the fixture
+        # predates the cutover so it resolves via the critic_proposals alias
+        # (same thread) rather than the retired curator_digest topic.
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
         )
         target = notifier.resolve_target(self._make_event("curator"))
-        assert target[2] == "107"
+        assert target[2] == "108"
 
     def test_watchdog_routes_to_watchdog_alerts(
         self, bus, topics_config, verbosity_config,
@@ -153,19 +159,24 @@ class TestAgentIterationRouting:
     def test_scout_events_route_to_scout(self):
         # v2 cutover 20260424T233627Z: scout-domain firehose absorbed into
         # jobflow_firehose (formerly the standalone "scout" topic).
-        assert TOPIC_ROUTING["job_discovered"] == "jobflow_firehose"
-        assert TOPIC_ROUTING["job_vip_discovered"] == "jobflow_firehose"
+        assert classify(Event.create(
+            EventType.JOB_DISCOVERED, "scout", {})).topic_key == "jobflow_firehose"
+        assert classify(Event.create(
+            EventType.JOB_VIP_DISCOVERED, "scout", {})).topic_key == "jobflow_firehose"
 
-    def test_critical_events_route_to_alerts(self):
-        # v2 cutover split the v1 "alerts" topic into two:
-        #   - watchdog_alerts: system/applier failures
-        #   - jobflow_decisions: human-action signals (interviews, offers)
-        assert TOPIC_ROUTING["application_blocked"] == "watchdog_alerts"
-        assert TOPIC_ROUTING["interview_signal"] == "jobflow_decisions"
-        assert TOPIC_ROUTING["offer_signal"] == "jobflow_decisions"
+    def test_critical_events_route_to_action_required(self):
+        # v3 attention-first cutover: human-action signals (blocked
+        # applications, interviews, offers) are ACT class and land in the
+        # cross-domain action_required topic (thread-aliased onto
+        # jobflow_decisions for pre-cutover topics.json files).
+        assert classify(Event.create(
+            EventType.APPLICATION_BLOCKED, "applier", {})).topic_key == "action_required"
+        assert classify(Event.create(
+            EventType.INTERVIEW_SIGNAL, "tracker", {})).topic_key == "action_required"
+        assert classify(Event.create(
+            EventType.OFFER_SIGNAL, "tracker", {})).topic_key == "action_required"
 
     def test_topic_routing_covers_all_domain_events(self):
-        from events.subscribers.telegram_notifier import TOPIC_ROUTING
         from events.schema import EventType
         required = {
             EventType.JOB_DISCOVERED, EventType.JOB_VIP_DISCOVERED,
@@ -177,79 +188,164 @@ class TestAgentIterationRouting:
             EventType.FOLLOWUP_DUE, EventType.AGENT_ERROR,
             EventType.CRON_FAILED_CONSECUTIVE, EventType.GATEWAY_HEALTH,
         }
-        # TOPIC_ROUTING is a flat {event_string: topic_string} mapping;
-        # an event is "covered" if its type_string is a key.
-        covered = {et for et in EventType if et.type_string in TOPIC_ROUTING}
-        missing = required - covered
-        assert not missing, f"TOPIC_ROUTING missing: {missing}"
+        # v3: _POLICY is keyed by EventType directly.
+        missing = required - set(_POLICY)
+        assert not missing, f"routing_policy._POLICY missing: {missing}"
 
-    def test_credential_loss_routes_to_security_and_system(self):
-        """R70 alert-gap fix (2026-07-10): a named credential/infra loss lands in
-        the Security & System topic Diego watches. CRITICAL priority => survives
-        significant_only and delivers even during quiet hours (the reliable 3am
-        channel when WhatsApp itself is the lost credential)."""
-        assert TOPIC_ROUTING["credential_loss"] == "security_and_system"
+    def test_credential_loss_routes_to_action_required_at_critical(self):
+        """R70 alert-gap fix (2026-07-10), v3 shape: a named credential/infra
+        loss is an ACT signal — it lands in the operator's action_required
+        topic at CRITICAL priority, so it survives significant_only verbosity
+        and pages IMMEDIATE even during quiet hours (the reliable 3am channel
+        when WhatsApp itself is the lost credential)."""
+        route = classify(Event.create(EventType.CREDENTIAL_LOSS, "watchdog", {}))
+        assert route.topic_key == "action_required"
+        assert route.priority == Priority.CRITICAL
+        assert route.wa_tier == "immediate"
 
     def test_devflow_pr_events_route_to_devflow_firehose(self):
         """DevFlow PR activity (opened, closed, merged) belongs in the
         devflow_firehose topic alongside the existing devflow.run_*
         events. Added 2026-04-30 — spec
         docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
-        Without this routing, PR events would fall through to ``system``
-        and disappear from the user's SDLC monitoring stream.
+        Without this routing, PR events would fall through to the alerts
+        degrade path and disappear from the user's SDLC monitoring stream.
         """
-        assert TOPIC_ROUTING["devflow.pr_opened"] == "devflow_firehose"
-        assert TOPIC_ROUTING["devflow.pr_merged"] == "devflow_firehose"
-        assert TOPIC_ROUTING["devflow.pr_closed"] == "devflow_firehose"
+        for et in (EventType.DEVFLOW_PR_OPENED, EventType.DEVFLOW_PR_MERGED,
+                   EventType.DEVFLOW_PR_CLOSED):
+            assert classify(Event.create(et, "devflow", {})).topic_key == \
+                "devflow_firehose"
 
-    def test_devflow_pr_review_requested_routes_to_devflow_decisions(self):
+    def test_devflow_pr_review_requested_routes_to_action_required(self):
         """PR ready-for-review is a human-action signal (someone needs
-        to review the PR) — pair it with devflow_decisions, NOT firehose.
-        Mirrors how jobflow_decisions carries human-action signals
-        (interview_signal, offer_signal) while jobflow_firehose carries
-        ambient activity. The Critic and Watchdog can also subscribe to
-        devflow_decisions for proposal triage.
+        to review the PR) — v3 classifies it ACT, landing in the
+        cross-domain action_required topic alongside the JobFlow
+        human-action signals (interview_signal, offer_signal), while
+        devflow_firehose keeps the ambient activity.
         """
-        assert TOPIC_ROUTING["devflow.pr_review_requested"] == "devflow_decisions"
+        route = classify(Event.create(
+            EventType.DEVFLOW_PR_REVIEW_REQUESTED, "devflow", {}))
+        assert route.topic_key == "action_required"
 
     def test_devflow_build_events_route_to_devflow_firehose(self):
         """Build started/succeeded land in firehose (ambient SDLC stream).
-        Build LOW-priority started events get batched per the existing
-        low-priority batching path; succeeded events at NORMAL deliver
-        immediately.
+        Both are TRACE class: below HIGH they batch per the existing
+        low-priority batching path.
         """
-        assert TOPIC_ROUTING["devflow.build_started"] == "devflow_firehose"
-        assert TOPIC_ROUTING["devflow.build_succeeded"] == "devflow_firehose"
+        assert classify(Event.create(
+            EventType.DEVFLOW_BUILD_STARTED, "devflow", {})).topic_key == \
+            "devflow_firehose"
+        assert classify(Event.create(
+            EventType.DEVFLOW_BUILD_SUCCEEDED, "devflow", {})).topic_key == \
+            "devflow_firehose"
 
-    def test_devflow_build_failed_routes_to_devflow_decisions(self):
-        """Build failures are decisions (someone needs to investigate).
-        Routes to devflow_decisions like pr_review_requested. CROSS_POST_
-        TO_ALERTS is intentionally NOT enabled for build_failed — DevFlow
-        has its own decision topic and we don't want every red CI to
-        leak into watchdog_alerts (already noisy with cron failures).
+    def test_devflow_build_failed_routes_to_watchdog_alerts(self):
+        """Build failures are WARN class in v3 — something is broken, so
+        they land on watchdog_alerts (the now flap-collapsed, noop-
+        suppressed alert stream) rather than a devflow decision topic.
+        They stay phone-worthy via the explicit URGENT WhatsApp pin.
         """
-        assert TOPIC_ROUTING["devflow.build_failed"] == "devflow_decisions"
+        route = classify(Event.create(
+            EventType.DEVFLOW_BUILD_FAILED, "devflow", {}))
+        assert route.topic_key == "watchdog_alerts"
+        assert route.wa_tier == "urgent"
 
     def test_agent_failure_cluster_routes_to_watchdog_alerts(self):
         """agent_failure_cluster fires from the watchdog detector and is
         an operational alert (cluster of failures across agents). It routes
         to watchdog_alerts.
 
-        Regression: 2026-04-26 — TOPIC_ROUTING contained two entries for
-        'agent_failure_cluster' (one mapping to watchdog_alerts, one to
-        critic_proposals). Python dict literals are last-write-wins, so the
-        cluster events silently went only to critic_proposals; watchdog_alerts
-        never received them.
+        Regression: 2026-04-26 — the pre-v3 TOPIC_ROUTING dict contained two
+        entries for 'agent_failure_cluster' (one mapping to watchdog_alerts,
+        one to critic_proposals). Python dict literals are last-write-wins, so
+        the cluster events silently went only to critic_proposals;
+        watchdog_alerts never received them.
 
         Why watchdog_alerts is the right primary topic: the event source is
-        the watchdog detector and the existing watchdog flood gate in
-        TelegramNotifier.handle() lists agent_failure_cluster alongside the
-        other watchdog signals. The Critic also consumes the cluster (Phase
-        3.1, agent-failure-cluster branch) but produces critic_proposal
-        events as its output — and those already route to critic_proposals.
+        the watchdog detector, and v3 deliberately keeps systemic signals
+        (clusters, consecutive failures) on the alert stream — they are
+        page-worthy and must NOT demote to a domain firehose. The Critic
+        also consumes the cluster but produces critic_proposal events as
+        its output — and those route to agents_memory/critic_proposals.
         Trigger and proposal are separate events with separate topics.
         """
-        assert TOPIC_ROUTING["agent_failure_cluster"] == "watchdog_alerts"
+        assert classify(Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, "watchdog",
+            {"source": "watchdog"})).topic_key == "watchdog_alerts"
+
+
+class TestStatusBlackoutSelfDegradedRouting:
+    """watchdog_self_degraded normally routes to watchdog_alerts, but the
+    'monitoring has gone dark' reasons (status.json stale / unreadable) route
+    to security_and_system instead.
+
+    2026-07-13 incident: a 3h16m prober blackout's one HIGH status-stale alert
+    was buried under gateway_health / WhatsApp flap on watchdog_alerts and went
+    unactioned for 3h. security_and_system (thread 106 in the fixture, 9680 in
+    prod) is the low-traffic operator topic (credential_loss, secret_detected,
+    backend_contract_drift already land there) so the monitoring-dark alert is
+    actually seen. The LaptopMonitor-Canary scheduled task is the primary
+    auto-fix; this reroute is the complementary visibility half.
+    """
+
+    def _event(self, reason):
+        return Event.create(
+            EventType.WATCHDOG_SELF_DEGRADED, "watchdog", {"reason": reason},
+        )
+
+    def test_status_stale_routes_to_security_and_system(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event("laptop-monitor status.json stale"))
+        assert target[2] == "106"  # security_and_system, NOT watchdog_alerts(100)
+
+    def test_status_unreadable_routes_to_security_and_system(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event("status.json unreadable"))
+        assert target[2] == "106"
+
+    def test_over_budget_reason_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # "monitor pass over budget" means the writer is ALIVE (just slow) --
+        # a normal operator watchdog signal, so it stays on watchdog_alerts.
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event("monitor pass over budget"))
+        assert target[2] == "100"
+
+    def test_self_degraded_without_reason_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event(""))
+        assert target[2] == "100"
+
+    def test_status_blackout_not_cross_posted_to_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # v3 removed cross-posting entirely (one event, one message), so the
+        # re-routed primary must be the ONLY target -- it must not also
+        # land on the flap-saturated watchdog_alerts topic.
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        targets = notifier.resolve_all_targets(
+            self._event("laptop-monitor status.json stale")
+        )
+        threads = [t[2] for t in targets]
+        assert threads == ["106"]
+        assert "100" not in threads
 
 
 class TestTelegramNotifier:
@@ -363,7 +459,7 @@ class TestTelegramNotifier:
         target = notifier.resolve_target(event)
         assert target == ("telegram", "-1001234567890", "105")  # scribe_daily thread
 
-    def test_cross_posts_critical_to_alerts(self, bus, topics_config, verbosity_config):
+    def test_critical_failure_targets_alerts(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
         )
@@ -376,26 +472,19 @@ class TestTelegramNotifier:
         # application_failed routes to alerts directly
         assert "100" in topic_ids  # alerts
 
-    def test_cross_posts_high_priority_event_to_watchdog_alerts(
+    def test_high_priority_event_has_exactly_one_target(
         self, bus, topics_config, verbosity_config,
     ):
-        """CROSS_POST_TO_ALERTS events at HIGH+ priority must hit BOTH the
-        primary topic AND watchdog_alerts.
+        """v3 (P2 — one event, one message): cross-posting is REMOVED.
+        resolve_all_targets() must return exactly ONE target for every
+        event, including the HIGH+ signals the pre-v3 CROSS_POST_TO_ALERTS
+        table duplicated onto watchdog_alerts.
 
-        Regression: 2026-04-27 — the v2 cutover (20260424T233627Z) renamed
-        the catch-all ``alerts`` topic to ``watchdog_alerts``, but
-        resolve_all_targets() kept reading ``self.topics.get("alerts", {})``.
-        Post-cutover topics.json has no ``alerts`` key, so the lookup
-        returned ``{}``, ``alerts_thread`` became ``""``, the guard
-        ``if alerts_thread and alerts_thread != primary_thread`` failed,
-        and CROSS_POST_TO_ALERTS events (application_ready, followup_due,
-        interview_signal, job_high_score, offer_signal) at HIGH+ silently
-        went ONLY to their primary firehose topic — exactly the noisy
-        stream a busy operator needs them surfaced OUT of.
-
-        JOB_HIGH_SCORE is a clean witness: its primary topic is
-        ``jobflow_decisions`` (thread 102), so a working cross-post must
-        ADD watchdog_alerts (thread 100). With the bug, only 102 appears.
+        JOB_HIGH_SCORE is the clean witness: pre-v3 it delivered to BOTH
+        jobflow_decisions and watchdog_alerts; in v3 it is INFO class on the
+        jobflow_firehose domain topic (thread 101) — and ONLY there. The
+        phone-worthiness of a >=9.0 score is carried by the WhatsApp tier,
+        not by a second Telegram copy.
         """
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
@@ -406,14 +495,13 @@ class TestTelegramNotifier:
             priority=Priority.HIGH,
         )
         targets = notifier.resolve_all_targets(event)
-        topic_ids = [t[2] for t in targets]
-        assert "102" in topic_ids, (
-            f"primary jobflow_decisions thread missing from {topic_ids}"
+        assert len(targets) == 1, (
+            f"v3 removed cross-posting; expected exactly one target, got "
+            f"{targets!r}"
         )
-        assert "100" in topic_ids, (
-            f"watchdog_alerts cross-post missing from {topic_ids} "
-            f"— resolve_all_targets() likely still reading the dead 'alerts' "
-            f"key instead of 'watchdog_alerts'"
+        assert targets[0][2] == "101", (
+            f"job_high_score must land on jobflow_firehose (101); got "
+            f"{targets[0]!r}"
         )
 
     def test_loads_topics_config(self, bus, topics_config, verbosity_config):
@@ -596,10 +684,13 @@ class TestLowPriorityBatching:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
 
-        # job_scored routes to "jobflow_firehose" topic (v2) with mode="all"
+        # v3: only TRACE routes batch — NORMAL job_scored now batches too,
+        # so the immediate-delivery witness is an INFO-class event.
+        # stage_transition routes to "jobflow_firehose" (v2) with mode="all".
         event = Event.create(
-            EventType.JOB_SCORED, "matcher",
-            {"score": 7.5, "title": "Engineer", "company": "Beta"},
+            EventType.STAGE_TRANSITION, "tracker",
+            {"prior_stage": "discovered", "new_stage": "applied",
+             "title": "Engineer", "company": "Beta"},
             priority=Priority.NORMAL,
         )
         notifier.handle(event)
@@ -629,11 +720,14 @@ class TestLowPriorityBatching:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
 
-        # Buffer two low-priority events on the "jobflow_firehose" topic (mode=all)
-        for i in range(2):
+        # Buffer two low-priority events on the "jobflow_firehose" topic
+        # (mode=all). NB titles must differ by LETTERS, not digits — the v3
+        # RepeatGuard fingerprint collapses digit runs, so "Job 0"/"Job 1"
+        # would count as verbatim repeats.
+        for title in ("Alpha Analyst", "Beta Engineer"):
             event = Event.create(
                 EventType.JOB_DISCOVERED, "scout",
-                {"title": f"Job {i}", "company": "Acme", "source": "Indeed"},
+                {"title": title, "company": "Acme", "source": "Indeed"},
                 priority=Priority.LOW,
             )
             notifier.handle(event)
@@ -645,6 +739,77 @@ class TestLowPriorityBatching:
 
         assert len(sent) == 1
         assert "Batched (2 events)" in sent[0]
+
+    def test_batch_flush_emits_synthetic_delivered_event(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Routing-v3 observability gap (2026-07-20): batch flushes call
+        _deliver() without event=, so hourly "Batched (N events)" sends
+        left ZERO notification_delivered rows — per-topic delivery audits
+        (routing_v3_24h_verify) undercount actual chat messages and can't
+        verify batch cadence. Fix: one synthetic NOTIFICATION_DELIVERED
+        per flush with original_event_type="batch_flush" + batch_count,
+        NOT one per constituent event (Phase 1 volume scoping stands).
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: None,
+        )
+        # Titles differ by LETTERS (RepeatGuard collapses digit runs).
+        for title in ("Alpha Analyst", "Beta Engineer"):
+            notifier.handle(Event.create(
+                EventType.JOB_DISCOVERED, "scout",
+                {"title": title, "company": "Acme", "source": "Indeed"},
+                priority=Priority.LOW,
+            ))
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+        notifier._flush_stale_batches(max_age=0)
+
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 1, (
+            f"expected exactly one synthetic NOTIFICATION_DELIVERED per "
+            f"batch flush, got {len(delivered)}"
+        )
+        evt = delivered[0]
+        assert evt.priority == Priority.LOW
+        assert evt.payload["original_event_type"] == "batch_flush"
+        assert evt.payload["batch_count"] == 2
+        assert evt.payload["platform"] == "telegram"
+        assert evt.payload["target"]["chat_id"] == "-1001234567890"
+        assert evt.payload["target"]["thread_id"] == "101"  # jobflow_firehose
+        assert evt.payload["target"]["topic_key"] == "jobflow_firehose"
+        assert evt.payload["latency_ms"] >= 0
+        # No single originating event — the field must not point anywhere.
+        assert "original_event_id" not in evt.payload
+
+    def test_batch_flush_send_failure_emits_no_delivered_event(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """A failed flush send must NOT claim delivery — the synthetic
+        event fires only on the success path, so the ledger never counts
+        a batch the chat never saw."""
+        calls = {"n": 0}
+
+        def flaky_send(chat_id, thread_id, msg):
+            calls["n"] += 1
+            raise RuntimeError("Bad Gateway")
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=flaky_send,
+        )
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+        assert calls["n"] == 0  # buffered, send not attempted yet
+
+        notifier._flush_stale_batches(max_age=0)
+
+        assert calls["n"] == 1, "flush must have attempted the send"
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
 
     def test_shutdown_flushes_all_batches(self, bus, topics_config, verbosity_config):
         sent = []
@@ -683,11 +848,15 @@ class TestAgentFailureClusterDedup:
     substrate and audit logger still receive both copies).
     """
 
-    def _cluster_event(self, source, timestamp):
+    def _cluster_event(self, source, timestamp, failure_type="captcha"):
+        # NB: tests that need TWO deliveries must vary failure_type (a
+        # LETTER difference) — the v3 RepeatGuard fingerprint collapses
+        # digit runs, so differing timestamps/counts alone still count as
+        # verbatim repeats within its 30-min real-time window.
         evt = Event.create(
             EventType.AGENT_FAILURE_CLUSTER, source,
             {
-                "source": source, "failure_type": "captcha", "count": 3,
+                "source": source, "failure_type": failure_type, "count": 3,
                 "first_seen": timestamp,
                 "last_seen": timestamp,
             },
@@ -703,7 +872,9 @@ class TestAgentFailureClusterDedup:
 
         Without this dedup the cron-emitter and mailbox-translator paths
         each fire a cluster event for the same Applier exit-126 incident
-        and the user sees two ``#watchdog_alerts`` messages back-to-back.
+        and the user sees two ``#watchdog_alerts`` messages back-to-back
+        (v3: clusters are systemic signals and stay on the alert stream —
+        they no longer demote to jobflow_firehose).
         """
         sent = []
         notifier = TelegramNotifier(
@@ -716,35 +887,43 @@ class TestAgentFailureClusterDedup:
         notifier.handle(evt1)
         notifier.handle(evt2)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 1, (
+        firehose_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(firehose_deliveries) == 1, (
             f"second cluster for same source in same 30-min bucket must "
-            f"be suppressed; got {len(watchdog_deliveries)} deliveries: "
+            f"be suppressed; got {len(firehose_deliveries)} deliveries: "
             f"{sent!r}"
         )
 
     def test_cluster_in_next_bucket_re_delivers(
-        self, bus, topics_config, verbosity_config,
+        self, bus, topics_config, verbosity_config, monkeypatch,
     ):
         """A cluster for the same agent in the NEXT 30-min bucket must
         deliver again — the dedup is rate-limit, not permanent
         suppression. Without this, an Applier failure that recurs the
-        next morning would silently never re-alert."""
+        next morning would silently never re-alert.
+
+        Advances a fake monotonic clock past the RepeatGuard's 30-min
+        window between the two events — in production the next-bucket
+        event really does arrive 30+ minutes later."""
         sent = []
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
             send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
         )
+        clock = {"now": 1000.0}
+        import events.noise_guards as ng
+        monkeypatch.setattr(ng.time, "monotonic", lambda: clock["now"])
         evt1 = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
         evt2 = self._cluster_event("applier", "2026-04-29T10:31:00+00:00")
 
         notifier.handle(evt1)
+        clock["now"] += 31 * 60
         notifier.handle(evt2)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 2, (
+        firehose_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(firehose_deliveries) == 2, (
             f"expected 2 deliveries across 2 buckets; got "
-            f"{len(watchdog_deliveries)}: {sent!r}"
+            f"{len(firehose_deliveries)}: {sent!r}"
         )
 
     def test_different_sources_same_bucket_both_deliver(
@@ -763,8 +942,8 @@ class TestAgentFailureClusterDedup:
         notifier.handle(evt_a)
         notifier.handle(evt_b)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 2, (
+        firehose_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(firehose_deliveries) == 2, (
             f"different sources must both deliver; got {sent!r}"
         )
 
@@ -773,7 +952,11 @@ class TestAgentFailureClusterDedup:
     ):
         """LRU dedup is scoped to AGENT_FAILURE_CLUSTER only. A CRON_FAILED
         event from the same source in the same window MUST still deliver —
-        the dedup must not bleed across event types."""
+        the dedup must not bleed across event types.
+
+        v3 topology note: the cluster (systemic) stays on watchdog_alerts
+        (100), while the single cron_failed from a JobFlow pipeline agent
+        demotes to jobflow_firehose (101) — both must deliver."""
         sent = []
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
@@ -789,8 +972,9 @@ class TestAgentFailureClusterDedup:
         notifier.handle(cluster)
         notifier.handle(cron_failed)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 2, (
+        alert_deliveries = [s for s in sent if s[0] == "100"]
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(alert_deliveries) == 1 and len(firehose_deliveries) == 1, (
             f"cron_failed must deliver after a cluster from same source; "
             f"got {sent!r}"
         )
@@ -821,7 +1005,11 @@ class TestAgentFailureClusterDedup:
             notifier.handle(evt)
 
         # Re-emit the original key — should deliver again because evicted.
-        replay = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        # The RepeatGuard would shadow the LRU behaviour under test (its
+        # 30-min real-time window sees an identical body), so clear it:
+        # this test pins the cluster LRU, not the repeat guard.
+        notifier._repeat_guard._seen.clear()
+        replay = self._cluster_event("applier", "2026-04-29T10:14:00+00:00")
         notifier.handle(replay)
 
         applier_lines = [
@@ -908,8 +1096,8 @@ class TestAgentFailureClusterDedup:
         for evt in clusters:
             notifier.handle(evt)
 
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 1, (
+        alert_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(alert_deliveries) == 1, (
             f"Option A+C must deliver exactly 1 cluster Telegram alert "
             f"despite {len(clusters)} bus events; got {sent!r}"
         )
@@ -947,8 +1135,8 @@ class TestAgentFailureClusterDedup:
         # Bus retains both copies (audit / Critic still see the duplicate).
         assert len(bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)) == 2
         # Telegram side: only the first one delivers.
-        watchdog_deliveries = [s for s in sent if s[0] == "100"]
-        assert len(watchdog_deliveries) == 1
+        alert_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(alert_deliveries) == 1
 
 
 class TestWatchdogDailySummary:
@@ -1001,12 +1189,12 @@ class TestWatchdogDailySummary:
         assert et.default_priority == Priority.NORMAL
 
     def test_routes_to_watchdog_alerts(self):
-        """TOPIC_ROUTING must place WATCHDOG_DAILY in watchdog_alerts.
+        """The routing policy must place WATCHDOG_DAILY in watchdog_alerts.
 
         Pin the routing alongside the other watchdog signals so a future
         cutover that splits watchdog topics has to update one obvious place.
         """
-        assert TOPIC_ROUTING["watchdog_daily"] == "watchdog_alerts"
+        assert classify(self._daily_event()).topic_key == "watchdog_alerts"
 
     def test_has_emoji(self):
         """WATCHDOG_DAILY must have a distinct EVENT_TYPE_EMOJI entry.
@@ -1175,9 +1363,11 @@ class TestWatchdogDailySummary:
 
 def test_watchdog_burst_routes_to_watchdog_alerts_topic():
     """Coalesced burst events go to the same topic as single-probe transitions."""
-    from events.subscribers.telegram_notifier import TOPIC_ROUTING
-
-    assert TOPIC_ROUTING.get("watchdog_burst") == "watchdog_alerts"
+    ev = Event.create(
+        EventType.WATCHDOG_BURST, "watchdog",
+        {"count": 1, "trigger": "burst_threshold", "transitions": []},
+    )
+    assert classify(ev).topic_key == "watchdog_alerts"
 
 
 def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
@@ -1199,6 +1389,390 @@ def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
         assert n2._batch_buffer.get("-1:15") == ["pending msg 1", "pending msg 2"]
     finally:
         bus.close()
+
+
+class TestBatchAgeSurvivesRestart:
+    """Restart-churn starvation fix (confirmed live 2026-07-21): batch age
+    must be measured from a persisted wall-clock first-buffered timestamp,
+    not re-stamped with the new process's time.monotonic() on every
+    __init__. Under ~20-30 min gateway lifetimes the old behavior meant a
+    3600s batch window NEVER elapsed — messages buffered at 18:07Z were
+    still undelivered at 00:44Z."""
+
+    def _write_configs(self, tmp_path):
+        (tmp_path / "telegram").mkdir(exist_ok=True)
+        (tmp_path / "telegram" / "topics.json").write_text(
+            '{"group_chat_id": "-1", "topics": {"system": {"thread_id": 15}}}')
+        (tmp_path / "telegram" / "verbosity.json").write_text(
+            '{"system": {"mode": "all"}}')
+
+    def _write_batch_state(self, tmp_path, state):
+        path = tmp_path / "notifications" / "notifier_batch.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+
+    def test_restored_batch_with_old_started_at_flushes_immediately(
+        self, tmp_path, monkeypatch,
+    ):
+        """A buffer restored with a 2h-old persisted started_at is already
+        past the 3600s window: the FIRST _flush_stale_batches call must
+        flush it, without the new process having to survive another hour."""
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_configs(tmp_path)
+        two_hours_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).isoformat()
+        self._write_batch_state(tmp_path, {
+            "buffer": {"-1:15": ["starved msg 1", "starved msg 2"]},
+            "started_at": {"-1:15": two_hours_ago},
+        })
+
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            sent = []
+            notifier = TelegramNotifier(
+                bus, send_fn=lambda chat_id, thread_id, msg: sent.append(msg))
+            notifier._flush_stale_batches()  # default max_age=3600s
+
+            assert len(sent) == 1, (
+                f"restored 2h-old batch must flush on first stale sweep; "
+                f"sent={sent!r}"
+            )
+            assert "Batched (2 events)" in sent[0]
+            # The synthetic batch_flush ledger row (18891230c) must survive
+            # the restore path too.
+            delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+            assert len(delivered) == 1
+            assert delivered[0].payload["original_event_type"] == "batch_flush"
+            assert delivered[0].payload["batch_count"] == 2
+        finally:
+            bus.close()
+
+    def test_restored_batch_with_fresh_started_at_does_not_flush_early(
+        self, tmp_path, monkeypatch,
+    ):
+        """A just-persisted batch restored after a quick restart keeps its
+        remaining age — it must NOT flush before the window elapses."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_configs(tmp_path)
+        self._write_batch_state(tmp_path, {
+            "buffer": {"-1:15": ["fresh msg"]},
+            "started_at": {"-1:15": datetime.now(timezone.utc).isoformat()},
+        })
+
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            sent = []
+            notifier = TelegramNotifier(
+                bus, send_fn=lambda chat_id, thread_id, msg: sent.append(msg))
+            notifier._flush_stale_batches()
+            assert sent == [], "fresh restored batch must wait out the window"
+            assert notifier._batch_buffer.get("-1:15") == ["fresh msg"]
+        finally:
+            bus.close()
+
+    def test_legacy_buffer_only_state_loads_and_seeds_now(
+        self, tmp_path, monkeypatch,
+    ):
+        """Backward compat: a pre-fix state file ({"buffer": {...}} with no
+        started_at) still restores; with no persisted age the key seeds at
+        now (old behavior — no crash, no premature flush)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_configs(tmp_path)
+        self._write_batch_state(tmp_path, {
+            "buffer": {"-1:15": ["legacy msg"]},
+        })
+
+        bus = EventBus(db_path=tmp_path / "db.sqlite")
+        try:
+            sent = []
+            notifier = TelegramNotifier(
+                bus, send_fn=lambda chat_id, thread_id, msg: sent.append(msg))
+            assert notifier._batch_buffer.get("-1:15") == ["legacy msg"]
+            notifier._flush_stale_batches()
+            assert sent == []
+        finally:
+            bus.close()
+
+    def test_persist_writes_wall_clock_started_at(
+        self, bus, topics_config, verbosity_config, tmp_path, monkeypatch,
+    ):
+        """Buffering a message must persist a parseable wall-clock
+        started_at for the key alongside the buffer, and flushing must
+        remove both."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda *a, **k: None,
+        )
+        # JOB_DISCOVERED at LOW is TRACE → batches (same witness as the
+        # TestLowPriorityBatching cases).
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+        assert notifier._batch_buffer, "event must have batched"
+        state_path = tmp_path / "notifications" / "notifier_batch.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert set(state["started_at"]) == set(state["buffer"])
+        for iso in state["started_at"].values():
+            parsed = datetime.fromisoformat(iso)
+            assert parsed.tzinfo is not None, (
+                "started_at must be timezone-aware wall clock")
+            age = (datetime.now(timezone.utc) - parsed).total_seconds()
+            assert 0 <= age < 60
+
+        notifier._flush_stale_batches(max_age=0)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["buffer"] == {}
+        assert state["started_at"] == {}
+
+
+class TestBatchFlushFailureRequeue:
+    """Lossy batch-flush gap (confirmed live 2026-07-20/21): _flush_batch_key
+    popped the key's messages BEFORE delivering, and _deliver() swallows send
+    exceptions — so while Telegram sat in a persistent httpx.ReadError
+    reconnect loop, the starved batch (buffered since 18:07Z) simply
+    vanished: no requeue, no NOTIFICATION_FAILED, no trace beyond the
+    generic delivery error line. The ledger contract stands (a batch the
+    chat never saw must NOT produce NOTIFICATION_DELIVERED); these tests
+    pin the recovery: a failed flush restores the popped messages + the
+    key's wall-clock age, emits ONE synthetic NOTIFICATION_FAILED
+    (original_event_type="batch_flush", mirroring 18891230c's delivered
+    twin), persists the restored state, and arms a per-key backoff so a
+    dead transport isn't hammered once per handled event.
+    """
+
+    KEY = "-1001234567890:101"  # jobflow_firehose in the topics_config fixture
+
+    def _buffer_two(self, notifier):
+        # Titles differ by LETTERS (RepeatGuard collapses digit runs).
+        for title in ("Alpha Analyst", "Beta Engineer"):
+            notifier.handle(Event.create(
+                EventType.JOB_DISCOVERED, "scout",
+                {"title": title, "company": "Acme", "source": "Indeed"},
+                priority=Priority.LOW,
+            ))
+
+    def _failing_notifier(self, bus, topics_config, verbosity_config):
+        calls = {"n": 0}
+
+        def failing_send(chat_id, thread_id, msg):
+            calls["n"] += 1
+            raise RuntimeError("Bad Gateway")
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=failing_send,
+        )
+        return notifier, calls
+
+    def test_failed_flush_restores_buffer_and_started_at(
+        self, bus, topics_config, verbosity_config, tmp_path, monkeypatch,
+    ):
+        """The popped messages go back to the buffer (front, in order) with
+        the key's original wall-clock started_at, and the restored state is
+        persisted — so neither an in-process retry nor a restart treats the
+        starved batch as fresh (or, worse, gone)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        notifier, calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        self._buffer_two(notifier)
+        messages_before = list(notifier._batch_buffer[self.KEY])
+        started_before = notifier._batch_started_at[self.KEY]
+
+        notifier._flush_stale_batches(max_age=0)
+
+        assert calls["n"] == 1, "flush must have attempted the send"
+        assert notifier._batch_buffer.get(self.KEY) == messages_before, (
+            "failed flush must restore the popped messages in order"
+        )
+        assert notifier._batch_started_at.get(self.KEY) == started_before, (
+            "failed flush must preserve the key's wall-clock started_at"
+        )
+        assert self.KEY in notifier._batch_timestamps
+        state = json.loads(
+            (tmp_path / "notifications" / "notifier_batch.json")
+            .read_text(encoding="utf-8"))
+        assert state["buffer"][self.KEY] == messages_before
+        assert state["started_at"][self.KEY] == started_before
+
+    def test_failed_flush_emits_synthetic_notification_failed(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """One NOTIFICATION_FAILED per failed flush attempt — the failure
+        twin of 18891230c's batch_flush NOTIFICATION_DELIVERED — so the
+        ledger shows the outage instead of silence. No DELIVERED row."""
+        notifier, _calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        self._buffer_two(notifier)
+
+        notifier._flush_stale_batches(max_age=0)
+
+        failed = bus.query(event_type=EventType.NOTIFICATION_FAILED)
+        assert len(failed) == 1, (
+            f"expected exactly one synthetic NOTIFICATION_FAILED per failed "
+            f"batch flush, got {len(failed)}"
+        )
+        evt = failed[0]
+        assert evt.priority == Priority.NORMAL
+        assert evt.payload["original_event_type"] == "batch_flush"
+        assert evt.payload["batch_count"] == 2
+        assert evt.payload["platform"] == "telegram"
+        assert evt.payload["target"]["chat_id"] == "-1001234567890"
+        assert evt.payload["target"]["thread_id"] == "101"
+        assert evt.payload["target"]["topic_key"] == "jobflow_firehose"
+        assert evt.payload["error"]["kind"] == "RuntimeError"
+        assert "Bad Gateway" in evt.payload["error"]["message"]
+        # No single originating event — the field must not point anywhere.
+        assert "original_event_id" not in evt.payload
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+    def test_retry_backoff_prevents_immediate_resend(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """_flush_stale_batches runs on EVERY handled event; without a
+        per-key backoff a restored stale batch would hammer a dead
+        Telegram once per event. After a failure the key must not retry
+        until the backoff window has elapsed."""
+        import events.subscribers.telegram_notifier as tn
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(tn.time, "monotonic", lambda: clock["now"])
+        notifier, calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        self._buffer_two(notifier)
+
+        notifier._flush_stale_batches(max_age=0)
+        assert calls["n"] == 1
+
+        notifier._flush_stale_batches(max_age=0)  # immediate re-sweep
+        assert calls["n"] == 1, (
+            "a failed key must NOT re-send before the backoff elapses"
+        )
+        assert notifier._batch_buffer.get(self.KEY), (
+            "backoff skip must leave the buffer intact"
+        )
+
+        clock["now"] += tn.BATCH_RETRY_BACKOFF_SECONDS + 1
+        notifier._flush_stale_batches(max_age=0)
+        assert calls["n"] == 2, "after the backoff the key must retry"
+
+    def test_retry_success_delivers_full_batch_and_clears_backoff(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """Once the transport recovers, the retried flush delivers the
+        restored messages, emits the normal batch_flush
+        NOTIFICATION_DELIVERED, empties the buffer, and clears the
+        backoff so later flushes are immediate again."""
+        import events.subscribers.telegram_notifier as tn
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(tn.time, "monotonic", lambda: clock["now"])
+        sent = []
+        state = {"fail": True}
+
+        def flaky_send(chat_id, thread_id, msg):
+            if state["fail"]:
+                raise RuntimeError("Bad Gateway")
+            sent.append(msg)
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=flaky_send,
+        )
+        self._buffer_two(notifier)
+        notifier._flush_stale_batches(max_age=0)
+        assert sent == []
+
+        state["fail"] = False
+        clock["now"] += tn.BATCH_RETRY_BACKOFF_SECONDS + 1
+        notifier._flush_stale_batches(max_age=0)
+
+        assert len(sent) == 1
+        assert "Batched (2 events)" in sent[0]
+        assert self.KEY not in notifier._batch_buffer
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 1
+        assert delivered[0].payload["original_event_type"] == "batch_flush"
+        assert delivered[0].payload["batch_count"] == 2
+
+        # Backoff cleared: a fresh batch flushes without waiting.
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Gamma Developer", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+        notifier._flush_stale_batches(max_age=0)
+        assert len(sent) == 2, "success must clear the per-key backoff"
+
+    def test_failed_flush_restore_caps_at_batch_max(
+        self, bus, topics_config, verbosity_config, caplog,
+    ):
+        """A restored buffer respects BATCH_MAX_MESSAGES: oldest messages
+        drop (with a log line) so a dead transport can't grow the buffer
+        unbounded across repeated failed flushes."""
+        import events.subscribers.telegram_notifier as tn
+
+        notifier, _calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        msgs = [f"msg {chr(ord('A') + i)}" for i in range(25)]
+        notifier._batch_buffer[self.KEY] = list(msgs)
+        notifier._batch_timestamps[self.KEY] = 0.0
+        notifier._batch_started_at[self.KEY] = "2026-07-20T18:07:00+00:00"
+
+        with caplog.at_level("WARNING"):
+            notifier._flush_stale_batches(max_age=0)
+
+        restored = notifier._batch_buffer.get(self.KEY)
+        assert restored == msgs[-tn.BATCH_MAX_MESSAGES:], (
+            "restore must cap oldest-out at BATCH_MAX_MESSAGES"
+        )
+        assert any("dropped" in r.message for r in caplog.records), (
+            "capping must leave a log trace of the dropped messages"
+        )
+
+    def test_buffer_stays_capped_while_backoff_blocks_size_flush(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """During the backoff window handle() keeps appending and the
+        size-triggered flush is skipped — the buffer must still stay at
+        BATCH_MAX_MESSAGES (oldest-out), keeping the newest message."""
+        import events.subscribers.telegram_notifier as tn
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(tn.time, "monotonic", lambda: clock["now"])
+        notifier, calls = self._failing_notifier(
+            bus, topics_config, verbosity_config)
+        msgs = [f"msg {chr(ord('A') + i)}" for i in range(tn.BATCH_MAX_MESSAGES)]
+        notifier._batch_buffer[self.KEY] = list(msgs)
+        notifier._batch_timestamps[self.KEY] = clock["now"]
+        notifier._batch_started_at[self.KEY] = "2026-07-20T18:07:00+00:00"
+
+        notifier._flush_stale_batches(max_age=0)  # fails, arms backoff
+        assert calls["n"] == 1
+
+        notifier.handle(Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Gamma Developer", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        ))
+
+        assert calls["n"] == 1, "size-triggered flush must respect the backoff"
+        buf = notifier._batch_buffer.get(self.KEY)
+        assert len(buf) == tn.BATCH_MAX_MESSAGES, (
+            f"buffer must stay capped during backoff; got {len(buf)}"
+        )
+        assert "Gamma Developer" in buf[-1], (
+            "cap must drop the OLDEST messages, keeping the newest"
+        )
 
 
 class TestNotificationDeliveredReverseSignal:
@@ -1230,13 +1804,15 @@ class TestNotificationDeliveredReverseSignal:
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
             send_fn=lambda chat_id, thread_id, msg: None,  # success
         )
+        # v3: NORMAL job_scored is TRACE and batches — use an INFO-class
+        # event (application_submitted) as the immediate-delivery witness.
         original = Event.create(
-            EventType.JOB_SCORED, "matcher",
-            {"score": 7.5, "title": "Engineer", "company": "Beta"},
+            EventType.APPLICATION_SUBMITTED, "applier",
+            {"title": "Engineer", "company": "Beta"},
             priority=Priority.NORMAL,
         )
         original_id = bus.emit(
-            event_type=EventType.JOB_SCORED, source="matcher",
+            event_type=EventType.APPLICATION_SUBMITTED, source="applier",
             payload=original.payload, priority=Priority.NORMAL,
         )
         original.event_id = original_id  # keep test event in sync with bus
@@ -1250,7 +1826,7 @@ class TestNotificationDeliveredReverseSignal:
         evt = delivered[0]
         assert evt.priority == Priority.LOW
         assert evt.payload["original_event_id"] == original_id
-        assert evt.payload["original_event_type"] == "job_scored"
+        assert evt.payload["original_event_type"] == "application_submitted"
         assert evt.payload["platform"] == "telegram"
         assert evt.payload["target"]["chat_id"] == "-1001234567890"
         assert evt.payload["target"]["thread_id"] == "101"  # jobflow_firehose
@@ -1269,12 +1845,12 @@ class TestNotificationDeliveredReverseSignal:
             send_fn=boom,
         )
         original_id = bus.emit(
-            event_type=EventType.JOB_SCORED, source="matcher",
-            payload={"score": 7.5, "title": "Engineer", "company": "Beta"},
+            event_type=EventType.APPLICATION_SUBMITTED, source="applier",
+            payload={"title": "Engineer", "company": "Beta"},
             priority=Priority.NORMAL,
         )
         # Recreate the Event object as handle() would receive it
-        original = bus.query(event_type=EventType.JOB_SCORED)[0]
+        original = bus.query(event_type=EventType.APPLICATION_SUBMITTED)[0]
 
         # _deliver() catches the exception per the contract (non-raising
         # wrapper around the send_fn). The reverse signal must still fire.
@@ -1305,11 +1881,11 @@ class TestNotificationDeliveredReverseSignal:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
         original_id = bus.emit(
-            event_type=EventType.JOB_SCORED, source="matcher",
-            payload={"score": 7.5, "title": "X", "company": "Y"},
+            event_type=EventType.APPLICATION_SUBMITTED, source="applier",
+            payload={"title": "X", "company": "Y"},
             priority=Priority.NORMAL,
         )
-        original = bus.query(event_type=EventType.JOB_SCORED)[0]
+        original = bus.query(event_type=EventType.APPLICATION_SUBMITTED)[0]
 
         # Break only the reverse-signal emit by replacing bus.emit with a
         # raising version AFTER the original event was emitted by the
@@ -1399,13 +1975,14 @@ class TestNotificationDeliveredReverseSignal:
         assert sent == [], "subscriber must not retry its own failure events"
         assert bus.query(event_type=EventType.NOTIFICATION_FAILED) == []
 
-    def test_cross_post_emits_two_delivered_events(
+    def test_act_event_emits_exactly_one_delivered_event(
         self, bus, topics_config, verbosity_config,
     ):
-        """interview_signal at HIGH cross-posts to watchdog_alerts (per
-        CROSS_POST_TO_ALERTS). Each target sends one message and emits
-        one NOTIFICATION_DELIVERED, so the audit log can answer "did
-        Telegram show this in BOTH topics?" per topic_key.
+        """v3 (P2): cross-posting is gone — interview_signal delivers ONE
+        message to the action_required topic (alias-resolved onto
+        jobflow_decisions, thread 102, in this pre-cutover fixture) and
+        emits exactly ONE NOTIFICATION_DELIVERED, so the audit log answers
+        "did Telegram show this?" without double-counting.
         """
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
@@ -1420,18 +1997,18 @@ class TestNotificationDeliveredReverseSignal:
         notifier.handle(original)
 
         delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
-        assert len(delivered) == 2, (
-            f"expected 2 NOTIFICATION_DELIVERED (primary + cross-post); "
-            f"got {len(delivered)}"
+        assert len(delivered) == 1, (
+            f"expected exactly 1 NOTIFICATION_DELIVERED (one event, one "
+            f"message); got {len(delivered)}"
         )
-        thread_ids = {d.payload["target"]["thread_id"] for d in delivered}
-        # Primary jobflow_decisions = 102; cross-post watchdog_alerts = 100
-        assert thread_ids == {"102", "100"}, (
-            f"unexpected thread_ids in delivery events: {thread_ids}"
+        d = delivered[0]
+        assert d.payload["target"]["thread_id"] == "102", (
+            f"action_required must alias-resolve onto jobflow_decisions "
+            f"(102); got {d.payload['target']!r}"
         )
-        for d in delivered:
-            assert d.payload["original_event_id"] == original_id
-            assert d.correlation_id == original_id
+        assert d.payload["target"]["topic_key"] == "jobflow_decisions"
+        assert d.payload["original_event_id"] == original_id
+        assert d.correlation_id == original_id
 
     def test_low_priority_batched_delivery_does_not_emit_per_event(
         self, bus, topics_config, verbosity_config,
@@ -1556,4 +2133,148 @@ class TestCronLifecycleRouting:
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
         )
         ev = Event.create(EventType.CRON_COMPLETED, "postgres-sync", {})
+        assert notifier.resolve_target(ev)[2] == "100"
+
+
+class TestJobflowFailureRouting:
+    """2026-07-16 operator request: failure events sourced from JobFlow
+    pipeline agents (applier, tracker, scout, ...) belong in jobflow_firehose,
+    not watchdog_alerts — their errors are pipeline telemetry, and burying
+    them among infrastructure alerts drowns the operator stream. System-
+    sourced failures (postgres-sync, jaum, watchdog itself) stay on
+    watchdog_alerts. AGENT_FAILURE_CLUSTER keeps its WhatsApp escalation
+    path regardless of Telegram topic.
+    """
+
+    def _notifier(self, bus, topics_path, verbosity_path):
+        return TelegramNotifier(
+            bus, topics_path=topics_path, verbosity_path=verbosity_path,
+        )
+
+    def test_agent_error_from_jobflow_agent_routes_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        for agent in ("applier", "tracker", "scout"):
+            ev = Event.create(
+                EventType.AGENT_ERROR, f"mailbox:{agent}",
+                {"message": "boom", "source_agent": agent},
+            )
+            assert notifier.resolve_target(ev)[2] == "101", \
+                f"agent_error from {agent} should route to jobflow_firehose"
+
+    def test_agent_error_falls_back_to_event_source_when_payload_missing(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # mailbox: transport prefix on event.source must be stripped before
+        # the agent lookup when payload.source_agent is absent.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_ERROR, "mailbox:applier", {"message": "boom"},
+        )
+        assert notifier.resolve_target(ev)[2] == "101"
+
+    def test_agent_error_from_non_jobflow_agent_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        for agent in ("jaum", "watchdog", "postgres-sync", "mempalace"):
+            ev = Event.create(
+                EventType.AGENT_ERROR, f"mailbox:{agent}",
+                {"message": "boom", "source_agent": agent},
+            )
+            assert notifier.resolve_target(ev)[2] == "100", \
+                f"agent_error from {agent} should stay on watchdog_alerts"
+
+    def test_failure_cluster_for_jobflow_agent_stays_on_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # v3 deliberate change vs the 2026-07-16 blanket demotion: a
+        # CLUSTER (>=3 failures) is systemic and page-worthy even from a
+        # pipeline agent — it stays on the alerts topic. Only SINGLE
+        # failures demote to the jobflow domain topic.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, "applier",
+            {"source": "applier", "count": 3},
+        )
+        assert notifier.resolve_target(ev)[2] == "100"
+
+    def test_failure_cluster_for_system_agent_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, "postgres-sync",
+            {"source": "postgres-sync", "count": 3},
+        )
+        assert notifier.resolve_target(ev)[2] == "100"
+
+    def test_jobflow_cron_failures_route_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # v3: single failures (cron_failed, cron_stale) demote to the
+        # jobflow domain topic; CONSECUTIVE failures are systemic and stay
+        # on alerts (tested below).
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        for et in (EventType.CRON_FAILED, EventType.CRON_STALE):
+            for job in ("jobflow-tracker-cycle", "jobflow-applier",
+                        "sentinel-vip-evening"):
+                ev = Event.create(et, job, {"job_name": job})
+                assert notifier.resolve_target(ev)[2] == "101", \
+                    f"{et.type_string} from {job} should route to jobflow_firehose"
+
+    def test_jobflow_consecutive_cron_failures_stay_on_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.CRON_FAILED_CONSECUTIVE, "jobflow-tracker-cycle",
+            {"job_name": "jobflow-tracker-cycle"},
+        )
+        assert notifier.resolve_target(ev)[2] == "100"
+
+    def test_jobflow_prefixed_cron_without_canonical_agent_still_reroutes(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # 'jobflow-approved-release' canonicalises to 'approved' (not a
+        # known agent) but the jobflow- prefix alone marks it as pipeline.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.CRON_FAILED, "jobflow-approved-release",
+            {"job_name": "jobflow-approved-release"},
+        )
+        assert notifier.resolve_target(ev)[2] == "101"
+
+    def test_main_agent_failures_stay_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # 'main' maps to jobflow_firehose for AGENT_ITERATION chatter, but
+        # its FAILURES are Hermes-core signals — keep them operator-visible.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        ev = Event.create(
+            EventType.AGENT_ERROR, "mailbox:main",
+            {"message": "boom", "source_agent": "main"},
+        )
+        assert notifier.resolve_target(ev)[2] == "100"
+
+    def test_missing_jobflow_firehose_topic_falls_back_to_watchdog_alerts(
+        self, bus, tmp_path, verbosity_config,
+    ):
+        # topics.json without jobflow_firehose must degrade to
+        # watchdog_alerts, not leak to General via an empty thread_id.
+        config = {
+            "group_chat_id": "-1001234567890",
+            "topics": {
+                "watchdog_alerts": {"thread_id": 100, "name": "Watchdog Alerts"},
+            },
+        }
+        path = tmp_path / "telegram" / "topics_no_firehose.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config))
+        notifier = self._notifier(bus, path, verbosity_config)
+        ev = Event.create(
+            EventType.CRON_FAILED, "jobflow-applier",
+            {"job_name": "jobflow-applier"},
+        )
         assert notifier.resolve_target(ev)[2] == "100"

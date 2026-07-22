@@ -393,6 +393,23 @@ class TestResourceMonitorWiring:
         assert ResourcePressureMonitor(bus)._sampler is sample_resources
 
 
+class TestCodeDriftMonitorWiring:
+    """CodeDriftMonitor (2026-07-21 stale-checkout remediation) must be
+    constructed at startup and probed by the poll loop. Asserted statically
+    for the same reasons as TestResourceMonitorWiring above."""
+
+    def test_getter_returns_module_global(self):
+        assert gi.get_code_drift_monitor() is gi._code_drift_monitor
+
+    def test_startup_constructs_code_drift_monitor(self):
+        src = inspect.getsource(gi.startup)
+        assert "_code_drift_monitor = CodeDriftMonitor(_bus)" in src
+
+    def test_poll_loop_probes_code_drift(self):
+        src = inspect.getsource(gi._subscriber_poll_loop)
+        assert "_code_drift_monitor.check()" in src
+
+
 class TestDedicatedApplierThread:
     """The tracker-intent-applier must run on its OWN daemon thread, decoupled
     from the shared serial subscriber poll loop.
@@ -539,3 +556,35 @@ class TestDedicatedApplierThread:
             if gi._registry is not None:
                 gi._registry.subscribers = []
             gi.shutdown()
+
+
+class TestPartialBacklogWiring:
+    """The PartialBacklogMonitor (2026-07-14 partial-pileup remediation) must be
+    constructed at startup and sampled by the SHARED subscriber poll loop; the
+    auto-re-drive must be driven from the DEDICATED applier thread (single-writer
+    invariant), gated at 60s. Verified via source introspection, like the
+    ResourcePressureMonitor wiring above (real startup() is heavy/timing-sensitive).
+    """
+
+    def test_getter_returns_module_global(self):
+        assert gi.get_partial_backlog_monitor() is gi._partial_backlog_monitor
+
+    def test_startup_constructs_partial_backlog_monitor(self):
+        src = inspect.getsource(gi.startup)
+        assert "PartialBacklogMonitor(" in src
+
+    def test_shared_loop_checks_partial_backlog(self):
+        src = inspect.getsource(gi._subscriber_poll_loop)
+        assert "_partial_backlog_monitor.check()" in src
+
+    def test_applier_loop_redrives_on_its_own_thread(self):
+        # Re-drive MUST be on the single-writer applier thread, gated to 60s.
+        src = inspect.getsource(gi._applier_poll_loop)
+        assert "redrive_partials()" in src
+        assert "REDRIVE_INTERVAL_SECONDS" in src
+
+    def test_shared_loop_does_not_redrive(self):
+        # Guard the single-writer invariant: the shared loop must NOT re-drive
+        # (that would race scan_inbox on the applier thread).
+        src = inspect.getsource(gi._subscriber_poll_loop)
+        assert "redrive_partials()" not in src

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -6,6 +8,33 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
 from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_eventbus_startup(monkeypatch):
+    """Keep ``GatewayRunner.start()`` off the canonical ~/.hermes event bus.
+
+    ``start()`` calls ``events.gateway_integration.startup()`` inline — and
+    *synchronously*, so not even an outer ``wait_for`` can interrupt it. That
+    does real I/O against the **canonical** ~/.hermes event bus (13
+    subscribers, the tracker-intent-applier's idempotency rehydrate, a jobops
+    :4100 probe). Notification state is deliberately cross-profile, so a
+    ``tmp_path`` HERMES_HOME does *not* redirect it — these tests hit the live
+    bus of whatever machine runs them.
+
+    That cost is real: the first test here to reach that call paid ~107s on a
+    loaded box (later ones are cheap only because the module global ``_bus`` is
+    already initialized). None of these tests assert anything about the event
+    bus, so neutralize it — they stay fast, hermetic, and dependent only on the
+    startup behavior they actually describe.
+
+    ``emit_gateway_started`` later in ``start()`` needs no patch: it returns
+    early while ``_bus`` is None, which is exactly what skipping ``startup()``
+    leaves it as.
+    """
+    import events.gateway_integration as _ebi
+
+    monkeypatch.setattr(_ebi, "startup", lambda *a, **k: None)
 
 
 class _RetryableFailureAdapter(BasePlatformAdapter):
@@ -89,6 +118,16 @@ async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_
     # Gateway stays alive in degraded mode; reconnect watcher takes over.
     assert ok is True
     assert runner.should_exit_cleanly is False
+
+    # Telegram now connects in the BACKGROUND (see _BACKGROUND_CONNECT_PLATFORMS),
+    # so its retryable failure is recorded by the background task shortly after
+    # start() returns rather than inline. Wait for it to land in the retry queue
+    # before asserting — same async semantics as WhatsApp's background connect.
+    for _ in range(300):  # ~3s ceiling
+        if Platform.TELEGRAM in runner._failed_platforms:
+            break
+        await asyncio.sleep(0.01)
+
     state = read_runtime_status()
     assert state["gateway_state"] in {"degraded", "running"}
     # Telegram was queued for retry, not given up on.

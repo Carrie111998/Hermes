@@ -59,20 +59,88 @@ except ImportError:
 # into one shared `jobs.json` and run them under whatever HERMES_HOME the
 # ticker process happens to have — leaking config/credentials/skills across
 # profiles (the security boundary #4707 was filed for). Do NOT change this to
-# the default root: that re-breaks per-profile isolation. See also the dynamic
-# `_get_hermes_home()` / `_get_lock_paths()` resolution in cron/scheduler.py.
-HERMES_DIR = get_hermes_home().resolve()
-CRON_DIR = HERMES_DIR / "cron"
-JOBS_FILE = CRON_DIR / "jobs.json"
-# Heartbeat file the in-process ticker touches on every loop iteration. The
-# gateway process and the (separate) ``hermes cron status`` process share it
-# so status can tell whether the ticker THREAD is alive, not just whether the
-# gateway PROCESS exists — a ticker that dies silently inside a live gateway
-# would otherwise report healthy (#32612, #32895).
-TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
-# Last tick that completed WITHOUT raising. Distinguishing this from the plain
-# heartbeat lets status detect a ticker that is alive but failing every tick.
-TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
+# the default root: that re-breaks per-profile isolation.
+#
+# Resolution is DYNAMIC (call-time), not import-pinned. cron.jobs is imported
+# once per process — frequently before a profile switch or a test's hermetic
+# HERMES_HOME lands — so freezing the paths at import made writes land in
+# whatever home was active at import (historically the real ~/.hermes/cron,
+# polluting the live store during test collection). The `_get_*` helpers below
+# re-resolve on every call, mirroring `_get_hermes_home()` / `_get_lock_paths()`
+# in cron/scheduler.py. All internal reads/writes MUST go through these helpers,
+# never the module-level snapshots defined just after them.
+#
+# Test/override hook: `_hermes_home` mirrors cron/scheduler.py's slot — leave it
+# None to resolve the active HERMES_HOME dynamically at call time.
+_hermes_home: Optional[Path] = None
+
+
+def _get_hermes_home() -> Path:
+    """Resolve Hermes home at call time (per-profile, #4707).
+
+    Honors the `_hermes_home` override when set (test hook / future profile
+    scoping), else the active `get_hermes_home()` — which itself layers the
+    context-local override, `HERMES_HOME`, and the platform default. Mirrors
+    `cron/scheduler.py::_get_hermes_home`.
+    """
+    return _hermes_home or get_hermes_home()
+
+
+def _get_hermes_dir() -> Path:
+    """Resolved Hermes home dir (``.resolve()``d, matching legacy HERMES_DIR)."""
+    return _get_hermes_home().resolve()
+
+
+def _get_cron_dir() -> Path:
+    """Active profile's ``cron`` directory."""
+    return _get_hermes_dir() / "cron"
+
+
+def _get_jobs_file() -> Path:
+    """Active profile's ``cron/jobs.json`` store."""
+    return _get_cron_dir() / "jobs.json"
+
+
+def _get_output_dir() -> Path:
+    """Active profile's ``cron/output`` directory."""
+    return _get_cron_dir() / "output"
+
+
+def _get_ticker_heartbeat_file() -> Path:
+    """Heartbeat file the in-process ticker touches on every loop iteration.
+
+    The gateway process and the (separate) ``hermes cron status`` process share
+    it so status can tell whether the ticker THREAD is alive, not just whether
+    the gateway PROCESS exists — a ticker that dies silently inside a live
+    gateway would otherwise report healthy (#32612, #32895).
+    """
+    return _get_cron_dir() / "ticker_heartbeat"
+
+
+def _get_ticker_success_file() -> Path:
+    """Last tick that completed WITHOUT raising.
+
+    Distinguishing this from the plain heartbeat lets status detect a ticker
+    that is alive but failing every tick.
+    """
+    return _get_cron_dir() / "ticker_last_success"
+
+
+# Backward-compatible module-level path SNAPSHOTS, resolved once at import for
+# callers that still read `cron.jobs.CRON_DIR` / `JOBS_FILE` / `OUTPUT_DIR` /
+# `HERMES_DIR` / `TICKER_*` as attributes, and for the long-standing test
+# monkeypatch pattern (`monkeypatch.setattr("cron.jobs.CRON_DIR", ...)`).
+# Internal code does NOT read these — it calls the dynamic `_get_*` helpers
+# above — so a stale snapshot (e.g. pinned to whatever home existed at import)
+# can no longer misroute a write into the wrong store. Prefer the helpers in
+# new code; these names are retained only for compatibility.
+HERMES_DIR = _get_hermes_dir()
+CRON_DIR = _get_cron_dir()
+JOBS_FILE = _get_jobs_file()
+TICKER_HEARTBEAT_FILE = _get_ticker_heartbeat_file()
+TICKER_SUCCESS_FILE = _get_ticker_success_file()
+OUTPUT_DIR = _get_output_dir()
+
 # Default ticker loop interval (seconds). The single source of truth shared by
 # the in-process ticker (cron/scheduler_provider.py) and the staleness
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
@@ -84,7 +152,6 @@ TICKER_INTERVAL_SECONDS = 60
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
-OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -136,7 +203,7 @@ def _oneshot_run_claim_ttl_seconds() -> float:
 
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
-    return CRON_DIR / ".jobs.lock"
+    return _get_cron_dir() / ".jobs.lock"
 
 
 @contextlib.contextmanager
@@ -221,7 +288,7 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
-    return OUTPUT_DIR / text
+    return _get_output_dir() / text
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -331,10 +398,12 @@ def _secure_file(path: Path):
 
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _secure_dir(CRON_DIR)
-    _secure_dir(OUTPUT_DIR)
+    cron_dir = _get_cron_dir()
+    output_dir = _get_output_dir()
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(cron_dir)
+    _secure_dir(output_dir)
 
 
 # =============================================================================
@@ -674,7 +743,7 @@ def _atomic_write_epoch(path: Path) -> None:
     torn/truncated file. Best-effort: failures are swallowed by callers.
     """
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(CRON_DIR), suffix=".tmp", prefix=".hb_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(_get_cron_dir()), suffix=".tmp", prefix=".hb_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(time.time()))
@@ -702,12 +771,12 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     Best-effort: a write failure must never disrupt the tick loop.
     """
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(_get_ticker_heartbeat_file())
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(_get_ticker_success_file())
         except Exception:
             pass
 
@@ -726,12 +795,12 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    return _epoch_file_age(_get_ticker_heartbeat_file())
 
 
 def get_ticker_success_age() -> Optional[float]:
     """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    return _epoch_file_age(_get_ticker_success_file())
 
 
 # =============================================================================
@@ -741,19 +810,20 @@ def get_ticker_success_age() -> Optional[float]:
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     ensure_dirs()
-    if not JOBS_FILE.exists():
+    jobs_file = _get_jobs_file()
+    if not jobs_file.exists():
         return []
 
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+        with open(jobs_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            with open(jobs_file, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -789,14 +859,15 @@ def load_jobs() -> List[Dict[str, Any]]:
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    jobs_file = _get_jobs_file()
+    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, JOBS_FILE)
-        _secure_file(JOBS_FILE)
+        atomic_replace(tmp_path, jobs_file)
+        _secure_file(jobs_file)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -1394,6 +1465,44 @@ def _get_event_bus():
     return EventBus()
 
 
+def emit_cron_triggered_safe(
+    *,
+    job_id: str,
+    job_name: str,
+    caller: Optional[str],
+    reason: Optional[str],
+    previous_next_run_at: Optional[str],
+    new_next_run_at: Optional[str],
+) -> None:
+    """Best-effort CRON_TRIGGERED emit shared by every off-schedule trigger path.
+
+    Both ``trigger_job`` (schedule-for-next-tick) and the cronjob tool's
+    execute-now path route through here so the audit contract can't drift
+    between them again (the 0.18.2 upstream merge dropped the emit from the
+    run path when it stopped calling ``trigger_job``). Defensive on purpose:
+    any import/bus failure is logged and swallowed — the trigger or run must
+    never break because audit emission failed. The state mutation has already
+    been persisted by the caller; the audit gap is a known degradation, not a
+    correctness regression.
+    """
+    try:
+        from events.producers.cron_trigger_emitter import emit_cron_triggered
+        bus = _get_event_bus()
+        emit_cron_triggered(
+            bus,
+            job_id=job_id,
+            job_name=job_name,
+            caller=caller,
+            reason=reason,
+            previous_next_run_at=previous_next_run_at,
+            new_next_run_at=new_next_run_at,
+        )
+    except Exception:
+        logger.exception(
+            "cron_triggered emit failed for job_id=%s", job_id
+        )
+
+
 def trigger_job(
     job_id: str,
     caller: Optional[str] = None,
@@ -1437,26 +1546,14 @@ def trigger_job(
     )
 
     if updated is not None:
-        try:
-            from events.producers.cron_trigger_emitter import emit_cron_triggered
-            bus = _get_event_bus()
-            emit_cron_triggered(
-                bus,
-                job_id=job["id"],
-                job_name=updated.get("name") or job.get("name") or job["id"],
-                caller=caller,
-                reason=reason,
-                previous_next_run_at=previous_next_run_at,
-                new_next_run_at=updated["next_run_at"],
-            )
-        except Exception:
-            # Defensive: any bus/import failure must not break trigger_job.
-            # The state mutation has already been persisted; the audit gap
-            # is a known degradation, not a correctness regression.
-            logger.exception(
-                "trigger_job: cron_triggered emit failed for job_id=%s",
-                job_id,
-            )
+        emit_cron_triggered_safe(
+            job_id=job["id"],
+            job_name=updated.get("name") or job.get("name") or job["id"],
+            caller=caller,
+            reason=reason,
+            previous_next_run_at=previous_next_run_at,
+            new_next_run_at=updated["next_run_at"],
+        )
 
     return updated
 

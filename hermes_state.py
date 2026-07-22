@@ -6969,9 +6969,18 @@ class SessionDB:
         older_than_days: Optional[float] = 90,
         source: Optional[str] = None,
         sessions_dir: Optional[Path] = None,
+        max_batch: Optional[int] = None,
         **filters,
     ) -> int:
         """Delete sessions matching the filters. Returns count deleted.
+
+        When *max_batch* is set, deletion is chunked: each chunk of up to
+        ``max_batch`` sessions is deleted in its own transaction, releasing
+        the write lock between chunks. This bounds lock-hold time and WAL
+        growth for large backlogs (e.g. a retention change or post-outage
+        catch-up) so an online prune never starves the live gateway. When
+        *max_batch* is None (default), all matches are deleted in a single
+        transaction — the original behavior.
 
         Default behavior (no keyword filters) is unchanged: delete ended
         sessions older than ``older_than_days`` days, optionally restricted
@@ -7003,20 +7012,22 @@ class SessionDB:
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
         """
+        if max_batch is not None:
+            max_batch = max(1, int(max_batch))  # <=0 would infinite-loop the chunk drain
         if filters.get("started_before") is None and older_than_days is not None:
             filters["started_before"] = time.time() - (older_than_days * 86400)
         where, where_params = self._prune_filter_where(source=source, **filters)
         removed_ids: list[str] = []
 
         def _do(conn):
-            cursor = conn.execute(
-                f"SELECT s.id FROM sessions s WHERE {where}", where_params
-            )
-            session_ids = {row["id"] for row in cursor.fetchall()}
-
+            sql = f"SELECT s.id FROM sessions s WHERE {where}"
+            params = list(where_params)
+            if max_batch is not None:
+                sql += " LIMIT ?"
+                params.append(max_batch)
+            session_ids = {row["id"] for row in conn.execute(sql, params).fetchall()}
             if not session_ids:
                 return 0
-
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -7024,14 +7035,21 @@ class SessionDB:
                 f"WHERE parent_session_id IN ({placeholders})",
                 list(session_ids),
             )
-
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
 
-        count = self._execute_write(_do)
+        if max_batch is None:
+            count = self._execute_write(_do)
+        else:
+            count = 0
+            while True:
+                n = self._execute_write(_do)
+                count += n
+                if n < max_batch:  # last (partial/empty) chunk drained the backlog
+                    break
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
@@ -7679,6 +7697,7 @@ class SessionDB:
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
+        max_batch: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
 
@@ -7698,16 +7717,19 @@ class SessionDB:
           - ``"pruned"`` (int)   — number of sessions deleted
           - ``"vacuumed"`` (bool) — true if VACUUM ran
           - ``"error"`` (str, optional) — present only on failure
+
+        Note: online callers pass ``vacuum=False`` — an in-gateway VACUUM
+        cannot get the exclusive lock a live multi-process gateway holds.
+        The last-run marker is recorded in a ``finally`` so a transient
+        prune failure never error-loops.
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        now = time.time()
         try:
-            # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
-            now = time.time()
             if last_raw:
                 try:
-                    last_ts = float(last_raw)
-                    if now - last_ts < min_interval_hours * 3600:
+                    if now - float(last_raw) < min_interval_hours * 3600:
                         result["skipped"] = True
                         return result
                 except (TypeError, ValueError):
@@ -7716,21 +7738,16 @@ class SessionDB:
             pruned = self.prune_sessions(
                 older_than_days=retention_days,
                 sessions_dir=sessions_dir,
+                max_batch=max_batch,
             )
             result["pruned"] = pruned
 
-            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
-            # is wasted I/O. Threshold keeps small DBs from paying the cost.
             if vacuum and pruned > 0:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True
                 except Exception as exc:
                     logger.warning("state.db VACUUM failed: %s", exc)
-
-            # Record the attempt even if pruned == 0, so we don't retry
-            # every startup within the min_interval_hours window.
-            self.set_meta("last_auto_prune", str(now))
 
             if pruned > 0:
                 logger.info(
@@ -7740,10 +7757,16 @@ class SessionDB:
                     " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:
-            # Maintenance must never block startup. Log and return error marker.
             logger.warning("state.db auto-maintenance failed: %s", exc)
             result["error"] = str(exc)
-
+        finally:
+            # Record the attempt (success OR failure) unless we early-skipped,
+            # so a transient 'database is locked' can't re-trigger every startup.
+            if not result["skipped"]:
+                try:
+                    self.set_meta("last_auto_prune", str(now))
+                except Exception as exc:
+                    logger.debug("could not record last_auto_prune: %s", exc)
         return result
 
     # ── Handoff (cross-platform session transfer) ──────────────────────────

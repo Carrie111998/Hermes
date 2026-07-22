@@ -129,6 +129,27 @@ _log = logging.getLogger(__name__)
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+# A machine gateway writes events/paths.gateway_heartbeat_path() every 60s
+# (events.gateway_integration.HEARTBEAT_INTERVAL_SECONDS); 3 missed writes
+# means it is genuinely gone, not just paging under memory pressure.
+_GATEWAY_HEARTBEAT_FRESH_SECONDS = 180
+
+
+def _machine_gateway_alive(threshold_seconds: float = _GATEWAY_HEARTBEAT_FRESH_SECONDS) -> bool:
+    """Whether a machine gateway wrote its liveness heartbeat recently.
+
+    Missing file, unreadable file, or any resolver error counts as NOT alive —
+    the safe default is to keep ticking (a desktop-only install has no
+    gateway and no heartbeat file at all).
+    """
+    try:
+        from events.paths import gateway_heartbeat_path
+
+        return (time.time() - gateway_heartbeat_path().stat().st_mtime) < threshold_seconds
+    except Exception:
+        return False
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -142,12 +163,64 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
     real gateway on the same HERMES_HOME — whichever process grabs the lock
     first wins the tick.
+
+    Defer-to-gateway guard: the lock only prevents DOUBLE-firing; on a machine
+    where a real gateway IS running, the two 60s loops phase-lock and this
+    backend can win every tick for hours — running LLM cron jobs inside the
+    process serving the dashboard/TUI (GIL stalls), without the gateway's live
+    delivery adapters, and dying with the app. So while the machine gateway's
+    heartbeat is fresh we skip the tick entirely and let the gateway own cron;
+    a stale/missing heartbeat restores the historical behavior (desktop-only
+    installs, and fallback coverage during gateway downtime/restarts).
+
+    ``HERMES_DESKTOP_CRON`` overrides the guard: ``0`` = never tick, ``1`` =
+    legacy always-tick, unset/anything else = auto (heartbeat guard). The
+    guard only applies to the built-in provider — an external provider (e.g.
+    chronos) arms remote schedules rather than looping locally, so it keeps
+    the plain ``start()`` path.
     """
+    mode = (os.getenv("HERMES_DESKTOP_CRON") or "").strip()
+    if mode == "0":
+        _log.info("Desktop cron ticker disabled (HERMES_DESKTOP_CRON=0)")
+        return
+
     from cron.scheduler_provider import resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
-    _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    if provider.name != "builtin" or mode == "1":
+        _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
+        provider.start(stop_event, interval=interval)
+        return
+
+    from cron.jobs import record_ticker_heartbeat
+    from cron.scheduler import tick as cron_tick
+
+    _log.info(
+        "Desktop cron scheduler started (provider=builtin, interval=%ds, defer-to-gateway guard on)",
+        interval,
+    )
+    deferring: "bool | None" = None  # unknown → log the first state either way
+    while not stop_event.is_set():
+        if _machine_gateway_alive():
+            if deferring is not True:
+                _log.info("Machine gateway heartbeat is fresh — desktop cron ticker deferring to the gateway")
+                deferring = True
+            # No tick and no ticker-heartbeat write: the gateway owns both.
+        else:
+            if deferring is not False:
+                _log.info("Gateway heartbeat stale or missing — desktop cron ticker active")
+                deferring = False
+            ok = False
+            try:
+                cron_tick(verbose=False, sync=False)
+                ok = True
+            except BaseException as e:
+                # Mirror InProcessCronScheduler.start: BaseException so a
+                # SystemExit from a provider SDK can't silently kill the
+                # thread; shutdown is driven by stop_event, not exceptions.
+                _log.error("Cron tick error: %s", e, exc_info=True)
+            record_ticker_heartbeat(success=ok)
+        stop_event.wait(interval)
 
 
 def _warm_gateway_module() -> None:
@@ -2454,11 +2527,16 @@ async def get_status(profile: Optional[str] = None):
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = (
-            get_running_pid(_gateway_pid_path)
-            if _gateway_pid_path is not None
-            else get_running_pid()
-        )
+        # On Windows get_running_pid() may invoke tasklist, which can take
+        # seconds under process pressure. Keep that subprocess off the asyncio
+        # loop so status polling cannot starve websocket flushes or unrelated
+        # dashboard requests.
+        if _gateway_pid_path is not None:
+            gateway_pid = await asyncio.to_thread(get_running_pid, _gateway_pid_path)
+        else:
+            # to_thread propagates the selected profile's contextvars into the
+            # worker; run_in_executor would silently probe the root profile.
+            gateway_pid = await asyncio.to_thread(get_running_pid)
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
@@ -10019,10 +10097,13 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
 def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
-    cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
-    from the process HERMES_HOME at import time. The dashboard is a single
-    process that can inspect many profiles, so temporarily retarget those
-    globals while holding a lock and restore them immediately after the call.
+    cron.jobs resolves its store dynamically from the active HERMES_HOME at
+    call time (per-profile, #4707). The dashboard is a single process that can
+    inspect many profiles, so set the context-local HERMES_HOME override (which
+    drives that resolution) while holding a lock, and restore it immediately
+    after the call. The CRON_DIR/JOBS_FILE/OUTPUT_DIR swap is retained only to
+    keep the backward-compat module-level snapshots consistent for any external
+    reader; internal cron.jobs code reads the override, not those globals.
     """
     profile_name, home = _cron_profile_home(target_profile)
     with _CRON_PROFILE_LOCK:
@@ -10310,10 +10391,21 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     with _CRON_PROFILE_LOCK:
         from cron import jobs as cron_jobs
         from cron.scheduler_provider import resolve_cron_scheduler
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
+        # cron.jobs resolves its store dynamically from the active HERMES_HOME
+        # (per-profile, #4707), so the context-local override — not the legacy
+        # module-global swap — is what redirects the CAS claim and run to THIS
+        # profile's jobs.json instead of the dashboard process's own home. Set
+        # both (matching _call_cron_for_profile): the override drives resolution,
+        # the swap keeps any compat-snapshot reader consistent, restored below.
         old_cron_dir = cron_jobs.CRON_DIR
         old_jobs_file = cron_jobs.JOBS_FILE
         old_output_dir = cron_jobs.OUTPUT_DIR
+        token = set_hermes_home_override(str(home))
         cron_jobs.CRON_DIR = home / "cron"
         cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
@@ -10324,6 +10416,7 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
             cron_jobs.OUTPUT_DIR = old_output_dir
+            reset_hermes_home_override(token)
 
 
 @app.post("/api/cron/fire")
@@ -14992,7 +15085,16 @@ async def console_ws(ws: WebSocket) -> None:
                         "prompt": _CONSOLE_PROMPT,
                     },
                 )
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
+            # SystemExit is a BaseException, not an Exception: a console command
+            # (or argparse's --help/--version) that calls sys.exit() in the
+            # worker thread would otherwise slip past an `except Exception`,
+            # escape this asyncio Task, and tear down the uvicorn loop — killing
+            # the whole dashboard. The console engine already contains SystemExit
+            # (execute() is total), so this guard is defense-in-depth for any
+            # future exit path in the executor. asyncio.CancelledError still
+            # propagates (caught + re-raised above); KeyboardInterrupt is left to
+            # propagate so server shutdown is never swallowed.
             if command_id == command_generation:
                 pending_confirmation = None
                 _log.exception("console command failed")

@@ -30,10 +30,68 @@ from events.bus import EventBus
 from events.schema import Event
 from events.subscribers.base import BaseSubscriber
 
-from intent_applier import IdempotencyTracker, IntentApplier, JobOpsClient
+from intent_applier import (
+    IdempotencyTracker,
+    IntentApplier,
+    JobOpsClient,
+    build_default_canonical_reader,
+    build_default_reader,
+)
 from pipeline_state import PipelineManager
 
 logger = logging.getLogger(__name__)
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _redrive_enabled_from_env() -> bool:
+    """The HARD-GATE feature flag. Default OFF until :4100 runs 8d7b5f5's dist.
+
+    Auto-re-drive must stay disabled until jobflow-api :4100 is restarted with
+    the idempotent no-op guard + lock/statement timeouts LIVE, or re-driving an
+    already-applied intent could double-write / re-fire notifications.
+    """
+    return os.environ.get(
+        "TRACKER_APPLIER_REDRIVE_ENABLED", "0"
+    ).strip().lower() in _TRUTHY
+
+
+def _reap_enabled_from_env() -> bool:
+    """Feature flag for the convergence-reaper. Default OFF.
+
+    Independent of TRACKER_APPLIER_REDRIVE_ENABLED: the reaper never POSTs to
+    :4100 (it reads native PG + the canonical pipeline.json and moves a file), so
+    it does not need the :4100 idempotent-no-op hard gate. Default-off lets us
+    enable it deliberately after a soak.
+    """
+    return os.environ.get(
+        "TRACKER_APPLIER_REAP_CONVERGED_ENABLED", "0"
+    ).strip().lower() in _TRUTHY
+
+
+def _redrive_config_from_env() -> dict:
+    """Backoff/attempt tuning for IntentApplier.redrive_partials(), env-overridable."""
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ[name])
+        except (KeyError, ValueError):
+            return default
+
+    def _i(name: str, default: int) -> int:
+        try:
+            return int(os.environ[name])
+        except (KeyError, ValueError):
+            return default
+
+    return {
+        "redrive_base_backoff": _f("TRACKER_APPLIER_REDRIVE_BASE_SECONDS", 120.0),
+        "redrive_multiplier": _f("TRACKER_APPLIER_REDRIVE_MULTIPLIER", 2.0),
+        "redrive_max_backoff": _f("TRACKER_APPLIER_REDRIVE_MAX_BACKOFF_SECONDS", 1800.0),
+        # Fix B: 0 => never give up (slow-lane retry at max_backoff forever).
+        # Set >0 only to restore a terminal "capped" after N attempts.
+        "redrive_give_up_attempts": _i("TRACKER_APPLIER_REDRIVE_GIVE_UP_ATTEMPTS", 0),
+    }
 
 
 def _hermes_root() -> Path:
@@ -48,6 +106,11 @@ def _tracker_mailbox(root: Path) -> Dict[str, Path]:
         "partial": base / "partial",
         "dead_letter": base / "dead-letter",
     }
+
+
+def tracker_partial_dir() -> Path:
+    """The tracker mailbox partial/ dir — read-only counted by PartialBacklogMonitor."""
+    return _tracker_mailbox(_hermes_root())["partial"]
 
 
 class TrackerIntentApplierSubscriber(BaseSubscriber):
@@ -75,6 +138,9 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             "HERMES_JOBOPS_URL", "http://127.0.0.1:4100"
         )
         self._applier: IntentApplier | None = None
+        self._redrive_enabled = _redrive_enabled_from_env()
+        self._redrive_config = _redrive_config_from_env()
+        self._reap_enabled = _reap_enabled_from_env()
 
     def startup(self) -> None:
         """Build the applier with rehydrated idempotency state."""
@@ -95,6 +161,14 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
                 "thread-resume disabled"
             )
 
+        # Fix A: native-Postgres pre-flight reader (None on minimal installs
+        # without a psycopg driver — pre-flight simply stays off).
+        job_state_reader = build_default_reader()
+
+        # Reaper gate B: fresh {job_id: currentBusinessState} from the tracker
+        # canonical pipeline.json under HERMES_ROOT.
+        canonical_state_reader = build_default_canonical_reader()
+
         self._applier = IntentApplier(
             inbox_dir=self._mailbox["inbox"],
             processed_dir=self._mailbox["processed"],
@@ -104,11 +178,19 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             jobops_client=JobOpsClient(base_url=self._jobops_url),
             idempotency=idempotency,
             resume_full=_resume_full,
+            job_state_reader=job_state_reader,
+            canonical_state_reader=canonical_state_reader,
+            **self._redrive_config,
         )
         logger.info(
-            "tracker-intent-applier: ready (inbox=%s, jobops=%s)",
+            "tracker-intent-applier: ready (inbox=%s, jobops=%s, redrive_enabled=%s, "
+            "reap_enabled=%s, preflight=%s, give_up_attempts=%s)",
             self._mailbox["inbox"],
             self._jobops_url,
+            self._redrive_enabled,
+            self._reap_enabled,
+            job_state_reader is not None,
+            self._redrive_config.get("redrive_give_up_attempts"),
         )
 
     def handle(self, event: Event) -> None:
@@ -142,9 +224,44 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             skipped = sum(
                 1 for v in outcomes.values() if v == "skipped_idempotent"
             )
+            satisfied = sum(1 for v in outcomes.values() if v == "satisfied")
             logger.info(
                 "tracker-intent-applier: tick processed=%d "
-                "(applied=%d partial=%d dead=%d skipped=%d)",
-                len(outcomes), applied, partial, dead, skipped,
+                "(applied=%d partial=%d dead=%d skipped=%d satisfied=%d)",
+                len(outcomes), applied, partial, dead, skipped, satisfied,
             )
         return len(outcomes)
+
+    def redrive_partials(self) -> int:
+        """Flag-gated wrapper: re-drive eligible partials iff the feature is enabled.
+
+        The HARD GATE. Returns the number of partials re-driven this sweep (0 when
+        disabled or nothing eligible). IntentApplier.redrive_partials() itself is
+        pure/always-acts; THIS method is the feature flag — it must stay OFF until
+        :4100 runs 8d7b5f5's dist (idempotent no-op guard live).
+        """
+        if not self._redrive_enabled or self._applier is None:
+            return 0
+        results = self._applier.redrive_partials()
+        redriven = sum(1 for v in results.values() if v == "redriven")
+        if redriven:
+            logger.info("tracker-intent-applier: re-drove %d partial(s)", redriven)
+        return redriven
+
+    def reap_converged_partials(self) -> int:
+        """Flag-gated wrapper: reap converged capped partials iff enabled.
+
+        Returns the number reaped this sweep (0 when disabled or nothing
+        converged). IntentApplier.reap_converged_partials() is pure/always-acts;
+        THIS method is the feature flag.
+        """
+        if not self._reap_enabled or self._applier is None:
+            return 0
+        results = self._applier.reap_converged_partials()
+        reaped = sum(1 for v in results.values() if v == "reaped")
+        if reaped:
+            logger.info(
+                "tracker-intent-applier: reaped %d converged capped partial(s)",
+                reaped,
+            )
+        return reaped

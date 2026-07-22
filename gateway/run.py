@@ -2845,7 +2845,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # that 30s (boot forensics 2026-07-10). Firing it as a background task lets
     # the loop bind api_server immediately; failures fall into the existing
     # reconnect watcher, which keeps retrying at its 60-300s backoff.
-    _BACKGROUND_CONNECT_PLATFORMS: frozenset = frozenset({Platform.WHATSAPP})
+    #
+    # Telegram is backgrounded for the same reason (death forensics 2026-07-16):
+    # a NordVPN/DNS flap made all name resolution fail (``getaddrinfo failed``),
+    # so Telegram's inline boot connect blocked on its reconnect ladder and the
+    # gateway could not reach a running state until DNS recovered — a ~10-minute
+    # blip became a ~27-minute restart storm. Backgrounding lets the gateway boot
+    # (api_server bound, cron + event bus up) during the outage; Telegram wires
+    # itself in via the reconnect watcher once the network returns.
+    _BACKGROUND_CONNECT_PLATFORMS: frozenset = frozenset(
+        {Platform.WHATSAPP, Platform.TELEGRAM}
+    )
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3091,27 +3101,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # "locking protocol" from NFS) is now also captured by
             # hermes_state.get_last_init_error() for slash-command error strings.
             logger.warning("SQLite session store not available: %s", e)
-
-        # Opportunistic state.db maintenance: prune ended sessions older
-        # than sessions.retention_days + optional VACUUM. Tracks last-run
-        # in state_meta so it only actually executes once per
-        # sessions.min_interval_hours.  Gateway is long-lived so blocking
-        # a few seconds once per day is acceptable; failures are logged
-        # but never raised.
-        if self._session_db is not None:
-            try:
-                from hermes_cli.config import load_config as _load_full_config
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                if _sess_cfg.get("auto_prune", False):
-                    # Construction-time, before the loop serves traffic; sync DB is fine.
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
-                        retention_days=int(_sess_cfg.get("retention_days", 90)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir,
-                    )
-            except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
@@ -3531,6 +3520,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             },
         )
 
+    async def _exit_if_nonretryable_leaves_nothing_running(
+        self, platform, adapter
+    ) -> None:
+        """Exit cleanly when a backgrounded non-retryable fatal leaves nothing up.
+
+        Mirrors the inline startup policy for the fire-and-retry path: a
+        non-retryable error with nothing else connected means EX_CONFIG (78), so
+        the s6 finish script translates it to 125 — a permanent failure that is
+        NOT restarted (#51228). Such an error will not fix itself (a bot token
+        held by another gateway, bad auth), so there is nothing for the reconnect
+        watcher to wait for. Left running, the process is dead weight at best and
+        at worst a duplicate racing another live gateway's cron.
+
+        Before ``_BACKGROUND_CONNECT_PLATFORMS`` grew Telegram this decision was
+        made inline; backgrounding the connect moved the fatal to *after*
+        ``start()`` returns and silently dropped it.
+
+        Two guards keep this from over-firing — it must be no more aggressive
+        than the inline path it replaces:
+
+        * Wait for the inline connect phase to finish (``_running``). This task
+          can lose the race to a platform that is merely *later* in the startup
+          loop (api_server binds after us), and exiting on that snapshot would
+          let one bad token kill an otherwise healthy boot.
+        * Stay alive if anything is connected or queued for retry — the inline
+          path only exits when ``connected_count == 0``, and a half-working
+          gateway still runs cron and serves its other platforms.
+        """
+        while not self._running and not self._shutdown_event.is_set():
+            await asyncio.sleep(0.05)
+
+        # Already going down — don't relabel another path's exit reason/code.
+        if self._shutdown_event.is_set():
+            return
+
+        if self.adapters or self._failed_platforms:
+            return
+
+        reason = f"{platform.value}: {adapter.fatal_error_message}"
+        logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+        except Exception:
+            pass
+        self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+        self._request_clean_exit(reason)
+
     async def _connect_platform_in_background(
         self, adapter, platform, platform_config
     ) -> None:
@@ -3576,6 +3613,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # retry queue — same policy as the inline startup path.
                 if adapter.fatal_error_retryable:
                     self._queue_platform_for_retry(platform, platform_config)
+                else:
+                    await self._exit_if_nonretryable_leaves_nothing_running(
+                        platform, adapter
+                    )
             else:
                 self._update_platform_runtime_status(
                     platform.value,
@@ -7488,6 +7529,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+        self._statedb_maint_task = asyncio.create_task(
+            self._state_db_maintenance_watcher()
+        )
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
@@ -7816,6 +7860,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
+
+    async def _state_db_maintenance_watcher(self, poll_hours: float = 6.0) -> None:
+        """Periodic ONLINE state.db prune (never VACUUM — needs exclusivity).
+
+        Relocated out of gateway construction, which raced the startup write
+        storm and error-looped 'database is locked' without ever recording
+        last_auto_prune. Runs after a 120 s settle delay, then every
+        ``poll_hours``; ``maybe_auto_prune_and_vacuum`` self-gates on
+        ``sessions.min_interval_hours`` so the actual prune happens ~daily.
+        """
+        if self._session_db is None:
+            return
+        await asyncio.sleep(120)  # let the startup write storm settle
+        while self._running:
+            try:
+                from hermes_cli.config import load_config as _load_full_config
+                cfg = (_load_full_config().get("sessions") or {})
+                if cfg.get("auto_prune", False):
+                    # await the AsyncSessionDB wrapper so the blocking prune runs
+                    # via asyncio.to_thread and never freezes the event loop.
+                    await self._session_db.maybe_auto_prune_and_vacuum(
+                        retention_days=int(cfg.get("retention_days", 90)),
+                        min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+                        vacuum=False,  # online: cannot get exclusive lock
+                        max_batch=int(cfg.get("prune_batch", 200)),
+                        sessions_dir=self.config.sessions_dir,
+                    )
+            except Exception as exc:
+                logger.debug("state.db maintenance watcher pass failed: %s", exc)
+            await asyncio.sleep(max(1.0, poll_hours) * 3600.0)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.

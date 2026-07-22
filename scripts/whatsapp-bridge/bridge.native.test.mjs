@@ -42,7 +42,7 @@ import {
     messageStore: store,
   });
 
-  assert.deepEqual(content, { text: 'reply text' });
+  assert.deepEqual(content, { text: 'reply text', linkPreview: null });
   assert.equal(options.quoted.key.id, 'inbound-1');
   assert.equal(options.quoted.message.conversation, 'original text');
   console.log('  ✓ text replies include Baileys quoted message when resolvable');
@@ -56,9 +56,16 @@ import {
     messageStore: store,
   });
 
-  assert.deepEqual(content, { text: 'plain text' });
+  assert.deepEqual(content, { text: 'plain text', linkPreview: null });
   assert.deepEqual(options, {});
   console.log('  ✓ unresolved replyTo falls back to plain text');
+
+  // Regression guard: every text send must disable Baileys' server-side link
+  // preview (link-preview-js SSRF sink, GHSA-4gp8-rjrq-ch6q). Baileys only skips
+  // the fetch when linkPreview is explicitly present (null), not undefined.
+  assert.ok('linkPreview' in content, 'text payload must set linkPreview explicitly');
+  assert.strictEqual(content.linkPreview, null, 'text payload linkPreview must be null');
+  console.log('  ✓ text send disables server-side link preview (SSRF sink unreachable)');
 }
 
 // -- inbound quote/media/native metadata --------------------------------

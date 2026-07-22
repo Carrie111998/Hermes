@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.console_engine import HermesConsoleEngine, run_console_repl
+from hermes_cli.console_engine import (
+    ConsoleResult,
+    HermesConsoleEngine,
+    run_console_repl,
+)
 
 
 EXPECTED_CONSOLE_COMMANDS = {
@@ -339,6 +343,78 @@ def test_console_registry_covers_non_admin_cli_surface():
     assert missing == set()
 
 
+# Regression: argparse's --help/--version action calls parser.exit() ->
+# sys.exit(). The dashboard web console runs each command in a worker thread
+# whose SystemExit (a BaseException) sailed past the `except Exception` guard,
+# escaped the asyncio Task, and tore down the whole uvicorn process. The console
+# must instead return the help text at the prompt. See console_engine
+# _ArgumentParser.exit() + HermesConsoleEngine.execute().
+CONSOLE_HELP_FLAG_LINES = [
+    ("version --help", False),
+    ("version -h", False),
+    ("skills list --help", False),
+    ("mcp add --help", True),  # mutating -> reached only on the confirmed pass
+]
+
+
+@pytest.mark.parametrize("line, confirmed", CONSOLE_HELP_FLAG_LINES)
+def test_console_help_flag_returns_help_without_exiting(
+    line: str, confirmed: bool, capsys: pytest.CaptureFixture[str]
+):
+    engine = HermesConsoleEngine()
+
+    result = engine.execute(line, confirmed=confirmed)
+
+    # Reaching this line at all proves no SystemExit escaped execute().
+    assert isinstance(result, ConsoleResult)
+    assert result.status == "ok"
+    assert "usage:" in result.output
+    # The help text is surfaced in the result, not dumped to the process
+    # stdout/stderr (which the web console never shows the user).
+    captured = capsys.readouterr()
+    assert "usage:" not in captured.out
+    assert "usage:" not in captured.err
+
+
+def test_console_cron_create_help_does_not_crash_process():
+    # Exact repro from the bug report. `cron create` is mutating, so the crash
+    # happened on the confirmation pass (confirmed=True), when the handler
+    # actually parsed the args and argparse hit --help.
+    engine = HermesConsoleEngine()
+
+    pending = engine.execute("cron create --help")
+    assert pending.status == "confirm_required"
+
+    result = engine.execute("cron create --help", confirmed=True)
+
+    assert result.status == "ok"
+    assert "usage: hermes cron create" in result.output
+
+
+def _selftest_exit_handler(_engine: HermesConsoleEngine, _args: list[str]) -> str:
+    raise SystemExit(7)
+
+
+def test_console_contains_handler_process_exit():
+    # Defense-in-depth: a handler (or a parser we don't control) that calls
+    # sys.exit() must not let SystemExit escape execute(); that BaseException
+    # would slip past the dashboard worker's `except Exception` and crash the
+    # event loop. execute() must always return a ConsoleResult.
+    engine = HermesConsoleEngine()
+    engine.register(
+        ("selftest-exit",),
+        "selftest-exit",
+        "Raise SystemExit for the containment test.",
+        _selftest_exit_handler,
+    )
+
+    result = engine.execute("selftest-exit")
+
+    assert isinstance(result, ConsoleResult)
+    assert result.status == "error"
+    assert "status 7" in result.output
+
+
 EXPECTED_HOSTED_CONSOLE_COMMANDS = {
     ("status",),
     ("doctor",),
@@ -601,8 +677,39 @@ def test_sessions_list_and_stats_use_isolated_session_store(_isolate_hermes_home
     assert "Listable sessions: 1" in stats.output
 
 
-def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
+@pytest.fixture()
+def _tmp_cron_store(tmp_path, monkeypatch):
+    """Redirect cron.jobs' module-pinned storage to a per-test tmp dir.
+
+    ``cron.jobs.CRON_DIR``/``JOBS_FILE``/``OUTPUT_DIR`` are constants resolved
+    from ``get_hermes_home()`` at *import* time — which, during collection,
+    is the real ``~/.hermes`` (the hermetic ``HERMES_HOME`` env override lands
+    after import). Without this, a console cron test creating a named job
+    writes it to the live cron store: it pollutes the user's real jobs.json
+    and, under xdist, goes ambiguous once a sibling reuses the same name.
+    Mirrors ``tests/cron/test_jobs.py::tmp_cron_dir``.
+    """
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
+def test_cron_pause_resume_and_run_require_confirmation(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
     from cron.jobs import create_job, get_job
+
+    # Local `cron run` now executes immediately (CLI/LLM parity); stub the real
+    # agent-run boundary so this confirmation-flow test doesn't depend on — or
+    # attempt — an actual agent execution.
+    def _fake_run_one_job(job):
+        from cron.jobs import mark_job_run
+
+        mark_job_run(job["id"], True)
+        return True
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
 
     job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
     engine = HermesConsoleEngine()
@@ -627,7 +734,373 @@ def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
 
     triggered = engine.execute("cron run alpha", confirmed=True)
     assert triggered.status == "ok"
-    assert "Triggered job" in triggered.output
+    assert "Ran job" in triggered.output
+
+
+def test_cron_run_attributes_trigger_to_console(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """`cron run` must emit CRON_TRIGGERED with an explicit console caller.
+
+    The emit fires on both the local execute-now path and the hosted
+    schedule-for-next-tick path; this exercises the default (local) engine.
+    """
+    from cron.jobs import create_job
+    from events.bus import EventBus
+    from events.schema import EventType
+
+    # ``_tmp_cron_store`` isolates the module-pinned cron paths (returning the
+    # tmp root); point the emit-side bus at a tmp DB in that same root.
+    bus = EventBus(db_path=_tmp_cron_store / "events.db")
+    monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+    # Local `cron run` executes immediately; stub the agent-run boundary so the
+    # attribution assertions don't depend on a real agent execution.
+    monkeypatch.setattr("cron.scheduler.run_one_job", lambda job: True)
+
+    job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine()
+
+    triggered = engine.execute("cron run alpha", confirmed=True)
+    assert triggered.status == "ok"
+
+    events = bus.query(event_type=EventType.CRON_TRIGGERED)
+    assert len(events) == 1
+    assert events[0].payload["caller"] == "tui:console_engine"
+    assert events[0].payload["job_id"] == job["id"]
+
+
+def test_cron_run_executes_immediately_in_local_context(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """Local REPL `cron run` executes the job NOW (CLI/LLM `run` parity), not
+    just schedule-for-next-tick — and still emits CRON_TRIGGERED as the console.
+
+    A manual `cron run` in the standalone REPL should actually fire, even when
+    no gateway ticker is active (the #41037 case), mirroring `hermes cron run`
+    and the cronjob(action='run') tool which both route through _execute_job_now.
+    """
+    from cron.jobs import create_job
+    from events.bus import EventBus
+    from events.schema import EventType
+
+    # ``_tmp_cron_store`` isolates the module-pinned cron paths (returning the
+    # tmp root); point the emit-side bus at a tmp DB in that same root.
+    bus = EventBus(db_path=_tmp_cron_store / "events.db")
+    monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+    # Stub the real agent-execution boundary so no actual run happens: record
+    # that it fired and mark the job ok so the console reports success.
+    ran: dict = {}
+
+    def _fake_run_one_job(job):
+        from cron.jobs import mark_job_run
+
+        ran["job_id"] = job["id"]
+        mark_job_run(job["id"], True)
+        return True
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+
+    job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine()  # default context == "local"
+    assert engine.context == "local"
+
+    result = engine.execute("cron run alpha", confirmed=True)
+    assert result.status == "ok"
+    assert "Ran job" in result.output
+    assert "succeeded" in result.output
+
+    # It actually executed now, rather than deferring to a scheduler tick.
+    assert ran.get("job_id") == job["id"]
+
+    # Attribution is preserved on the execute-now path.
+    events = bus.query(event_type=EventType.CRON_TRIGGERED)
+    assert len(events) == 1
+    assert events[0].payload["caller"] == "tui:console_engine"
+    assert events[0].payload["job_id"] == job["id"]
+
+
+def test_cron_run_reports_skip_when_claim_lost_in_local_context(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """If the scheduler already holds the fire claim, local `cron run` reports a
+    skip and never double-runs the job (at-most-once safety)."""
+    from cron.jobs import create_job
+
+    # Force the at-most-once claim to be lost (another fire owns this job).
+    monkeypatch.setattr(
+        "tools.cronjob_tools.claim_job_for_fire", lambda job_id: False
+    )
+
+    def _must_not_run(job):
+        raise AssertionError("run_one_job must not fire when the claim is lost")
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _must_not_run)
+
+    create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine()  # local
+
+    result = engine.execute("cron run alpha", confirmed=True)
+    assert result.status == "ok"
+    assert "Run skipped" in result.output
+    assert "already being fired" in result.output
+
+
+def test_cron_run_executes_in_background_in_hosted_context(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """Hosted (dashboard web-console) `cron run` fires the job NOW, but off the
+    console's bounded 4-worker/60s pool: it dispatches `_execute_job_now` on a
+    dedicated background executor and returns a "started" ack immediately.
+
+    The run still emits exactly one CRON_TRIGGERED (console caller) and — via
+    `run_one_job` -> `on_job_completed` — the completion event the dashboard
+    activity feed already consumes; that is how the result is surfaced without
+    blocking the console thread or tripping the 60s timeout.
+    """
+    import concurrent.futures
+
+    from cron.jobs import create_job, get_job
+    from events.bus import EventBus
+    from events.schema import EventType
+    from hermes_cli import console_engine
+
+    bus = EventBus(db_path=_tmp_cron_store / "events.db")
+    monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+    # Stub the real agent-execution boundary: record that it fired and mark the
+    # job ok. Running on the background thread, it reaches the same store/bus
+    # (HERMES_HOME env + monkeypatched globals are process-global).
+    ran: dict = {}
+
+    def _fake_run_one_job(job):
+        from cron.jobs import mark_job_run
+
+        ran["job_id"] = job["id"]
+        mark_job_run(job["id"], True)
+        return True
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+
+    # The test owns the background executor so it can join deterministically
+    # (no sleeps): shutdown(wait=True) blocks until the fire completes.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(
+        console_engine, "_get_console_run_executor", lambda: executor
+    )
+
+    job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine(context="hosted")
+
+    result = engine.execute("cron run alpha", confirmed=True)
+    assert result.status == "ok"
+    assert "Started" in result.output
+    assert "background" in result.output.lower()
+    assert job["id"] in result.output
+
+    executor.shutdown(wait=True)  # join the background fire
+
+    # It actually executed NOW in the background (not defer-to-tick).
+    assert ran.get("job_id") == job["id"]
+    stored = get_job(job["id"])
+    assert stored is not None
+    assert stored.get("last_status") == "ok"
+
+    # Exactly one CRON_TRIGGERED, attributed to the console caller.
+    events = bus.query(event_type=EventType.CRON_TRIGGERED)
+    assert len(events) == 1
+    assert events[0].payload["caller"] == "tui:console_engine"
+    assert events[0].payload["job_id"] == job["id"]
+
+
+def test_cron_run_hosted_dispatch_is_non_blocking(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """The hosted `cron run` ack returns while the agent run is still in flight.
+
+    A synchronous run would block the console worker (and trip the 60s timeout).
+    Here the stubbed run parks on a gate: if `execute()` returned, the console
+    thread was NOT blocked on the run. If it *were* blocked, the test would
+    deadlock (the gate is released only after `execute()` returns) — a hang is
+    the failure signal.
+    """
+    import concurrent.futures
+    import threading
+
+    from cron.jobs import create_job
+    from events.bus import EventBus
+    from hermes_cli import console_engine
+
+    bus = EventBus(db_path=_tmp_cron_store / "events.db")
+    monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+    started = threading.Event()
+    gate = threading.Event()
+
+    def _blocking_run_one_job(job):
+        from cron.jobs import mark_job_run
+
+        started.set()
+        if not gate.wait(timeout=5):
+            raise AssertionError("gate never released")
+        mark_job_run(job["id"], True)
+        return True
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _blocking_run_one_job)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(
+        console_engine, "_get_console_run_executor", lambda: executor
+    )
+
+    create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine(context="hosted")
+
+    # Returns immediately with the ack even though the run is parked on `gate`.
+    result = engine.execute("cron run alpha", confirmed=True)
+    assert result.status == "ok"
+    assert "background" in result.output.lower()
+
+    # The background fire genuinely started, and it is still blocked — proving
+    # `execute()` did not wait for it.
+    assert started.wait(timeout=5)
+    assert not gate.is_set()
+
+    gate.set()
+    executor.shutdown(wait=True)
+
+
+def test_cron_run_hosted_missing_job_fast_fails_without_dispatch(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """Hosted `cron run <missing>` resolves on the console thread and fast-fails
+    with `Job not found` — it must NOT dispatch a background run for a job that
+    does not exist."""
+    from hermes_cli import console_engine
+
+    class _NoDispatchExecutor:
+        def submit(self, *args, **kwargs):
+            raise AssertionError(
+                "must not dispatch a background run for a missing job"
+            )
+
+    monkeypatch.setattr(
+        console_engine, "_get_console_run_executor", lambda: _NoDispatchExecutor()
+    )
+
+    engine = HermesConsoleEngine(context="hosted")
+    result = engine.execute("cron run does-not-exist", confirmed=True)
+    assert result.status == "error"
+    assert "not found" in result.output.lower()
+
+
+def test_cron_run_hosted_returns_started_ack_even_when_claim_lost(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """The hosted background fire is optimistic (fire-and-forget): if the
+    scheduler already holds the fire claim, `_execute_job_now` no-ops on the
+    background thread, but the console has already returned the "started" ack.
+    At-most-once safety still holds — `run_one_job` is never called — and the
+    activity feed shows the scheduler's own trigger/completion. This pins that
+    deliberate optimistic-ack decision.
+    """
+    import concurrent.futures
+
+    from cron.jobs import create_job
+    from hermes_cli import console_engine
+
+    # Force the at-most-once claim to be lost (another fire owns this job).
+    monkeypatch.setattr(
+        "tools.cronjob_tools.claim_job_for_fire", lambda job_id: False
+    )
+
+    def _must_not_run(job):
+        raise AssertionError("run_one_job must not fire when the claim is lost")
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _must_not_run)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(
+        console_engine, "_get_console_run_executor", lambda: executor
+    )
+
+    create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine(context="hosted")
+
+    result = engine.execute("cron run alpha", confirmed=True)
+    assert result.status == "ok"
+    assert "Started" in result.output
+    assert "background" in result.output.lower()
+
+    executor.shutdown(wait=True)  # join; the fire no-ops on a lost claim
+
+
+def test_cron_run_hosted_background_fire_inherits_profile_home(
+    _isolate_hermes_home,
+    _tmp_cron_store,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    """The background fire must resolve the SAME profile store as the console
+    thread that dispatched it.
+
+    Hosted `cron run` runs inside `_profile_scope`, which sets a *context-local*
+    (ContextVar) HERMES_HOME override for a non-default profile. A
+    ThreadPoolExecutor worker does NOT inherit that ContextVar, so the dispatch
+    must carry the caller's context (contextvars.copy_context) — otherwise the
+    fire would claim/run/record against the WRONG profile's store, regressing
+    the per-profile fire correctness cron.jobs' dynamic resolution preserves.
+    """
+    import concurrent.futures
+
+    from cron.jobs import create_job
+    from events.bus import EventBus
+    from hermes_cli import console_engine
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    bus = EventBus(db_path=_tmp_cron_store / "events.db")
+    monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+    # A distinct profile home, different from the hermetic default HERMES_HOME.
+    profile_home = tmp_path / "profileX"
+    (profile_home / "cron").mkdir(parents=True)
+
+    seen: dict = {}
+
+    def _fake_run_one_job(job):
+        from cron.jobs import _get_hermes_home, mark_job_run
+
+        seen["home"] = str(_get_hermes_home().resolve())
+        mark_job_run(job["id"], True)
+        return True
+
+    monkeypatch.setattr("cron.scheduler.run_one_job", _fake_run_one_job)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(
+        console_engine, "_get_console_run_executor", lambda: executor
+    )
+
+    # Enter the profile override on THIS (console) thread, create the job in the
+    # profile store, and dispatch — mirroring `_profile_scope` wrapping a hosted
+    # console command.
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        create_job(prompt="say hello", schedule="every 1h", name="alpha")
+        engine = HermesConsoleEngine(context="hosted")
+        result = engine.execute("cron run alpha", confirmed=True)
+        assert result.status == "ok"
+    finally:
+        reset_hermes_home_override(token)
+
+    executor.shutdown(wait=True)  # join the background fire
+
+    # The background thread resolved the PROFILE store, not the process default.
+    assert seen.get("home") == str(profile_home.resolve())
 
 
 def test_repl_runs_non_interactive_lines_without_prompts(_isolate_hermes_home):

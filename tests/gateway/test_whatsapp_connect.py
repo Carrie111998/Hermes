@@ -462,6 +462,67 @@ class TestBridgeRuntimeFailure:
 
 
 # ---------------------------------------------------------------------------
+# _wait_for_port_release() tests
+# ---------------------------------------------------------------------------
+
+class TestWaitForPortRelease:
+    """After killing the old bridge, connect() must wait until :3000 is
+    actually released before spawning the new node — a fixed 1s sleep raced
+    OS socket teardown and the fresh bridge crashed with EADDRINUSE
+    (2026-07-18 flap RCA)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_immediately_when_port_free(self):
+        from plugins.platforms.whatsapp.adapter import _wait_for_port_release
+
+        import socket
+        # Grab an ephemeral port then release it so we know it's free.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        assert await _wait_for_port_release(port, timeout_s=2.0) is True
+
+    @pytest.mark.asyncio
+    async def test_waits_for_busy_port_then_returns_true(self):
+        from plugins.platforms.whatsapp.adapter import _wait_for_port_release
+
+        import asyncio
+        import socket
+
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+
+        async def release_soon():
+            await asyncio.sleep(0.6)
+            holder.close()
+
+        release_task = asyncio.ensure_future(release_soon())
+        try:
+            assert await _wait_for_port_release(port, timeout_s=5.0) is True
+        finally:
+            await release_task
+            holder.close()
+
+    @pytest.mark.asyncio
+    async def test_times_out_when_port_stays_bound(self):
+        from plugins.platforms.whatsapp.adapter import _wait_for_port_release
+
+        import socket
+
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            assert await _wait_for_port_release(port, timeout_s=1.0) is False
+        finally:
+            holder.close()
+
+
+# ---------------------------------------------------------------------------
 # _kill_port_process() cross-platform tests
 # ---------------------------------------------------------------------------
 

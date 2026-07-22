@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from events.bus import EventBus
+from events.noise_guards import RepeatGuard
+from events.routing_policy import (
+    HIGH_SCORE_WA_THRESHOLD,
+    WA_IMMEDIATE,
+    WA_IMPORTANT,
+    WA_URGENT,
+    classify as policy_classify,
+    resolve_topic_thread,
+)
 from events.schema import Event, EventType, Priority
 from events.subscribers.base import BaseSubscriber
 
@@ -40,74 +49,32 @@ class EscalationTier(Enum):
         self.priority = priority
 
 
-# Tier assignment per event type (static mapping)
-_TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
-    # Immediate
-    EventType.INTERVIEW_SIGNAL: EscalationTier.IMMEDIATE,
-    EventType.OFFER_SIGNAL: EscalationTier.IMMEDIATE,
-    # Credential/infra loss (2026-07-10, R70 alert-gap fix). IMMEDIATE so it
-    # breaks quiet hours -- a 2:44am WhatsApp-creds zeroing (or OAuth/ENOSPC
-    # credential loss) must wake Diego, not queue to the 7am flush. SELF-
-    # REFERENCE CAVEAT: when the lost credential IS WhatsApp, this WhatsApp
-    # escalation cannot deliver -- the Telegram route (security_and_system,
-    # unaffected by quiet hours) is the reliable channel for that case. Kept
-    # IMMEDIATE anyway so a NON-WhatsApp credential loss still breaks through here.
-    EventType.CREDENTIAL_LOSS: EscalationTier.IMMEDIATE,
-    # Urgent
-    EventType.APPLICATION_BLOCKED: EscalationTier.URGENT,
-    EventType.APPLICATION_FAILED: EscalationTier.URGENT,
-    EventType.CRON_FAILED_CONSECUTIVE: EscalationTier.URGENT,
-    EventType.AGENT_ERROR: EscalationTier.URGENT,
-    # Phase B Stage-3 iter2: approval requests interrupt the LangGraph until
-    # Diego replies. Treat as URGENT so they queue during quiet hours and
-    # flush at 7:01am rather than wake him up at 3am.
-    EventType.APPROVAL_REQUEST: EscalationTier.URGENT,
-    # GATEWAY_HEALTH is conditional (only down) — handled in classify_tier
-    # AGENT_ERROR escalation is gated by cluster threshold — see should_escalate()
-    # Important
-    EventType.APPLICATION_READY: EscalationTier.IMPORTANT,
-    EventType.FOLLOWUP_DUE: EscalationTier.IMPORTANT,
-    # Phase B Stage-3 iter2: APPLY_PACKET hands materials to Diego for the
-    # final manual click. Important but not urgent.
-    EventType.APPLY_PACKET: EscalationTier.IMPORTANT,
-    # Phase C iter2: Critic proposals are advisory; daily flush is enough.
-    EventType.CRITIC_PROPOSAL: EscalationTier.IMPORTANT,
-    # iter5: proper watchdog signals (replacing AGENT_ERROR-fallback hack).
-    # WATCHDOG_PROBE_TRANSITION at HIGH = real probe state flip (gateway down,
-    # API server :8642 down, etc.). Treat as URGENT so it queues during quiet
-    # hours and flushes at 7:01am. Routine probe ticks aren't routed here.
-    # WATCHDOG_BURST = coalesced multi-probe failure burst; at least as urgent
-    # as a single probe transition — same URGENT tier.
-    EventType.WATCHDOG_BURST: EscalationTier.URGENT,
-    EventType.WATCHDOG_PROBE_TRANSITION: EscalationTier.URGENT,
-    # WATCHDOG_SILENCE_ALERT at HIGH = an agent missed its expected cadence
-    # (e.g. jaum-inbox-sweeper silent for 1042s vs expected 600s). Important,
-    # not urgent — operator can act in next digest window.
-    EventType.WATCHDOG_SILENCE_ALERT: EscalationTier.IMPORTANT,
-    # AGENT_FAILURE_CLUSTER at HIGH = >=3 consecutive failures from the same
-    # source. Real ones (NOT watchdog self-emissions thanks to the
-    # source=watchdog skip in watchdog_sweep.py) escalate as URGENT.
-    EventType.AGENT_FAILURE_CLUSTER: EscalationTier.URGENT,
-    # DevFlow decisions -> WhatsApp (2026-07-11, operator request: route DevFlow
-    # decision signals to WhatsApp alongside the devflow_decisions Telegram
-    # topic). All three are Priority.HIGH and land in devflow_decisions via
-    # TOPIC_ROUTING. URGENT = queue during quiet hours, flush at 7:01am — a
-    # pending review / broken build shouldn't wake Diego at 3am but must not
-    # wait for the daily digest either. Mirrors APPROVAL_REQUEST=URGENT. NOTE:
-    # devflow.pr_* emitters are partly deferred (events/producers/
-    # devflow_pr_build.py); entries are harmless-inert until those fire.
-    EventType.DEVFLOW_APPROVAL_REQUESTED: EscalationTier.URGENT,
-    EventType.DEVFLOW_PR_REVIEW_REQUESTED: EscalationTier.URGENT,
-    EventType.DEVFLOW_BUILD_FAILED: EscalationTier.URGENT,
-    # Security critical: a detected secret is as wake-worthy as CREDENTIAL_LOSS.
-    # IMMEDIATE so it breaks quiet hours (2026-07-11 operator request).
-    EventType.SECRET_DETECTED: EscalationTier.IMMEDIATE,
-    # WATCHDOG_TICK + WATCHDOG_RECOVERED intentionally NOT in tier map ->
-    # bus-only, no WhatsApp escalation.
-    # JOB_HIGH_SCORE is conditional (>= 9.0) — handled in classify_tier
+# v3 (2026-07-18): the per-event tier dict (_TIER_BY_EVENT) is GONE —
+# escalation derives from events.routing_policy.classify() (P3: WhatsApp is
+# a contract, not a list). ACT always pages (IMMEDIATE at CRITICAL, else
+# URGENT); WARN pages at CRITICAL or via explicit per-type pins;
+# job_high_score >= 9.0 is phone-worthy IMPORTANT. Conditional logic that
+# lived here (gateway_health down-only, probe actionability, high-score
+# threshold) lives in routing_policy's hooks now.
+_TIER_BY_LABEL: Dict[str, EscalationTier] = {
+    WA_IMMEDIATE: EscalationTier.IMMEDIATE,
+    WA_URGENT: EscalationTier.URGENT,
+    WA_IMPORTANT: EscalationTier.IMPORTANT,
 }
 
-HIGH_SCORE_WA_THRESHOLD = 9.0
+
+def classify_tier(event: Event) -> Optional[EscalationTier]:
+    """Classify an event into its WhatsApp escalation tier.
+
+    Returns None if the event should not be escalated to WhatsApp at all.
+    v3: thin adapter over events.routing_policy — the policy's wa_tier
+    string maps onto this module's EscalationTier enum.
+    """
+    route = policy_classify(event)
+    if route.wa_tier is None:
+        return None
+    return _TIER_BY_LABEL.get(route.wa_tier)
+
 
 # Sustained-failure window for agent_error events. Isolated agent_errors stay
 # digest-only (avoids flooding WhatsApp); only a cluster (>= threshold in window)
@@ -128,57 +95,6 @@ _NEVER_CONSUME = frozenset({
     EventType.NOTIFICATION_DELIVERED,
     EventType.NOTIFICATION_FAILED,
 })
-
-
-def _probe_actionable(transition: dict) -> bool:
-    """A probe state-change worth a phone ping: a DEGRADATION (anything not
-    ending 'healthy') of a non-optional-tier probe. Missing/unknown tiers
-    fail open (treated as actionable) so producer drift degrades to noisy,
-    not silent."""
-    return (
-        transition.get("after") != "healthy"
-        and transition.get("tier") != "optional"
-    )
-
-
-def classify_tier(event: Event) -> Optional[EscalationTier]:
-    """Classify an event into its WhatsApp escalation tier.
-
-    Returns None if the event should not be escalated to WhatsApp at all
-    (e.g. GATEWAY_HEALTH when status=up, or JOB_HIGH_SCORE below threshold).
-    """
-    # Conditional: GATEWAY_HEALTH only escalates on "down"
-    if event.event_type == EventType.GATEWAY_HEALTH:
-        if event.payload.get("status") == "down":
-            return EscalationTier.URGENT
-        return None
-
-    # Conditional: JOB_HIGH_SCORE only escalates above WhatsApp threshold
-    if event.event_type == EventType.JOB_HIGH_SCORE:
-        score = event.payload.get("score", 0)
-        if score >= HIGH_SCORE_WA_THRESHOLD:
-            return EscalationTier.IMPORTANT
-        return None
-
-    # Conditional: watchdog probe signals are tier-aware (2026-07-11 operator
-    # feedback — WhatsApp was flooded with count-55 bursts of optional-tier
-    # container flaps and pure recoveries). Only a degradation of a probe the
-    # operator must act on (tier critical/important) earns a phone ping;
-    # optional-tier noise and recovery-only signals stay on Telegram/bus.
-    # A burst with a missing/empty transitions list falls through to the
-    # tier map (fail open — an URGENT ping on a malformed payload beats
-    # silently dropping a real outage).
-    if event.event_type == EventType.WATCHDOG_BURST:
-        transitions = [t for t in (event.payload.get("transitions") or [])
-                       if isinstance(t, dict)]
-        if transitions and not any(_probe_actionable(t) for t in transitions):
-            return None
-
-    if event.event_type == EventType.WATCHDOG_PROBE_TRANSITION:
-        if not _probe_actionable(event.payload):
-            return None
-
-    return _TIER_BY_EVENT.get(event.event_type)
 
 
 class WhatsAppEscalator(BaseSubscriber):
@@ -232,6 +148,16 @@ class WhatsAppEscalator(BaseSubscriber):
 
         # Sustained-failure tracking for agent_error clustering
         self._agent_error_times: Deque[float] = deque()
+
+        # P8 (v3): when a WhatsApp send fails, the same message lands in
+        # the Action Required Telegram topic with a 📵 marker so a
+        # phone-worthy item is never silently lost while the bridge is
+        # down (the 2026-07-16/18 credential_loss escalations died
+        # exactly this way). Once per unique message per 6h so the
+        # 900s retry loops don't spam the topic with fallbacks.
+        self._fallback_guard = RepeatGuard(window_seconds=6 * 3600.0)
+        # Repeating identical escalations collapse (30-min window).
+        self._wa_repeat_guard = RepeatGuard()
 
     # Sensible defaults used whenever the config file is missing or
     # malformed.  Matching the spec: 23:00-07:00 ET, interview/offer
@@ -362,6 +288,14 @@ class WhatsAppEscalator(BaseSubscriber):
             self._daily_reset_date = today
 
         message = self.format_message(event)
+
+        # v3 P4 on the phone lane: a repeating identical escalation
+        # (normalized — digits ignored) within 30 min is one page, not N.
+        # IMMEDIATE tier is exempt (interview/offer/secret/credential).
+        tier = classify_tier(event)
+        if (tier != EscalationTier.IMMEDIATE
+                and self._wa_repeat_guard.is_repeat("wa", message)):
+            return
 
         if not self.should_deliver_now(event):
             self._queue_message(message)
@@ -648,7 +582,43 @@ class WhatsAppEscalator(BaseSubscriber):
                 self._safe_emit_failed(
                     event, latency_ms, exc or RuntimeError("unknown"),
                 )
+        if not ok:
+            self._telegram_fallback(message)
         return ok
+
+    def _telegram_fallback(self, message: str) -> None:
+        """P8: the escalation lane monitors itself. On WhatsApp failure,
+        deliver the same text to the Action Required Telegram topic with a
+        📵 prefix. Swallows every exception — fallback must never break
+        the caller's requeue path. Production only: when a test injects
+        ``send_fn`` there is no real bridge and no real Telegram either.
+        """
+        if self._send_fn is not None:
+            return
+        try:
+            if self._fallback_guard.is_repeat("wa-fallback", message):
+                return
+            import json as _json
+            from events.paths import telegram_topics_path
+            from cron.scheduler import _deliver_result
+            data = _json.loads(
+                Path(telegram_topics_path()).read_text(encoding="utf-8"))
+            chat_id = data.get("group_chat_id", "")
+            _key, thread_id = resolve_topic_thread(
+                data.get("topics", {}), "action_required")
+            if not chat_id or not thread_id:
+                return
+            _deliver_result(
+                {"deliver": f"telegram:{chat_id}:{thread_id}",
+                 "id": "event-bus", "name": "event-bus"},
+                f"📵 WhatsApp unreachable — escalation delivered here instead:\n\n{message}",
+                skip_cron_framing=True,
+            )
+            logger.warning(
+                "WhatsAppEscalator: bridge send failed; message delivered "
+                "to Telegram action_required as fallback")
+        except Exception:
+            logger.exception("WhatsAppEscalator: telegram fallback failed")
 
     def _whatsapp_target(self) -> Dict[str, str]:
         """Render the target field for the reverse-signal payload.

@@ -1,8 +1,9 @@
 """ResourcePressureMonitor — emits RESOURCE_PRESSURE on system-resource exhaustion.
 
 Sibling of GatewayHealthMonitor: where that producer watches WhatsApp/Telegram
-connectivity, this one watches the *host's* commit charge, pagefile allocation,
-and C: free space, and fires a high-priority alert BEFORE the disk gets eaten.
+connectivity, this one watches the *host's* commit charge, physical RAM,
+pagefile allocation, and C: free space, and fires a high-priority alert BEFORE
+the disk gets eaten or paging takes services down.
 
 Why this exists
 ---------------
@@ -31,7 +32,14 @@ read the same numbers WMI would report, but in-process via
                      contribution to the commit limit; tracks
                      Win32_PageFileUsage.AllocatedBaseSize — on the incident
                      machine 85.6 - 31 ~= 54.6 GB, matching the recorded 54.4)
+  * phys total    == ``ullTotalPhys``   (physical RAM installed)
+  * phys avail    == ``ullAvailPhys``   (== psutil.virtual_memory().available)
   * C: free       == ``shutil.disk_usage(SystemDrive).free``
+
+The physical-RAM axis was added 2026-07-16: a paging storm (phys 96.4%,
+Docker/PG down, laptop-monitor healthy-count collapsing to 2-9/75 twice in one
+day) produced ZERO events here because commit charge sat at 50-73% throughout —
+the monitor was blind to the axis that actually killed services.
 
 ``psutil`` is a hard dependency too, but its ``virtual_memory()`` reports
 physical RAM (not commit) and its ``swap_memory()`` interpretation of the
@@ -71,22 +79,39 @@ DEFAULT_DISK_FREE_GB_THRESHOLD = 15.0    # C: free below this many GB
 DEFAULT_PAGEFILE_GROWTH_GB_THRESHOLD = 2.0   # pagefile grew more than this...
 DEFAULT_GROWTH_WINDOW_SECONDS = 600.0    # ...within this trailing window (10 min)
 DEFAULT_RE_ALERT_COOLDOWN_SECONDS = 900.0    # re-ping a sustained episode every 15 min
+# Physical-RAM axis — added 2026-07-16 after a paging storm (phys 96.4%,
+# services dying, laptop-monitor healthy-count collapsed twice) emitted zero
+# events because commit charge stayed at 50-73% the whole day.
+DEFAULT_PHYS_PCT_THRESHOLD = 92.0        # physical RAM used > this %
 
 
 @dataclass(frozen=True)
 class ResourceSample:
-    """A single point-in-time reading of host resource pressure (bytes)."""
+    """A single point-in-time reading of host resource pressure (bytes).
+
+    ``phys_*`` fields default to 0 so pre-2026-07-16 constructor shapes keep
+    working; phys_pct then reads 0.0 and the phys axis never triggers.
+    """
 
     commit_used_bytes: int
     commit_limit_bytes: int
     pagefile_allocated_bytes: int
     disk_free_bytes: int
+    phys_total_bytes: int = 0
+    phys_avail_bytes: int = 0
 
     @property
     def commit_pct(self) -> float:
         if self.commit_limit_bytes <= 0:
             return 0.0
         return 100.0 * self.commit_used_bytes / self.commit_limit_bytes
+
+    @property
+    def phys_pct(self) -> float:
+        if self.phys_total_bytes <= 0:
+            return 0.0
+        used = max(0, self.phys_total_bytes - self.phys_avail_bytes)
+        return 100.0 * used / self.phys_total_bytes
 
 
 def _system_drive_root() -> str:
@@ -144,6 +169,8 @@ def sample_resources() -> Optional[ResourceSample]:
             commit_limit_bytes=commit_limit,
             pagefile_allocated_bytes=pagefile_alloc,
             disk_free_bytes=int(disk_free),
+            phys_total_bytes=int(stat.ullTotalPhys),
+            phys_avail_bytes=int(stat.ullAvailPhys),
         )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("sample_resources failed: %s", e)
@@ -169,6 +196,7 @@ class ResourcePressureMonitor:
         pagefile_growth_gb_threshold: float = DEFAULT_PAGEFILE_GROWTH_GB_THRESHOLD,
         growth_window_seconds: float = DEFAULT_GROWTH_WINDOW_SECONDS,
         re_alert_cooldown_seconds: float = DEFAULT_RE_ALERT_COOLDOWN_SECONDS,
+        phys_pct_threshold: float = DEFAULT_PHYS_PCT_THRESHOLD,
     ):
         self.bus = bus
         self._sampler = sampler or sample_resources
@@ -178,6 +206,7 @@ class ResourcePressureMonitor:
         self.pagefile_growth_gb_threshold = pagefile_growth_gb_threshold
         self.growth_window_seconds = growth_window_seconds
         self.re_alert_cooldown_seconds = re_alert_cooldown_seconds
+        self.phys_pct_threshold = phys_pct_threshold
 
         # Rolling (monotonic_ts, pagefile_bytes) window for growth detection.
         self._pagefile_window: List[Tuple[float, int]] = []
@@ -220,6 +249,8 @@ class ResourcePressureMonitor:
         reasons: List[str] = []
         if sample.commit_pct > self.commit_pct_threshold:
             reasons.append("commit_high")
+        if sample.phys_pct > self.phys_pct_threshold:
+            reasons.append("phys_high")
         if sample.disk_free_bytes < self.disk_free_gb_threshold * _GB:
             reasons.append("disk_low")
         if growth_bytes > self.pagefile_growth_gb_threshold * _GB:
@@ -253,11 +284,14 @@ class ResourcePressureMonitor:
             "commit_used_gb": round(sample.commit_used_bytes / _GB, 2),
             "commit_limit_gb": round(sample.commit_limit_bytes / _GB, 2),
             "commit_pct": round(sample.commit_pct, 1),
+            "phys_used_pct": round(sample.phys_pct, 1),
+            "phys_available_gb": round(sample.phys_avail_bytes / _GB, 2),
             "pagefile_allocated_gb": round(sample.pagefile_allocated_bytes / _GB, 2),
             "pagefile_growth_gb_10min": round(growth_bytes / _GB, 2),
             "disk_c_free_gb": round(sample.disk_free_bytes / _GB, 2),
             "thresholds": {
                 "commit_pct": self.commit_pct_threshold,
+                "phys_pct": self.phys_pct_threshold,
                 "disk_free_gb": self.disk_free_gb_threshold,
                 "pagefile_growth_gb": self.pagefile_growth_gb_threshold,
                 "growth_window_min": round(self.growth_window_seconds / 60.0, 1),
@@ -265,9 +299,11 @@ class ResourcePressureMonitor:
         }
         logger.warning(
             "Resource pressure: %s — commit %.1f%% (%.1f/%.1f GB) · "
+            "phys %.1f%% (%.1f GB avail) · "
             "pagefile %.1f GB (+%.1f GB/%.0fm) · C: %.1f GB free",
             ",".join(reasons),
             payload["commit_pct"], payload["commit_used_gb"], payload["commit_limit_gb"],
+            payload["phys_used_pct"], payload["phys_available_gb"],
             payload["pagefile_allocated_gb"], payload["pagefile_growth_gb_10min"],
             payload["thresholds"]["growth_window_min"], payload["disk_c_free_gb"],
         )

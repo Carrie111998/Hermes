@@ -116,6 +116,29 @@ def _kill_port_process(port: int) -> None:
         pass
 
 
+async def _wait_for_port_release(port: int, timeout_s: float = 15.0) -> bool:
+    """Wait until ``port`` can actually be bound on 127.0.0.1.
+
+    taskkill/SIGTERM on the old bridge returns before the OS finishes socket
+    teardown; spawning the new node after a fixed 1s sleep raced that window
+    and the fresh bridge crashed with EADDRINUSE.  Probe with a real bind —
+    the exact operation the bridge is about to perform.
+    """
+    import socket
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.5)
+
+
 def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     """True only if ``pid`` is alive AND still our node bridge for this session.
 
@@ -950,7 +973,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Kill any orphaned bridge from a previous gateway run
             _kill_stale_bridge_by_pidfile(self._session_path)
             _kill_port_process(self._bridge_port)
-            await asyncio.sleep(1)
+            if not await _wait_for_port_release(self._bridge_port):
+                print(
+                    f"[{self.name}] Port {self._bridge_port} still bound after kill; "
+                    "spawning anyway (bridge retries EADDRINUSE on its own)"
+                )
             
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection

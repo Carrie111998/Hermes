@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from curator.memory_renderer import render
+from curator.memory_renderer import render, _stable_prefix
 
 NOW = datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -244,3 +244,84 @@ def test_render_meets_size_floor():
         generated_at=NOW,
     )
     assert len(out.encode("utf-8")) > 5120, f"size was {len(out.encode('utf-8'))} bytes"
+
+
+# ---------------------------------------------------------------------------
+# Bounded carry-forward (bound MEMORY.md growth) — 2026-07-14
+# ---------------------------------------------------------------------------
+
+
+def test_stable_prefix_keeps_human_head_before_curator_banner():
+    content = (
+        "# Jaum Memory\n\n## Orchestration Rules\n- keep this\n\n"
+        "---\n\n# Curator-Bootstrapped Sections (2026-07-10)\n\n"
+        "# MEMORY — main\n\n## Operating Stats\n- drop this\n"
+    )
+    prefix = _stable_prefix(content)
+    assert "# Jaum Memory" in prefix
+    assert "- keep this" in prefix
+    assert "Curator-Bootstrapped Sections" not in prefix
+    assert "## Operating Stats" not in prefix
+    # No trailing '---' separator carried over (idempotence).
+    assert not prefix.rstrip().endswith("-")
+
+
+def test_stable_prefix_empty_for_pure_curator_file():
+    # Non-main file: stacked empty '## Prior Notes' + a curator banner, no human content.
+    content = (
+        "## Prior Notes (pre-2026-07-14)\n\n## Prior Notes (pre-2026-07-13)\n\n"
+        "# MEMORY — scout\n\n## Operating Stats\n- regenerated nightly\n"
+    )
+    assert _stable_prefix(content) == ""
+
+
+def test_render_append_drops_stale_curator_blocks():
+    # Existing content already holds a prior curator block; append must NOT carry it forward.
+    existing = (
+        "# Jaum Memory\n\n- human note\n\n---\n\n"
+        "# Curator-Bootstrapped Sections (2026-07-01)\n\n# MEMORY — main\n\n"
+        "## Operating Stats\n- STALE BLOCK MARKER\n"
+    )
+    out = render(
+        agent="main", audit_stats=_basic_audit(), drawer_data=_basic_drawers(),
+        constitutional_principles=_basic_principles(), skills_observed=_basic_skills(),
+        existing_content=existing, mode="append", generated_at=NOW,
+    )
+    assert "# Jaum Memory" in out
+    assert "- human note" in out
+    assert "STALE BLOCK MARKER" not in out          # old block dropped
+    assert out.count("## Operating Stats") == 1      # exactly one fresh block
+
+
+def test_render_append_is_idempotent():
+    existing = "# Jaum Memory\n\n- human note\n"
+    first = render(
+        agent="main", audit_stats=_basic_audit(), drawer_data=_basic_drawers(),
+        constitutional_principles=_basic_principles(), skills_observed=_basic_skills(),
+        existing_content=existing, mode="append", generated_at=NOW,
+    )
+    second = render(
+        agent="main", audit_stats=_basic_audit(), drawer_data=_basic_drawers(),
+        constitutional_principles=_basic_principles(), skills_observed=_basic_skills(),
+        existing_content=first, mode="append", generated_at=NOW,
+    )
+    # Re-rendering the previous output must be byte-identical: no stacked block,
+    # no accumulating separators, human head intact.
+    assert second == first
+    assert first.count("## Operating Stats") == 1
+    assert "# Jaum Memory" in second and "- human note" in second
+
+
+def test_render_preserve_with_prior_collapses_to_replace():
+    existing = (
+        "## Prior Notes (pre-2026-07-14)\n\n# MEMORY — scout\n\n"
+        "## Operating Stats\n- STALE\n"
+    )
+    out = render(
+        agent="scout", audit_stats=_basic_audit(), drawer_data=_basic_drawers(),
+        constitutional_principles=_basic_principles(), skills_observed=_basic_skills(),
+        existing_content=existing, mode="preserve_with_prior", generated_at=NOW,
+    )
+    assert "STALE" not in out                         # no prior carried forward
+    assert "## Prior Notes" not in out                # no wrapper (nothing human to wrap)
+    assert out.count("## Operating Stats") == 1

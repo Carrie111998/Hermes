@@ -3,6 +3,12 @@
 For each intent file in the inbox:
   1. Parse (corrupt JSON -> dead-letter immediately)
   2. Idempotency check (already applied -> skip + move to processed)
+  2b. Pre-flight state check (Fix A): if a native-Postgres reader is wired and
+      the job is ALREADY at or past the requested stage, the intent is a
+      redundant no-op — skip steps 3/3b/4 entirely (no legacy-projection write,
+      no mirror, no congesting :4100 POST) and move to processed ("satisfied").
+      Fails OPEN: any reader error / unknown stage falls through to the normal
+      dual-write path, so the optimization can never block a real transition.
   3. Pipeline.json write via PipelineManager (canonical-first)
   3b. Mirror the intent as a PIPELINE_UPDATE message into the tracker mailbox
       inbox, so the tracker agent applies it to ITS canonical projection
@@ -29,6 +35,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +61,43 @@ logger = logging.getLogger(__name__)
 
 # Intents whose protected stages must be mirrored to Postgres via tracker_only-allowed source.
 PROTECTED_STAGES = {"approved", "final_submission", "applied"}
+
+
+# Fix A — "already at or past" business-state sets per requested legacy stage.
+# Mirrors jobflow-api's OWN progression semantics (repository.ts ~2054-2064,
+# the pipeline stage-count query): a job whose current_business_state is in the
+# set for a requested legacy stage has already reached (or moved beyond) it, so
+# re-applying that stage is a redundant no-op. Forward stages include every
+# downstream state; terminal states (archived/withdrawn/rejected) match only
+# themselves (nothing is "past" a terminal). Stages NOT listed here (e.g.
+# 'scored', 'applied', 'final_submission') are deliberately omitted — the
+# pre-flight will NOT short-circuit them and they flow through the normal gated
+# dual-write path. Keep in sync with jobflow-api if the state machine changes.
+_STAGE_SATISFIED_BY: dict[str, frozenset[str]] = {
+    "approved": frozenset({
+        "approved_for_tailor", "materials_ready", "approved_for_submission",
+        "submitted", "responded", "interviewing", "offer",
+    }),
+    "materials_ready": frozenset({
+        "materials_ready", "approved_for_submission",
+        "submitted", "responded", "interviewing", "offer",
+    }),
+    "submission_ready": frozenset({
+        "approved_for_submission", "submitted", "responded", "interviewing", "offer",
+    }),
+    "submitted": frozenset({"submitted", "responded", "interviewing", "offer"}),
+    "interviewing": frozenset({"interviewing", "offer"}),
+    "offer": frozenset({"offer"}),
+    "archived": frozenset({"archived"}),
+    "withdrawn": frozenset({"withdrawn"}),
+    "rejected": frozenset({"rejected"}),
+}
+
+
+# Re-drive attempt marker: original intent stems never end in ``.rd<digits>``
+# (they end in the poster tag, e.g. ``_main`` or a job8 hex), so a trailing
+# ``.rdN`` on the stem is unambiguously the applier's own re-drive counter.
+_REDRIVE_MARKER_RE = re.compile(r"\.rd(\d+)$")
 
 
 class IntentApplier:
@@ -79,6 +125,12 @@ class IntentApplier:
         idempotency: IdempotencyTracker,
         circuit_breaker: Optional[SimpleCircuitBreaker] = None,
         resume_full: Optional[Callable[[str, dict], object]] = None,
+        job_state_reader: Optional[Callable[[str], Optional[str]]] = None,
+        canonical_state_reader: Optional[Callable[[], dict[str, str]]] = None,
+        redrive_base_backoff: float = 120.0,
+        redrive_multiplier: float = 2.0,
+        redrive_max_backoff: float = 1800.0,
+        redrive_give_up_attempts: int = 0,
     ):
         self.inbox_dir = Path(inbox_dir)
         self.processed_dir = Path(processed_dir)
@@ -91,6 +143,25 @@ class IntentApplier:
             failure_threshold=5, reset_timeout_seconds=300.0,
         )
         self.resume_full = resume_full
+        # Fix A: optional native-Postgres reader mapping job_id -> current
+        # business_state (or None if unknown / read failed). None => pre-flight
+        # disabled (every intent takes the normal dual-write path).
+        self.job_state_reader = job_state_reader
+        # Reaper gate B: zero-arg callable -> {job_id: currentBusinessState} from
+        # the tracker canonical pipeline.json. None => gate B unsatisfiable =>
+        # reaper never reaps (fail-closed).
+        self.canonical_state_reader = canonical_state_reader
+        self.redrive_base_backoff = redrive_base_backoff
+        self.redrive_multiplier = redrive_multiplier
+        self.redrive_max_backoff = redrive_max_backoff
+        # Fix B: attempts after which a partial is truly "capped" (given up,
+        # left for the PartialBacklogMonitor alert). 0 => NEVER give up — past
+        # the give-up attempt count the backoff is already pinned at redrive_max_backoff
+        # (a slow lane), so transient partials keep self-healing at that cadence.
+        # Everything in partial/ is transient by construction (permanent/gate
+        # failures dead-letter), so a terminal cap surrenders on failures that
+        # are only ever "try later".
+        self.redrive_give_up_attempts = redrive_give_up_attempts
         for d in (self.inbox_dir, self.processed_dir, self.partial_dir, self.dead_letter_dir):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -109,7 +180,7 @@ class IntentApplier:
 
     def apply_one(self, intent_path: Path) -> str:
         """Apply a single intent. Returns one of:
-        'applied' | 'skipped_idempotent' | 'partial' | 'dead_lettered'.
+        'applied' | 'skipped_idempotent' | 'satisfied' | 'partial' | 'dead_lettered'.
         """
         # Step 1: parse
         try:
@@ -132,6 +203,21 @@ class IntentApplier:
             )
             self._move_to(intent_path, self.processed_dir)
             return "skipped_idempotent"
+
+        # Step 2b: pre-flight (Fix A) — suppress redundant no-op intents.
+        # If native Postgres already shows the job at or past the requested
+        # stage, the intent's goal is already met. Skip the whole dual-write
+        # (no legacy-projection regression, no redundant mirror, no congesting
+        # :4100 POST) and burn the key so the redundant intent can't recur.
+        if self._already_satisfied(msg):
+            logger.info(
+                "intent-applier: pre-flight satisfied job=%s stage=%s "
+                "(Postgres already at/past target); skipping dual-write",
+                msg.job_id, msg.requested_stage,
+            )
+            self.idempotency.mark_applied(msg.idempotency_key, message_id=msg.message_id)
+            self._move_to(intent_path, self.processed_dir)
+            return "satisfied"
 
         # Step 3: pipeline.json (canonical-first)
         original_source = msg.source
@@ -188,7 +274,7 @@ class IntentApplier:
             # (job, stage) transition to be silently skipped_idempotent
             # (observed 2026-07-13, job 4de4f9fb :withdrawn). The key is
             # committed only on a confirmed 2xx at step 6.
-            self._move_to(intent_path, self.partial_dir)
+            self._move_to_partial(intent_path)
             return "partial"
         except JobOpsClientTransientError as exc:
             logger.warning("intent-applier: JobOps transient error for %s: %s", msg.job_id, exc)
@@ -202,7 +288,7 @@ class IntentApplier:
             # downstream by idempotency_key, and gating only the mirror would
             # desync the legacy vs tracker-canonical projections. See the
             # _emit_canonical_pipeline_update docstring.
-            self._move_to(intent_path, self.partial_dir)
+            self._move_to_partial(intent_path)
             return "partial"
         except JobOpsClientPermanentError as exc:
             logger.error("intent-applier: JobOps permanent error for %s: %s", msg.job_id, exc)
@@ -239,6 +325,33 @@ class IntentApplier:
             msg.job_id, msg.requested_stage, msg.actor_id, original_source,
         )
         return "applied"
+
+    def _already_satisfied(self, msg: IntentMessage) -> bool:
+        """True iff Postgres already shows the job at or past the requested stage.
+
+        Fix A pre-flight. Fails OPEN in every ambiguous case so it can only ever
+        SKIP redundant work, never block a real transition:
+          * no reader wired               -> False (normal dual-write)
+          * reader raises / returns None   -> False (Postgres unknown -> apply)
+          * requested stage not in the known progression map -> False
+        Only when the reader returns a concrete business_state that lives in the
+        requested stage's "at or past" set do we short-circuit.
+        """
+        reader = self.job_state_reader
+        if reader is None:
+            return False
+        satisfied_by = _STAGE_SATISFIED_BY.get(msg.requested_stage)
+        if satisfied_by is None:
+            return False
+        try:
+            current = reader(msg.job_id)
+        except Exception:
+            logger.debug(
+                "intent-applier: pre-flight state read failed for job=%s; "
+                "falling through to dual-write", msg.job_id, exc_info=True,
+            )
+            return False
+        return bool(current) and current in satisfied_by
 
     def _emit_canonical_pipeline_update(
         self,
@@ -318,3 +431,178 @@ class IntentApplier:
         dest = dest_dir / src.name
         src.replace(dest)
         return dest
+
+    def _move_to_partial(self, src: Path) -> Path:
+        """Move an intent into partial/ and stamp its mtime to NOW.
+
+        rename/replace PRESERVE mtime, so without this the file's mtime would be
+        the intent's *creation* time and the per-attempt exponential backoff in
+        redrive_partials() would never space retries. Stamping on landing makes
+        partial mtime mean "when it last entered partial/".
+        """
+        dest = self._move_to(src, self.partial_dir)
+        os.utime(dest, None)
+        return dest
+
+    def _parse_redrive_attempt(self, path: Path) -> int:
+        """Parse the re-drive attempt count N from a ``.rdN`` filename marker.
+
+        ``Path.stem`` has already stripped ``.json``. No marker => attempt 0.
+        """
+        m = _REDRIVE_MARKER_RE.search(path.stem)
+        return int(m.group(1)) if m else 0
+
+    def _bump_redrive_marker(self, name: str, new_n: int) -> str:
+        """Return ``name`` (a ``*.json`` filename) with any ``.rdN`` marker
+        replaced by ``.rd{new_n}``."""
+        stem = name[:-5] if name.endswith(".json") else name
+        stem = _REDRIVE_MARKER_RE.sub("", stem)
+        return f"{stem}.rd{new_n}.json"
+
+    def redrive_partials(self) -> dict[str, str]:
+        """Move backoff-eligible partials back to inbox/ for reprocessing.
+
+        Pure filesystem logic; ALWAYS acts (the feature flag lives at the
+        subscriber layer). MUST be called on the single-writer applier thread —
+        it shares _move_to/glob semantics with scan_inbox and is not race-free
+        against a concurrent scan.
+
+        For each ``*_INTENT_*.json`` in partial/:
+          * attempt N = ``.rdN`` marker (absent => 0);
+          * if redrive_give_up_attempts > 0 and N >= it => leave in place
+            ("capped") for the PartialBacklogMonitor alert. Default 0 => NEVER
+            give up: every partial is transient by construction (permanent/gate
+            failures dead-letter, never land here), so surrendering would strand
+            a "try later" failure forever. Past the give-up attempt count the backoff
+            below is already pinned at redrive_max_backoff, i.e. a slow lane that
+            keeps self-healing (esp. paired with the Fix A pre-flight, which
+            clears the common already-satisfied re-drive without a :4100 write);
+          * else eligible iff ``now - mtime >= min(base * mult**N, max_backoff)``,
+            where mtime is the "entered-partial" clock set by _move_to_partial;
+          * eligible => rename to ``.rd{N+1}`` and move to inbox/; the next 1s
+            scan_inbox re-runs steps 3/3b/4 (key unburned => it re-applies).
+
+        Returns {original_filename: "redriven" | "waiting" | "capped"}.
+        """
+        results: dict[str, str] = {}
+        now = time.time()
+        for path in sorted(self.partial_dir.glob("*_INTENT_*.json")):
+            n = self._parse_redrive_attempt(path)
+            if self.redrive_give_up_attempts and n >= self.redrive_give_up_attempts:
+                results[path.name] = "capped"
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                # File vanished mid-sweep (raced by another mover) — skip.
+                continue
+            backoff = min(
+                self.redrive_base_backoff * (self.redrive_multiplier ** n),
+                self.redrive_max_backoff,
+            )
+            if age < backoff:
+                results[path.name] = "waiting"
+                continue
+            new_name = self._bump_redrive_marker(path.name, n + 1)
+            self.inbox_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                path.replace(self.inbox_dir / new_name)
+            except OSError:
+                logger.exception(
+                    "intent-applier: failed to re-drive partial %s", path.name
+                )
+                continue
+            results[path.name] = "redriven"
+            logger.info(
+                "intent-applier: re-driving partial %s -> inbox/%s (attempt %d)",
+                path.name, new_name, n + 1,
+            )
+        return results
+
+    def _is_capped(self, path: Path) -> bool:
+        """True iff this partial has reached the re-drive give-up cap.
+
+        Mirrors redrive_partials()'s capping predicate: capping is opt-in via
+        redrive_give_up_attempts (0 => never capped, so the reaper is a no-op).
+        """
+        if not self.redrive_give_up_attempts:
+            return False
+        return self._parse_redrive_attempt(path) >= self.redrive_give_up_attempts
+
+    def reap_converged_partials(self) -> dict[str, str]:
+        """Auto-clear CAPPED partials already converged at/past their target stage.
+
+        A capped partial is one redrive_partials() has given up on
+        (redrive_give_up_attempts > 0 and attempt N >= it): it is never re-driven
+        again, so the Fix A pre-flight never re-runs on it. If Postgres later
+        catches up (the 2026-07-18 backlog), it alerts forever. This sweep closes
+        that gap with a two-gate, FAIL-CLOSED convergence check:
+
+          * Gate A (native Postgres): _already_satisfied(msg) -- current_business_state
+            in _STAGE_SATISFIED_BY[requested_stage].
+          * Gate B (tracker canonical pipeline.json): currentBusinessState for the
+            job is ALSO in that same set.
+
+        Both must pass. Anything ambiguous (reader off/None, stage unmapped, job
+        absent from canonical, canonical reader unwired, parse error) => NOT
+        reaped: the file stays capped and keeps alerting. A reap mirrors the
+        'satisfied' path -- mark_applied (burn key immediately) + move to
+        processed/ -- and NEVER moves to inbox/ (re-driving a past-stage intent
+        regresses state).
+
+        Cost: gate B parses the (large) canonical pipeline.json AT MOST ONCE per
+        sweep, and only when >= 1 capped partial has already passed gate A. MUST
+        run on the single-writer applier thread (shares _move_to/glob/idempotency
+        with scan_inbox).
+
+        Returns {filename: "reaped" | "not_converged" | "skipped"}.
+        """
+        results: dict[str, str] = {}
+        # First pass: gate A over capped partials only. Never touch the big
+        # canonical file yet.
+        a_pass: list[tuple[Path, IntentMessage]] = []
+        for path in sorted(self.partial_dir.glob("*_INTENT_*.json")):
+            if not self._is_capped(path):
+                continue  # non-capped -> handled by redrive + pre-flight
+            try:
+                msg = parse_intent_file(path)
+            except IntentParseError:
+                results[path.name] = "skipped"
+                continue
+            if self._already_satisfied(msg):
+                a_pass.append((path, msg))
+            else:
+                results[path.name] = "not_converged"
+        if not a_pass:
+            return results
+
+        # Second gate: parse the canonical pipeline.json ONCE. Unwired reader or a
+        # failed/empty parse => fail closed (nothing reaps).
+        canonical: dict[str, str] = {}
+        if self.canonical_state_reader is not None:
+            try:
+                canonical = self.canonical_state_reader() or {}
+            except Exception:
+                logger.debug(
+                    "reaper: canonical pipeline read failed; fail-closed",
+                    exc_info=True,
+                )
+                canonical = {}
+
+        for path, msg in a_pass:
+            satisfied_by = _STAGE_SATISFIED_BY.get(msg.requested_stage)
+            canonical_state = canonical.get(msg.job_id)
+            if satisfied_by and canonical_state and canonical_state in satisfied_by:
+                self.idempotency.mark_applied(
+                    msg.idempotency_key, message_id=msg.message_id
+                )
+                self._move_to(path, self.processed_dir)
+                results[path.name] = "reaped"
+                logger.info(
+                    "intent-applier: reaped converged capped partial %s "
+                    "(job=%s stage=%s canonical=%s; PG+canonical agree) — auto-cleared",
+                    path.name, msg.job_id, msg.requested_stage, canonical_state,
+                )
+            else:
+                results[path.name] = "not_converged"
+        return results

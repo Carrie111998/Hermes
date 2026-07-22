@@ -258,6 +258,88 @@ class TestWatermarkRecencyTrim:
         assert fresh.scan() == 0
 
 
+class TestDictPayloadDoesNotCrashScan:
+    r"""2026-07-18 crash: a mailbox message whose ``payload.summary`` /
+    ``payload.body`` / ``payload.question`` is a **dict** made ``_summarize``
+    do ``dict[:200]`` → ``TypeError: unhashable type: 'slice'``. That error was
+    not caught by ``_scan_dir`` (only json/OS errors were), so it propagated
+    through ``scan()`` into ``_subscriber_poll_loop`` and aborted the ENTIRE
+    mailbox scan for that pass — messages after the offending file were never
+    translated to events. Two layers of defense: (1) coerce to str before the
+    slice, (2) isolate a per-file processing failure so one bad message never
+    aborts the whole scan."""
+
+    def test_summarize_coerces_dict_notification_summary(self, bus, mailbox_root):
+        w = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        out = w._summarize({"type": "NOTIFICATION",
+                            "payload": {"summary": {"nested": "object"}}})
+        assert isinstance(out, str)
+        assert len(out) <= 200
+
+    def test_summarize_coerces_dict_error_message(self, bus, mailbox_root):
+        w = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        out = w._summarize({"type": "ERROR",
+                            "payload": {"message": {"code": 500, "detail": "boom"}}})
+        assert isinstance(out, str)
+        assert len(out) <= 200
+
+    def test_summarize_coerces_dict_blocked_question(self, bus, mailbox_root):
+        # BLOCKED_QUESTION is in MIRRORED_MESSAGE_TYPES, so a dict `question`
+        # reaches the slice in _summarize and previously crashed.
+        w = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        out = w._summarize({"type": "BLOCKED_QUESTION",
+                            "payload": {"question": {"ask": "which offer?"}}})
+        assert isinstance(out, str)
+        assert len(out) <= 200
+
+    def test_scan_survives_dict_notification_and_continues(self, bus, mailbox_root):
+        """A NOTIFICATION with a dict summary sitting in the inbox must not
+        abort the scan: it is emitted (with a coerced string summary) AND a
+        later valid message in the same inbox is still emitted."""
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        inbox = mailbox_root / "main" / "inbox"
+        # Filenames chosen so the dict-payload file sorts first in iteration.
+        _write_message(inbox, "NOTIFICATION", "aaa_notifier",
+                       {"summary": {"nested": "object"}})
+        _write_message(inbox, "SCORE_RESULT", "zzz_matcher",
+                       {"score": 7.0, "company": "Acme", "title": "VP"})
+
+        count = watcher.scan()  # must not raise
+
+        assert count == 2
+        summaries = {e.payload["message_type"]: e.payload["summary"]
+                     for e in bus.query(event_type=EventType.MAILBOX_MESSAGE)}
+        assert isinstance(summaries["NOTIFICATION"], str)
+        assert summaries["SCORE_RESULT"] == "score 7.0 for Acme (VP)"
+
+    def test_scan_isolates_a_file_whose_summarize_raises(self, bus, mailbox_root, monkeypatch):
+        """Defense in depth: even an UNANTICIPATED failure inside per-file
+        processing must skip only that one file, not abort the whole scan.
+        Fault-inject by forcing _summarize to raise for one message type."""
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        original = watcher._summarize
+
+        def boom(msg):
+            if msg.get("type") == "SCORE_RESULT":
+                raise TypeError("unhashable type: 'slice'")
+            return original(msg)
+
+        monkeypatch.setattr(watcher, "_summarize", boom)
+
+        inbox = mailbox_root / "main" / "inbox"
+        _write_message(inbox, "SCORE_RESULT", "matcher",
+                       {"score": 9.0, "company": "Bad", "title": "X"})
+        _write_message(inbox, "SCOUT_DISCOVERY", "scout",
+                       {"jobs": [{"title": "VP Finance"}]})
+
+        count = watcher.scan()  # must not raise despite the crashing file
+
+        # The crashing file is skipped; the valid one still emits.
+        assert count == 1
+        events = bus.query(event_type=EventType.MAILBOX_MESSAGE)
+        assert [e.payload["message_type"] for e in events] == ["SCOUT_DISCOVERY"]
+
+
 class TestKbRpcNotMirrored:
     """KB_QUERY / KB_RESPONSE are tailor<->cv-handler machine RPC — removed
     from MIRRORED_MESSAGE_TYPES 2026-07-11 (comms audit)."""

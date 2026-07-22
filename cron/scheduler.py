@@ -321,19 +321,41 @@ CRON_EVENT_SUMMARY_MAX_CHARS = 4000
 _event_emitter = None
 
 def _get_event_emitter():
-    """Lazy-load the CronEventEmitter using the gateway's shared EventBus."""
+    """Lazy-load the CronEventEmitter.
+
+    Prefers the gateway's shared EventBus.  When this process is NOT the
+    gateway — ``get_bus()`` is None because ``gateway_integration.startup()``
+    never ran here (e.g. ``hermes serve``/the TUI web server, the dashboard,
+    or a CLI cron run) — fall back to a process-local EventBus on the
+    canonical events DB.  SQLite WAL + busy_timeout makes cross-process
+    writes safe, and FailureClusterDetector's state file was already
+    designed for the cross-process case.
+
+    Before 2026-07-16 the no-gateway-bus case cached the ``False`` sentinel
+    forever, so any non-gateway process that won the jobs.json claim races
+    ran jobs normally while silently dropping every cron_started/
+    cron_completed/cron_failed emit — the multi-hour "emission dark
+    windows" that made watchdog_sweep raise false silence alarms.
+    """
     global _event_emitter
     if _event_emitter is None:
         try:
             from events.gateway_integration import get_bus
+            from events.bus import EventBus
             from events.producers.cron_emitter import CronEventEmitter
             bus = get_bus()
-            if bus:
-                _event_emitter = CronEventEmitter(bus)
-            else:
-                _event_emitter = False  # sentinel: gateway not started yet
+            if bus is None:
+                bus = EventBus()
+                logger.info(
+                    "Cron event emitter: gateway bus not initialized in this "
+                    "process; using direct EventBus at %s", bus.db_path,
+                )
+            _event_emitter = CronEventEmitter(bus)
         except Exception as e:
-            logger.debug("Event bus not available: %s", e)
+            logger.warning(
+                "Cron event emitter unavailable — cron lifecycle events "
+                "will NOT be recorded by this process: %s", e,
+            )
             _event_emitter = False  # sentinel: don't retry
     return _event_emitter if _event_emitter else None
 
@@ -702,6 +724,56 @@ def _release_in_flight_started_before(job_id: str, started_before: float) -> Non
             _in_flight.pop(job_id, None)
 
 
+def _emit_cron_skipped_duplicate(
+    emitter, job_id: str, job_name: str, prior: "_InFlightRecord"
+) -> None:
+    """Emit exactly one CRON_SKIPPED_DUPLICATE for a same-job fire blocked
+    because ``prior`` is still in flight.
+
+    Shared by BOTH duplicate-block sites so they surface identical
+    observability:
+
+      * Guard #3 inside ``_process_job`` — a duplicate that reached the worker
+        (e.g. the external-provider ``fire_due`` path, or an ``_in_flight``
+        record seeded out-of-band), and
+      * the submit-time running-set guard in ``_submit_with_guard`` — upstream's
+        0.16.0 non-blocking-dispatch dedup (``_running_job_ids``), which lands
+        FIRST in the tick path and otherwise swallows the duplicate silently.
+        That is the trigger_job()-vs-tick cross-tick race Guard #3 was built to
+        make visible; the running-set guard shadowed its emit seam when the
+        0.16.0 catch-up merge rerouted dispatch (no conflict, dead emit).
+
+    ``reason`` mirrors the dedup guard's wedge threshold:
+    ``concurrent_fire_blocked`` while the prior fire is within the timeout,
+    ``prior_fire_exceeded_timeout`` once it has outlived it. Never raises.
+    """
+    elapsed = max(0.0, time.monotonic() - prior.start_monotonic)
+    timeout_s = _dup_guard_timeout_seconds()
+    reason = (
+        "concurrent_fire_blocked"
+        if elapsed < timeout_s
+        else "prior_fire_exceeded_timeout"
+    )
+    logger.warning(
+        "Cron duplicate fire blocked: job_id=%s job_name=%s "
+        "elapsed=%.1fs reason=%s prior_event=%s",
+        job_id, job_name, elapsed, reason, prior.cron_started_event_id,
+    )
+    if emitter:
+        try:
+            emitter.on_job_skipped_duplicate(
+                job_id=job_id,
+                job_name=job_name,
+                prior_cron_started_event_id=prior.cron_started_event_id,
+                prior_elapsed_seconds=round(elapsed, 1),
+                reason=reason,
+            )
+        except Exception as ee:
+            logger.warning(
+                "Event emit failed for cron_skipped_duplicate: %s", ee
+            )
+
+
 # === Per-job soft deadline (2026-06-10 audit M1 T1.4) =======================
 #
 # LLM cron jobs had NO wall-clock bound: a hung run_job blocked its worker
@@ -809,7 +881,7 @@ def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
                 consecutive_errors=0,
             )
         except Exception as ee:
-            logger.debug("Event emit failed for deadline timeout: %s", ee)
+            logger.warning("Event emit failed for deadline timeout: %s", ee)
 
     if not abandon_on_timeout:
         t.join()
@@ -3065,7 +3137,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
-        from cron.jobs import OUTPUT_DIR
+        # Resolve the cron output dir dynamically (per-profile, #4707) so it
+        # tracks the active HERMES_HOME, matching where save_job_output() wrote.
+        # (cron.jobs.OUTPUT_DIR is now only a static back-compat snapshot;
+        # `_get_output_dir()` is the dynamic resolver.)
+        from cron.jobs import _get_output_dir
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
@@ -3080,7 +3156,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 )
                 continue
             try:
-                job_output_dir = OUTPUT_DIR / source_job_id
+                job_output_dir = _get_output_dir() / source_job_id
                 if not job_output_dir.exists():
                     continue  # silent skip — no output yet
                 output_files = sorted(
@@ -4538,32 +4614,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             # event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e.
             prior = _try_register_in_flight(_job_id, _cron_job_name)
             if prior is not None:
-                elapsed = max(0.0, time.monotonic() - prior.start_monotonic)
-                timeout_s = _dup_guard_timeout_seconds()
-                reason = (
-                    "concurrent_fire_blocked"
-                    if elapsed < timeout_s
-                    else "prior_fire_exceeded_timeout"
+                _emit_cron_skipped_duplicate(
+                    emitter, _job_id, _cron_job_name, prior
                 )
-                logger.warning(
-                    "Cron duplicate fire blocked: job_id=%s job_name=%s "
-                    "elapsed=%.1fs reason=%s prior_event=%s",
-                    _job_id, _cron_job_name, elapsed, reason,
-                    prior.cron_started_event_id,
-                )
-                if emitter:
-                    try:
-                        emitter.on_job_skipped_duplicate(
-                            job_id=_job_id,
-                            job_name=_cron_job_name,
-                            prior_cron_started_event_id=prior.cron_started_event_id,
-                            prior_elapsed_seconds=round(elapsed, 1),
-                            reason=reason,
-                        )
-                    except Exception as ee:
-                        logger.debug(
-                            "Event emit failed for cron_skipped_duplicate: %s", ee
-                        )
                 return False
 
             # We hold the in-flight slot for _job_id from here; release it
@@ -4624,7 +4677,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                                 min_seconds_between_fires=_min_interval,
                             )
                         except Exception as ee:
-                            logger.debug(
+                            logger.warning(
                                 "Event emit failed for "
                                 "cron_skipped_min_interval: %s", ee
                             )
@@ -4642,7 +4695,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     )
                     _attach_started_event_id(_job_id, _started_event_id)
                 except Exception as ee:
-                    logger.debug("Event emit failed: %s", ee)
+                    logger.warning("Event emit failed for cron_started: %s", ee)
 
             import time as _time
             # OTel: one span per cron fire. Covers run_job + delivery + event emission.
@@ -4739,7 +4792,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                             consecutive_errors=consecutive,
                         )
                     except Exception as ee:
-                        logger.debug("Event emit failed: %s", ee)
+                        logger.warning(
+                            "Event emit failed for cron_completed/cron_failed: %s", ee
+                        )
 
                 # Tailor structured iteration event (2026-04-29).
                 # Gated by job name inside the helper; runs ALONGSIDE the
@@ -4864,10 +4919,31 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 )
                 return None
             with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+                _running_dup = job_id in _running_job_ids
+                if not _running_dup:
+                    _running_job_ids.add(job_id)
+            if _running_dup:
+                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                # Restore Guard #3 observability at the point the duplicate is
+                # ACTUALLY blocked. Upstream's running-set guard (0.16.0
+                # non-blocking dispatch) lands before _process_job, so the
+                # trigger_job()-vs-tick cross-tick duplicate is rejected here and
+                # never reaches Guard #3 — surface the skip event here when a
+                # live in-flight record exists to correlate against (it does once
+                # the prior fire has crossed _process_job; the brief
+                # pre-registration window falls back to a silent skip, matching
+                # the prior behaviour). Done after releasing _running_lock so the
+                # event-bus call never blocks the hot dispatch lock.
+                with _in_flight_lock:
+                    _dup_prior = _in_flight.get(job_id)
+                if _dup_prior is not None:
+                    _emit_cron_skipped_duplicate(
+                        _get_event_emitter(),
+                        job_id,
+                        job.get("name", job_id),
+                        _dup_prior,
+                    )
+                return None
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=job, ctx=_ctx, abandon=abandon_on_timeout):

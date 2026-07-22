@@ -8,20 +8,27 @@ shared by the dashboard console websocket without becoming a raw shell.
 from __future__ import annotations
 
 import argparse
+import atexit
+import concurrent.futures
 import contextlib
+import contextvars
 import difflib
 import functools
 import importlib
 import io
 import json
+import logging
 import shlex
 import sys
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Literal, NoReturn, Sequence
 from urllib.parse import urlparse
 
 from tools.ansi_strip import strip_ansi as _strip_ansi
+
+logger = logging.getLogger(__name__)
 
 
 ConsoleStatus = Literal["ok", "error", "confirm_required", "exit", "clear"]
@@ -32,6 +39,26 @@ LOCAL_CONTEXTS: frozenset[ConsoleContext] = frozenset({"local"})
 
 class ConsoleCommandError(RuntimeError):
     """User-facing console command failure."""
+
+
+class _ConsoleParserExit(ConsoleCommandError):
+    """Raised when an argparse parser would have called ``sys.exit()``.
+
+    argparse terminates the process (via ``parser.exit()`` -> ``sys.exit()``)
+    for ``--help``/``--version`` and a few internal paths. In the dashboard the
+    console runs inside a worker thread whose ``SystemExit`` escapes the asyncio
+    Task and tears down the whole uvicorn process. ``_ArgumentParser.exit()``
+    raises this instead so the line can be surfaced at the prompt.
+
+    Subclasses :class:`ConsoleCommandError` so any code path that already only
+    catches ``ConsoleCommandError`` still contains it (never reaching
+    ``sys.exit``); ``execute()`` special-cases it to render ``--help`` output as
+    a normal result rather than an error.
+    """
+
+    def __init__(self, message: str, *, code: int = 0):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -56,6 +83,30 @@ class ConsoleCommand:
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:  # pragma: no cover - argparse hook
         raise ConsoleCommandError(f"{self.prog}: {message}")
+
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        # argparse calls exit() for --help/--version and some terminal paths.
+        # The default implementation calls sys.exit(), which would raise
+        # SystemExit out of the console worker thread and — because SystemExit
+        # is a BaseException, not an Exception — sail past the dashboard's
+        # `except Exception` guard, escape the asyncio Task, and tear down the
+        # uvicorn event loop (killing the whole dashboard). Convert it to a
+        # catchable console error carrying whatever help/usage/version text
+        # argparse buffered via _print_message below. Mirrors error(), which
+        # already keeps parse failures from reaching sys.exit().
+        buffered = getattr(self, "_console_output_buffer", "")
+        text = (buffered + (message or "")).strip()
+        raise _ConsoleParserExit(text, code=int(status or 0))
+
+    def _print_message(self, message: str, file: object | None = None) -> None:
+        # argparse routes help/usage/version text through _print_message on its
+        # way to stdout/stderr. The web console never surfaces the process's own
+        # stdout, so capture the text onto the parser instead; exit() (above)
+        # then returns it to the prompt.
+        if message:
+            self._console_output_buffer = (
+                getattr(self, "_console_output_buffer", "") + message
+            )
 
 
 def _capture_output(fn: Callable[[], object]) -> str:
@@ -626,8 +677,26 @@ class HermesConsoleEngine:
             output = self._cap_output(output)
             self.history.append(raw_line)
             return ConsoleResult("ok", output=output, command=raw_line)
+        except _ConsoleParserExit as exc:
+            # argparse --help/--version (exit code 0) is a successful, informational
+            # result — show it as normal output; a non-zero code is a failure.
+            status: ConsoleStatus = "ok" if exc.code == 0 else "error"
+            return ConsoleResult(
+                status, output=self._cap_output(str(exc).strip()), command=raw_line
+            )
         except ConsoleCommandError as exc:
             return ConsoleResult("error", output=str(exc).strip(), command=raw_line)
+        except SystemExit as exc:
+            # Defense-in-depth: a handler called sys.exit() directly, or built a
+            # parser that is not our _ArgumentParser. SystemExit is a
+            # BaseException, so without this it would escape execute(), slip past
+            # the dashboard worker's `except Exception`, and crash the uvicorn
+            # loop. Contain it here so execute() ALWAYS returns a ConsoleResult.
+            code = exc.code
+            if code in (0, None):
+                return ConsoleResult("ok", command=raw_line)
+            message = code if isinstance(code, str) else f"Command exited with status {code}."
+            return ConsoleResult("error", output=str(message).strip(), command=raw_line)
 
     def help_text(self, subject: str | None = None) -> str:
         if subject:
@@ -694,7 +763,7 @@ class HermesConsoleEngine:
         self.register(
             ("cron", "run"),
             "cron run <job>",
-            "Run a job on the next scheduler tick.",
+            "Run a job now (the hosted web-console schedules it for the next tick).",
             _cron_run,
             mutating=True,
             confirmation="Trigger this cron job?",
@@ -1812,18 +1881,179 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
     return _format_job(job, "Resumed")
 
 
+# Hosted `cron run` fires the job immediately on a dedicated BACKGROUND pool —
+# NOT the console's shared 4-worker/60s pool in web_server.py. Bounding the pool
+# caps concurrent manual agent runs (desirable); `submit` never blocks the
+# caller even when all workers are busy (excess work queues), so the console
+# thread always returns the ack instantly. See spec
+# 2026-07-14-hosted-console-cron-run-background-design.md.
+_CONSOLE_RUN_EXECUTOR_MAX_WORKERS = 2
+_console_run_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_console_run_executor_lock = threading.Lock()
+
+
+def _get_console_run_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily create the bounded background pool for hosted `cron run` (once)."""
+    global _console_run_executor
+    if _console_run_executor is None:
+        with _console_run_executor_lock:
+            if _console_run_executor is None:
+                _console_run_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_CONSOLE_RUN_EXECUTOR_MAX_WORKERS,
+                    thread_name_prefix="hermes-console-cronrun",
+                )
+                # Tear down at interpreter exit without waiting on an in-flight
+                # agent run (mirrors web_server's console pool).
+                atexit.register(
+                    lambda: _console_run_executor
+                    and _console_run_executor.shutdown(
+                        wait=False, cancel_futures=True
+                    )
+                )
+    return _console_run_executor
+
+
+def _log_console_background_run_result(
+    job: dict, future: concurrent.futures.Future
+) -> None:
+    """Log the outcome of a background hosted `cron run`.
+
+    The dashboard activity feed already surfaces the real trigger/completion via
+    the event stream; this makes the outcome visible in the gateway logs and
+    ensures a crash in the background fire is never silently swallowed.
+    """
+    job_id = job.get("id", "?")
+    name = job.get("name") or job_id
+    try:
+        result = future.result()
+    except Exception:  # pragma: no cover - _execute_job_now catches its own
+        logger.exception(
+            "console background cron run crashed: %s (%s)", name, job_id
+        )
+        return
+    if not result.get("claimed", False):
+        logger.info(
+            "console background cron run skipped: %s (%s) — already being "
+            "fired by the scheduler",
+            name,
+            job_id,
+        )
+    elif result.get("success"):
+        logger.info(
+            "console background cron run succeeded: %s (%s)", name, job_id
+        )
+    else:
+        logger.warning(
+            "console background cron run failed: %s (%s) — %s",
+            name,
+            job_id,
+            result.get("error"),
+        )
+
+
+def _dispatch_console_background_run(job: dict, *, caller: str) -> None:
+    """Fire `_execute_job_now` on the background pool, off the console thread.
+
+    Reuses the same at-most-once claim + single-CRON_TRIGGERED emit + shared
+    `run_one_job` body the local path uses, so attribution and the audit
+    contract are identical; only the executing thread differs.
+
+    The fire runs inside a COPY of the caller's context so it inherits the
+    hosted request's context-local HERMES_HOME override (set by web_server's
+    `_profile_scope` for a non-default profile). A ThreadPoolExecutor worker
+    otherwise starts with an empty context and would resolve the WRONG profile's
+    cron store / secret scope — the same per-profile fire correctness cron.jobs'
+    dynamic path resolution exists to preserve.
+    """
+    from tools.cronjob_tools import _execute_job_now
+
+    ctx = contextvars.copy_context()
+    future = _get_console_run_executor().submit(
+        ctx.run, functools.partial(_execute_job_now, job, caller=caller)
+    )
+    future.add_done_callback(
+        functools.partial(_log_console_background_run_result, job)
+    )
+
+
 def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron run <job>")
-    from cron.jobs import AmbiguousJobReference, trigger_job
+    from cron.jobs import AmbiguousJobReference
+
+    # Context-aware execution semantics (see spec 2026-07-14-hosted-console-
+    # cron-run-background-design.md; supersedes the earlier 2026-07-14 defer
+    # decision). "run" now means run-NOW on every surface:
+    #
+    #   local (standalone REPL)  → execute NOW, blocking, matching `hermes cron
+    #                              run` (CLI) and the cronjob(action='run') tool,
+    #                              both of which route through _execute_job_now.
+    #                              A manual run then actually fires even when no
+    #                              gateway ticker is active (the #41037 case).
+    #
+    #   hosted (dashboard web-console) → also fire NOW, but on a dedicated
+    #                              BACKGROUND pool. That surface runs each command
+    #                              in a bounded 4-worker pool under a 60s asyncio
+    #                              timeout (web_server.py), so a synchronous agent
+    #                              run would be mis-reported as timed-out and could
+    #                              starve the shared pool. Dispatching
+    #                              _execute_job_now off-thread returns an immediate
+    #                              "started" ack and surfaces the result via the
+    #                              CRON_TRIGGERED + completion events the dashboard
+    #                              already consumes.
+    #
+    # Both paths keep caller="tui:console_engine" attribution and emit exactly one
+    # CRON_TRIGGERED (via emit_cron_triggered_safe) so the audit contract holds.
+    if _engine.context != "local":
+        from cron.jobs import resolve_job_ref
+
+        # Resolve on the console thread so `not found`/ambiguous come back
+        # immediately; only the actual fire goes to the background pool.
+        try:
+            job = resolve_job_ref(args[0])
+        except AmbiguousJobReference as exc:
+            raise ConsoleCommandError(str(exc)) from exc
+        if not job:
+            raise ConsoleCommandError(f"Job not found: {args[0]}")
+
+        _dispatch_console_background_run(job, caller="tui:console_engine")
+        name = job.get("name") or job["id"]
+        return (
+            f"Started job: {name} ({job['id']}) - running now in the "
+            "background; watch the activity feed for the result."
+        )
+
+    from cron.jobs import get_job, resolve_job_ref
+    from tools.cronjob_tools import _execute_job_now
 
     try:
-        job = trigger_job(args[0])
+        job = resolve_job_ref(args[0])
     except AmbiguousJobReference as exc:
         raise ConsoleCommandError(str(exc)) from exc
     if not job:
         raise ConsoleCommandError(f"Job not found: {args[0]}")
-    return _format_job(job, "Triggered")
+
+    # Execute now: _execute_job_now claims at-most-once (blocking a concurrent
+    # tick), emits CRON_TRIGGERED with the console caller, then fires via the
+    # shared run_one_job body. A lost claim means the scheduler already owns this
+    # fire — report it rather than double-running.
+    exec_result = _execute_job_now(job, caller="tui:console_engine")
+
+    refreshed = get_job(job["id"]) or job
+    name = refreshed.get("name") or job.get("name") or job["id"]
+    job_id = job["id"]
+
+    if not exec_result.get("claimed", False):
+        return (
+            f"Run skipped: {name} ({job_id}) is already being fired "
+            "by the scheduler."
+        )
+    if exec_result.get("success"):
+        return f"Ran job: {name} ({job_id}) - succeeded."
+    error = exec_result.get("error")
+    if error:
+        return f"Ran job: {name} ({job_id}) - failed: {error}"
+    return f"Ran job: {name} ({job_id}) - failed."
 
 
 def run_console_repl(

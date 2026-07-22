@@ -15,8 +15,11 @@ closes a gap from the cron-emitter wiring (events/producers/cron_emitter.py)
 which only saw failures that surfaced as cron exit codes.
 """
 
+import json
 import logging
 import re
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
@@ -25,10 +28,26 @@ from events.paths import failure_cluster_state_path
 from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
 from events.subscribers.base import BaseSubscriber
+from pipeline_state.manager import PIPELINE_PATH
 
 logger = logging.getLogger(__name__)
 
 HIGH_SCORE_THRESHOLD = 8.75
+
+# The matcher reports every scored job through BOTH a per-job SCORE_RESULT
+# file and the run's SCORE_BATCH_SUMMARY results[] (and may add a
+# HIGH_SCORE_ALERT), so translating each message independently double-emits
+# JOB_SCORED / JOB_HIGH_SCORE for the same job — the batch rows carry no
+# `dimensions`, which is the dimensions:null twin seen on the live bus
+# 2026-07-10..07-18. Either lane can also arrive alone (07-15 runs were
+# SCORE_RESULT-only, 07-10 00:14 batch-only), so neither message type can
+# simply be dropped: dedupe at emission by job identity + score instead.
+# Window matches the notifier RepeatGuard (30 min): wide enough for the
+# observed 3-minute straggler (Transamerica 07-11), narrow enough that a
+# genuine rescore in a later matcher run (>= 2 h apart) still emits.
+SCORE_DEDUP_WINDOW_SECONDS = 1800.0
+_SCORE_DEDUP_MAX_ENTRIES = 512
+_SCORE_EVENT_TYPES = (EventType.JOB_SCORED, EventType.JOB_HIGH_SCORE)
 
 _INTERVIEW_PATTERNS = [
     re.compile(r"\binterview\s+(?:scheduled|invitation|request|invite)", re.I),
@@ -42,33 +61,52 @@ _OFFER_PATTERNS = [
 ]
 
 
-def _stage_transition_payload(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize PIPELINE_UPDATE payloads from tracker/tailor mailbox messages."""
+def _stage_transition_payload(
+    d: Dict[str, Any], from_agent: Optional[str] = None
+) -> Dict[str, Any]:
+    """Normalize PIPELINE_UPDATE payloads from tracker/tailor mailbox messages.
+
+    Emits the `prior_stage` key that both the pipeline_state.manager producer
+    and the TelegramNotifier formatter treat as canonical. `previous_stage` is
+    also emitted as a back-compat alias for any older consumer.  `actor` is
+    populated so the formatter's "(by <actor>)" clause is not "(by ?)":
+    an explicit `actor` in the message wins, otherwise it defaults to the
+    sending agent (mailbox `from`), canonicalised.
+    """
     metadata = d.get("metadata") or {}
     job_id = d.get("job_id")
     job_key = d.get("job_key") or job_id
-    previous_stage = d.get("previous_stage")
-    if previous_stage is None:
-        previous_stage = d.get("from_stage")
+    prior_stage = d.get("prior_stage")
+    if prior_stage is None:
+        prior_stage = d.get("previous_stage")
+    if prior_stage is None:
+        prior_stage = d.get("from_stage")
     new_stage = d.get("new_stage")
     if new_stage is None:
         new_stage = d.get("to_stage")
     company = d.get("company") or metadata.get("company")
     title = d.get("title") or metadata.get("title")
+    actor = d.get("actor")
+    if actor is None and from_agent:
+        actor = canonical_agent_source(from_agent)
 
     out: Dict[str, Any] = {}
     if job_key is not None:
         out["job_key"] = job_key
     if job_id is not None:
         out["job_id"] = job_id
-    if previous_stage is not None:
-        out["previous_stage"] = previous_stage
+    if prior_stage is not None:
+        out["prior_stage"] = prior_stage
+        # Back-compat alias — older consumers keyed on `previous_stage`.
+        out["previous_stage"] = prior_stage
     if new_stage is not None:
         out["new_stage"] = new_stage
     if company is not None:
         out["company"] = company
     if title is not None:
         out["title"] = title
+    if actor is not None:
+        out["actor"] = actor
     return out
 
 
@@ -86,6 +124,57 @@ class MailboxTranslator(BaseSubscriber):
         self._cluster_detector = FailureClusterDetector(
             state_path=failure_cluster_state_path(),
         )
+        # mtime-keyed cache for pipeline-state title/company enrichment so a
+        # burst of PIPELINE_UPDATE events (matcher scores/archives many jobs at
+        # once) rebuilds the index at most once per pipeline.json write.
+        self._pipeline_index_cache: Optional[Tuple[float, Dict[str, Dict[str, str]]]] = None
+        # (event_type, job identity, score) -> last-emit monotonic time.
+        # First emission within the window wins; in-memory only (duplicates
+        # arrive seconds-to-minutes apart, so restart loss is harmless).
+        self._recent_score_emissions: "OrderedDict[Tuple[str, str, str], float]" = OrderedDict()
+
+    def _pipeline_metadata(self, job_ref: Optional[str]) -> Dict[str, str]:
+        """Best-effort {title, company} lookup by job id/key from pipeline
+        state. Returns {} on any miss or error — enrichment must never break
+        event emission. Cached and invalidated by pipeline.json mtime.
+        """
+        if not job_ref:
+            return {}
+        try:
+            path = PIPELINE_PATH
+            mtime = path.stat().st_mtime
+            cache = self._pipeline_index_cache
+            if cache is None or cache[0] != mtime:
+                raw = path.read_bytes()
+                if raw.startswith(b"\xef\xbb\xbf"):  # strip BOM (Windows-authored)
+                    raw = raw[3:]
+                data = json.loads(raw.decode("utf-8"))
+                jobs = data.get("jobs", [])
+                # On this host Tracker projects `jobs` as a dict keyed by
+                # job_id; older/other producers use a list. Support both —
+                # iterating a dict yields keys (strings), which silently
+                # emptied this index before (every j.get() raised and the
+                # broad except returned {}), so title/company backfill never
+                # populated the Telegram STAGE_TRANSITION head.
+                job_records = jobs.values() if isinstance(jobs, dict) else jobs
+                index: Dict[str, Dict[str, str]] = {}
+                for j in job_records:
+                    if not isinstance(j, dict):
+                        continue
+                    jid = j.get("job_id") or j.get("id")
+                    if not jid:
+                        continue
+                    meta = {}
+                    if j.get("title"):
+                        meta["title"] = j["title"]
+                    if j.get("company"):
+                        meta["company"] = j["company"]
+                    index[jid] = meta
+                cache = (mtime, index)
+                self._pipeline_index_cache = cache
+            return dict(cache[1].get(job_ref, {}))
+        except Exception:
+            return {}
 
     def handle(self, event: Event) -> None:
         payload = event.payload or {}
@@ -93,8 +182,19 @@ class MailboxTranslator(BaseSubscriber):
         inner = payload.get("inner_payload") or payload.get("payload") or {}
         correlation_id = event.correlation_id
 
-        emissions = self._translate(message_type, inner)
+        emissions = self._translate(message_type, inner, payload.get("from"))
         for et, out_payload, priority in emissions:
+            if et in _SCORE_EVENT_TYPES and self._is_duplicate_score_emission(
+                et, out_payload
+            ):
+                logger.info(
+                    "MailboxTranslator: suppressed duplicate %s for %s (%s @ %s)",
+                    et.type_string,
+                    out_payload.get("job_id") or out_payload.get("job_key"),
+                    out_payload.get("title"),
+                    out_payload.get("company"),
+                )
+                continue
             try:
                 self.bus.emit(
                     event_type=et,
@@ -114,6 +214,34 @@ class MailboxTranslator(BaseSubscriber):
         # 'source' (which is the transport label).
         if message_type == "ERROR":
             self._record_error_for_clustering(payload, inner, correlation_id)
+
+    def _is_duplicate_score_emission(
+        self,
+        et: EventType,
+        payload: Dict[str, Any],
+        now: Optional[float] = None,
+    ) -> bool:
+        """Record-and-decide (RepeatGuard shape): True → suppress.
+
+        Identity is job_id/job_key when the message carries one, else
+        company|title. Score is part of the key so a changed score is
+        never suppressed — only literal repeats of the same fact are.
+        The window slides on repeats (a fact that keeps arriving stays
+        suppressed); a re-emission after the window is a fresh fact.
+        """
+        now = time.monotonic() if now is None else now
+        ident = payload.get("job_id") or payload.get("job_key")
+        if not ident:
+            ident = f"{payload.get('company')}|{payload.get('title')}"
+        key = (et.type_string, str(ident), str(payload.get("score")))
+        seen = self._recent_score_emissions
+        last = seen.get(key)
+        duplicate = last is not None and (now - last) < SCORE_DEDUP_WINDOW_SECONDS
+        seen[key] = now
+        seen.move_to_end(key)
+        while len(seen) > _SCORE_DEDUP_MAX_ENTRIES:
+            seen.popitem(last=False)
+        return duplicate
 
     def _record_error_for_clustering(
         self,
@@ -169,6 +297,7 @@ class MailboxTranslator(BaseSubscriber):
         self,
         message_type: str,
         inner: Dict[str, Any],
+        from_agent: Optional[str] = None,
     ) -> List[Tuple[EventType, Dict[str, Any], Optional[Priority]]]:
         """Return a list of (event_type, payload, priority_override_or_None)."""
         results: List[Tuple[EventType, Dict[str, Any], Optional[Priority]]] = []
@@ -210,11 +339,21 @@ class MailboxTranslator(BaseSubscriber):
                 inner, ["company", "title", "job_key", "question"]), None))
 
         elif message_type == "PIPELINE_UPDATE":
-            transition = _stage_transition_payload(inner)
-            prev = transition.get("previous_stage")
+            transition = _stage_transition_payload(inner, from_agent)
+            prev = transition.get("prior_stage")
             new = transition.get("new_stage")
             # Emit on any real transition — including first assignment where prev is None.
             if new and new != prev:
+                # Backfill title/company from pipeline state when the message
+                # omits them (matcher batch updates carry only job_key + stage),
+                # so the Telegram head is "<title> at <company>" not a bare UUID.
+                if not transition.get("title") or not transition.get("company"):
+                    meta = self._pipeline_metadata(
+                        transition.get("job_id") or transition.get("job_key")
+                    )
+                    for k in ("title", "company"):
+                        if not transition.get(k) and meta.get(k):
+                            transition[k] = meta[k]
                 results.append((EventType.STAGE_TRANSITION, transition, None))
 
         elif message_type == "FOLLOWUP_ALERT":
@@ -246,13 +385,19 @@ class MailboxTranslator(BaseSubscriber):
 
 
 def _score_payload(d: Dict[str, Any]) -> Dict[str, Any]:
+    # The matcher's score messages identify jobs by `job_id`, not `job_key`
+    # (every score event on the live bus had job_key=None and an empty bus
+    # job_id column). Carry both, backfilling job_key, so the emit path's
+    # job_id column and the dedup guard have an identity to key on.
+    job_id = d.get("job_id")
     return {
         "score": d.get("score", 0),
         "recommendation": d.get("recommendation"),
         "company": d.get("company"),
         "title": d.get("title"),
         "dimensions": d.get("dimensions"),
-        "job_key": d.get("job_key"),
+        "job_key": d.get("job_key") or job_id,
+        "job_id": job_id,
     }
 
 

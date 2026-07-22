@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -80,6 +82,33 @@ def applier(tmp_path, mailbox, pipeline_path):
         jobops_client=jobops,
         idempotency=tracker,
     ), jobops, mgr
+
+
+def _make_applier(tmp_path, mailbox, pipeline_path, *, job_state_reader=None, jobops=None, **kwargs):
+    """Build an IntentApplier with optional pre-flight reader / config overrides.
+
+    Returns (applier, jobops, mgr) mirroring the ``applier`` fixture shape when
+    the caller wants the jobops mock; callers that ignore it can just take [0].
+    """
+    mgr = PipelineManager(path=pipeline_path)
+    if jobops is None:
+        jobops = MagicMock()
+        jobops.post_legacy_stage.return_value = {"success": True}
+    tracker = IdempotencyTracker(tmp_path / "applier_state.db")
+    a = IntentApplier(
+        inbox_dir=mailbox["inbox"],
+        processed_dir=mailbox["processed"],
+        partial_dir=mailbox["partial"],
+        dead_letter_dir=mailbox["dead_letter"],
+        pipeline_manager=mgr,
+        jobops_client=jobops,
+        idempotency=tracker,
+        job_state_reader=job_state_reader,
+        **kwargs,
+    )
+    a._jobops_mock = jobops
+    a._mgr = mgr
+    return a
 
 
 class TestApplierHappyPath:
@@ -396,3 +425,330 @@ class TestPartialDoesNotBurnIdempotencyKey:
         f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
         assert a.apply_one(f) == "applied"
         assert a.idempotency.is_applied(self.KEY)
+
+
+def _write_partial(partial_dir: Path, name: str, payload: dict, age_seconds: float) -> Path:
+    """Write a synthetic partial intent whose mtime is ``age_seconds`` in the past."""
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    p = partial_dir / name
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    past = time.time() - age_seconds
+    os.utime(p, (past, past))
+    return p
+
+
+class TestRedriveMarkerParsing:
+    def test_no_marker_is_attempt_zero(self, applier):
+        a, _j, _m = applier
+        assert a._parse_redrive_attempt(Path("20260713T1_APPROVAL_INTENT_main.json")) == 0
+
+    def test_rd1_marker_parses(self, applier):
+        a, _j, _m = applier
+        assert a._parse_redrive_attempt(Path("x_INTENT_main.rd1.json")) == 1
+
+    def test_rd12_marker_parses(self, applier):
+        a, _j, _m = applier
+        assert a._parse_redrive_attempt(Path("x_INTENT_main.rd12.json")) == 12
+
+    def test_bump_from_zero_appends_rd1(self, applier):
+        a, _j, _m = applier
+        assert a._bump_redrive_marker("x_INTENT_main.json", 1) == "x_INTENT_main.rd1.json"
+
+    def test_bump_replaces_existing_marker(self, applier):
+        a, _j, _m = applier
+        assert a._bump_redrive_marker("x_INTENT_main.rd1.json", 2) == "x_INTENT_main.rd2.json"
+
+
+class TestRedrivePartials:
+    def test_eligible_partial_moves_to_inbox_with_bumped_marker(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=0 -> backoff 120s; age 200s -> eligible.
+        _write_partial(mailbox["partial"], "20260713T1_APPROVAL_INTENT_main.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=200)
+        result = a.redrive_partials()
+        assert result == {"20260713T1_APPROVAL_INTENT_main.json": "redriven"}
+        assert not (mailbox["partial"] / "20260713T1_APPROVAL_INTENT_main.json").exists()
+        assert (mailbox["inbox"] / "20260713T1_APPROVAL_INTENT_main.rd1.json").exists()
+
+    def test_not_yet_eligible_partial_stays(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=0 -> backoff 120s; age 30s -> too young.
+        _write_partial(mailbox["partial"], "20260713T2_APPROVAL_INTENT_main.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=30)
+        result = a.redrive_partials()
+        assert result == {"20260713T2_APPROVAL_INTENT_main.json": "waiting"}
+        assert (mailbox["partial"] / "20260713T2_APPROVAL_INTENT_main.json").exists()
+        assert list(mailbox["inbox"].glob("*")) == []
+
+    def test_backoff_grows_with_attempt(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=1 -> backoff 240s; age 200s -> still waiting (proves 2^N spacing).
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd1.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=200)
+        assert a.redrive_partials() == {"x_APPROVAL_INTENT_main.rd1.json": "waiting"}
+
+    def test_capped_partial_is_left_in_place_when_give_up_configured(self, tmp_path, mailbox, pipeline_path):
+        # Fix B: capping is now opt-in via redrive_give_up_attempts. With it set
+        # to 5, N=5 -> terminal "capped" (old default behaviour), even if ancient.
+        a = _make_applier(tmp_path, mailbox, pipeline_path, redrive_give_up_attempts=5)
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=99999)
+        result = a.redrive_partials()
+        assert result == {"x_APPROVAL_INTENT_main.rd5.json": "capped"}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert list(mailbox["inbox"].glob("*")) == []
+
+    def test_default_never_caps_slow_lane_redrives_past_max_attempts(self, mailbox, applier):
+        # Fix B: default redrive_give_up_attempts=0 => never surrender. An
+        # ancient rd5 partial (old code: "capped") now re-drives on the slow lane.
+        a, _j, _m = applier
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=99999)
+        result = a.redrive_partials()
+        assert result == {"x_APPROVAL_INTENT_main.rd5.json": "redriven"}
+        assert (mailbox["inbox"] / "x_APPROVAL_INTENT_main.rd6.json").exists()
+
+    def test_slow_lane_still_honours_max_backoff_cadence(self, mailbox, applier):
+        # Past the give-up attempt count the backoff is pinned at redrive_max_backoff
+        # (1800s). An rd8 partial only 1000s old is still "waiting", proving the
+        # slow lane retries at the capped cadence rather than hot-looping.
+        a, _j, _m = applier
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd8.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1000)
+        assert a.redrive_partials() == {"x_APPROVAL_INTENT_main.rd8.json": "waiting"}
+
+    def test_move_to_partial_resets_mtime(self, mailbox, applier):
+        a, jobops, _m = applier
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("boom")
+        # Write intent with an OLD mtime; landing in partial must reset it to now,
+        # else the per-attempt backoff would measure from intent creation time.
+        f = write_intent(mailbox["inbox"], "20260713T3_APPROVAL_INTENT_main.json",
+                         VALID_INTENT_PAYLOAD)
+        old = time.time() - 5000
+        os.utime(f, (old, old))
+        assert a.apply_one(f) == "partial"
+        landed = mailbox["partial"] / "20260713T3_APPROVAL_INTENT_main.json"
+        assert landed.exists()
+        assert time.time() - landed.stat().st_mtime < 60  # reset to ~now
+
+    def test_redriven_intent_reapplies_end_to_end(self, mailbox, applier):
+        a, jobops, _m = applier
+        # 1) transient failure -> partial (key unburned, mtime reset to now).
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("read timeout")
+        f = write_intent(mailbox["inbox"], "20260713T4_APPROVAL_INTENT_main.json",
+                         VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "partial"
+        key = VALID_INTENT_PAYLOAD["idempotency_key"]
+        assert not a.idempotency.is_applied(key)
+        # 2) age the partial past its 120s backoff, then re-drive.
+        landed = mailbox["partial"] / "20260713T4_APPROVAL_INTENT_main.json"
+        past = time.time() - 200
+        os.utime(landed, (past, past))
+        assert a.redrive_partials() == {"20260713T4_APPROVAL_INTENT_main.json": "redriven"}
+        # 3) :4100 recovers; the re-driven file re-applies on the next scan.
+        jobops.post_legacy_stage.side_effect = None
+        jobops.post_legacy_stage.return_value = {"success": True}
+        outcomes = a.scan_inbox()
+        assert outcomes == {"20260713T4_APPROVAL_INTENT_main.rd1.json": "applied"}
+        assert a.idempotency.is_applied(key)
+
+
+def _stage_payload(stage: str, key_suffix: str = "") -> dict:
+    """A VALID_INTENT_PAYLOAD variant requesting a specific stage."""
+    p = json.loads(json.dumps(VALID_INTENT_PAYLOAD))
+    p["payload"]["requested_stage"] = stage
+    p["idempotency_key"] = f"tracker-intent:it:linkedin-1:{stage}{key_suffix}"
+    return p
+
+
+class TestPreflightSatisfied:
+    """Fix A — suppress redundant no-op intents whose job is already at/past target."""
+
+    def test_past_target_skips_dual_write(self, tmp_path, mailbox, pipeline_path):
+        # Job sits at materials_ready, which is PAST the requested 'approved'.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "materials_ready")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "satisfied"
+        # No :4100 POST, no mirror, no legacy-projection regression.
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+        assert _pipeline_updates(mailbox["inbox"]) == []
+        data = json.loads(pipeline_path.read_text())
+        job = next(j for j in data["jobs"] if j["job_id"] == "linkedin-1")
+        assert job["stage"] == "review"  # unchanged — step 3 skipped
+        # Moved to processed + key burned so the redundant intent can't recur.
+        assert (mailbox["processed"] / "intent.json").exists()
+        assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_at_exact_target_is_satisfied(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "approved_for_tailor")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "satisfied"
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+
+    def test_archived_target_satisfied_only_by_archived(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "archived")
+        f = write_intent(mailbox["inbox"], "arch.json", _stage_payload("archived"))
+        assert a.apply_one(f) == "satisfied"
+        a._jobops_mock.post_legacy_stage.assert_not_called()
+
+    def test_before_target_takes_normal_dual_write(self, tmp_path, mailbox, pipeline_path):
+        # 'scored' is BEFORE 'approved' -> not satisfied -> normal apply.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "scored")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+    def test_reader_none_result_takes_normal_path(self, tmp_path, mailbox, pipeline_path):
+        # Unknown job (reader returns None) must not short-circuit.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: None)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+    def test_reader_exception_fails_open(self, tmp_path, mailbox, pipeline_path):
+        def boom(jid):
+            raise RuntimeError("pg down")
+        a = _make_applier(tmp_path, mailbox, pipeline_path, job_state_reader=boom)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"  # never blocks on a reader error
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+    def test_no_reader_takes_normal_path(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, job_state_reader=None)
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+
+    def test_unlisted_stage_never_shortcircuits(self, tmp_path, mailbox, pipeline_path):
+        # 'scored' is deliberately absent from _STAGE_SATISFIED_BY: even a reader
+        # claiming a downstream state must NOT short-circuit an unlisted stage.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "materials_ready")
+        f = write_intent(mailbox["inbox"], "intent.json", _stage_payload("scored"))
+        assert a.apply_one(f) == "applied"
+        a._jobops_mock.post_legacy_stage.assert_called_once()
+
+
+class TestReapConvergedPartials:
+    """Convergence-reaper: auto-clear CAPPED partials PG+canonical both show done."""
+
+    def _capped_kwargs(self, **extra):
+        # give_up=5 so a .rd5 partial is "capped"; both readers wired.
+        base = dict(redrive_give_up_attempts=5,
+                    job_state_reader=lambda jid: "materials_ready",
+                    canonical_state_reader=lambda: {"linkedin-1": "materials_ready"})
+        base.update(extra)
+        return base
+
+    def test_capped_and_both_gates_converged_is_reaped(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        result = a.reap_converged_partials()
+        assert result == {"x_APPROVAL_INTENT_main.rd5.json": "reaped"}
+        # Moved to processed (never inbox), key burned.
+        assert (mailbox["processed"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not (mailbox["inbox"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_gate_b_disagrees_is_not_reaped(self, tmp_path, mailbox, pipeline_path):
+        # PG says materials_ready (gate A pass) but canonical still shows scored.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(
+                              canonical_state_reader=lambda: {"linkedin-1": "scored"}))
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_gate_a_behind_never_parses_canonical(self, tmp_path, mailbox, pipeline_path):
+        from unittest.mock import MagicMock
+        canonical = MagicMock(return_value={"linkedin-1": "materials_ready"})
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(
+                              job_state_reader=lambda jid: "scored",   # gate A fails
+                              canonical_state_reader=canonical))
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+        canonical.assert_not_called()  # gate B never touched
+
+    def test_canonical_parsed_once_per_sweep(self, tmp_path, mailbox, pipeline_path):
+        from unittest.mock import MagicMock
+        canonical = MagicMock(return_value={"linkedin-1": "materials_ready",
+                                            "linkedin-2": "materials_ready"})
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(canonical_state_reader=canonical))
+        p2 = json.loads(json.dumps(VALID_INTENT_PAYLOAD))
+        p2["job_id"] = "linkedin-2"
+        p2["idempotency_key"] = "tracker-intent:it:linkedin-2:approved"
+        _write_partial(mailbox["partial"], "a_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        _write_partial(mailbox["partial"], "b_APPROVAL_INTENT_main.rd5.json",
+                       p2, age_seconds=1)
+        result = a.reap_converged_partials()
+        assert result == {"a_APPROVAL_INTENT_main.rd5.json": "reaped",
+                          "b_APPROVAL_INTENT_main.rd5.json": "reaped"}
+        assert canonical.call_count == 1
+
+    def test_gate_a_pass_but_job_absent_from_canonical_not_reaped(self, tmp_path, mailbox, pipeline_path):
+        # Gate A passes (PG at materials_ready) but the canonical map is wired
+        # and non-empty yet lacks this job_id -> canonical.get(...) is None ->
+        # fail-closed "not_converged" (distinct branch from unwired-reader).
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          **self._capped_kwargs(
+                              canonical_state_reader=lambda: {"some-other-job": "materials_ready"}))
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert not a.idempotency.is_applied(VALID_INTENT_PAYLOAD["idempotency_key"])
+
+    def test_non_capped_partial_is_ignored(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
+        # rd1 < give_up=5 -> not capped -> reaper leaves it entirely.
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd1.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd1.json").exists()
+
+    def test_give_up_zero_reaps_nothing(self, tmp_path, mailbox, pipeline_path):
+        # Default give_up=0 => nothing is ever capped => reaper is a no-op.
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          job_state_reader=lambda jid: "materials_ready",
+                          canonical_state_reader=lambda: {"linkedin-1": "materials_ready"})
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {}
+
+    def test_archived_incident_case_reaped(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          redrive_give_up_attempts=5,
+                          job_state_reader=lambda jid: "archived",
+                          canonical_state_reader=lambda: {"linkedin-1": "archived"})
+        _write_partial(mailbox["partial"], "z_STATE_TRANSITION_INTENT_main.rd5.json",
+                       _stage_payload("archived"), age_seconds=1)
+        assert a.reap_converged_partials() == {"z_STATE_TRANSITION_INTENT_main.rd5.json": "reaped"}
+
+    def test_canonical_reader_unwired_fails_closed(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path,
+                          redrive_give_up_attempts=5,
+                          job_state_reader=lambda jid: "materials_ready",
+                          canonical_state_reader=None)
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=1)
+        assert a.reap_converged_partials() == {"x_APPROVAL_INTENT_main.rd5.json": "not_converged"}
+
+    def test_corrupt_capped_file_is_skipped(self, tmp_path, mailbox, pipeline_path):
+        a = _make_applier(tmp_path, mailbox, pipeline_path, **self._capped_kwargs())
+        mailbox["partial"].mkdir(parents=True, exist_ok=True)
+        bad = mailbox["partial"] / "bad_APPROVAL_INTENT_main.rd5.json"
+        bad.write_text("{not valid", encoding="utf-8")
+        assert a.reap_converged_partials() == {"bad_APPROVAL_INTENT_main.rd5.json": "skipped"}
+        assert bad.exists()

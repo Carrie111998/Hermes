@@ -58,10 +58,15 @@ class TestEscalationTier:
         assert classify_tier(self._ev(EventType.INTERVIEW_SIGNAL)) == EscalationTier.IMMEDIATE
         assert classify_tier(self._ev(EventType.OFFER_SIGNAL)) == EscalationTier.IMMEDIATE
 
-    def test_urgent_tier_application_blocked_and_failed(self):
-        assert classify_tier(self._ev(EventType.APPLICATION_BLOCKED)) == EscalationTier.URGENT
+    def test_urgent_tier_application_failed_and_consecutive_cron(self):
         assert classify_tier(self._ev(EventType.APPLICATION_FAILED)) == EscalationTier.URGENT
         assert classify_tier(self._ev(EventType.CRON_FAILED_CONSECUTIVE)) == EscalationTier.URGENT
+
+    def test_application_blocked_is_immediate(self):
+        # v3: application_blocked is ACT at CRITICAL default priority —
+        # JobFlow is stalled on Diego's input, so it breaks quiet hours
+        # (was URGENT pre-v3).
+        assert classify_tier(self._ev(EventType.APPLICATION_BLOCKED)) == EscalationTier.IMMEDIATE
 
     def test_urgent_tier_only_for_gateway_down(self):
         assert classify_tier(self._ev(EventType.GATEWAY_HEALTH, {"status": "down"})) == EscalationTier.URGENT
@@ -74,9 +79,11 @@ class TestEscalationTier:
         # Below 9.0 is not escalated
         assert classify_tier(self._ev(EventType.JOB_HIGH_SCORE, {"score": 8.9})) is None
 
-    def test_important_tier_application_ready_and_followup(self):
-        assert classify_tier(self._ev(EventType.APPLICATION_READY)) == EscalationTier.IMPORTANT
-        assert classify_tier(self._ev(EventType.FOLLOWUP_DUE)) == EscalationTier.IMPORTANT
+    def test_urgent_tier_application_ready_and_followup(self):
+        # v3: both are ACT (operator decisions) — URGENT, not the retired
+        # IMPORTANT classification. Queued during quiet hours, 7:01 flush.
+        assert classify_tier(self._ev(EventType.APPLICATION_READY)) == EscalationTier.URGENT
+        assert classify_tier(self._ev(EventType.FOLLOWUP_DUE)) == EscalationTier.URGENT
 
     def test_devflow_decisions_escalate_urgent(self):
         # 2026-07-11 operator request: DevFlow decision signals escalate to
@@ -240,15 +247,17 @@ class TestQuietHours:
             assert escalator.should_deliver_now(event) is True  # breakthrough
 
     def test_non_breakthrough_queued_during_quiet_hours(self, bus, quiet_config, queue_path):
+        # v3: application_blocked became IMMEDIATE; approval_request is the
+        # archetypal URGENT (queued during quiet hours) event now.
         escalator = WhatsAppEscalator(bus, quiet_config_path=quiet_config, queue_path=queue_path)
-        event = Event.create(EventType.APPLICATION_BLOCKED, "applier", {})
+        event = Event.create(EventType.APPROVAL_REQUEST, "tracker", {})
 
         with patch.object(escalator, '_is_quiet_hours', return_value=True):
             assert escalator.should_deliver_now(event) is False
 
     def test_all_events_deliver_during_active_hours(self, bus, quiet_config, queue_path):
         escalator = WhatsAppEscalator(bus, quiet_config_path=quiet_config, queue_path=queue_path)
-        event = Event.create(EventType.APPLICATION_BLOCKED, "applier", {})
+        event = Event.create(EventType.APPROVAL_REQUEST, "tracker", {})
 
         with patch.object(escalator, '_is_quiet_hours', return_value=False):
             assert escalator.should_deliver_now(event) is True
@@ -297,8 +306,8 @@ class TestThrottleBuffer:
         )
 
         event = Event.create(
-            EventType.APPLICATION_BLOCKED, "applier",
-            {"company": "Acme", "question": "Visa?"},
+            EventType.APPROVAL_REQUEST, "tracker",
+            {"job_title": "Visa Analyst", "job_company": "Acme", "score": 9},
         )
 
         with patch.object(escalator, '_is_quiet_hours', return_value=False):
@@ -317,8 +326,8 @@ class TestThrottleBuffer:
 
         # Buffer a non-breakthrough event
         event = Event.create(
-            EventType.APPLICATION_BLOCKED, "applier",
-            {"company": "Acme", "question": "Visa?"},
+            EventType.APPROVAL_REQUEST, "tracker",
+            {"job_title": "Visa Analyst", "job_company": "Acme", "score": 9},
         )
 
         with patch.object(escalator, '_is_quiet_hours', return_value=False):
@@ -716,11 +725,16 @@ class TestNotificationDeliveredReverseSignal:
 
 
 def test_watchdog_burst_maps_to_urgent_tier():
-    """A coalesced burst is at least as urgent as a single transition."""
-    from events.subscribers.whatsapp_escalator import _TIER_BY_EVENT, EscalationTier
-    from events.schema import EventType
-
-    assert _TIER_BY_EVENT[EventType.WATCHDOG_BURST] == EscalationTier.URGENT
+    """A coalesced burst with actionable degradations is at least as urgent
+    as a single transition (v3: via routing_policy, not a static dict)."""
+    event = Event.create(
+        EventType.WATCHDOG_BURST, "watchdog",
+        {"count": 2, "trigger": "burst_threshold", "transitions": [
+            {"probe": "Hermes API Server :8642", "tier": "critical",
+             "before": "healthy", "after": "down"},
+        ]},
+    )
+    assert classify_tier(event) == EscalationTier.URGENT
 
 
 class TestCredentialLoss:
@@ -795,8 +809,8 @@ class TestDeliveryFailureRequeue:
             send_fn=self._failing_send,
         )
         event = Event.create(
-            EventType.APPLICATION_BLOCKED, "applier",
-            {"company": "Acme", "question": "visa?"},
+            EventType.APPROVAL_REQUEST, "tracker",
+            {"job_title": "Visa Analyst", "job_company": "Acme", "score": 9},
         )
         with patch.object(escalator, "_is_quiet_hours", return_value=False):
             escalator.handle(event)
@@ -825,8 +839,8 @@ class TestThrottleAgeOutOnPoll:
             send_fn=lambda msg: sent.append(msg),
         )
         event = Event.create(
-            EventType.APPLICATION_BLOCKED, "applier",
-            {"company": "Acme", "question": "visa?"},
+            EventType.APPROVAL_REQUEST, "tracker",
+            {"job_title": "Visa Analyst", "job_company": "Acme", "score": 9},
         )
         with patch.object(escalator, "_is_quiet_hours", return_value=False):
             escalator.handle(event)
@@ -848,8 +862,8 @@ class TestThrottleAgeOutOnPoll:
             send_fn=lambda msg: sent.append(msg),
         )
         event = Event.create(
-            EventType.APPLICATION_BLOCKED, "applier",
-            {"company": "Acme", "question": "visa?"},
+            EventType.APPROVAL_REQUEST, "tracker",
+            {"job_title": "Visa Analyst", "job_company": "Acme", "score": 9},
         )
         with patch.object(escalator, "_is_quiet_hours", return_value=False):
             escalator.handle(event)
@@ -874,8 +888,8 @@ class TestThrottlePersistence:
             send_fn=lambda msg: None,
         )
         event = Event.create(
-            EventType.APPLICATION_BLOCKED, "applier",
-            {"company": "Acme", "question": "visa?"},
+            EventType.APPROVAL_REQUEST, "tracker",
+            {"job_title": "Visa Analyst", "job_company": "Acme", "score": 9},
         )
         with patch.object(escalator, "_is_quiet_hours", return_value=False):
             escalator.handle(event)

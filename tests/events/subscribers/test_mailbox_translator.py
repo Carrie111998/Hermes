@@ -149,6 +149,46 @@ def test_pipeline_update_emits_on_first_stage_assignment(bus):
     assert transitions[0]["new_stage"] == "discovered"
 
 
+def test_pipeline_update_emits_prior_stage_key_for_formatter(bus):
+    """The TelegramNotifier formatter reads `prior_stage` (matching the
+    pipeline_state.manager producer + the '? →' symptom). The mailbox path
+    must emit that canonical key, not only `previous_stage`, or the prior
+    stage renders as '?'.
+    """
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j1", "previous_stage": "discovered", "new_stage": "scored"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["prior_stage"] == "discovered"
+    # legacy alias kept for back-compat with any older consumer
+    assert t["previous_stage"] == "discovered"
+
+
+def test_pipeline_update_populates_actor_from_mailbox_sender(bus):
+    """The '(by ?)' symptom: mailbox-sourced transitions never set `actor`,
+    so the formatter falls back to '?'. Actor must default to the sending
+    agent (mailbox 'from'), canonicalised.
+    """
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j1", "new_stage": "archived"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["actor"] == "matcher"
+
+
+def test_pipeline_update_explicit_actor_wins_over_sender(bus):
+    """An explicit actor in the mailbox payload takes precedence over the
+    sender attribution."""
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j1", "new_stage": "applied", "actor": "diego"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["actor"] == "diego"
+
+
 def test_pipeline_update_accepts_tailor_alias_fields(bus):
     _mailbox_event(bus, "PIPELINE_UPDATE", {
         "job_id": "48f36c8d-ad38-4bf4-aaf5-d38be28a97e3",
@@ -169,6 +209,79 @@ def test_pipeline_update_accepts_tailor_alias_fields(bus):
     assert transitions[0]["new_stage"] == "materials_ready"
     assert transitions[0]["company"] == "Citi"
     assert transitions[0]["title"].startswith("LMS Deposit Strategy")
+
+
+def test_pipeline_update_enriches_title_company_from_pipeline_state(bus, tmp_path, monkeypatch):
+    """Matcher's batch PIPELINE_UPDATE messages carry only job_key + new_stage
+    (no title/company), so the Telegram head fell back to a bare UUID. The
+    translator best-effort backfills title/company from pipeline state.
+    """
+    import events.subscribers.mailbox_translator as mt
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text(json.dumps({"jobs": [
+        {"job_id": "e0752a61", "title": "Director Finance", "company": "Acme"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {"job_key": "e0752a61", "new_stage": "archived"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["title"] == "Director Finance"
+    assert t["company"] == "Acme"
+
+
+def test_pipeline_update_enriches_from_dict_keyed_pipeline_state(bus, tmp_path, monkeypatch):
+    """Regression: on this host Tracker projects `jobs` as a dict keyed by
+    job_id, not a list. The backfill iterated `jobs` as a list, so `for j in
+    <dict>` yielded keys (strings), every `j.get()` raised, and the broad
+    except returned {} — title/company never populated and the Telegram head
+    stayed a bare UUID. This fixture mirrors the real dict shape.
+    """
+    import events.subscribers.mailbox_translator as mt
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text(json.dumps({"jobs": {
+        "e0752a61": {"job_id": "e0752a61", "title": "Director Finance", "company": "Acme"},
+    }}), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {"job_key": "e0752a61", "new_stage": "archived"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["title"] == "Director Finance"
+    assert t["company"] == "Acme"
+
+
+def test_pipeline_update_enrichment_does_not_override_message_fields(bus, tmp_path, monkeypatch):
+    """Title/company already in the message win over pipeline-state values."""
+    import events.subscribers.mailbox_translator as mt
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text(json.dumps({"jobs": [
+        {"job_id": "j9", "title": "Stale Title", "company": "StaleCo"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(mt, "PIPELINE_PATH", pipeline)
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {
+        "job_key": "j9", "new_stage": "applied", "title": "Fresh Title", "company": "FreshCo"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["title"] == "Fresh Title"
+    assert t["company"] == "FreshCo"
+
+
+def test_pipeline_update_enrichment_best_effort_when_no_pipeline_file(bus, tmp_path, monkeypatch):
+    """Missing/unreadable pipeline state must never break emission."""
+    import events.subscribers.mailbox_translator as mt
+    monkeypatch.setattr(mt, "PIPELINE_PATH", tmp_path / "does_not_exist.json")
+
+    _mailbox_event(bus, "PIPELINE_UPDATE", {"job_key": "j1", "new_stage": "scored"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    t = next(p for et, p in events if et == EventType.STAGE_TRANSITION)
+    assert t["new_stage"] == "scored"
+    assert "title" not in t and "company" not in t
 
 
 def test_error_message_emits_agent_error(bus):
@@ -331,6 +444,140 @@ class TestMailboxErrorFeedsClusterDetector:
         clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
         assert len(clusters) == 1
         assert clusters[0].source == "applier"
+
+
+class TestScoreEventDedup:
+    """The matcher writes BOTH a per-job SCORE_RESULT file AND a
+    SCORE_BATCH_SUMMARY whose results[] repeats the same job, so every
+    scored job produced two JOB_SCORED (and two JOB_HIGH_SCORE when
+    >= threshold) bus events ~60ms apart — one full payload, one with
+    dimensions:null (the batch rows carry no dimensions). Observed on
+    the live bus 2026-07-10..07-18 (e.g. Amex 'Director – Treasury
+    Deposits' 2026-07-12 14:14:03.98 + 14:14:04.04). The translator —
+    the sole producer of these event types — must dedupe by job
+    identity + score within a window.
+    """
+
+    def test_score_result_then_batch_summary_same_job_emits_once(self, bus):
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "4388377347", "score": 9.2, "recommendation": "PROCEED",
+            "company": "JPMC", "title": "FRM Lead",
+            "dimensions": {"title_match": {"raw": 10.0}},
+        })
+        _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+            "results": [
+                {"job_id": "4388377347", "score": 9.2,
+                 "recommendation": "PROCEED", "company": "JPMC",
+                 "title": "FRM Lead"},
+            ],
+        }, correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        scored = [p for et, p in events if et == EventType.JOB_SCORED]
+        high = [p for et, p in events if et == EventType.JOB_HIGH_SCORE]
+        assert len(scored) == 1
+        assert len(high) == 1
+        # First (full) emission wins — dimensions survive.
+        assert high[0]["dimensions"] is not None
+
+    def test_batch_summary_then_score_result_same_job_emits_once(self, bus):
+        """Real 2026-07-18 14:12 order: the batch summary lands first."""
+        _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+            "results": [
+                {"job_id": "b3760968", "score": 8.8, "company": "JPMC",
+                 "title": "Quant Treasury"},
+            ],
+        })
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "b3760968", "score": 8.8, "company": "JPMC",
+            "title": "Quant Treasury",
+            "dimensions": {"title_match": {"raw": 9.0}},
+        }, correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_SCORED]) == 1
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 1
+
+    def test_dedup_spans_polls_of_same_translator(self, bus):
+        """The straggler shape (Transamerica 2026-07-11: third duplicate
+        3 minutes after the pair) arrives in a LATER poll cycle."""
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.1, "company": "A", "title": "T"})
+        t = MailboxTranslator(bus)
+        bus._execute(
+            "INSERT OR REPLACE INTO subscriber_cursors "
+            "(subscriber_id, last_rowid, updated_at) VALUES (?, 0, datetime('now'))",
+            (t.subscriber_id,),
+        )
+        t.poll()
+        _mailbox_event(bus, "HIGH_SCORE_ALERT", {
+            "job_id": "j1", "score": 9.1, "company": "A", "title": "T"},
+            correlation_id="corr-2")
+        t.poll()
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 1
+
+    def test_different_jobs_same_score_both_emit(self, bus):
+        _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+            "results": [
+                {"job_id": "j1", "score": 9.0, "company": "Central Bank", "title": "ALM"},
+                {"job_id": "j2", "score": 9.0, "company": "BlackRock", "title": "Head of AI"},
+            ],
+        })
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 2
+
+    def test_rescore_with_different_score_still_emits(self, bus):
+        """A changed score is new information, never suppressed."""
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.0, "company": "A", "title": "T"})
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.3, "company": "A", "title": "T"},
+            correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 2
+
+    def test_dedup_falls_back_to_company_title_without_ids(self, bus):
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "score": 9.0, "company": "Acme", "title": "VP"})
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "score": 9.0, "company": "Acme", "title": "VP"},
+            correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 1
+
+    def test_window_expiry_allows_reemission(self, bus, monkeypatch):
+        """A genuine rescore in a later matcher run (observed 2h apart)
+        must emit again once the window has passed."""
+        import events.subscribers.mailbox_translator as mt
+        monkeypatch.setattr(mt, "SCORE_DEDUP_WINDOW_SECONDS", 0.0)
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.0, "company": "A", "title": "T"})
+        _mailbox_event(bus, "SCORE_RESULT", {
+            "job_id": "j1", "score": 9.0, "company": "A", "title": "T"},
+            correlation_id="corr-2")
+        _translate(bus)
+        events = _recent_domain_events(bus)
+        assert len([1 for et, _ in events if et == EventType.JOB_HIGH_SCORE]) == 2
+
+
+def test_score_payload_carries_job_id_and_backfills_job_key(bus):
+    """The matcher sends `job_id`, not `job_key` — every score event on the
+    live bus had job_key=None and an empty bus job_id column, defeating any
+    downstream keying. The payload must carry job_id and backfill job_key."""
+    _mailbox_event(bus, "SCORE_RESULT", {
+        "job_id": "4388377347", "score": 7.0, "company": "JPMC", "title": "Lead"})
+    _translate(bus)
+    events = _recent_domain_events(bus)
+    p = next(p for et, p in events if et == EventType.JOB_SCORED)
+    assert p["job_id"] == "4388377347"
+    assert p["job_key"] == "4388377347"
+    row = next(e for e in bus.query()
+               if e.event_type == EventType.JOB_SCORED)
+    assert row.job_id == "4388377347"
 
 
 def test_unknown_message_type_produces_no_domain_event(bus):

@@ -1,7 +1,10 @@
 """ScribeRealtime — per-event-driven Scribe narration to Telegram topics.
 
 Subscribes to 7 high-stakes Hermes event types and renders each via a
-per-event-type template into an emoji-prefixed one-liner ≤160 chars.
+per-event-type template into an emoji-prefixed narration line. Most types
+stay a scannable one-liner (≤160 chars); critic_proposal is the exception
+(caps at _MAX_LINE_LEN) so full proposal summaries aren't clipped mid-
+sentence in the critic_proposals topic (2026-07-18 operator report).
 Emits a `mailbox_message` NOTIFICATION event whose `to:` field directs
 telegram-notifier to the correct v2 topic. Per the 2D-1 design spec:
 
@@ -56,8 +59,12 @@ _TEMPLATES: Dict[str, Tuple[str, Callable[[dict], str]]] = {
     ),
     "critic_proposal": (
         "critic_proposals",
+        # No inner truncation: a proposal's summary is the whole point of the
+        # critic_proposals topic, and real ones run ~130 chars (complete
+        # sentences). The per-type cap in _MAX_LINE_LEN keeps a runaway model
+        # summary bounded without clipping a normal one mid-sentence.
         lambda p: (f"🧠 Critic ({p.get('kind','proposal')}): "
-                   f"{(p.get('summary') or '?')[:120]}"),
+                   f"{p.get('summary') or '?'}"),
     ),
     "curator_daily": (
         "curator_digest",
@@ -65,6 +72,20 @@ _TEMPLATES: Dict[str, Tuple[str, Callable[[dict], str]]] = {
                    f"{p.get('patterns_seeded','?')} patterns, "
                    f"{p.get('skills_observed','?')} skills"),
     ),
+}
+
+
+# Per-event-type hard cap on the rendered narration line. Scribe narration is
+# a scannable feed, so most types stay tight (160 chars, ~one Telegram line).
+# critic_proposal is the deliberate exception (2026-07-18 operator report:
+# proposals arriving clipped mid-sentence in the critic_proposals topic): its
+# summaries are complete sentences of ~130 chars and occasionally longer, and
+# the operator reads them in full to decide whether to apply. 600 keeps a
+# proposal fully readable while still bounding a runaway model summary far
+# below Telegram's own 4096-char hard limit.
+_DEFAULT_LINE_LEN = 160
+_MAX_LINE_LEN: Dict[str, int] = {
+    "critic_proposal": 600,
 }
 
 
@@ -98,7 +119,11 @@ class ScribeRealtime(BaseSubscriber):
                 return
             topic_key, render_fn = template
             payload = event.payload or {}
-            line = render_fn(payload)[:160]  # final hard-truncate safety net
+            # Final hard-truncate safety net, per event type (critic_proposal
+            # gets a larger cap so full proposals aren't clipped mid-sentence).
+            max_len = _MAX_LINE_LEN.get(
+                event.event_type.type_string, _DEFAULT_LINE_LEN)
+            line = render_fn(payload)[:max_len]
             self._emit_notification(line, topic_key, event.event_type.type_string)
         except Exception as exc:
             logger.warning(

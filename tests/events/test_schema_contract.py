@@ -48,3 +48,23 @@ class TestResourcePressureEnumEntry:
     def test_resolvable_from_string(self):
         resolved = EventType.from_string("resource_pressure")
         assert resolved is EventType.RESOURCE_PRESSURE
+
+
+class TestTrackerPartialBacklogEnumEntry:
+    """TRACKER_PARTIAL_BACKLOG is the tracker partial/ pileup early-warning
+    (2026-07-14; the 07-13 storm's 13 partials sat ~a day unnoticed). Emitted by
+    events.producers.partial_backlog_monitor.PartialBacklogMonitor and routed to
+    jobflow_decisions (the human-action lane). Must remain a first-class EventType."""
+
+    def test_enum_entry_exists(self):
+        assert hasattr(EventType, "TRACKER_PARTIAL_BACKLOG")
+
+    def test_type_string_is_stable(self):
+        assert EventType.TRACKER_PARTIAL_BACKLOG.type_string == "tracker_partial_backlog"
+
+    def test_default_priority_is_high(self):
+        assert EventType.TRACKER_PARTIAL_BACKLOG.default_priority == Priority.HIGH
+
+    def test_resolvable_from_string(self):
+        resolved = EventType.from_string("tracker_partial_backlog")
+        assert resolved is EventType.TRACKER_PARTIAL_BACKLOG

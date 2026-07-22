@@ -23,6 +23,8 @@ from events.paths import (
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
+from events.producers.code_drift_monitor import CodeDriftMonitor
+from events.producers.partial_backlog_monitor import PartialBacklogMonitor
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
@@ -34,7 +36,10 @@ from events.subscribers.memory_writer import MemoryWriter
 from events.subscribers.telegram_mirror import TelegramMirror
 from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.cron_stale_monitor import CronStaleMonitor
-from events.subscribers.tracker_intent_applier import TrackerIntentApplierSubscriber
+from events.subscribers.tracker_intent_applier import (
+    TrackerIntentApplierSubscriber,
+    tracker_partial_dir,
+)
 from events.subscribers.critic_trigger import CriticSubscriber
 from events.subscribers.scribe_realtime import ScribeRealtime
 from events.subscribers.scribe_action_telemetry import ScribeActionTelemetry
@@ -55,6 +60,15 @@ POLL_LOOP_ERROR_COOLDOWN_SECONDS = 900
 # and alert on staleness > a few minutes, so this cadence must be tight
 # enough that a single missed write stays under the alert threshold.
 HEARTBEAT_INTERVAL_SECONDS = 60
+# Hourly TRUNCATE-checkpoint attempt. The 60s PASSIVE checkpoint keeps the WAL
+# backfilled but can never RESET it, and journal_size_limit only truncates on
+# a reset - under the subscribers' 1-2s read cadence a reset almost never
+# happens on its own, which is how event_bus.db-wal reached 1.44 GB on
+# 2026-07-13. A TRUNCATE that loses to a reader returns busy=1 (no exception);
+# we just try again next hour. The nightly event-bus-retention cron (04:52)
+# is the backstop and the reporting surface.
+WAL_TRUNCATE_INTERVAL_SECONDS = 3600
+WAL_WARN_BYTES = 512 * 1024 * 1024
 # WhatsApp morning-flush retry throttle. The flush delivers the overnight queue
 # OVER WhatsApp, so when the WhatsApp bridge is itself down at 7am (2026-07-10:
 # a 0/105 flush stranded the whole overnight queue) the flush fails and must
@@ -67,11 +81,19 @@ FLUSH_RETRY_INTERVAL_SECONDS = 900  # 15 min
 # the shared serial loop (2026-07-13 starvation fix) so this is its real,
 # uncontended floor rather than a best-case the serial loop rarely hits.
 APPLIER_POLL_INTERVAL_SECONDS = 1
+# Auto-re-drive eligible partials at most once/min, on the dedicated applier
+# thread (single-writer). Flag-gated at the subscriber (default off — the :4100
+# hard gate). See docs/superpowers/specs/2026-07-14-tracker-applier-auto-redrive-design.md.
+REDRIVE_INTERVAL_SECONDS = 60
+# Read-only partial/ backlog count on the shared subscriber loop, once/min.
+PARTIAL_BACKLOG_CHECK_INTERVAL_SECONDS = 60
 
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
 _resource_monitor: Optional[ResourcePressureMonitor] = None
+_code_drift_monitor: Optional[CodeDriftMonitor] = None
+_partial_backlog_monitor: Optional[PartialBacklogMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
 # Dedicated poll thread + its subscriber for the tracker-intent-applier. The
@@ -96,7 +118,7 @@ _gateway_started_at_monotonic: Optional[float] = None
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _resource_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _code_drift_monitor, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -108,6 +130,12 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
     _resource_monitor = ResourcePressureMonitor(_bus)
+    _code_drift_monitor = CodeDriftMonitor(_bus)
+    # Always-on tracker partial/ backlog alert (independent of the re-drive flag).
+    # Construction is side-effect-free (stores the path; counts only on check()).
+    _partial_backlog_monitor = PartialBacklogMonitor(
+        _bus, partial_dir=tracker_partial_dir(),
+    )
     _mailbox_watcher = MailboxWatcher(_bus)
 
     # Register subscribers
@@ -133,7 +161,12 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _applier_subscriber = TrackerIntentApplierSubscriber(_bus)
     _registry.register(_applier_subscriber)
     _registry.register(CriticSubscriber(_bus))
-    _registry.register(ScribeRealtime(_bus))
+    # ScribeRealtime retired 2026-07-18 (routing v3, P2 one-event-one-
+    # message): its narrated mailbox_message NOTIFICATION copies duplicated
+    # the typed delivery of the same 7 event types (interview/offer landed
+    # in THREE topics per event). Typed events are canonical; plain-language
+    # bodies live in events/formatting.py. Class + tests kept for history.
+    # _registry.register(ScribeRealtime(_bus))
     _registry.register(ScribeActionTelemetry(_bus))
     _registry.register(ScribeVoiceTuning(_bus))
 
@@ -307,6 +340,16 @@ def get_health_monitor() -> Optional[GatewayHealthMonitor]:
 def get_resource_monitor() -> Optional[ResourcePressureMonitor]:
     """Get the resource-pressure monitor (commit/pagefile/disk sampling)."""
     return _resource_monitor
+
+
+def get_code_drift_monitor() -> Optional[CodeDriftMonitor]:
+    """Get the code-drift monitor (checkout-vs-main probe)."""
+    return _code_drift_monitor
+
+
+def get_partial_backlog_monitor() -> Optional[PartialBacklogMonitor]:
+    """Get the tracker partial-backlog monitor (counts mailbox/tracker/partial/)."""
+    return _partial_backlog_monitor
 
 
 def _check_subscriber_lag(
@@ -524,9 +567,16 @@ def _subscriber_poll_loop() -> None:
     # reads the real host (kernel32 + disk stat) and fires real emits, which
     # gi.startup()-based tests would otherwise pay on every startup.
     last_resource_check: float = time.monotonic()
+    # Skip the boot tick like last_resource_check: reconnect storms make the
+    # first sample noisy, and the edge state is in-process so a crash-loop under
+    # a sustained backlog would re-fire the rising edge on every restart.
+    last_partial_backlog_check: float = time.monotonic()
     last_lag_check: float = 0
     last_cleanup: float = 0
     last_checkpoint: float = 0
+    # NOT 0: skip the boot tick (reconnect storms make TRUNCATE lose anyway);
+    # first attempt comes one interval in, mirroring last_resource_check.
+    last_wal_truncate: float = time.monotonic()
     last_heartbeat: float = 0
     last_batch_flush: float = 0
     _state = load_state(digest_state_path(), default={})
@@ -706,14 +756,37 @@ def _subscriber_poll_loop() -> None:
                 last_health_check = now
 
             # Resource-pressure sampling every 60 seconds — commit charge,
-            # pagefile allocation, and C: free. Emits RESOURCE_PRESSURE on the
-            # rising edge of any trigger (2026-06-11 pagefile-burst remediation).
+            # physical RAM, pagefile allocation, and C: free. Emits
+            # RESOURCE_PRESSURE on the rising edge of any trigger (2026-06-11
+            # pagefile-burst + 2026-07-16 paging-storm remediation).
             if _resource_monitor and now - last_resource_check >= 60:
                 try:
                     _resource_monitor.check()
                 except Exception:
                     logger.exception("Resource pressure check failed")
                 last_resource_check = now
+
+            # Code-drift probe — the deployed detached checkout vs the landed
+            # main ref (2026-07-20/21 stale-restart incident). The monitor
+            # self-gates to one read-only git sample per 15 min, so the
+            # per-tick call is a clock comparison.
+            if _code_drift_monitor:
+                try:
+                    _code_drift_monitor.check()
+                except Exception:
+                    logger.exception("Code drift check failed")
+
+            # Tracker partial-backlog check every 60s — counts
+            # mailbox/tracker/partial/ and emits TRACKER_PARTIAL_BACKLOG on the
+            # rising edge of count > threshold (2026-07-14; the 07-13 pileup sat
+            # ~a day unnoticed). Read-only, so it runs here in the shared loop
+            # rather than the latency-sensitive applier thread.
+            if _partial_backlog_monitor and now - last_partial_backlog_check >= PARTIAL_BACKLOG_CHECK_INTERVAL_SECONDS:
+                try:
+                    _partial_backlog_monitor.check()
+                except Exception:
+                    logger.exception("Partial backlog check failed")
+                last_partial_backlog_check = now
 
             # Scan mailbox every 60 seconds
             if _mailbox_watcher and now - last_mailbox_scan >= 60:
@@ -738,6 +811,26 @@ def _subscriber_poll_loop() -> None:
                 except Exception:
                     logger.exception("WAL checkpoint failed")
                 last_checkpoint = now
+
+            # Hourly WAL TRUNCATE attempt (see WAL_TRUNCATE_INTERVAL_SECONDS)
+            if _bus and now - last_wal_truncate >= WAL_TRUNCATE_INTERVAL_SECONDS:
+                try:
+                    result = _bus.checkpoint("TRUNCATE")
+                    wal_path = _bus.db_path.parent / (_bus.db_path.name + "-wal")
+                    wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+                    if result is not None and result[0]:
+                        logger.info(
+                            "event_bus WAL TRUNCATE lost to readers (wal %.0f MB); retrying in 1h",
+                            wal_bytes / 1e6,
+                        )
+                    if wal_bytes > WAL_WARN_BYTES:
+                        logger.warning(
+                            "event_bus WAL at %.0f MB despite hourly TRUNCATE attempts",
+                            wal_bytes / 1e6,
+                        )
+                except Exception:
+                    logger.exception("event_bus WAL truncate attempt failed")
+                last_wal_truncate = now
 
             # Liveness heartbeat file — external watchers stat mtime and alert
             # on staleness, so we must always attempt to write even when other
@@ -818,10 +911,32 @@ def _applier_poll_loop() -> None:
             _applier_subscriber, "poll_interval_seconds", interval
         ) or interval
 
+    # Skip the boot tick (reconnect-storm window); first re-drive one interval in.
+    last_redrive = time.monotonic()
+
     while not _stop_event.is_set():
         try:
             if _applier_subscriber is not None:
                 _applier_subscriber.poll()
         except Exception:
             logger.exception("tracker-intent-applier dedicated poll failed")
+        # Auto-re-drive eligible partials at most once/min, on THIS single-writer
+        # thread (never the shared loop) so it can't race scan_inbox's
+        # is_applied/mark_applied/_move_to. Flag-gated inside the subscriber
+        # (TRACKER_APPLIER_REDRIVE_ENABLED, default off — the :4100 hard gate).
+        now = time.monotonic()
+        if _applier_subscriber is not None and now - last_redrive >= REDRIVE_INTERVAL_SECONDS:
+            try:
+                _applier_subscriber.redrive_partials()
+            except Exception:
+                logger.exception("tracker-intent-applier redrive failed")
+            # Reap capped partials PG+canonical both show converged (own flag,
+            # default off). Runs after redrive so it mops up exactly what redrive
+            # just classified capped. Single-writer thread; own try/except so a
+            # reap failure never stalls the loop.
+            try:
+                _applier_subscriber.reap_converged_partials()
+            except Exception:
+                logger.exception("tracker-intent-applier reap failed")
+            last_redrive = now
         _stop_event.wait(timeout=interval)

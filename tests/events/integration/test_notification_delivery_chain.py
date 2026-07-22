@@ -135,12 +135,12 @@ class TestCorrelationIdDeliveryChain:
         assert len(originals) == 1
         assert originals[0]["event_id"] == original_id
 
-        # And the NOTIFICATION_DELIVERED reverse-signal lines (cross-post
-        # produces 2 — primary + watchdog_alerts at HIGH+) must point
-        # back to it via correlation_id.
+        # And the NOTIFICATION_DELIVERED reverse-signal line must point
+        # back to it via correlation_id. v3: one event, ONE Telegram
+        # message (cross-posting removed) — exactly 1 reverse signal.
         delivered = [l for l in lines if l["event_type"] == "notification_delivered"]
-        assert len(delivered) == 2, (
-            f"interview_signal cross-posts; expected 2 reverse signals, "
+        assert len(delivered) == 1, (
+            f"v3 single-dispatch; expected 1 reverse signal, "
             f"got {len(delivered)}"
         )
         for d in delivered:
@@ -266,9 +266,10 @@ class TestCorrelationIdDeliveryChain:
         audit.poll()
 
         # Simulate the operator grep: filter audit by correlation_id /
-        # event_id == original_id. We expect ≥ 4 hits:
+        # event_id == original_id. We expect ≥ 3 hits (v3 single-dispatch —
+        # cross-posting removed):
         #   1 original interview_signal
-        #   2 telegram NOTIFICATION_DELIVERED (primary + cross-post)
+        #   1 telegram NOTIFICATION_DELIVERED (action_required topic)
         #   1 whatsapp NOTIFICATION_DELIVERED (IMMEDIATE breakthrough)
         lines = [
             json.loads(line) for line in audit_path.read_text().strip().split("\n")
@@ -279,8 +280,8 @@ class TestCorrelationIdDeliveryChain:
             if l.get("correlation_id") == original_id
             or l.get("event_id") == original_id
         ]
-        assert len(joined) >= 4, (
-            f"grep must join 4+ events on correlation_id; got {len(joined)}: "
+        assert len(joined) >= 3, (
+            f"grep must join 3+ events on correlation_id; got {len(joined)}: "
             f"{[(l.get('event_type'), l.get('payload', {}).get('platform')) for l in joined]}"
         )
         # Confirm at least one telegram and one whatsapp delivery

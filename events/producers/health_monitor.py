@@ -25,12 +25,17 @@ class GatewayHealthMonitor:
     """
 
     TELEGRAM_CACHE_TTL = 300  # 5-minute cache for Telegram connectivity
+    # Consecutive failed probes required before whatsapp is reported down.
+    # The bridge's node event loop can stall past the probe timeout for a
+    # single 60s cycle during a Baileys resync; one blip is not an outage.
+    WHATSAPP_DOWN_THRESHOLD = 2
 
     def __init__(self, bus: EventBus):
         self.bus = bus
         self._last_state: Dict[str, bool] = {}  # platform -> healthy
         self._telegram_cache: Optional[bool] = None
         self._telegram_cache_ts: float = 0
+        self._whatsapp_fail_streak: int = 0
 
     def check(self) -> None:
         """Actively check all platform health endpoints.
@@ -66,6 +71,13 @@ class GatewayHealthMonitor:
         except Exception as e:
             healthy = False
             detail = str(e)[:200]
+
+        if healthy:
+            self._whatsapp_fail_streak = 0
+        else:
+            self._whatsapp_fail_streak += 1
+            if self._whatsapp_fail_streak < self.WHATSAPP_DOWN_THRESHOLD:
+                return  # single blip — wait for the next probe before alerting
 
         self.report_health("whatsapp", healthy, detail)
 

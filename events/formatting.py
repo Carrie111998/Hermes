@@ -128,6 +128,13 @@ EVENT_TYPE_EMOJI = {
     # from every other watchdog_alerts icon and (deliberately) not a priority
     # dot, so it doesn't render adjacent to its own HIGH 🟠 dot in the header.
     EventType.RESOURCE_PRESSURE:        "🧯",
+    # Tracker partial/ backlog alert (2026-07-14) — a growing queue of intents
+    # whose Postgres mirror is stuck; the inbox-tray icon reads as "pile-up".
+    EventType.TRACKER_PARTIAL_BACKLOG:  "📥",
+    # Agent-src code drift (2026-07-21) — the deployed detached checkout is
+    # not running what main says should be running. Shuffle arrows read as
+    # "the code paths crossed"; distinct from 🔃 (PR opened).
+    EventType.CODE_DRIFT:               "🔀",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)
@@ -158,6 +165,25 @@ def priority_dot(priority: Priority) -> str:
     return PRIORITY_EMOJI.get(priority, "")
 
 
+def header_dot(event: Event) -> str:
+    """Header status dot, overriding the priority color where an event
+    semantically reads as a recovery rather than a problem.
+
+    GATEWAY_HEALTH carries a fixed HIGH priority (so a real outage escalates),
+    which means a 'down' AND a 'back-up' both inherited the amber 🟠 dot. An
+    operator scanning the feed asked (2026-07-18) for the recovery/'up' line to
+    read as green — visually distinct from an outage — without touching the
+    event's priority (routing/escalation stay as-is). Only the dot changes.
+    """
+    if event.event_type == EventType.GATEWAY_HEALTH:
+        if (event.payload or {}).get("status") == "up":
+            return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
+    if event.event_type == EventType.CODE_DRIFT:
+        if (event.payload or {}).get("status") == "resolved":
+            return PRIORITY_EMOJI[Priority.LOW]  # 🟢 — recovery, not an alert
+    return priority_dot(event.priority)
+
+
 def event_icon(event: Event) -> str:
     """Return the icon for an event.
 
@@ -184,7 +210,7 @@ def format_header(event: Event) -> str:
     For mailbox_message events, surfaces the inner message_type and includes
     sender -> recipient: '🟡 📊 SCORE_RESULT — matcher → main · 14:37 UTC'.
     """
-    dot = priority_dot(event.priority)
+    dot = header_dot(event)
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
 
@@ -231,6 +257,7 @@ WHATSAPP_TITLE_BY_EVENT = {
     EventType.OFFER_SIGNAL:                "JOB OFFER",
     EventType.SECRET_DETECTED:             "SECRET DETECTED",
     EventType.RESOURCE_PRESSURE:           "RESOURCE PRESSURE",
+    EventType.CODE_DRIFT:                  "STALE CODE RUNNING",
     EventType.DIGEST_GENERATED:            "MORNING DIGEST",
 }
 
@@ -240,7 +267,7 @@ def format_whatsapp_header(event: Event) -> str:
     title = WHATSAPP_TITLE_BY_EVENT.get(event.event_type)
     if title is None or event.event_type == EventType.MAILBOX_MESSAGE:
         return format_header(event)
-    dot = priority_dot(event.priority)
+    dot = header_dot(event)
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
     return f"{dot} {icon} {title} — {event.source} · {ts}"
@@ -272,7 +299,7 @@ _TIER_RANK = {"critical": 0, "important": 1, "optional": 2}
 
 
 def format_duration(seconds) -> str:
-    """Render a second count as '45s' / '8m 29s' / '2h 5m'."""
+    """Render a second count as '45s' / '8m 29s' / '2h 5m' / '2d 19h'."""
     try:
         s = int(float(seconds))
     except (TypeError, ValueError):
@@ -284,7 +311,10 @@ def format_duration(seconds) -> str:
     if m < 60:
         return f"{m}m {sec}s" if sec else f"{m}m"
     h, m = divmod(m, 60)
-    return f"{h}h {m}m" if m else f"{h}h"
+    if h < 24:
+        return f"{h}h {m}m" if m else f"{h}h"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h" if h else f"{d}d"
 
 
 def humanize_health_detail(detail: str) -> str:
@@ -460,3 +490,89 @@ def failure_cluster_body(payload: dict) -> str:
     when = f" at {_short_time(last_ts)}" if last_ts else ""
     return (f"{source} has failed {size} times in a row "
             f"(latest: {last_type}{when}). Something is stuck — needs a look.")
+
+
+def partial_backlog_body(payload: dict, *, max_ids: int = 10) -> str:
+    """Plain-language summary of a TRACKER_PARTIAL_BACKLOG alert.
+
+    A "partial" is a tracker approve/reject/archive intent whose pipeline.json
+    write (the canonical store) succeeded but whose Postgres mirror (:4100)
+    did not — so the dashboard and Postgres lag the real pipeline until the
+    intent is re-driven. The idempotency key stays unburned, so every partial
+    is safe to re-drive. See events/producers/partial_backlog_monitor.py.
+
+    Before this (2026-07-18 operator feedback: "these are cryptic and don't
+    really mean anything"), TRACKER_PARTIAL_BACKLOG hit TelegramNotifier's
+    generic fallback, which splatted count/threshold/oldest_age_seconds/
+    capped_count/sample_job_ids as raw key:value lines — a wall of numbers and
+    full UUIDs that said nothing about what was wrong or what to do.
+    """
+    p = payload or {}
+    count = p.get("count", "?")
+    threshold = p.get("threshold")
+    oldest = p.get("oldest_age_seconds")
+    ids = [str(j) for j in (p.get("sample_job_ids") or [])]
+
+    try:
+        verb = "update is" if int(count) == 1 else "updates are"
+    except (TypeError, ValueError):
+        verb = "updates are"
+
+    lines = [
+        f"{count} tracker {verb} stuck half-applied — each was saved to the "
+        f"pipeline but never mirrored to Postgres (:4100), so the dashboard "
+        f"and Postgres are out of sync with the real pipeline. They're safe "
+        f"to re-drive: the idempotency keys are unburned."
+    ]
+    if oldest is not None:
+        lines.append(f"Oldest has been waiting {format_duration(oldest)}.")
+    if threshold is not None:
+        lines.append(f"(Alert fires above {threshold} stuck updates.)")
+    if ids:
+        shown = [j[:8] for j in ids[:max_ids]]
+        try:
+            total = int(count)
+            scope = f"{len(shown)} of {total}" if total > len(shown) else str(len(shown))
+        except (TypeError, ValueError):
+            scope = str(len(shown))
+        lines.append(f"Sample jobs ({scope}): {', '.join(shown)}")
+    return "\n".join(lines)
+
+
+def code_drift_body(p: dict) -> str:
+    """Plain-language CODE_DRIFT body (2026-07-21).
+
+    The generic fallback would splat missed_subjects as a raw list; this is
+    the operator's phone-facing diagnosis + remediation line.
+    """
+    p = p or {}
+    repo = p.get("repo", "~/.hermes/agent-src")
+    if p.get("status") == "resolved":
+        return f"Deployed checkout back in sync with main @ {p.get('main', '?')}"
+
+    state = p.get("state", "?")
+    lines = []
+    if state == "behind":
+        lines.append(
+            f"Deployed checkout LAGS main by {p.get('behind_count', '?')} "
+            "commit(s) — landed fixes are NOT running."
+        )
+        for subj in (p.get("missed_subjects") or [])[:5]:
+            lines.append(f"  missed: {subj}")
+    elif state == "ahead":
+        lines.append(
+            f"Deployed checkout is AHEAD of main by {p.get('ahead_count', '?')} "
+            "commit(s) — the working tree carries unlanded state."
+        )
+    else:
+        lines.append(
+            f"Deployed checkout has DIVERGED from main "
+            f"(HEAD {p.get('head', '?')} vs main {p.get('main', '?')})."
+        )
+    if p.get("dirty"):
+        lines.append("Working tree is DIRTY (uncommitted changes).")
+    if state == "behind":
+        lines.append(
+            f"Fix: git -C {repo} merge --ff-only main, then restart the gateway."
+        )
+    return "\n".join(lines)
