@@ -663,6 +663,18 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+  # External memory provider (one at a time, off by default). Obsidian = local
+  # FTS5 retrieval over a markdown vault (the vault is the source of truth;
+  # the SQLite index is derived and disposable, stored outside the vault
+  # under HERMES_HOME).
+  # provider: obsidian   # enable the Obsidian provider
+
+# obsidian:
+#   vault_path: "/srv/dj/obsidian"
+#   top_k: 5
+#   # exclude_dirs: [".git", ".obsidian", ".trash"]
+#   # pinned: ["memory/core.md", "memory/daniel.md"]   # Phase B: always-on core
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================
