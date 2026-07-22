@@ -1568,32 +1568,26 @@ def test_bounded_provider_error_is_retryable_and_capture_is_durable(
     monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
     seen_config_paths = []
 
+    class Runner:
+        async def replay(self, plan):
+            assert Path(os.environ["HERMES_HOME"]) == config.parent.resolve()
+            exc = RuntimeError("HTTP 403 AuthorizationError: provider-auth refused")
+            exc.replay_outbound = [{
+                "kind": "send",
+                "args": [plan.messages[0]["chatId"], "captured before provider failure"],
+                "kwargs": {},
+                "replay_run_id": plan.run_id,
+            }]
+            raise exc
+
     def runner_factory(config_path=None):
         seen_config_paths.append(config_path)
         assert Path(config_path) == config.resolve()
         assert Path(os.environ["HERMES_HOME"]) == config.parent.resolve()
-        return object()
+        return Runner()
 
     monkeypatch.setattr(consumer, "_new_gateway_runner", runner_factory)
 
-    async def provider_error(records, **kwargs):
-        assert kwargs["defer_provider_errors"] is True
-        assert Path(os.environ["HERMES_HOME"]) == config.parent.resolve()
-        body = "AuthenticationError: HTTP 401 Missing Authentication header"
-        return {
-            "submitted_message_ids": [record.message_id for record in records],
-            "handled": [],
-            "provider_errors": [body],
-            "captured_outbound": [{
-                "kind": "send",
-                "args": [records[0].chat_id, body],
-                "kwargs": {},
-                "replay_run_id": "provider-error-run",
-            }],
-            "outbound_sent": 0,
-        }
-
-    monkeypatch.setattr(consumer, "process_live_records", provider_error)
     args = argparse.Namespace(
         inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
         case_db=str(case_db), canonical_env=str(canonical),
@@ -1603,23 +1597,34 @@ def test_bounded_provider_error_is_retryable_and_capture_is_durable(
         run_id="provider-error-test", dry_run=False,
         lock_file=str(tmp_path / "consumer.lock"),
     )
-    with pytest.raises(consumer.ConsumerError, match="HTTP 401 Missing Authentication"):
+    with pytest.raises(consumer.ConsumerError, match="HTTP 403 AuthorizationError"):
         asyncio.run(consumer.run_bounded_backplay(args))
 
     audit = json.loads(Path(args.audit).read_text())
     assert audit["ok"] is False
-    assert "HTTP 401 Missing Authentication" in audit["error"]
+    assert "HTTP 403 AuthorizationError" in audit["error"]
     assert audit["captured_outbound"] == 1
     capture = audit["captured_outbound_entries"][0]
-    assert capture["body"].endswith("Missing Authentication header")
+    assert capture["body"] == "captured before provider failure"
     assert capture["chat_id"] == "hg@g.us"
     assert capture["message_ids"] == ["bounded-1"]
     assert capture["turn_ids"] == []
-    assert capture["raw"]["replay_run_id"] == "provider-error-run"
+    assert capture["raw"]["replay_run_id"].startswith("live-drain-")
     assert audit["mutations"][0]["status"] == "retryable"
     assert audit["conservation"]["preserved"] is True
     assert inbox.counts() == {"completed": 1, "pending": 4}
     assert seen_config_paths == [config.resolve()]
+
+
+@pytest.mark.parametrize("body", [
+    "HTTP 403 AuthorizationError: forbidden",
+    "provider-auth failed while resolving credentials",
+    "model resolution failed: unable to resolve model deployment",
+])
+def test_captured_provider_error_recognizes_auth_and_model_resolution(body):
+    assert consumer._captured_provider_error([{
+        "kind": "send", "args": ["ops@g.us", body], "kwargs": {},
+    }]) == body
 
 
 def test_bounded_captured_provider_error_fallback_is_retryable(tmp_path, monkeypatch):

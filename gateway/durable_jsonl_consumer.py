@@ -1699,25 +1699,43 @@ async def process_live_records(
     replay_namespace = (
         "agent:live-drain:persistent-chat" if persistent_batch else None
     )
-    result = await runner.replay(
-        ReplayPlan(
-            platform="whatsapp",
-            messages=tuple(record.raw for record in records),
-            run_id=run_id,
-            attempt_id=f"attempt-{uuid.uuid4().hex[:12]}",
-            delivery_mode="capture",
-            bypass_require_mention=True,
-            bypass_auth=True,
-            live_business_writes=True,
-            source_path="durable-jsonl-consumer-live",
-            # Every chat is one ongoing conversation. The stable prefix plus
-            # SessionStore's existing platform/chat suffix yields one session
-            # per chat. Rollout scope is management-only for the demo; setting
-            # TGG_PERSISTENT_CHAT_SESSION_SCOPE=all extends the same mechanism
-            # to site chats after backlog/autocompact validation.
-            replay_namespace=replay_namespace,
-        )
+    replay_plan = ReplayPlan(
+        platform="whatsapp",
+        messages=tuple(record.raw for record in records),
+        run_id=run_id,
+        attempt_id=f"attempt-{uuid.uuid4().hex[:12]}",
+        delivery_mode="capture",
+        bypass_require_mention=True,
+        bypass_auth=True,
+        live_business_writes=True,
+        source_path="durable-jsonl-consumer-live",
+        # Every chat is one ongoing conversation. The stable prefix plus
+        # SessionStore's existing platform/chat suffix yields one session
+        # per chat. Rollout scope is management-only for the demo; setting
+        # TGG_PERSISTENT_CHAT_SESSION_SCOPE=all extends the same mechanism
+        # to site chats after backlog/autocompact validation.
+        replay_namespace=replay_namespace,
     )
+    try:
+        result = await runner.replay(replay_plan)
+    except Exception as exc:
+        if not defer_provider_errors:
+            raise
+        captured = [
+            dict(entry)
+            for entry in (getattr(exc, "replay_outbound", None) or [])
+            if isinstance(entry, Mapping)
+        ]
+        return {
+            "provider": provider,
+            "model": model,
+            "processed": 0,
+            "handled": [],
+            "captured_outbound": captured,
+            "provider_errors": [f"{type(exc).__name__}: {exc}"],
+            "outbound_sent": 0,
+            "submitted_message_ids": [record.message_id for record in records],
+        }
     handled: list[dict[str, Any]] = []
     provider_errors: list[str] = []
     for row in _turn_rows(state_db, replay_run_id=run_id):
@@ -1824,10 +1842,18 @@ def _captured_provider_error(
     """Return a provider/model error notice captured instead of a PA turn."""
     markers = (
         "authenticationerror",
+        "authorizationerror",
         "missing authentication header",
         "http 401",
+        "http 403",
+        "provider authentication",
+        "provider-auth",
         "provider error",
         "model error",
+        "model resolution",
+        "unable to resolve model",
+        "model not found",
+        "no provider configured",
     )
     for entry in captured_outbound:
         parsed = _parse_captured_send(entry)

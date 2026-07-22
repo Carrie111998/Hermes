@@ -6336,6 +6336,7 @@ class GatewayRunner:
         if session_db is not None and hasattr(session_db, "record_replay_attempt"):
             session_db.record_replay_attempt(**attempt.to_db_kwargs())
 
+        ctx = None
         try:
             with replay_context(plan) as ctx:
                 replay_home = self._replay_home_channel(platform, plan)
@@ -6389,6 +6390,14 @@ class GatewayRunner:
                     execution_report=execution_report,
                 )
         except Exception as exc:
+            # Capture-mode replay can fail after the guarded adapter has already
+            # recorded outbound bodies.  Preserve those bodies on the exception
+            # so bounded consumers can durably audit them before failing.
+            if ctx is not None:
+                try:
+                    setattr(exc, "replay_outbound", list(ctx.outbound))
+                except Exception:
+                    pass
             if session_db is not None and hasattr(session_db, "finish_replay_attempt"):
                 try:
                     session_db.finish_replay_attempt(

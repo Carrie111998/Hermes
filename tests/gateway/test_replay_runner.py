@@ -104,6 +104,40 @@ async def test_gateway_runner_replay_uses_no_connect_build_and_captures_outbound
 
 
 @pytest.mark.asyncio
+async def test_gateway_runner_replay_exception_carries_captured_outbound(monkeypatch):
+    runner = GatewayRunner(GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, extra={})}
+    ))
+    runner._session_db = None
+    adapter = FakeReplayAdapter()
+
+    async def fake_build(platform, platform_config, *, connect=True):
+        runner._wire_adapter(adapter)
+        return adapter, None
+
+    async def capture_then_raise(messages, *, bypass_require_mention=True):
+        await adapter.send("ops@g.us", "durable before failure")
+        raise RuntimeError("HTTP 403 AuthorizationError")
+
+    monkeypatch.setattr(runner, "_build_adapter", fake_build)
+    monkeypatch.setattr(adapter, "replay_bridge_messages", capture_then_raise)
+
+    with pytest.raises(RuntimeError, match="HTTP 403") as caught:
+        await runner.replay(ReplayPlan(
+            platform="whatsapp",
+            run_id="run-capture-failure",
+            attempt_id="attempt-capture-failure",
+            messages=({"messageId": "m1", "chatId": "ops@g.us", "body": "hello"},),
+        ))
+
+    captures = caught.value.replay_outbound
+    assert len(captures) == 1
+    assert captures[0]["kind"] == "send"
+    assert captures[0]["args"] == ["ops@g.us", "durable before failure"]
+    assert captures[0]["replay_run_id"] == "run-capture-failure"
+
+
+@pytest.mark.asyncio
 async def test_gateway_runner_concurrent_replays_keep_adapter_context_home_and_sessions_isolated(
     monkeypatch,
 ):
