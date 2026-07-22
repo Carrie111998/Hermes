@@ -107,6 +107,10 @@ def _check_env_file(path: Path, expected: dict[str, str]) -> None:
     values = _read_env_values(path)
     for key, value in expected.items():
         actual = values.get(key)
+        # The retired global kill switch is false both when explicitly false and
+        # when absent; per-chat allowlisting is the live policy boundary.
+        if key == "WHATSAPP_OUTBOUND_DISABLED" and value == "false" and actual is None:
+            continue
         if actual != value:
             raise AssertionError(f"{path}: expected {key}={value!r}, found {actual!r}")
 
