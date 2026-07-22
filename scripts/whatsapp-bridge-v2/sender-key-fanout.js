@@ -6,10 +6,13 @@ function stableDeviceList(value) {
   return value
     .map((device) => ({
       user: String(device?.user || ''),
+      // Baileys 6.x cache entries contain only { user, device }. The server is
+      // chosen later from group addressingMode, so it must not be required to
+      // detect a device-list mutation.
       server: String(device?.server || ''),
       device: Number(device?.device || 0),
     }))
-    .filter((device) => device.user && device.server)
+    .filter((device) => device.user)
     .sort((left, right) => `${left.user}:${left.device}@${left.server}`
       .localeCompare(`${right.user}:${right.device}@${right.server}`));
 }
@@ -22,14 +25,15 @@ function userFromJid(jid) {
   return String(jid || '').split('@')[0].split(':')[0];
 }
 
-function deviceJid(device) {
+function deviceJid(device, defaultServer = '') {
   if (device?.jid) return String(device.jid);
   const suffix = Number(device?.device || 0) > 0 ? `:${Number(device.device)}` : '';
-  return `${device?.user || ''}${suffix}@${device?.server || ''}`;
+  const server = String(device?.server || defaultServer || '');
+  return server ? `${device?.user || ''}${suffix}@${server}` : '';
 }
 
-function isSenderKeyEligible(device) {
-  const jid = deviceJid(device);
+function isSenderKeyEligible(device, defaultServer = '') {
+  const jid = deviceJid(device, defaultServer);
   return jid
     && Number(device?.device || 0) !== 99
     && !jid.endsWith('@hosted')
@@ -256,10 +260,17 @@ export function createSenderKeyFanoutManager({
       : await socket.getUSyncDevices(participants, true, false);
     const senderKeyResult = await authKeys.get('sender-key-memory', [chatId]);
     const senderKeyMap = senderKeyResult?.[chatId] || {};
-    const recipientDevices = devices.map(deviceJid).filter(Boolean).sort();
+    // Baileys 6.7.x returns { user, device }; rc13 additionally returns
+    // server/jid. Match Baileys' own 6.x relay logic by deriving the server
+    // from the group's addressing mode when it is absent.
+    const defaultDeviceServer = metadata?.addressingMode === 'lid' ? 'lid' : 's.whatsapp.net';
+    const recipientDevices = devices.map((device) => deviceJid(device, defaultDeviceServer)).filter(Boolean).sort();
     const senderKeyRecipients = devices
-      .filter((device) => isSenderKeyEligible(device) && !senderKeyMap[deviceJid(device)])
-      .map(deviceJid)
+      .filter((device) => {
+        const jid = deviceJid(device, defaultDeviceServer);
+        return isSenderKeyEligible(device, defaultDeviceServer) && !senderKeyMap[jid];
+      })
+      .map((device) => deviceJid(device, defaultDeviceServer))
       .sort();
     const cachedKeyDevices = recipientDevices.filter((jid) => !!senderKeyMap[jid]);
     const nextState = refreshReason

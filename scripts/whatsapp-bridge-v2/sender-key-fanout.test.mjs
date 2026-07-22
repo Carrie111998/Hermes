@@ -107,3 +107,42 @@ test('ttl fallback bypasses device cache and redistributes sender keys', async (
   assert.equal(refreshed.refreshReason, 'ttl');
   assert.deepEqual(refreshed.senderKeyRecipients, ['111:8@lid', '111@lid']);
 });
+
+test('Baileys 6.x device shape derives jid server from group addressing mode', async () => {
+  const chatId = '120363000000000002@g.us';
+  const keys = memoryKeys({
+    [`sender-key-memory:${chatId}`]: { '111@lid': true, '111:8@lid': true },
+  });
+  const events = [];
+  let currentDevices = [{ user: '111', device: 0 }];
+  const manager = createSenderKeyFanoutManager({
+    authKeys: keys,
+    refreshTtlMs: 60_000,
+    refreshEverySends: 100,
+    emit: (event) => events.push(event),
+  });
+  manager.bindSocket({
+    async groupMetadata() {
+      return { addressingMode: 'lid', participants: [{ id: '111@lid' }] };
+    },
+    async getUSyncDevices(participants, useCache) {
+      if (useCache) return manager.userDevicesCache.get('111') || currentDevices;
+      manager.userDevicesCache.set('111', currentDevices);
+      return currentDevices;
+    },
+  });
+
+  const cold = await manager.prepareGroupSend(chatId);
+  assert.deepEqual(cold.recipientDevices, ['111@lid']);
+  assert.deepEqual(cold.senderKeyRecipients, ['111@lid']);
+
+  keys.values.set(`sender-key-memory:${chatId}`, { '111@lid': true, '111:8@lid': true });
+  currentDevices = [{ user: '111', device: 0 }, { user: '111', device: 8 }];
+  manager.userDevicesCache.set('111', currentDevices);
+  await manager.settle();
+
+  const changed = await manager.prepareGroupSend(chatId);
+  assert.deepEqual(changed.recipientDevices, ['111:8@lid', '111@lid']);
+  assert.deepEqual(changed.senderKeyRecipients, ['111:8@lid', '111@lid']);
+  assert.ok(events.some((event) => event.phase === 'invalidation' && event.reason === 'device-list-change'));
+});
