@@ -2864,6 +2864,7 @@ def list_picker_providers(
     current_model: str = "",
     include_moa: bool = False,
     excluded_providers: list | None = None,
+    probe_custom_providers: bool = True,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -2883,6 +2884,11 @@ def list_picker_providers(
     All other providers and metadata fields are passed through unchanged.
     The typed ``/model <name>`` path is unaffected -- only the interactive
     picker payload is narrowed.
+
+    ``probe_custom_providers`` is forwarded to the base provider lister. Set
+    it false for deterministic/offline callers that must preserve the supplied
+    custom model list without querying a live ``/models`` endpoint. The default
+    remains true for existing interactive-picker behavior.
     """
     from hermes_cli.models import fetch_openrouter_models
 
@@ -2895,6 +2901,7 @@ def list_picker_providers(
         current_model=current_model,
         for_picker=True,
         excluded_providers=excluded_providers,
+        probe_custom_providers=probe_custom_providers,
     )
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
