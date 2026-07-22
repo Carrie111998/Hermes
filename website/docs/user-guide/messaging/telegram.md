@@ -157,7 +157,7 @@ With this option enabled:
   `$HERMES_HOME/state/telegram_background_locations/<bot-scope>.json` with exact
   coordinates, Telegram sender/chat/message/update/thread identifiers,
   timestamps, accuracy, and live-only heading/proximity/live-period metadata;
-- a later text message or command from the same sender receives the latest
+- a later text message or command from the same sender receives the latest live
   snapshot as ephemeral user-side context for that turn. Questions such as
   "Where am I?" or "What's nearby?" can therefore use it without changing the
   cached system prompt or cached-agent signature, or writing the injected live

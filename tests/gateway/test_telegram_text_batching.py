@@ -57,12 +57,20 @@ def _make_adapter():
 def _make_event(
     text: str,
     chat_id: str = "12345",
+    user_id: str = "12345",
+    chat_type: str = "dm",
     ephemeral_user_context: str | None = None,
+    message_type: MessageType = MessageType.TEXT,
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
-        message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"),
+        message_type=message_type,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+        ),
         ephemeral_user_context=ephemeral_user_context,
     )
 
@@ -104,6 +112,29 @@ class TestTextBatching:
         dispatched = adapter.handle_message.call_args[0][0]
         assert "part one" in dispatched.text
         assert "split by Telegram" in dispatched.text
+
+    @pytest.mark.asyncio
+    async def test_fixed_location_pin_batches_with_recent_same_sender_text(self):
+        """A fixed pin and its nearby request form one normal user turn."""
+        adapter = _make_adapter()
+
+        adapter._enqueue_text_event(_make_event("Find coffee near me"))
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(
+            _make_event(
+                "[The user shared a one-time location pin.]\nlatitude: 48.8584\n"
+                "longitude: 2.2945",
+                message_type=MessageType.LOCATION,
+            )
+        )
+
+        await asyncio.sleep(0.2)
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args.args[0]
+        assert "Find coffee near me" in dispatched.text
+        assert "[The user shared a one-time location pin.]" in dispatched.text
+        assert dispatched.ephemeral_user_context is None
 
     @pytest.mark.asyncio
     async def test_split_messages_keep_newest_ephemeral_user_context(self):
