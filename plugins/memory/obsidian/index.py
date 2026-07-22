@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from collections import namedtuple
 
 from plugins.memory.obsidian.chunker import chunk_markdown
+from plugins.memory.obsidian.sanitizer import sanitize_fts_query
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
@@ -33,6 +35,9 @@ END;
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+SearchHit = namedtuple("SearchHit", ["path", "heading", "content", "score"])
 
 
 class ObsidianIndex:
@@ -68,6 +73,23 @@ class ObsidianIndex:
     def delete_note(self, path: str) -> None:
         self.conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
         self.conn.commit()
+
+    def search(self, query: str, top_k: int = 5) -> "list[SearchHit]":
+        fts = sanitize_fts_query(query)
+        if not fts:
+            return []
+        try:
+            cur = self.conn.execute(
+                "SELECT c.path, c.heading, c.content, bm25(chunks_fts) AS score "
+                "FROM chunks_fts "
+                "JOIN chunks c ON c.chunk_id = chunks_fts.rowid "
+                "WHERE chunks_fts MATCH ? AND c.content != '' "
+                "ORDER BY score ASC LIMIT ?",
+                (fts, top_k),
+            )
+            return [SearchHit(*row) for row in cur.fetchall()]
+        except sqlite3.OperationalError:
+            return []
 
     def indexed_paths(self) -> "dict[str, tuple[float, str]]":
         cur = self.conn.execute(
