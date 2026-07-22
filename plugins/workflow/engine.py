@@ -253,6 +253,10 @@ class WorkflowEngine:
         self.kanban_board = "fleet-workflow"
         WorkflowEngine.STATE_DIR = self.workflows_dir / ".engine-state"
         self.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        # Job log DB at ~/.hermes/workflows/executions.db
+        self._exec_db_path = Path.home() / ".hermes" / "workflows" / "executions.db"
+        self._exec_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_exec_db()
 
     # ── Loading ───────────────────────────────────────────────
 
@@ -1115,6 +1119,78 @@ class WorkflowEngine:
 
     # ── State persistence ──────────────────────────────────────
 
+    def _init_exec_db(self) -> None:
+        """Create the workflow executions table if it doesn't exist."""
+        try:
+            import sqlite3
+            with sqlite3.connect(str(self._exec_db_path)) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS workflow_executions (
+                        run_id TEXT PRIMARY KEY,
+                        workflow_name TEXT NOT NULL,
+                        board TEXT,
+                        status TEXT NOT NULL DEFAULT 'running'
+                            CHECK(status IN ('running','completed','failed','blocked')),
+                        started_at TEXT,
+                        finished_at TEXT,
+                        error TEXT,
+                        current_layer INTEGER DEFAULT 0,
+                        total_layers INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_we_status ON workflow_executions(status)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_we_name ON workflow_executions(workflow_name)")
+        except Exception:
+            pass  # Non-fatal — state files still work
+
+    def _record_execution(self, workflow_name: str, run_id: str, board: str,
+                          total_layers: int) -> None:
+        """Insert a new execution record at workflow start."""
+        try:
+            import sqlite3
+            from datetime import datetime, timezone
+            with sqlite3.connect(str(self._exec_db_path)) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO workflow_executions "
+                    "(run_id, workflow_name, board, status, started_at, total_layers) "
+                    "VALUES (?, ?, ?, 'running', ?, ?)",
+                    (run_id, workflow_name, board,
+                     datetime.now(timezone.utc).isoformat(), total_layers)
+                )
+        except Exception:
+            pass
+
+    def _update_execution(self, run_id: str, status: str = None,
+                          current_layer: int = None, error: str = None) -> None:
+        """Update an execution record (layer advance, completion, failure)."""
+        try:
+            import sqlite3
+            from datetime import datetime, timezone
+            updates = []
+            params = []
+            if status is not None:
+                updates.append("status = ?")
+                params.append(status)
+                if status in ("completed", "failed"):
+                    updates.append("finished_at = ?")
+                    params.append(datetime.now(timezone.utc).isoformat())
+            if current_layer is not None:
+                updates.append("current_layer = ?")
+                params.append(current_layer)
+            if error is not None:
+                updates.append("error = ?")
+                params.append(error)
+            if not updates:
+                return
+            params.append(run_id)
+            with sqlite3.connect(str(self._exec_db_path)) as conn:
+                conn.execute(
+                    f"UPDATE workflow_executions SET {', '.join(updates)} WHERE run_id = ?",
+                    params
+                )
+        except Exception:
+            pass
+
     def _state_path(self, workflow_name: str, run_id: str = None) -> Path:
         if run_id:
             return self.STATE_DIR / f"{workflow_name}_{run_id}_state.json"
@@ -1935,6 +2011,13 @@ class WorkflowEngine:
             print("  FIRE-AND-FORGET — creating all cards, no monitoring loop")
         print()
 
+        # Record execution in job log DB
+        if not dry_run:
+            self._record_execution(
+                workflow_name, workflow.run_id,
+                board or self.kanban_board, len(layers)
+            )
+
         # ── Fire-and-forget: create cards, detect loop zones, spawn supervisor ──
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
@@ -1982,6 +2065,8 @@ class WorkflowEngine:
 
                 self._save_state(workflow_name, states, results, len(layers) - 1, layers,
                                 run_id=workflow.run_id, context=context)
+                self._update_execution(workflow.run_id, status="completed",
+                                      current_layer=len(layers) - 1)
                 return results
 
             # ── Has loop zones: save state, spawn supervisor, return ──
@@ -2286,6 +2371,11 @@ class WorkflowEngine:
         blocked = sum(1 for s in states.values() if s.status == "blocked")
         print(f"Workflow complete: {completed} done, {failed} failed, "
               f"{skipped} skipped, {blocked} blocked")
+
+        # Update job log
+        final_status = "failed" if failed > 0 else "completed"
+        self._update_execution(workflow.run_id, status=final_status,
+                              current_layer=layer_idx)
 
         self._clear_state(workflow_name, run_id=workflow.run_id)
 

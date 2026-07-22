@@ -1798,6 +1798,12 @@ def main():
     # list
     sub.add_parser("list", help="List available workflow definitions")
 
+    # jobs
+    jobs = sub.add_parser("jobs", help="List workflow execution history")
+    jobs.add_argument("--status", choices=["running", "completed", "failed", "blocked"],
+                      help="Filter by status")
+    jobs.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
+
     # show
     show = sub.add_parser("show", help="Show pipeline structure (layers + nodes)")
     show.add_argument("workflow", help="Workflow name to display")
@@ -1840,6 +1846,32 @@ def main():
     elif args.command == "list":
         for f in sorted(engine.workflows_dir.glob("*.yaml")):
             print(f"  {f.stem}")
+
+    elif args.command == "jobs":
+        import sqlite3
+        db_path = Path.home() / ".hermes" / "workflows" / "executions.db"
+        if not db_path.exists():
+            print("No workflow executions found.")
+            return
+        query = "SELECT run_id, workflow_name, status, started_at, finished_at, current_layer, total_layers, error FROM workflow_executions"
+        params = []
+        if args.status:
+            query += " WHERE status = ?"
+            params.append(args.status)
+        query += " ORDER BY started_at DESC LIMIT ?"
+        params.append(args.limit)
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = conn.execute(query, params).fetchall()
+        if not rows:
+            print("No workflow executions found.")
+            return
+        print(f"{'RUN ID':<30} {'WORKFLOW':<20} {'STATUS':<12} {'STARTED':<22} {'LAYER':<8} {'ERROR'}")
+        print("-" * 120)
+        for row in rows:
+            run_id, name, status, started, finished, layer, total, err = row
+            layer_str = f"{layer}/{total}" if total else str(layer)
+            err_str = (err[:40] + "...") if err and len(err) > 40 else (err or "")
+            print(f"{run_id:<30} {name:<20} {status:<12} {started or '':<22} {layer_str:<8} {err_str}")
 
     elif args.command == "show":
         workflow = engine.load_workflow(args.workflow)
