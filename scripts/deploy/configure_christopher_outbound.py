@@ -107,9 +107,10 @@ def _check_env_file(path: Path, expected: dict[str, str]) -> None:
     values = _read_env_values(path)
     for key, value in expected.items():
         actual = values.get(key)
-        # The retired global kill switch is false both when explicitly false and
-        # when absent; per-chat allowlisting is the live policy boundary.
-        if key == "WHATSAPP_OUTBOUND_DISABLED" and value == "false" and actual is None:
+        # These bridge env keys are optional on the Hermes process. When absent,
+        # the live boundary is still checked below in policy.env, config, and the
+        # constitution; do not force an .env mutation merely to satisfy this check.
+        if key in {"WHATSAPP_OUTBOUND_DISABLED", "WHATSAPP_OUTBOUND_ALLOWED_CHATS"} and actual is None:
             continue
         if actual != value:
             raise AssertionError(f"{path}: expected {key}={value!r}, found {actual!r}")
