@@ -194,7 +194,7 @@ class TestStaleBridgeHandshake:
 
         assert result is False  # mock proc died; not the point of the test
         mock_popen.assert_called_once()  # stale bridge replaced, not reused
-        mock_kill_port.assert_called_once_with(adapter._bridge_port)
+        mock_kill_port.assert_called_once_with(adapter._bridge_port, adapter._session_path)
 
     @pytest.mark.asyncio
     async def test_restarts_unversioned_bridge(self, tmp_path):

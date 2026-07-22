@@ -493,17 +493,17 @@ def resolve_whatsapp_bridge_dir() -> Path:
     if install_writable:
         return install_bridge
 
-    # Install dir is read-only, mirror to HERMES_HOME if needed
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
-
-    # Mirror the bridge source to HERMES_HOME
+    # Install dir is read-only. Refresh the managed source on every resolve so
+    # updates to bridge.js/package metadata and security-patched lockfiles reach
+    # long-lived Docker/read-only installs. Preserve node_modules: the adapter's
+    # package hash stamp decides when dependencies need reinstalling.
     try:
         hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(
             install_bridge,
             hermes_home_bridge,
-            dirs_exist_ok=False,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("node_modules", ".deps.sha256"),
         )
         return hermes_home_bridge
     except Exception:

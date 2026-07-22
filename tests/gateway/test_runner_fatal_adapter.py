@@ -131,6 +131,32 @@ async def test_runner_queues_retryable_runtime_fatal_for_reconnection(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_runner_does_not_requeue_logged_out_whatsapp_session(tmp_path):
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    adapter = _RuntimeRetryableAdapter()
+    adapter._set_fatal_error(
+        "whatsapp_session_logged_out",
+        "WhatsApp session logged out. Run `hermes whatsapp` to pair this device again.",
+        retryable=False,
+    )
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.delivery_router.adapters = runner.adapters
+    runner.stop = AsyncMock()
+
+    await runner._handle_adapter_fatal_error(adapter)
+
+    assert Platform.WHATSAPP not in runner._failed_platforms
+    assert runner._exit_with_failure is False
+    runner.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_retryable_fatal_queues_reconnect_after_cancellation_swallowing_disconnect(
     monkeypatch, tmp_path
 ):

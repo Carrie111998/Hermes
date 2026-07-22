@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+from contextlib import contextmanager
 import re
 import signal
 from pathlib import Path
@@ -85,6 +86,19 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
     return MagicMock(return_value=_AsyncCM(mock_session))
 
 
+@contextmanager
+def _session_setup_patches():
+    """Patch session setup without changing the historical patch-list indexes."""
+    with (
+        patch.object(Path, "mkdir", return_value=None),
+        patch(
+            "plugins.platforms.whatsapp.adapter._load_or_create_bridge_token",
+            return_value="test-bridge-token-with-enough-entropy",
+        ),
+    ):
+        yield
+
+
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     """Return a dict of common patches needed to reach the health-check loop."""
     patches = {
@@ -94,7 +108,7 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     base = [
         patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
         patch.object(Path, "exists", return_value=True),
-        patch.object(Path, "mkdir", return_value=None),
+        _session_setup_patches(),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
@@ -496,6 +510,7 @@ class TestBridgeRuntimeFailure:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "mkdir", return_value=None), \
+             patch("plugins.platforms.whatsapp.adapter._load_or_create_bridge_token", return_value="test-bridge-token-with-enough-entropy"), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("subprocess.Popen", side_effect=OSError("spawn failed")), \
              patch("builtins.open", return_value=mock_fh):
@@ -532,8 +547,9 @@ class TestKillPortProcess:
             return MagicMock()
 
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
+             patch("plugins.platforms.whatsapp.adapter._bridge_pid_is_ours", return_value=True), \
              patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=run_side_effect) as mock_run:
-            _kill_port_process(3000)
+            _kill_port_process(3000, Path("/whatsapp/session"))
 
         # netstat called
         assert any(
@@ -555,7 +571,7 @@ class TestKillPortProcess:
 
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
              patch("plugins.platforms.whatsapp.adapter.subprocess.run", return_value=mock_netstat) as mock_run:
-            _kill_port_process(3000)
+            _kill_port_process(3000, Path("/whatsapp/session"))
 
         # Should NOT call taskkill because port 30000 != 3000
         assert not any(
@@ -577,9 +593,10 @@ class TestKillPortProcess:
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", False), \
              patch("plugins.platforms.whatsapp.adapter._listener_pids_on_port",
                    return_value=[55555]) as mock_listeners, \
+             patch("plugins.platforms.whatsapp.adapter._bridge_pid_is_ours", return_value=True), \
              patch("plugins.platforms.whatsapp.adapter.os.kill",
                    side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000)
+            wa._kill_port_process(3000, Path("/whatsapp/session"))
 
         mock_listeners.assert_called_once_with(3000)
         assert kills == [(55555, signal.SIGTERM)]
@@ -594,7 +611,7 @@ class TestKillPortProcess:
                    return_value=[]) as mock_listeners, \
              patch("plugins.platforms.whatsapp.adapter.os.kill",
                    side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000)
+            wa._kill_port_process(3000, Path("/whatsapp/session"))
 
         mock_listeners.assert_called_once_with(3000)
         assert kills == []
@@ -604,7 +621,7 @@ class TestKillPortProcess:
 
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
              patch("plugins.platforms.whatsapp.adapter.subprocess.run", side_effect=OSError("no netstat")):
-            _kill_port_process(3000)  # must not raise
+            _kill_port_process(3000, Path("/whatsapp/session"))  # must not raise
 
 
 # ---------------------------------------------------------------------------

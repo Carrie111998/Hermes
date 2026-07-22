@@ -1,5 +1,6 @@
 """Regression tests for packaging metadata in pyproject.toml."""
 
+import json
 from pathlib import Path
 import tomllib
 
@@ -16,6 +17,19 @@ def _load_package_data():
     with pyproject_path.open("rb") as handle:
         tool = tomllib.load(handle)["tool"]
     return tool["setuptools"]["package-data"]
+
+
+def test_desktop_version_matches_python_project_and_workspace_lock():
+    """A release is one product version across CLI, Desktop, and npm installs."""
+    root = Path(__file__).resolve().parents[1]
+    with (root / "pyproject.toml").open("rb") as handle:
+        python_version = tomllib.load(handle)["project"]["version"]
+
+    desktop = json.loads((root / "apps" / "desktop" / "package.json").read_text())
+    lock = json.loads((root / "package-lock.json").read_text())
+
+    assert desktop["version"] == python_version
+    assert lock["packages"]["apps/desktop"]["version"] == python_version
 
 
 def test_matrix_extra_not_in_all():
