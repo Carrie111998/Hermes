@@ -879,11 +879,12 @@ class TestLocalNativeReadFastPath:
     stdio).  Regular local files are read with native Python I/O
     instead; anything else falls back to the shell pipeline unchanged.
 
-    The expected values pin the shell pipeline's exact historical
-    output, quirks included: total_lines is the newline count (wc -l),
-    and a window whose last printed line ends with a newline gains a
-    trailing empty numbered line (sed's final \\n split by
-    _add_line_numbers).
+    The expected values pin the shell pipeline's exact output, quirks
+    included: total_lines is the newline count (wc -l), and a window
+    whose last printed line ends with a newline gains a trailing empty
+    numbered line (sed's final \\n split by _add_line_numbers).  The
+    gutter is the compact ``<n>|`` form (upstream #35368/#35532 dropped
+    the fixed-width padded gutter for both paths).
     """
 
     @pytest.fixture
@@ -905,7 +906,7 @@ class TestLocalNativeReadFastPath:
         f.write_bytes(b"a\nb\n")
         r = local_ops.read_file(str(f))
         assert r.error is None
-        assert r.content == "     1|a\n     2|b\n     3|"
+        assert r.content == "1|a\n2|b\n3|"
         assert r.total_lines == 2
         assert r.file_size == 4
         assert r.truncated is False
@@ -914,7 +915,7 @@ class TestLocalNativeReadFastPath:
         f = tmp_path / "slice.txt"
         f.write_bytes(b"l1\nl2\nl3\nl4\n")
         r = local_ops.read_file(str(f), offset=2, limit=2)
-        assert r.content == "     2|l2\n     3|l3\n     4|"
+        assert r.content == "2|l2\n3|l3\n4|"
         assert r.total_lines == 4
         assert r.truncated is True
         assert r.hint == "Use offset=4 to continue reading (showing 2-3 of 4 lines)"
@@ -923,7 +924,7 @@ class TestLocalNativeReadFastPath:
         f = tmp_path / "nonl.txt"
         f.write_bytes(b"a\nb")
         r = local_ops.read_file(str(f))
-        assert r.content == "     1|a\n     2|b"
+        assert r.content == "1|a\n2|b"
         assert r.total_lines == 1  # wc -l counts newlines — historical contract
 
     def test_read_empty_file(self, local_ops, tmp_path):
@@ -931,14 +932,14 @@ class TestLocalNativeReadFastPath:
         f.write_bytes(b"")
         r = local_ops.read_file(str(f))
         assert r.error is None
-        assert r.content == "     1|"
+        assert r.content == "1|"
         assert r.total_lines == 0
 
     def test_read_offset_past_eof(self, local_ops, tmp_path):
         f = tmp_path / "short.txt"
         f.write_bytes(b"x\n")
         r = local_ops.read_file(str(f), offset=5, limit=10)
-        assert r.content == "     5|"
+        assert r.content == "5|"
         assert r.total_lines == 1
         assert r.truncated is False
 
@@ -946,7 +947,7 @@ class TestLocalNativeReadFastPath:
         f = tmp_path / "dos.txt"
         f.write_bytes(b"a\r\nb\r\n")
         r = local_ops.read_file(str(f))
-        assert r.content == "     1|a\r\n     2|b\r\n     3|"
+        assert r.content == "1|a\r\n2|b\r\n3|"
         assert r.total_lines == 2
 
     def test_relative_path_resolves_against_env_cwd(self, local_ops, tmp_path):
