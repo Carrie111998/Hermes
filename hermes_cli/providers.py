@@ -94,6 +94,17 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "junie-acp": HermesOverlay(
+        # The ACP subprocess client (agent/junie_acp_client.py) is selected by
+        # provider name before api_mode/transport is consulted, so this value
+        # is inert on the request path. We still set openai_chat so that
+        # determine_api_mode() -> "chat_completions" stays consistent with the
+        # junie-acp ProviderProfile and runtime_provider.py's forced api_mode.
+        transport="openai_chat",
+        auth_type="external_process",
+        base_url_override="acp://junie",
+        base_url_env_var="JUNIE_ACP_BASE_URL",
+    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
@@ -317,6 +328,10 @@ ALIASES: Dict[str, str] = {
     "ai-gateway": "vercel",
     "aigateway": "vercel",
     "vercel-ai-gateway": "vercel",
+    # jetbrains-junie (ACP coding-agent subprocess)
+    "jetbrains-junie-acp": "junie-acp",
+    "junie-acp-agent": "junie-acp",
+    "junie": "junie-acp",
 
     # opencode (models.dev ID for OpenCode Zen)
     "opencode-zen": "opencode",
@@ -404,6 +419,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nous": "Nous Portal",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
+    "junie-acp": "JetBrains Junie ACP",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
