@@ -165,7 +165,7 @@ import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRoutePr
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
-import { resolveReadyRemoteConnectionWithRetry } from './remote-connection-retry'
+import { remoteHttpStatusError, resolveReadyRemoteConnectionWithRetry } from './remote-connection-retry'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -4363,7 +4363,7 @@ function fetchJson(url, token, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            reject(remoteHttpStatusError(res.statusCode, text || res.statusMessage))
 
             return
           }
@@ -4457,7 +4457,7 @@ function fetchPublicJson(url, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            reject(remoteHttpStatusError(res.statusCode, text || res.statusMessage))
 
             return
           }
