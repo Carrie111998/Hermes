@@ -2,6 +2,7 @@ import * as React from 'react'
 
 import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { translateNow } from '@/i18n'
 import { isMetaClose, middleClickHandlers } from '@/lib/middle-click'
@@ -44,8 +45,8 @@ const TAB_SELECTED =
 interface PaneTabProps extends React.ComponentProps<'div'> {
   active?: boolean
   dirty?: boolean
-  /** Close gesture, no hover X (too easy to hit on small tabs): middle-click,
-   *  or ⌘-click as the trackpad-friendly Mac equivalent. */
+  /** Close gesture: hover X on horizontal tabs, plus middle-click and ⌘-click
+   *  (the trackpad-friendly Mac equivalent). */
   onClose?: () => void
   /** Part of a multi-tab selection (⌥/Ctrl-click, Shift-click) — an accent
    *  wash marks every tab that a drag would carry, Chrome-style. */
@@ -140,7 +141,35 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
       {...props}
     >
       {children}
-      {dirty && (
+      {onClose && !vertical && (
+        <button
+          aria-label="Close tab"
+          className={cn(
+            'grid size-4 shrink-0 place-items-center self-center rounded-sm text-(--ui-text-tertiary) transition-opacity',
+            // Always reserve the slot; visible on hover. The dirty dot
+            // (below) yields to the X on hover so the two never overlap.
+            // Opacity transitions keep the layout stable (no width shift
+            // when the X appears).
+            'mr-1.5 opacity-0 group-hover/tab:opacity-100',
+            'hover:bg-(--ui-control-hover-background) hover:text-foreground'
+          )}
+          onClick={event => {
+            event.preventDefault()
+            event.stopPropagation()
+            onClose()
+          }}
+          onPointerDown={event => {
+            // Claim the press so the tab's drag/activate pointerdown handler
+            // can't fire — the X is a leaf action, never a drag start.
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          type="button"
+        >
+          <Codicon name="close" size="0.625rem" />
+        </button>
+      )}
+      {dirty && !(onClose && !vertical) && (
         <span
           aria-hidden
           className={cn(
