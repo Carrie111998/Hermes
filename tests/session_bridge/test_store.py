@@ -87,6 +87,25 @@ def _claude_visibility_identity(
     )
 
 
+def _claude_characterization_identity(
+    operation_id: str,
+) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=f"codex:{operation_id}",
+        source_provider=Provider.CODEX,
+        native_name="[Codex] Verify native Claude session visibility and exact-ID resume metadata.",
+        source_cwd=f"C:/characterization/claude-visibility-{operation_id}",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    return candidate, derive_claude_visibility_identity(
+        candidate, _CLAUDE_MARKER_SECRET
+    )
+
+
 def _claude_visibility_hermes_identity(
     suffix: str,
 ) -> tuple[ClaudeVisibilityCandidate, ClaudeVisibilityIdentity]:
@@ -365,6 +384,11 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
         ("session_sidebar_terminal_resolutions",),
     ) == [{"name": "session_sidebar_terminal_resolutions"}]
+    assert _rows(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_claude_visibility_characterization_events",),
+    ) == [{"name": "session_claude_visibility_characterization_events"}]
     assert [
         row["name"]
         for row in _rows(
@@ -939,6 +963,7 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
     } == {
         "claude_visibility_security_v24",
         "claude_auth_recovery_call_started_v25",
+        "claude_characterization_abort_max_attempts_v27",
     }
     first._conn.execute(
         """UPDATE session_claude_visibility_jobs
@@ -2224,9 +2249,7 @@ def test_claude_visibility_commit_accepts_exact_native_or_profile_shadow_source(
     else:
         profile_path.parent.mkdir(parents=True, exist_ok=True)
         SessionDB(profile_path).close()
-    store = _profile_aware_claude_visibility_store(
-        db, (("main", profile_path),)
-    )
+    store = _profile_aware_claude_visibility_store(db, (("main", profile_path),))
     if source_provider is Provider.CODEX:
         _seed_claude_visibility_native_source(db, store, candidate)
     _enqueue_claude_visibility_job(store, candidate, identity)
@@ -2276,9 +2299,7 @@ def test_claude_visibility_status_and_reconcile_accept_profile_aware_source(
     else:
         profile_path.parent.mkdir(parents=True, exist_ok=True)
         SessionDB(profile_path).close()
-    store = _profile_aware_claude_visibility_store(
-        db, (("main", profile_path),)
-    )
+    store = _profile_aware_claude_visibility_store(db, (("main", profile_path),))
     if source_provider is Provider.CODEX:
         _seed_claude_visibility_native_source(db, store, candidate)
     _enqueue_claude_visibility_job(store, candidate, identity)
@@ -2313,7 +2334,9 @@ def test_claude_visibility_status_and_reconcile_accept_profile_aware_source(
     assert repaired["remaining"] == 0
     assert repaired["complete"] is True
     assert _rows(
-        db, "SELECT bridge_id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+        db,
+        "SELECT bridge_id FROM session_links WHERE bridge_id = ?",
+        (identity.bridge_id,),
     ) == [{"bridge_id": identity.bridge_id}]
 
 
@@ -2402,15 +2425,23 @@ def test_profile_shadow_source_mismatch_precedes_target_and_is_atomic(
             identity.job_id, claim.lease_digest, "c" * 64, 200.0
         )
 
-    assert _rows(
-        db,
-        """SELECT state, lease_digest, completion_digest, visible_at
+    assert (
+        _rows(
+            db,
+            """SELECT state, lease_digest, completion_digest, visible_at
              FROM session_claude_visibility_jobs WHERE id = ?""",
-        (identity.job_id,),
-    )[0] == before_job
-    assert _rows(
-        db, "SELECT id FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
-    ) == []
+            (identity.job_id,),
+        )[0]
+        == before_job
+    )
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_links WHERE bridge_id = ?",
+            (identity.bridge_id,),
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("table", ["external_sessions", "session_links"])
@@ -2419,15 +2450,11 @@ def test_profile_shadow_status_and_reconcile_fail_closed_on_legacy_bridge_table(
     tmp_path: Path,
     table: str,
 ) -> None:
-    candidate, identity = _claude_visibility_hermes_identity(
-        f"legacy-profile-{table}"
-    )
+    candidate, identity = _claude_visibility_hermes_identity(f"legacy-profile-{table}")
     profile_path = tmp_path / "profiles" / "main" / "state.db"
     _seed_profile_native_hermes_source(profile_path, candidate)
     _seed_exact_profile_shadow(db, candidate)
-    store = _profile_aware_claude_visibility_store(
-        db, (("main", profile_path),)
-    )
+    store = _profile_aware_claude_visibility_store(db, (("main", profile_path),))
     _enqueue_claude_visibility_job(store, candidate, identity)
     store.upsert_projection(
         _projection(
@@ -2467,13 +2494,15 @@ def test_profile_shadow_status_and_reconcile_fail_closed_on_legacy_bridge_table(
     )
 
     assert reconciled["repaired"] == 0
-    assert reconciled["blocker_codes"] == {
-        "claude_lineage_source_identity_mismatch": 1
-    }
-    assert _rows(
-        db,
-        "SELECT id, bridge_id FROM session_links ORDER BY id",
-    ) == before == []
+    assert reconciled["blocker_codes"] == {"claude_lineage_source_identity_mismatch": 1}
+    assert (
+        _rows(
+            db,
+            "SELECT id, bridge_id FROM session_links ORDER BY id",
+        )
+        == before
+        == []
+    )
 
 
 def test_claude_visibility_commit_rejects_invalid_digest_before_target_without_poisoning(
@@ -2708,9 +2737,7 @@ def test_claude_visibility_source_identity_mismatch_is_atomic_across_finalizers(
         result = store.reconcile_claude_visibility_lineage(
             limit=1, marker_secret=_CLAUDE_MARKER_SECRET, apply=True
         )
-        assert result["blocker_codes"] == {
-            "claude_lineage_source_identity_mismatch": 1
-        }
+        assert result["blocker_codes"] == {"claude_lineage_source_identity_mismatch": 1}
     else:
         with pytest.raises(ValueError, match="claude_lineage_source_identity_mismatch"):
             store.upsert_projection(target)
@@ -3050,10 +3077,13 @@ def test_claude_visibility_lineage_cursor_is_mode_bound_before_mutation(
         )
 
     assert before == []
-    assert _rows(
-        db,
-        "SELECT bridge_id FROM session_links ORDER BY bridge_id",
-    ) == before
+    assert (
+        _rows(
+            db,
+            "SELECT bridge_id FROM session_links ORDER BY bridge_id",
+        )
+        == before
+    )
     assert all(
         _rows(
             db,
@@ -3101,10 +3131,13 @@ def test_claude_visibility_lineage_cursor_rejects_forged_anchored_values_before_
                 cursor=forged,
             )
 
-        assert _rows(
-            db,
-            "SELECT id, bridge_id FROM session_links ORDER BY id",
-        ) == before
+        assert (
+            _rows(
+                db,
+                "SELECT id, bridge_id FROM session_links ORDER BY id",
+            )
+            == before
+        )
 
 
 @pytest.mark.parametrize(
@@ -3169,6 +3202,855 @@ def test_claude_visibility_status_blocks_clean_gate_on_unlinked_visible_job(db) 
         "blocked": 1,
         "blocker_codes": {"claude_lineage_target_missing": 1},
     }
+
+
+def test_registered_characterization_is_exact_id_only_and_skips_production_lineage(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    recorded = store.record_claude_visibility_characterization(
+        job_id=identity.job_id,
+        operation_id=operation_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=identity.bridge_id,
+        idempotency_key=identity.idempotency_key,
+        reserved_claude_uuid=identity.claude_uuid,
+        native_name=candidate.native_name,
+        source_cwd=candidate.source_cwd,
+        signed_marker=identity.signed_marker,
+        evidence_digest="a" * 64,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        cleanup_completed=False,
+    )
+
+    assert recorded["status"] == "registered"
+    assert (
+        store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").status
+        == "no_due_job"
+    )
+    assert store.inspect_due_claude_visibility_reconciliation(100.0).status == (
+        "no_due_job"
+    )
+    assert store.claim_claude_visibility_reconciliation(100.0, 60).status == (
+        "no_due_job"
+    )
+    claim = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        expected_job_id=identity.job_id,
+    )
+    assert claim.claimed
+    assert claim.reserved_claude_uuid == identity.claude_uuid
+
+    store.upsert_projection(
+        _projection(
+            _message("characterization-target", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    committed = store.commit_claude_visibility_job(
+        identity.job_id, claim.lease_digest, "b" * 64, 100.0
+    )
+
+    assert committed["state"] == "claude_visible"
+    assert committed["reserved_claude_uuid"] == identity.claude_uuid
+    assert store.claude_visibility_status(100.0)["lineage"] == {
+        "unlinked_visible": 0,
+        "repairable": 0,
+        "blocked": 0,
+        "blocker_codes": {},
+    }
+    assert (
+        _rows(
+            db, "SELECT * FROM session_links WHERE bridge_id = ?", (identity.bridge_id,)
+        )
+        == []
+    )
+
+
+def test_characterization_enqueue_registers_atomically_before_generic_claim(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "12121212-1212-4212-8212-121212121212"
+    candidate, identity = _claude_characterization_identity(operation_id)
+
+    registered = store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+
+    assert registered == {
+        "status": "registered",
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+    }
+    assert _rows(
+        db,
+        """SELECT event_kind
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?""",
+        (identity.job_id,),
+    ) == [{"event_kind": "registered"}]
+    assert (
+        store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").status
+        == "no_due_job"
+    )
+    assert store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        expected_job_id=identity.job_id,
+    ).claimed
+
+
+def test_characterization_enqueue_atomically_refuses_unrelated_open_work(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    unrelated_candidate, unrelated_identity = _claude_visibility_identity("other-open")
+    _enqueue_claude_visibility_job(store, unrelated_candidate, unrelated_identity)
+    operation_id = "17171717-1717-4717-8717-171717171717"
+    candidate, identity = _claude_characterization_identity(operation_id)
+
+    with pytest.raises(ValueError, match="characterization requires idle delivery"):
+        store.enqueue_claude_visibility_characterization(
+            candidate,
+            identity,
+            _CLAUDE_MARKER_SECRET,
+            operation_id=operation_id,
+            evidence_digest="a" * 64,
+        )
+
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )
+        == []
+    )
+    assert (
+        _rows(
+            db,
+            """SELECT job_id
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?""",
+            (identity.job_id,),
+        )
+        == []
+    )
+
+
+def test_characterization_enqueue_exact_replay_ignores_later_unrelated_open_work(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "18181818-1818-4818-8818-181818181818"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    expected = store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+    unrelated_candidate, unrelated_identity = _claude_visibility_identity("later-open")
+    _enqueue_claude_visibility_job(store, unrelated_candidate, unrelated_identity)
+
+    replayed = store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="b" * 64,
+    )
+
+    assert replayed == expected
+    assert _rows(
+        db,
+        """SELECT event_kind, COUNT(*) AS count
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?
+           GROUP BY event_kind""",
+        (identity.job_id,),
+    ) == [{"event_kind": "registered", "count": 1}]
+
+
+def test_characterization_enqueue_backfills_exact_preledger_retry_without_mutation(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "19191919-1919-4919-8919-191919191919"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_retry', attempts = 7,
+                   next_attempt_at = 100, error_code = 'creation_ambiguous',
+                   error_detail = 'legacy ambiguous create', updated_at = 99
+               WHERE id = ?""",
+            (identity.job_id,),
+        )
+    )
+    before = _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )
+
+    registered = store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+
+    assert registered == {
+        "status": "registered",
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+    }
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )
+        == before
+    )
+    assert _rows(
+        db,
+        """SELECT event_kind, operation_id, evidence_digest
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?""",
+        (identity.job_id,),
+    ) == [
+        {
+            "event_kind": "registered",
+            "operation_id": operation_id,
+            "evidence_digest": "a" * 64,
+        }
+    ]
+    assert (
+        store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").status
+        == "no_due_job"
+    )
+    exact = store.claim_claude_visibility_reconciliation(
+        100.0, 60, expected_job_id=identity.job_id
+    )
+    assert exact.claimed is True
+    assert exact.job_id == identity.job_id
+    assert exact.reserved_claude_uuid == identity.claude_uuid
+    assert exact.requires_exact_id_reconciliation is True
+
+
+def test_characterization_enqueue_rejects_preledger_unexpired_lease(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "20202020-2020-4020-8020-202020202020"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_leased', attempts = 7,
+                   lease_digest = ?, lease_expires_at = 200,
+                   lease_kind = 'reconciliation', updated_at = 99
+               WHERE id = ?""",
+            ("f" * 64, identity.job_id),
+        )
+    )
+
+    with pytest.raises(ValueError, match="registration race"):
+        store.enqueue_claude_visibility_characterization(
+            candidate,
+            identity,
+            _CLAUDE_MARKER_SECRET,
+            operation_id=operation_id,
+            evidence_digest="a" * 64,
+        )
+
+    assert (
+        _rows(
+            db,
+            """SELECT event_kind
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?""",
+            (identity.job_id,),
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("legacy_state", ["claude_failed", "claude_visible"])
+def test_characterization_enqueue_backfills_exact_preledger_terminal_state(
+    db, legacy_state: str
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = (
+        "21212121-2121-4121-8121-212121212121"
+        if legacy_state == "claude_failed"
+        else "22222222-2222-4222-8222-222222222223"
+    )
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    if legacy_state == "claude_failed":
+        update = """UPDATE session_claude_visibility_jobs
+                    SET state = 'claude_failed', attempts = 7,
+                        error_code = 'max_attempts_exhausted', updated_at = 99
+                    WHERE id = ?"""
+    else:
+        update = """UPDATE session_claude_visibility_jobs
+                    SET state = 'claude_visible', attempts = 1,
+                        completion_digest = ?, visible_at = 98, updated_at = 99
+                    WHERE id = ?"""
+    db._execute_write(
+        lambda conn: conn.execute(
+            update,
+            (identity.job_id,)
+            if legacy_state == "claude_failed"
+            else ("c" * 64, identity.job_id),
+        )
+    )
+    before = _rows(
+        db,
+        "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    )
+
+    result = store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+
+    assert result["status"] == "registered"
+    assert (
+        _rows(
+            db,
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )
+        == before
+    )
+    assert _rows(
+        db,
+        """SELECT event_kind
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?""",
+        (identity.job_id,),
+    ) == [{"event_kind": "registered"}]
+
+
+def test_characterization_enqueue_rolls_back_job_when_registration_append_fails(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "13131313-1313-4313-8313-131313131313"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    db._execute_write(
+        lambda conn: conn.execute(
+            """CREATE TRIGGER fail_characterization_registration
+               BEFORE INSERT ON session_claude_visibility_characterization_events
+               WHEN NEW.event_kind = 'registered'
+               BEGIN
+                 SELECT RAISE(ABORT, 'forced registration failure');
+               END"""
+        )
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced registration failure"):
+        store.enqueue_claude_visibility_characterization(
+            candidate,
+            identity,
+            _CLAUDE_MARKER_SECRET,
+            operation_id=operation_id,
+            evidence_digest="a" * 64,
+        )
+
+    assert (
+        _rows(
+            db,
+            "SELECT id FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        )
+        == []
+    )
+    assert (
+        _rows(
+            db,
+            """SELECT job_id
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ?""",
+            (identity.job_id,),
+        )
+        == []
+    )
+
+
+def test_authenticated_completed_characterization_is_terminal_not_visible_lineage(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 150.0, local_timezone=timezone.utc)
+    operation_id = "22222222-2222-4222-8222-222222222222"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    store.upsert_projection(
+        _projection(
+            _message("cleaned-characterization-target", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_visible', completion_digest = ?, visible_at = 100,
+                   updated_at = 100 WHERE id = ?""",
+            ("c" * 64, identity.job_id),
+        )
+    )
+    assert store.claude_visibility_status(150.0)["lineage"]["blocker_codes"] == {
+        "claude_lineage_missing_source": 1
+    }
+
+    recorded = store.record_claude_visibility_characterization(
+        job_id=identity.job_id,
+        operation_id=operation_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=identity.bridge_id,
+        idempotency_key=identity.idempotency_key,
+        reserved_claude_uuid=identity.claude_uuid,
+        native_name=candidate.native_name,
+        source_cwd=candidate.source_cwd,
+        signed_marker=identity.signed_marker,
+        evidence_digest="d" * 64,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        cleanup_completed=True,
+    )
+
+    assert recorded["status"] == "cleanup_completed"
+    status = store.claude_visibility_status(150.0)
+    assert status["counts"] == {
+        "claude_pending": 0,
+        "claude_leased": 0,
+        "claude_retry": 0,
+        "claude_visible": 0,
+        "claude_failed": 0,
+    }
+    assert status["lineage"] == {
+        "unlinked_visible": 0,
+        "repairable": 0,
+        "blocked": 0,
+        "blocker_codes": {},
+    }
+    assert (
+        store.reconcile_claude_visibility_lineage(
+            limit=25, marker_secret=_CLAUDE_MARKER_SECRET, apply=False
+        )["complete"]
+        is True
+    )
+
+
+def test_characterization_events_are_append_only_and_identity_bound(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "33333333-3333-4333-8333-333333333333"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    with pytest.raises(ValueError, match="characterization identity mismatch"):
+        store.record_claude_visibility_characterization(
+            job_id=identity.job_id,
+            operation_id=operation_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=identity.bridge_id,
+            idempotency_key=identity.idempotency_key,
+            reserved_claude_uuid="44444444-4444-4444-8444-444444444444",
+            native_name=candidate.native_name,
+            source_cwd=candidate.source_cwd,
+            signed_marker=identity.signed_marker,
+            evidence_digest="e" * 64,
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            cleanup_completed=False,
+        )
+
+    store.record_claude_visibility_characterization(
+        job_id=identity.job_id,
+        operation_id=operation_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=identity.bridge_id,
+        idempotency_key=identity.idempotency_key,
+        reserved_claude_uuid=identity.claude_uuid,
+        native_name=candidate.native_name,
+        source_cwd=candidate.source_cwd,
+        signed_marker=identity.signed_marker,
+        evidence_digest="e" * 64,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        cleanup_completed=False,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_claude_visibility_characterization_events "
+                "SET evidence_digest = ? WHERE job_id = ?",
+                ("f" * 64, identity.job_id),
+            )
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM session_claude_visibility_characterization_events "
+                "WHERE job_id = ?",
+                (identity.job_id,),
+            )
+        )
+
+
+def test_characterization_exact_absence_abort_is_audited_terminal_and_idempotent(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "44444444-4444-4444-8444-444444444444"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    def record(*, launch_aborted: bool = False) -> dict[str, object]:
+        return store.record_claude_visibility_characterization(
+            job_id=identity.job_id,
+            operation_id=operation_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=identity.bridge_id,
+            idempotency_key=identity.idempotency_key,
+            reserved_claude_uuid=identity.claude_uuid,
+            native_name=candidate.native_name,
+            source_cwd=candidate.source_cwd,
+            signed_marker=identity.signed_marker,
+            evidence_digest="a" * 64,
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            cleanup_completed=False,
+            launch_aborted=launch_aborted,
+        )
+
+    assert record(launch_aborted=True) == {
+        "status": "reconciliation_required",
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+    }
+    assert _rows(
+        db,
+        "SELECT event_kind FROM session_claude_visibility_characterization_events "
+        "WHERE job_id = ? ORDER BY created_at, event_kind",
+        (identity.job_id,),
+    ) == [{"event_kind": "registered"}]
+
+    launch = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        expected_job_id=identity.job_id,
+    )
+    assert launch.launch_permitted is True
+    store.retry_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "creation_ambiguous",
+        100.0,
+        "launch result unknown",
+    )
+    reconciliation = store.claim_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+    )
+    assert reconciliation.requires_exact_id_reconciliation is True
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "b" * 64,
+    )
+
+    assert record(launch_aborted=True) == {
+        "status": "launch_aborted",
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+    }
+    assert record(launch_aborted=True) == {
+        "status": "already_aborted",
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+    }
+    assert _rows(
+        db,
+        "SELECT event_kind, evidence_digest "
+        "FROM session_claude_visibility_characterization_events "
+        "WHERE job_id = ? ORDER BY event_kind",
+        (identity.job_id,),
+    ) == [
+        {"event_kind": "launch_aborted", "evidence_digest": "b" * 64},
+        {"event_kind": "registered", "evidence_digest": "a" * 64},
+    ]
+    assert _rows(
+        db,
+        "SELECT outcome, evidence_digest, consumed_at "
+        "FROM session_claude_visibility_reconciliations WHERE job_id = ?",
+        (identity.job_id,),
+    ) == [
+        {
+            "outcome": "absent",
+            "evidence_digest": "b" * 64,
+            "consumed_at": 100.0,
+        }
+    ]
+    assert store.claude_visibility_status(100.0)["counts"] == {
+        "claude_pending": 0,
+        "claude_leased": 0,
+        "claude_retry": 0,
+        "claude_visible": 0,
+        "claude_failed": 0,
+    }
+    assert (
+        store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02").status
+        == "no_due_job"
+    )
+    assert (
+        store.claim_claude_visibility_job(
+            100.0,
+            60,
+            25,
+            "0.50",
+            "0.02",
+            expected_job_id=identity.job_id,
+        ).status
+        == "no_due_job"
+    )
+    assert (
+        store.claim_claude_visibility_reconciliation(
+            100.0, 60, expected_job_id=identity.job_id
+        ).status
+        == "no_due_job"
+    )
+
+    store.record_claude_visibility_cycle(
+        status="no_due_job", error_code=None, registrar_result=False
+    )
+    assert store.claude_visibility_status(100.0)["last_empty_cycle"] == {
+        "tracked": True,
+        "value": 100.0,
+    }
+
+    next_candidate, next_identity = _claude_visibility_identity("after-abort")
+    assert store.enqueue_claude_visibility_batch_if_idle(
+        [(next_candidate, next_identity)], _CLAUDE_MARKER_SECRET
+    ) == {"status": "inserted", "inserted": 1, "duplicates": 0}
+    next_claim = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        expected_job_id=next_identity.job_id,
+    )
+    assert next_claim.claimed is True
+    assert next_claim.job_id == next_identity.job_id
+
+
+def test_characterization_pending_without_launch_can_reconcile_exact_absence_for_abort(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "45454545-4545-4545-8545-454545454545"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+
+    reconciliation = store.claim_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+    )
+
+    assert reconciliation.claimed is True
+    assert reconciliation.lease_kind == "reconciliation"
+    assert reconciliation.attempt_ordinal == 0
+    assert reconciliation.launch_permitted is False
+    assert reconciliation.registration_reserved is False
+    assert reconciliation.requires_exact_id_reconciliation is True
+    assert _rows(
+        db,
+        "SELECT attempts, lease_kind FROM session_claude_visibility_jobs WHERE id = ?",
+        (identity.job_id,),
+    ) == [{"attempts": 0, "lease_kind": "reconciliation"}]
+    assert _rows(db, "SELECT * FROM session_claude_registration_usage") == []
+
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        0,
+        "b" * 64,
+    )
+    terminal = store.record_claude_visibility_characterization(
+        job_id=identity.job_id,
+        operation_id=operation_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=identity.bridge_id,
+        idempotency_key=identity.idempotency_key,
+        reserved_claude_uuid=identity.claude_uuid,
+        native_name=candidate.native_name,
+        source_cwd=candidate.source_cwd,
+        signed_marker=identity.signed_marker,
+        evidence_digest="a" * 64,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        cleanup_completed=False,
+        launch_aborted=True,
+    )
+
+    assert terminal["status"] == "launch_aborted"
+    assert store.claude_visibility_status(100.0)["counts"] == {
+        "claude_pending": 0,
+        "claude_leased": 0,
+        "claude_retry": 0,
+        "claude_visible": 0,
+        "claude_failed": 0,
+    }
+
+
+def test_characterization_abort_consumes_exact_absence_after_max_attempt_failure(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "46464646-4646-4646-8646-464646464646"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+    launch = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        max_attempts=1,
+        expected_job_id=identity.job_id,
+    )
+    store.retry_claude_visibility_job(
+        identity.job_id,
+        launch.lease_digest,
+        "creation_ambiguous",
+        100.0,
+        "launch result unknown",
+    )
+    reconciliation = store.claim_claude_visibility_reconciliation(
+        100.0,
+        60,
+        expected_job_id=identity.job_id,
+    )
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        reconciliation.attempt_ordinal,
+        "b" * 64,
+    )
+    exhausted = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        max_attempts=1,
+        expected_job_id=identity.job_id,
+    )
+    assert exhausted.status == "max_attempts_exhausted"
+
+    terminal = store.record_claude_visibility_characterization(
+        job_id=identity.job_id,
+        operation_id=operation_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=identity.bridge_id,
+        idempotency_key=identity.idempotency_key,
+        reserved_claude_uuid=identity.claude_uuid,
+        native_name=candidate.native_name,
+        source_cwd=candidate.source_cwd,
+        signed_marker=identity.signed_marker,
+        evidence_digest="a" * 64,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        cleanup_completed=False,
+        launch_aborted=True,
+    )
+
+    assert terminal["status"] == "launch_aborted"
+    assert _rows(
+        db,
+        """SELECT state, attempts, error_code, lease_digest
+           FROM session_claude_visibility_jobs WHERE id = ?""",
+        (identity.job_id,),
+    ) == [
+        {
+            "state": "claude_failed",
+            "attempts": 1,
+            "error_code": "max_attempts_exhausted",
+            "lease_digest": None,
+        }
+    ]
+    assert _rows(
+        db,
+        """SELECT outcome, consumed_at
+           FROM session_claude_visibility_reconciliations WHERE job_id = ?""",
+        (identity.job_id,),
+    ) == [{"outcome": "absent", "consumed_at": 100.0}]
+
+
+def test_characterization_rejects_cleanup_and_abort_in_one_event(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    operation_id = "55555555-5555-4555-8555-555555555555"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    with pytest.raises(ValueError, match="cleanup and abort are mutually exclusive"):
+        store.record_claude_visibility_characterization(
+            job_id=identity.job_id,
+            operation_id=operation_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=identity.bridge_id,
+            idempotency_key=identity.idempotency_key,
+            reserved_claude_uuid=identity.claude_uuid,
+            native_name=candidate.native_name,
+            source_cwd=candidate.source_cwd,
+            signed_marker=identity.signed_marker,
+            evidence_digest="a" * 64,
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            cleanup_completed=True,
+            launch_aborted=True,
+        )
 
 
 def test_claude_visibility_historical_lineage_reconciliation_is_concurrent_safe(
@@ -6930,9 +7812,7 @@ def test_precreate_cutover_resolution_is_append_only_and_unblocks_without_native
     assert failed["attempts"] == 0
     reservation = store.get_sidebar_create_reservation(candidate.source_session_id)
     assert reservation is not None
-    cutover = store.get_state(
-        "session-bridge:sidebar:create-reservation-cutover:v1"
-    )
+    cutover = store.get_state("session-bridge:sidebar:create-reservation-cutover:v1")
     assert cutover is not None
     reservation_key = (
         "session-bridge:sidebar-create:"

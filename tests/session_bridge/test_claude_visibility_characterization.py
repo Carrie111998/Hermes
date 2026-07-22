@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import timezone
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import time
 from typing import Any, Mapping
 
 import pytest
+
+from hermes_state import SessionDB
 
 from session_bridge.characterize import (
     CharacterizationAuthenticationFailure,
@@ -19,14 +22,16 @@ from session_bridge.characterize import (
     _write_characterization_record,
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
+    retire_aborted_claude_visibility_characterization,
 )
-from session_bridge.cli import _claude_visibility_preflight
+from session_bridge.cli import ProductionBackend, _claude_visibility_preflight
 from session_bridge.cli import main
 from session_bridge.config import BridgeConfig
 from session_bridge.claude_registrar import ClaudeRegistrarOutcome
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
     ClaudeVisibilityClaim,
+    build_claude_visibility_candidate,
     build_claude_registration_prompt,
     derive_claude_visibility_identity,
 )
@@ -36,9 +41,556 @@ from session_bridge.models import (
     Provider,
     SessionProjection,
 )
+from session_bridge.store import SessionBridgeStore
 
 
 SECRET = b"characterization-marker-secret"
+
+
+def _aborted_characterization_state(
+    root: Path, operation_id: str
+) -> tuple[dict[str, Any], Path]:
+    disposable = root / f"claude-visibility-{operation_id}"
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps(
+            {"operation_id": operation_id, "nonce": "abort-nonce"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=f"codex:{operation_id}",
+        source_provider=Provider.CODEX,
+        native_name="[Codex] disposable abort probe",
+        source_cwd=str(disposable),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, SECRET)
+    return (
+        {
+            "schema_version": 2,
+            "operation_id": operation_id,
+            "phase": "launching",
+            "created_at": 100.0,
+            "expires_at": 200.0,
+            "source_provider": Provider.CODEX.value,
+            "source_session_id": candidate.source_session_id,
+            "bridge_id": identity.bridge_id,
+            "job_id": identity.job_id,
+            "reserved_claude_uuid": identity.claude_uuid,
+            "native_name": candidate.native_name,
+            "source_cwd": candidate.source_cwd,
+            "signed_marker": identity.signed_marker,
+            "transcript_path": None,
+            "transcript_identity": None,
+            "sentinel_nonce": "abort-nonce",
+            "cleanup_authorized_at": None,
+            "cleanup_capability_hash": "a" * 64,
+        },
+        disposable,
+    )
+
+
+def test_exact_absence_abort_retires_active_record_and_allows_fresh_reservation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sources"
+    projects = tmp_path / "projects"
+    root.mkdir()
+    projects.mkdir()
+    operation_id = "77777777-7777-4777-8777-777777777777"
+    state, disposable = _aborted_characterization_state(root, operation_id)
+    active = root / ".claude-visibility-operation.json"
+    _write_characterization_record(active, state, SECRET)
+
+    first = retire_aborted_claude_visibility_characterization(
+        source_root=root,
+        marker_secret=SECRET,
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        expected_operation_id=operation_id,
+        now=lambda: 150.0,
+    )
+    replay = retire_aborted_claude_visibility_characterization(
+        source_root=root,
+        marker_secret=SECRET,
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        expected_operation_id=operation_id,
+        now=lambda: 160.0,
+    )
+
+    assert (
+        first
+        == replay
+        == {
+            "status": "retired",
+            "job_id": state["job_id"],
+            "reserved_claude_uuid": state["reserved_claude_uuid"],
+            "active_record_retired": True,
+        }
+    )
+    assert not active.exists()
+    assert not disposable.exists()
+    archived = root / ".abort-completed" / f"{operation_id}.json"
+    assert _read_characterization_record(archived, SECRET)["phase"] == "aborted"
+
+    fresh: list[SessionProjection] = []
+
+    def stop_after_reservation(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        fresh.append(projection)
+        raise RuntimeError("fresh_reservation_reached")
+
+    with pytest.raises(RuntimeError, match="fresh_reservation_reached"):
+        characterize_claude_visibility(
+            source_root=root,
+            projects_root=projects,
+            reserve=stop_after_reservation,
+            registrar=object(),
+            restarted_source=lambda: pytest.fail("fresh reserve must happen first"),
+            marker_secret=SECRET,
+            now=lambda: 170.0,
+        )
+    assert len(fresh) == 1
+    assert fresh[0].native_id != operation_id
+
+
+@pytest.mark.parametrize("move_before_crash", [False, True])
+def test_exact_absence_abort_replays_crash_around_active_claim_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    move_before_crash: bool,
+) -> None:
+    root = tmp_path / "sources"
+    root.mkdir()
+    operation_id = "99999999-9999-4999-8999-999999999999"
+    state, disposable = _aborted_characterization_state(root, operation_id)
+    active = root / ".claude-visibility-operation.json"
+    claimed = root / ".abort-claims" / f"{operation_id}.json"
+    _write_characterization_record(active, state, SECRET)
+    actual_replace = os.replace
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_at_claim_rename(source: object, destination: object) -> None:
+        if Path(source) == active and Path(destination) == claimed:
+            if move_before_crash:
+                actual_replace(source, destination)
+            raise SimulatedCrash
+        actual_replace(source, destination)
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(
+            "session_bridge.characterize.os.replace", crash_at_claim_rename
+        )
+        with pytest.raises(SimulatedCrash):
+            retire_aborted_claude_visibility_characterization(
+                source_root=root,
+                marker_secret=SECRET,
+                expected_job_id=str(state["job_id"]),
+                expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+                expected_operation_id=operation_id,
+                now=lambda: 150.0,
+            )
+
+    replay = retire_aborted_claude_visibility_characterization(
+        source_root=root,
+        marker_secret=SECRET,
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        expected_operation_id=operation_id,
+        now=lambda: 160.0,
+    )
+
+    assert replay["status"] == "retired"
+    assert not active.exists()
+    assert not claimed.exists()
+    assert not disposable.exists()
+    assert (
+        _read_characterization_record(
+            root / ".abort-completed" / f"{operation_id}.json", SECRET
+        )["phase"]
+        == "aborted"
+    )
+
+
+@pytest.mark.parametrize("move_before_crash", [False, True])
+def test_exact_absence_abort_replays_crash_around_disposable_quarantine_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    move_before_crash: bool,
+) -> None:
+    root = tmp_path / "sources"
+    root.mkdir()
+    operation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    state, disposable = _aborted_characterization_state(root, operation_id)
+    active = root / ".claude-visibility-operation.json"
+    quarantine = root / ".abort-quarantine" / operation_id
+    _write_characterization_record(active, state, SECRET)
+    actual_replace = os.replace
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_at_quarantine_rename(source: object, destination: object) -> None:
+        if Path(source) == disposable and Path(destination) == quarantine:
+            if move_before_crash:
+                actual_replace(source, destination)
+            raise SimulatedCrash
+        actual_replace(source, destination)
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(
+            "session_bridge.characterize.os.replace", crash_at_quarantine_rename
+        )
+        with pytest.raises(SimulatedCrash):
+            retire_aborted_claude_visibility_characterization(
+                source_root=root,
+                marker_secret=SECRET,
+                expected_job_id=str(state["job_id"]),
+                expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+                expected_operation_id=operation_id,
+                now=lambda: 150.0,
+            )
+
+    replay = retire_aborted_claude_visibility_characterization(
+        source_root=root,
+        marker_secret=SECRET,
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        expected_operation_id=operation_id,
+        now=lambda: 160.0,
+    )
+
+    assert replay["status"] == "retired"
+    assert not active.exists()
+    assert not disposable.exists()
+    assert not quarantine.exists()
+
+
+def test_exact_absence_abort_replays_after_crash_during_deferred_quarantine_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "sources"
+    root.mkdir()
+    operation_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    state, disposable = _aborted_characterization_state(root, operation_id)
+    (disposable / "payload.txt").write_text("disposable", encoding="utf-8")
+    active = root / ".claude-visibility-operation.json"
+    claimed = root / ".abort-claims" / f"{operation_id}.json"
+    completed = root / ".abort-completed" / f"{operation_id}.json"
+    quarantine = root / ".abort-quarantine" / operation_id
+    _write_characterization_record(active, state, SECRET)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_during_delete(path: Path, _state: Mapping[str, Any]) -> None:
+        (path / ".session-bridge-characterization.json").unlink()
+        (path / "payload.txt").unlink()
+        raise SimulatedCrash
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(
+            "session_bridge.characterize._safe_remove_disposable",
+            crash_during_delete,
+        )
+        with pytest.raises(SimulatedCrash):
+            retire_aborted_claude_visibility_characterization(
+                source_root=root,
+                marker_secret=SECRET,
+                expected_job_id=str(state["job_id"]),
+                expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+                expected_operation_id=operation_id,
+                now=lambda: 150.0,
+            )
+
+    assert completed.exists()
+    assert not active.exists()
+    assert not claimed.exists()
+    assert quarantine.exists()
+
+    replay = retire_aborted_claude_visibility_characterization(
+        source_root=root,
+        marker_secret=SECRET,
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        expected_operation_id=operation_id,
+        now=lambda: 160.0,
+    )
+
+    assert replay["status"] == "retired"
+    assert not active.exists()
+    assert not claimed.exists()
+    assert completed.exists()
+    # Identity loss during best-effort deletion is retained for manual cleanup,
+    # never reinterpreted as authority to delete an untrusted directory.
+    assert quarantine.exists()
+
+
+def test_characterization_fails_closed_while_authenticated_abort_claim_is_open(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "sources"
+    projects = tmp_path / "projects"
+    root.mkdir()
+    projects.mkdir()
+    operation_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    state, disposable = _aborted_characterization_state(root, operation_id)
+    active = root / ".claude-visibility-operation.json"
+    claim_root = root / ".abort-claims"
+    claim_root.mkdir()
+    claimed = claim_root / f"{operation_id}.json"
+    _write_characterization_record(active, state, SECRET)
+    os.replace(active, claimed)
+
+    with pytest.raises(RuntimeError, match="characterization_abort_in_progress"):
+        characterize_claude_visibility(
+            source_root=root,
+            projects_root=projects,
+            reserve=lambda _projection: pytest.fail(
+                "open abort claim must block a fresh reservation"
+            ),
+            registrar=object(),
+            restarted_source=lambda: pytest.fail(
+                "open abort claim must block native discovery"
+            ),
+            marker_secret=SECRET,
+            now=lambda: 150.0,
+        )
+
+    assert claimed.exists()
+    assert disposable.exists()
+    assert not active.exists()
+
+
+def test_characterization_fails_closed_while_authenticated_cleanup_claim_is_open(
+    tmp_path: Path,
+) -> None:
+    pending, state, _registrar, _restarted_source = _pending_characterization(tmp_path)
+    operation_id = pending["cleanup_token"]["id"]
+    active = state["source_root"] / ".claude-visibility-operation.json"
+    claim_root = state["source_root"] / ".cleanup-claims"
+    claim_root.mkdir()
+    claimed = claim_root / f"{operation_id}.json"
+    authorized = _read_characterization_record(active, SECRET)
+    authorized["cleanup_authorized_at"] = 11.0
+    _write_characterization_record(active, authorized, SECRET)
+    os.replace(active, claimed)
+
+    with pytest.raises(RuntimeError, match="characterization_cleanup_in_progress"):
+        characterize_claude_visibility(
+            source_root=state["source_root"],
+            projects_root=state["projects_root"],
+            reserve=lambda _projection: pytest.fail(
+                "open cleanup claim must block a fresh reservation"
+            ),
+            registrar=object(),
+            restarted_source=lambda: pytest.fail(
+                "open cleanup claim must block native discovery"
+            ),
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )
+
+    assert claimed.exists()
+    assert state["transcript"].exists()
+    assert Path(state["claim"].source_cwd).exists()
+
+
+def test_characterization_persists_exact_launching_identity_before_reservation_call(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+    reserve_calls: list[ClaudeVisibilityClaim] = []
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        reserve_calls.append(claim)
+        state.update(claim=claim, marker=marker)
+        if len(reserve_calls) == 1:
+            # Models a crash after the store's atomic registration boundary but
+            # before the callback can return its exact launch lease.
+            raise SimulatedCrash
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir(exist_ok=True)
+        transcript.write_text("native", encoding="utf-8")
+        state["transcript"] = transcript
+        return claim
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        transcript = state.get(
+            "transcript",
+            projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl",
+        )
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=_successful_characterization_messages(claim, state["marker"]),
+            native_path=str(transcript),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(transcript, projection, state["marker"])
+
+    with pytest.raises(SimulatedCrash):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=_Registrar(),
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 10.0,
+        )
+
+    active = source_root / ".claude-visibility-operation.json"
+    persisted = _read_characterization_record(active, SECRET)
+    first_claim = reserve_calls[0]
+    assert persisted["phase"] == "launching"
+    assert persisted["job_id"] == first_claim.job_id
+    assert persisted["reserved_claude_uuid"] == first_claim.reserved_claude_uuid
+    assert persisted["signed_marker"] == first_claim.signed_marker
+
+    recovered = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=_Registrar(),
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+
+    assert recovered["reserved_claude_uuid"] == first_claim.reserved_claude_uuid
+    assert {claim.job_id for claim in reserve_calls} == {first_claim.job_id}
+    assert {claim.reserved_claude_uuid for claim in reserve_calls} == {
+        first_claim.reserved_claude_uuid
+    }
+
+
+def test_characterization_serializes_concurrent_root_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    first_uuid_entered = threading.Event()
+    release_first_uuid = threading.Event()
+    uuid_calls: list[str] = []
+    generated = iter([
+        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    ])
+
+    def controlled_operation_id() -> str:
+        value = next(generated)
+        uuid_calls.append(value)
+        if len(uuid_calls) == 1:
+            first_uuid_entered.set()
+            assert release_first_uuid.wait(5)
+        return value
+
+    monkeypatch.setattr(
+        "session_bridge.characterize._new_characterization_operation_id",
+        controlled_operation_id,
+    )
+    registrations: dict[str, tuple[ClaudeVisibilityClaim, str, Path]] = {}
+    reserve_calls: list[str] = []
+    state_lock = threading.Lock()
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir(exist_ok=True)
+        transcript.write_text("native", encoding="utf-8")
+        with state_lock:
+            reserve_calls.append(claim.job_id or "")
+            registrations[claim.reserved_claude_uuid or ""] = (
+                claim,
+                marker,
+                transcript,
+            )
+        return claim
+
+    def restarted_source() -> _RestartedSource:
+        operation = _read_characterization_record(
+            source_root / ".claude-visibility-operation.json", SECRET
+        )
+        reserved_uuid = str(operation["reserved_claude_uuid"])
+        claim, marker, transcript = registrations[reserved_uuid]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=reserved_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=_successful_characterization_messages(claim, marker),
+            native_path=str(transcript),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(transcript, projection, marker)
+
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(
+                characterize_claude_visibility(
+                    source_root=source_root,
+                    projects_root=projects_root,
+                    reserve=reserve,
+                    registration_is_visible=lambda _operation: True,
+                    registrar=_Registrar(),
+                    restarted_source=restarted_source,
+                    marker_secret=SECRET,
+                    now=lambda: 10.0,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run)
+    second = threading.Thread(target=run)
+    first.start()
+    assert first_uuid_entered.wait(5)
+    second.start()
+    time.sleep(0.1)
+    release_first_uuid.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert len(uuid_calls) == 1
+    assert len(reserve_calls) == 1
+    assert len(results) == 2
+    assert {result["reserved_claude_uuid"] for result in results} == {
+        results[0]["reserved_claude_uuid"]
+    }
 
 
 def _claude_216_runner(
@@ -427,9 +979,11 @@ def _pending_characterization(
     tmp_path: Path,
     *,
     now: float = 10.0,
+    source_root: Path | None = None,
+    projects_root: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], _Registrar, Any]:
-    source_root = tmp_path / "sources"
-    projects_root = tmp_path / "projects"
+    source_root = source_root or tmp_path / "sources"
+    projects_root = projects_root or tmp_path / "projects"
     projects_root.mkdir()
     state: dict[str, Any] = {}
     registrar = _Registrar()
@@ -553,7 +1107,7 @@ def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit
     ) -> None:
         nonlocal failed_checkpoint
         _write_characterization_record(path, payload, secret)
-        if payload.get("phase") == "disposable_removed" and not failed_checkpoint:
+        if payload.get("phase") == "disposable_quarantined" and not failed_checkpoint:
             failed_checkpoint = True
             raise OSError("synthetic cleanup checkpoint interruption")
 
@@ -589,6 +1143,147 @@ def test_characterization_leaves_transcript_for_operator_then_cleans_on_explicit
     assert cleaned["cleanup"] == "removed_exact_characterization"
     assert not state["transcript"].exists()
     assert not Path(reserved[0].cwd or "").exists()
+
+
+@pytest.mark.parametrize("move_before_crash", [False, True])
+def test_cleanup_replays_crash_around_disposable_quarantine_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    move_before_crash: bool,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    operation_id = pending["cleanup_token"]["id"]
+    disposable = Path(state["claim"].source_cwd)
+    quarantine = state["source_root"] / ".cleanup-quarantine" / operation_id
+    actual_replace = os.replace
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_at_quarantine_rename(source: object, destination: object) -> None:
+        if Path(source) == disposable and Path(destination) == quarantine:
+            if move_before_crash:
+                actual_replace(source, destination)
+            raise SimulatedCrash
+        actual_replace(source, destination)
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(
+            "session_bridge.characterize.os.replace", crash_at_quarantine_rename
+        )
+        with pytest.raises(SimulatedCrash):
+            cleanup_characterized_claude_visibility(
+                cleanup_token=pending["cleanup_token"],
+                source_root=state["source_root"],
+                projects_root=state["projects_root"],
+                restarted_source=restarted_source,
+                marker_secret=SECRET,
+                now=lambda: 11.0,
+            )
+
+    replay = cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=lambda: pytest.fail(
+            "quarantine replay must not rediscover the removed transcript"
+        ),
+        marker_secret=SECRET,
+        now=lambda: 12.0,
+    )
+
+    assert replay["cleanup"] == "removed_exact_characterization"
+    assert not disposable.exists()
+    assert not quarantine.exists()
+
+
+def test_cleanup_replays_after_crash_during_deferred_quarantine_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    operation_id = pending["cleanup_token"]["id"]
+    disposable = Path(state["claim"].source_cwd)
+    (disposable / "payload.txt").write_text("disposable", encoding="utf-8")
+    claim = state["source_root"] / ".cleanup-claims" / f"{operation_id}.json"
+    completed = state["source_root"] / ".cleanup-completed" / f"{operation_id}.json"
+    quarantine = state["source_root"] / ".cleanup-quarantine" / operation_id
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    def crash_during_delete(path: Path, _state: Mapping[str, Any]) -> None:
+        (path / ".session-bridge-characterization.json").unlink()
+        (path / "payload.txt").unlink()
+        raise SimulatedCrash
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(
+            "session_bridge.characterize._safe_remove_disposable",
+            crash_during_delete,
+        )
+        with pytest.raises(SimulatedCrash):
+            cleanup_characterized_claude_visibility(
+                cleanup_token=pending["cleanup_token"],
+                source_root=state["source_root"],
+                projects_root=state["projects_root"],
+                restarted_source=restarted_source,
+                marker_secret=SECRET,
+                now=lambda: 11.0,
+            )
+
+    assert completed.exists()
+    assert not claim.exists()
+    assert quarantine.exists()
+
+    replay = cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=lambda: pytest.fail(
+            "terminal cleanup replay must not rediscover native state"
+        ),
+        marker_secret=SECRET,
+        now=lambda: 12.0,
+    )
+
+    assert replay["cleanup"] == "removed_exact_characterization"
+    assert completed.exists()
+    assert not claim.exists()
+    assert quarantine.exists()
+
+
+def test_cleanup_terminal_replay_removes_stale_authenticated_claim(
+    tmp_path: Path,
+) -> None:
+    pending, state, _registrar, restarted_source = _pending_characterization(tmp_path)
+    operation_id = pending["cleanup_token"]["id"]
+    cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+    done = state["source_root"] / ".cleanup-completed" / f"{operation_id}.json"
+    claimed_root = state["source_root"] / ".cleanup-claims"
+    claimed = claimed_root / f"{operation_id}.json"
+    stale = _read_characterization_record(done, SECRET)
+    stale["phase"] = "disposable_quarantined"
+    _write_characterization_record(claimed, stale, SECRET)
+
+    replay = cleanup_characterized_claude_visibility(
+        cleanup_token=pending["cleanup_token"],
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        restarted_source=lambda: pytest.fail("terminal replay must not rediscover"),
+        marker_secret=SECRET,
+        now=lambda: 12.0,
+    )
+
+    assert replay["cleanup"] == "removed_exact_characterization"
+    assert not claimed.exists()
 
 
 def test_ready_cleanup_accepts_complete_strict_operator_continuation_pair(
@@ -1477,16 +2172,32 @@ def test_characterization_rerun_reconciles_same_operation_without_second_launch(
     projects_root.mkdir()
     claims: list[ClaudeVisibilityClaim] = []
     launches: list[str] = []
+    processes: list[str | None] = []
     state: dict[str, Any] = {}
 
     def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
         claim, marker = _claim_for(projection)
+        if claims:
+            claim = replace(
+                claim,
+                lease_kind="reconciliation",
+                lease_digest="b" * 64,
+                registration_reserved=False,
+                launch_permitted=False,
+                requires_exact_id_reconciliation=True,
+                prior_error_code="lease_expired",
+            )
         claims.append(claim)
         state.update(claim=claim, marker=marker)
         return claim
 
     class FailingAfterLaunchRegistrar:
         def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+            processes.append(claim.lease_kind)
+            if claim.lease_kind == "reconciliation":
+                return ClaudeRegistrarOutcome(
+                    "visible", claim.job_id, claim.reserved_claude_uuid
+                )
             launches.append(claim.reserved_claude_uuid or "")
             transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
             transcript.parent.mkdir(exist_ok=True)
@@ -1528,12 +2239,461 @@ def test_characterization_rerun_reconciles_same_operation_without_second_launch(
         registrar=FailingAfterLaunchRegistrar(),
         restarted_source=restarted_source,
         marker_secret=SECRET,
+        reconcile_existing=reserve,
+        registration_is_visible=lambda _operation: failure_point == "after_commit",
         now=lambda: 11.0,
     )
 
     assert len(launches) == 1
-    assert len(claims) == 1
+    assert processes == (
+        ["launch"] if failure_point == "after_commit" else ["launch", "reconciliation"]
+    )
+    assert len(claims) == (1 if failure_point == "after_commit" else 2)
     assert recovered["reserved_claude_uuid"] == launches[0]
+
+
+def test_characterization_commit_failure_reconciles_existing_transcript_into_store(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    database = SessionDB(tmp_path / "state.db")
+    clock = [100.0]
+    store = SessionBridgeStore(
+        database,
+        clock=lambda: clock[0],
+        local_timezone=timezone.utc,
+    )
+    state: dict[str, Any] = {}
+    claims: list[ClaudeVisibilityClaim] = []
+    native_launches: list[str] = []
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        candidate = build_claude_visibility_candidate(
+            projection, eligible_at=projection.last_active
+        )
+        identity = derive_claude_visibility_identity(candidate, SECRET)
+        store.enqueue_claude_visibility_characterization(
+            candidate,
+            identity,
+            SECRET,
+            operation_id=projection.native_id,
+            evidence_digest="a" * 64,
+        )
+        claim = store.claim_claude_visibility_job(
+            clock[0],
+            10.0,
+            25,
+            "1.00",
+            "0.02",
+            expected_job_id=identity.job_id,
+        )
+        claims.append(claim)
+        state.update(claim=claim, marker=identity.signed_marker)
+        return claim
+
+    def reconcile(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        candidate = build_claude_visibility_candidate(
+            projection, eligible_at=projection.last_active
+        )
+        identity = derive_claude_visibility_identity(candidate, SECRET)
+        claim = store.claim_claude_visibility_reconciliation(
+            clock[0], 10.0, expected_job_id=identity.job_id
+        )
+        claims.append(claim)
+        state["claim"] = claim
+        return claim
+
+    class CommitFailingRegistrar:
+        def process(self, claim: ClaudeVisibilityClaim) -> ClaudeRegistrarOutcome:
+            if claim.lease_kind == "launch":
+                native_launches.append(claim.reserved_claude_uuid or "")
+                transcript = (
+                    projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+                )
+                transcript.parent.mkdir(exist_ok=True)
+                transcript.write_text("native", encoding="utf-8")
+                state["transcript"] = transcript
+                # Mirrors ClaudeNativeRegistrar's commit-exception outcome: the
+                # exact transcript exists while the launch lease remains durable.
+                return ClaudeRegistrarOutcome(
+                    "retry",
+                    claim.job_id,
+                    claim.reserved_claude_uuid,
+                    "session_bridge_unavailable",
+                )
+            store.commit_claude_visibility_job(
+                claim.job_id or "",
+                claim.lease_digest or "",
+                "b" * 64,
+                clock[0],
+            )
+            return ClaudeRegistrarOutcome(
+                "visible", claim.job_id, claim.reserved_claude_uuid
+            )
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=100.0,
+            last_active=101.0,
+            messages=_successful_characterization_messages(
+                claim, state["marker"], timestamp=100.0
+            ),
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    registrar = CommitFailingRegistrar()
+    with pytest.raises(RuntimeError, match="characterization_registration_failed"):
+        characterize_claude_visibility(
+            source_root=source_root,
+            projects_root=projects_root,
+            reserve=reserve,
+            registrar=registrar,
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: clock[0],
+        )
+
+    clock[0] = 111.0
+
+    def registration_is_visible(operation: Mapping[str, Any]) -> bool:
+        rows = store.claude_visibility_status(clock[0])["characterizations"]
+        return rows == [{"job_id": operation["job_id"], "state": "claude_visible"}]
+
+    recovered = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        reconcile_existing=reconcile,
+        registration_is_visible=registration_is_visible,
+        registrar=registrar,
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: clock[0],
+    )
+
+    assert recovered["reserved_claude_uuid"] == native_launches[0]
+    assert native_launches == [claims[0].reserved_claude_uuid]
+    assert [claim.lease_kind for claim in claims] == ["launch", "reconciliation"]
+    assert store.claude_visibility_status(clock[0])["characterizations"] == [
+        {"job_id": claims[0].job_id, "state": "claude_visible"}
+    ]
+    database.close()
+
+
+def test_ready_visible_characterization_renews_without_claude_auth_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    state: dict[str, Any] = {}
+
+    def reserve(projection: SessionProjection) -> ClaudeVisibilityClaim:
+        claim, marker = _claim_for(projection)
+        transcript = projects_root / "exact" / f"{claim.reserved_claude_uuid}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("native", encoding="utf-8")
+        state.update(claim=claim, marker=marker, transcript=transcript)
+        return claim
+
+    def restarted_source() -> _RestartedSource:
+        claim = state["claim"]
+        projection = SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=claim.reserved_claude_uuid,
+            title=claim.native_name,
+            cwd=claim.source_cwd,
+            started_at=10.0,
+            last_active=11.0,
+            messages=_successful_characterization_messages(claim, state["marker"]),
+            native_path=str(state["transcript"]),
+            native_hash="b" * 64,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        )
+        return _RestartedSource(state["transcript"], projection, state["marker"])
+
+    original = characterize_claude_visibility(
+        source_root=source_root,
+        projects_root=projects_root,
+        reserve=reserve,
+        registrar=_Registrar(),
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 10.0,
+    )
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            return {"status": "registered"}
+
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": 0,
+                    "claude_visible": 1,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "lineage": {
+                    "unlinked_visible": 0,
+                    "repairable": 0,
+                    "blocked": 0,
+                    "blocker_codes": {},
+                },
+                "characterizations": [
+                    {"job_id": state["claim"].job_id, "state": "claude_visible"}
+                ],
+            }
+
+        def claim_claude_visibility_job(self, *_args, **_kwargs):
+            pytest.fail("visible ready renewal must not claim launch authority")
+
+        def claim_claude_visibility_reconciliation(self, *_args, **_kwargs):
+            pytest.fail("visible ready renewal must not claim reconciliation")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli._CLAUDE_PROJECTS_ROOT", projects_root)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: SECRET)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda _name: pytest.fail("ready visible renewal must not resolve Claude"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight",
+        lambda _command: pytest.fail("ready visible renewal must not require auth"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: restarted_source(),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ready visible renewal must not construct a native registrar"
+        ),
+    )
+
+    renewed = backend.characterize_claude_visibility()
+
+    assert renewed["reserved_claude_uuid"] == original["reserved_claude_uuid"]
+    assert renewed["cleanup_token"]["id"] == original["cleanup_token"]["id"]
+    assert (
+        renewed["cleanup_token"]["capability"]
+        != original["cleanup_token"]["capability"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("recovery_phase", "job_state", "claim_status"),
+    [
+        ("launched", "claude_retry", "claimed"),
+        ("ready", "claude_retry", "claimed"),
+        ("ready", "claude_pending", "claimed"),
+        ("ready", "claude_leased", "claimed"),
+        ("ready", "claude_leased", "no_due_job"),
+    ],
+)
+def test_ready_retry_characterization_uses_exact_backend_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_phase: str,
+    job_state: str,
+    claim_status: str,
+) -> None:
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    projects_root = tmp_path / "projects"
+    _pending, state, launch_registrar, restarted_source = _pending_characterization(
+        tmp_path,
+        source_root=source_root,
+        projects_root=projects_root,
+    )
+    active_path = source_root / ".claude-visibility-operation.json"
+    active = _read_characterization_record(active_path, SECRET)
+    active["phase"] = recovery_phase
+    _write_characterization_record(active_path, active, SECRET)
+    reconciliation_claims: list[str] = []
+    recovery_registrar = _Registrar()
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            return {"status": "registered"}
+
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    "claude_pending": int(job_state == "claude_pending"),
+                    "claude_leased": int(job_state == "claude_leased"),
+                    "claude_retry": int(job_state == "claude_retry"),
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": (
+                    {"session_bridge_unavailable": 1}
+                    if job_state == "claude_retry"
+                    else {}
+                ),
+                "failed_codes": {},
+                "fatal": [],
+                "lineage": {
+                    "unlinked_visible": 0,
+                    "repairable": 0,
+                    "blocked": 0,
+                    "blocker_codes": {},
+                },
+                "characterizations": [
+                    {"job_id": state["claim"].job_id, "state": job_state}
+                ],
+            }
+
+        def claim_claude_visibility_job(self, *_args, **_kwargs):
+            pytest.fail("ready retry recovery must not claim launch authority")
+
+        def claim_claude_visibility_reconciliation(
+            self, *_args, expected_job_id, **_kwargs
+        ):
+            reconciliation_claims.append(expected_job_id)
+            return replace(
+                state["claim"],
+                status=claim_status,
+                lease_kind="reconciliation",
+                lease_digest="c" * 64,
+                registration_reserved=False,
+                launch_permitted=False,
+                requires_exact_id_reconciliation=True,
+                prior_error_code="session_bridge_unavailable",
+            )
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli._CLAUDE_PROJECTS_ROOT", projects_root)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: SECRET)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda _name: pytest.fail(
+            "ready retry exact reconciliation must not resolve Claude"
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight",
+        lambda _command: pytest.fail(
+            "ready retry exact reconciliation must not require OAuth"
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: restarted_source(),
+    )
+
+    def recovery_registrar_factory(*_args, **kwargs):
+        assert kwargs["startup_theme"] == "light"
+        assert kwargs["claude_command"] == ()
+        return recovery_registrar
+
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar", recovery_registrar_factory
+    )
+
+    if claim_status == "no_due_job":
+        with pytest.raises(RuntimeError, match="characterization_reservation_invalid"):
+            backend.characterize_claude_visibility()
+    else:
+        recovered = backend.characterize_claude_visibility()
+        assert recovered["reserved_claude_uuid"] == state["claim"].reserved_claude_uuid
+    assert len(launch_registrar.claims) == 1
+    assert [claim.lease_kind for claim in recovery_registrar.claims] == (
+        ["reconciliation"] if claim_status == "claimed" else []
+    )
+    assert reconciliation_claims == [state["claim"].job_id]
+
+
+def test_ready_characterization_refuses_success_when_store_is_not_visible(
+    tmp_path: Path,
+) -> None:
+    _pending, state, registrar, restarted_source = _pending_characterization(tmp_path)
+    recovery_registrar = _Registrar()
+
+    with pytest.raises(RuntimeError, match="characterization_reservation_invalid"):
+        characterize_claude_visibility(
+            source_root=state["source_root"],
+            projects_root=state["projects_root"],
+            reserve=lambda _projection: pytest.fail(
+                "ready recovery must never request launch authority"
+            ),
+            reconcile_existing=lambda _projection: ClaudeVisibilityClaim(
+                status="no_due_job"
+            ),
+            registration_is_visible=lambda _operation: False,
+            registrar=recovery_registrar,
+            restarted_source=restarted_source,
+            marker_secret=SECRET,
+            now=lambda: 11.0,
+        )
+
+    assert len(registrar.claims) == 1
+    assert recovery_registrar.claims == []
+
+
+def test_ready_characterization_reconciles_exact_retry_before_success(
+    tmp_path: Path,
+) -> None:
+    _pending, state, registrar, restarted_source = _pending_characterization(tmp_path)
+    recovery_registrar = _Registrar()
+    original_claim = state["claim"]
+
+    def reconcile(_projection: SessionProjection) -> ClaudeVisibilityClaim:
+        return replace(
+            original_claim,
+            lease_kind="reconciliation",
+            lease_digest="c" * 64,
+            registration_reserved=False,
+            launch_permitted=False,
+            requires_exact_id_reconciliation=True,
+            prior_error_code="session_bridge_unavailable",
+        )
+
+    recovered = characterize_claude_visibility(
+        source_root=state["source_root"],
+        projects_root=state["projects_root"],
+        reserve=lambda _projection: pytest.fail(
+            "ready recovery must never request launch authority"
+        ),
+        reconcile_existing=reconcile,
+        registration_is_visible=lambda _operation: False,
+        registrar=recovery_registrar,
+        restarted_source=restarted_source,
+        marker_secret=SECRET,
+        now=lambda: 11.0,
+    )
+
+    assert recovered["reserved_claude_uuid"] == original_claim.reserved_claude_uuid
+    assert len(registrar.claims) == 1
+    assert [claim.lease_kind for claim in recovery_registrar.claims] == [
+        "reconciliation"
+    ]
 
 
 def test_characterization_rerun_reconciles_absence_then_relaunches_reserved_uuid(
@@ -1822,6 +2982,7 @@ def test_characterization_recovers_same_cleanup_capability_after_ready_write_err
         source_root=source_root,
         projects_root=projects_root,
         reserve=reserve,
+        registration_is_visible=lambda _operation: True,
         registrar=Registrar(),
         restarted_source=restarted_source,
         marker_secret=SECRET,
@@ -1849,6 +3010,7 @@ def test_expired_ready_operation_revalidates_identity_and_renews_same_operation(
         registrar=_Registrar(),
         restarted_source=restarted_source,
         marker_secret=SECRET,
+        registration_is_visible=lambda _operation: True,
         now=lambda: float(first_record["expires_at"]) + 1.0,
     )
 
@@ -1899,6 +3061,7 @@ def test_expired_ready_operation_renews_after_native_resume_appends_transcript(
         registrar=renewal_registrar,
         restarted_source=restarted_source,
         marker_secret=SECRET,
+        registration_is_visible=lambda _operation: True,
         now=lambda: float(first_record["expires_at"]) + 1.0,
     )
 
@@ -1931,6 +3094,7 @@ def test_expired_ready_operation_rejects_replaced_transcript_with_same_content(
             reserve=lambda _projection: (_ for _ in ()).throw(
                 AssertionError("renewal must not reserve a second operation")
             ),
+            registration_is_visible=lambda _operation: True,
             registrar=renewal_registrar,
             restarted_source=restarted_source,
             marker_secret=SECRET,

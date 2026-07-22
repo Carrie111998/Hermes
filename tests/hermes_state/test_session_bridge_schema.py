@@ -331,6 +331,59 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
         conn.close()
 
 
+def test_v26_database_replaces_abort_trigger_for_exact_max_attempt_absence(tmp_path):
+    db_path = tmp_path / "v26-characterization-abort-trigger.db"
+    current = hermes_state.SessionDB(db_path)
+    current.close()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TRIGGER trg_claude_characterization_abort_order")
+        conn.execute(
+            """CREATE TRIGGER trg_claude_characterization_abort_order
+               BEFORE INSERT ON session_claude_visibility_characterization_events
+               WHEN NEW.event_kind = 'launch_aborted' AND NOT EXISTS (
+                   SELECT 1 FROM session_claude_visibility_jobs AS job
+                   WHERE job.id = NEW.job_id AND job.state = 'claude_retry'
+               )
+               BEGIN
+                   SELECT RAISE(
+                       ABORT,
+                       'Claude characterization abort is not anchored'
+                   );
+               END"""
+        )
+        conn.execute(
+            "DELETE FROM session_bridge_migrations "
+            "WHERE migration_name = 'claude_characterization_abort_max_attempts_v27'"
+        )
+        conn.execute("UPDATE schema_version SET version = 26")
+        conn.commit()
+    finally:
+        conn.close()
+
+    upgraded = hermes_state.SessionDB(db_path)
+    try:
+        trigger_sql = upgraded._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            ("trg_claude_characterization_abort_order",),
+        ).fetchone()[0]
+        version = upgraded._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0]
+        migration_count = upgraded._conn.execute(
+            "SELECT COUNT(*) FROM session_bridge_migrations WHERE migration_name = ?",
+            ("claude_characterization_abort_max_attempts_v27",),
+        ).fetchone()[0]
+    finally:
+        upgraded.close()
+
+    normalized = " ".join(trigger_sql.split())
+    assert "job.state = 'claude_failed'" in normalized
+    assert "job.error_code = 'max_attempts_exhausted'" in normalized
+    assert version == hermes_state.SCHEMA_VERSION
+    assert migration_count == 1
+
+
 def test_reopening_current_database_repairs_missing_sidebar_indexes_without_data_loss(
     tmp_path,
 ):
@@ -503,9 +556,7 @@ def test_duplicate_mirror_job_idempotency_key_is_rejected(tmp_path):
         ("codex_thread_id", "same-thread"),
     ],
 )
-def test_sidebar_job_unique_fields_are_rejected(
-    tmp_path, column, duplicate_value
-):
+def test_sidebar_job_unique_fields_are_rejected(tmp_path, column, duplicate_value):
     db = hermes_state.SessionDB(tmp_path / f"sidebar-{column}-unique.db")
     try:
         conn = db._conn
@@ -544,7 +595,9 @@ def test_sidebar_job_unique_fields_are_rejected(
 def test_sidebar_job_source_session_foreign_key_is_enforced(tmp_path):
     db = hermes_state.SessionDB(tmp_path / "sidebar-source-foreign-key.db")
     try:
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"
+        ):
             db._conn.execute(
                 "INSERT INTO session_sidebar_jobs "
                 "(id, idempotency_key, source_session_id, bridge_id, state, "
@@ -687,9 +740,10 @@ def test_valid_sidebar_job_state_shapes_are_insertable(tmp_path, state, fields):
         _seed_sessions(db._conn, "source")
         _insert_sidebar_job(db._conn, state=state, **fields)
 
-        assert db._conn.execute(
-            "SELECT state FROM session_sidebar_jobs"
-        ).fetchone()[0] == state
+        assert (
+            db._conn.execute("SELECT state FROM session_sidebar_jobs").fetchone()[0]
+            == state
+        )
     finally:
         db.close()
 

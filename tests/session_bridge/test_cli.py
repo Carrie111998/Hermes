@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field, replace
+from datetime import timezone
 from pathlib import Path
 from threading import Event, Thread
 import time
@@ -21,7 +22,11 @@ if os.name == "nt" and "USERPROFILE" not in os.environ:
 
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
-from session_bridge.characterize import CharacterizationGateError
+from session_bridge.characterize import (
+    CharacterizationGateError,
+    _write_characterization_record,
+    characterize_claude_visibility,
+)
 from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
     derive_claude_visibility_identity,
@@ -33,6 +38,7 @@ from session_bridge.cli import (
     RolloutGateBlocked,
     _run_continuous_visibility_worker,
     _claude_characterization_open_work_allowed,
+    _sync_claude_characterization_records,
     main,
 )
 from session_bridge.codex_adapter import SidebarThreadVerifier
@@ -263,6 +269,22 @@ class FakeBackend:
             "status": "no_due_job",
             "degraded": False,
             "fatal": False,
+        }
+
+    def abort_claude_visibility_characterization(
+        self, *, expected_job_id: str, expected_reserved_claude_uuid: str
+    ):
+        self.calls.append((
+            "abort_claude_visibility_characterization",
+            expected_job_id,
+            expected_reserved_claude_uuid,
+        ))
+        return {
+            "status": "aborted_exact_absence",
+            "job_id": expected_job_id,
+            "reserved_claude_uuid": expected_reserved_claude_uuid,
+            "replacement_created": False,
+            "active_record_retired": True,
         }
 
     def characterize(self, *, provider: str) -> dict[str, Any]:
@@ -1029,9 +1051,7 @@ def _production_precreate_resolution_backend(
         now=130.0,
     )
     reservation = store.get_sidebar_create_reservation(source_session_id)
-    cutover = store.get_state(
-        "session-bridge:sidebar:create-reservation-cutover:v1"
-    )
+    cutover = store.get_state("session-bridge:sidebar:create-reservation-cutover:v1")
     assert reservation is not None
     assert cutover is not None
     backend = ProductionBackend(BridgeConfig())
@@ -1077,14 +1097,18 @@ def test_production_precreate_acknowledgement_probes_exact_identities_and_replay
             "resolution_code": "precutover_create_unrecoverable",
         }
         assert replay == {**first, "status": "already_acknowledged"}
-        assert verifier.all_marker_calls == [
-            BridgeMarkerPayload(
-                bridge_id=candidate.bridge_id,
-                source_session_id=candidate.source_session_id,
-                target_provider=Provider.CODEX,
-                policy_generation=1,
-            )
-        ] * 2
+        assert (
+            verifier.all_marker_calls
+            == [
+                BridgeMarkerPayload(
+                    bridge_id=candidate.bridge_id,
+                    source_session_id=candidate.source_session_id,
+                    target_provider=Provider.CODEX,
+                    policy_generation=1,
+                )
+            ]
+            * 2
+        )
         assert [
             (recovery_key, cwd)
             for recovery_key, cwd, _deadline in verifier.recovery_calls
@@ -1094,7 +1118,9 @@ def test_production_precreate_acknowledgement_probes_exact_identities_and_replay
             for _recovery_key, _cwd, deadline in verifier.recovery_calls
         )
         assert verifier.create_calls == []
-        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+        assert (
+            store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+        )
         [audit] = store.db._conn.execute(
             "SELECT * FROM session_sidebar_precreate_resolutions"
         ).fetchall()
@@ -2461,6 +2487,1133 @@ def test_characterization_preflight_blocks_before_store_or_registrar(
     assert events == [("preflight", ("claude",))]
 
 
+@pytest.mark.parametrize("sync_fails", [False, True])
+def test_characterization_cleanup_syncs_exact_terminal_record_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sync_fails: bool,
+) -> None:
+    operation_id = "16161616-1616-4616-8616-161616161616"
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    completed_root = source_root / ".cleanup-completed"
+    completed_root.mkdir(parents=True)
+    completed_state = _characterization_state(
+        operation_id, phase="completed", source_root=source_root
+    )
+    calls: list[dict[str, object]] = []
+
+    class Store:
+        def record_claude_visibility_characterization(self, **kwargs):
+            calls.append(kwargs)
+            if sync_fails:
+                raise ValueError("synthetic terminal append failure")
+            return {"status": "cleanup_completed"}
+
+    def cleanup(**_kwargs):
+        _write_characterization_record(
+            completed_root / f"{operation_id}.json",
+            completed_state,
+            b"k" * 32,
+        )
+        return {
+            "passed": True,
+            "cleanup": "removed_exact_characterization",
+        }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.cleanup_characterized_claude_visibility", cleanup
+    )
+
+    token = {"id": operation_id, "capability": "x" * 43}
+    if sync_fails:
+        with pytest.raises(
+            ConfigurationFailure, match="characterization_record_invalid"
+        ):
+            backend.characterize_claude_visibility(cleanup_token=token)
+    else:
+        result = backend.characterize_claude_visibility(cleanup_token=token)
+        assert result["cleanup"] == "removed_exact_characterization"
+    assert (completed_root / f"{operation_id}.json").exists()
+    assert len(calls) == 1
+    assert calls[0]["operation_id"] == operation_id
+    assert calls[0]["cleanup_completed"] is True
+
+
+@pytest.mark.parametrize("fatal_kind", ["unknown_retry", "raw_fatal"])
+def test_characterization_status_fatal_blocks_before_native_or_low_level_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_kind: str,
+) -> None:
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    active_state: dict[str, object] | None = None
+    if fatal_kind == "unknown_retry":
+        source_root.mkdir(parents=True)
+        active_state = _characterization_state(
+            "15151515-1515-4515-8515-151515151515",
+            phase="launching",
+            source_root=source_root,
+        )
+        _write_characterization_record(
+            source_root / ".claude-visibility-operation.json",
+            active_state,
+            b"k" * 32,
+        )
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            assert active_state is not None
+            return {"status": "registered"}
+
+        def claude_visibility_status(self, _now):
+            state = "claude_retry" if fatal_kind == "unknown_retry" else None
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": int(state == "claude_retry"),
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": (
+                    {"future_unknown_retry": 1} if fatal_kind == "unknown_retry" else {}
+                ),
+                "failed_codes": {},
+                "fatal": (
+                    [{"code": "unknown_job_state"}] if fatal_kind == "raw_fatal" else []
+                ),
+                "lineage": {
+                    "unlinked_visible": 0,
+                    "repairable": 0,
+                    "blocked": 0,
+                    "blocker_codes": {},
+                },
+                "characterizations": (
+                    []
+                    if active_state is None
+                    else [{"job_id": active_state["job_id"], "state": state}]
+                ),
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight",
+        lambda _command: {"theme": "light"},
+    )
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: pytest.fail("fatal status must block native source"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.characterize_claude_visibility",
+        lambda **_kwargs: pytest.fail("fatal status must block low-level work"),
+    )
+
+    with pytest.raises(RolloutGateBlocked, match="claude_visibility_not_idle"):
+        backend.characterize_claude_visibility()
+
+
+def test_characterization_replays_terminal_abort_before_native_or_new_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    source_root.mkdir(parents=True)
+    operation_id = "19191919-1919-4919-8919-191919191919"
+    active = _characterization_state(
+        operation_id, phase="launching", source_root=source_root
+    )
+    _write_characterization_record(
+        source_root / ".claude-visibility-operation.json", active, b"k" * 32
+    )
+    calls: list[object] = []
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            return {"status": "registered"}
+
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": 0,
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "lineage": {
+                    "unlinked_visible": 0,
+                    "repairable": 0,
+                    "blocked": 0,
+                    "blocker_codes": {},
+                },
+                "characterizations": [],
+            }
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            calls.append(("terminal", kwargs))
+            assert kwargs["launch_aborted"] is True
+            return {
+                "status": "already_aborted",
+                "job_id": active["job_id"],
+                "reserved_claude_uuid": active["reserved_claude_uuid"],
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda _name: pytest.fail("terminal abort replay must not resolve Claude"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **kwargs: calls.append(("retire", kwargs)) or {"status": "retired"},
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal abort must not read native data"
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.characterize_claude_visibility",
+        lambda **_kwargs: pytest.fail("terminal abort must not start new work"),
+    )
+
+    result = backend.characterize_claude_visibility()
+
+    assert result == {
+        "status": "aborted_exact_absence",
+        "job_id": active["job_id"],
+        "reserved_claude_uuid": active["reserved_claude_uuid"],
+        "replacement_created": False,
+        "active_record_retired": True,
+        "replayed": True,
+    }
+    assert [call[0] for call in calls] == ["terminal", "retire"]
+
+
+def _characterization_state(
+    operation_id: str, *, phase: str, source_root: Path
+) -> dict[str, object]:
+    source_session_id = f"codex:{operation_id}"
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=source_session_id,
+        source_provider=Provider.CODEX,
+        native_name="[Codex] Verify native Claude session visibility and exact-ID resume metadata.",
+        source_cwd=str(source_root / f"claude-visibility-{operation_id}"),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, b"k" * 32)
+    return {
+        "schema_version": 2,
+        "operation_id": operation_id,
+        "phase": phase,
+        "created_at": 100.0,
+        "expires_at": 200.0,
+        "source_provider": "codex",
+        "source_session_id": source_session_id,
+        "bridge_id": identity.bridge_id,
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+        "native_name": candidate.native_name,
+        "source_cwd": candidate.source_cwd,
+        "signed_marker": identity.signed_marker,
+        "transcript_path": None,
+        "transcript_identity": None,
+        "sentinel_nonce": "nonce",
+        "cleanup_authorized_at": 150.0 if phase == "completed" else None,
+        "cleanup_capability_hash": "a" * 64,
+    }
+
+
+def test_characterization_record_sync_is_authenticated_bounded_and_phase_aware(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    completed = root / ".cleanup-completed"
+    completed.mkdir()
+    active_id = "11111111-1111-4111-8111-111111111111"
+    completed_id = "22222222-2222-4222-8222-222222222222"
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json",
+        _characterization_state(active_id, phase="launching", source_root=root),
+        b"k" * 32,
+    )
+    _write_characterization_record(
+        completed / f"{completed_id}.json",
+        _characterization_state(completed_id, phase="completed", source_root=root),
+        b"k" * 32,
+    )
+
+    class Store:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def enqueue_claude_visibility_characterization(
+            self,
+            _candidate,
+            _identity,
+            _marker_secret,
+            *,
+            operation_id,
+            evidence_digest,
+        ):
+            self.calls.append({
+                "operation_id": operation_id,
+                "evidence_digest": evidence_digest,
+                "cleanup_completed": False,
+            })
+            return {"status": "registered"}
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"status": "recorded"}
+
+    store = Store()
+    result = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=b"k" * 32,
+        include_active=True,
+        include_completed=True,
+    )
+
+    assert result == {"registered": 2, "cleanup_completed": 1}
+    assert [call["operation_id"] for call in store.calls] == [
+        active_id,
+        completed_id,
+    ]
+    assert store.calls[0]["cleanup_completed"] is False
+    assert store.calls[1]["cleanup_completed"] is True
+    assert all(len(str(call["evidence_digest"])) == 64 for call in store.calls)
+
+
+def test_characterization_restart_sync_atomically_recovers_missing_job_before_claim(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    operation_id = "14141414-1414-4414-8414-141414141414"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+
+    synced = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=b"k" * 32,
+        include_active=True,
+        include_completed=False,
+    )
+    raw = store.claude_visibility_status(100.0)
+
+    assert synced == {"registered": 1, "cleanup_completed": 0}
+    assert raw["counts"]["claude_pending"] == 1
+    assert raw["characterizations"] == [
+        {"job_id": state["job_id"], "state": "claude_pending"}
+    ]
+    assert _claude_characterization_open_work_allowed(
+        raw,
+        active_operation=True,
+        active_job_id=str(state["job_id"]),
+    )
+    claim = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        expected_job_id=str(state["job_id"]),
+    )
+    assert claim.claimed
+    assert claim.reserved_claude_uuid == state["reserved_claude_uuid"]
+    db.close()
+
+
+def test_characterization_restart_sync_backfills_exact_preledger_retry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    operation_id = "16161616-1616-4616-8616-161616161616"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=str(state["source_session_id"]),
+        source_provider=Provider.CODEX,
+        native_name=str(state["native_name"]),
+        source_cwd=str(state["source_cwd"]),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=float(state["created_at"]),
+    )
+    identity = derive_claude_visibility_identity(candidate, b"k" * 32)
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    store.enqueue_claude_visibility_job(candidate, identity, b"k" * 32)
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_retry', attempts = 7,
+                   next_attempt_at = 100, error_code = 'creation_ambiguous',
+                   error_detail = 'legacy ambiguous create', updated_at = 99
+               WHERE id = ?""",
+            (identity.job_id,),
+        )
+    )
+    before = dict(
+        db._conn.execute(
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        ).fetchone()
+    )
+
+    synced = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=b"k" * 32,
+        include_active=True,
+        include_completed=False,
+    )
+
+    assert synced == {"registered": 1, "cleanup_completed": 0}
+    assert (
+        dict(
+            db._conn.execute(
+                "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                (identity.job_id,),
+            ).fetchone()
+        )
+        == before
+    )
+    assert store.claude_visibility_status(100.0)["characterizations"] == [
+        {"job_id": identity.job_id, "state": "claude_retry"}
+    ]
+    db.close()
+
+
+def test_characterization_restart_sync_refuses_to_create_second_open_job(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    operation_id = "18181818-1818-4818-8818-181818181818"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id="codex:unrelated-open",
+        source_provider=Provider.CODEX,
+        native_name="[Codex] unrelated",
+        source_cwd="C:/work/unrelated",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, b"k" * 32)
+    store.enqueue_claude_visibility_job(candidate, identity, b"k" * 32)
+
+    with pytest.raises(ConfigurationFailure, match="characterization_record_invalid"):
+        _sync_claude_characterization_records(
+            store=store,
+            source_root=root,
+            marker_secret=b"k" * 32,
+            include_active=True,
+            include_completed=False,
+        )
+
+    raw = store.claude_visibility_status(100.0)
+    assert raw["counts"]["claude_pending"] == 1
+    assert raw["characterizations"] == []
+    db.close()
+
+
+def test_lineage_apply_syncs_completed_characterization_before_store_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[object] = []
+
+    class Store:
+        def reconcile_claude_visibility_lineage(self, **kwargs):
+            events.append(("reconcile", kwargs))
+            return {
+                "scanned": 0,
+                "repairable": 0,
+                "repaired": 0,
+                "remaining": 0,
+                "blocker_codes": {},
+                "next_cursor": None,
+                "has_more": False,
+                "complete": True,
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    store = Store()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli._sync_claude_characterization_records",
+        lambda **kwargs: (
+            events.append(("sync", kwargs)) or {"registered": 1, "cleanup_completed": 1}
+        ),
+    )
+
+    result = backend.reconcile_claude_visibility_lineage(limit=25, apply=True)
+
+    assert result["complete"] is True
+    assert events[0][0] == "sync"  # type: ignore[index]
+    assert events[0][1]["include_active"] is False  # type: ignore[index]
+    assert events[0][1]["include_completed"] is True  # type: ignore[index]
+    assert events[1][0] == "reconcile"  # type: ignore[index]
+
+
+def test_characterization_abort_cli_requires_explicit_confirmation(capsys) -> None:
+    backend = FakeBackend()
+
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+    assert (
+        _run(
+            [
+                "claude-visibility-abort-characterization",
+                "--job-id",
+                job_id,
+                "--reserved-claude-uuid",
+                reserved_uuid,
+            ],
+            backend,
+        )
+        == 4
+    )
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": "characterization_exact_absence_confirmation_required",
+    }
+    assert not any(
+        call[0] == "abort_claude_visibility_characterization" for call in backend.calls
+    )
+
+    assert (
+        _run(
+            [
+                "claude-visibility-abort-characterization",
+                "--confirm-exact-absence",
+                "--job-id",
+                job_id,
+                "--reserved-claude-uuid",
+                reserved_uuid,
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys) == {
+        "status": "aborted_exact_absence",
+        "job_id": job_id,
+        "reserved_claude_uuid": reserved_uuid,
+        "replacement_created": False,
+        "active_record_retired": True,
+    }
+
+
+@pytest.mark.parametrize("phase", ["launched", "ready"])
+def test_characterization_abort_rejects_unretirable_active_phase_before_store_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "55555555-5555-4555-8555-555555555555"
+    state = _characterization_state(operation_id, phase=phase, source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(AssertionError("store must remain untouched")),
+    )
+
+    with pytest.raises(RolloutGateBlocked, match="characterization_abort_not_active"):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("registrar_status", "expected_gate"),
+    [
+        ("absent", None),
+        ("visible", "characterization_native_session_materialized"),
+        ("failed", "characterization_exact_id_conflict"),
+    ],
+)
+def test_characterization_abort_reconciles_only_exact_uuid_and_never_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registrar_status: str,
+    expected_gate: str | None,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "66666666-6666-4666-8666-666666666666"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    calls: list[tuple[object, ...]] = []
+
+    class Claim:
+        claimed = True
+        status = "claimed"
+        job_id = state["job_id"]
+        reserved_claude_uuid = state["reserved_claude_uuid"]
+        lease_kind = "reconciliation"
+        launch_permitted = False
+        registration_reserved = False
+        requires_exact_id_reconciliation = True
+
+    class Store:
+        abort_calls = 0
+
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            calls.append(("register",))
+            return {
+                "status": "registered",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            calls.append(("record", kwargs))
+            assert kwargs["launch_aborted"] is True
+            self.abort_calls += 1
+            if self.abort_calls == 1:
+                return {
+                    "status": "reconciliation_required",
+                    "job_id": state["job_id"],
+                    "reserved_claude_uuid": state["reserved_claude_uuid"],
+                }
+            return {
+                "status": "launch_aborted",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def claim_claude_visibility_reconciliation(self, *args, **kwargs):
+            calls.append(("claim", args, kwargs))
+            assert kwargs == {"expected_job_id": state["job_id"]}
+            return Claim()
+
+    class Registrar:
+        def process(self, claim):
+            calls.append(("process", claim))
+            assert claim is not None
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": registrar_status,
+                    "job_id": state["job_id"],
+                    "reserved_claude_uuid": state["reserved_claude_uuid"],
+                    "error_code": None,
+                },
+            )()
+
+    store = Store()
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: calls.append(("source",)) or object(),
+    )
+
+    def registrar_factory(*args, **kwargs):
+        calls.append(("registrar", args, kwargs))
+        assert kwargs["claude_command"] == ()
+        return Registrar()
+
+    monkeypatch.setattr("session_bridge.cli.ClaudeNativeRegistrar", registrar_factory)
+    monkeypatch.setattr(
+        "session_bridge.cli.claim_claude_visibility_characterization_abort",
+        lambda **kwargs: (
+            calls.append(("abort-intent", kwargs))
+            or {
+                "status": "claimed",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+                "operation": state,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda *_args, **_kwargs: pytest.fail("abort must not resolve a launcher"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **kwargs: calls.append(("retire", kwargs)) or {"status": "retired"},
+    )
+
+    with pytest.raises(
+        RolloutGateBlocked, match="characterization_abort_identity_mismatch"
+    ):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id="claude-visibility-job:reviewed-other-job",
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+    assert store.abort_calls == 0
+
+    if expected_gate is not None:
+        with pytest.raises(RolloutGateBlocked, match=expected_gate):
+            backend.abort_claude_visibility_characterization(
+                expected_job_id=str(state["job_id"]),
+                expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+            )
+        assert store.abort_calls == 1
+    else:
+        result = backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+        assert result == {
+            "status": "aborted_exact_absence",
+            "job_id": state["job_id"],
+            "reserved_claude_uuid": state["reserved_claude_uuid"],
+            "replacement_created": False,
+            "active_record_retired": True,
+        }
+        assert store.abort_calls == 2
+        assert len([call for call in calls if call[0] == "retire"]) == 1
+    [claim_call] = [call for call in calls if call[0] == "claim"]
+    assert claim_call[2] == {"expected_job_id": state["job_id"]}
+    assert len([call for call in calls if call[0] == "process"]) == 1
+
+
+def test_characterization_abort_registers_crash_before_enqueue_then_proves_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "67676767-6767-4767-8767-676767676767"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    disposable = Path(str(state["source_cwd"]))
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps({"operation_id": operation_id, "nonce": "nonce"}),
+        encoding="utf-8",
+    )
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    claims: list[object] = []
+
+    class Registrar:
+        def process(self, claim):
+            assert not (root / ".claude-visibility-operation.json").exists()
+            assert (root / ".abort-claims" / f"{operation_id}.json").exists()
+            claims.append(claim)
+            store.record_claude_visibility_exact_id_absent(
+                claim.job_id,
+                claim.lease_digest,
+                claim.reserved_claude_uuid,
+                claim.attempt_ordinal,
+                "b" * 64,
+            )
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": "absent",
+                    "job_id": claim.job_id,
+                    "reserved_claude_uuid": claim.reserved_claude_uuid,
+                    "error_code": None,
+                },
+            )()
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: Registrar(),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **_kwargs: {"status": "retired"},
+    )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result == {
+        "status": "aborted_exact_absence",
+        "job_id": state["job_id"],
+        "reserved_claude_uuid": state["reserved_claude_uuid"],
+        "replacement_created": False,
+        "active_record_retired": True,
+    }
+    assert len(claims) == 1
+    assert claims[0].lease_kind == "reconciliation"
+    assert claims[0].attempt_ordinal == 0
+    assert (
+        database._conn.execute(
+            "SELECT COUNT(*) FROM session_claude_registration_usage"
+        ).fetchone()[0]
+        == 0
+    )
+    assert [
+        row[0]
+        for row in database._conn.execute(
+            """SELECT event_kind
+               FROM session_claude_visibility_characterization_events
+               WHERE job_id = ? ORDER BY event_kind""",
+            (state["job_id"],),
+        ).fetchall()
+    ] == ["launch_aborted", "registered"]
+    database.close()
+
+
+def test_characterization_abort_claim_survives_crash_before_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import session_bridge.cli as cli_module
+
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    projects = tmp_path / "projects"
+    root.mkdir(parents=True)
+    projects.mkdir()
+    operation_id = "68686868-6868-4868-8868-686868686868"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    disposable = Path(str(state["source_cwd"]))
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps({"operation_id": operation_id, "nonce": "nonce"}),
+        encoding="utf-8",
+    )
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    original_record = cli_module._record_claude_characterization_payload
+    crash_once = True
+
+    def crash_before_registration(**kwargs):
+        nonlocal crash_once
+        if crash_once and kwargs.get("ensure_registered") is True:
+            crash_once = False
+            raise RuntimeError("simulated crash before registration")
+        return original_record(**kwargs)
+
+    class Registrar:
+        def process(self, claim):
+            store.record_claude_visibility_exact_id_absent(
+                claim.job_id,
+                claim.lease_digest,
+                claim.reserved_claude_uuid,
+                claim.attempt_ordinal,
+                "b" * 64,
+            )
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": "absent",
+                    "job_id": claim.job_id,
+                    "reserved_claude_uuid": claim.reserved_claude_uuid,
+                    "error_code": None,
+                },
+            )()
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli._record_claude_characterization_payload",
+        crash_before_registration,
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: Registrar(),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash before registration"):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+
+    assert not (root / ".claude-visibility-operation.json").exists()
+    assert (root / ".abort-claims" / f"{operation_id}.json").exists()
+    assert (
+        database._conn.execute(
+            "SELECT COUNT(*) FROM session_claude_visibility_jobs"
+        ).fetchone()[0]
+        == 0
+    )
+    with pytest.raises(RuntimeError, match="characterization_abort_in_progress"):
+        characterize_claude_visibility(
+            source_root=root,
+            projects_root=projects,
+            reserve=lambda _projection: pytest.fail("abort claim must block reserve"),
+            registrar=object(),
+            restarted_source=lambda: pytest.fail(
+                "abort claim must block source discovery"
+            ),
+            marker_secret=b"k" * 32,
+        )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result["status"] == "aborted_exact_absence"
+    assert result["replacement_created"] is False
+    assert (root / ".abort-completed" / f"{operation_id}.json").exists()
+    database.close()
+
+
+def test_characterization_abort_replays_exact_absence_after_crash_before_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "69696969-6969-4969-8969-696969696969"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    disposable = Path(str(state["source_cwd"]))
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps({"operation_id": operation_id, "nonce": "nonce"}),
+        encoding="utf-8",
+    )
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    process_calls = 0
+
+    class Registrar:
+        def process(self, claim):
+            nonlocal process_calls
+            process_calls += 1
+            store.record_claude_visibility_exact_id_absent(
+                claim.job_id,
+                claim.lease_digest,
+                claim.reserved_claude_uuid,
+                claim.attempt_ordinal,
+                "b" * 64,
+            )
+            raise RuntimeError("simulated crash after exact absence")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: Registrar(),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash after exact absence"):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result["status"] == "aborted_exact_absence"
+    assert process_calls == 1
+    assert (
+        database._conn.execute(
+            """SELECT COUNT(*)
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ? AND event_kind = 'launch_aborted'""",
+            (state["job_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    database.close()
+
+
+def test_characterization_abort_replays_claimed_filesystem_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    claims = root / ".abort-claims"
+    claims.mkdir(parents=True)
+    operation_id = "88888888-8888-4888-8888-888888888888"
+    state = _characterization_state(
+        operation_id, phase="abort_disposable_removing", source_root=root
+    )
+    _write_characterization_record(claims / f"{operation_id}.json", state, b"k" * 32)
+    events: list[tuple[str, object]] = []
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            events.append(("register", None))
+            return {
+                "status": "registered",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            events.append(("record", kwargs))
+            return {
+                "status": "already_aborted",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def claim_claude_visibility_reconciliation(self, *_args, **_kwargs):
+            raise AssertionError("replay must not acquire another lease")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.claim_claude_visibility_characterization_abort",
+        lambda **kwargs: (
+            events.append(("abort-intent", kwargs))
+            or {
+                "status": "claimed",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+                "operation": state,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **kwargs: events.append(("retire", kwargs)) or {"status": "retired"},
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda *_args, **_kwargs: pytest.fail("replay must not resolve a launcher"),
+    )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result == {
+        "status": "aborted_exact_absence",
+        "job_id": state["job_id"],
+        "reserved_claude_uuid": state["reserved_claude_uuid"],
+        "replacement_created": False,
+        "active_record_retired": True,
+        "replayed": True,
+    }
+    assert [event[0] for event in events] == [
+        "abort-intent",
+        "register",
+        "record",
+        "retire",
+    ]
+    assert events[3][1]["expected_operation_id"] == operation_id  # type: ignore[index]
+
+
 def test_claude_visibility_status_reports_durable_open_work_while_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2499,11 +3652,11 @@ def test_claude_visibility_status_reports_durable_open_work_while_disabled(
 @pytest.mark.parametrize(
     ("counts", "active_operation", "allowed"),
     [
-        ({"claude_retry": 1}, True, True),
+        ({"claude_retry": 1}, True, False),
         ({"claude_retry": 1}, False, False),
         ({"claude_retry": 2}, True, False),
-        ({"claude_leased": 1}, True, True),
-        ({"claude_failed": 1}, True, True),
+        ({"claude_leased": 1}, True, False),
+        ({"claude_failed": 1}, True, False),
         ({"claude_pending": 1}, True, False),
     ],
 )
@@ -2523,6 +3676,74 @@ def test_characterization_recovery_allows_only_one_owned_open_job(
     assert (
         _claude_characterization_open_work_allowed(
             {"counts": complete}, active_operation=active_operation
+        )
+        is allowed
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["claude_pending", "claude_leased", "claude_retry"],
+)
+def test_characterization_recovery_allows_only_exact_authenticated_open_job(
+    state: str,
+) -> None:
+    raw = {
+        "counts": {
+            candidate: int(candidate == state)
+            for candidate in (
+                "claude_pending",
+                "claude_leased",
+                "claude_retry",
+                "claude_failed",
+            )
+        },
+        "characterizations": [
+            {"job_id": "claude-visibility-job:exact", "state": state}
+        ],
+    }
+
+    assert _claude_characterization_open_work_allowed(
+        raw,
+        active_operation=True,
+        active_job_id="claude-visibility-job:exact",
+    )
+    assert not _claude_characterization_open_work_allowed(
+        raw,
+        active_operation=True,
+        active_job_id="claude-visibility-job:other",
+    )
+
+
+@pytest.mark.parametrize(
+    ("failed_codes", "allowed"),
+    [({"bridge_conflict": 1}, True), ({"future_failure": 1}, False)],
+)
+def test_characterization_recovery_allows_only_exact_auth_recoverable_failed_job(
+    failed_codes: dict[str, int], allowed: bool
+) -> None:
+    raw = {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_failed": 1,
+        },
+        "characterizations": [
+            {
+                "job_id": "claude-visibility-job:exact",
+                "state": "claude_failed",
+            }
+        ],
+        "failed_codes": failed_codes,
+        "retry_codes": {},
+    }
+
+    assert (
+        _claude_characterization_open_work_allowed(
+            raw,
+            active_operation=True,
+            active_job_id="claude-visibility-job:exact",
         )
         is allowed
     )

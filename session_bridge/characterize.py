@@ -46,6 +46,7 @@ from .models import (
 from .claude_visibility import (
     ClaudeVisibilityCandidate,
     ClaudeVisibilityClaim,
+    build_claude_visibility_candidate,
     build_claude_registration_prompt,
     derive_claude_visibility_identity,
 )
@@ -71,6 +72,10 @@ _MARKER_PREFIX = "HERMES_SESSION_BRIDGE_V1:"
 _MAX_CLI_VERSION_BYTES = 4096
 _CHARACTERIZATION_RECORD = ".claude-visibility-operation.json"
 _CHARACTERIZATION_SENTINEL = ".session-bridge-characterization.json"
+_ABORT_QUARANTINE_DIRECTORY = ".abort-quarantine"
+_CLEANUP_QUARANTINE_DIRECTORY = ".cleanup-quarantine"
+_ABORT_CLAIM_SCAN_LIMIT = 100
+_CLEANUP_CLAIM_SCAN_LIMIT = 100
 _CLEANUP_TTL_SECONDS = 7 * 24 * 60 * 60
 _PROVIDER_REQUIRED_FIELDS = frozenset({
     "create",
@@ -81,6 +86,10 @@ _PROVIDER_REQUIRED_FIELDS = frozenset({
     "cleanup",
     "error_code",
 })
+
+
+def _new_characterization_operation_id() -> str:
+    return str(uuid.uuid4())
 
 
 class CharacterizationAuthenticationFailure(RuntimeError):
@@ -131,6 +140,50 @@ def characterize_claude_visibility(
     source_root: Path,
     projects_root: Path,
     reserve: Callable[[SessionProjection], ClaudeVisibilityClaim],
+    reconcile_existing: Callable[[SessionProjection], ClaudeVisibilityClaim]
+    | None = None,
+    registration_is_visible: Callable[[Mapping[str, Any]], bool] | None = None,
+    registrar: Any,
+    restarted_source: Callable[[], ClaudeReadableSource],
+    marker_secret: bytes,
+    recover_auth_failure: Callable[[Mapping[str, Any], str, str], Mapping[str, Any]]
+    | None = None,
+    complete_auth_recovery: Callable[[Mapping[str, Any], str], None] | None = None,
+    reconcile_auth_recovery: Callable[[Mapping[str, Any], str, str, str], None]
+    | None = None,
+    record_writer: Callable[[Path, dict[str, Any], bytes], None] | None = None,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Serialize one root-wide characterization creation or resume operation."""
+
+    _require_secret(marker_secret)
+    root = _prepare_safe_root(source_root, create=True)
+    with _exclusive_cleanup_lock(root, "characterization-root"):
+        return _characterize_claude_visibility_locked(
+            source_root=root,
+            projects_root=projects_root,
+            reserve=reserve,
+            reconcile_existing=reconcile_existing,
+            registration_is_visible=registration_is_visible,
+            registrar=registrar,
+            restarted_source=restarted_source,
+            marker_secret=marker_secret,
+            recover_auth_failure=recover_auth_failure,
+            complete_auth_recovery=complete_auth_recovery,
+            reconcile_auth_recovery=reconcile_auth_recovery,
+            record_writer=record_writer,
+            now=now,
+        )
+
+
+def _characterize_claude_visibility_locked(
+    *,
+    source_root: Path,
+    projects_root: Path,
+    reserve: Callable[[SessionProjection], ClaudeVisibilityClaim],
+    reconcile_existing: Callable[[SessionProjection], ClaudeVisibilityClaim]
+    | None = None,
+    registration_is_visible: Callable[[Mapping[str, Any]], bool] | None = None,
     registrar: Any,
     restarted_source: Callable[[], ClaudeReadableSource],
     marker_secret: bytes,
@@ -154,16 +207,35 @@ def characterize_claude_visibility(
     writer = record_writer or _write_characterization_record
     root = _prepare_safe_root(source_root, create=True)
     project_root = _prepare_safe_root(projects_root, create=False)
+    _assert_no_unresolved_abort_claims(root, marker_secret)
+    _assert_no_unresolved_cleanup_claims(root, marker_secret)
     active_path = root / _CHARACTERIZATION_RECORD
     timestamp = float(now())
     renew_ready_authority = False
+    registration_proven = False
     state: dict[str, Any]
     if active_path.exists():
         state = _read_characterization_record(active_path, marker_secret)
         _validate_operation_state(state, root=root, now=timestamp)
-        if state["phase"] == "prepared":
-            raise RuntimeError("characterization_reservation_incomplete")
         disposable = _validate_disposable(state, root)
+        if state["phase"] == "prepared":
+            projection = _bind_prepared_characterization_identity(state, marker_secret)
+            writer(active_path, state, marker_secret)
+            outcome = _process_characterization_reservation(
+                state=state,
+                projection=projection,
+                reserve=reserve,
+                registrar=registrar,
+            )
+            if getattr(outcome, "status", None) != "visible":
+                raise RuntimeError("characterization_registration_failed")
+            registration_proven = True
+            state["phase"] = "launched"
+            writer(active_path, state, marker_secret)
+        elif state["phase"] == "reserved":
+            # Legacy crash boundary: exact identity was durable before launch.
+            state["phase"] = "launching"
+            writer(active_path, state, marker_secret)
         renew_ready_authority = state["phase"] == "ready" and timestamp > float(
             state["expires_at"]
         )
@@ -178,6 +250,29 @@ def characterize_claude_visibility(
                     signed_marker=_required_state_text(state, "signed_marker"),
                     marker_secret=marker_secret,
                 )
+                if registration_is_visible is not None and registration_is_visible(
+                    state
+                ):
+                    registration_proven = True
+                    state["phase"] = "launched"
+                    writer(active_path, state, marker_secret)
+                else:
+                    if reconcile_existing is None:
+                        raise RuntimeError(
+                            "characterization_registration_state_unverified"
+                        )
+                    projection = _characterization_projection(state)
+                    claim = reconcile_existing(projection)
+                    _validate_characterization_recovery_claim(
+                        claim, state, require_reconciliation=True
+                    )
+                    outcome = registrar.process(claim)
+                    _validate_characterization_outcome(outcome, state)
+                    if getattr(outcome, "status", None) != "visible":
+                        raise RuntimeError("characterization_registration_failed")
+                    registration_proven = True
+                    state["phase"] = "launched"
+                    writer(active_path, state, marker_secret)
             except CharacterizationRecoveredTranscript as exc:
                 if reconcile_auth_recovery is None:
                     raise
@@ -187,6 +282,7 @@ def characterize_claude_visibility(
                     exc.prompt_digest,
                     exc.transcript_digest,
                 )
+                registration_proven = True
                 state["phase"] = "launched"
                 writer(active_path, state, marker_secret)
             except CharacterizationAuthenticationFailure as exc:
@@ -217,6 +313,7 @@ def characterize_claude_visibility(
                     allow_recovered=True,
                 )
                 complete_auth_recovery(recovery, _sha256_file(recovered_transcript))
+                registration_proven = True
                 state["phase"] = "launched"
                 writer(active_path, state, marker_secret)
             except RuntimeError as exc:
@@ -240,10 +337,11 @@ def characterize_claude_visibility(
                     _validate_characterization_outcome(outcome, state)
                 if getattr(outcome, "status", None) != "visible":
                     raise RuntimeError("characterization_registration_failed")
+                registration_proven = True
                 state["phase"] = "launched"
                 writer(active_path, state, marker_secret)
     else:
-        operation_id = str(uuid.uuid4())
+        operation_id = _new_characterization_operation_id()
         disposable = root / f"claude-visibility-{operation_id}"
         os.mkdir(disposable)
         sentinel_nonce = secrets.token_urlsafe(32)
@@ -273,42 +371,17 @@ def characterize_claude_visibility(
         }
         writer(active_path, state, marker_secret)
         projection = _characterization_projection(state)
-        claim = reserve(projection)
-        if (
-            not isinstance(claim, ClaudeVisibilityClaim)
-            or not claim.claimed
-            or claim.lease_kind != "launch"
-            or claim.source_cwd != str(disposable)
-            or claim.source_provider is not Provider.CODEX
-            or not claim.reserved_claude_uuid
-            or not claim.signed_marker
-            or not claim.native_name
-            or not claim.job_id
-        ):
-            raise RuntimeError("characterization_reservation_invalid")
-        marker_payload = _validated_characterization_marker(
-            claim.signed_marker,
-            marker_secret,
-            source_session_id=claim.source_session_id,
+        _bind_prepared_characterization_identity(state, marker_secret)
+        writer(active_path, state, marker_secret)
+        outcome = _process_characterization_reservation(
+            state=state,
+            projection=projection,
+            reserve=reserve,
+            registrar=registrar,
         )
-        state.update({
-            "phase": "reserved",
-            "source_session_id": claim.source_session_id,
-            "bridge_id": marker_payload.bridge_id,
-            "job_id": claim.job_id,
-            "reserved_claude_uuid": claim.reserved_claude_uuid,
-            "native_name": claim.native_name,
-            "signed_marker": claim.signed_marker,
-        })
-        writer(active_path, state, marker_secret)
-        # This durable transition is the no-relaunch boundary.  Any failure
-        # after it can only reconcile the exact reserved UUID.
-        state["phase"] = "launching"
-        writer(active_path, state, marker_secret)
-        outcome = registrar.process(claim)
-        _validate_characterization_outcome(outcome, state)
         if getattr(outcome, "status", None) != "visible":
             raise RuntimeError("characterization_registration_failed")
+        registration_proven = True
         state["phase"] = "launched"
         writer(active_path, state, marker_secret)
 
@@ -335,6 +408,22 @@ def characterize_claude_visibility(
         allow_recovered=True,
         allow_post_ready_continuations=state["phase"] == "ready",
     )
+    if not registration_proven:
+        if registration_is_visible is not None and registration_is_visible(state):
+            registration_proven = True
+        else:
+            if reconcile_existing is None:
+                raise RuntimeError("characterization_registration_state_unverified")
+            projection = _characterization_projection(state)
+            claim = reconcile_existing(projection)
+            _validate_characterization_recovery_claim(
+                claim, state, require_reconciliation=True
+            )
+            outcome = registrar.process(claim)
+            _validate_characterization_outcome(outcome, state)
+            if getattr(outcome, "status", None) != "visible":
+                raise RuntimeError("characterization_registration_failed")
+            registration_proven = True
     if state["transcript_path"] not in (None, str(resolved_transcript)):
         raise RuntimeError("characterization_identity_mismatch:path_changed")
     transcript_identity = list(_path_identity(resolved_transcript))
@@ -398,15 +487,64 @@ def _characterization_projection(state: Mapping[str, Any]) -> SessionProjection:
     )
 
 
+def _bind_prepared_characterization_identity(
+    state: dict[str, Any], marker_secret: bytes
+) -> SessionProjection:
+    """Persist the deterministic exact identity before any store/lease mutation."""
+
+    projection = _characterization_projection(state)
+    candidate = build_claude_visibility_candidate(
+        projection, eligible_at=projection.last_active
+    )
+    identity = derive_claude_visibility_identity(candidate, marker_secret)
+    state.update({
+        "phase": "launching",
+        "source_session_id": candidate.source_session_id,
+        "bridge_id": identity.bridge_id,
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+        "native_name": candidate.native_name,
+        "signed_marker": identity.signed_marker,
+    })
+    return projection
+
+
+def _process_characterization_reservation(
+    *,
+    state: Mapping[str, Any],
+    projection: SessionProjection,
+    reserve: Callable[[SessionProjection], ClaudeVisibilityClaim],
+    registrar: Any,
+) -> Any:
+    """Use only store-authorized exact launch/reconciliation leases."""
+
+    claim = reserve(projection)
+    _validate_characterization_recovery_claim(claim, state)
+    outcome = registrar.process(claim)
+    _validate_characterization_outcome(outcome, state)
+    if getattr(outcome, "status", None) == "absent":
+        # Durable exact absence authorizes only the store's next launch lease,
+        # which remains bound to the same deterministic UUID.
+        claim = reserve(projection)
+        _validate_characterization_recovery_claim(claim, state, require_launch=True)
+        outcome = registrar.process(claim)
+        _validate_characterization_outcome(outcome, state)
+    return outcome
+
+
 def _validate_characterization_recovery_claim(
     claim: Any,
     state: Mapping[str, Any],
     *,
     require_launch: bool = False,
+    require_reconciliation: bool = False,
 ) -> None:
+    if require_launch and require_reconciliation:
+        raise ValueError("conflicting characterization lease requirements")
     lease_kind = getattr(claim, "lease_kind", None)
     valid_authority = (
-        lease_kind == "launch"
+        not require_reconciliation
+        and lease_kind == "launch"
         and getattr(claim, "launch_permitted", None) is True
         and getattr(claim, "registration_reserved", None) is True
         and getattr(claim, "requires_exact_id_reconciliation", None) is False
@@ -454,16 +592,401 @@ def cleanup_characterized_claude_visibility(
     operation_id, capability = _parse_cleanup_token(cleanup_token)
     root = _prepare_safe_root(source_root, create=False)
     project_root = _prepare_safe_root(projects_root, create=False)
-    with _exclusive_cleanup_lock(root, operation_id):
-        return _cleanup_characterized_claude_visibility_locked(
-            operation_id=operation_id,
-            capability=capability,
-            root=root,
-            project_root=project_root,
-            restarted_source=restarted_source,
-            marker_secret=marker_secret,
-            timestamp=float(now()),
+    with _exclusive_cleanup_lock(root, "characterization-root"):
+        with _exclusive_cleanup_lock(root, operation_id):
+            return _cleanup_characterized_claude_visibility_locked(
+                operation_id=operation_id,
+                capability=capability,
+                root=root,
+                project_root=project_root,
+                restarted_source=restarted_source,
+                marker_secret=marker_secret,
+                timestamp=float(now()),
+            )
+
+
+def claim_claude_visibility_characterization_abort(
+    *,
+    source_root: Path,
+    marker_secret: bytes,
+    expected_job_id: str,
+    expected_reserved_claude_uuid: str,
+    expected_operation_id: str,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Durably move one authenticated active probe into abort-only ownership."""
+
+    _require_secret(marker_secret)
+    if not isinstance(expected_job_id, str) or not expected_job_id:
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    if (
+        not isinstance(expected_reserved_claude_uuid, str)
+        or not expected_reserved_claude_uuid
+    ):
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    try:
+        if str(uuid.UUID(expected_operation_id)) != expected_operation_id:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        raise RuntimeError("characterization_abort_identity_mismatch") from None
+    root = _prepare_safe_root(source_root, create=False)
+    with _exclusive_cleanup_lock(root, "characterization-root"):
+        with _exclusive_cleanup_lock(root, expected_operation_id):
+            claims = root / ".abort-claims"
+            completed = root / ".abort-completed"
+            claims.mkdir(exist_ok=True)
+            completed.mkdir(exist_ok=True)
+            _require_plain_directory(claims)
+            _require_plain_directory(completed)
+            active = root / _CHARACTERIZATION_RECORD
+            claimed = claims / f"{expected_operation_id}.json"
+            done = completed / f"{expected_operation_id}.json"
+            if done.exists():
+                state = _read_characterization_record(done, marker_secret)
+                _validate_aborted_characterization_identity(
+                    state,
+                    root=root,
+                    expected_operation_id=expected_operation_id,
+                    expected_job_id=expected_job_id,
+                    expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+                    marker_secret=marker_secret,
+                    allowed_phases={"aborted"},
+                )
+                return {
+                    "status": "already_aborted",
+                    "job_id": expected_job_id,
+                    "reserved_claude_uuid": expected_reserved_claude_uuid,
+                    "operation": dict(state),
+                }
+            if not claimed.exists():
+                if not active.exists():
+                    raise RuntimeError("characterization_abort_identity_mismatch")
+                state = _read_characterization_record(active, marker_secret)
+                if state.get("phase") in {"reserved", "launching"}:
+                    _validate_operation_state(state, root=root, now=float(now()))
+                _validate_aborted_characterization_identity(
+                    state,
+                    root=root,
+                    expected_operation_id=expected_operation_id,
+                    expected_job_id=expected_job_id,
+                    expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+                    marker_secret=marker_secret,
+                    allowed_phases={"reserved", "launching"},
+                )
+                os.replace(active, claimed)
+            state = _read_characterization_record(claimed, marker_secret)
+            _validate_aborted_characterization_identity(
+                state,
+                root=root,
+                expected_operation_id=expected_operation_id,
+                expected_job_id=expected_job_id,
+                expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+                marker_secret=marker_secret,
+                allowed_phases={
+                    "reserved",
+                    "launching",
+                    "abort_disposable_removing",
+                    "abort_disposable_removed",
+                },
+            )
+            return {
+                "status": "claimed",
+                "job_id": expected_job_id,
+                "reserved_claude_uuid": expected_reserved_claude_uuid,
+                "operation": dict(state),
+            }
+
+
+def retire_aborted_claude_visibility_characterization(
+    *,
+    source_root: Path,
+    marker_secret: bytes,
+    expected_job_id: str,
+    expected_reserved_claude_uuid: str,
+    expected_operation_id: str | None = None,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """Crash-safely archive one exact-absence probe without touching Claude data."""
+
+    _require_secret(marker_secret)
+    if not isinstance(expected_job_id, str) or not expected_job_id:
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    if (
+        not isinstance(expected_reserved_claude_uuid, str)
+        or not expected_reserved_claude_uuid
+    ):
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    root = _prepare_safe_root(source_root, create=False)
+    operation_id = expected_operation_id
+    if operation_id is None:
+        active = root / _CHARACTERIZATION_RECORD
+        if not active.exists():
+            raise RuntimeError("characterization_abort_identity_mismatch")
+        operation_id = _required_state_text(
+            _read_characterization_record(active, marker_secret), "operation_id"
         )
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        raise RuntimeError("characterization_abort_identity_mismatch") from None
+
+    with _exclusive_cleanup_lock(root, "characterization-root"):
+        with _exclusive_cleanup_lock(root, operation_id):
+            return _retire_aborted_claude_visibility_characterization_locked(
+                root=root,
+                marker_secret=marker_secret,
+                expected_job_id=expected_job_id,
+                expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+                operation_id=operation_id,
+                now=now,
+            )
+
+
+def _retire_aborted_claude_visibility_characterization_locked(
+    *,
+    root: Path,
+    marker_secret: bytes,
+    expected_job_id: str,
+    expected_reserved_claude_uuid: str,
+    operation_id: str,
+    now: Callable[[], float],
+) -> dict[str, Any]:
+    claims = root / ".abort-claims"
+    completed = root / ".abort-completed"
+    quarantine_root = root / _ABORT_QUARANTINE_DIRECTORY
+    claims.mkdir(exist_ok=True)
+    completed.mkdir(exist_ok=True)
+    quarantine_root.mkdir(exist_ok=True)
+    _require_plain_directory(claims)
+    _require_plain_directory(completed)
+    _require_plain_directory(quarantine_root)
+    active = root / _CHARACTERIZATION_RECORD
+    claimed = claims / f"{operation_id}.json"
+    done = completed / f"{operation_id}.json"
+    quarantined = quarantine_root / operation_id
+
+    if done.exists():
+        state = _read_characterization_record(done, marker_secret)
+        _validate_aborted_characterization_identity(
+            state,
+            root=root,
+            expected_operation_id=operation_id,
+            expected_job_id=expected_job_id,
+            expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+            marker_secret=marker_secret,
+            allowed_phases={"aborted"},
+        )
+        if claimed.exists():
+            claimed_state = _read_characterization_record(claimed, marker_secret)
+            _validate_aborted_characterization_identity(
+                claimed_state,
+                root=root,
+                expected_operation_id=operation_id,
+                expected_job_id=expected_job_id,
+                expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+                marker_secret=marker_secret,
+                allowed_phases={
+                    "reserved",
+                    "launching",
+                    "abort_disposable_removing",
+                    "abort_disposable_removed",
+                },
+            )
+            claimed.unlink()
+        _best_effort_remove_disposable(quarantined, state)
+        return _aborted_characterization_result(state)
+
+    if not claimed.exists():
+        if not active.exists():
+            raise RuntimeError("characterization_abort_identity_mismatch")
+        state = _read_characterization_record(active, marker_secret)
+        if state.get("phase") in {"reserved", "launching"}:
+            _validate_operation_state(state, root=root, now=float(now()))
+        _validate_aborted_characterization_identity(
+            state,
+            root=root,
+            expected_operation_id=operation_id,
+            expected_job_id=expected_job_id,
+            expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+            marker_secret=marker_secret,
+            allowed_phases={
+                "reserved",
+                "launching",
+                "abort_disposable_removing",
+                "abort_disposable_removed",
+            },
+        )
+        # Move the authenticated record first while it is still in a phase
+        # accepted on either side. A crash before or after this atomic rename
+        # therefore leaves one replayable source of truth.
+        os.replace(active, claimed)
+
+    state = _read_characterization_record(claimed, marker_secret)
+    _validate_aborted_characterization_identity(
+        state,
+        root=root,
+        expected_operation_id=operation_id,
+        expected_job_id=expected_job_id,
+        expected_reserved_claude_uuid=expected_reserved_claude_uuid,
+        marker_secret=marker_secret,
+        allowed_phases={
+            "reserved",
+            "launching",
+            "abort_disposable_removing",
+            "abort_disposable_removed",
+        },
+    )
+    if state["phase"] in {"reserved", "launching"}:
+        state["phase"] = "abort_disposable_removing"
+        _write_characterization_record(claimed, state, marker_secret)
+    disposable = _bound_disposable_path(state, root)
+    if state["phase"] == "abort_disposable_removing":
+        if disposable.exists() and quarantined.exists():
+            raise RuntimeError("characterization_abort_identity_mismatch")
+        if disposable.exists():
+            _validate_disposable(state, root)
+            # The whole authenticated disposable is quarantined atomically.
+            # Recursive deletion happens only after terminal publication, so
+            # a mid-delete crash can never strand the active operation.
+            os.replace(disposable, quarantined)
+        if not quarantined.exists():
+            raise RuntimeError("characterization_abort_identity_mismatch")
+        _validate_disposable_path(quarantined, state)
+        state["phase"] = "abort_disposable_removed"
+        _write_characterization_record(claimed, state, marker_secret)
+    elif not quarantined.exists():
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    else:
+        _validate_disposable_path(quarantined, state)
+    state["phase"] = "aborted"
+    _write_characterization_record(done, state, marker_secret)
+    claimed.unlink()
+    _best_effort_remove_disposable(quarantined, state)
+    return _aborted_characterization_result(state)
+
+
+def _assert_no_unresolved_abort_claims(root: Path, marker_secret: bytes) -> None:
+    claims = root / ".abort-claims"
+    if not claims.exists():
+        return
+    _require_plain_directory(claims)
+    paths = sorted(
+        path for path in claims.iterdir() if path.is_file() and path.suffix == ".json"
+    )
+    if len(paths) > _ABORT_CLAIM_SCAN_LIMIT:
+        raise RuntimeError("characterization_abort_record_limit")
+    for path in paths:
+        state = _read_characterization_record(path, marker_secret)
+        operation_id = _required_state_text(state, "operation_id")
+        _validate_aborted_characterization_identity(
+            state,
+            root=root,
+            expected_operation_id=operation_id,
+            expected_job_id=_required_state_text(state, "job_id"),
+            expected_reserved_claude_uuid=_required_state_text(
+                state, "reserved_claude_uuid"
+            ),
+            marker_secret=marker_secret,
+            allowed_phases={
+                "reserved",
+                "launching",
+                "abort_disposable_removing",
+                "abort_disposable_removed",
+            },
+        )
+    if paths:
+        raise RuntimeError("characterization_abort_in_progress")
+
+
+def _assert_no_unresolved_cleanup_claims(root: Path, marker_secret: bytes) -> None:
+    claims = root / ".cleanup-claims"
+    if not claims.exists():
+        return
+    _require_plain_directory(claims)
+    paths = sorted(
+        path for path in claims.iterdir() if path.is_file() and path.suffix == ".json"
+    )
+    if len(paths) > _CLEANUP_CLAIM_SCAN_LIMIT:
+        raise RuntimeError("characterization_cleanup_record_limit")
+    for path in paths:
+        state = _read_characterization_record(path, marker_secret)
+        operation_id = _required_state_text(state, "operation_id")
+        if path.stem != operation_id:
+            raise RuntimeError("characterization_cleanup_token_invalid")
+        _validate_cleanup_claim_identity(
+            state,
+            root=root,
+            expected_operation_id=operation_id,
+            marker_secret=marker_secret,
+            allowed_phases={
+                "ready",
+                "transcript_removing",
+                "transcript_removed",
+                "disposable_quarantining",
+                "disposable_quarantined",
+                "disposable_removed",
+            },
+        )
+    if paths:
+        raise RuntimeError("characterization_cleanup_in_progress")
+
+
+def _validate_aborted_characterization_identity(
+    state: Mapping[str, Any],
+    *,
+    root: Path,
+    expected_operation_id: str,
+    expected_job_id: str,
+    expected_reserved_claude_uuid: str,
+    marker_secret: bytes,
+    allowed_phases: set[str],
+) -> None:
+    if (
+        state.get("schema_version") != 2
+        or state.get("operation_id") != expected_operation_id
+        or state.get("phase") not in allowed_phases
+        or state.get("source_provider") != Provider.CODEX.value
+        or state.get("source_session_id") != f"codex:{expected_operation_id}"
+        or state.get("job_id") != expected_job_id
+        or state.get("reserved_claude_uuid") != expected_reserved_claude_uuid
+    ):
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=_required_state_text(state, "source_session_id"),
+        source_provider=Provider.CODEX,
+        native_name=_required_state_text(state, "native_name"),
+        source_cwd=_required_state_text(state, "source_cwd"),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=float(_required_state_number(state, "created_at")),
+    )
+    identity = derive_claude_visibility_identity(candidate, marker_secret)
+    if (
+        identity.job_id != expected_job_id
+        or identity.claude_uuid != expected_reserved_claude_uuid
+        or identity.bridge_id != state.get("bridge_id")
+        or identity.signed_marker != state.get("signed_marker")
+    ):
+        raise RuntimeError("characterization_abort_identity_mismatch")
+    _bound_disposable_path(state, root)
+    _validated_characterization_marker(
+        identity.signed_marker,
+        marker_secret,
+        source_session_id=candidate.source_session_id,
+        bridge_id=identity.bridge_id,
+    )
+
+
+def _aborted_characterization_result(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "retired",
+        "job_id": state["job_id"],
+        "reserved_claude_uuid": state["reserved_claude_uuid"],
+        "active_record_retired": True,
+    }
 
 
 def _cleanup_characterized_claude_visibility_locked(
@@ -478,13 +1001,17 @@ def _cleanup_characterized_claude_visibility_locked(
 ) -> dict[str, Any]:
     claims = root / ".cleanup-claims"
     completed = root / ".cleanup-completed"
+    quarantine_root = root / _CLEANUP_QUARANTINE_DIRECTORY
     claims.mkdir(exist_ok=True)
     completed.mkdir(exist_ok=True)
+    quarantine_root.mkdir(exist_ok=True)
     _require_plain_directory(claims)
     _require_plain_directory(completed)
+    _require_plain_directory(quarantine_root)
     active = root / _CHARACTERIZATION_RECORD
     claimed = claims / f"{operation_id}.json"
     done = completed / f"{operation_id}.json"
+    quarantined = quarantine_root / operation_id
     if done.exists():
         state = _read_characterization_record(done, marker_secret)
         _validate_cleanup_authority(
@@ -495,6 +1022,31 @@ def _cleanup_characterized_claude_visibility_locked(
             timestamp,
             allow_expired_claim=True,
         )
+        _validate_cleanup_claim_identity(
+            state,
+            root=root,
+            expected_operation_id=operation_id,
+            marker_secret=marker_secret,
+            allowed_phases={"completed"},
+        )
+        if claimed.exists():
+            claimed_state = _read_characterization_record(claimed, marker_secret)
+            _validate_cleanup_claim_identity(
+                claimed_state,
+                root=root,
+                expected_operation_id=operation_id,
+                marker_secret=marker_secret,
+                allowed_phases={
+                    "ready",
+                    "transcript_removing",
+                    "transcript_removed",
+                    "disposable_quarantining",
+                    "disposable_quarantined",
+                    "disposable_removed",
+                },
+            )
+            claimed.unlink()
+        _best_effort_remove_disposable(quarantined, state)
         return _cleanup_result(state)
     if not claimed.exists():
         if not active.exists():
@@ -515,8 +1067,27 @@ def _cleanup_characterized_claude_visibility_locked(
         timestamp,
         allow_expired_claim=True,
     )
+    _validate_cleanup_claim_identity(
+        state,
+        root=root,
+        expected_operation_id=operation_id,
+        marker_secret=marker_secret,
+        allowed_phases={
+            "ready",
+            "transcript_removing",
+            "transcript_removed",
+            "disposable_quarantining",
+            "disposable_quarantined",
+            "disposable_removed",
+        },
+    )
     disposable = _bound_disposable_path(state, root)
-    if state["phase"] not in {"disposable_removed", "completed"}:
+    if state["phase"] not in {
+        "disposable_quarantining",
+        "disposable_quarantined",
+        "disposable_removed",
+        "completed",
+    }:
         _validate_disposable(state, root)
     _validated_characterization_marker(
         _required_state_text(state, "signed_marker"),
@@ -573,17 +1144,37 @@ def _cleanup_characterized_claude_visibility_locked(
             quarantine.unlink()
         state["phase"] = "transcript_removed"
         _write_characterization_record(claimed, state, marker_secret)
-    elif state["phase"] not in {"transcript_removed", "disposable_removed"}:
+    elif state["phase"] not in {
+        "transcript_removed",
+        "disposable_quarantining",
+        "disposable_quarantined",
+        "disposable_removed",
+    }:
         raise RuntimeError("characterization_cleanup_token_invalid")
     if state["phase"] == "transcript_removed":
+        state["phase"] = "disposable_quarantining"
+        _write_characterization_record(claimed, state, marker_secret)
+    if state["phase"] == "disposable_quarantining":
+        if disposable.exists() and quarantined.exists():
+            raise RuntimeError("characterization_identity_mismatch:disposable")
         if disposable.exists():
             _validate_disposable(state, root)
-            _safe_remove_disposable(disposable, state)
-        state["phase"] = "disposable_removed"
+            os.replace(disposable, quarantined)
+        if not quarantined.exists():
+            raise RuntimeError("characterization_identity_mismatch:disposable")
+        _validate_disposable_path(quarantined, state)
+        state["phase"] = "disposable_quarantined"
         _write_characterization_record(claimed, state, marker_secret)
+    elif state["phase"] == "disposable_quarantined":
+        if not quarantined.exists():
+            raise RuntimeError("characterization_identity_mismatch:disposable")
+        _validate_disposable_path(quarantined, state)
+    elif state["phase"] != "disposable_removed":
+        raise RuntimeError("characterization_cleanup_token_invalid")
     state["phase"] = "completed"
     _write_characterization_record(done, state, marker_secret)
     claimed.unlink()
+    _best_effort_remove_disposable(quarantined, state)
     return _cleanup_result(state)
 
 
@@ -985,6 +1576,66 @@ def _validate_cleanup_authority(
         raise RuntimeError("characterization_cleanup_token_expired")
 
 
+def _validate_cleanup_claim_identity(
+    state: Mapping[str, Any],
+    *,
+    root: Path,
+    expected_operation_id: str,
+    marker_secret: bytes,
+    allowed_phases: set[str],
+) -> None:
+    if (
+        state.get("schema_version") != 2
+        or state.get("operation_id") != expected_operation_id
+        or state.get("phase") not in allowed_phases
+        or state.get("source_provider") != Provider.CODEX.value
+        or state.get("source_session_id") != f"codex:{expected_operation_id}"
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    try:
+        if str(uuid.UUID(expected_operation_id)) != expected_operation_id:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError):
+        raise RuntimeError("characterization_cleanup_token_invalid") from None
+    created_at = _required_state_number(state, "created_at")
+    expires_at = _required_state_number(state, "expires_at")
+    authorized_at = state.get("cleanup_authorized_at")
+    if (
+        expires_at <= created_at
+        or not isinstance(authorized_at, (int, float))
+        or isinstance(authorized_at, bool)
+        or not math.isfinite(authorized_at)
+        or float(authorized_at) > expires_at
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=_required_state_text(state, "source_session_id"),
+        source_provider=Provider.CODEX,
+        native_name=_required_state_text(state, "native_name"),
+        source_cwd=_required_state_text(state, "source_cwd"),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=created_at,
+    )
+    identity = derive_claude_visibility_identity(candidate, marker_secret)
+    _validated_characterization_marker(
+        _required_state_text(state, "signed_marker"),
+        marker_secret,
+        source_session_id=candidate.source_session_id,
+        bridge_id=_required_state_text(state, "bridge_id"),
+    )
+    if (
+        identity.job_id != state.get("job_id")
+        or identity.bridge_id != state.get("bridge_id")
+        or identity.claude_uuid != state.get("reserved_claude_uuid")
+        or identity.signed_marker != state.get("signed_marker")
+    ):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    _bound_disposable_path(state, root)
+
+
 def _validate_operation_state(
     state: Mapping[str, Any], *, root: Path, now: float
 ) -> None:
@@ -1145,6 +1796,11 @@ def _write_identity_sentinel(directory: Path, operation_id: str, nonce: str) -> 
 
 def _validate_disposable(state: Mapping[str, Any], root: Path) -> Path:
     disposable = _bound_disposable_path(state, root)
+    _validate_disposable_path(disposable, state)
+    return disposable
+
+
+def _validate_disposable_path(disposable: Path, state: Mapping[str, Any]) -> None:
     _require_plain_directory(disposable)
     sentinel = disposable / _CHARACTERIZATION_SENTINEL
     if _path_is_redirect(sentinel):
@@ -1158,7 +1814,6 @@ def _validate_disposable(state: Mapping[str, Any], root: Path) -> Path:
         "nonce": state.get("sentinel_nonce"),
     }:
         raise RuntimeError("characterization_identity_mismatch:sentinel")
-    return disposable
 
 
 def _bound_disposable_path(state: Mapping[str, Any], root: Path) -> Path:
@@ -1214,7 +1869,7 @@ def _recorded_object_identity(value: Any) -> tuple[int, int]:
 
 
 def _safe_remove_disposable(disposable: Path, state: Mapping[str, Any]) -> None:
-    _validate_disposable(state, disposable.parent)
+    _validate_disposable_path(disposable, state)
     # Delete bottom-up, never following a redirect. A swapped directory causes
     # rmdir to fail rather than traversing an attacker-controlled target.
     for current_root, dirs, files in os.walk(
@@ -1236,6 +1891,19 @@ def _safe_remove_disposable(disposable: Path, state: Mapping[str, Any]) -> None:
                 raise RuntimeError("characterization_identity_mismatch:disposable")
             item.rmdir()
     disposable.rmdir()
+
+
+def _best_effort_remove_disposable(disposable: Path, state: Mapping[str, Any]) -> None:
+    if not disposable.exists():
+        return
+    try:
+        _safe_remove_disposable(disposable, state)
+    except (OSError, RuntimeError):
+        # Terminal state is already durably published before this cleanup runs.
+        # On identity loss or an OS error, retain the deterministic quarantine
+        # for manual inspection rather than interpreting ambiguity as authority
+        # to delete anything.
+        return
 
 
 def _characterization_message(timestamp: float) -> Any:

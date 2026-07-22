@@ -45,6 +45,7 @@ from .models import (
     SidebarJobState,
     UpsertResult,
     canonical_session_id,
+    decode_bridge_marker,
     encode_bridge_marker,
 )
 
@@ -208,9 +209,7 @@ SIDEBAR_TERMINAL_RESOLUTION_CODE = "native_thread_unrecoverable"
 SIDEBAR_TERMINAL_EVIDENCE_KIND = "codex_app_server_read_not_loaded_resume_no_rollout"
 SIDEBAR_TERMINAL_EVIDENCE_VERSION = 1
 SIDEBAR_PRECREATE_RESOLUTION_CODE = "precutover_create_unrecoverable"
-SIDEBAR_PRECREATE_EVIDENCE_KIND = (
-    "codex_inventory_marker_and_recovery_zero_no_rollout"
-)
+SIDEBAR_PRECREATE_EVIDENCE_KIND = "codex_inventory_marker_and_recovery_zero_no_rollout"
 SIDEBAR_PRECREATE_EVIDENCE_VERSION = 1
 
 
@@ -681,6 +680,153 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def enqueue_claude_visibility_characterization(
+        self,
+        candidate: Any,
+        identity: Any,
+        marker_secret: bytes,
+        *,
+        operation_id: str,
+        evidence_digest: str,
+    ) -> dict[str, Any]:
+        """Atomically enqueue and mark one disposable characterization job.
+
+        Generic delivery excludes jobs with a registered characterization event.
+        The job insert and that event therefore must share one transaction: neither
+        a concurrent worker nor a crash may observe a launchable synthetic job.
+        """
+
+        from .claude_visibility import (
+            ClaudeVisibilityCandidate,
+            ClaudeVisibilityIdentity,
+            validate_claude_visibility_identity_binding,
+        )
+
+        if not isinstance(candidate, ClaudeVisibilityCandidate):
+            raise TypeError("candidate must be a ClaudeVisibilityCandidate")
+        if not isinstance(identity, ClaudeVisibilityIdentity):
+            raise TypeError("identity must be a ClaudeVisibilityIdentity")
+        validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+        normalized_operation = _exact_nonempty_text(
+            operation_id, "Claude characterization operation ID"
+        )
+        if (
+            re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                normalized_operation,
+            )
+            is None
+        ):
+            raise ValueError("Claude characterization operation ID is invalid")
+        normalized_evidence = _exact_nonempty_text(
+            evidence_digest, "Claude characterization evidence digest"
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", normalized_evidence) is None:
+            raise ValueError(
+                "Claude characterization evidence digest must be lowercase SHA-256"
+            )
+        if (
+            candidate.source_provider is not Provider.CODEX
+            or candidate.source_session_id != f"codex:{normalized_operation}"
+        ):
+            raise ValueError("Claude characterization identity mismatch")
+
+        def _write(conn: Any) -> dict[str, Any]:
+            recorded_at = _finite_number(self._clock(), "clock")
+            row, created = self._insert_claude_visibility_job(
+                conn, candidate, identity, marker_secret, recorded_at
+            )
+            existing = conn.execute(
+                """SELECT *
+                   FROM session_claude_visibility_characterization_events
+                   WHERE job_id = ? AND event_kind = 'registered'""",
+                (identity.job_id,),
+            ).fetchone()
+            expected_event = {
+                "operation_id": normalized_operation,
+                "source_session_id": candidate.source_session_id,
+                "bridge_id": identity.bridge_id,
+                "idempotency_key": identity.idempotency_key,
+                "reserved_claude_uuid": identity.claude_uuid,
+            }
+            if existing is not None:
+                if any(existing[key] != value for key, value in expected_event.items()):
+                    raise ValueError("Claude characterization identity mismatch")
+                return {
+                    "status": "registered",
+                    "job_id": identity.job_id,
+                    "reserved_claude_uuid": identity.claude_uuid,
+                }
+            if created:
+                other_open = conn.execute(
+                    """SELECT 1
+                       FROM session_claude_visibility_jobs AS job
+                       WHERE job.id != ?
+                         AND job.state IN (
+                             'claude_pending', 'claude_leased',
+                             'claude_retry', 'claude_failed'
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = job.id
+                               AND event.event_kind IN (
+                                   'cleanup_completed', 'launch_aborted'
+                               )
+                         )
+                       LIMIT 1""",
+                    (identity.job_id,),
+                ).fetchone()
+                if other_open is not None:
+                    raise ValueError("Claude characterization requires idle delivery")
+            else:
+                # Schema 26 could persist an exact signed job before the
+                # append-only characterization ledger was introduced.  Binding
+                # that pre-ledger row is protective (generic delivery excludes it)
+                # and must never reset its attempt or lease history.  An active
+                # lease is the sole unsafe ownership state; an expired lease can
+                # be reconciled later by the exact-ID claimant.
+                state = row["state"]
+                recoverable_preledger = (
+                    state in {"claude_retry", "claude_failed", "claude_visible"}
+                    or (
+                        state == "claude_pending"
+                        and int(row["attempts"]) == 0
+                        and row["lease_digest"] is None
+                    )
+                    or (
+                        state == "claude_leased"
+                        and row["lease_expires_at"] is not None
+                        and float(row["lease_expires_at"]) <= recorded_at
+                    )
+                )
+                if not recoverable_preledger:
+                    raise ValueError("Claude characterization registration race")
+            conn.execute(
+                """INSERT INTO session_claude_visibility_characterization_events (
+                       job_id, event_kind, operation_id, source_session_id,
+                       bridge_id, idempotency_key, reserved_claude_uuid,
+                       evidence_digest, created_at
+                   ) VALUES (?, 'registered', ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    identity.job_id,
+                    normalized_operation,
+                    candidate.source_session_id,
+                    identity.bridge_id,
+                    identity.idempotency_key,
+                    identity.claude_uuid,
+                    normalized_evidence,
+                    recorded_at,
+                ),
+            )
+            return {
+                "status": "registered",
+                "job_id": identity.job_id,
+                "reserved_claude_uuid": identity.claude_uuid,
+            }
+
+        return self.db._execute_write(_write)
+
     def _insert_claude_visibility_job(
         self,
         conn: Any,
@@ -792,7 +938,15 @@ class SessionBridgeStore:
         def _write(conn):
             grouped = conn.execute(
                 """SELECT state, error_code, COUNT(*) AS count
-                     FROM session_claude_visibility_jobs
+                     FROM session_claude_visibility_jobs AS job
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM session_claude_visibility_characterization_events AS event
+                        WHERE event.job_id = job.id
+                          AND event.event_kind IN (
+                              'cleanup_completed', 'launch_aborted'
+                          )
+                    )
                     GROUP BY state, error_code"""
             ).fetchall()
             known = {
@@ -880,21 +1034,30 @@ class SessionBridgeStore:
             assert conn is not None
             operation_time = _finite_number(self._clock(), "clock")
             due = conn.execute(
-                """SELECT * FROM session_claude_visibility_jobs
+                """SELECT * FROM session_claude_visibility_jobs AS job
                    WHERE (
-                       state = 'claude_retry'
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM session_claude_visibility_reconciliations r
-                           WHERE r.job_id = session_claude_visibility_jobs.id
-                             AND r.attempt_ordinal = session_claude_visibility_jobs.attempts
-                             AND r.reserved_claude_uuid = session_claude_visibility_jobs.reserved_claude_uuid
-                             AND r.outcome = 'absent' AND r.consumed_at IS NULL
+                       (
+                           state = 'claude_retry'
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM session_claude_visibility_reconciliations r
+                               WHERE r.job_id = job.id
+                                 AND r.attempt_ordinal = job.attempts
+                                 AND r.reserved_claude_uuid = job.reserved_claude_uuid
+                                 AND r.outcome = 'absent'
+                                 AND r.consumed_at IS NULL
+                           )
+                           AND next_attempt_at <= ?
+                       ) OR (
+                           state = 'claude_leased' AND lease_expires_at <= ?
                        )
-                       AND next_attempt_at <= ?
-                   ) OR (
-                       state = 'claude_leased' AND lease_expires_at <= ?
                    )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM session_claude_visibility_characterization_events AS event
+                         WHERE event.job_id = job.id
+                           AND event.event_kind = 'registered'
+                     )
                    ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
                 (inspection_time, operation_time),
             ).fetchone()
@@ -925,6 +1088,8 @@ class SessionBridgeStore:
         self,
         now: float,
         lease_seconds: float,
+        *,
+        expected_job_id: str | None = None,
     ) -> ClaudeVisibilityClaim:
         """Lease exact-ID reconciliation without reserving launch budget."""
 
@@ -934,33 +1099,113 @@ class SessionBridgeStore:
         lease_duration = _finite_number(lease_seconds, "lease_seconds")
         if lease_duration <= 0:
             raise ValueError("lease_seconds must be positive")
+        expected_id = (
+            None
+            if expected_job_id is None
+            else _exact_nonempty_text(
+                expected_job_id, "expected Claude visibility job ID"
+            )
+        )
 
         def _write(conn):
             operation_time = _finite_number(self._clock(), "clock")
-            conn.execute(
-                """UPDATE session_claude_visibility_jobs
-                   SET state = 'claude_retry', next_attempt_at = ?,
-                       lease_digest = NULL, lease_expires_at = NULL,
-                       lease_kind = NULL,
-                       error_code = 'lease_expired',
-                       error_detail = 'active lease expired before completion',
-                       updated_at = ?
-                   WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
-                (claim_time, operation_time, operation_time),
+            if expected_id is None:
+                conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_retry', next_attempt_at = ?,
+                           lease_digest = NULL, lease_expires_at = NULL,
+                           lease_kind = NULL,
+                           error_code = 'lease_expired',
+                           error_detail = 'active lease expired before completion',
+                           updated_at = ?
+                       WHERE state = 'claude_leased' AND lease_expires_at <= ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = session_claude_visibility_jobs.id
+                               AND event.event_kind = 'registered'
+                         )""",
+                    (claim_time, operation_time, operation_time),
+                )
+            else:
+                conn.execute(
+                    """UPDATE session_claude_visibility_jobs
+                       SET state = 'claude_retry', next_attempt_at = ?,
+                           lease_digest = NULL, lease_expires_at = NULL,
+                           lease_kind = NULL,
+                           error_code = 'lease_expired',
+                           error_detail = 'active lease expired before completion',
+                           updated_at = ?
+                       WHERE id = ? AND state = 'claude_leased'
+                         AND lease_expires_at <= ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = session_claude_visibility_jobs.id
+                               AND event.event_kind IN (
+                                   'cleanup_completed', 'launch_aborted'
+                               )
+                         )""",
+                    (claim_time, operation_time, expected_id, operation_time),
+                )
+                other_open = conn.execute(
+                    """SELECT 1 FROM session_claude_visibility_jobs AS job
+                       WHERE id != ? AND state IN (
+                           'claude_pending', 'claude_leased',
+                           'claude_retry', 'claude_failed'
+                       ) AND NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_characterization_events AS event
+                           WHERE event.job_id = job.id
+                             AND event.event_kind IN (
+                                 'cleanup_completed', 'launch_aborted'
+                             )
+                       ) LIMIT 1""",
+                    (expected_id,),
+                ).fetchone()
+                if other_open is not None:
+                    return ClaudeVisibilityClaim(
+                        status="not_sole_open_job", job_id=expected_id
+                    )
+            characterization_filter = (
+                "event.event_kind = 'registered'"
+                if expected_id is None
+                else "event.event_kind IN ('cleanup_completed', 'launch_aborted')"
             )
             due = conn.execute(
-                """SELECT * FROM session_claude_visibility_jobs
-                   WHERE state = 'claude_retry' AND next_attempt_at <= ?
+                f"""SELECT * FROM session_claude_visibility_jobs AS job
+                   WHERE (? IS NULL OR id = ?)
+                      AND (
+                          state = 'claude_retry'
+                          OR (
+                              ? IS NOT NULL
+                              AND state = 'claude_pending'
+                              AND attempts = 0
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM session_claude_visibility_characterization_events AS registered
+                                  WHERE registered.job_id = job.id
+                                    AND registered.event_kind = 'registered'
+                              )
+                          )
+                      )
+                      AND next_attempt_at <= ?
                      AND NOT EXISTS (
                          SELECT 1
                          FROM session_claude_visibility_reconciliations r
-                         WHERE r.job_id = session_claude_visibility_jobs.id
-                           AND r.attempt_ordinal = session_claude_visibility_jobs.attempts
-                           AND r.reserved_claude_uuid = session_claude_visibility_jobs.reserved_claude_uuid
+                         WHERE r.job_id = job.id
+                           AND r.attempt_ordinal = job.attempts
+                           AND r.reserved_claude_uuid = job.reserved_claude_uuid
                            AND r.outcome = 'absent' AND r.consumed_at IS NULL
                      )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM session_claude_visibility_characterization_events AS event
+                         WHERE event.job_id = job.id
+                           AND {characterization_filter}
+                     )
                    ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
-                (claim_time,),
+                (expected_id, expected_id, expected_id, claim_time),
             ).fetchone()
             if due is None:
                 return ClaudeVisibilityClaim(status="no_due_job")
@@ -1113,7 +1358,13 @@ class SessionBridgeStore:
                            error_code = 'lease_expired',
                            error_detail = 'active lease expired before completion',
                            updated_at = ?
-                       WHERE state = 'claude_leased' AND lease_expires_at <= ?""",
+                       WHERE state = 'claude_leased' AND lease_expires_at <= ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = session_claude_visibility_jobs.id
+                               AND event.event_kind = 'registered'
+                         )""",
                     (claim_time, operation_time, operation_time),
                 )
             else:
@@ -1126,14 +1377,29 @@ class SessionBridgeStore:
                            error_detail = 'active lease expired before completion',
                            updated_at = ?
                        WHERE id = ? AND state = 'claude_leased'
-                         AND lease_expires_at <= ?""",
+                         AND lease_expires_at <= ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = session_claude_visibility_jobs.id
+                               AND event.event_kind IN (
+                                   'cleanup_completed', 'launch_aborted'
+                               )
+                         )""",
                     (claim_time, operation_time, expected_id, operation_time),
                 )
                 other_open = conn.execute(
-                    """SELECT 1 FROM session_claude_visibility_jobs
+                    """SELECT 1 FROM session_claude_visibility_jobs AS job
                        WHERE id != ? AND state IN (
                            'claude_pending', 'claude_leased',
                            'claude_retry', 'claude_failed'
+                       ) AND NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_characterization_events AS event
+                           WHERE event.job_id = job.id
+                             AND event.event_kind IN (
+                                 'cleanup_completed', 'launch_aborted'
+                             )
                        ) LIMIT 1""",
                     (expected_id,),
                 ).fetchone()
@@ -1143,18 +1409,32 @@ class SessionBridgeStore:
                     )
             if expected_id is None:
                 due = conn.execute(
-                    """SELECT * FROM session_claude_visibility_jobs
+                    """SELECT * FROM session_claude_visibility_jobs AS job
                        WHERE state IN ('claude_pending', 'claude_retry')
                          AND next_attempt_at <= ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = job.id
+                               AND event.event_kind = 'registered'
+                         )
                        ORDER BY next_attempt_at, eligible_at, id LIMIT 1""",
                     (claim_time,),
                 ).fetchone()
             else:
                 due = conn.execute(
-                    """SELECT * FROM session_claude_visibility_jobs
+                    """SELECT * FROM session_claude_visibility_jobs AS job
                        WHERE id = ?
                          AND state IN ('claude_pending', 'claude_retry')
-                         AND next_attempt_at <= ? LIMIT 1""",
+                         AND next_attempt_at <= ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_claude_visibility_characterization_events AS event
+                             WHERE event.job_id = job.id
+                               AND event.event_kind IN (
+                                   'cleanup_completed', 'launch_aborted'
+                               )
+                         ) LIMIT 1""",
                     (expected_id, claim_time),
                 ).fetchone()
             if due is None:
@@ -1423,17 +1703,32 @@ class SessionBridgeStore:
             operation_time = _finite_number(self._clock(), "clock")
             local_day = self._claude_visibility_local_day(operation_time)
             job = conn.execute(
-                """SELECT * FROM session_claude_visibility_jobs
-                   WHERE id = ? AND reserved_claude_uuid = ?""",
+                """SELECT * FROM session_claude_visibility_jobs AS job
+                   WHERE id = ? AND reserved_claude_uuid = ?
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM session_claude_visibility_characterization_events AS event
+                         WHERE event.job_id = job.id
+                           AND event.event_kind IN (
+                               'cleanup_completed', 'launch_aborted'
+                           )
+                     )""",
                 (normalized_job, normalized_uuid),
             ).fetchone()
             if job is None:
                 raise ValueError("exact failed Claude visibility job required")
             other_open = conn.execute(
-                """SELECT 1 FROM session_claude_visibility_jobs
+                """SELECT 1 FROM session_claude_visibility_jobs AS job
                    WHERE id != ? AND state IN (
                        'claude_pending', 'claude_leased',
                        'claude_retry', 'claude_failed'
+                   ) AND NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS event
+                       WHERE event.job_id = job.id
+                         AND event.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
                    ) LIMIT 1""",
                 (normalized_job,),
             ).fetchone()
@@ -1861,7 +2156,7 @@ class SessionBridgeStore:
             )
             if completed.rowcount != 1:
                 raise ValueError("stale Claude authentication recovery completion")
-            lineage = _finalize_claude_visibility_lineage_if_indexed(
+            lineage = _finalize_claude_visibility_lineage_if_production(
                 conn,
                 job_id=normalized_job,
                 created_at=operation_time,
@@ -1941,7 +2236,7 @@ class SessionBridgeStore:
                     raise ValueError(
                         "exact Claude authentication recovery authority required"
                     )
-                lineage = _finalize_claude_visibility_lineage_if_indexed(
+                lineage = _finalize_claude_visibility_lineage_if_production(
                     conn,
                     job_id=normalized_job,
                     created_at=operation_time,
@@ -1988,7 +2283,7 @@ class SessionBridgeStore:
             )
             if completed.rowcount != 1:
                 raise ValueError("stale Claude authentication recovery completion")
-            lineage = _finalize_claude_visibility_lineage_if_indexed(
+            lineage = _finalize_claude_visibility_lineage_if_production(
                 conn,
                 job_id=normalized_job,
                 created_at=operation_time,
@@ -2039,10 +2334,17 @@ class SessionBridgeStore:
         def _write(conn):
             operation_time = _finite_number(self._clock(), "clock")
             other_open = conn.execute(
-                """SELECT 1 FROM session_claude_visibility_jobs
+                """SELECT 1 FROM session_claude_visibility_jobs AS job
                    WHERE id != ? AND state IN (
                        'claude_pending', 'claude_leased',
                        'claude_retry', 'claude_failed'
+                   ) AND NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS event
+                       WHERE event.job_id = job.id
+                         AND event.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
                    ) LIMIT 1""",
                 (normalized_job,),
             ).fetchone()
@@ -2147,7 +2449,7 @@ class SessionBridgeStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("exact active Claude visibility lease required")
-            lineage = _finalize_claude_visibility_lineage_if_indexed(
+            lineage = _finalize_claude_visibility_lineage_if_production(
                 conn,
                 job_id=normalized_job_id,
                 created_at=operation_time,
@@ -2254,12 +2556,28 @@ class SessionBridgeStore:
             assert conn is not None
             count_rows = conn.execute(
                 """SELECT state, COUNT(*) AS count
-                   FROM session_claude_visibility_jobs GROUP BY state"""
+                   FROM session_claude_visibility_jobs AS job
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS event
+                       WHERE event.job_id = job.id
+                         AND event.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
+                   )
+                   GROUP BY state"""
             ).fetchall()
             code_rows = conn.execute(
                 """SELECT state, error_code, COUNT(*) AS count
-                   FROM session_claude_visibility_jobs
-                   WHERE error_code IS NOT NULL
+                   FROM session_claude_visibility_jobs AS job
+                   WHERE error_code IS NOT NULL AND NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS event
+                       WHERE event.job_id = job.id
+                         AND event.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
+                   )
                    GROUP BY state, error_code"""
             ).fetchall()
             usage_rows = conn.execute(
@@ -2272,6 +2590,22 @@ class SessionBridgeStore:
                 "SELECT value_json FROM session_bridge_state WHERE key = ?",
                 (_CLAUDE_VISIBILITY_CYCLE_STATE_KEY,),
             ).fetchone()
+            characterization_rows = conn.execute(
+                """SELECT job.id AS job_id, job.state AS state
+                   FROM session_claude_visibility_jobs AS job
+                   JOIN session_claude_visibility_characterization_events AS registered
+                     ON registered.job_id = job.id
+                    AND registered.event_kind = 'registered'
+                   WHERE NOT EXISTS (
+                       SELECT 1
+                       FROM session_claude_visibility_characterization_events AS terminal
+                       WHERE terminal.job_id = job.id
+                         AND terminal.event_kind IN (
+                             'cleanup_completed', 'launch_aborted'
+                         )
+                   )
+                   ORDER BY job.id"""
+            ).fetchall()
             lineage = _claude_visibility_lineage_status(
                 conn,
                 source_identity_issue=self._claude_lineage_source_identity_issue,
@@ -2338,6 +2672,10 @@ class SessionBridgeStore:
             },
             "fatal": fatal,
             "lineage": lineage,
+            "characterizations": [
+                {"job_id": row["job_id"], "state": row["state"]}
+                for row in characterization_rows
+            ],
             **_public_claude_visibility_cycle_state(cycle),
         }
 
@@ -2489,7 +2827,16 @@ class SessionBridgeStore:
             if safe_status == "no_due_job":
                 state_rows = conn.execute(
                     """SELECT state, COUNT(*) AS count
-                       FROM session_claude_visibility_jobs GROUP BY state"""
+                       FROM session_claude_visibility_jobs AS job
+                       WHERE NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_characterization_events AS event
+                           WHERE event.job_id = job.id
+                             AND event.event_kind IN (
+                                 'cleanup_completed', 'launch_aborted'
+                             )
+                       )
+                       GROUP BY state"""
                 ).fetchall()
                 empty_verified = all(
                     state_row["state"] == "claude_visible"
@@ -2681,10 +3028,9 @@ class SessionBridgeStore:
             shadow_config = json.loads(model_config)
         except (TypeError, ValueError):
             return "identity"
-        if (
-            not isinstance(shadow_config, Mapping)
-            or set(shadow_config) != {"_session_bridge_profile"}
-        ):
+        if not isinstance(shadow_config, Mapping) or set(shadow_config) != {
+            "_session_bridge_profile"
+        }:
             return "identity"
         expected_profile = shadow_config["_session_bridge_profile"]
         if (
@@ -2977,9 +3323,7 @@ class SessionBridgeStore:
                     target_native_id=native_id,
                     bridge_id=origin_bridge_id,
                     created_at=now,
-                    source_identity_issue=(
-                        self._claude_lineage_source_identity_issue
-                    ),
+                    source_identity_issue=(self._claude_lineage_source_identity_issue),
                 )
 
             if rebuild:
@@ -4595,9 +4939,7 @@ class SessionBridgeStore:
                     cutover = _decode_sidebar_create_reservation_cutover(
                         cutover_row["value_json"]
                     )
-                    delivery_candidate = _validated_sidebar_cutover_candidate(
-                        conn, job
-                    )
+                    delivery_candidate = _validated_sidebar_cutover_candidate(conn, job)
                     if (
                         reservation["job_id"] != job["id"]
                         or reservation["bridge_id"] != job["bridge_id"]
@@ -4632,14 +4974,10 @@ class SessionBridgeStore:
             ledger_valid = False
         ineffective = max(0, total - effective)
         by_resolution_code = {
-            SIDEBAR_TERMINAL_RESOLUTION_CODE: (
-                bound_effective if ledger_valid else 0
-            )
+            SIDEBAR_TERMINAL_RESOLUTION_CODE: (bound_effective if ledger_valid else 0)
         }
         if ledger_valid and precreate_total:
-            by_resolution_code[SIDEBAR_PRECREATE_RESOLUTION_CODE] = (
-                precreate_effective
-            )
+            by_resolution_code[SIDEBAR_PRECREATE_RESOLUTION_CODE] = precreate_effective
         return {
             "total": total,
             "effective": effective,
@@ -5908,6 +6246,251 @@ class SessionBridgeStore:
                 "error_code": expected_error,
                 "resolution_code": SIDEBAR_TERMINAL_RESOLUTION_CODE,
                 "created": True,
+            }
+
+        return self.db._execute_write(_write)
+
+    def record_claude_visibility_characterization(
+        self,
+        *,
+        job_id: str,
+        operation_id: str,
+        source_session_id: str,
+        bridge_id: str,
+        idempotency_key: str,
+        reserved_claude_uuid: str,
+        native_name: str,
+        source_cwd: str,
+        signed_marker: str,
+        evidence_digest: str,
+        marker_secret: bytes,
+        cleanup_completed: bool,
+        launch_aborted: bool = False,
+    ) -> dict[str, Any]:
+        """Append authenticated lifecycle evidence for one disposable live probe.
+
+        Characterization rows deliberately use a synthetic Codex source and must
+        never enter production catalog lineage.  The event ledger preserves the
+        exact job/UUID binding while allowing an explicitly cleaned probe to stop
+        counting as a durable visible mirror.
+        """
+
+        normalized_job = _exact_nonempty_text(job_id, "Claude visibility job ID")
+        normalized_operation = _exact_nonempty_text(
+            operation_id, "Claude characterization operation ID"
+        )
+        if (
+            re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                normalized_operation,
+            )
+            is None
+        ):
+            raise ValueError("Claude characterization operation ID is invalid")
+        normalized_source = _exact_nonempty_text(
+            source_session_id, "Claude characterization source session ID"
+        )
+        normalized_bridge = _exact_nonempty_text(
+            bridge_id, "Claude characterization bridge ID"
+        )
+        normalized_idempotency = _exact_nonempty_text(
+            idempotency_key, "Claude characterization idempotency key"
+        )
+        normalized_uuid = _exact_nonempty_text(
+            reserved_claude_uuid, "reserved Claude UUID"
+        )
+        normalized_name = _exact_nonempty_text(
+            native_name, "Claude characterization native name"
+        )
+        normalized_cwd = _exact_nonempty_text(
+            source_cwd, "Claude characterization source cwd"
+        )
+        normalized_marker = _exact_nonempty_text(
+            signed_marker, "Claude characterization signed marker"
+        )
+        normalized_evidence = _exact_nonempty_text(
+            evidence_digest, "Claude characterization evidence digest"
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", normalized_evidence) is None:
+            raise ValueError(
+                "Claude characterization evidence digest must be lowercase SHA-256"
+            )
+        if not isinstance(marker_secret, bytes) or not marker_secret:
+            raise ValueError("Claude characterization marker secret must be nonempty")
+        if type(cleanup_completed) is not bool:
+            raise ValueError("Claude characterization cleanup flag must be boolean")
+        if type(launch_aborted) is not bool:
+            raise ValueError("Claude characterization abort flag must be boolean")
+        if cleanup_completed and launch_aborted:
+            raise ValueError(
+                "Claude characterization cleanup and abort are mutually exclusive"
+            )
+        if normalized_source != f"codex:{normalized_operation}":
+            raise ValueError("Claude characterization identity mismatch")
+
+        def _write(conn):
+            from .claude_visibility import (
+                ClaudeVisibilityCandidate,
+                derive_claude_visibility_identity,
+                validate_claude_visibility_identity_binding,
+            )
+
+            row = conn.execute(
+                "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                (normalized_job,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Claude characterization identity mismatch")
+            expected = {
+                "source_session_id": normalized_source,
+                "bridge_id": normalized_bridge,
+                "idempotency_key": normalized_idempotency,
+                "reserved_claude_uuid": normalized_uuid,
+                "native_name": normalized_name,
+                "source_cwd": normalized_cwd,
+                "signed_marker": normalized_marker,
+            }
+            if any(row[key] != value for key, value in expected.items()):
+                raise ValueError("Claude characterization identity mismatch")
+            if row["source_provider"] != Provider.CODEX.value:
+                raise ValueError("Claude characterization identity mismatch")
+            candidate = ClaudeVisibilityCandidate(
+                source_session_id=row["source_session_id"],
+                source_provider=Provider.CODEX,
+                native_name=row["native_name"],
+                source_cwd=row["source_cwd"],
+                git_root=row["git_root"],
+                git_branch=row["git_branch"],
+                git_head=row["git_head"],
+                worktree_id=row["worktree_id"],
+                eligible_at=float(row["eligible_at"]),
+            )
+            derived = derive_claude_visibility_identity(candidate, marker_secret)
+            validate_claude_visibility_identity_binding(
+                candidate, derived, marker_secret
+            )
+            if (
+                derived.job_id != normalized_job
+                or derived.bridge_id != normalized_bridge
+                or derived.idempotency_key != normalized_idempotency
+                or derived.claude_uuid != normalized_uuid
+                or not hmac.compare_digest(derived.signed_marker, normalized_marker)
+            ):
+                raise ValueError("Claude characterization identity mismatch")
+            try:
+                marker = decode_bridge_marker(normalized_marker, marker_secret)
+            except (TypeError, ValueError):
+                raise ValueError("Claude characterization identity mismatch") from None
+            if (
+                marker.source_session_id != normalized_source
+                or marker.bridge_id != normalized_bridge
+                or marker.target_provider is not Provider.CLAUDE
+            ):
+                raise ValueError("Claude characterization identity mismatch")
+
+            recorded_at = _finite_number(self._clock(), "clock")
+            identity_values = (
+                normalized_job,
+                normalized_operation,
+                normalized_source,
+                normalized_bridge,
+                normalized_idempotency,
+                normalized_uuid,
+            )
+
+            def append_event(kind: str, digest: str) -> None:
+                existing = conn.execute(
+                    """SELECT *
+                       FROM session_claude_visibility_characterization_events
+                       WHERE job_id = ? AND event_kind = ?""",
+                    (normalized_job, kind),
+                ).fetchone()
+                if existing is not None:
+                    if any(
+                        existing[key] != value
+                        for key, value in {
+                            "operation_id": normalized_operation,
+                            "source_session_id": normalized_source,
+                            "bridge_id": normalized_bridge,
+                            "idempotency_key": normalized_idempotency,
+                            "reserved_claude_uuid": normalized_uuid,
+                        }.items()
+                    ):
+                        raise ValueError("Claude characterization identity mismatch")
+                    if kind != "registered" and not hmac.compare_digest(
+                        existing["evidence_digest"], digest
+                    ):
+                        raise ValueError("Claude characterization evidence mismatch")
+                    return
+                conn.execute(
+                    """INSERT INTO session_claude_visibility_characterization_events (
+                           job_id, event_kind, operation_id, source_session_id,
+                           bridge_id, idempotency_key, reserved_claude_uuid,
+                           evidence_digest, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        *identity_values[:1],
+                        kind,
+                        *identity_values[1:],
+                        digest,
+                        recorded_at,
+                    ),
+                )
+
+            append_event("registered", normalized_evidence)
+            if cleanup_completed:
+                append_event("cleanup_completed", normalized_evidence)
+            if launch_aborted:
+                existing_abort = conn.execute(
+                    """SELECT evidence_digest
+                       FROM session_claude_visibility_characterization_events
+                       WHERE job_id = ? AND event_kind = 'launch_aborted'""",
+                    (normalized_job,),
+                ).fetchone()
+                if existing_abort is not None:
+                    append_event("launch_aborted", existing_abort["evidence_digest"])
+                    return {
+                        "status": "already_aborted",
+                        "job_id": normalized_job,
+                        "reserved_claude_uuid": normalized_uuid,
+                    }
+                absence = conn.execute(
+                    """SELECT rowid, evidence_digest
+                       FROM session_claude_visibility_reconciliations
+                       WHERE job_id = ? AND reserved_claude_uuid = ?
+                         AND attempt_ordinal = ? AND outcome = 'absent'
+                         AND consumed_at IS NULL
+                       ORDER BY checked_at DESC LIMIT 1""",
+                    (normalized_job, normalized_uuid, row["attempts"]),
+                ).fetchone()
+                abortable_state = row["state"] == "claude_retry" or (
+                    row["state"] == "claude_failed"
+                    and row["error_code"] == "max_attempts_exhausted"
+                )
+                if not abortable_state or absence is None:
+                    return {
+                        "status": "reconciliation_required",
+                        "job_id": normalized_job,
+                        "reserved_claude_uuid": normalized_uuid,
+                    }
+                append_event("launch_aborted", absence["evidence_digest"])
+                consumed = conn.execute(
+                    """UPDATE session_claude_visibility_reconciliations
+                       SET consumed_at = ?
+                       WHERE rowid = ? AND consumed_at IS NULL""",
+                    (recorded_at, absence["rowid"]),
+                )
+                if consumed.rowcount != 1:
+                    raise ValueError("Claude characterization abort evidence is stale")
+                return {
+                    "status": "launch_aborted",
+                    "job_id": normalized_job,
+                    "reserved_claude_uuid": normalized_uuid,
+                }
+            return {
+                "status": ("cleanup_completed" if cleanup_completed else "registered"),
+                "job_id": normalized_job,
+                "reserved_claude_uuid": normalized_uuid,
             }
 
         return self.db._execute_write(_write)
@@ -7734,12 +8317,40 @@ def _claude_visibility_lineage_link_id(
     return f"claude-visibility-link:{digest}"
 
 
+def _claude_visibility_characterization_registered(conn: Any, job_id: str) -> bool:
+    return (
+        conn.execute(
+            """SELECT 1
+               FROM session_claude_visibility_characterization_events
+               WHERE job_id = ? AND event_kind = 'registered'""",
+            (job_id,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _claude_visibility_characterization_terminal(conn: Any, job_id: str) -> bool:
+    return (
+        conn.execute(
+            """SELECT 1
+               FROM session_claude_visibility_characterization_events
+               WHERE job_id = ? AND event_kind IN (
+                   'cleanup_completed', 'launch_aborted'
+               )""",
+            (job_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _inspect_claude_visibility_lineage(
     conn: Any,
     job: Mapping[str, Any],
     *,
     source_identity_issue: Callable[..., str | None] | None = None,
 ) -> dict[str, Any]:
+    if _claude_visibility_characterization_registered(conn, str(job["id"])):
+        return {"state": "already_linked", "code": None, "link": None}
     bridge_id = str(job["bridge_id"])
     source_session_id = str(job["source_session_id"])
     reserved_uuid = str(job["reserved_claude_uuid"])
@@ -7869,6 +8480,23 @@ def _inspect_claude_visibility_lineage(
             "link": None,
         }
     return {"state": "already_linked", "code": None, "link": dict(link)}
+
+
+def _finalize_claude_visibility_lineage_if_production(
+    conn: Any,
+    *,
+    job_id: str,
+    created_at: float,
+    source_identity_issue: Callable[..., str | None] | None = None,
+) -> dict[str, Any]:
+    if _claude_visibility_characterization_registered(conn, job_id):
+        return {"state": "already_linked", "code": None, "link": None}
+    return _finalize_claude_visibility_lineage_if_indexed(
+        conn,
+        job_id=job_id,
+        created_at=created_at,
+        source_identity_issue=source_identity_issue,
+    )
 
 
 def _finalize_claude_visibility_lineage_if_indexed(

@@ -27,10 +27,13 @@ from .catalog import UnifiedCatalog
 from .characterize import (
     CharacterizationGateError,
     LiveCharacterizationError,
+    _read_characterization_record,
     resolve_characterization_gate,
     resolve_cli_executable,
+    claim_claude_visibility_characterization_abort,
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
+    retire_aborted_claude_visibility_characterization,
     run_live_characterization,
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
@@ -39,6 +42,7 @@ from .claude_registrar import (
     _canonical_claude_startup_settings,
 )
 from .claude_visibility import (
+    ClaudeVisibilityCandidate,
     build_claude_visibility_candidate,
     derive_claude_visibility_identity,
 )
@@ -118,6 +122,7 @@ _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
 _MAX_CLAUDE_AUTH_STATUS_BYTES = 16_384
 _MAX_CLAUDE_GLOBAL_CONFIG_BYTES = 4 * 1024 * 1024
 _MAX_CLAUDE_USER_SETTINGS_BYTES = 4 * 1024 * 1024
+_CLAUDE_CHARACTERIZATION_SYNC_LIMIT = 100
 _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY = (
     "session-bridge:sidebar:create-reservation-cutover:v1"
 )
@@ -360,6 +365,169 @@ def _production_codex_permission_preflight(cwd: str) -> bool:
     return True
 
 
+def _claude_characterization_evidence(payload: Mapping[str, Any]) -> str:
+    try:
+        encoded = json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise ConfigurationFailure("characterization_record_invalid") from None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _record_claude_characterization_payload(
+    *,
+    store: Any,
+    payload: Mapping[str, Any],
+    marker_secret: bytes,
+    cleanup_completed: bool,
+    launch_aborted: bool = False,
+    ensure_registered: bool = False,
+) -> Mapping[str, Any]:
+    if type(ensure_registered) is not bool or (
+        ensure_registered and (cleanup_completed or launch_aborted)
+    ):
+        raise ConfigurationFailure("characterization_record_invalid")
+    required_text = (
+        "operation_id",
+        "source_session_id",
+        "bridge_id",
+        "job_id",
+        "reserved_claude_uuid",
+        "native_name",
+        "source_cwd",
+        "signed_marker",
+    )
+    if (
+        payload.get("schema_version") != 2
+        or payload.get("source_provider") != Provider.CODEX.value
+        or any(
+            not isinstance(payload.get(key), str) or not payload.get(key)
+            for key in required_text
+        )
+    ):
+        raise ConfigurationFailure("characterization_record_invalid")
+    operation_id = str(payload["operation_id"])
+    source_session_id = str(payload["source_session_id"])
+    if source_session_id != f"codex:{operation_id}":
+        raise ConfigurationFailure("characterization_record_invalid")
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=source_session_id,
+        source_provider=Provider.CODEX,
+        native_name=str(payload["native_name"]),
+        source_cwd=str(payload["source_cwd"]),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=float(payload.get("created_at", 0.0)),
+    )
+    identity = derive_claude_visibility_identity(candidate, marker_secret)
+    if (
+        identity.job_id != payload["job_id"]
+        or identity.bridge_id != payload["bridge_id"]
+        or identity.claude_uuid != payload["reserved_claude_uuid"]
+        or identity.signed_marker != payload["signed_marker"]
+    ):
+        raise ConfigurationFailure("characterization_record_invalid")
+    evidence_digest = _claude_characterization_evidence(payload)
+    try:
+        if ensure_registered:
+            result = store.enqueue_claude_visibility_characterization(
+                candidate,
+                identity,
+                marker_secret,
+                operation_id=operation_id,
+                evidence_digest=evidence_digest,
+            )
+        else:
+            result = store.record_claude_visibility_characterization(
+                job_id=identity.job_id,
+                operation_id=operation_id,
+                source_session_id=source_session_id,
+                bridge_id=identity.bridge_id,
+                idempotency_key=identity.idempotency_key,
+                reserved_claude_uuid=identity.claude_uuid,
+                native_name=candidate.native_name,
+                source_cwd=candidate.source_cwd,
+                signed_marker=identity.signed_marker,
+                evidence_digest=evidence_digest,
+                marker_secret=marker_secret,
+                cleanup_completed=cleanup_completed,
+                launch_aborted=launch_aborted,
+            )
+    except (TypeError, ValueError):
+        raise ConfigurationFailure("characterization_record_invalid") from None
+    if not isinstance(result, Mapping):
+        raise ConfigurationFailure("characterization_record_invalid")
+    return result
+
+
+def _sync_claude_characterization_records(
+    *,
+    store: Any,
+    source_root: Path,
+    marker_secret: bytes,
+    include_active: bool,
+    include_completed: bool,
+) -> dict[str, int]:
+    """Authenticate and bind only bounded, canonical characterization records."""
+
+    if type(include_active) is not bool or type(include_completed) is not bool:
+        raise ConfigurationFailure("characterization_record_invalid")
+    root = Path(source_root).expanduser().absolute()
+    if not root.exists():
+        return {"registered": 0, "cleanup_completed": 0}
+    paths: list[tuple[Path, bool]] = []
+    if include_active:
+        active = root / ".claude-visibility-operation.json"
+        if active.exists():
+            paths.append((active, False))
+    if include_completed:
+        completed_root = root / ".cleanup-completed"
+        if completed_root.exists():
+            completed_paths = sorted(
+                path
+                for path in completed_root.iterdir()
+                if path.is_file() and path.suffix == ".json"
+            )
+            if len(completed_paths) > _CLAUDE_CHARACTERIZATION_SYNC_LIMIT:
+                raise ConfigurationFailure("characterization_record_limit")
+            paths.extend((path, True) for path in completed_paths)
+    if len(paths) > _CLAUDE_CHARACTERIZATION_SYNC_LIMIT + 1:
+        raise ConfigurationFailure("characterization_record_limit")
+
+    result = {"registered": 0, "cleanup_completed": 0}
+    for path, completed in paths:
+        try:
+            payload = _read_characterization_record(path, marker_secret)
+        except RuntimeError:
+            raise ConfigurationFailure("characterization_record_invalid") from None
+        phase = payload.get("phase")
+        if completed:
+            if phase != "completed" or path.stem != payload.get("operation_id"):
+                raise ConfigurationFailure("characterization_record_invalid")
+        elif phase == "prepared":
+            # The job identity is not persisted until the reservation callback.
+            continue
+        elif phase not in {"reserved", "launching", "launched", "ready"}:
+            raise ConfigurationFailure("characterization_record_invalid")
+        _record_claude_characterization_payload(
+            store=store,
+            payload=payload,
+            marker_secret=marker_secret,
+            cleanup_completed=completed,
+            ensure_registered=not completed,
+        )
+        result["registered"] += 1
+        result["cleanup_completed"] += int(completed)
+    return result
+
+
 class _Backend(Protocol):
     def close(self) -> None: ...
     def serve(self) -> None: ...
@@ -403,6 +571,9 @@ class _Backend(Protocol):
     def claude_visibility_run_once(self) -> Mapping[str, Any]: ...
     def characterize_claude_visibility(
         self, cleanup_token: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]: ...
+    def abort_claude_visibility_characterization(
+        self, *, expected_job_id: str, expected_reserved_claude_uuid: str
     ) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
@@ -954,7 +1125,8 @@ class ProductionBackend:
             reservation = store.get_sidebar_create_reservation(source_session_id)
             if (
                 reservation is None
-                or set(reservation) != {
+                or set(reservation)
+                != {
                     "version",
                     "job_id",
                     "source_session_id",
@@ -971,15 +1143,12 @@ class ProductionBackend:
             ):
                 raise ValueError("sidebar precreate reservation mismatch")
 
-            cutover = store.get_state(
-                _SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY
-            )
+            cutover = store.get_state(_SIDEBAR_CREATE_RESERVATION_CUTOVER_STATE_KEY)
             if cutover is None:
                 raise ValueError("missing sidebar precreate cutover")
             quarantined_job_ids = cutover.get("quarantined_job_ids")
             if (
-                set(cutover)
-                != {"version", "applied_at", "quarantined_job_ids"}
+                set(cutover) != {"version", "applied_at", "quarantined_job_ids"}
                 or cutover.get("version") != 1
                 or not _is_finite_number(cutover.get("applied_at"))
                 or not isinstance(quarantined_job_ids, list)
@@ -1091,7 +1260,22 @@ class ProductionBackend:
         cursor: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         marker_secret = resolve_marker_key()
-        result = self._require_store().reconcile_claude_visibility_lineage(
+        store = self._require_store()
+        if apply:
+            source_root = (
+                Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+                / "session-bridge"
+                / "characterization"
+                / "claude-visibility-sources"
+            )
+            _sync_claude_characterization_records(
+                store=store,
+                source_root=source_root,
+                marker_secret=marker_secret,
+                include_active=False,
+                include_completed=True,
+            )
+        result = store.reconcile_claude_visibility_lineage(
             limit=limit,
             marker_secret=marker_secret,
             apply=apply,
@@ -1185,6 +1369,222 @@ class ProductionBackend:
             result, continuous=self.config.claude_visibility.continuous
         )
 
+    def abort_claude_visibility_characterization(
+        self, *, expected_job_id: str, expected_reserved_claude_uuid: str
+    ) -> Mapping[str, Any]:
+        """Terminally retire one exact-UUID probe only after durable absence."""
+
+        if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
+            raise ConfigurationFailure("live_characterization_not_enabled")
+        source_root = (
+            Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+            / "session-bridge"
+            / "characterization"
+            / "claude-visibility-sources"
+        )
+        active_record = source_root / ".claude-visibility-operation.json"
+        marker_secret = resolve_marker_key()
+        try:
+            if active_record.exists():
+                operation = _read_characterization_record(active_record, marker_secret)
+            else:
+                roots = (
+                    source_root / ".abort-completed",
+                    source_root / ".abort-claims",
+                )
+                paths_by_root: list[list[Path]] = []
+                for record_root in roots:
+                    paths_by_root.append(
+                        []
+                        if not record_root.exists()
+                        else sorted(
+                            path
+                            for path in record_root.iterdir()
+                            if path.is_file() and path.suffix == ".json"
+                        )
+                    )
+                if (
+                    sum(len(paths) for paths in paths_by_root)
+                    > _CLAUDE_CHARACTERIZATION_SYNC_LIMIT
+                ):
+                    raise ConfigurationFailure("characterization_record_limit")
+                operation = None
+                for paths in paths_by_root:
+                    matches: list[dict[str, Any]] = []
+                    for path in paths:
+                        candidate = _read_characterization_record(path, marker_secret)
+                        if (
+                            candidate.get("job_id") == expected_job_id
+                            and candidate.get("reserved_claude_uuid")
+                            == expected_reserved_claude_uuid
+                        ):
+                            matches.append(candidate)
+                    if len(matches) > 1:
+                        raise ConfigurationFailure("characterization_record_invalid")
+                    if len(matches) == 1:
+                        operation = matches[0]
+                        break
+                if operation is None:
+                    raise ConfigurationFailure("characterization_record_invalid")
+        except RuntimeError:
+            raise ConfigurationFailure("characterization_record_invalid") from None
+        if operation.get("phase") not in {
+            "reserved",
+            "launching",
+            "abort_disposable_removing",
+            "abort_disposable_removed",
+            "aborted",
+        }:
+            raise RolloutGateBlocked("characterization_abort_not_active")
+        if (
+            operation.get("job_id") != expected_job_id
+            or operation.get("reserved_claude_uuid") != expected_reserved_claude_uuid
+        ):
+            raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+        expected_operation_id = str(operation["operation_id"])
+        claimed_abort = claim_claude_visibility_characterization_abort(
+            source_root=source_root,
+            marker_secret=marker_secret,
+            expected_operation_id=expected_operation_id,
+            expected_job_id=str(operation["job_id"]),
+            expected_reserved_claude_uuid=str(operation["reserved_claude_uuid"]),
+        )
+        if claimed_abort.get("job_id") != operation.get("job_id") or claimed_abort.get(
+            "reserved_claude_uuid"
+        ) != operation.get("reserved_claude_uuid"):
+            raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+        claimed_operation = claimed_abort.get("operation")
+        if not isinstance(claimed_operation, Mapping):
+            raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+        operation = dict(claimed_operation)
+        if (
+            operation.get("operation_id") != expected_operation_id
+            or operation.get("job_id") != expected_job_id
+            or operation.get("reserved_claude_uuid") != expected_reserved_claude_uuid
+            or operation.get("phase")
+            not in {
+                "reserved",
+                "launching",
+                "abort_disposable_removing",
+                "abort_disposable_removed",
+                "aborted",
+            }
+        ):
+            raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+        store = self._require_store()
+        registered = _record_claude_characterization_payload(
+            store=store,
+            payload=operation,
+            marker_secret=marker_secret,
+            cleanup_completed=False,
+            ensure_registered=True,
+        )
+        if registered.get("job_id") != operation.get("job_id") or registered.get(
+            "reserved_claude_uuid"
+        ) != operation.get("reserved_claude_uuid"):
+            raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+
+        def request_abort() -> Mapping[str, Any]:
+            result = _record_claude_characterization_payload(
+                store=store,
+                payload=operation,
+                marker_secret=marker_secret,
+                cleanup_completed=False,
+                launch_aborted=True,
+            )
+            if result.get("job_id") != operation.get("job_id") or result.get(
+                "reserved_claude_uuid"
+            ) != operation.get("reserved_claude_uuid"):
+                raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+            return result
+
+        def terminal_result(*, replayed: bool = False) -> Mapping[str, Any]:
+            payload: dict[str, Any] = {
+                "status": "aborted_exact_absence",
+                "job_id": operation["job_id"],
+                "reserved_claude_uuid": operation["reserved_claude_uuid"],
+                "replacement_created": False,
+                "active_record_retired": True,
+            }
+            if replayed:
+                payload["replayed"] = True
+            return payload
+
+        abort = request_abort()
+        if abort.get("status") in {"launch_aborted", "already_aborted"}:
+            retire_aborted_claude_visibility_characterization(
+                source_root=source_root,
+                marker_secret=marker_secret,
+                expected_operation_id=str(operation["operation_id"]),
+                expected_job_id=str(operation["job_id"]),
+                expected_reserved_claude_uuid=str(operation["reserved_claude_uuid"]),
+            )
+            return terminal_result(replayed=abort.get("status") == "already_aborted")
+        if abort.get("status") != "reconciliation_required":
+            raise RolloutGateBlocked("characterization_abort_not_available")
+
+        policy = self.config.claude_visibility
+        claim = store.claim_claude_visibility_reconciliation(
+            time.time(),
+            policy.lease_seconds,
+            expected_job_id=str(operation["job_id"]),
+        )
+        authority = (
+            getattr(claim, "lease_kind", None),
+            getattr(claim, "launch_permitted", None),
+            getattr(claim, "registration_reserved", None),
+            getattr(claim, "requires_exact_id_reconciliation", None),
+        )
+        if (
+            not getattr(claim, "claimed", False)
+            or getattr(claim, "job_id", None) != operation["job_id"]
+            or getattr(claim, "reserved_claude_uuid", None)
+            != operation["reserved_claude_uuid"]
+            or authority != ("reconciliation", False, False, True)
+        ):
+            raise RolloutGateBlocked("characterization_reconciliation_not_available")
+
+        source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
+        registrar = ClaudeNativeRegistrar(
+            store,
+            source,
+            marker_secret=marker_secret,
+            startup_theme="light",
+            claude_command=(),
+            process_timeout=policy.process_timeout_seconds,
+            discovery_timeout=policy.discovery_timeout_seconds,
+        )
+        outcome = registrar.process(claim)
+        if (
+            getattr(outcome, "job_id", None) != operation["job_id"]
+            or getattr(outcome, "reserved_claude_uuid", None)
+            != operation["reserved_claude_uuid"]
+        ):
+            raise RolloutGateBlocked("characterization_abort_identity_mismatch")
+        if getattr(outcome, "status", None) == "visible":
+            raise RolloutGateBlocked("characterization_native_session_materialized")
+        if getattr(outcome, "status", None) == "failed":
+            raise RolloutGateBlocked("characterization_exact_id_conflict")
+        if getattr(outcome, "status", None) != "absent":
+            raise ProviderDegraded(
+                str(
+                    getattr(outcome, "error_code", None)
+                    or "characterization_exact_id_lookup_unavailable"
+                )
+            )
+
+        completed = request_abort()
+        if completed.get("status") not in {"launch_aborted", "already_aborted"}:
+            raise RolloutGateBlocked("characterization_abort_not_committed")
+        retire_aborted_claude_visibility_characterization(
+            source_root=source_root,
+            marker_secret=marker_secret,
+            expected_operation_id=str(operation["operation_id"]),
+            expected_job_id=str(operation["job_id"]),
+            expected_reserved_claude_uuid=str(operation["reserved_claude_uuid"]),
+        )
+        return terminal_result(replayed=completed.get("status") == "already_aborted")
+
     def characterize_claude_visibility(
         self, cleanup_token: Mapping[str, Any] | None = None
     ) -> Mapping[str, Any]:
@@ -1198,7 +1598,7 @@ class ProductionBackend:
         )
         if cleanup_token is not None:
             marker_secret = resolve_marker_key()
-            return cleanup_characterized_claude_visibility(
+            result = cleanup_characterized_claude_visibility(
                 cleanup_token=cleanup_token,
                 source_root=source_root,
                 projects_root=_CLAUDE_PROJECTS_ROOT,
@@ -1207,13 +1607,67 @@ class ProductionBackend:
                 ),
                 marker_secret=marker_secret,
             )
-        claude_command = resolve_cli_executable("claude")
-        startup = _claude_visibility_preflight(claude_command)
-        if startup is None:
-            raise ProviderDegraded("claude_visibility_preflight_failed")
+            operation_id = cleanup_token.get("id")
+            if not isinstance(operation_id, str) or not operation_id:
+                raise ConfigurationFailure("characterization_record_invalid")
+            completed_path = source_root / ".cleanup-completed" / f"{operation_id}.json"
+            try:
+                completed = _read_characterization_record(completed_path, marker_secret)
+            except RuntimeError:
+                raise ConfigurationFailure("characterization_record_invalid") from None
+            if (
+                completed.get("phase") != "completed"
+                or completed.get("operation_id") != operation_id
+            ):
+                raise ConfigurationFailure("characterization_record_invalid")
+            _record_claude_characterization_payload(
+                store=self._require_store(),
+                payload=completed,
+                marker_secret=marker_secret,
+                cleanup_completed=True,
+                ensure_registered=False,
+            )
+            return result
+        active_path = source_root / ".claude-visibility-operation.json"
+        claude_command: Sequence[str] = ()
+        startup: Mapping[str, Any] | None = None
+        if not active_path.exists():
+            claude_command = resolve_cli_executable("claude")
+            startup = _claude_visibility_preflight(claude_command)
+            if startup is None:
+                raise ProviderDegraded("claude_visibility_preflight_failed")
         marker_secret = resolve_marker_key()
         store = self._require_store()
+        _sync_claude_characterization_records(
+            store=store,
+            source_root=source_root,
+            marker_secret=marker_secret,
+            include_active=True,
+            include_completed=True,
+        )
+        active_job_id: str | None = None
+        active_payload: Mapping[str, Any] | None = None
+        if active_path.exists():
+            try:
+                active_payload = _read_characterization_record(
+                    active_path, marker_secret
+                )
+            except RuntimeError:
+                raise ConfigurationFailure("characterization_record_invalid") from None
+            value = active_payload.get("job_id")
+            if isinstance(value, str) and value:
+                active_job_id = value
         raw = store.claude_visibility_status(time.time())
+        auth_recovery_allowed = _claude_characterization_auth_recovery_allowed(
+            raw,
+            active_operation=active_path.exists(),
+            active_job_id=active_job_id,
+        )
+        status_fatal = _claude_visibility_fatal_reasons(raw)
+        if status_fatal and not (
+            auth_recovery_allowed and status_fatal == ["bridge_conflict"]
+        ):
+            raise RolloutGateBlocked("claude_visibility_not_idle")
         has_open_work = any(
             int(raw.get("counts", {}).get(state, 0))
             for state in (
@@ -1225,21 +1679,101 @@ class ProductionBackend:
         )
         if has_open_work and not _claude_characterization_open_work_allowed(
             raw,
-            active_operation=(
-                source_root / ".claude-visibility-operation.json"
-            ).exists(),
+            active_operation=active_path.exists(),
+            active_job_id=active_job_id,
         ):
             raise RolloutGateBlocked("claude_visibility_not_idle")
-        source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
-        registrar = ClaudeNativeRegistrar(
-            store,
-            source,
-            marker_secret=marker_secret,
-            startup_theme=startup["theme"],
-            claude_command=claude_command,
-            process_timeout=self.config.claude_visibility.process_timeout_seconds,
-            discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
+        characterizations = raw.get("characterizations")
+        if not isinstance(characterizations, list):
+            raise RolloutGateBlocked("claude_visibility_not_idle")
+        active_matches = (
+            []
+            if active_job_id is None
+            else [
+                item
+                for item in characterizations
+                if isinstance(item, Mapping) and item.get("job_id") == active_job_id
+            ]
         )
+        if len(active_matches) > 1:
+            raise RolloutGateBlocked("characterization_status_identity_mismatch")
+        if active_job_id is not None and not active_matches:
+            assert active_payload is not None
+            terminal = _record_claude_characterization_payload(
+                store=store,
+                payload=active_payload,
+                marker_secret=marker_secret,
+                cleanup_completed=False,
+                ensure_registered=False,
+                launch_aborted=True,
+            )
+            if terminal.get("status") != "already_aborted":
+                raise RolloutGateBlocked("characterization_status_identity_missing")
+            retire_aborted_claude_visibility_characterization(
+                source_root=source_root,
+                marker_secret=marker_secret,
+                expected_operation_id=str(active_payload["operation_id"]),
+                expected_job_id=str(active_payload["job_id"]),
+                expected_reserved_claude_uuid=str(
+                    active_payload["reserved_claude_uuid"]
+                ),
+            )
+            return {
+                "status": "aborted_exact_absence",
+                "job_id": active_payload["job_id"],
+                "reserved_claude_uuid": active_payload["reserved_claude_uuid"],
+                "replacement_created": False,
+                "active_record_retired": True,
+                "replayed": True,
+            }
+        active_state = active_matches[0].get("state") if active_matches else None
+        active_phase = (
+            active_payload.get("phase") if active_payload is not None else None
+        )
+        local_visible_recovery = active_state == "claude_visible" and active_phase in {
+            "launching",
+            "launched",
+            "ready",
+        }
+        local_exact_reconciliation = active_state in {
+            "claude_pending",
+            "claude_leased",
+            "claude_retry",
+        } and active_phase in {"launched", "ready"}
+        local_recovery = local_visible_recovery or local_exact_reconciliation
+        if not local_recovery and startup is None:
+            claude_command = resolve_cli_executable("claude")
+            startup = _claude_visibility_preflight(claude_command)
+            if startup is None:
+                raise ProviderDegraded("claude_visibility_preflight_failed")
+        registrar: Any = None
+        if local_exact_reconciliation:
+            source = ClaudeSourceAdapter(
+                _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+            )
+            registrar = ClaudeNativeRegistrar(
+                store,
+                source,
+                marker_secret=marker_secret,
+                startup_theme="light",
+                claude_command=(),
+                process_timeout=self.config.claude_visibility.process_timeout_seconds,
+                discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
+            )
+        elif not local_visible_recovery:
+            assert startup is not None
+            source = ClaudeSourceAdapter(
+                _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+            )
+            registrar = ClaudeNativeRegistrar(
+                store,
+                source,
+                marker_secret=marker_secret,
+                startup_theme=startup["theme"],
+                claude_command=claude_command,
+                process_timeout=self.config.claude_visibility.process_timeout_seconds,
+                discovery_timeout=self.config.claude_visibility.discovery_timeout_seconds,
+            )
         policy = self.config.claude_visibility
 
         def _reserve(projection: Any) -> Any:
@@ -1247,7 +1781,39 @@ class ProductionBackend:
                 projection, eligible_at=float(projection.last_active)
             )
             identity = derive_claude_visibility_identity(candidate, marker_secret)
-            store.enqueue_claude_visibility_job(candidate, identity, marker_secret)
+            try:
+                prepared = _read_characterization_record(
+                    source_root / ".claude-visibility-operation.json",
+                    marker_secret,
+                )
+            except RuntimeError:
+                raise RolloutGateBlocked("characterization_record_invalid") from None
+            operation_id = prepared.get("operation_id")
+            if (
+                not isinstance(operation_id, str)
+                or candidate.source_session_id != f"codex:{operation_id}"
+                or prepared.get("source_provider") != Provider.CODEX.value
+                or prepared.get("source_cwd") != candidate.source_cwd
+                or prepared.get("source_session_id") != candidate.source_session_id
+                or prepared.get("bridge_id") != identity.bridge_id
+                or prepared.get("job_id") != identity.job_id
+                or prepared.get("reserved_claude_uuid") != identity.claude_uuid
+                or prepared.get("native_name") != candidate.native_name
+                or prepared.get("signed_marker") != identity.signed_marker
+                or prepared.get("phase")
+                not in {"prepared", "reserved", "launching", "launched", "ready"}
+            ):
+                raise RolloutGateBlocked("characterization_record_invalid")
+            try:
+                store.enqueue_claude_visibility_characterization(
+                    candidate,
+                    identity,
+                    marker_secret,
+                    operation_id=operation_id,
+                    evidence_digest=_claude_characterization_evidence(prepared),
+                )
+            except (TypeError, ValueError):
+                raise RolloutGateBlocked("characterization_record_invalid") from None
             claim = store.claim_claude_visibility_job(
                 time.time(),
                 policy.lease_seconds,
@@ -1261,9 +1827,49 @@ class ProductionBackend:
                 raise RolloutGateBlocked("characterization_claim_mismatch")
             return claim
 
+        def _reconcile_existing(projection: Any) -> Any:
+            candidate = build_claude_visibility_candidate(
+                projection, eligible_at=float(projection.last_active)
+            )
+            identity = derive_claude_visibility_identity(candidate, marker_secret)
+            claim = store.claim_claude_visibility_reconciliation(
+                time.time(),
+                policy.lease_seconds,
+                expected_job_id=identity.job_id,
+            )
+            if claim.job_id != identity.job_id:
+                raise RolloutGateBlocked("characterization_claim_mismatch")
+            return claim
+
+        def _registration_is_visible(operation: Mapping[str, Any]) -> bool:
+            job_id = operation.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                raise RolloutGateBlocked("characterization_record_invalid")
+            current = store.claude_visibility_status(time.time())
+            characterizations = current.get("characterizations")
+            if not isinstance(characterizations, list):
+                raise RolloutGateBlocked("characterization_record_invalid")
+            matches = [
+                item
+                for item in characterizations
+                if isinstance(item, Mapping) and item.get("job_id") == job_id
+            ]
+            if not matches:
+                return False
+            if len(matches) != 1:
+                raise RolloutGateBlocked("characterization_registration_not_visible")
+            state = matches[0].get("state")
+            if state == "claude_visible":
+                return True
+            if state in {"claude_pending", "claude_leased", "claude_retry"}:
+                return False
+            raise RolloutGateBlocked("characterization_registration_not_visible")
+
         def _recover_auth_failure(
             operation: Mapping[str, Any], evidence_digest: str, prompt: str
         ) -> Mapping[str, Any]:
+            if registrar is None:
+                raise RolloutGateBlocked("characterization_registration_not_visible")
             job_id = operation.get("job_id")
             reserved_uuid = operation.get("reserved_claude_uuid")
             operation_id = operation.get("operation_id")
@@ -1326,10 +1932,17 @@ class ProductionBackend:
                 visible_at=time.time(),
             )
 
+        def _reject_local_relaunch(_projection: Any) -> Any:
+            raise RolloutGateBlocked("characterization_relaunch_requires_provider")
+
         return characterize_claude_visibility(
             source_root=source_root,
             projects_root=_CLAUDE_PROJECTS_ROOT,
-            reserve=_reserve,
+            reserve=(
+                _reject_local_relaunch if local_exact_reconciliation else _reserve
+            ),
+            reconcile_existing=_reconcile_existing,
+            registration_is_visible=_registration_is_visible,
             registrar=registrar,
             restarted_source=lambda: ClaudeSourceAdapter(
                 _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
@@ -2071,6 +2684,18 @@ def build_parser() -> argparse.ArgumentParser:
     characterize_claude_visibility_parser.add_argument("--json", action="store_true")
     characterize_claude_visibility_parser.add_argument("--cleanup-token")
 
+    abort_claude_characterization = commands.add_parser(
+        "claude-visibility-abort-characterization",
+        help="retire one disposable Claude probe after exact-UUID absence proof",
+    )
+    abort_claude_characterization.add_argument(
+        "--confirm-exact-absence",
+        action="store_true",
+        help="confirm terminal abort without creating a replacement session",
+    )
+    abort_claude_characterization.add_argument("--job-id", required=True)
+    abort_claude_characterization.add_argument("--reserved-claude-uuid", required=True)
+
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
     )
@@ -2257,6 +2882,19 @@ def main(
                 if payload.get("degraded") is True or payload.get("fatal") is True
                 else EXIT_OK
             )
+        if args.command == "claude-visibility-abort-characterization":
+            if not args.confirm_exact_absence:
+                raise RolloutGateBlocked(
+                    "characterization_exact_absence_confirmation_required"
+                )
+            payload = dict(
+                backend.abort_claude_visibility_characterization(
+                    expected_job_id=args.job_id,
+                    expected_reserved_claude_uuid=args.reserved_claude_uuid,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
         if args.command == "characterize-claude-visibility":
             if args.cleanup_token is None:
                 payload = backend.characterize_claude_visibility()
@@ -2499,7 +3137,7 @@ def _claude_visibility_open_reasons(raw: Mapping[str, Any]) -> list[str]:
 
 
 def _claude_characterization_open_work_allowed(
-    raw: Mapping[str, Any], *, active_operation: bool
+    raw: Mapping[str, Any], *, active_operation: bool, active_job_id: str | None = None
 ) -> bool:
     """Permit recovery only for the one durable characterization retry row."""
 
@@ -2520,25 +3158,74 @@ def _claude_characterization_open_work_allowed(
         }
     except (TypeError, ValueError):
         return False
-    return open_counts in (
-        {
-            "claude_pending": 0,
-            "claude_leased": 0,
-            "claude_retry": 1,
-            "claude_failed": 0,
-        },
-        {
-            "claude_pending": 0,
-            "claude_leased": 1,
-            "claude_retry": 0,
-            "claude_failed": 0,
-        },
-        {
+    if open_counts["claude_failed"] != 0:
+        return _claude_characterization_auth_recovery_allowed(
+            raw,
+            active_operation=active_operation,
+            active_job_id=active_job_id,
+        )
+    owned_states = [state for state, count in open_counts.items() if count != 0]
+    if len(owned_states) != 1 or open_counts[owned_states[0]] != 1:
+        return False
+    expected_state = owned_states[0]
+    characterizations = raw.get("characterizations")
+    return (
+        isinstance(active_job_id, str)
+        and bool(active_job_id)
+        and isinstance(characterizations, list)
+        and characterizations == [{"job_id": active_job_id, "state": expected_state}]
+    )
+
+
+def _claude_characterization_auth_recovery_allowed(
+    raw: Mapping[str, Any], *, active_operation: bool, active_job_id: str | None
+) -> bool:
+    """Allow only the exact authenticated bridge-conflict recovery FSM."""
+
+    if type(active_operation) is not bool or not active_operation:
+        return False
+    counts = raw.get("counts")
+    failed_codes = raw.get("failed_codes")
+    retry_codes = raw.get("retry_codes")
+    characterizations = raw.get("characterizations")
+    if (
+        not isinstance(counts, Mapping)
+        or not isinstance(failed_codes, Mapping)
+        or not isinstance(retry_codes, Mapping)
+        or not isinstance(characterizations, list)
+        or not isinstance(active_job_id, str)
+        or not active_job_id
+    ):
+        return False
+    try:
+        open_counts = {
+            state: int(counts.get(state, 0))
+            for state in (
+                "claude_pending",
+                "claude_leased",
+                "claude_retry",
+                "claude_failed",
+            )
+        }
+        normalized_failed = {
+            str(code): int(count) for code, count in failed_codes.items()
+        }
+        normalized_retry = {
+            str(code): int(count) for code, count in retry_codes.items()
+        }
+    except (TypeError, ValueError):
+        return False
+    return (
+        open_counts
+        == {
             "claude_pending": 0,
             "claude_leased": 0,
             "claude_retry": 0,
             "claude_failed": 1,
-        },
+        }
+        and normalized_failed == {"bridge_conflict": 1}
+        and not any(count > 0 for count in normalized_retry.values())
+        and characterizations == [{"job_id": active_job_id, "state": "claude_failed"}]
     )
 
 

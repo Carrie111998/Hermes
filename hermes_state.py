@@ -199,7 +199,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 27
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -1214,6 +1214,105 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_reconciliations (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS session_claude_visibility_characterization_events (
+    job_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN ('registered', 'cleanup_completed', 'launch_aborted')
+    ),
+    operation_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (job_id, event_kind),
+    UNIQUE (operation_id, event_kind),
+    UNIQUE (source_session_id, event_kind),
+    UNIQUE (bridge_id, event_kind),
+    UNIQUE (idempotency_key, event_kind),
+    UNIQUE (reserved_claude_uuid, event_kind),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE RESTRICT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_identity
+BEFORE INSERT ON session_claude_visibility_characterization_events
+WHEN NOT EXISTS (
+    SELECT 1 FROM session_claude_visibility_jobs AS job
+    WHERE job.id = NEW.job_id
+      AND job.source_session_id = NEW.source_session_id
+      AND job.bridge_id = NEW.bridge_id
+      AND job.idempotency_key = NEW.idempotency_key
+      AND job.reserved_claude_uuid = NEW.reserved_claude_uuid
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_cleanup_order
+BEFORE INSERT ON session_claude_visibility_characterization_events
+WHEN NEW.event_kind = 'cleanup_completed' AND (
+    NOT EXISTS (
+        SELECT 1 FROM session_claude_visibility_characterization_events
+        WHERE job_id = NEW.job_id AND event_kind = 'registered'
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM session_claude_visibility_jobs
+        WHERE id = NEW.job_id AND state = 'claude_visible'
+          AND completion_digest IS NOT NULL AND visible_at IS NOT NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization cleanup is not anchored');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_abort_order
+BEFORE INSERT ON session_claude_visibility_characterization_events
+WHEN NEW.event_kind = 'launch_aborted' AND (
+    NOT EXISTS (
+        SELECT 1 FROM session_claude_visibility_characterization_events
+        WHERE job_id = NEW.job_id AND event_kind = 'registered'
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM session_claude_visibility_jobs AS job
+        JOIN session_claude_visibility_reconciliations AS reconciliation
+          ON reconciliation.job_id = job.id
+         AND reconciliation.reserved_claude_uuid = job.reserved_claude_uuid
+         AND reconciliation.attempt_ordinal = job.attempts
+        WHERE job.id = NEW.job_id
+          AND (
+              job.state = 'claude_retry'
+              OR (
+                  job.state = 'claude_failed'
+                  AND job.error_code = 'max_attempts_exhausted'
+              )
+          )
+          AND reconciliation.outcome = 'absent'
+          AND reconciliation.consumed_at IS NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization abort is not anchored');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_no_update
+BEFORE UPDATE ON session_claude_visibility_characterization_events
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_no_delete
+BEFORE DELETE ON session_claude_visibility_characterization_events
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization events are append-only');
+END;
+
 CREATE TABLE IF NOT EXISTS session_claude_auth_recoveries (
     job_id TEXT PRIMARY KEY,
     reserved_claude_uuid TEXT NOT NULL,
@@ -2040,6 +2139,73 @@ class SessionDB:
                 connection.rollback()
             raise
 
+    def _apply_claude_characterization_abort_trigger_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Allow exact max-attempt absence to anchor operator-confirmed abort."""
+
+        migration_name = "claude_characterization_abort_max_attempts_v27"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                connection.commit()
+                return
+            cursor.execute(
+                "DROP TRIGGER IF EXISTS trg_claude_characterization_abort_order"
+            )
+            cursor.execute(
+                """CREATE TRIGGER trg_claude_characterization_abort_order
+                   BEFORE INSERT ON session_claude_visibility_characterization_events
+                   WHEN NEW.event_kind = 'launch_aborted' AND (
+                       NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_characterization_events
+                           WHERE job_id = NEW.job_id AND event_kind = 'registered'
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_jobs AS job
+                           JOIN session_claude_visibility_reconciliations AS reconciliation
+                             ON reconciliation.job_id = job.id
+                            AND reconciliation.reserved_claude_uuid = job.reserved_claude_uuid
+                            AND reconciliation.attempt_ordinal = job.attempts
+                           WHERE job.id = NEW.job_id
+                             AND (
+                                 job.state = 'claude_retry'
+                                 OR (
+                                     job.state = 'claude_failed'
+                                     AND job.error_code = 'max_attempts_exhausted'
+                                 )
+                             )
+                             AND reconciliation.outcome = 'absent'
+                             AND reconciliation.consumed_at IS NULL
+                       )
+                   )
+                   BEGIN
+                       SELECT RAISE(
+                           ABORT,
+                           'Claude characterization abort is not anchored'
+                       );
+                   END"""
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
     def _apply_claude_auth_recovery_call_started_migration(
         self, cursor: sqlite3.Cursor
     ) -> None:
@@ -2122,6 +2288,7 @@ class SessionDB:
         # Bridge security migrations have their own durable ledger. They must
         # run after bridge-column reconciliation and must not wait for FTS.
         self._apply_bridge_migrations(cursor)
+        self._apply_claude_characterization_abort_trigger_migration(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
