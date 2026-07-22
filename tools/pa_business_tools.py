@@ -1511,6 +1511,10 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
         current_refs = _current_turn_source_refs()
         if current_refs:
             payload["evidenceMessageRefs"] = current_refs
+            # A source-native job sheet is direct observed evidence, not an
+            # inferred candidate. Keep the backend decision gate explicit even
+            # when the model omits this mechanical classification.
+            payload.setdefault("confidence", "observed")
 
     # Alias coercion: the model sometimes invents sibling names for the job
     # number param (PG day-26 run passed reportedJobNo); the backend only
