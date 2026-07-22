@@ -1482,6 +1482,80 @@ class WorkflowEngine:
         # Fall back to mechanical loop
         return "loop"
 
+    def _try_block_notify(self, workflow: "Workflow", nid: str,
+                          state: "NodeState", rejection: str,
+                          context: dict = None):
+        """When a non-LOOP block is detected, call the analyst and push
+        the assessment to the calling agent's session.
+
+        This is the mechanism that tells the calling agent something
+        unexpected went wrong — without the agent having to poll or
+        subscribe to every card.
+        """
+        try:
+            from plugins.workflow.analyst import analyze_block_notification
+        except Exception:
+            return
+
+        node = workflow.nodes[nid]
+        ctx = context or {}
+        project = ctx.get("project", "")
+        repo = ctx.get("repo", "")
+        workflow_context = f"Project: {project}, Repository: {repo}" if project else ""
+
+        outcome = analyze_block_notification(
+            node_id=nid,
+            workflow_name=workflow.name,
+            node_task=node.task,
+            block_reason=rejection,
+            workflow_context=workflow_context,
+        )
+
+        if not outcome.success or not isinstance(outcome.result, dict):
+            print(f"   ⚠  Block analysis unavailable for {nid}")
+            return
+
+        severity = outcome.result.get("severity", "warning")
+        summary = outcome.result.get("summary", "")
+        detail = outcome.result.get("detail", "")
+        action = outcome.result.get("suggested_action", "")
+
+        # Build the notification message
+        emoji = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(severity, "⚠️")
+        msg = (
+            f"{emoji} Workflow anomaly: **{nid}** blocked in **{workflow.name}**\n"
+            f"**Summary:** {summary}\n"
+            f"**Detail:** {detail}\n"
+            f"**Action:** {action}"
+        )
+
+        print(f"   {emoji} Block notified to calling agent: {summary}")
+
+        # Push to the calling session via the adapter
+        platform = ctx.get("platform", "")
+        chat_id = ctx.get("chat_id", "")
+        thread_id = ctx.get("thread_id", "")
+        profile = ctx.get("profile", "")
+
+        if not platform or not chat_id:
+            return
+
+        try:
+            from gateway.platforms import get_adapter as get_platform_adapter
+            adapter = get_platform_adapter(platform)
+            if adapter:
+                import asyncio
+                meta = {}
+                if thread_id:
+                    meta["thread_id"] = thread_id
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(adapter.send(chat_id, msg, metadata=meta))
+                except RuntimeError:
+                    asyncio.run(adapter.send(chat_id, msg, metadata=meta))
+        except Exception as exc:
+            print(f"   ⚠  Failed to notify calling agent: {exc}")
+
     def _try_failure_analysis(self, node: WorkflowNode, state: NodeState,
                                elapsed_sec: float):
         """Try LLM diagnosis of a node failure. Best-effort — silent on failure."""
@@ -2683,8 +2757,12 @@ class WorkflowEngine:
                             state.status = "blocked"
                             state.error = f"Blocked: {body[:100]}"
                             results[nid] = "blocked"
-                            print(f"   🚫 {nid} BLOCKED — escalate to Sherlock")
+                            print(f"   🚫 {nid} BLOCKED — notifying calling agent")
                             pending.discard(nid)
+                            # Notify calling agent via analyst
+                            self._try_block_notify(
+                                workflow, nid, state, body, context
+                            )
 
                 except Exception as e:
                     # Card query failed — keep polling

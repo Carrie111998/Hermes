@@ -256,6 +256,74 @@ def analyze_loop_decision(
         timeout=timeout,
     )
 
+
+# ── Mode: unexpected block notification ──────────────────────────
+
+_BLOCK_NOTIFY_SYSTEM = """You are the workflow anomaly analyst for the Hermes Agent fleet.
+
+A node in a workflow has been unexpectedly blocked (not a LOOP revision).
+You must assess the situation and produce a concise report for the calling agent.
+
+You are given:
+1. The node's task body — what it was supposed to do
+2. The block reason — why it was blocked
+3. The workflow context — what project/repo this is for
+
+Produce a concise JSON report:
+
+  {
+    "severity": "critical" | "warning" | "info",
+    "summary": "One-line summary of what happened",
+    "detail": "2-3 sentence explanation of the failure and its impact",
+    "suggested_action": "What the calling agent should do next"
+  }
+
+Rules:
+- severity=critical: workflow cannot proceed without human intervention
+- severity=warning: workflow can proceed but something is wrong
+- severity=info: informational, no action needed
+- Be concise — the calling agent needs a quick summary, not an essay
+- No preamble, no code fences. Output only the JSON object."""
+
+_BLOCK_NOTIFY_USER = """Node "{node_id}" in workflow "{workflow_name}" has been unexpectedly blocked.
+
+Node task (what it was supposed to do):
+{node_task}
+
+Block reason:
+{block_reason}
+
+Workflow context:
+{workflow_context}
+
+Assess the situation and produce a report for the calling agent."""
+
+
+def analyze_block_notification(
+    *,
+    node_id: str = "",
+    workflow_name: str = "",
+    node_task: str = "",
+    block_reason: str = "",
+    workflow_context: str = "",
+    timeout: Optional[int] = None,
+) -> AnalystOutcome:
+    """Assess an unexpected block and produce a report for the calling agent."""
+    user_msg = _BLOCK_NOTIFY_USER.format(
+        node_id=node_id,
+        workflow_name=workflow_name,
+        node_task=node_task,
+        block_reason=block_reason,
+        workflow_context=workflow_context,
+    )
+    return _invoke(
+        mode="block_notification",
+        system_prompt=_BLOCK_NOTIFY_SYSTEM,
+        user_message=user_msg,
+        timeout=timeout,
+    )
+
+
 @dataclass
 class AnalystOutcome:
     """Result of an analyst invocation."""
