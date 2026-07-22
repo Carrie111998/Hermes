@@ -487,6 +487,22 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
+    # Durable outbox (2026-07-22): text-only Telegram sends are recorded to
+    # disk before the attempt, so a send that dies mid-flight (SIGKILL, host
+    # reboot — anything a signal handler can't catch) is not silently lost;
+    # outbox_drain() can re-attempt it later. Scoped to telegram+text-only to
+    # keep blast radius small (media re-send on drain would need file paths
+    # that may no longer exist after a crash — out of scope for this pass).
+    # `_skip_outbox` is set by outbox_drain()'s own resend path to avoid
+    # re-appending a new entry for every retry of the same logical message.
+    _outbox_entry_id = None
+    if platform_name == "telegram" and not media_files and not args.get("_skip_outbox"):
+        try:
+            from tools.telegram_outbox import outbox_append
+            _outbox_entry_id = outbox_append(chat_id, cleaned_message, thread_id=thread_id)
+        except Exception:
+            pass  # best-effort durability — never blocks the real send below
+
     try:
         from model_tools import _run_async
         result = _run_async(
@@ -500,6 +516,12 @@ def _handle_send(args):
                 force_document=force_document_attachments,
             )
         )
+        if _outbox_entry_id and isinstance(result, dict) and result.get("success"):
+            try:
+                from tools.telegram_outbox import outbox_mark_sent
+                outbox_mark_sent(_outbox_entry_id)
+            except Exception:
+                pass  # message was sent; only the outbox bookkeeping is stale
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
