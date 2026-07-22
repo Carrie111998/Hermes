@@ -1365,7 +1365,11 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
+<<<<<<< HEAD
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+=======
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "desktop"})
+>>>>>>> df75c0559 (feat: add compute provider capability poc)
 
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
@@ -1467,7 +1471,11 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
+<<<<<<< HEAD
     container_backend = env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
+=======
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona", "desktop"}
+>>>>>>> df75c0559 (feat: add compute provider capability poc)
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1667,6 +1675,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
     
+    elif env_type == "desktop":
+        from tools.environments.desktop_lease import get_desktop_sandbox_manager
+        return get_desktop_sandbox_manager().acquire(task_id, image=image).environment
+
     elif env_type == "modal":
         sandbox_kwargs = {}
         if cpu > 0:

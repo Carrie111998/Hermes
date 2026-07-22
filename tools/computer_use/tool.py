@@ -493,7 +493,9 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 
     # Dispatch to backend.
     try:
-        backend = _get_backend(session_id=session_id)
+        backend = _get_task_desktop_backend(kwargs.get("task_id")) or _get_backend(
+            session_id=session_id
+        )
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
