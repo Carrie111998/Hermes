@@ -64,6 +64,33 @@ def _msgs(n=20):
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
 
 
+class TestCwdPropagatesOnLocalRotation:
+    def test_local_child_inherits_exact_persisted_parent_cwd(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_LOCAL_CWD"
+        cwd = str(tmp_path / "project")
+        db.create_session(parent, source="cli", cwd=cwd)
+        agent = _build_agent_with_db(db, parent, platform="cli")
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = db.get_session(agent.session_id)
+        assert child["parent_session_id"] == parent
+        assert child["cwd"] == cwd
+
+    def test_remote_child_does_not_inherit_host_cwd(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_REMOTE_CWD"
+        db.create_session(parent, source="telegram", cwd=str(tmp_path / "host-only"))
+        agent = _build_agent_with_db(db, parent, platform="telegram")
+
+        agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        child = db.get_session(agent.session_id)
+        assert child["parent_session_id"] == parent
+        assert child["cwd"] is None
+
+
 class TestGoalMigratesOnRotation:
     def test_goal_follows_compression_rotation(self, tmp_path: Path):
         db = SessionDB(db_path=tmp_path / "state.db")

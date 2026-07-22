@@ -317,6 +317,17 @@ export interface SessionCreateResponse {
 
 export interface SessionInfo {
   archived?: boolean
+  bridge_id?: null | string
+  bridge_mirror_state?: 'catalog_only' | 'continued' | 'diverged' | 'failed' | 'mirrored' | 'queued' | null
+  bridge_native_id?: null | string
+  bridge_origin_kind?: 'bridge_continuation' | 'bridge_placeholder' | 'native' | null
+  bridge_provider?: 'claude' | 'codex' | 'hermes' | null
+  bridge_sidebar_codex_thread_id?: null | string
+  bridge_sidebar_error?: 'delivery_degraded' | null
+  bridge_sidebar_stale?: boolean
+  bridge_sidebar_state?: 'failed' | 'pending' | 'retrying' | 'visible' | null
+  bridge_stale?: boolean
+  bridge_sync_error?: 'sync_degraded' | null
   cwd?: null | string
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work

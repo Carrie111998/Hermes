@@ -1,7 +1,9 @@
 """Tests for hermes_cli configuration management."""
 
+import multiprocessing
 import os
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -28,6 +30,89 @@ from hermes_cli.config import (
     write_platform_config_field,
     _sanitize_env_lines,
 )
+
+
+def _mutate_config_process(home, key, entered, release=None, ready=None):
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.config import mutate_config
+
+    if ready is not None:
+        ready.set()
+
+    def update(config):
+        config.setdefault("race_test", {})[key] = True
+        entered.set()
+        if release is not None and not release.wait(timeout=10):
+            raise RuntimeError("test release timed out")
+
+    mutate_config(update, strip_defaults=False)
+
+
+def _mutate_config_after_exception_process(home):
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.config import mutate_config
+
+    def fail(_config):
+        raise RuntimeError("expected mutation failure")
+
+    try:
+        mutate_config(fail, strip_defaults=False)
+    except RuntimeError as exc:
+        if str(exc) != "expected mutation failure":
+            raise
+
+    def recover(config):
+        config.setdefault("race_test", {})["recovered"] = True
+
+    mutate_config(recover, strip_defaults=False)
+
+
+def _set_config_value_process(home, ready, done):
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.config import set_config_value
+
+    ready.set()
+    set_config_value("race_test.config_set", "true")
+    done.set()
+
+
+def _auth_config_process(home, action, ready, done):
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.auth import _reset_config_provider, _update_config_for_provider
+
+    ready.set()
+    if action == "update":
+        _update_config_for_provider("nous", "https://inference.example/v1")
+    elif action == "logout":
+        _reset_config_provider()
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(action)
+    done.set()
+
+
+def _hold_config_file_lock_process(config_path, entered, release):
+    from hermes_cli.config import _config_file_lock
+
+    with _config_file_lock(Path(config_path)):
+        entered.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError("test release timed out")
+
+
+def _managed_policy_writer_process(home, action, ready, done):
+    os.environ["HERMES_HOME"] = str(home)
+    ready.set()
+    if action == "model":
+        from hermes_cli.auth import _save_model_choice
+
+        _save_model_choice("new-model")
+    elif action == "platform":
+        from hermes_cli.config import write_platform_config_field
+
+        write_platform_config_field("email", "mode", "pair", raw=True)
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(action)
+    done.set()
 
 
 class TestGetHermesHome:
@@ -609,6 +694,373 @@ class TestSaveConfigAtomicity:
                 raw = yaml.safe_load(f)
             assert raw["model"] == "test/atomic-model"
             assert raw["agent"]["max_turns"] == 77
+
+
+class TestConfigInterprocessLocking:
+    def test_mutate_config_rejects_unpersisted_managed_document_and_releases_lock(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.config as config_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        save_config({"existing": True}, strip_defaults=False)
+        original = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+
+        def rejected(document):
+            document["unpersisted"] = "sensitive-value"
+
+        with pytest.raises(
+            config_module.ConfigPersistenceRejected,
+            match="^config_persistence_rejected$",
+        ):
+            config_module.mutate_config(rejected, strip_defaults=False)
+        assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == original
+
+        monkeypatch.delenv("HERMES_MANAGED")
+        config_module.mutate_config(
+            lambda document: document.update({"recovered": True}),
+            strip_defaults=False,
+        )
+        assert read_raw_config()["recovered"] is True
+
+    def test_mutate_config_returns_effective_value_after_managed_leaf_stripping(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import managed_scope
+        import hermes_cli.config as config_module
+
+        home = tmp_path / "home"
+        managed = tmp_path / "managed"
+        home.mkdir()
+        managed.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        (managed / "config.yaml").write_text(
+            "session_bridge:\n  sidebar:\n    continuous: false\n",
+            encoding="utf-8",
+        )
+        managed_scope.invalidate_managed_cache()
+
+        def request_true(document):
+            document.setdefault("session_bridge", {}).setdefault("sidebar", {})[
+                "continuous"
+            ] = True
+
+        persisted = config_module.mutate_config(
+            request_true,
+            preserve_keys={("session_bridge", "sidebar", "continuous")},
+        )
+
+        assert persisted["session_bridge"]["sidebar"]["continuous"] is False
+        assert read_raw_config().get("session_bridge", {}).get("sidebar", {}).get(
+            "continuous"
+        ) is not True
+
+    def test_mutate_config_preserves_unrelated_keys_across_processes(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        first_entered = context.Event()
+        release_first = context.Event()
+        second_ready = context.Event()
+        second_entered = context.Event()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"existing": {"keep": True}}, strip_defaults=False)
+            first = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "first", first_entered, release_first),
+            )
+            second = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "second", second_entered, None, second_ready),
+            )
+            first.start()
+            assert first_entered.wait(timeout=10)
+            second.start()
+            try:
+                assert second_ready.wait(timeout=10)
+                assert not second_entered.wait(timeout=0.5)
+            finally:
+                release_first.set()
+                first.join(timeout=15)
+                second.join(timeout=15)
+                if first.is_alive():
+                    first.terminate()
+                if second.is_alive():
+                    second.terminate()
+
+            assert first.exitcode == 0
+            assert second.exitcode == 0
+            assert read_raw_config()["race_test"] == {
+                "first": True,
+                "second": True,
+            }
+            assert read_raw_config()["existing"] == {"keep": True}
+
+    def test_mutator_exception_releases_lock(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            process = context.Process(
+                target=_mutate_config_after_exception_process,
+                args=(tmp_path,),
+            )
+            process.start()
+            process.join(timeout=15)
+            if process.is_alive():
+                process.terminate()
+                pytest.fail("config lock remained held after a mutator exception")
+
+            assert process.exitcode == 0
+            assert read_raw_config()["race_test"]["recovered"] is True
+
+    def test_direct_save_uses_bounded_lock_with_fixed_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.config as config_module
+
+        context = multiprocessing.get_context("spawn")
+        holder_entered = context.Event()
+        release_holder = context.Event()
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            holder = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "holder", holder_entered, release_holder),
+            )
+            holder.start()
+            assert holder_entered.wait(timeout=10)
+            monkeypatch.setattr(
+                config_module,
+                "_CONFIG_FILE_LOCK_TIMEOUT_SECONDS",
+                0.1,
+                raising=False,
+            )
+            try:
+                with pytest.raises(TimeoutError) as raised:
+                    save_config({"direct": True}, strip_defaults=False)
+                assert str(raised.value) == "config_lock_timeout"
+            finally:
+                release_holder.set()
+                holder.join(timeout=15)
+                if holder.is_alive():
+                    holder.terminate()
+
+            assert holder.exitcode == 0
+
+    def test_config_set_waits_for_mutation_transaction_and_preserves_keys(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        holder_entered = context.Event()
+        release_holder = context.Event()
+        setter_ready = context.Event()
+        setter_done = context.Event()
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"race_test": {"initial": True}}, strip_defaults=False)
+            holder = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "mutate", holder_entered, release_holder),
+            )
+            setter = context.Process(
+                target=_set_config_value_process,
+                args=(tmp_path, setter_ready, setter_done),
+            )
+            holder.start()
+            assert holder_entered.wait(timeout=10)
+            setter.start()
+            try:
+                assert setter_ready.wait(timeout=10)
+                assert not setter_done.wait(timeout=0.5)
+            finally:
+                release_holder.set()
+                holder.join(timeout=15)
+                setter.join(timeout=15)
+                if holder.is_alive():
+                    holder.terminate()
+                if setter.is_alive():
+                    setter.terminate()
+
+            assert holder.exitcode == 0
+            assert setter.exitcode == 0
+            assert read_raw_config()["race_test"] == {
+                "initial": True,
+                "mutate": True,
+                "config_set": True,
+            }
+
+    @pytest.mark.parametrize(
+        ("action", "initial_provider", "expected_provider"),
+        (("update", "openrouter", "nous"), ("logout", "nous", "auto")),
+    )
+    def test_auth_config_writers_wait_for_mutation_transaction(
+        self, tmp_path, action, initial_provider, expected_provider
+    ):
+        context = multiprocessing.get_context("spawn")
+        holder_entered = context.Event()
+        release_holder = context.Event()
+        auth_ready = context.Event()
+        auth_done = context.Event()
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config(
+                {
+                    "model": {"provider": initial_provider},
+                    "race_test": {"initial": True},
+                },
+                strip_defaults=False,
+            )
+            holder = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "mutate", holder_entered, release_holder),
+            )
+            auth_writer = context.Process(
+                target=_auth_config_process,
+                args=(tmp_path, action, auth_ready, auth_done),
+            )
+            holder.start()
+            assert holder_entered.wait(timeout=10)
+            auth_writer.start()
+            try:
+                assert auth_ready.wait(timeout=10)
+                assert not auth_done.wait(timeout=0.5)
+            finally:
+                release_holder.set()
+                holder.join(timeout=15)
+                auth_writer.join(timeout=15)
+                if holder.is_alive():
+                    holder.terminate()
+                if auth_writer.is_alive():
+                    auth_writer.terminate()
+
+            assert holder.exitcode == 0
+            assert auth_writer.exitcode == 0
+            raw = read_raw_config()
+            assert raw["race_test"] == {"initial": True, "mutate": True}
+            assert raw["model"]["provider"] == expected_provider
+
+    def test_symlink_aliases_share_the_real_target_lock(self, tmp_path, monkeypatch):
+        from hermes_cli import config as config_module
+
+        real_path = tmp_path / "real" / "config.yaml"
+        real_path.parent.mkdir()
+        real_path.write_text("existing: true\n", encoding="utf-8")
+        alias_directories = []
+        if os.name == "nt":
+            for name in ("first", "second"):
+                alias_dir = tmp_path / name
+                result = subprocess.run(
+                    ["cmd.exe", "/d", "/c", "mklink", "/J", alias_dir, real_path.parent],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    pytest.skip(f"directory junctions unavailable: {result.stderr}")
+                alias_directories.append(alias_dir)
+            first_alias = alias_directories[0] / "config.yaml"
+            second_alias = alias_directories[1] / "config.yaml"
+        else:
+            first_alias = tmp_path / "first.yaml"
+            second_alias = tmp_path / "second.yaml"
+            try:
+                first_alias.symlink_to(real_path)
+                second_alias.symlink_to(real_path)
+            except OSError as exc:
+                pytest.skip(f"file symlinks unavailable: {exc}")
+
+        context = multiprocessing.get_context("spawn")
+        entered = context.Event()
+        release = context.Event()
+        holder = context.Process(
+            target=_hold_config_file_lock_process,
+            args=(first_alias, entered, release),
+        )
+        holder.start()
+        assert entered.wait(timeout=10)
+        monkeypatch.setattr(config_module, "_CONFIG_FILE_LOCK_TIMEOUT_SECONDS", 0.1)
+        try:
+            with pytest.raises(TimeoutError, match="^config_lock_timeout$"):
+                with config_module._config_file_lock(second_alias):
+                    pass
+        finally:
+            release.set()
+            holder.join(timeout=15)
+            if holder.is_alive():
+                holder.terminate()
+
+        assert holder.exitcode == 0
+        assert real_path.with_name("config.yaml.lock").exists()
+        assert not first_alias.with_name("first.yaml.lock").exists()
+        assert not second_alias.with_name("second.yaml.lock").exists()
+        for alias_dir in alias_directories:
+            os.rmdir(alias_dir)
+
+    def test_broken_symlink_lock_identity_is_safe(self, tmp_path):
+        from hermes_cli.config import _config_file_lock
+
+        missing_target = tmp_path / "missing" / "config.yaml"
+        alias = tmp_path / "broken.yaml"
+        try:
+            alias.symlink_to(missing_target)
+        except OSError as exc:
+            pytest.skip(f"file symlinks unavailable: {exc}")
+
+        with _config_file_lock(alias):
+            pass
+
+        assert missing_target.with_name("config.yaml.lock").exists()
+
+    def test_nested_different_config_target_fails_closed(self, tmp_path):
+        from hermes_cli.config import _config_file_lock
+
+        with _config_file_lock(tmp_path / "first.yaml"):
+            with pytest.raises(
+                RuntimeError,
+                match="^config_lock_reentrancy_target_mismatch$",
+            ):
+                with _config_file_lock(tmp_path / "second.yaml"):
+                    pass
+
+    @pytest.mark.parametrize("action", ("model", "platform"))
+    def test_managed_policy_writers_keep_cross_process_serialization(
+        self, tmp_path, action
+    ):
+        context = multiprocessing.get_context("spawn")
+        holder_entered = context.Event()
+        release_holder = context.Event()
+        writer_ready = context.Event()
+        writer_done = context.Event()
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config(
+                {"model": {"default": "old-model"}, "race_test": {"initial": True}},
+                strip_defaults=False,
+            )
+            holder = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "mutate", holder_entered, release_holder),
+            )
+            writer = context.Process(
+                target=_managed_policy_writer_process,
+                args=(tmp_path, action, writer_ready, writer_done),
+            )
+            holder.start()
+            assert holder_entered.wait(timeout=10)
+            writer.start()
+            try:
+                assert writer_ready.wait(timeout=10)
+                assert not writer_done.wait(timeout=0.5)
+            finally:
+                release_holder.set()
+                holder.join(timeout=15)
+                writer.join(timeout=15)
+                if holder.is_alive():
+                    holder.terminate()
+                if writer.is_alive():
+                    writer.terminate()
+
+            assert holder.exitcode == 0
+            assert writer.exitcode == 0
+            raw = read_raw_config()
+            assert raw["race_test"] == {"initial": True, "mutate": True}
+            if action == "model":
+                assert raw["model"]["default"] == "new-model"
+            else:
+                assert raw["platforms"]["email"]["mode"] == "pair"
 
 
 class TestSanitizeEnvLines:

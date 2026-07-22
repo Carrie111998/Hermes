@@ -89,6 +89,10 @@ class CodexEventProjector:
             return ProjectionResult()
 
         item = params.get("item") or {}
+        return self.project_item(item)
+
+    def project_item(self, item: dict) -> ProjectionResult:
+        """Project one completed app-server item using the live event semantics."""
         item_type = item.get("type") or ""
         item_id = item.get("id") or ""
 

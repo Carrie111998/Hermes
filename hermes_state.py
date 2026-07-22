@@ -24,6 +24,7 @@ import sqlite3
 import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -32,13 +33,69 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+_LOCAL_PERSISTED_CWD_SOURCES = frozenset({"cli", "tui"})
+_MAX_PERSISTED_CWD_CHARS = 4096
+_NATIVE_CWD_PLATFORM = "windows" if os.name == "nt" else "posix"
+
+
+def _is_canonical_absolute_cwd(value: object, *, platform: str) -> bool:
+    """Validate original cwd text under an explicit lexical path grammar."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > _MAX_PERSISTED_CWD_CHARS
+        or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
+    ):
+        return False
+
+    if platform == "windows":
+        drive_match = re.match(r"^[A-Za-z]:[\\/]", value)
+        if drive_match is not None:
+            lexical_tail = value[2:]
+            components = re.split(r"[\\/]", value[3:])
+        elif len(value) >= 2 and value[0] in "\\/" and value[1] == value[0]:
+            if len(value) < 3 or value[2] in "\\/":
+                return False
+            lexical_tail = value[2:]
+            components = re.split(r"[\\/]", lexical_tail)
+            if (
+                len(components) < 2
+                or not components[0]
+                or not components[1]
+                or components[0] in {"?", "."}
+            ):
+                return False
+        else:
+            return False
+        if re.search(r"[\\/]{2}", lexical_tail):
+            return False
+    elif platform == "posix":
+        if not value.startswith("/") or value.startswith("//"):
+            return False
+        if value == "/":
+            return True
+        lexical_tail = value[1:]
+        if "//" in lexical_tail:
+            return False
+        components = lexical_tail.split("/")
+    else:
+        return False
+
+    return not any(part in {".", ".."} for part in components)
+
+
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
-    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [
+        prefix,
+        f"{prefix}/%",
+        f"{prefix}\\%",
+    ]
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
@@ -59,7 +116,9 @@ _COMPRESSION_CHILD_SQL = (
 
 # Rows that surface in pickers: roots + branch children (subagent runs and
 # compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
@@ -119,6 +178,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
         conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
     return ids
 
+
 T = TypeVar("T")
 
 # Session DB path.  None = resolve get_hermes_home() at call time (see
@@ -139,7 +199,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 28
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -163,8 +223,8 @@ MAX_FTS5_QUERY_CHARS = 2_048
 # works on NFS.  Concurrency drops — concurrent readers are blocked during
 # a write — but the feature works.
 _WAL_INCOMPAT_MARKERS = (
-    "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
-    "not authorized",         # Some FUSE mounts block WAL pragma outright
+    "locking protocol",  # SQLITE_PROTOCOL on NFS/SMB
+    "not authorized",  # Some FUSE mounts block WAL pragma outright
 )
 
 # Last SessionDB() init error, per-process.  Surfaced in /resume and
@@ -213,7 +273,10 @@ def _message_trigram_disabled() -> bool:
     already handles).
     """
     return os.getenv("HERMES_DISABLE_MESSAGE_TRIGRAM", "").strip().lower() in (
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -300,7 +363,9 @@ def _strip_background_review_harness(
     return out
 
 
-def format_session_db_unavailable(prefix: str = "Session database not available") -> str:
+def format_session_db_unavailable(
+    prefix: str = "Session database not available",
+) -> str:
     """Format a user-facing 'session DB unavailable' message with cause.
 
     When ``SessionDB()`` init fails, callers set ``_session_db = None`` and
@@ -319,7 +384,9 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
         return f"{prefix}."
     hint = ""
     if any(marker in cause.lower() for marker in _WAL_INCOMPAT_MARKERS):
-        hint = " (state.db may be on NFS/SMB/FUSE — see https://www.sqlite.org/wal.html)"
+        hint = (
+            " (state.db may be on NFS/SMB/FUSE — see https://www.sqlite.org/wal.html)"
+        )
     return f"{prefix}: {cause}{hint}."
 
 
@@ -452,6 +519,7 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
         db_label,
         exc,
     )
+
 
 # ---------------------------------------------------------------------------
 # Malformed-schema recovery
@@ -694,7 +762,8 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             report["strategy"] = "dedup_schema"
             logger.warning(
                 "state.db schema repaired by de-duplicating sqlite_master "
-                "(FTS index preserved): %s", db_path
+                "(FTS index preserved): %s",
+                db_path,
             )
             return report
     except sqlite3.DatabaseError as exc:
@@ -717,7 +786,8 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             report["strategy"] = "drop_fts_rebuild"
             logger.warning(
                 "state.db schema repaired by dropping FTS schema; indexes "
-                "will rebuild from messages on next open: %s", db_path
+                "will rebuild from messages on next open: %s",
+                db_path,
             )
             return report
         report["error"] = reason
@@ -728,7 +798,8 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         logger.error(
             "state.db schema repair could not recover %s automatically "
             "(backup: %s); manual restore from backup may be required.",
-            db_path, report["backup_path"],
+            db_path,
+            report["backup_path"],
         )
     return report
 
@@ -828,13 +899,644 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_sidebar_exclusions (
+    source_session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'hermes')),
+    reason_code TEXT NOT NULL CHECK (reason_code IN ('source_cwd_missing')),
+    source_identity_digest TEXT NOT NULL,
+    excluded_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_exclusions_reason
+    ON session_sidebar_exclusions(reason_code, excluded_at DESC);
 """
+
+BRIDGE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS external_sessions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    native_id TEXT NOT NULL,
+    native_path TEXT,
+    native_status TEXT NOT NULL DEFAULT 'unknown',
+    last_native_cursor TEXT,
+    last_native_hash TEXT,
+    first_indexed_at REAL NOT NULL,
+    last_indexed_at REAL NOT NULL,
+    parser_version INTEGER NOT NULL,
+    origin_kind TEXT NOT NULL CHECK (
+        origin_kind IN ('native', 'bridge_placeholder', 'bridge_continuation')
+    ),
+    origin_bridge_id TEXT,
+    sync_error TEXT,
+    UNIQUE(provider, native_id)
+);
+
+CREATE TABLE IF NOT EXISTS external_message_map (
+    session_id TEXT NOT NULL REFERENCES external_sessions(session_id) ON DELETE CASCADE,
+    native_event_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY(session_id, native_event_id, ordinal),
+    UNIQUE(message_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_links (
+    id TEXT PRIMARY KEY,
+    from_session_id TEXT NOT NULL REFERENCES sessions(id),
+    to_session_id TEXT NOT NULL REFERENCES sessions(id),
+    relation TEXT NOT NULL CHECK (relation IN ('mirrors', 'continues', 'forks')),
+    bridge_id TEXT NOT NULL,
+    source_cursor TEXT,
+    source_hash TEXT,
+    created_at REAL NOT NULL,
+    hydrated_at REAL,
+    diverged_at REAL,
+    UNIQUE(bridge_id, from_session_id, to_session_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS session_mirror_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id),
+    target_provider TEXT NOT NULL CHECK (target_provider IN ('claude', 'codex')),
+    state TEXT NOT NULL CHECK (
+        state IN ('queued', 'running', 'retry', 'succeeded', 'manual_failure')
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL,
+    target_native_id TEXT,
+    error_code TEXT,
+    error_detail TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id),
+    bridge_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'sidebar_pending', 'sidebar_leased', 'sidebar_visible',
+            'sidebar_retry', 'sidebar_failed'
+        )
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT,
+    lease_expires_at REAL,
+    completion_digest TEXT,
+    codex_thread_id TEXT UNIQUE,
+    error_code TEXT,
+    eligible_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    visible_at REAL,
+    CHECK (
+        (state = 'sidebar_leased' AND lease_digest IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state != 'sidebar_leased' AND lease_digest IS NULL AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        state != 'sidebar_visible'
+        OR (
+            codex_thread_id IS NOT NULL
+            AND visible_at IS NOT NULL
+            AND completion_digest IS NOT NULL
+        )
+    )
+);
+
+CREATE TABLE IF NOT EXISTS session_sidebar_terminal_resolutions (
+    job_id TEXT PRIMARY KEY
+        REFERENCES session_sidebar_jobs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL UNIQUE,
+    bridge_id TEXT NOT NULL UNIQUE,
+    codex_thread_id TEXT NOT NULL UNIQUE,
+    failure_state TEXT NOT NULL CHECK (failure_state = 'sidebar_failed'),
+    failure_code TEXT NOT NULL CHECK (failure_code = 'native_create_ambiguous'),
+    failure_attempts INTEGER NOT NULL CHECK (failure_attempts >= 0),
+    failure_next_attempt_at REAL NOT NULL,
+    failure_updated_at REAL NOT NULL,
+    resolution_code TEXT NOT NULL CHECK (
+        resolution_code = 'native_thread_unrecoverable'
+    ),
+    evidence_kind TEXT NOT NULL CHECK (
+        evidence_kind = 'codex_app_server_read_not_loaded_resume_no_rollout'
+    ),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    resolved_at REAL NOT NULL,
+    CHECK (resolved_at >= failure_updated_at)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_replacement
+BEFORE INSERT ON session_sidebar_terminal_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_terminal_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+        OR existing.codex_thread_id = NEW.codex_thread_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_update
+BEFORE UPDATE ON session_sidebar_terminal_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_delete
+BEFORE DELETE ON session_sidebar_terminal_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS session_sidebar_precreate_resolutions (
+    job_id TEXT PRIMARY KEY
+        REFERENCES session_sidebar_jobs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL UNIQUE,
+    bridge_id TEXT NOT NULL UNIQUE,
+    failure_state TEXT NOT NULL CHECK (failure_state = 'sidebar_failed'),
+    failure_code TEXT NOT NULL CHECK (failure_code = 'native_create_ambiguous'),
+    failure_attempts INTEGER NOT NULL CHECK (failure_attempts = 0),
+    failure_next_attempt_at REAL NOT NULL,
+    failure_updated_at REAL NOT NULL,
+    cutover_applied_at REAL NOT NULL,
+    reservation_reserved_at REAL NOT NULL,
+    resolution_code TEXT NOT NULL CHECK (
+        resolution_code = 'precutover_create_unrecoverable'
+    ),
+    evidence_kind TEXT NOT NULL CHECK (
+        evidence_kind = 'codex_inventory_marker_and_recovery_zero_no_rollout'
+    ),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    resolved_at REAL NOT NULL,
+    CHECK (reservation_reserved_at = cutover_applied_at),
+    CHECK (resolved_at >= failure_updated_at)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_precreate_resolutions_no_replacement
+BEFORE INSERT ON session_sidebar_precreate_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_precreate_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+OR EXISTS (
+    SELECT 1 FROM session_sidebar_terminal_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar precreate resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_precreate_resolutions_no_update
+BEFORE UPDATE ON session_sidebar_precreate_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar precreate resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_precreate_resolutions_no_delete
+BEFORE DELETE ON session_sidebar_precreate_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar precreate resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_precreate_overlap
+BEFORE INSERT ON session_sidebar_terminal_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_precreate_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions overlap precreate evidence');
+END;
+
+CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
+    id TEXT PRIMARY KEY,
+    source_session_id TEXT NOT NULL UNIQUE,
+    bridge_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    reserved_claude_uuid TEXT NOT NULL UNIQUE,
+    native_name TEXT NOT NULL,
+    source_provider TEXT NOT NULL CHECK (source_provider IN ('codex', 'hermes')),
+    source_cwd TEXT NOT NULL,
+    git_root TEXT,
+    git_branch TEXT,
+    git_head TEXT,
+    worktree_id TEXT,
+    signed_marker TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'claude_pending', 'claude_leased', 'claude_retry',
+            'claude_visible', 'claude_failed'
+        )
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT,
+    lease_expires_at REAL,
+    lease_kind TEXT CHECK (lease_kind IN ('launch', 'reconciliation')),
+    error_code TEXT,
+    error_detail TEXT,
+    completion_digest TEXT,
+    eligible_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    visible_at REAL,
+    CHECK (
+        (state = 'claude_leased' AND lease_digest IS NOT NULL
+         AND lease_expires_at IS NOT NULL AND lease_kind IS NOT NULL)
+        OR (state != 'claude_leased' AND lease_digest IS NULL
+            AND lease_expires_at IS NULL AND lease_kind IS NULL)
+    ),
+    CHECK (
+        state != 'claude_visible'
+        OR (completion_digest IS NOT NULL AND visible_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS session_claude_registration_usage (
+    local_day TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES session_claude_visibility_jobs(id),
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+    reserved_estimated_cost_usd TEXT NOT NULL,
+    reserved_at REAL NOT NULL,
+    UNIQUE(job_id, attempt_ordinal)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_claude_job_id_reserved_uuid
+    ON session_claude_visibility_jobs(id, reserved_claude_uuid);
+
+CREATE TABLE IF NOT EXISTS session_claude_visibility_reconciliations (
+    job_id TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 0),
+    outcome TEXT NOT NULL CHECK (outcome IN ('absent', 'exact_match', 'conflict')),
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    checked_at REAL NOT NULL,
+    consumed_at REAL,
+    PRIMARY KEY (job_id, attempt_ordinal, outcome, checked_at),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_claude_visibility_characterization_events (
+    job_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN ('registered', 'cleanup_completed', 'launch_aborted')
+    ),
+    operation_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (job_id, event_kind),
+    UNIQUE (operation_id, event_kind),
+    UNIQUE (source_session_id, event_kind),
+    UNIQUE (bridge_id, event_kind),
+    UNIQUE (idempotency_key, event_kind),
+    UNIQUE (reserved_claude_uuid, event_kind),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE RESTRICT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_identity
+BEFORE INSERT ON session_claude_visibility_characterization_events
+WHEN NOT EXISTS (
+    SELECT 1 FROM session_claude_visibility_jobs AS job
+    WHERE job.id = NEW.job_id
+      AND job.source_session_id = NEW.source_session_id
+      AND job.bridge_id = NEW.bridge_id
+      AND job.idempotency_key = NEW.idempotency_key
+      AND job.reserved_claude_uuid = NEW.reserved_claude_uuid
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_cleanup_order
+BEFORE INSERT ON session_claude_visibility_characterization_events
+WHEN NEW.event_kind = 'cleanup_completed' AND (
+    NOT EXISTS (
+        SELECT 1 FROM session_claude_visibility_characterization_events
+        WHERE job_id = NEW.job_id AND event_kind = 'registered'
+    )
+    OR NOT EXISTS (
+        SELECT 1 FROM session_claude_visibility_jobs
+        WHERE id = NEW.job_id AND state = 'claude_visible'
+          AND completion_digest IS NOT NULL AND visible_at IS NOT NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization cleanup is not anchored');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_abort_order
+BEFORE INSERT ON session_claude_visibility_characterization_events
+WHEN NEW.event_kind = 'launch_aborted' AND (
+    NOT EXISTS (
+        SELECT 1 FROM session_claude_visibility_characterization_events
+        WHERE job_id = NEW.job_id AND event_kind = 'registered'
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM session_claude_visibility_jobs AS job
+        JOIN session_claude_visibility_reconciliations AS reconciliation
+          ON reconciliation.job_id = job.id
+         AND reconciliation.reserved_claude_uuid = job.reserved_claude_uuid
+         AND reconciliation.attempt_ordinal = job.attempts
+        WHERE job.id = NEW.job_id
+          AND (
+              job.state = 'claude_retry'
+              OR (
+                  job.state = 'claude_failed'
+                  AND job.error_code = 'max_attempts_exhausted'
+              )
+          )
+          AND reconciliation.outcome = 'absent'
+          AND reconciliation.consumed_at IS NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization abort is not anchored');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_no_update
+BEFORE UPDATE ON session_claude_visibility_characterization_events
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_no_delete
+BEFORE DELETE ON session_claude_visibility_characterization_events
+BEGIN
+    SELECT RAISE(ABORT, 'Claude characterization events are append-only');
+END;
+
+CREATE TABLE IF NOT EXISTS session_claude_auth_recoveries (
+    job_id TEXT PRIMARY KEY,
+    reserved_claude_uuid TEXT NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    prompt_digest TEXT NOT NULL CHECK (
+        length(prompt_digest) = 64
+        AND prompt_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK (state IN ('leased', 'retry', 'completed')),
+    attempt_ordinal INTEGER NOT NULL CHECK (attempt_ordinal >= 1),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT UNIQUE,
+    lease_expires_at REAL,
+    call_started_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    CHECK (
+        (state = 'leased' AND lease_digest IS NOT NULL
+         AND lease_expires_at IS NOT NULL)
+        OR (state != 'leased' AND lease_digest IS NULL
+            AND lease_expires_at IS NULL)
+    ),
+    CHECK ((state = 'completed') = (completed_at IS NOT NULL)),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_context_packs (
+    id TEXT PRIMARY KEY,
+    bridge_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id),
+    target_session_id TEXT REFERENCES sessions(id),
+    source_cursor TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    budget_chars INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    immutable_at REAL,
+    UNIQUE(bridge_id, source_cursor, source_hash, budget_chars)
+);
+
+CREATE TABLE IF NOT EXISTS session_bridge_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_bridge_migrations (
+    migration_name TEXT PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_sessions_last_indexed_at
+    ON external_sessions(last_indexed_at);
+CREATE INDEX IF NOT EXISTS idx_external_sessions_origin_bridge_id
+    ON external_sessions(origin_bridge_id);
+CREATE INDEX IF NOT EXISTS idx_session_links_bridge_id
+    ON session_links(bridge_id);
+CREATE INDEX IF NOT EXISTS idx_session_links_from_session_id
+    ON session_links(from_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_links_to_session_id
+    ON session_links(to_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_mirror_jobs_state_next_attempt_at
+    ON session_mirror_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_state_next_attempt_at
+    ON session_sidebar_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_source_session_id
+    ON session_sidebar_jobs(source_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_lease_digest
+    ON session_sidebar_jobs(lease_digest) WHERE lease_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_completion_digest
+    ON session_sidebar_jobs(completion_digest)
+    WHERE completion_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_visible_at
+    ON session_sidebar_jobs(state, visible_at DESC, id DESC)
+    WHERE visible_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_state_next_attempt_at
+    ON session_claude_visibility_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_lease_digest
+    ON session_claude_visibility_jobs(lease_digest)
+    WHERE lease_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_claude_registration_usage_local_day
+    ON session_claude_registration_usage(local_day, reserved_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_claude_reconciliation_unconsumed_absent
+    ON session_claude_visibility_reconciliations(job_id, attempt_ordinal)
+    WHERE outcome = 'absent' AND consumed_at IS NULL;
+"""
+
+_CLAUDE_CHARACTERIZATION_EVENTS_TABLE_V28_SQL = """
+CREATE TABLE _session_claude_visibility_characterization_events_v28 (
+    job_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN ('registered', 'cleanup_completed', 'launch_aborted')
+    ),
+    operation_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (job_id, event_kind),
+    UNIQUE (operation_id, event_kind),
+    UNIQUE (source_session_id, event_kind),
+    UNIQUE (bridge_id, event_kind),
+    UNIQUE (idempotency_key, event_kind),
+    UNIQUE (reserved_claude_uuid, event_kind),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE RESTRICT
+)
+"""
+
+_CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_SQL = (
+    """CREATE TRIGGER trg_claude_characterization_event_identity
+       BEFORE INSERT ON session_claude_visibility_characterization_events
+       WHEN NOT EXISTS (
+           SELECT 1 FROM session_claude_visibility_jobs AS job
+           WHERE job.id = NEW.job_id
+             AND job.source_session_id = NEW.source_session_id
+             AND job.bridge_id = NEW.bridge_id
+             AND job.idempotency_key = NEW.idempotency_key
+             AND job.reserved_claude_uuid = NEW.reserved_claude_uuid
+       )
+       BEGIN
+           SELECT RAISE(ABORT, 'Claude characterization identity mismatch');
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_cleanup_order
+       BEFORE INSERT ON session_claude_visibility_characterization_events
+       WHEN NEW.event_kind = 'cleanup_completed' AND (
+           NOT EXISTS (
+               SELECT 1 FROM session_claude_visibility_characterization_events
+               WHERE job_id = NEW.job_id AND event_kind = 'registered'
+           )
+           OR NOT EXISTS (
+               SELECT 1 FROM session_claude_visibility_jobs
+               WHERE id = NEW.job_id AND state = 'claude_visible'
+                 AND completion_digest IS NOT NULL AND visible_at IS NOT NULL
+           )
+       )
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization cleanup is not anchored'
+           );
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_abort_order
+       BEFORE INSERT ON session_claude_visibility_characterization_events
+       WHEN NEW.event_kind = 'launch_aborted' AND (
+           NOT EXISTS (
+               SELECT 1 FROM session_claude_visibility_characterization_events
+               WHERE job_id = NEW.job_id AND event_kind = 'registered'
+           )
+           OR NOT EXISTS (
+               SELECT 1
+               FROM session_claude_visibility_jobs AS job
+               JOIN session_claude_visibility_reconciliations AS reconciliation
+                 ON reconciliation.job_id = job.id
+                AND reconciliation.reserved_claude_uuid = job.reserved_claude_uuid
+                AND reconciliation.attempt_ordinal = job.attempts
+               WHERE job.id = NEW.job_id
+                 AND (
+                     job.state = 'claude_retry'
+                     OR (
+                         job.state = 'claude_failed'
+                         AND job.error_code = 'max_attempts_exhausted'
+                     )
+                 )
+                 AND reconciliation.outcome = 'absent'
+                 AND reconciliation.consumed_at IS NULL
+           )
+       )
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization abort is not anchored'
+           );
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_event_no_update
+       BEFORE UPDATE ON session_claude_visibility_characterization_events
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization events are append-only'
+           );
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_event_no_delete
+       BEFORE DELETE ON session_claude_visibility_characterization_events
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization events are append-only'
+           );
+       END""",
+)
+
+_CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES = (
+    "trg_claude_characterization_event_identity",
+    "trg_claude_characterization_cleanup_order",
+    "trg_claude_characterization_abort_order",
+    "trg_claude_characterization_event_no_update",
+    "trg_claude_characterization_event_no_delete",
+)
+
+_CLAUDE_CHARACTERIZATION_EVENT_COLUMNS = (
+    "job_id",
+    "event_kind",
+    "operation_id",
+    "source_session_id",
+    "bridge_id",
+    "idempotency_key",
+    "reserved_claude_uuid",
+    "evidence_digest",
+    "created_at",
+)
 
 # Indexes that reference columns added in later schema versions must be
 # created AFTER _reconcile_columns() has had a chance to ADD them on
@@ -851,6 +1553,46 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+DROP TRIGGER IF EXISTS trg_claude_visibility_lease_kind_insert;
+DROP TRIGGER IF EXISTS trg_claude_visibility_lease_kind_update;
+CREATE TRIGGER IF NOT EXISTS trg_claude_visibility_lease_kind_insert
+BEFORE INSERT ON session_claude_visibility_jobs
+WHEN (
+    NEW.state = 'claude_leased'
+    AND (
+        NEW.lease_digest IS NULL OR NEW.lease_expires_at IS NULL
+        OR NEW.lease_kind IS NULL
+        OR NEW.lease_kind NOT IN ('launch', 'reconciliation')
+    )
+) OR (
+    NEW.state != 'claude_leased'
+    AND (
+        NEW.lease_digest IS NOT NULL OR NEW.lease_expires_at IS NOT NULL
+        OR NEW.lease_kind IS NOT NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Claude visibility lease fields');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_claude_visibility_lease_kind_update
+BEFORE UPDATE ON session_claude_visibility_jobs
+WHEN (
+    NEW.state = 'claude_leased'
+    AND (
+        NEW.lease_digest IS NULL OR NEW.lease_expires_at IS NULL
+        OR NEW.lease_kind IS NULL
+        OR NEW.lease_kind NOT IN ('launch', 'reconciliation')
+    )
+) OR (
+    NEW.state != 'claude_leased'
+    AND (
+        NEW.lease_digest IS NOT NULL OR NEW.lease_expires_at IS NOT NULL
+        OR NEW.lease_kind IS NOT NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid Claude visibility lease fields');
+END;
 """
 
 FTS_SQL = """
@@ -927,8 +1669,8 @@ class SessionDB:
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
     _WRITE_MAX_RETRIES = 15
-    _WRITE_RETRY_MIN_S = 0.020   # 20ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _WRITE_RETRY_MIN_S = 0.020  # 20ms
+    _WRITE_RETRY_MAX_S = 0.150  # 150ms
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Merge fragmented FTS5 segments every N successful writes. The message
@@ -942,7 +1684,7 @@ class SessionDB:
     # merge cost is amortised far below the checkpoint cadence.
     _OPTIMIZE_EVERY_N_WRITES = 1000
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(self, db_path: Optional[Path] = None, read_only: bool = False):
         # Fork: resolve the default DB path at call time (_default_db_path)
         # so a profile/env change is honored, instead of the import-time
         # DEFAULT_DB_PATH snapshot. Upstream: read_only cross-profile attach.
@@ -956,7 +1698,6 @@ class SessionDB:
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
-        self._conn = None
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -1007,15 +1748,19 @@ class SessionDB:
                 # place (backup first; canonical sessions/messages preserved),
                 # then reopen once. This is what lets Desktop/Dashboard
                 # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                if not is_malformed_db_error(exc) or not _claim_repair_attempt(
+                    self.db_path
+                ):
                     raise
                 logger.error(
                     "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
+                    "repair (a backup copy is made first).",
+                    exc,
                 )
                 try:
-                    if self._conn is not None:
-                        self._conn.close()
+                    connection = getattr(self, "_conn", None)
+                    if connection is not None:
+                        connection.close()
                 except Exception:
                     pass
                 report = repair_state_db_schema(self.db_path)
@@ -1162,7 +1907,9 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass
 
-    def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
+    def _fts_table_probe(
+        self, cursor: sqlite3.Cursor, table_name: str
+    ) -> Optional[bool]:
         try:
             cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
             return True
@@ -1299,7 +2046,8 @@ class SessionDB:
                 if result and result[1] > 0:
                     logger.debug(
                         "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
+                        result[2],
+                        result[1],
                     )
         except Exception:
             pass  # Best effort — never fatal.
@@ -1327,13 +2075,14 @@ class SessionDB:
         help shrink the WAL file.
         """
         with self._lock:
-            if self._conn:
+            connection = getattr(self, "_conn", None)
+            if connection is not None:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except Exception:
                     pass
-                self._conn.close()
-                self._conn = None
+                connection.close()
+                del self._conn
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -1357,9 +2106,7 @@ class SessionDB:
                 "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall():
                 cols: Dict[str, str] = {}
-                for row in ref.execute(
-                    f'PRAGMA table_info("{tbl}")'
-                ).fetchall():
+                for row in ref.execute(f'PRAGMA table_info("{tbl}")').fetchall():
                     # row: (cid, name, type, notnull, dflt_value, pk)
                     col_name = row[1]
                     col_type = row[2] or ""
@@ -1378,7 +2125,9 @@ class SessionDB:
         finally:
             ref.close()
 
-    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+    def _reconcile_columns_from_sql(
+        self, cursor: sqlite3.Cursor, schema_sql: str
+    ) -> None:
         """Ensure live tables have every column declared in SCHEMA_SQL.
 
         Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
@@ -1391,13 +2140,11 @@ class SessionDB:
         the column to SCHEMA_SQL and it appears on the next startup.
         Version-gated migration blocks are no longer needed for ADD COLUMN.
         """
-        expected = self._parse_schema_columns(SCHEMA_SQL)
+        expected = self._parse_schema_columns(schema_sql)
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
             try:
-                rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
-                ).fetchall()
+                rows = cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
             except sqlite3.OperationalError:
                 continue  # Table doesn't exist yet (shouldn't happen after executescript)
             live_cols = set()
@@ -1419,8 +2166,416 @@ class SessionDB:
                         # with default value NULL" from a schema mistake.
                         # Log at DEBUG so it's visible in agent.log.
                         logger.debug(
-                            "reconcile %s.%s: %s", table_name, col_name, exc,
+                            "reconcile %s.%s: %s",
+                            table_name,
+                            col_name,
+                            exc,
                         )
+
+    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Ensure live core and bridge tables have every declared column."""
+        self._reconcile_columns_from_sql(cursor, SCHEMA_SQL)
+        self._reconcile_columns_from_sql(cursor, BRIDGE_SCHEMA_SQL)
+
+    @staticmethod
+    def _canonicalize_legacy_claude_cost(raw: object, rowid: int) -> str:
+        """Return exact six-decimal legacy cost text or fail closed."""
+        try:
+            value = Decimal(str(raw))
+            quantum = Decimal("0.000001")
+            canonical = value.quantize(quantum)
+        except (InvalidOperation, ValueError):
+            canonical = None
+        if (
+            canonical is None
+            or not value.is_finite()
+            or value < 0
+            or value > Decimal("1000000")
+            or value != canonical
+        ):
+            raise RuntimeError(
+                "unsafe session_claude_registration_usage row "
+                f"{rowid} reserved_estimated_cost_usd={raw!r}"
+            )
+        return format(canonical, ".6f")
+
+    def _apply_bridge_migrations(self, cursor: sqlite3.Cursor) -> None:
+        """Apply bridge-only data migrations independently of core/FTS."""
+        migration_name = "claude_visibility_security_v24"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                connection.commit()
+                return
+
+            for row in cursor.execute(
+                """SELECT rowid, reserved_estimated_cost_usd
+                   FROM session_claude_registration_usage"""
+            ).fetchall():
+                rowid = row["rowid"] if isinstance(row, sqlite3.Row) else row[0]
+                raw = (
+                    row["reserved_estimated_cost_usd"]
+                    if isinstance(row, sqlite3.Row)
+                    else row[1]
+                )
+                canonical = self._canonicalize_legacy_claude_cost(raw, rowid)
+                if raw != canonical:
+                    cursor.execute(
+                        """UPDATE session_claude_registration_usage
+                           SET reserved_estimated_cost_usd = ? WHERE rowid = ?""",
+                        (canonical, rowid),
+                    )
+
+            # v23 lease/error sentinels were not authenticated authorization.
+            cursor.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_retry', next_attempt_at = updated_at,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       lease_kind = NULL, error_code = 'lease_expired',
+                       error_detail = substr(
+                           'v23 active lease invalidated during v24 migration; '
+                           || COALESCE(error_code, 'no prior diagnostic') || '; '
+                           || COALESCE(error_detail, ''), 1, 512
+                       )
+                   WHERE state = 'claude_leased'"""
+            )
+            cursor.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET error_code = 'creation_ambiguous',
+                       error_detail = substr(
+                           'v23 authorization sentinel invalidated during v24 migration; '
+                           || error_code || '; ' || COALESCE(error_detail, ''), 1, 512
+                       )
+                   WHERE state = 'claude_retry'
+                     AND error_code IN (
+                         'exact_id_absent_reconciled',
+                         'exact_id_reconciliation_in_progress'
+                     )"""
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    def _apply_claude_characterization_abort_trigger_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Allow exact max-attempt absence to anchor operator-confirmed abort."""
+
+        migration_name = "claude_characterization_abort_max_attempts_v27"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                connection.commit()
+                return
+            cursor.execute(
+                "DROP TRIGGER IF EXISTS trg_claude_characterization_abort_order"
+            )
+            cursor.execute(
+                """CREATE TRIGGER trg_claude_characterization_abort_order
+                   BEFORE INSERT ON session_claude_visibility_characterization_events
+                   WHEN NEW.event_kind = 'launch_aborted' AND (
+                       NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_characterization_events
+                           WHERE job_id = NEW.job_id AND event_kind = 'registered'
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1
+                           FROM session_claude_visibility_jobs AS job
+                           JOIN session_claude_visibility_reconciliations AS reconciliation
+                             ON reconciliation.job_id = job.id
+                            AND reconciliation.reserved_claude_uuid = job.reserved_claude_uuid
+                            AND reconciliation.attempt_ordinal = job.attempts
+                           WHERE job.id = NEW.job_id
+                             AND (
+                                 job.state = 'claude_retry'
+                                 OR (
+                                     job.state = 'claude_failed'
+                                     AND job.error_code = 'max_attempts_exhausted'
+                                 )
+                             )
+                             AND reconciliation.outcome = 'absent'
+                             AND reconciliation.consumed_at IS NULL
+                       )
+                   )
+                   BEGIN
+                       SELECT RAISE(
+                           ABORT,
+                           'Claude characterization abort is not anchored'
+                       );
+                   END"""
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    @staticmethod
+    def _drop_claude_characterization_event_triggers(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        for trigger_name in _CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES:
+            cursor.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+
+    @staticmethod
+    def _create_claude_characterization_event_triggers(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        for trigger_sql in _CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_SQL:
+            cursor.execute(trigger_sql)
+
+    @staticmethod
+    def _validate_claude_characterization_events_v28(
+        cursor: sqlite3.Cursor,
+        *,
+        expected_rows: int | None = None,
+    ) -> None:
+        table_name = "session_claude_visibility_characterization_events"
+        schema_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if schema_row is None or schema_row[0] is None:
+            raise RuntimeError("Claude characterization event table is missing")
+        normalized_schema = " ".join(str(schema_row[0]).split())
+        if "'launch_aborted'" not in normalized_schema:
+            raise RuntimeError("Claude characterization event CHECK is stale")
+
+        columns = tuple(
+            row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        )
+        if columns != _CLAUDE_CHARACTERIZATION_EVENT_COLUMNS:
+            raise RuntimeError("Claude characterization event columns changed")
+
+        unique_column_sets: set[tuple[str, ...]] = set()
+        for index_row in cursor.execute(
+            f'PRAGMA index_list("{table_name}")'
+        ).fetchall():
+            if int(index_row[2]) != 1:
+                continue
+            index_name = str(index_row[1]).replace('"', '""')
+            unique_column_sets.add(
+                tuple(
+                    row[2]
+                    for row in cursor.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall()
+                )
+            )
+        expected_unique = {
+            ("job_id", "event_kind"),
+            ("operation_id", "event_kind"),
+            ("source_session_id", "event_kind"),
+            ("bridge_id", "event_kind"),
+            ("idempotency_key", "event_kind"),
+            ("reserved_claude_uuid", "event_kind"),
+        }
+        if unique_column_sets != expected_unique:
+            raise RuntimeError("Claude characterization event uniqueness changed")
+
+        foreign_keys = tuple(
+            (row[3], row[4], row[2], row[6])
+            for row in cursor.execute(
+                f'PRAGMA foreign_key_list("{table_name}")'
+            ).fetchall()
+        )
+        if foreign_keys != (
+            (
+                "job_id",
+                "id",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+            (
+                "reserved_claude_uuid",
+                "reserved_claude_uuid",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+        ):
+            raise RuntimeError("Claude characterization event foreign key changed")
+        if (
+            cursor.execute(f'PRAGMA foreign_key_check("{table_name}")').fetchone()
+            is not None
+        ):
+            raise RuntimeError("Claude characterization event foreign key violation")
+
+        triggers = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND tbl_name = ?",
+                (table_name,),
+            ).fetchall()
+        }
+        if triggers != set(_CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES):
+            raise RuntimeError("Claude characterization event triggers changed")
+        if expected_rows is not None:
+            actual_rows = cursor.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if int(actual_rows) != expected_rows:
+                raise RuntimeError("Claude characterization event row count changed")
+
+    def _apply_claude_characterization_events_v28_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Rebuild the v26/v27 event table so launch-abort is persistable."""
+
+        migration_name = "claude_characterization_events_v28"
+        table_name = "session_claude_visibility_characterization_events"
+        temporary_name = "_session_claude_visibility_characterization_events_v28"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                self._validate_claude_characterization_events_v28(cursor)
+                connection.commit()
+                return
+
+            table_row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if table_row is None or table_row[0] is None:
+                raise RuntimeError("Claude characterization event table is missing")
+            source_rows = int(
+                cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+            )
+            if "'launch_aborted'" not in " ".join(str(table_row[0]).split()):
+                if (
+                    cursor.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        (temporary_name,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise RuntimeError(
+                        "Claude characterization event migration temp table exists"
+                    )
+                self._drop_claude_characterization_event_triggers(cursor)
+                cursor.execute(_CLAUDE_CHARACTERIZATION_EVENTS_TABLE_V28_SQL)
+                column_list = ", ".join(
+                    f'"{column}"' for column in _CLAUDE_CHARACTERIZATION_EVENT_COLUMNS
+                )
+                cursor.execute(
+                    f'INSERT INTO "{temporary_name}" ({column_list}) '
+                    f'SELECT {column_list} FROM "{table_name}"'
+                )
+                copied_rows = int(
+                    cursor.execute(
+                        f'SELECT COUNT(*) FROM "{temporary_name}"'
+                    ).fetchone()[0]
+                )
+                if copied_rows != source_rows:
+                    raise RuntimeError(
+                        "Claude characterization event row count changed"
+                    )
+                missing = cursor.execute(
+                    f'SELECT 1 FROM (SELECT {column_list} FROM "{table_name}" '
+                    f'EXCEPT SELECT {column_list} FROM "{temporary_name}") LIMIT 1'
+                ).fetchone()
+                extra = cursor.execute(
+                    f'SELECT 1 FROM (SELECT {column_list} FROM "{temporary_name}" '
+                    f'EXCEPT SELECT {column_list} FROM "{table_name}") LIMIT 1'
+                ).fetchone()
+                if missing is not None or extra is not None:
+                    raise RuntimeError("Claude characterization event rows changed")
+                cursor.execute(f'DROP TABLE "{table_name}"')
+                cursor.execute(
+                    f'ALTER TABLE "{temporary_name}" RENAME TO "{table_name}"'
+                )
+            else:
+                self._drop_claude_characterization_event_triggers(cursor)
+
+            self._create_claude_characterization_event_triggers(cursor)
+            self._validate_claude_characterization_events_v28(
+                cursor, expected_rows=source_rows
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    def _apply_claude_auth_recovery_call_started_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Add the crash-accounting checkpoint to the c214 recovery table."""
+
+        migration_name = "claude_auth_recovery_call_started_v25"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                connection.commit()
+                return
+            columns = {
+                row["name"] if isinstance(row, sqlite3.Row) else row[1]
+                for row in cursor.execute(
+                    'PRAGMA table_info("session_claude_auth_recoveries")'
+                ).fetchall()
+            }
+            if "call_started_at" not in columns:
+                cursor.execute(
+                    "ALTER TABLE session_claude_auth_recoveries "
+                    "ADD COLUMN call_started_at REAL"
+                )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
@@ -1439,12 +2594,33 @@ class SessionDB:
 
         cursor.executescript(SCHEMA_SQL)
 
+        # ``executescript`` commits before executing its SQL, so explicitly
+        # put the complete bridge DDL in one transaction. This keeps a v19
+        # database at v19 with none of the additive bridge objects if any
+        # statement fails partway through the script.
+        try:
+            cursor.executescript("BEGIN IMMEDIATE;\n" + BRIDGE_SCHEMA_SQL + "\nCOMMIT;")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
+
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
+        # c214 created this table before its durable call-start checkpoint.
+        # Upgrade that exact shape before generic reconciliation so the
+        # migration remains explicit and auditable.
+        self._apply_claude_auth_recovery_call_started_migration(cursor)
         self._reconcile_columns(cursor)
+
+        # Bridge security migrations have their own durable ledger. They must
+        # run after bridge-column reconciliation and must not wait for FTS.
+        self._apply_bridge_migrations(cursor)
+        self._apply_claude_characterization_abort_trigger_migration(cursor)
+        self._apply_claude_characterization_events_v28_migration(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -1474,9 +2650,7 @@ class SessionDB:
         # before the fix.  It was previously gated at ``current_version <
         # 12`` which never re-ran for already-v12+ databases.
         try:
-            cursor.execute(
-                "UPDATE messages SET active = 1 WHERE active IS NULL"
-            )
+            cursor.execute("UPDATE messages SET active = 1 WHERE active IS NULL")
         except sqlite3.OperationalError:
             pass
 
@@ -1688,22 +2862,24 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
-    def _insert_session_row(
+    def _upsert_session_row(
         self,
+        conn: sqlite3.Connection,
         session_id: str,
         source: str,
-        model: str = None,
-        model_config: Dict[str, Any] = None,
-        system_prompt: str = None,
-        user_id: str = None,
-        session_key: str = None,
-        chat_id: str = None,
-        chat_type: str = None,
-        thread_id: str = None,
-        parent_session_id: str = None,
-        cwd: str = None,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
+        user_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        started_at: Optional[float] = None,
     ) -> None:
-        """Insert a session row, enriching NULL metadata on conflict.
+        """Upsert a session row using the caller's active transaction.
 
         The gateway's ``get_or_create_session`` creates a bare row (source +
         user_id) *before* the agent exists; the agent's later
@@ -1721,39 +2897,73 @@ class SessionDB:
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
-        def _do(conn):
-            conn.execute(
-                """INSERT INTO sessions (
-                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, started_at
-                )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       model = COALESCE(sessions.model, excluded.model),
-                       model_config = COALESCE(sessions.model_config, excluded.model_config),
-                       system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
-                       session_key = COALESCE(sessions.session_key, excluded.session_key),
-                       chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
-                       chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
-                       thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
-                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
-                       cwd = COALESCE(sessions.cwd, excluded.cwd)""",
-                (
-                    session_id,
-                    source,
-                    user_id,
-                    session_key,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
-                    parent_session_id,
-                    cwd,
-                    time.time(),
-                ),
+        conn.execute(
+            """INSERT INTO sessions (
+               id, source, user_id, session_key, chat_id, chat_type, thread_id,
+               model, model_config, system_prompt, parent_session_id, cwd, started_at
             )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   model = COALESCE(sessions.model, excluded.model),
+                   model_config = COALESCE(sessions.model_config, excluded.model_config),
+                   system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                   session_key = COALESCE(sessions.session_key, excluded.session_key),
+                   chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                   chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                   thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                   parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                   cwd = COALESCE(sessions.cwd, excluded.cwd)""",
+            (
+                session_id,
+                source,
+                user_id,
+                session_key,
+                chat_id,
+                chat_type,
+                thread_id,
+                model,
+                json.dumps(model_config) if model_config else None,
+                system_prompt,
+                parent_session_id,
+                cwd,
+                time.time() if started_at is None else started_at,
+            ),
+        )
+
+    def _insert_session_row(
+        self,
+        session_id: str,
+        source: str,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
+        user_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> None:
+        """Insert a session row, enriching NULL metadata on conflict."""
+
+        def _do(conn):
+            self._upsert_session_row(
+                conn,
+                session_id,
+                source,
+                model=model,
+                model_config=model_config,
+                system_prompt=system_prompt,
+                user_id=user_id,
+                session_key=session_key,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                parent_session_id=parent_session_id,
+                cwd=cwd,
+            )
+
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
@@ -1766,13 +2976,13 @@ class SessionDB:
         session_id: str,
         *,
         source: str,
-        user_id: str = None,
-        session_key: str = None,
-        chat_id: str = None,
-        chat_type: str = None,
-        thread_id: str = None,
-        display_name: str = None,
-        origin_json: str = None,
+        user_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        display_name: Optional[str] = None,
+        origin_json: Optional[str] = None,
     ) -> None:
         """Persist the gateway routing peer for an existing session row.
 
@@ -2031,10 +3241,14 @@ class SessionDB:
                     entry.get("session_key") or key,
                     (origin or {}).get("chat_id") if isinstance(origin, dict) else None,
                     entry.get("chat_type"),
-                    (origin or {}).get("thread_id") if isinstance(origin, dict) else None,
+                    (origin or {}).get("thread_id")
+                    if isinstance(origin, dict)
+                    else None,
                     entry.get("display_name"),
                     json.dumps(origin) if isinstance(origin, dict) else None,
-                    1 if entry.get("expiry_finalized") or entry.get("memory_flushed") else 0,
+                    1
+                    if entry.get("expiry_finalized") or entry.get("memory_flushed")
+                    else 0,
                     str(session_id),
                 ),
             )
@@ -2113,25 +3327,33 @@ class SessionDB:
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
         """
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
             )
+
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
             )
+
         self._execute_write(_do)
 
     def update_session_cwd(
-        self, session_id: str, cwd: str, git_branch: str = None, git_repo_root: str = None
+        self,
+        session_id: str,
+        cwd: str,
+        git_branch: Optional[str] = None,
+        git_repo_root: Optional[str] = None,
     ) -> None:
         """Persist the session working directory when a frontend knows it.
 
@@ -2211,7 +3433,8 @@ class SessionDB:
         except sqlite3.Error as exc:
             logger.warning(
                 "record_compression_failure_cooldown(%s) failed: %s",
-                session_id, exc,
+                session_id,
+                exc,
             )
 
     def get_compression_failure_cooldown(
@@ -2241,9 +3464,7 @@ class SessionDB:
         if cooldown_until <= now:
             return None
         error = (
-            row["compression_failure_error"]
-            if isinstance(row, sqlite3.Row)
-            else row[1]
+            row["compression_failure_error"] if isinstance(row, sqlite3.Row) else row[1]
         )
         return {
             "cooldown_until": cooldown_until,
@@ -2268,8 +3489,10 @@ class SessionDB:
         except sqlite3.Error as exc:
             logger.warning(
                 "clear_compression_failure_cooldown(%s) failed: %s",
-                session_id, exc,
+                session_id,
+                exc,
             )
+
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────
@@ -2316,7 +3539,8 @@ class SessionDB:
         except sqlite3.Error as exc:
             logger.warning(
                 "refresh_compression_lock(%s) failed: %s",
-                session_id, exc,
+                session_id,
+                exc,
             )
             return False
 
@@ -2351,8 +3575,7 @@ class SessionDB:
         def _do(conn):
             # First: reclaim any expired lock for this session_id.
             conn.execute(
-                "DELETE FROM compression_locks "
-                "WHERE session_id = ? AND expires_at < ?",
+                "DELETE FROM compression_locks WHERE session_id = ? AND expires_at < ?",
                 (session_id, now),
             )
             # Then: try to insert. INSERT OR IGNORE returns no rowcount
@@ -2367,16 +3590,19 @@ class SessionDB:
                 "SELECT holder FROM compression_locks WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            return row is not None and (
-                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
-            ) == holder
+            return (
+                row is not None
+                and (row["holder"] if isinstance(row, sqlite3.Row) else row[0])
+                == holder
+            )
 
         try:
             return bool(self._execute_write(_do))
         except sqlite3.Error as exc:
             logger.warning(
                 "try_acquire_compression_lock(%s) failed: %s",
-                session_id, exc,
+                session_id,
+                exc,
             )
             # Fail open: returning False makes the caller skip compression,
             # which is the safe behaviour when the lock subsystem is broken.
@@ -2395,8 +3621,7 @@ class SessionDB:
 
         def _do(conn):
             conn.execute(
-                "DELETE FROM compression_locks "
-                "WHERE session_id = ? AND holder = ?",
+                "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?",
                 (session_id, holder),
             )
 
@@ -2405,7 +3630,8 @@ class SessionDB:
         except sqlite3.Error as exc:
             logger.warning(
                 "release_compression_lock(%s) failed: %s",
-                session_id, exc,
+                session_id,
+                exc,
             )
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
@@ -2437,20 +3663,24 @@ class SessionDB:
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
         """
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
                 (model_config_json, model, session_id),
             )
+
         self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
                 (system_prompt, session_id),
             )
+
         self._execute_write(_do)
 
     def update_session_model(self, session_id: str, model: str) -> None:
@@ -2460,11 +3690,13 @@ class SessionDB:
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
         """
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model = ? WHERE id = ?",
                 (model, session_id),
             )
+
         self._execute_write(_do)
 
     def update_session_billing_route(
@@ -2485,6 +3717,7 @@ class SessionDB:
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
         behavior of ``update_session_model`` (see #48173, #48248).
         """
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions SET
@@ -2495,6 +3728,7 @@ class SessionDB:
                    WHERE id = ?""",
                 (provider, base_url, billing_mode, session_id),
             )
+
         self._execute_write(_do)
 
     def update_token_counts(
@@ -2502,7 +3736,7 @@ class SessionDB:
         session_id: str,
         input_tokens: int = 0,
         output_tokens: int = 0,
-        model: str = None,
+        model: Optional[str] = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
@@ -2592,15 +3826,17 @@ class SessionDB:
             api_call_count,
             session_id,
         )
+
         def _do(conn):
             conn.execute(sql, params)
+
         self._execute_write(_do)
 
     def ensure_session(
         self,
         session_id: str,
         source: str = "unknown",
-        model: str = None,
+        model: Optional[str] = None,
         **kwargs,
     ) -> str:
         """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
@@ -2612,7 +3848,8 @@ class SessionDB:
         cutoff = time.time() - 86400  # Only sessions older than 24 hours
 
         def _do(conn):
-            rows = conn.execute("""
+            rows = conn.execute(
+                """
                 SELECT id FROM sessions
                 WHERE source = 'tui'
                   AND title IS NULL
@@ -2621,13 +3858,13 @@ class SessionDB:
                   AND NOT EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                   )
-            """, (cutoff,)).fetchall()
+            """,
+                (cutoff,),
+            ).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
                 placeholders = ",".join("?" * len(ids))
-                conn.execute(
-                    f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
-                )
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({placeholders})", ids)
             return ids
 
         removed_ids = self._execute_write(_do) or []
@@ -2685,6 +3922,34 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    def get_inheritable_local_child_cwd(
+        self, parent_session_id: str, child_source: str
+    ) -> Optional[str]:
+        """Return an exact persisted cwd safe to copy to a local child.
+
+        This is deliberately a narrow metadata copy, not cwd discovery. The
+        requested parent identity, returned row identity, and local source must
+        all agree. Missing, remote, relative, or malformed values stay absent.
+        """
+        if (
+            not isinstance(parent_session_id, str)
+            or not parent_session_id
+            or not isinstance(child_source, str)
+            or child_source not in _LOCAL_PERSISTED_CWD_SOURCES
+        ):
+            return None
+        parent = self.get_session(parent_session_id)
+        if (
+            not parent
+            or parent.get("id") != parent_session_id
+            or parent.get("source") != child_source
+        ):
+            return None
+        cwd = parent.get("cwd")
+        if not _is_canonical_absolute_cwd(cwd, platform=_NATIVE_CWD_PLATFORM):
+            return None
+        return cwd
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -2735,19 +4000,20 @@ class SessionDB:
         # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
         # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
         # normalized to spaces by the whitespace collapsing step below
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", title)
 
         # Remove problematic Unicode control characters:
         # - Zero-width chars (U+200B-U+200F, U+FEFF)
         # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
         # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
         cleaned = re.sub(
-            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
-            '', cleaned,
+            r"[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]",
+            "",
+            cleaned,
         )
 
         # Collapse internal whitespace runs and strip
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         if not cleaned:
             return None
@@ -2804,13 +4070,14 @@ class SessionDB:
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
         """
-        title = self.sanitize_title(title)
+        normalized_title = self.sanitize_title(title)
+
         def _do(conn):
-            if title:
+            if normalized_title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
                     "SELECT id FROM sessions WHERE title = ? AND id != ?",
-                    (title, session_id),
+                    (normalized_title, session_id),
                 )
                 conflict = cursor.fetchone()
                 if conflict:
@@ -2835,13 +4102,14 @@ class SessionDB:
                         )
                     else:
                         raise ValueError(
-                            f"Title '{title}' is already in use by session {conflict_id}"
+                            f"Title '{normalized_title}' is already in use by session {conflict_id}"
                         )
             cursor = conn.execute(
                 "UPDATE sessions SET title = ? WHERE id = ?",
-                (title, session_id),
+                (normalized_title, session_id),
             )
             return cursor.rowcount
+
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -2864,6 +4132,7 @@ class SessionDB:
         displayed tip lets the still-unarchived root resurrect it on refresh.
         Returns True when at least one row was updated.
         """
+
         def _do(conn):
             cursor = conn.execute(
                 """
@@ -2901,6 +4170,7 @@ class SessionDB:
             if rowcount is None or rowcount < 0:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
             return rowcount
+
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
@@ -2949,7 +4219,7 @@ class SessionDB:
         the highest existing number and increments.
         """
         # Strip existing #N suffix to find the true base
-        match = re.match(r'^(.*?) #(\d+)$', base_title)
+        match = re.match(r"^(.*?) #(\d+)$", base_title)
         if match:
             base = match.group(1)
         else:
@@ -2971,7 +4241,7 @@ class SessionDB:
         # Find the highest number
         max_num = 1  # The unnumbered original counts as #1
         for t in existing:
-            m = re.match(r'^.* #(\d+)$', t)
+            m = re.match(r"^.* #(\d+)$", t)
             if m:
                 max_num = max(max_num, int(m.group(1)))
 
@@ -3040,7 +4310,9 @@ class SessionDB:
             current = child_id
         return current
 
-    def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+    def distinct_session_cwds(
+        self, include_archived: bool = False
+    ) -> List[Dict[str, Any]]:
         """Distinct non-empty session cwds with usage stats, for repo discovery.
 
         Aggregates across ALL session history (not a single page), so the desktop
@@ -3068,9 +4340,9 @@ class SessionDB:
 
     def list_sessions_rich(
         self,
-        source: str = None,
-        exclude_sources: List[str] = None,
-        cwd_prefix: str = None,
+        source: Optional[str] = None,
+        exclude_sources: Optional[List[str]] = None,
+        cwd_prefix: Optional[str] = None,
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
@@ -3079,8 +4351,8 @@ class SessionDB:
         order_by_last_active: bool = False,
         include_archived: bool = False,
         archived_only: bool = False,
-        id_query: str = None,
-        search_query: str = None,
+        id_query: Optional[str] = None,
+        search_query: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3326,7 +4598,7 @@ class SessionDB:
                     projected.append(s)
                     continue
                 tip_id = self.get_compression_tip(s["id"])
-                if tip_id == s["id"]:
+                if tip_id is None or tip_id == s["id"]:
                     projected.append(s)
                     continue
                 tip_row = self._get_session_rich_row(tip_id)
@@ -3337,9 +4609,19 @@ class SessionDB:
                 # surface the tip's identity and activity data.
                 merged = dict(s)
                 for key in (
-                    "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "preview",
-                    "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+                    "id",
+                    "ended_at",
+                    "end_reason",
+                    "message_count",
+                    "tool_call_count",
+                    "title",
+                    "last_active",
+                    "preview",
+                    "model",
+                    "system_prompt",
+                    "cwd",
+                    "git_branch",
+                    "git_repo_root",
                 ):
                     if key in tip_row:
                         merged[key] = tip_row[key]
@@ -3487,7 +4769,7 @@ class SessionDB:
         """Reverse :meth:`_encode_content`; returns scalars unchanged."""
         if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
             try:
-                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
+                return json.loads(content[len(cls._CONTENT_JSON_PREFIX) :])
             except (json.JSONDecodeError, TypeError):
                 logger.warning(
                     "Failed to decode JSON-encoded message content; "
@@ -3500,18 +4782,18 @@ class SessionDB:
         self,
         session_id: str,
         role: str,
-        content: str = None,
-        tool_name: str = None,
+        content: Optional[str] = None,
+        tool_name: Optional[str] = None,
         tool_calls: Any = None,
-        tool_call_id: str = None,
-        token_count: int = None,
-        finish_reason: str = None,
-        reasoning: str = None,
-        reasoning_content: str = None,
+        tool_call_id: Optional[str] = None,
+        token_count: Optional[int] = None,
+        finish_reason: Optional[str] = None,
+        reasoning: Optional[str] = None,
+        reasoning_content: Optional[str] = None,
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
-        platform_message_id: str = None,
+        platform_message_id: Optional[str] = None,
         observed: bool = False,
         timestamp: Any = None,
     ) -> int:
@@ -3529,16 +4811,13 @@ class SessionDB:
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
+            json.dumps(reasoning_details) if reasoning_details else None
         )
         codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
+            json.dumps(codex_reasoning_items) if codex_reasoning_items else None
         )
         codex_message_items_json = (
-            json.dumps(codex_message_items)
-            if codex_message_items else None
+            json.dumps(codex_message_items) if codex_message_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
@@ -3553,7 +4832,9 @@ class SessionDB:
                 else:
                     message_timestamp = float(timestamp)
             except (TypeError, ValueError):
-                logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
+                logger.debug(
+                    "Ignoring invalid explicit message timestamp: %r", timestamp
+                )
 
         # Pre-compute tool call count
         num_tool_calls = 0
@@ -3605,32 +4886,42 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows_with_ids(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[list[int], int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
+        ``(inserted_ids, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
         now_ts = time.time()
-        inserted = 0
+        inserted_ids: list[int] = []
         tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
             message_timestamp = now_ts
-            if msg.get("timestamp") is not None:
+            ts_value = msg.get("timestamp")
+            if ts_value is not None:
                 try:
-                    ts_value = msg.get("timestamp")
                     if hasattr(ts_value, "timestamp"):
                         message_timestamp = float(ts_value.timestamp())
                     else:
                         message_timestamp = float(ts_value)
                 except (TypeError, ValueError):
-                    logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
-            reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
+                    logger.debug(
+                        "Ignoring invalid explicit message timestamp: %r",
+                        msg.get("timestamp"),
+                    )
+            reasoning_details = (
+                msg.get("reasoning_details") if role == "assistant" else None
+            )
             codex_reasoning_items = (
                 msg.get("codex_reasoning_items") if role == "assistant" else None
             )
@@ -3649,11 +4940,9 @@ class SessionDB:
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
-            platform_msg_id = (
-                msg.get("platform_message_id") or msg.get("message_id")
-            )
+            platform_msg_id = msg.get("platform_message_id") or msg.get("message_id")
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -3679,13 +4968,25 @@ class SessionDB:
                     1,
                 ),
             )
-            inserted += 1
+            inserted_ids.append(cursor.lastrowid)
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
-        return inserted, tool_calls_total
+        return inserted_ids, tool_calls_total
+
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Compatibility wrapper returning counts for existing callers."""
+        inserted_ids, tool_calls_total = self._insert_message_rows_with_ids(
+            conn, session_id, messages
+        )
+        return len(inserted_ids), tool_calls_total
 
     def replace_messages(
         self,
@@ -3801,7 +5102,6 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-
     def get_messages(
         self, session_id: str, include_inactive: bool = False
     ) -> List[Dict[str, Any]]:
@@ -3832,7 +5132,9 @@ class SessionDB:
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_messages, falling back to []"
+                    )
                     msg["tool_calls"] = []
             result.append(msg)
         return result
@@ -3971,7 +5273,8 @@ class SessionDB:
         if keep_roles is not None:
             keep_set = set(keep_roles)
             filtered_window = [
-                m for m in window_rows
+                m
+                for m in window_rows
                 if m.get("id") == around_message_id or m.get("role") in keep_set
             ]
         else:
@@ -4116,7 +5419,9 @@ class SessionDB:
                     return session_id
                 if child_row is None:
                     break
-                child_id = child_row["id"] if hasattr(child_row, "keys") else child_row[0]
+                child_id = (
+                    child_row["id"] if hasattr(child_row, "keys") else child_row[0]
+                )
                 if not child_id or child_id in seen:
                     break
                 seen.add(child_id)
@@ -4178,7 +5483,9 @@ class SessionDB:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
+                    logger.warning(
+                        "Failed to deserialize tool_calls in conversation replay, falling back to []"
+                    )
                     msg["tool_calls"] = []
             # Surface the platform-side message id (e.g. yuanbao msg_id,
             # telegram update_id) so platform-specific flows like recall
@@ -4203,21 +5510,33 @@ class SessionDB:
                     try:
                         msg["reasoning_details"] = json.loads(row["reasoning_details"])
                     except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
+                        logger.warning(
+                            "Failed to deserialize reasoning_details, falling back to None"
+                        )
                         msg["reasoning_details"] = None
                 if row["codex_reasoning_items"]:
                     try:
-                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
+                        msg["codex_reasoning_items"] = json.loads(
+                            row["codex_reasoning_items"]
+                        )
                     except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
+                        logger.warning(
+                            "Failed to deserialize codex_reasoning_items, falling back to None"
+                        )
                         msg["codex_reasoning_items"] = None
                 if row["codex_message_items"]:
                     try:
-                        msg["codex_message_items"] = json.loads(row["codex_message_items"])
+                        msg["codex_message_items"] = json.loads(
+                            row["codex_message_items"]
+                        )
                     except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_message_items, falling back to None")
+                        logger.warning(
+                            "Failed to deserialize codex_message_items, falling back to None"
+                        )
                         msg["codex_message_items"] = None
-            if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
+            if include_ancestors and self._is_duplicate_replayed_user_message(
+                messages, msg
+            ):
                 continue
             messages.append(msg)
         # DEFENSE-IN-DEPTH against background-review session pollution: a forked
@@ -4256,7 +5575,9 @@ class SessionDB:
         return list(reversed(chain)) or [session_id]
 
     @staticmethod
-    def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
+    def _is_duplicate_replayed_user_message(
+        messages: List[Dict[str, Any]], msg: Dict[str, Any]
+    ) -> bool:
         if msg.get("role") != "user":
             return False
         content = msg.get("content")
@@ -4265,7 +5586,9 @@ class SessionDB:
         for prev in reversed(messages):
             if prev.get("role") == "user" and prev.get("content") == content:
                 return True
-            if prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
+            if prev.get("role") == "assistant" and (
+                prev.get("content") or prev.get("tool_calls")
+            ):
                 return False
         return False
 
@@ -4367,6 +5690,7 @@ class SessionDB:
         Intended for undo-of-rewind and test cleanup; not wired to a
         slash command in v1.
         """
+
         def _do(conn):
             cursor = conn.execute(
                 "SELECT id FROM messages "
@@ -4416,7 +5740,8 @@ class SessionDB:
             if isinstance(decoded, list):
                 # Multimodal — flatten text parts.
                 text_parts = [
-                    p.get("text", "") for p in decoded
+                    p.get("text", "")
+                    for p in decoded
                     if isinstance(p, dict) and p.get("type") == "text"
                 ]
                 preview = " ".join(t for t in text_parts if t).strip()
@@ -4429,13 +5754,11 @@ class SessionDB:
             preview = " ".join(preview.split())  # collapse whitespace
             if len(preview) > 80:
                 preview = preview[:77] + "..."
-            result.append(
-                {
-                    "id": row["id"],
-                    "timestamp": row["timestamp"],
-                    "preview": preview,
-                }
-            )
+            result.append({
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "preview": preview,
+            })
         return result
 
     # =========================================================================
@@ -4484,7 +5807,7 @@ class SessionDB:
                 pieces.append(" ")
                 i += 1
                 continue
-            _quoted_parts.append(query[i:end + 1])
+            _quoted_parts.append(query[i : end + 1])
             pieces.append(f"\x00Q{len(_quoted_parts) - 1}\x00")
             i = end + 1
 
@@ -4495,7 +5818,7 @@ class SessionDB:
         # single ``content`` column, an unquoted colon query like ``TODO: fix``
         # parses as ``column:term`` and raises "no such column" — swallowed at
         # the execute site into zero results.  Strip it like the others.
-        sanitized = re.sub(r'[+{}():\"^]', " ", sanitized)
+        sanitized = re.sub(r"[+{}():\"^]", " ", sanitized)
 
         # Step 3: Collapse repeated * (e.g. "***") into a single one,
         # and remove leading * (prefix-only needs at least one char before *)
@@ -4521,29 +5844,32 @@ class SessionDB:
 
         return sanitized.strip()
 
-
     @staticmethod
     def _is_cjk_codepoint(cp: int) -> bool:
-        return (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
-                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
-                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
-                0x3000 <= cp <= 0x303F or    # CJK Symbols
-                0x3040 <= cp <= 0x309F or    # Hiragana
-                0x30A0 <= cp <= 0x30FF or    # Katakana
-                0xAC00 <= cp <= 0xD7AF)      # Hangul Syllables
+        return (
+            0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+            or 0x3400 <= cp <= 0x4DBF  # CJK Extension A
+            or 0x20000 <= cp <= 0x2A6DF  # CJK Extension B
+            or 0x3000 <= cp <= 0x303F  # CJK Symbols
+            or 0x3040 <= cp <= 0x309F  # Hiragana
+            or 0x30A0 <= cp <= 0x30FF  # Katakana
+            or 0xAC00 <= cp <= 0xD7AF
+        )  # Hangul Syllables
 
     @staticmethod
     def _contains_cjk(text: str) -> bool:
         """Check if text contains CJK (Chinese, Japanese, Korean) characters."""
         for ch in text:
             cp = ord(ch)
-            if (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
-                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
-                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
-                0x3000 <= cp <= 0x303F or    # CJK Symbols
-                0x3040 <= cp <= 0x309F or    # Hiragana
-                0x30A0 <= cp <= 0x30FF or    # Katakana
-                0xAC00 <= cp <= 0xD7AF):     # Hangul Syllables
+            if (
+                0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+                or 0x3400 <= cp <= 0x4DBF  # CJK Extension A
+                or 0x20000 <= cp <= 0x2A6DF  # CJK Extension B
+                or 0x3000 <= cp <= 0x303F  # CJK Symbols
+                or 0x3040 <= cp <= 0x309F  # Hiragana
+                or 0x30A0 <= cp <= 0x30FF  # Katakana
+                or 0xAC00 <= cp <= 0xD7AF
+            ):  # Hangul Syllables
                 return True
         return False
 
@@ -4555,12 +5881,12 @@ class SessionDB:
     def search_messages(
         self,
         query: str,
-        source_filter: List[str] = None,
-        exclude_sources: List[str] = None,
-        role_filter: List[str] = None,
+        source_filter: Optional[List[str]] = None,
+        exclude_sources: Optional[List[str]] = None,
+        role_filter: Optional[List[str]] = None,
         limit: int = 20,
         offset: int = 0,
-        sort: str = None,
+        sort: Optional[str] = None,
         include_inactive: bool = False,
     ) -> List[Dict[str, Any]]:
         """
@@ -4686,12 +6012,11 @@ class SessionDB:
             # (>=3) but each individual token is only 2 chars — trigram returns 0.
             # Route to LIKE when any non-operator CJK token is <3 CJK chars.
             _tokens_for_check = [
-                t for t in raw_query.split()
+                t
+                for t in raw_query.split()
                 if t.upper() not in {"AND", "OR", "NOT"} and self._contains_cjk(t)
             ]
-            _any_short_cjk = any(
-                self._count_cjk(t) < 3 for t in _tokens_for_check
-            )
+            _any_short_cjk = any(self._count_cjk(t) < 3 for t in _tokens_for_check)
 
             _trigram_succeeded = False
             if cjk_count >= 3 and not _any_short_cjk and self._trigram_available:
@@ -4711,13 +6036,19 @@ class SessionDB:
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
                 if source_filter is not None:
-                    tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                    tri_where.append(
+                        f"s.source IN ({','.join('?' for _ in source_filter)})"
+                    )
                     tri_params.extend(source_filter)
                 if exclude_sources is not None:
-                    tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                    tri_where.append(
+                        f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})"
+                    )
                     tri_params.extend(exclude_sources)
                 if role_filter:
-                    tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                    tri_where.append(
+                        f"m.role IN ({','.join('?' for _ in role_filter)})"
+                    )
                     tri_params.extend(role_filter)
                 tri_sql = f"""
                     SELECT
@@ -4734,7 +6065,7 @@ class SessionDB:
                     FROM messages_fts_trigram
                     JOIN messages m ON m.id = messages_fts_trigram.rowid
                     JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(tri_where)}
+                    WHERE {" AND ".join(tri_where)}
                     {order_by_sql}
                     LIMIT ? OFFSET ?
                 """
@@ -4755,26 +6086,38 @@ class SessionDB:
                 # build one LIKE condition per non-operator token so each term
                 # is matched independently (#20494).
                 non_op_tokens = [
-                    t for t in raw_query.split()
+                    t
+                    for t in raw_query.split()
                     if t.upper() not in {"AND", "OR", "NOT"}
                 ] or [raw_query]
                 token_clauses = []
                 like_params: list = []
                 for tok in non_op_tokens:
-                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    esc = (
+                        tok
+                        .replace("\\", "\\\\")
+                        .replace("%", "\\%")
+                        .replace("_", "\\_")
+                    )
                     token_clauses.append(
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
                 like_where = [f"({' OR '.join(token_clauses)})"]
                 if source_filter is not None:
-                    like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                    like_where.append(
+                        f"s.source IN ({','.join('?' for _ in source_filter)})"
+                    )
                     like_params.extend(source_filter)
                 if exclude_sources is not None:
-                    like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                    like_where.append(
+                        f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})"
+                    )
                     like_params.extend(exclude_sources)
                 if role_filter:
-                    like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                    like_where.append(
+                        f"m.role IN ({','.join('?' for _ in role_filter)})"
+                    )
                     like_params.extend(role_filter)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
@@ -4785,7 +6128,7 @@ class SessionDB:
                            s.source, s.model, s.started_at AS session_started
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(like_where)}
+                    WHERE {" AND ".join(like_where)}
                     ORDER BY m.timestamp DESC
                     LIMIT ? OFFSET ?
                 """
@@ -4851,7 +6194,8 @@ class SessionDB:
                         # summary for search previews.
                         if isinstance(decoded, list):
                             text_parts = [
-                                p.get("text", "") for p in decoded
+                                p.get("text", "")
+                                for p in decoded
                                 if isinstance(p, dict) and p.get("type") == "text"
                             ]
                             text = " ".join(t for t in text_parts if t).strip()
@@ -4860,9 +6204,10 @@ class SessionDB:
                             preview = decoded
                         else:
                             preview = ""
-                        context_msgs.append(
-                            {"role": r["role"], "content": preview[:200]}
-                        )
+                        context_msgs.append({
+                            "role": r["role"],
+                            "content": preview[:200],
+                        })
                 match["context"] = context_msgs
             except Exception:
                 match["context"] = []
@@ -4922,7 +6267,7 @@ class SessionDB:
 
     def search_sessions(
         self,
-        source: str = None,
+        source: Optional[str] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -4962,13 +6307,13 @@ class SessionDB:
 
     def session_count(
         self,
-        source: str = None,
-        cwd_prefix: str = None,
+        source: Optional[str] = None,
+        cwd_prefix: Optional[str] = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
         exclude_children: bool = False,
-        exclude_sources: List[str] = None,
+        exclude_sources: Optional[List[str]] = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -5015,10 +6360,12 @@ class SessionDB:
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
         with self._lock:
-            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
+            cursor = self._conn.execute(
+                f"SELECT COUNT(*) FROM sessions s{where_sql}", params
+            )
             return cursor.fetchone()[0]
 
-    def message_count(self, session_id: str = None) -> int:
+    def message_count(self, session_id: Optional[str] = None) -> int:
         """Count messages, optionally for a specific session."""
         with self._lock:
             if session_id:
@@ -5134,10 +6481,12 @@ class SessionDB:
         base["segments"] = segments
         base["lineage_session_ids"] = [seg["id"] for seg in segments]
         base["message_count"] = total_messages
-        base["messages"] = [msg for seg in segments for msg in (seg.get("messages") or [])]
+        base["messages"] = [
+            msg for seg in segments for msg in (seg.get("messages") or [])
+        ]
         return base
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(self, source: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
@@ -5151,14 +6500,14 @@ class SessionDB:
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
+
         def _do(conn):
-            conn.execute(
-                "DELETE FROM messages WHERE session_id = ?", (session_id,)
-            )
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+
         self._execute_write(_do)
 
     @staticmethod
@@ -5248,6 +6597,7 @@ class SessionDB:
         spawned work is not "empty" even if its own transcript never
         flushed. Returns True if the session was deleted.
         """
+
         def _do(conn):
             cursor = conn.execute(
                 """
@@ -5434,9 +6784,7 @@ class SessionDB:
                 # these rows have ``message_count = 0`` — but if a
                 # bookkeeping bug ever lets the counter drift below the
                 # real row count, we still leave a clean FK state.
-                conn.execute(
-                    "DELETE FROM messages WHERE session_id = ?", (sid,)
-                )
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
@@ -5545,14 +6893,10 @@ class SessionDB:
             )
             params.append(max_tokens)
         if min_cost is not None:
-            clauses.append(
-                "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0) >= ?"
-            )
+            clauses.append("COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0) >= ?")
             params.append(min_cost)
         if max_cost is not None:
-            clauses.append(
-                "COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0) <= ?"
-            )
+            clauses.append("COALESCE(s.actual_cost_usd, s.estimated_cost_usd, 0) <= ?")
             params.append(max_cost)
         if min_tool_calls is not None:
             clauses.append("COALESCE(s.tool_call_count, 0) >= ?")
@@ -5569,7 +6913,7 @@ class SessionDB:
     def list_prune_candidates(
         self,
         older_than_days: Optional[float] = None,
-        source: str = None,
+        source: Optional[str] = None,
         **filters,
     ) -> List[Dict[str, Any]]:
         """Return the sessions a matching :meth:`prune_sessions` /
@@ -5597,7 +6941,7 @@ class SessionDB:
     def archive_sessions(
         self,
         older_than_days: Optional[float] = None,
-        source: str = None,
+        source: Optional[str] = None,
         **filters,
     ) -> int:
         """Bulk-archive (soft-hide) every session matching the filters.
@@ -5623,7 +6967,7 @@ class SessionDB:
     def prune_sessions(
         self,
         older_than_days: Optional[float] = 90,
-        source: str = None,
+        source: Optional[str] = None,
         sessions_dir: Optional[Path] = None,
         max_batch: Optional[int] = None,
         **filters,
@@ -5725,12 +7069,14 @@ class SessionDB:
 
     def set_meta(self, key: str, value: str) -> None:
         """Write a value to the state_meta key/value store."""
+
         def _do(conn):
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
         self._execute_write(_do)
 
     def apply_telegram_topic_migration(self) -> None:
@@ -5746,6 +7092,7 @@ class SessionDB:
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
         """
+
         def _do(conn):
             conn.executescript(
                 """
@@ -5789,7 +7136,9 @@ class SessionDB:
                 "SELECT value FROM state_meta WHERE key = ?",
                 ("telegram_dm_topic_schema_version",),
             ).fetchone()
-            current_version = int(current[0]) if current and str(current[0]).isdigit() else 0
+            current_version = (
+                int(current[0]) if current and str(current[0]).isdigit() else 0
+            )
             if current_version < 2:
                 fk_rows = conn.execute(
                     "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
@@ -5831,6 +7180,7 @@ class SessionDB:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 ("telegram_dm_topic_schema_version", "2"),
             )
+
         self._execute_write(_do)
 
     def enable_telegram_topic_mode(
@@ -5880,6 +7230,7 @@ class SessionDB:
                     now,
                 ),
             )
+
         self._execute_write(_do)
 
     def disable_telegram_topic_mode(
@@ -5898,6 +7249,7 @@ class SessionDB:
         Never creates the topic-mode tables from scratch; if they don't
         exist there is nothing to disable and the call is a no-op.
         """
+
         def _do(conn):
             try:
                 conn.execute(
@@ -5913,6 +7265,7 @@ class SessionDB:
             except sqlite3.OperationalError:
                 # Tables don't exist yet — nothing to disable.
                 return
+
         self._execute_write(_do)
 
     def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
@@ -6108,10 +7461,20 @@ class SessionDB:
                 (session_id,),
             ).fetchone()
             if existing_session is not None:
-                linked_chat = existing_session["chat_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[0]
-                linked_thread = existing_session["thread_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[1]
+                linked_chat = (
+                    existing_session["chat_id"]
+                    if isinstance(existing_session, sqlite3.Row)
+                    else existing_session[0]
+                )
+                linked_thread = (
+                    existing_session["thread_id"]
+                    if isinstance(existing_session, sqlite3.Row)
+                    else existing_session[1]
+                )
                 if str(linked_chat) != chat_id or str(linked_thread) != thread_id:
-                    raise ValueError("session is already linked to another Telegram topic")
+                    raise ValueError(
+                        "session is already linked to another Telegram topic"
+                    )
 
             conn.execute(
                 """
@@ -6137,6 +7500,7 @@ class SessionDB:
                     now,
                 ),
             )
+
         self._execute_write(_do)
 
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
@@ -6233,7 +7597,9 @@ class SessionDB:
         for row in rows:
             session = dict(row)
             raw = str(session.pop("_preview_raw", "") or "").strip()
-            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            session["preview"] = (
+                raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            )
             sessions.append(session)
         return sessions
 
@@ -6281,14 +7647,10 @@ class SessionDB:
                 try:
                     # The column name in the INSERT must match the table name
                     # for FTS5 special commands.
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}) VALUES('optimize')"
-                    )
+                    self._conn.execute(f"INSERT INTO {tbl}({tbl}) VALUES('optimize')")
                     optimized += 1
                 except sqlite3.OperationalError as exc:
-                    logger.warning(
-                        "FTS optimize failed for %s: %s", tbl, exc
-                    )
+                    logger.warning("FTS optimize failed for %s: %s", tbl, exc)
         return optimized
 
     def vacuum(self) -> int:
@@ -6425,6 +7787,7 @@ class SessionDB:
         Returns True if the row was found and not already in flight; False if
         the session is already in a non-terminal handoff state.
         """
+
         def _do(conn):
             cur = conn.execute(
                 "UPDATE sessions "
@@ -6436,6 +7799,7 @@ class SessionDB:
                 (platform, session_id),
             )
             return cur.rowcount > 0
+
         return self._execute_write(_do)
 
     def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -6478,6 +7842,7 @@ class SessionDB:
 
     def claim_handoff(self, session_id: str) -> bool:
         """Atomically transition pending → running. Returns True if claimed."""
+
         def _do(conn):
             cur = conn.execute(
                 "UPDATE sessions SET handoff_state = 'running' "
@@ -6485,26 +7850,31 @@ class SessionDB:
                 (session_id,),
             )
             return cur.rowcount > 0
+
         return self._execute_write(_do)
 
     def complete_handoff(self, session_id: str) -> None:
         """Mark a handoff as completed."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'completed', "
                 "handoff_error = NULL WHERE id = ?",
                 (session_id,),
             )
+
         self._execute_write(_do)
 
     def fail_handoff(self, session_id: str, error: str) -> None:
         """Mark a handoff as failed and record the reason."""
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET handoff_state = 'failed', "
                 "handoff_error = ? WHERE id = ?",
                 (error[:500], session_id),
             )
+
         self._execute_write(_do)
 
 

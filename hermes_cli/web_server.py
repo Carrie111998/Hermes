@@ -3891,6 +3891,60 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+def _add_bridge_metadata_to_sessions(
+    db: Any,
+    sessions: List[Dict[str, Any]],
+) -> None:
+    """Best-effort bridge metadata enrichment for session catalog rows."""
+    catalog_fields = {
+        "bridge_provider",
+        "bridge_native_id",
+        "bridge_origin_kind",
+        "bridge_mirror_state",
+        "bridge_sync_error",
+        "bridge_stale",
+        "bridge_id",
+        "bridge_sidebar_state",
+        "bridge_sidebar_codex_thread_id",
+        "bridge_sidebar_error",
+        "bridge_sidebar_stale",
+    }
+    session_ids = [
+        session_id
+        for session in sessions
+        if isinstance((session_id := session.get("id")), str)
+    ]
+    if not session_ids:
+        return
+
+    try:
+        from session_bridge.store import SessionBridgeStore
+
+        summaries = SessionBridgeStore(db).get_bridge_summaries(session_ids)
+    except Exception:
+        # Catalog responses must remain usable if bridge metadata is unavailable.
+        # Do not include exception details: native transcript paths can be secret.
+        _log.warning("Session bridge metadata unavailable for session catalog")
+        return
+
+    for session in sessions:
+        session_id = session.get("id")
+        if not isinstance(session_id, str):
+            continue
+        summary = summaries.get(session_id)
+        if summary is not None:
+            public_summary = {
+                key: value
+                for key, value in summary.items()
+                if key in catalog_fields
+            }
+            if public_summary.get("bridge_sync_error") is not None:
+                public_summary["bridge_sync_error"] = "sync_degraded"
+            if public_summary.get("bridge_sidebar_error") is not None:
+                public_summary["bridge_sidebar_error"] = "delivery_degraded"
+            session.update(public_summary)
+
+
 @app.get("/api/sessions")
 async def get_sessions(
     limit: int = 20,
@@ -3970,6 +4024,7 @@ async def get_sessions(
                     s["is_default_profile"] = profile_name == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
+            _add_bridge_metadata_to_sessions(db, sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
@@ -4062,6 +4117,7 @@ def get_profiles_sessions(
                 archived_only=archived_only,
                 order_by_last_active=order == "recent",
             )
+            _add_bridge_metadata_to_sessions(db, rows)
             profile_total = db.session_count(
                 source=source_filter,
                 exclude_sources=exclude_list or None,

@@ -58,6 +58,35 @@ describe('sessionMatchesSearch', () => {
     expect(sessionMatchesSearch(makeSession({ source: 'whatsapp' }), 'wa')).toBe(true)
     expect(sessionMatchesSearch(makeSession({ source: 'slack' }), 'slack')).toBe(true)
     expect(sessionMatchesSearch(makeSession({ source: 'bluebubbles' }), 'imessage')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ source: 'claude' }), 'anthropic')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ source: 'claude' }), 'claude code')).toBe(true)
+  })
+
+  it('matches unified sessions by bridge provider name', () => {
+    expect(sessionMatchesSearch(makeSession({ bridge_provider: 'claude' }), 'Claude')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_provider: 'codex' }), 'Codex')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_provider: 'hermes' }), 'Hermes')).toBe(true)
+  })
+
+  it('matches unified sessions by human mirror-state label', () => {
+    expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'catalog_only' }), 'catalog only')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'continued' }), 'continued')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'diverged' }), 'diverged')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'failed' }), '失敗')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'queued' }), '已排队')).toBe(true)
+    expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'catalog_only' }), '僅目錄')).toBe(true)
+  })
+
+  it.each([
+    ['pending', 'pending'],
+    ['visible', 'visible'],
+    ['retrying', 'retrying'],
+    ['failed', 'failed']
+  ] as const)('matches %s Codex sidebar delivery status', (state, query) => {
+    const session = makeSession({ bridge_sidebar_state: state })
+
+    expect(sessionMatchesSearch(session, query)).toBe(true)
+    expect(sessionMatchesSearch(session, 'Codex sidebar')).toBe(true)
   })
 
   it('does not match unrelated queries', () => {
