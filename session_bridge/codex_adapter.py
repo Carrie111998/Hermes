@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -81,6 +82,8 @@ class CodexThreadSummary:
     preview: str | None = None
     native_path: str | None = None
     thread_source: str | None = None
+    trusted_origin_bridge_id: str | None = None
+    trusted_origins_checked: bool = field(default=False, compare=False, repr=False)
 
 
 class CodexInventoryProtocolError(ValueError):
@@ -438,6 +441,9 @@ class CodexSourceAdapter:
         *,
         marker_secret: bytes,
         monotonic=time.monotonic,
+        trusted_origins: Mapping[str, str]
+        | Callable[[], Mapping[str, str]]
+        | None = None,
     ) -> None:
         self._client = client
         self._marker_secret = marker_secret
@@ -447,6 +453,78 @@ class CodexSourceAdapter:
         self._experimental_search_enabled = False
         self._seen_inventory: dict[str, CodexThreadSummary] = {}
         self._inventory_cache: dict[str, CodexThreadSummary] = {}
+        if trusted_origins is None:
+            self._trusted_origins_resolver: Callable[[], Mapping[str, str]] = dict
+        elif isinstance(trusted_origins, Mapping):
+            snapshot = dict(trusted_origins)
+            self._trusted_origins_resolver = lambda: snapshot
+        elif callable(trusted_origins):
+            self._trusted_origins_resolver = trusted_origins
+        else:
+            raise TypeError("Codex trusted origins must be a mapping or callable")
+
+    def _load_trusted_origins(self) -> dict[str, str]:
+        value = self._trusted_origins_resolver()
+        if not isinstance(value, Mapping):
+            raise ValueError("Codex trusted origin resolver returned no mapping")
+        origins: dict[str, str] = {}
+        for native_id, bridge_id in value.items():
+            if (
+                not isinstance(native_id, str)
+                or not native_id
+                or native_id != native_id.strip()
+                or not isinstance(bridge_id, str)
+                or not bridge_id
+                or bridge_id != bridge_id.strip()
+            ):
+                raise ValueError("Codex trusted origin mapping is malformed")
+            origins[native_id] = bridge_id
+        return origins
+
+    def _with_trusted_origin(
+        self,
+        summary: CodexThreadSummary,
+        origins: Mapping[str, str],
+    ) -> CodexThreadSummary:
+        bridge_id = origins.get(summary.native_id)
+        if bridge_id == summary.trusted_origin_bridge_id and (
+            summary.trusted_origins_checked
+        ):
+            return summary
+        return replace(
+            summary,
+            trusted_origin_bridge_id=bridge_id,
+            trusted_origins_checked=True,
+        )
+
+    def _refresh_trusted_origins(
+        self, summaries: list[CodexThreadSummary]
+    ) -> list[CodexThreadSummary]:
+        origins = self._load_trusted_origins()
+        return [self._with_trusted_origin(summary, origins) for summary in summaries]
+
+    def _reconcile_trusted_origin(
+        self,
+        summary: CodexThreadSummary,
+        origin_kind: OriginKind,
+        origin_bridge_id: str | None,
+    ) -> tuple[OriginKind, str | None]:
+        trusted_bridge_id = summary.trusted_origin_bridge_id
+        if not summary.trusted_origins_checked:
+            resolved_bridge_id = self._load_trusted_origins().get(summary.native_id)
+            if (
+                trusted_bridge_id is not None
+                and resolved_bridge_id != trusted_bridge_id
+            ):
+                raise ValueError("Codex trusted origin mapping conflicts with summary")
+            trusted_bridge_id = resolved_bridge_id
+        if trusted_bridge_id is None:
+            return origin_kind, origin_bridge_id
+        if origin_kind is OriginKind.NATIVE:
+            return OriginKind.BRIDGE_PLACEHOLDER, trusted_bridge_id
+        if origin_bridge_id != trusted_bridge_id:
+            raise ValueError("Codex trusted origin conflicts with signed marker")
+        return origin_kind, origin_bridge_id
 
     def supports_sidebar_search(self) -> bool:
         self._ensure_initialized()
@@ -772,6 +850,7 @@ class CodexSourceAdapter:
         summaries = sorted(
             combined.values(), key=lambda item: (-item.last_active, item.native_id)
         )
+        summaries = self._refresh_trusted_origins(summaries)
         from .store import SidebarSource
 
         sources: list[SidebarSource] = []
@@ -819,6 +898,11 @@ class CodexSourceAdapter:
             )
         origin_kind, origin_bridge_id = _detect_origin(
             messages, marker_secret=self._marker_secret
+        )
+        origin_kind, origin_bridge_id = self._reconcile_trusted_origin(
+            summary,
+            origin_kind,
+            origin_bridge_id,
         )
         return SessionProjection(
             provider=Provider.CODEX,
@@ -928,9 +1012,16 @@ class CodexSourceAdapter:
         origin_kind, origin_bridge_id = _detect_origin(
             projected, marker_secret=self._marker_secret
         )
+        origin_kind, origin_bridge_id = self._reconcile_trusted_origin(
+            summary,
+            origin_kind,
+            origin_bridge_id,
+        )
         native_path = _nonempty_string(
             _first(thread, "rolloutPath", "rollout_path")
-        ) or _nonempty_string(_first(response, "rolloutPath", "rollout_path"))
+        ) or _nonempty_string(
+            _first(response, "rolloutPath", "rollout_path")
+        ) or summary.native_path
         message_timestamps = [message.timestamp for message in projected]
         started_at = min([summary_started_at, *message_timestamps])
         last_active = max([summary_last_active, *message_timestamps])
@@ -1049,17 +1140,23 @@ class CodexSourceAdapter:
         source_kinds: tuple[str, ...] | None = None,
     ) -> list[CodexThreadSummary]:
         if source_kinds is None:
-            return self._fetch_inventory_pages(archived=archived, source_kinds=None)
+            summaries = self._fetch_inventory_pages(
+                archived=archived, source_kinds=None
+            )
+            return self._refresh_trusted_origins(summaries)
         try:
-            return self._fetch_inventory_pages(
+            summaries = self._fetch_inventory_pages(
                 archived=archived, source_kinds=source_kinds
             )
         except Exception as exc:
             retry_without_filter = _is_source_kinds_schema_error(exc)
             failure = exc
+        else:
+            return self._refresh_trusted_origins(summaries)
         if not retry_without_filter:
             raise failure
-        return self._fetch_inventory_pages(archived=archived, source_kinds=None)
+        summaries = self._fetch_inventory_pages(archived=archived, source_kinds=None)
+        return self._refresh_trusted_origins(summaries)
 
     def _fetch_inventory_pages(
         self,
@@ -1073,6 +1170,7 @@ class CodexSourceAdapter:
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
         raw_entry_count = 0
+        trusted_origins = self._load_trusted_origins()
         while True:
             params: dict[str, Any] = {"archived": archived}
             if state_db_only:
@@ -1103,7 +1201,10 @@ class CodexSourceAdapter:
                         "Codex thread/list inventory entry must be an object"
                     )
                 try:
-                    summary = _normalize_summary(entry, archived=archived)
+                    summary = self._with_trusted_origin(
+                        _normalize_summary(entry, archived=archived),
+                        trusted_origins,
+                    )
                 except (TypeError, ValueError):
                     raise ValueError(
                         "Codex thread/list inventory entry is invalid"
@@ -2424,8 +2525,11 @@ def _detect_origin(
 def _projection_hash(
     summary: CodexThreadSummary, messages: list[ProjectedMessage]
 ) -> str:
+    summary_snapshot = asdict(summary)
+    summary_snapshot.pop("trusted_origin_bridge_id", None)
+    summary_snapshot.pop("trusted_origins_checked", None)
     supported = {
-        "summary": asdict(summary),
+        "summary": summary_snapshot,
         "messages": [asdict(message) for message in messages],
     }
     return hashlib.sha256(_canonical_json(supported).encode("utf-8")).hexdigest()

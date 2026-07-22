@@ -4649,6 +4649,7 @@ def test_characterization_report_preserves_only_sanitized_claude_failure_metrics
             claude_executable="fake-claude",
             codex_executable="fake-codex",
             cwd=tmp_path,
+            provenance_secret=SECRET,
         )
 
     report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
@@ -4696,16 +4697,23 @@ def test_live_characterization_preserves_direct_runtime_argv_prefixes(
         "_characterize_claude",
         lambda status, **kwargs: characterized.update(claude=kwargs["executable"]),
     )
+    def characterize_codex(status: dict[str, Any], **kwargs: Any) -> None:
+        native_id = "22222222-2222-4222-8222-222222222222"
+        characterized.update(codex=kwargs["executable"])
+        status["native_id"] = native_id
+        kwargs["record_native_id"](native_id)
+
     monkeypatch.setattr(
         characterize_module,
         "_characterize_codex",
-        lambda status, **kwargs: characterized.update(codex=kwargs["executable"]),
+        characterize_codex,
     )
 
     run_live_characterization(
         report_root=tmp_path / "reports",
         claude_projects_root=tmp_path / "projects",
         cwd=tmp_path,
+        provenance_secret=SECRET,
     )
 
     assert version_calls == [
@@ -4716,6 +4724,247 @@ def test_live_characterization_preserves_direct_runtime_argv_prefixes(
         "claude": claude_command,
         "codex": codex_command,
     }
+
+
+def test_live_characterization_guard_blocks_then_binds_exact_codex_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_root = tmp_path / "reports"
+    native_id = "019f8621-4d36-7fe0-9419-319ee7ec09dd"
+    observations: list[str] = []
+
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setattr(
+        characterize_module, "resolve_cli_executable", lambda value: (value,)
+    )
+    monkeypatch.setattr(characterize_module, "_cli_version", lambda _args: "test")
+    monkeypatch.setattr(
+        characterize_module, "_characterize_claude", lambda *_args, **_kwargs: None
+    )
+
+    def characterize_codex(status: dict[str, Any], **kwargs: Any) -> None:
+        with pytest.raises(
+            characterize_module.CharacterizationGateError,
+            match="characterization_codex_origin_unresolved",
+        ):
+            characterize_module.load_codex_characterization_origins(
+                report_root=report_root,
+                marker_secret=SECRET,
+            )
+        observations.append("blocked-before-id")
+        status["native_id"] = native_id
+        kwargs["record_native_id"](native_id)
+        [guard] = characterize_module._read_codex_origin_guards(
+            report_root,
+            marker_secret=SECRET,
+        )
+        assert guard["native_id"] == native_id
+        with pytest.raises(
+            characterize_module.CharacterizationGateError,
+            match="characterization_codex_origin_unresolved",
+        ):
+            characterize_module.load_codex_characterization_origins(
+                report_root=report_root,
+                marker_secret=SECRET,
+            )
+        observations.append("bound-before-return")
+
+    monkeypatch.setattr(
+        characterize_module, "_characterize_codex", characterize_codex
+    )
+
+    report_path = run_live_characterization(
+        report_root=report_root,
+        claude_projects_root=tmp_path / "projects",
+        cwd=tmp_path,
+        provenance_secret=SECRET,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    characterization_id = report["characterization_id"]
+    assert observations == ["blocked-before-id", "bound-before-return"]
+    assert characterize_module.load_codex_characterization_origins(
+        report_root=report_root,
+        marker_secret=SECRET,
+    ) == {
+        native_id: f"characterization-{characterization_id}-codex"
+    }
+
+
+def test_live_characterization_crash_before_codex_id_remains_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setattr(
+        characterize_module, "resolve_cli_executable", lambda value: (value,)
+    )
+    monkeypatch.setattr(characterize_module, "_cli_version", lambda _args: "test")
+    monkeypatch.setattr(
+        characterize_module, "_characterize_claude", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        characterize_module,
+        "_characterize_codex",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit(91)),
+    )
+
+    with pytest.raises(SystemExit, match="91"):
+        run_live_characterization(
+            report_root=report_root,
+            claude_projects_root=tmp_path / "projects",
+            cwd=tmp_path,
+            provenance_secret=SECRET,
+        )
+
+    with pytest.raises(
+        characterize_module.CharacterizationGateError,
+        match="characterization_codex_origin_unresolved",
+    ):
+        characterize_module.load_codex_characterization_origins(
+            report_root=report_root,
+            marker_secret=SECRET,
+        )
+
+
+def test_live_characterization_rejects_tampered_active_codex_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setattr(
+        characterize_module, "resolve_cli_executable", lambda value: (value,)
+    )
+    monkeypatch.setattr(characterize_module, "_cli_version", lambda _args: "test")
+    monkeypatch.setattr(
+        characterize_module, "_characterize_claude", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        characterize_module,
+        "_characterize_codex",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit(91)),
+    )
+    with pytest.raises(SystemExit):
+        run_live_characterization(
+            report_root=report_root,
+            claude_projects_root=tmp_path / "projects",
+            cwd=tmp_path,
+            provenance_secret=SECRET,
+        )
+    [guard] = (report_root / ".codex-origin-guards").glob("*.json")
+    guard.write_bytes(guard.read_bytes() + b"tampered")
+
+    with pytest.raises(
+        characterize_module.CharacterizationGateError,
+        match="characterization_codex_origin_guard_invalid",
+    ):
+        characterize_module.load_codex_characterization_origins(
+            report_root=report_root,
+            marker_secret=SECRET,
+        )
+
+
+def test_live_characterization_ambiguous_no_id_keeps_blocking_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setattr(
+        characterize_module, "resolve_cli_executable", lambda value: (value,)
+    )
+    monkeypatch.setattr(characterize_module, "_cli_version", lambda _args: "test")
+    monkeypatch.setattr(
+        characterize_module, "_characterize_claude", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        characterize_module,
+        "_characterize_codex",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AmbiguousPlaceholderCreation("codex_thread_start_ambiguous")
+        ),
+    )
+
+    with pytest.raises(LiveCharacterizationError) as raised:
+        run_live_characterization(
+            report_root=report_root,
+            claude_projects_root=tmp_path / "projects",
+            cwd=tmp_path,
+            provenance_secret=SECRET,
+        )
+
+    report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
+    assert "native_id" not in report["providers"]["codex"]
+    assert list((report_root / ".codex-origin-guards").glob("*.json"))
+    with pytest.raises(
+        characterize_module.CharacterizationGateError,
+        match="characterization_codex_origin_unresolved",
+    ):
+        characterize_module.load_codex_characterization_origins(
+            report_root=report_root,
+            marker_secret=SECRET,
+        )
+
+
+def test_live_characterization_success_without_id_is_failed_and_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_root = tmp_path / "reports"
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setattr(
+        characterize_module, "resolve_cli_executable", lambda value: (value,)
+    )
+    monkeypatch.setattr(characterize_module, "_cli_version", lambda _args: "test")
+    monkeypatch.setattr(
+        characterize_module, "_characterize_claude", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        characterize_module, "_characterize_codex", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(LiveCharacterizationError) as raised:
+        run_live_characterization(
+            report_root=report_root,
+            claude_projects_root=tmp_path / "projects",
+            cwd=tmp_path,
+            provenance_secret=SECRET,
+        )
+
+    report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
+    assert (
+        report["providers"]["codex"]["error_code"]
+        == "codex_characterization_identity_missing"
+    )
+    assert list((report_root / ".codex-origin-guards").glob("*.json"))
+
+
+def test_codex_origin_guard_retire_requires_exact_bound_identity(
+    tmp_path: Path,
+) -> None:
+    report_root = tmp_path / "reports"
+    characterization_id = "11111111-1111-4111-8111-111111111111"
+    bound_id = "22222222-2222-4222-8222-222222222222"
+    path = characterize_module._prepare_codex_origin_guard(
+        report_root,
+        characterization_id=characterization_id,
+        marker_secret=SECRET,
+    )
+    characterize_module._bind_codex_origin_guard(
+        path,
+        native_id=bound_id,
+        marker_secret=SECRET,
+    )
+
+    with pytest.raises(RuntimeError, match="retire_failed"):
+        characterize_module._retire_codex_origin_guard(
+            path,
+            marker_secret=SECRET,
+            expected_native_id="33333333-3333-4333-8333-333333333333",
+            expected_bridge_id=(
+                f"characterization-{characterization_id}-codex"
+            ),
+        )
+
+    assert path.exists()
 
 
 def test_claude_live_metrics_accept_only_finite_numeric_result_fields() -> None:

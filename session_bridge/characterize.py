@@ -77,6 +77,8 @@ _CLEANUP_QUARANTINE_DIRECTORY = ".cleanup-quarantine"
 _ABORT_CLAIM_SCAN_LIMIT = 100
 _CLEANUP_CLAIM_SCAN_LIMIT = 100
 _CLEANUP_TTL_SECONDS = 7 * 24 * 60 * 60
+_CODEX_ORIGIN_GUARD_DIRECTORY = ".codex-origin-guards"
+_CODEX_ORIGIN_GUARD_LIMIT = 100
 _PROVIDER_REQUIRED_FIELDS = frozenset({
     "create",
     "discover",
@@ -2065,6 +2067,267 @@ def _read_validated_gate_reports(root: Path) -> list[_ValidatedGateReport]:
     ]
 
 
+def load_codex_characterization_origins(
+    *,
+    report_root: Path | None = None,
+    marker_secret: bytes | None = None,
+) -> dict[str, str]:
+    """Return exact Codex native IDs created by trusted characterization reports.
+
+    Characterization uses a short-lived marker key, so its native Codex threads
+    cannot be authenticated later with the production marker key.  The safely
+    read, schema-validated report is therefore the durable provenance authority.
+    Every valid report counts, including failed characterizations: once a report
+    records an exact native ID, that ID must never be treated as native user work.
+    """
+
+    root = (
+        Path(
+            report_root
+            if report_root is not None
+            else get_hermes_home() / "session-bridge" / "characterization"
+        )
+        .expanduser()
+        .absolute()
+    )
+    try:
+        _require_safe_report_root(root)
+    except CharacterizationGateError as exc:
+        if exc.code == "missing":
+            return {}
+        raise
+    try:
+        reports = _read_validated_gate_reports(root)
+    except CharacterizationGateError as exc:
+        if exc.code == "missing":
+            reports = []
+        else:
+            raise
+
+    origins: dict[str, str] = {}
+    reports_by_id: dict[str, _ValidatedGateReport] = {}
+    for report in reports:
+        reports_by_id[report.characterization_id] = report
+        provider = report.report["providers"]["codex"]
+        native_id = provider.get("native_id")
+        if native_id is None:
+            continue
+        bridge_id = f"characterization-{report.characterization_id}-codex"
+        prior = origins.get(native_id)
+        if prior is not None and prior != bridge_id:
+            raise CharacterizationGateError(
+                "invalid", "characterization_native_identity_conflict"
+            )
+        origins[native_id] = bridge_id
+
+    for guard in _read_codex_origin_guards(root, marker_secret=marker_secret):
+        characterization_id = guard["characterization_id"]
+        native_id = guard["native_id"]
+        report = reports_by_id.get(characterization_id)
+        if report is None:
+            raise CharacterizationGateError(
+                "failed", "characterization_codex_origin_unresolved"
+            )
+        if report is not None:
+            reported_native_id = report.report["providers"]["codex"].get(
+                "native_id"
+            )
+            if (
+                native_id is not None
+                and reported_native_id is not None
+                and native_id != reported_native_id
+            ):
+                raise CharacterizationGateError(
+                    "invalid", "characterization_native_identity_conflict"
+                )
+            if native_id is not None and reported_native_id is None:
+                raise CharacterizationGateError(
+                    "invalid", "characterization_native_identity_conflict"
+                )
+            if native_id is None and reported_native_id is None:
+                raise CharacterizationGateError(
+                    "failed", "characterization_codex_origin_unresolved"
+                )
+            continue
+    return origins
+
+
+def _read_codex_origin_guards(
+    report_root: Path,
+    *,
+    marker_secret: bytes | None,
+) -> list[dict[str, Any]]:
+    guard_root = report_root / _CODEX_ORIGIN_GUARD_DIRECTORY
+    if _path_is_redirect(guard_root):
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_guard_invalid"
+        )
+    if not guard_root.exists():
+        return []
+    if marker_secret is None:
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_key_unavailable"
+        )
+    try:
+        _require_secret(marker_secret)
+        _require_safe_report_root(guard_root)
+        paths = sorted(
+            (path for path in guard_root.iterdir() if path.suffix == ".json"),
+            key=lambda path: path.name,
+        )
+    except CharacterizationGateError:
+        raise
+    except (OSError, ValueError):
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_guard_invalid"
+        ) from None
+    if len(paths) > _CODEX_ORIGIN_GUARD_LIMIT:
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_guard_invalid"
+        )
+    guards: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            payload = _read_characterization_record(path, marker_secret)
+            guards.append(_validate_codex_origin_guard(payload, path=path))
+        except CharacterizationGateError:
+            raise
+        except (RuntimeError, TypeError, ValueError):
+            raise CharacterizationGateError(
+                "invalid", "characterization_codex_origin_guard_invalid"
+            ) from None
+    return guards
+
+
+def _validate_codex_origin_guard(
+    payload: Mapping[str, Any], *, path: Path
+) -> dict[str, Any]:
+    if set(payload) != {
+        "schema_version",
+        "characterization_id",
+        "bridge_id",
+        "phase",
+        "native_id",
+    } or payload.get("schema_version") != 1:
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_guard_invalid"
+        )
+    try:
+        characterization_id = _canonical_uuid(payload["characterization_id"])
+    except ValueError:
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_guard_invalid"
+        ) from None
+    bridge_id = f"characterization-{characterization_id}-codex"
+    native_id = payload["native_id"]
+    phase = payload["phase"]
+    if (
+        path.stem != characterization_id
+        or payload["bridge_id"] != bridge_id
+        or phase not in {"creating", "created"}
+        or (phase == "creating" and native_id is not None)
+    ):
+        raise CharacterizationGateError(
+            "invalid", "characterization_codex_origin_guard_invalid"
+        )
+    if native_id is not None:
+        try:
+            native_id = _canonical_uuid(native_id)
+        except ValueError:
+            raise CharacterizationGateError(
+                "invalid", "characterization_codex_origin_guard_invalid"
+            ) from None
+        if phase != "created":
+            raise CharacterizationGateError(
+                "invalid", "characterization_codex_origin_guard_invalid"
+            )
+    return {
+        "schema_version": 1,
+        "characterization_id": characterization_id,
+        "bridge_id": bridge_id,
+        "phase": phase,
+        "native_id": native_id,
+    }
+
+
+def _prepare_codex_origin_guard(
+    report_root: Path,
+    *,
+    characterization_id: str,
+    marker_secret: bytes,
+) -> Path:
+    _require_secret(marker_secret)
+    record_id = _canonical_uuid(characterization_id)
+    root = _safe_directory_root(
+        Path(report_root).expanduser(),
+        error_code="unsafe_characterization_report",
+    )
+    guard_root = _safe_directory_root(
+        root / _CODEX_ORIGIN_GUARD_DIRECTORY,
+        error_code="unsafe_characterization_origin_guard",
+    )
+    path = guard_root / f"{record_id}.json"
+    if path.exists() or _path_is_redirect(path):
+        raise RuntimeError("unsafe_characterization_origin_guard:already_exists")
+    _write_characterization_record(
+        path,
+        {
+            "schema_version": 1,
+            "characterization_id": record_id,
+            "bridge_id": f"characterization-{record_id}-codex",
+            "phase": "creating",
+            "native_id": None,
+        },
+        marker_secret,
+    )
+    return path
+
+
+def _bind_codex_origin_guard(
+    path: Path,
+    *,
+    native_id: str,
+    marker_secret: bytes,
+) -> None:
+    expected_id = _canonical_uuid(native_id)
+    try:
+        current = _validate_codex_origin_guard(
+            _read_characterization_record(path, marker_secret),
+            path=path,
+        )
+    except (CharacterizationGateError, RuntimeError):
+        raise RuntimeError("unsafe_characterization_origin_guard:invalid") from None
+    prior = current["native_id"]
+    if prior is not None and prior != expected_id:
+        raise RuntimeError("unsafe_characterization_origin_guard:identity_conflict")
+    current["phase"] = "created"
+    current["native_id"] = expected_id
+    _write_characterization_record(path, current, marker_secret)
+
+
+def _retire_codex_origin_guard(
+    path: Path,
+    *,
+    marker_secret: bytes,
+    expected_native_id: str,
+    expected_bridge_id: str,
+) -> None:
+    try:
+        guard = _validate_codex_origin_guard(
+            _read_characterization_record(path, marker_secret),
+            path=path,
+        )
+        if (
+            guard["native_id"] != _canonical_uuid(expected_native_id)
+            or guard["bridge_id"] != expected_bridge_id
+            or _path_is_redirect(path)
+        ):
+            raise RuntimeError
+        path.unlink()
+    except (CharacterizationGateError, OSError, RuntimeError):
+        raise RuntimeError("unsafe_characterization_origin_guard:retire_failed") from None
+
+
 def _read_report_safely(path: Path) -> dict[str, Any]:
     try:
         before = os.lstat(path)
@@ -2470,6 +2733,7 @@ def run_live_characterization(
     claude_executable: str = "claude",
     codex_executable: str = "codex",
     cwd: Path | None = None,
+    provenance_secret: bytes | None = None,
 ) -> Path:
     if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
         raise RuntimeError("live_characterization_not_enabled")
@@ -2482,6 +2746,11 @@ def run_live_characterization(
     if codex_version is None:
         raise RuntimeError("codex_cli_preflight_failed")
     characterization_id = str(uuid.uuid4())
+    if provenance_secret is None:
+        from .mcp_server import resolve_marker_key
+
+        provenance_secret = resolve_marker_key()
+    _require_secret(provenance_secret)
     resolved_report_root = (
         Path(report_root)
         if report_root is not None
@@ -2522,6 +2791,19 @@ def run_live_characterization(
         if isinstance(exc, PlaceholderCreationError):
             _record_claude_failure_diagnostics(report["providers"]["claude"], exc)
         failures.append(code)
+    codex_origin_guard = _prepare_codex_origin_guard(
+        resolved_report_root,
+        characterization_id=characterization_id,
+        marker_secret=provenance_secret,
+    )
+
+    def record_codex_native_id(native_id: str) -> None:
+        _bind_codex_origin_guard(
+            codex_origin_guard,
+            native_id=native_id,
+            marker_secret=provenance_secret,
+        )
+
     try:
         _characterize_codex(
             report["providers"]["codex"],
@@ -2530,17 +2812,33 @@ def run_live_characterization(
             marker_secret=marker_secret,
             executable=codex_command,
             cwd=working_directory,
+            record_native_id=record_codex_native_id,
         )
     except Exception as exc:
         code = _safe_error_code("codex", exc)
         report["providers"]["codex"]["error_code"] = code
         failures.append(code)
+    else:
+        try:
+            _canonical_uuid(report["providers"]["codex"].get("native_id"))
+        except ValueError:
+            code = "codex_characterization_identity_missing"
+            report["providers"]["codex"]["error_code"] = code
+            failures.append(code)
 
     report_path = write_characterization_report(
         report,
         report_root=resolved_report_root,
         characterization_id=characterization_id,
     )
+    codex_native_id = report["providers"]["codex"].get("native_id")
+    if codex_native_id is not None:
+        _retire_codex_origin_guard(
+            codex_origin_guard,
+            marker_secret=provenance_secret,
+            expected_native_id=codex_native_id,
+            expected_bridge_id=f"characterization-{characterization_id}-codex",
+        )
     if failures:
         raise LiveCharacterizationError(report_path, failures)
     return report_path
@@ -2856,6 +3154,7 @@ def _characterize_codex(
     marker_secret: bytes,
     executable: Sequence[str],
     cwd: Path,
+    record_native_id: Callable[[str], None],
 ) -> None:
     characterization_started = time.monotonic()
     codex_bin = _single_native_executable(executable, label="Codex")
@@ -2883,9 +3182,11 @@ def _characterize_codex(
             native_id = exc.native_id
             if native_id is not None:
                 status["native_id"] = native_id
+                record_native_id(native_id)
             raise
         native_id = result.native_id
         status["native_id"] = native_id
+        record_native_id(native_id)
         status["create"] = True
         status["used_registration_turn"] = result.used_registration_turn
         summary = source.find_native_thread(

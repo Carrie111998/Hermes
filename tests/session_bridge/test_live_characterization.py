@@ -12,6 +12,7 @@ from session_bridge.characterize import (
     CharacterizationGateError,
     _cli_version,
     _read_report_safely,
+    load_codex_characterization_origins,
     resolve_characterization_gate,
     run_live_characterization,
     write_characterization_report,
@@ -34,9 +35,10 @@ def _report(
     claude_passed: bool = True,
     codex_passed: bool = True,
     registration_turn: bool = False,
+    codex_native_id: str | None = None,
 ) -> dict[str, object]:
     def provider(passed: bool, *, codex: bool) -> dict[str, object]:
-        return {
+        status: dict[str, object] = {
             "create": passed,
             "discover": passed,
             "read": passed,
@@ -45,6 +47,9 @@ def _report(
             "cleanup": "archived" if codex else "quarantined",
             "error_code": None if passed else "synthetic_characterization_failure",
         }
+        if codex and codex_native_id is not None:
+            status["native_id"] = codex_native_id
+        return status
 
     return {
         "schema_version": 1,
@@ -122,6 +127,98 @@ def test_characterization_defaults_follow_active_hermes_home(
     expected_root = hermes_home / "session-bridge" / "characterization"
     assert report_path.parent == expected_root
     assert gate.report_path == report_path
+
+
+def test_codex_characterization_origins_include_every_valid_report_native_id(
+    tmp_path: Path,
+) -> None:
+    passing_id = "11111111-1111-4111-8111-111111111111"
+    passing_native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    failed_id = "22222222-2222-4222-8222-222222222222"
+    failed_native_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    _write_report(
+        tmp_path,
+        passing_id,
+        mtime_ns=100,
+        codex_native_id=passing_native_id,
+    )
+    _write_report(
+        tmp_path,
+        failed_id,
+        mtime_ns=200,
+        codex_passed=False,
+        codex_native_id=failed_native_id,
+    )
+
+    assert load_codex_characterization_origins(report_root=tmp_path) == {
+        passing_native_id: f"characterization-{passing_id}-codex",
+        failed_native_id: f"characterization-{failed_id}-codex",
+    }
+
+
+def test_codex_characterization_origins_allow_missing_report_root(
+    tmp_path: Path,
+) -> None:
+    assert load_codex_characterization_origins(
+        report_root=tmp_path / "not-created"
+    ) == {}
+
+
+def test_codex_characterization_origins_reject_malformed_report_root(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "not-a-report.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        CharacterizationGateError,
+        match="characterization_report_malformed",
+    ):
+        load_codex_characterization_origins(report_root=tmp_path)
+
+
+def test_codex_characterization_origins_reject_native_identity_reuse(
+    tmp_path: Path,
+) -> None:
+    native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    _write_report(
+        tmp_path,
+        "11111111-1111-4111-8111-111111111111",
+        mtime_ns=100,
+        codex_native_id=native_id,
+    )
+    _write_report(
+        tmp_path,
+        "22222222-2222-4222-8222-222222222222",
+        mtime_ns=200,
+        codex_passed=False,
+        codex_native_id=native_id,
+    )
+
+    with pytest.raises(
+        CharacterizationGateError,
+        match="characterization_native_identity_conflict",
+    ):
+        load_codex_characterization_origins(report_root=tmp_path)
+
+
+def test_codex_characterization_origins_reject_redirected_guard_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard_root = tmp_path / ".codex-origin-guards"
+    monkeypatch.setattr(
+        "session_bridge.characterize._path_is_redirect",
+        lambda path: Path(path) == guard_root,
+    )
+
+    with pytest.raises(
+        CharacterizationGateError,
+        match="characterization_codex_origin_guard_invalid",
+    ):
+        load_codex_characterization_origins(
+            report_root=tmp_path,
+            marker_secret=b"trusted-key",
+        )
 
 
 @pytest.mark.parametrize("gate_value", (None, "", "0", "true"))
