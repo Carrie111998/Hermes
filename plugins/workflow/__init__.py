@@ -37,7 +37,7 @@ _DEFAULTS: Dict[str, Any] = {
 
 
 def load_config() -> Dict[str, Any]:
-    """Load workflow plugin config from ``~/.hermes/profiles/<profile>/workflow/config.yaml``.
+    """Load workflow plugin config from ``~/.hermes/workflows/config.yaml``.
 
     Returns a dict with defaults merged under any user-set values.
     Caches the result for the lifetime of the process.
@@ -52,8 +52,8 @@ def load_config() -> Dict[str, Any]:
 
     # Try profile-scoped config first, then fall back to shared
     config_paths = [
-        hermes_home / "workflow" / "config.yaml",
-        Path.home() / ".hermes" / "workflow" / "config.yaml",
+        hermes_home / "workflows" / "config.yaml",
+        Path.home() / ".hermes" / "workflows" / "config.yaml",
     ]
 
     user_config: Dict[str, Any] = {}
