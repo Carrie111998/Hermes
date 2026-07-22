@@ -882,6 +882,7 @@ class SessionBridgeCoordinator:
             _SIDEBAR_CANCELLATION_RECOVERY_SECONDS
         ),
         permission_preflight: Callable[[str], bool] | None = None,
+        mirror_float: object | None = None,
     ) -> None:
         if type(scan_batch_size) is not int or scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be a positive integer")
@@ -931,6 +932,11 @@ class SessionBridgeCoordinator:
         ):
             raise TypeError("sidebar_executor must provide run_once() or be None")
         self._sidebar_executor = sidebar_executor
+        if mirror_float is not None and not callable(
+            getattr(mirror_float, "run_once", None)
+        ):
+            raise TypeError("mirror_float must provide run_once() or be None")
+        self._mirror_float = mirror_float
         self._sidebar_cancellation_recovery_timeout = float(
             sidebar_cancellation_recovery_timeout
         )
@@ -2733,27 +2739,36 @@ class SessionBridgeCoordinator:
     async def _after_successful_scan(self, summary: ScanSummary) -> None:
         if summary.failed or not await self._register_sidebar_after_successful_scan():
             return
-        if self._sidebar_executor is None:
+        if self._any_configured_provider_unhealthy():
             return
+        if self._sidebar_executor is not None:
+            await self._run_post_scan_worker(
+                self._sidebar_executor, "sidebar_executor_failed"
+            )
+        if self._mirror_float is not None:
+            await self._run_post_scan_worker(
+                self._mirror_float, "mirror_float_failed"
+            )
+
+    def _any_configured_provider_unhealthy(self) -> bool:
         configured_providers = set(self._adapters).intersection(_EXTERNAL_PROVIDERS)
-        if any(
+        return any(
             self._provider_health[provider]["last_success"] is None
             or self._provider_health[provider]["degraded_reason"] is not None
             for provider in configured_providers
-        ):
-            return
-        executor_task = asyncio.create_task(
-            asyncio.to_thread(self._sidebar_executor.run_once)
         )
+
+    async def _run_post_scan_worker(self, worker: Any, error_code: str) -> None:
+        worker_task = asyncio.create_task(asyncio.to_thread(worker.run_once))
         try:
-            await asyncio.shield(executor_task)
+            await asyncio.shield(worker_task)
         except asyncio.CancelledError:
-            await asyncio.gather(executor_task, return_exceptions=True)
+            await asyncio.gather(worker_task, return_exceptions=True)
             raise
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
-            self._record_error_code("sidebar_executor_failed")
+            self._record_error_code(error_code)
 
     async def _register_sidebar_after_successful_scan(self) -> bool:
         sidebar = self._config.sidebar

@@ -2892,6 +2892,42 @@ class SessionBridgeStore:
             ).fetchone()
         return row is not None
 
+    def get_external_activity(self, session_id: str) -> float | None:
+        """Return the indexed activity watermark for an external session."""
+        key = _external_activity_state_key(session_id)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return _decode_external_activity(row["value_json"])
+        except ValueError:
+            return None
+
+    def list_visible_claude_visibility_mirrors(self) -> list[dict[str, str]]:
+        """Return (source_session_id, claude_uuid) for every visible mirror."""
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            rows = conn.execute(
+                """SELECT source_session_id, reserved_claude_uuid
+                   FROM session_claude_visibility_jobs
+                   WHERE state = 'claude_visible'
+                   ORDER BY source_session_id""",
+            ).fetchall()
+        return [
+            {
+                "source_session_id": row["source_session_id"],
+                "claude_uuid": row["reserved_claude_uuid"],
+            }
+            for row in rows
+        ]
+
     def _claude_visibility_local_day(self, timestamp: float) -> str:
         if self._local_timezone is None:
             local = datetime.fromtimestamp(timestamp).astimezone()

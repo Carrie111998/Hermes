@@ -60,6 +60,7 @@ from .coordinator import (
     SessionBridgeCoordinator,
 )
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
+from .mirror_float import ClaudeMirrorFloatWorker
 from .mirror import (
     BatchProgress,
     DiscoveryMode,
@@ -2388,6 +2389,15 @@ class ProductionBackend:
                 )
                 else None
             )
+            mirror_float = (
+                ClaudeMirrorFloatWorker(self._require_store())
+                if (
+                    not catalog_only
+                    and effective_config.claude_visibility.enabled
+                    and effective_config.claude_visibility.float_activity
+                )
+                else None
+            )
             self._coordinator = SessionBridgeCoordinator(
                 config=effective_config,
                 store=self._require_store(),
@@ -2402,6 +2412,7 @@ class ProductionBackend:
                 permission_preflight=_production_codex_permission_preflight,
                 sidebar_verifier=sidebar_verifier,
                 sidebar_executor=sidebar_executor,
+                mirror_float=mirror_float,
             )
             return self._coordinator
         except Exception:
