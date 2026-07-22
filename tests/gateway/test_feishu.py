@@ -3155,6 +3155,12 @@ class TestHydrateBotIdentity(unittest.TestCase):
     match against.
     """
 
+    def setUp(self):
+        # Upstream 0.19.0's adapter resolves get_hermes_home() in __init__
+        # (dedup state path); under the clear=True env these tests use,
+        # that falls through to Path.home() and raises on Windows.
+        _pin_feishu_home(self)
+
     def _make_adapter(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -3277,6 +3283,12 @@ class TestPendingInboundQueue(unittest.TestCase):
     """Tests for the loop-not-ready race (#5499): inbound events arriving
     before or during adapter loop transitions must be queued for replay
     rather than silently dropped."""
+
+    def setUp(self):
+        # Upstream 0.19.0's adapter resolves get_hermes_home() in __init__
+        # (dedup state path); under the clear=True env these tests use,
+        # that falls through to Path.home() and raises on Windows.
+        _pin_feishu_home(self)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_event_queued_when_loop_not_ready(self):
@@ -3421,6 +3433,12 @@ class TestPendingInboundQueue(unittest.TestCase):
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestWebhookSecurity(unittest.TestCase):
     """Tests for webhook signature verification, rate limiting, and body size limits."""
+
+    def setUp(self):
+        # Upstream 0.19.0's adapter resolves get_hermes_home() in __init__
+        # (dedup state path); under the clear=True env these tests use,
+        # that falls through to Path.home() and raises on Windows.
+        _pin_feishu_home(self)
 
     def _make_adapter(self, encrypt_key: str = "") -> "FeishuAdapter":
         from gateway.config import PlatformConfig
@@ -3729,6 +3747,12 @@ class TestGroupMentionAtAll(unittest.TestCase):
 class TestSenderNameResolution(unittest.TestCase):
     """Tests for _resolve_sender_name_from_api (contact API + cache)."""
 
+    def setUp(self):
+        # Upstream 0.19.0's adapter resolves get_hermes_home() in __init__
+        # (dedup state path); under the clear=True env these tests use,
+        # that falls through to Path.home() and raises on Windows.
+        _pin_feishu_home(self)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_returns_none_when_client_is_none(self):
         from gateway.config import PlatformConfig
@@ -3834,6 +3858,12 @@ class TestSenderNameResolution(unittest.TestCase):
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestBotNameResolution(unittest.TestCase):
     """Tests for the bot branch of _resolve_sender_name_from_api (basic_batch API + shared cache)."""
+
+    def setUp(self):
+        # Upstream 0.19.0's adapter resolves get_hermes_home() in __init__
+        # (dedup state path); under the clear=True env these tests use,
+        # that falls through to Path.home() and raises on Windows.
+        _pin_feishu_home(self)
 
     @staticmethod
     def _batch_payload(bots: Dict[str, str]):
@@ -3966,6 +3996,12 @@ class TestBotNameResolution(unittest.TestCase):
 class TestProcessingReactions(unittest.TestCase):
     """Typing on start → removed on SUCCESS, swapped for CrossMark on FAILURE,
     removed (no replacement) on CANCELLED."""
+
+    def setUp(self):
+        # Upstream 0.19.0's adapter resolves get_hermes_home() in __init__
+        # (dedup state path); under the clear=True env these tests use,
+        # that falls through to Path.home() and raises on Windows.
+        _pin_feishu_home(self)
 
     @staticmethod
     def _run(coro):

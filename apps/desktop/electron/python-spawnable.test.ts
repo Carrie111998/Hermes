@@ -1,5 +1,3 @@
-'use strict'
-
 // Unit tests for isSpawnablePythonExe — the guard that stops the desktop from
 // handing a Microsoft Store "App Execution Alias" python.exe to
 // child_process.spawn(). Those aliases are IO_REPARSE_TAG_APPEXECLINK reparse
@@ -7,14 +5,19 @@
 // windowless launch context throws EPERM (boot failure, 2026-07-09). libuv
 // surfaces them via lstat as symbolic links whose target lives under
 // %ProgramFiles%\WindowsApps and cannot be followed (statSync → EACCES/EPERM).
+//
+// Ported verbatim from python-spawnable.test.cjs (node:test) when the electron
+// test suite moved to vitest (`vitest run --project electron` collects only
+// *.test.ts, so the .cjs file had silently dropped out of the run).
 
-const test = require('node:test')
-const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const os = require('node:os')
-const path = require('node:path')
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
-const { isSpawnablePythonExe } = require('./python-spawnable.cjs')
+import { test } from 'vitest'
+
+import { isSpawnablePythonExe } from './python-spawnable.cjs'
 
 // Build a Stats-like object with just the methods the helper touches.
 function fakeStats({ size = 0, symlink = false, file = true } = {}) {
@@ -31,9 +34,7 @@ function fakeFs(table) {
     lstatSync(p) {
       const entry = table[p]
       if (!entry || !entry.lstat) {
-        const err = new Error(`ENOENT: ${p}`)
-        err.code = 'ENOENT'
-        throw err
+        throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' })
       }
       if (entry.lstat instanceof Error) throw entry.lstat
       return entry.lstat
@@ -41,9 +42,7 @@ function fakeFs(table) {
     statSync(p) {
       const entry = table[p]
       if (!entry || !entry.stat) {
-        const err = new Error(`ENOENT: ${p}`)
-        err.code = 'ENOENT'
-        throw err
+        throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' })
       }
       if (entry.stat instanceof Error) throw entry.stat
       return entry.stat
@@ -60,8 +59,7 @@ function collectingLog() {
 test('rejects a Microsoft Store app-execution-alias reparse stub and logs it', () => {
   const aliasPath =
     'C:\\Users\\diego\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\\python.exe'
-  const eacces = new Error('EACCES: permission denied')
-  eacces.code = 'EACCES'
+  const eacces = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })
   // Real-world shape: lstat says symlink (size = reparse buffer), follow throws.
   const fsDouble = fakeFs({
     [aliasPath]: { lstat: fakeStats({ size: 111, symlink: true, file: false }), stat: eacces }

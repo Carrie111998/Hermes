@@ -438,7 +438,10 @@ def make_agent(
     # match the loop's call sites, no leading ``self``.)
     cursor = shared_client._cursor
     if api_mode == "anthropic_messages":
-        def _scripted_anthropic_messages_create(api_kwargs):
+        def _scripted_anthropic_messages_create(api_kwargs, client=None):
+            # 0.19.0: chat_completion_helpers passes the per-request client
+            # (agent/chat_completion_helpers.py: `client=request_client`).
+            # The scripted stub ignores it — fixtures fully determine the reply.
             fixture = cursor.take(_summarize_provider_call(api_kwargs))
             return build_anthropic_response(fixture)
 

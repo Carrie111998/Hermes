@@ -7055,7 +7055,12 @@ class TestStatusRemoteGateway:
 
         seen: dict = {}
 
-        def fake_pid(pid_path=None):
+        def fake_pid(pid_path=None, **_kwargs):
+            # Patch the CACHED wrapper: 0.19.0's /api/status probes through
+            # get_running_pid_cached (gateway/status.py), which calls its own
+            # module's get_running_pid — patching ws.get_running_pid no longer
+            # intercepts the probe. The explicit-path retargeting contract is
+            # unchanged; only the seam moved.
             seen["pid_path"] = pid_path
             return 4242 if pid_path is not None else None
 
@@ -7067,7 +7072,7 @@ class TestStatusRemoteGateway:
                 else None
             )
 
-        monkeypatch.setattr(ws, "get_running_pid", fake_pid)
+        monkeypatch.setattr(ws, "get_running_pid_cached", fake_pid)
         monkeypatch.setattr(ws, "read_runtime_status", fake_rt)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
 
@@ -7098,7 +7103,8 @@ class TestStatusRemoteGateway:
 
         seen: dict = {}
 
-        def fake_pid(pid_path=None):
+        def fake_pid(pid_path=None, **_kwargs):
+            # See retargeting test above: 0.19.0 probes via get_running_pid_cached.
             seen["pid_path"] = pid_path
             return None
 
@@ -7106,7 +7112,7 @@ class TestStatusRemoteGateway:
             seen["state_path"] = path
             return None
 
-        monkeypatch.setattr(ws, "get_running_pid", fake_pid)
+        monkeypatch.setattr(ws, "get_running_pid_cached", fake_pid)
         monkeypatch.setattr(ws, "read_runtime_status", fake_rt)
         monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
 

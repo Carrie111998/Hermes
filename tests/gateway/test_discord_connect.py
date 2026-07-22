@@ -343,7 +343,7 @@ async def test_connect_timeout_cancels_bot_task(monkeypatch):
     """
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(
@@ -391,7 +391,7 @@ async def test_disconnect_cancels_running_bot_task(monkeypatch):
     """
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     # Simulate a zombie bot_task that never finishes (as if discord.py is mid-handshake)
@@ -419,7 +419,7 @@ async def test_connect_ready_wait_uses_gateway_platform_connect_timeout(monkeypa
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "90")
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
