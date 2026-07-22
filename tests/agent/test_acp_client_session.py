@@ -41,6 +41,7 @@ def _make_session(
     command: str = "fake-acp",
     args=None,
     model: Optional[str] = None,
+    permission_mode: Optional[str] = None,
     on_delta=None,
     approval_callback=None,
     auto_approve_permissions: bool = False,
@@ -60,6 +61,7 @@ def _make_session(
         command=command,
         args=args,
         model=model,
+        permission_mode=permission_mode,
         on_delta=on_delta,
         approval_callback=approval_callback,
         auto_approve_permissions=auto_approve_permissions,
@@ -301,6 +303,194 @@ class TestModelPin:
         sid = session.ensure_started(cwd="/tmp")
         assert sid == "sess-generic"
         assert session._session_id == "sess-generic"
+
+
+# --------------------------------------------------------------------------- #
+# Tests: permission_mode startup pin (sent alongside the model pin)
+# --------------------------------------------------------------------------- #
+
+
+def _make_mode_config_response(current_value: str) -> dict:
+    """Build a realistic set_config_option response for the 'mode' config."""
+    return {
+        "configOptions": [
+            {
+                "id": "mode",
+                "name": "Permission Mode",
+                "type": "select",
+                "category": "permission",
+                "currentValue": current_value,
+                "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "acceptEdits", "name": "Accept Edits"},
+                    {"value": "plan", "name": "Plan"},
+                    {"value": "bypassPermissions", "name": "Bypass"},
+                ],
+            },
+        ]
+    }
+
+
+class TestPermissionModePin:
+    def test_permission_mode_pin_sent_after_session_new(self):
+        """When permission_mode is configured, session/set_config_option is
+        sent with configId='mode' after session/new (and after the model pin
+        if both are set)."""
+        session, mock_client = _make_session(permission_mode="acceptEdits")
+        mock_client.request.side_effect = [
+            {"sessionId": "sess-mode"},                  # session/new
+            _make_mode_config_response("acceptEdits"),   # set_config_option mode
+        ]
+
+        session.ensure_started(cwd="/tmp")
+
+        calls = mock_client.request.call_args_list
+        assert len(calls) == 2
+        assert calls[0][0][0] == "session/new"
+        cfg_call = calls[1]
+        assert cfg_call[0][0] == "session/set_config_option"
+        params = cfg_call[0][1]
+        assert params["sessionId"] == "sess-mode"
+        assert params["configId"] == "mode"
+        assert params["value"] == "acceptEdits"
+
+    def test_permission_mode_pin_not_sent_when_not_set(self):
+        """No permission_mode -> no 'mode' set_config_option sent."""
+        session, mock_client = _make_session()
+        mock_client.request.side_effect = [{"sessionId": "s"}]
+        session.ensure_started(cwd="/tmp")
+        assert mock_client.request.call_count == 1
+        assert mock_client.request.call_args[0][0] == "session/new"
+
+    def test_permission_mode_pin_mismatch_raises(self):
+        """Server accepts the call but currentValue != requested -> raise."""
+        session, mock_client = _make_session(permission_mode="bypassPermissions")
+        mock_client.request.side_effect = [
+            {"sessionId": "s"},
+            _make_mode_config_response("default"),  # mismatch
+        ]
+        with pytest.raises(ACPClientError) as exc_info:
+            session.ensure_started(cwd="/tmp")
+        assert exc_info.value.code == 1
+        assert session._session_id is None
+
+    def test_permission_mode_pin_transport_error_tolerated(self):
+        """Transport failure from the mode pin is tolerated."""
+        session, mock_client = _make_session(permission_mode="acceptEdits")
+        mock_client.request.side_effect = [
+            {"sessionId": "s"},
+            ACPClientError(code=-32601, message="Method not found"),
+        ]
+        sid = session.ensure_started(cwd="/tmp")
+        assert sid == "s"
+
+    def test_model_and_permission_mode_pins_both_sent(self):
+        """When both model and permission_mode are set, both pins are sent
+        (model first, then mode)."""
+        session, mock_client = _make_session(
+            model="sonnet", permission_mode="plan",
+        )
+        mock_client.request.side_effect = [
+            {"sessionId": "s-both"},                 # session/new
+            _make_config_response("sonnet"),         # model pin
+            _make_mode_config_response("plan"),      # mode pin
+        ]
+        session.ensure_started(cwd="/tmp")
+        calls = mock_client.request.call_args_list
+        assert len(calls) == 3
+        assert calls[0][0][0] == "session/new"
+        assert calls[1][0][1]["configId"] == "model"
+        assert calls[1][0][1]["value"] == "sonnet"
+        assert calls[2][0][1]["configId"] == "mode"
+        assert calls[2][0][1]["value"] == "plan"
+
+
+# --------------------------------------------------------------------------- #
+# Tests: live set_config_option / set_model / set_permission_mode
+# --------------------------------------------------------------------------- #
+
+
+class TestLiveSetConfigOption:
+    """Runtime live-switch of model / permission_mode without rebuilding the
+    session."""
+
+    def test_set_config_option_sends_against_live_session(self):
+        """set_config_option('model', 'X') issues a session/set_config_option
+        against the already-started session."""
+        session, mock_client = _make_session(model="haiku")
+        mock_client.request.side_effect = [
+            {"sessionId": "sess-live"},                # session/new
+            _make_config_response("haiku"),            # startup model pin
+            _make_config_response("sonnet"),           # live switch -> match
+        ]
+        session.ensure_started(cwd="/tmp")
+        session.set_config_option("model", "sonnet")
+
+        last_call = mock_client.request.call_args_list[-1]
+        assert last_call[0][0] == "session/set_config_option"
+        assert last_call[0][1]["sessionId"] == "sess-live"
+        assert last_call[0][1]["configId"] == "model"
+        assert last_call[0][1]["value"] == "sonnet"
+
+    def test_set_config_option_before_ensure_started_is_noop(self):
+        """Calling set_config_option before ensure_started is a logged no-op
+        (no exception, no request issued)."""
+        session, mock_client = _make_session()
+        mock_client.request.return_value = {}
+        session.set_config_option("model", "sonnet")
+        # Only the session/new request should have been issued -- but we
+        # haven't called ensure_started at all, so zero requests.
+        assert mock_client.request.call_count == 0
+
+    def test_set_model_delegates_to_set_config_option(self):
+        """set_model('X') is sugar for set_config_option('model', 'X')."""
+        session, mock_client = _make_session()
+        mock_client.request.side_effect = [
+            {"sessionId": "s"},                       # session/new
+            _make_config_response("sonnet"),          # live switch
+        ]
+        session.ensure_started(cwd="/tmp")
+        session.set_model("sonnet")
+        last_call = mock_client.request.call_args_list[-1]
+        assert last_call[0][1]["configId"] == "model"
+        assert last_call[0][1]["value"] == "sonnet"
+
+    def test_set_permission_mode_delegates_to_set_config_option(self):
+        """set_permission_mode('X') is sugar for set_config_option('mode', 'X')."""
+        session, mock_client = _make_session()
+        mock_client.request.side_effect = [
+            {"sessionId": "s"},                       # session/new
+            _make_mode_config_response("acceptEdits"),  # live switch
+        ]
+        session.ensure_started(cwd="/tmp")
+        session.set_permission_mode("acceptEdits")
+        last_call = mock_client.request.call_args_list[-1]
+        assert last_call[0][1]["configId"] == "mode"
+        assert last_call[0][1]["value"] == "acceptEdits"
+
+    def test_set_config_option_value_rejected_raises(self):
+        """Server accepts the call but currentValue != requested -> raise."""
+        session, mock_client = _make_session()
+        mock_client.request.side_effect = [
+            {"sessionId": "s"},                       # session/new
+            _make_config_response("default"),         # mismatch on live switch
+        ]
+        session.ensure_started(cwd="/tmp")
+        with pytest.raises(ACPClientError) as exc_info:
+            session.set_model("sonnet")
+        assert exc_info.value.code == 1
+
+    def test_set_config_option_transport_error_tolerated(self):
+        """Server does not implement set_config_option at runtime -> tolerated."""
+        session, mock_client = _make_session()
+        mock_client.request.side_effect = [
+            {"sessionId": "s"},                       # session/new
+            ACPClientError(code=-32601, message="Method not found"),
+        ]
+        session.ensure_started(cwd="/tmp")
+        # Must not raise -- transport failure is tolerated.
+        session.set_model("sonnet")
+
 
 
 # ---------------------------------------------------------------------------

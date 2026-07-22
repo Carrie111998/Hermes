@@ -127,6 +127,7 @@ class ACPClientSession:
         args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
         model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
         mcp_servers: Optional[list[dict]] = None,
         session_meta: Optional[dict] = None,
         on_delta: Optional[Callable[[str], None]] = None,
@@ -146,6 +147,16 @@ class ACPClientSession:
                 when set; servers that do not support set_config_option are
                 tolerated -- the call is wrapped in a try/except and a warning
                 is logged rather than hard-failing the session.
+            permission_mode: Permission / edit-approval mode to pin on the
+                ACP session after session/new. Sent via
+                ``session/set_config_option`` with ``configId="mode"``. Only
+                sent when set; servers that do not support set_config_option
+                are tolerated (warning logged). Accepted values are
+                server-specific (for claude-agent-acp: ``"default"``,
+                ``"acceptEdits"``, ``"plan"``, ``"auto"``, ``"dontAsk"``,
+                ``"bypassPermissions"``). Like ``model``, a server that
+                accepts the call but silently rejects the value raises an
+                ``ACPClientError`` so the caller knows the pin did not take.
             mcp_servers: Pre-translated ACP McpServer dicts to forward in
                 session/new.  Build with ``_translate_mcp_servers()`` from
                 Hermes' mcp_servers config.  Hermes does NOT open these
@@ -192,6 +203,7 @@ class ACPClientSession:
         self._args = list(args or [])
         self._env = env
         self._model = model
+        self._permission_mode = permission_mode
         self._mcp_servers: list[dict] = list(mcp_servers or [])
         # Deep copy: insulates the session/new payload from caller mutations
         # after __init__ — including nested dicts (a plugin may reuse a shared
@@ -269,7 +281,7 @@ class ACPClientSession:
         # it but reject the value raise loud.
         if self._model:
             try:
-                self._send_model_config(self._session_id, self._model)
+                self._send_config_option(self._session_id, "model", self._model)
             except ACPClientError:
                 # Mismatch detected: clear session so ensure_started does not
                 # short-circuit on the next call (idempotency guard at top of
@@ -278,93 +290,221 @@ class ACPClientSession:
                 self._session_id = None
                 raise
 
+        # Permission-mode pin: same two-layer strategy as the model pin. Sent
+        # only when a permission_mode is explicitly configured. Servers that do
+        # not implement set_config_option are tolerated; servers that accept
+        # the call but silently reject the value raise loud so the caller knows
+        # the mode did not take.
+        if self._permission_mode:
+            try:
+                self._send_config_option(
+                    self._session_id, "mode", self._permission_mode,
+                )
+            except ACPClientError:
+                self._session_id = None
+                raise
+
         return self._session_id
 
-    def _send_model_config(self, session_id: str, model: str) -> None:
-        """Send session/set_config_option to pin the model on the ACP session, then
-        verify the server honoured the value.
+    def _send_config_option(
+        self, session_id: str, config_id: str, value: str,
+    ) -> None:
+        """Send ``session/set_config_option`` to pin a config value on the ACP
+        session, then verify the server honoured the value.
 
-        The model identifier is sent as-is.  The server decides which values it
-        accepts (e.g. short aliases, full API IDs, or vendor-specific names);
+        Currently used for ``config_id`` of:
+
+        * ``"model"`` — the model identifier the ACP agent should use.
+        * ``"mode"`` — the permission / edit-approval mode (e.g.
+          ``"default"``, ``"acceptEdits"``, ``"plan"``).
+
+        The value is sent as-is.  The server decides which values it accepts;
         consult the server's config options response for the accepted list.
 
-        Verification is REQUIRED because a wrong value may silently fall back to
-        the server's default model, which may differ in cost or capability.
+        Verification is REQUIRED for ``"model"`` because a wrong value may
+        silently fall back to the server's default model, which may differ in
+        cost or capability.  For other config ids, the server's response shape
+        varies; this method still verifies when a matching configOption is
+        present, but tolerates a generic server that returns no configOptions.
 
         Two-layer exception strategy:
           • transport/protocol failure (request() raises) → TOLERATE: server may
             not implement set_config_option at all; warn and continue.
-          • server supported but value rejected or silently ignored (request() succeeds
-            but currentValue != requested) → FAIL LOUD: raise ACPClientError so the
-            caller knows the pin didn't take.  Do NOT swallow this.
+          • server supported but value rejected or silently ignored (request()
+            succeeds but currentValue != requested) → FAIL LOUD: raise
+            ACPClientError so the caller knows the pin didn't take.
         """
         assert self._client is not None
 
-        # Tolerance layer: wraps only the wire call.  Servers that do not implement
-        # set_config_option return a -32601 method-not-found error; we log and return.
+        # Tolerance layer: wraps only the wire call.  Only a -32601
+        # method-not-found error indicates the server does not implement
+        # set_config_option at all; any other JSON-RPC error code (including
+        # -32603 internal error, which Claude ACP raises when the value is
+        # rejected) is treated as "server supports the method but refused
+        # the value" and fails loud below.
         try:
             result = self._client.request(
                 _METHOD_SESSION_SET_CONFIG,
                 {
                     "sessionId": session_id,
-                    "configId": "model",
-                    "value": model,
+                    "configId": config_id,
+                    "value": value,
                 },
                 timeout=5,
             )
-        except (ACPClientError, TimeoutError, RuntimeError) as exc:
-            # Server does not support set_config_option (e.g. -32601 method-not-found)
-            # or timed out.  Tolerate: not all ACP servers expose config options.
+        except TimeoutError as exc:
+            # Transport-level timeout -- server may be slow or stuck.
+            # Tolerate: not a value rejection.
             logger.warning(
-                "ACP client: session/set_config_option not supported or timed out "
-                "(model=%r, session=%s): %s -- session continues with server default",
-                model,
+                "ACP client: session/set_config_option timed out "
+                "(configId=%s, value=%r, session=%s): %s -- session "
+                "continues with server default",
+                config_id,
+                value,
+                session_id[:8],
+                exc,
+            )
+            return
+        except ACPClientError as exc:
+            if exc.code == -32601:
+                # Method not implemented by this server.  Tolerate.
+                logger.warning(
+                    "ACP client: session/set_config_option not implemented "
+                    "by server (configId=%s, session=%s): %s -- session "
+                    "continues with server default",
+                    config_id,
+                    session_id[:8],
+                    exc,
+                )
+                return
+            # Any other error code: the server understood the call but
+            # refused the value.  Fail loud so the caller knows the pin
+            # did not take.
+            raise ACPClientError(
+                code=1,  # positive = config rejection (see run_turn)
+                message=(
+                    f"ACP {config_id} config option rejected by server "
+                    f"(code={exc.code}): {exc.message}"
+                ),
+            )
+        except RuntimeError as exc:
+            # Other runtime errors from the transport -- ambiguous, but
+            # safer to tolerate than to fail every turn on a flaky server.
+            logger.warning(
+                "ACP client: session/set_config_option transport error "
+                "(configId=%s, value=%r, session=%s): %s -- session "
+                "continues with server default",
+                config_id,
+                value,
                 session_id[:8],
                 exc,
             )
             return
 
         # Verification layer: the server responded successfully.  Extract the
-        # "model" configOption's currentValue from the response.  The response
-        # shape is: {"configOptions": [{"id": "model", "currentValue": "<server-default-model-id>", ...}]}
+        # matching configOption's currentValue from the response.  The response
+        # shape is:
+        #   {"configOptions": [{"id": "model"|"mode"|..., "currentValue": "..."}]}
         config_opts = result.get("configOptions") or []
-        model_opt = next((o for o in config_opts if o.get("id") == "model"), None)
+        opt = next((o for o in config_opts if o.get("id") == config_id), None)
 
-        if model_opt is None:
-            # Server returned a successful response but no "model" configOption.
-            # Generic ACP server -- cannot verify; proceed without confirmation.
+        if opt is None:
+            # Server returned a successful response but no matching
+            # configOption.  Generic ACP server -- cannot verify; proceed
+            # without confirmation.
             logger.warning(
-                "ACP client: set_config_option succeeded but response carried no "
-                "'model' configOption -- cannot verify pin (session=%s)",
+                "ACP client: set_config_option succeeded but response carried "
+                "no %r configOption -- cannot verify pin (session=%s)",
+                config_id,
                 session_id[:8],
             )
             return
 
-        current_value = model_opt.get("currentValue")
-        if current_value == model:
+        current_value = opt.get("currentValue")
+        if current_value == value:
             # Pin confirmed.
             logger.info(
-                "ACP client: model pinned and verified: %r on session %s",
-                model,
+                "ACP client: config %r pinned and verified: %r on session %s",
+                config_id,
+                value,
                 session_id[:8],
             )
             return
 
         # Server accepted the call but currentValue does not match the requested
-        # model.  Continuing would silently run every turn on the server's default
-        # model instead of the configured one.  Report the mismatch so the caller
-        # can fix the configured model value.
-        accepted = [o.get("value") for o in model_opt.get("options", [])]
+        # value.  Continuing would silently run every turn on the server's
+        # default.  Report the mismatch so the caller can fix the configured
+        # value.
+        accepted = [o.get("value") for o in opt.get("options", [])]
         raise ACPClientError(
             code=1,  # positive = config rejection, not a transport crash (see run_turn)
             message=(
-                f"ACP model pin rejected: requested {model!r} but server "
-                f"currentValue={current_value!r}. "
-                f"Continuing would silently run on {current_value!r} (server default) "
-                f"instead of the configured model. "
-                f"Set the model to one of the server's accepted values: {accepted}."
+                f"ACP config pin rejected: configId={config_id!r} requested "
+                f"{value!r} but server currentValue={current_value!r}. "
+                f"Continuing would silently run on {current_value!r} (server "
+                f"default) instead of the configured value. Set the value to "
+                f"one of the server's accepted values: {accepted}."
             ),
         )
+
+    # Backwards-compatible alias. Old callers/tests referenced
+    # ``_send_model_config``; keep it as a thin shim so external test suites
+    # (e.g. the plugin's pinned deps) do not break before they migrate.
+    def _send_model_config(self, session_id: str, model: str) -> None:
+        """Deprecated alias for ``_send_config_option(sid, "model", model)``."""
+        self._send_config_option(session_id, "model", model)
+
+    def set_config_option(self, config_id: str, value: str) -> None:
+        """Live-switch a config option on the existing ACP session.
+
+        Sends ``session/set_config_option`` against the session created by
+        :meth:`ensure_started` so the model or permission mode can be changed
+        at runtime **without** rebuilding the session. If the session has not
+        been started yet, this is a no-op (and a warning is logged) — callers
+        that want to set a startup pin should pass ``model`` /
+        ``permission_mode`` to :meth:`__init__` instead.
+
+        Parameters
+        ----------
+        config_id
+            One of ``"model"`` or ``"mode"`` (other server-defined ids are
+            forwarded verbatim). ``"mode"`` is the permission / edit-approval
+            mode.
+        value
+            The new value (e.g. ``"sonnet"`` or ``"acceptEdits"``).
+
+        Fault policy mirrors the startup pin (see :meth:`_send_config_option`):
+
+        * transport/protocol failure (server does not implement the method,
+          timeout) → tolerated, a warning is logged, no exception raised.
+        * server accepts the call but rejects the value (currentValue does
+          not match) → raises :class:`ACPClientError` so the caller knows the
+          switch failed.
+
+        Raises
+        ------
+        ACPClientError
+            If the server accepts the call but refuses the value. Positive
+            ``code`` (1) distinguishes this from a transport crash.
+        """
+        if self._session_id is None or self._client is None:
+            logger.warning(
+                "ACP client: set_config_option(%r, %r) called before "
+                "ensure_started() -- ignoring (no live session)",
+                config_id, value,
+            )
+            return
+        self._send_config_option(self._session_id, config_id, value)
+
+    def set_model(self, model: str) -> None:
+        """Live-switch the model on the existing session. See
+        :meth:`set_config_option`."""
+        self.set_config_option("model", model)
+
+    def set_permission_mode(self, mode: str) -> None:
+        """Live-switch the permission / edit-approval mode on the existing
+        session. See :meth:`set_config_option`."""
+        self.set_config_option("mode", mode)
 
     def close(self) -> None:
         """Send session/close and tear down the subprocess."""
