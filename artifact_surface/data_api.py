@@ -1,6 +1,6 @@
 """Read-only JSON data API for live artifacts.
 
-Four readers over Hermes sources. Each accepts its source path(s) as a parameter
+Five readers over Hermes sources. Each accepts its source path(s) as a parameter
 (defaulting to the canonical location) for testability, and fails soft: a missing
 or unreadable source yields an empty result, never an exception. A FastAPI
 APIRouter at the bottom exposes them under /api/*.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -135,6 +136,147 @@ def read_jobflow(*, submissions_dir: Optional[Path] = None) -> dict:
     }
 
 
+_BOOT_DONE_STATES = ("started", "already-up")
+_BOOT_FAIL_STATES = ("start-error", "timeout")
+
+
+def _parse_boot_ts(ts: Any) -> Optional[datetime]:
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _summarize_boot_jsonl(path: Path) -> Optional[dict]:
+    """Fold one boot-<id>.jsonl (schema v1 events: boot-start/phase/step/boot-end)
+    into a summary dict. Tolerant of BOM, blank and malformed lines."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    boot_id = path.stem[len("boot-"):] if path.stem.startswith("boot-") else path.stem
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    state = "incomplete"
+    phase = ""
+    phases: list[dict] = []
+    steps: dict[str, dict] = {}  # insertion-ordered; one entry per step name
+    for line in text.splitlines():
+        line = line.strip().lstrip("﻿")
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("ev")
+        at = ev.get("at")
+        if kind == "boot-start":
+            started_at = at
+            boot_id = ev.get("bootId") or boot_id
+        elif kind == "phase":
+            phase = ev.get("phase") or ""
+            phases.append({"phase": phase, "at": at})
+        elif kind == "boot-end":
+            finished_at = at
+            state = ev.get("state") or state
+        elif kind == "step":
+            name = ev.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            s = steps.setdefault(name, {
+                "name": name, "tier": ev.get("tier") or "",
+                "category": ev.get("category") or "",
+                "state": "running", "startedAt": at, "phase": phase,
+                "durationMs": 0, "detail": "", "offsetMs": None,
+            })
+            if ev.get("state") == "running":
+                s["startedAt"] = at
+                s["phase"] = phase
+            else:
+                s["state"] = ev.get("state") or s["state"]
+                s["durationMs"] = ev.get("durationMs") or 0
+                s["detail"] = ev.get("detail") or ""
+    if not steps and started_at is None:
+        return None
+    t0 = _parse_boot_ts(started_at)
+    for s in steps.values():
+        t = _parse_boot_ts(s["startedAt"])
+        if t0 is not None and t is not None:
+            s["offsetMs"] = int((t - t0).total_seconds() * 1000)
+    step_list = list(steps.values())
+    duration_secs = None
+    t1 = _parse_boot_ts(finished_at)
+    if t0 is not None and t1 is not None:
+        duration_secs = int((t1 - t0).total_seconds())
+    counts = {
+        "total": len(step_list),
+        "done": sum(1 for s in step_list if s["state"] in _BOOT_DONE_STATES),
+        "failed": sum(1 for s in step_list if s["state"] in _BOOT_FAIL_STATES),
+        "skipped": sum(1 for s in step_list if str(s["state"]).startswith("skipped")),
+    }
+    return {
+        "bootId": boot_id, "state": state,
+        "startedAt": started_at, "finishedAt": finished_at,
+        "durationSecs": duration_secs, "counts": counts,
+        "phases": phases, "steps": step_list,
+        "anomalies": [], "sweep": {}, "anomalyCount": 0,
+    }
+
+
+def read_boot(*, boot_dir: Optional[Path] = None,
+              progress_path: Optional[Path] = None, limit: int = 20) -> dict:
+    """Current boot-progress.json + per-boot history from the JSONL dir.
+
+    Anomalies never reach the JSONL (the sweep merges them into
+    boot-progress.json only), so each boot's anomalies come from its
+    boot-<id>.final.json snapshot (written by emit-boot-history-artifact.py)
+    or, for the boot boot-progress.json still describes, from that live file.
+    """
+    home = Path.home()
+    d = Path(boot_dir) if boot_dir else home / "architecture-map" / "boot"
+    pp = Path(progress_path) if progress_path else home / "architecture-map" / "boot-progress.json"
+    current: dict = {}
+    if pp.exists():
+        try:
+            loaded = json.loads(pp.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                current = loaded
+        except (OSError, json.JSONDecodeError):
+            current = {}
+    boots: list[dict] = []
+    if d.is_dir():
+        # bootId is yyyyMMdd-HHmmss, so reverse name order == newest first
+        for f in sorted(d.glob("boot-*.jsonl"), reverse=True)[:limit]:
+            summary = _summarize_boot_jsonl(f)
+            if summary is None:
+                continue
+            summary["jsonlPath"] = str(f)
+            merged: Optional[dict] = None
+            snap = f.with_name(f"boot-{summary['bootId']}.final.json")
+            if snap.exists():
+                try:
+                    loaded = json.loads(snap.read_text(encoding="utf-8-sig"))
+                    if isinstance(loaded, dict):
+                        merged = loaded
+                except (OSError, json.JSONDecodeError):
+                    merged = None
+            if merged is None and current.get("bootId") == summary["bootId"]:
+                merged = current
+            if merged is not None:
+                summary["anomalies"] = merged.get("anomalies") or []
+                summary["sweep"] = merged.get("sweep") or {}
+                if merged.get("state"):
+                    summary["state"] = merged["state"]
+                summary["anomalyCount"] = len(summary["anomalies"])
+            boots.append(summary)
+    return {"current": current, "boots": boots}
+
+
 def read_financier(*, workspace_dir: Optional[Path] = None) -> dict:
     ws = workspace_dir or (_root() / "profiles" / "financier" / "workspace")
     snapshot: dict = {}
@@ -177,3 +319,8 @@ async def api_jobflow() -> JSONResponse:
 @router.get("/financier")
 async def api_financier() -> JSONResponse:
     return JSONResponse(read_financier())
+
+
+@router.get("/boot")
+async def api_boot(limit: int = 20) -> JSONResponse:
+    return JSONResponse(read_boot(limit=limit))

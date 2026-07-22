@@ -5,7 +5,7 @@ Routes:
     GET /a/{artifact_id}   wrapper page embedding the artifact in a sandboxed iframe
     GET /raw/{artifact_id} the raw artifact HTML (iframe src), served with a tight CSP
     GET /api/health        JSON liveness probe (laptop-monitor)
-    GET /api/{events,cron,jobflow,financier}   read-only data (see data_api)
+    GET /api/{events,cron,jobflow,financier,boot}   read-only data (see data_api)
     /static/*              hermes-live.js + assets
 
 Loopback-only; everything is read-only. Mirrors the control_center pattern.
