@@ -320,7 +320,7 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     return False
 
 
-# ── Disabled skills ───────────────────────────────────────────────────────
+# ── Skill enable / disable policy ─────────────────────────────────────────
 
 
 _RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
@@ -366,6 +366,22 @@ def _load_raw_config() -> Dict[str, Any]:
     return parsed
 
 
+def get_enabled_skill_names() -> Set[str] | None:
+    """Return the optional ``skills.enabled`` allowlist from config.yaml.
+
+    ``None`` means the key is absent and preserves the historical unrestricted
+    behavior. An explicit empty list therefore means "load no skills".
+    """
+    parsed = _load_raw_config()
+    if not parsed:
+        return None
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict) or "enabled" not in skills_cfg:
+        return None
+    return _normalize_string_set(skills_cfg.get("enabled"))
+
+
 def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     """Read disabled skill names from config.yaml.
 
@@ -395,6 +411,11 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         or get_session_env("HERMES_SESSION_PLATFORM")
     )
     global_disabled = _normalize_string_set(skills_cfg.get("disabled"))
+    enabled = get_enabled_skill_names()
+    # An explicit allowlist wins over the global denylist when a name appears
+    # in both. Platform-specific disables remain authoritative below.
+    if enabled is not None:
+        global_disabled -= enabled
     if resolved_platform:
         platform_disabled = (skills_cfg.get("platform_disabled") or {}).get(
             resolved_platform

@@ -24,6 +24,7 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_enabled_skill_names,
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_environment,
@@ -1501,6 +1502,7 @@ def _current_session_platform_hint() -> str:
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    enabled_skill_names: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
@@ -1534,12 +1536,14 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    enabled = get_enabled_skill_names() if enabled_skill_names is None else enabled_skill_names
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
+        None if enabled is None else tuple(sorted(enabled)),
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
     )
@@ -1566,6 +1570,8 @@ def build_skills_system_prompt(
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
+            if enabled is not None and frontmatter_name not in enabled and skill_name not in enabled:
+                continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -1591,6 +1597,8 @@ def build_skills_system_prompt(
             if not is_compatible:
                 continue
             skill_name = entry["skill_name"]
+            if enabled is not None and entry["frontmatter_name"] not in enabled and skill_name not in enabled:
+                continue
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -1645,6 +1653,8 @@ def build_skills_system_prompt(
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
+                    continue
+                if enabled is not None and frontmatter_name not in enabled and skill_name not in enabled:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
                     continue

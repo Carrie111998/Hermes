@@ -95,7 +95,29 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
-## Update Behavior
+## Skill loading policy
+
+Use `skills.enabled` as an optional exact-name allowlist for lean profiles:
+
+```yaml
+skills:
+  enabled:
+    - hermes-agent-skill-authoring
+    - github
+```
+
+When omitted, Hermes preserves the historical behavior and loads all otherwise
+eligible skills. When present, only matching skill directory names or
+frontmatter `name` values are included in the skills index and prompt. An
+explicit empty list disables all skills. Existing `skills.disabled` entries
+remain honored except an explicitly enabled name wins over the global
+`disabled` list; platform-specific disables remain authoritative.
+
+Unknown names are ignored. The allowlist is read at prompt-build time and is
+part of the prompt cache key, so config changes do not reuse a stale skills
+index. Profiles can keep separate allowlists by using separate Hermes config
+homes.
+
 
 `hermes update` settings live under `updates` in `config.yaml`:
 
