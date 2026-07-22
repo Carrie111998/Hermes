@@ -442,6 +442,13 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
     normalized = os.path.normpath(_expand_tilde(path))
+    if os.sep == "\\":
+        # On Windows the read I/O shells through Git Bash, whose MSYS layer
+        # emulates /dev/* and /proc/* — normpath's backslashes must not let
+        # those aliases slip past the POSIX-string comparisons below.
+        # Drive-qualified paths (C:\dev\zero) keep their prefix and still
+        # fall through to False.
+        normalized = normalized.replace("\\", "/")
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
