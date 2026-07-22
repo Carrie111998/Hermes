@@ -510,7 +510,16 @@ class TestApprovalInjection:
             )
 
         assert captured["approval_callback"] is not None
-        assert captured["approval_callback"] is fake_cb  # passthrough (generic bridge)
+        # The generic bridge wraps the CLI callback in a dynamic bypass check,
+        # so the injected callback is not the raw object — but it delegates to
+        # it when bypass is inactive.
+        assert captured["approval_callback"] is not fake_cb
+        with patch(
+            "tools.approval.is_approval_bypass_active",
+            return_value=False,
+        ):
+            assert captured["approval_callback"]("cmd", "desc", kind="read") == "once"
+        fake_cb.assert_called()
         assert captured["auto_approve_permissions"] is True
 
     def test_callback_none_and_bypass_false_by_default(self):

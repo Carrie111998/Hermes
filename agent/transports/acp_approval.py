@@ -25,6 +25,19 @@ implement their own approval callback factory and do not use this generic
 bridge for kind routing.  See ``claude_code_acp/approval.py`` for the
 Claude-specific implementation.
 
+**Dynamic approval-bypass wrapper.**  Whichever channel is resolved above,
+``make_acp_approval_callback()`` wraps the returned callback in a bypass-aware
+wrapper that checks ``is_approval_bypass_active()`` (yolo / ``approvals.mode:
+off``) on **every** invocation — before any gateway round-trip or fail-closed
+deny.  When bypass is active the wrapper returns ``"once"`` immediately and
+skips the underlying channel.  This closes the gap where the fail-closed paths
+(gateway-without-notify and neither-channel) would deny even though the user
+had enabled yolo/bypass: those paths never reach ``_run_approval_gate``, which
+was previously the only place the bypass was checked.  The check is dynamic
+(re-evaluated per call, so a ``/yolo`` toggled after session creation is
+honored) and fail-safe (if the check itself raises, the wrapper falls through
+to the underlying callback so the approval flow is never broken by the check).
+
 ``auto_approve_permissions`` is NOT touched here — it stays driven solely by
 ``is_approval_bypass_active()`` (mode:off / yolo) in the caller.
 """
@@ -57,6 +70,14 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
     2. **Gateway context with notify** — escalate to ``request_tool_approval()``.
     3. **Neither** — fail-closed ``"deny"``.
 
+    Whichever channel is resolved, the returned callback is wrapped by
+    ``_wrap_with_bypass_check()`` so that ``is_approval_bypass_active()``
+    (yolo / ``approvals.mode: off``) is consulted on every invocation before
+    any gateway round-trip or fail-closed deny.  When bypass is active the
+    wrapper returns ``"once"`` immediately without invoking the underlying
+    channel; if the bypass check itself raises, it falls through to the
+    underlying channel (fail-safe).
+
     Returns ``None`` only when the core approval module itself is unavailable
     (import failure), so the caller falls back to the session's built-in
     fail-closed default.  In all other cases a non-None callback is returned.
@@ -75,8 +96,8 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
             "ACP approval: tools.approval import failed; "
             "returning fail-closed callback"
         )
-        return _make_fail_closed_callback(
-            "approval module unavailable"
+        return _wrap_with_bypass_check(
+            _make_fail_closed_callback("approval module unavailable")
         )
 
     # --- 1. CLI thread-local callback (existing CLI UX) ---
@@ -89,7 +110,7 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
 
     if cli_cb is not None:
         logger.debug("ACP approval: using CLI callback (passthrough)")
-        return cli_cb
+        return _wrap_with_bypass_check(cli_cb)
 
     # --- 2. Gateway context ---
     is_gateway = _is_gateway_approval_context()
@@ -109,8 +130,10 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
                 "(session=%s) — using request_tool_approval bridge",
                 session_key[:16] if session_key else "?",
             )
-            return _make_gateway_request_callback(
-                request_fn=request_tool_approval,
+            return _wrap_with_bypass_check(
+                _make_gateway_request_callback(
+                    request_fn=request_tool_approval,
+                )
             )
         else:
             logger.debug(
@@ -118,8 +141,10 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
                 "(session=%s) — fail-closed",
                 session_key[:16] if session_key else "?",
             )
-            return _make_fail_closed_callback(
-                "gateway session has no approval notify channel"
+            return _wrap_with_bypass_check(
+                _make_fail_closed_callback(
+                    "gateway session has no approval notify channel"
+                )
             )
 
     # --- 3. Neither CLI nor gateway ---
@@ -127,9 +152,67 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
         "ACP approval: no CLI callback and not a gateway context — "
         "fail-closed"
     )
-    return _make_fail_closed_callback(
-        "no interactive CLI or gateway approval channel available"
+    return _wrap_with_bypass_check(
+        _make_fail_closed_callback(
+            "no interactive CLI or gateway approval channel available"
+        )
     )
+
+
+# --------------------------------------------------------------------------- #
+# Internal: dynamic approval-bypass wrapper
+# --------------------------------------------------------------------------- #
+
+
+def _wrap_with_bypass_check(inner: Callable[..., str]) -> Callable[..., str]:
+    """Wrap an approval callback with a dynamic approval-bypass check.
+
+    On **every** invocation, before any gateway round-trip or fail-closed deny,
+    check ``is_approval_bypass_active()`` (yolo / ``approvals.mode: off``).  If
+    bypass is active, auto-approve with ``"once"`` and skip ``inner`` entirely.
+
+    The check is:
+
+    * **Dynamic** — re-evaluated on each call (not baked in at factory time),
+      so a ``/yolo`` toggled after the session/callback was created is honored.
+    * **Fail-safe** — if importing or calling ``is_approval_bypass_active``
+      raises, fall through to ``inner`` so the bypass check can never break the
+      approval flow.
+    """
+
+    def _bypass_aware_callback(
+        command_label: str,
+        description: str,
+        *,
+        allow_permanent: bool = False,
+        kind: str = "",
+        **kwargs,
+    ) -> str:
+        try:
+            from tools.approval import is_approval_bypass_active
+
+            if is_approval_bypass_active():
+                logger.debug(
+                    "ACP approval: bypass active (yolo/mode=off) — "
+                    "auto-approve %r (kind=%r)",
+                    command_label,
+                    kind,
+                )
+                return "once"
+        except Exception:
+            logger.debug(
+                "ACP approval: bypass check failed; falling through",
+                exc_info=True,
+            )
+        return inner(
+            command_label,
+            description,
+            allow_permanent=allow_permanent,
+            kind=kind,
+            **kwargs,
+        )
+
+    return _bypass_aware_callback
 
 
 # --------------------------------------------------------------------------- #
