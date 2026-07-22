@@ -4,8 +4,8 @@
   "case_delta_nonzero": {},
   "chat_count": 4,
   "conservation": {
-    "inbox_rows_after": 3172,
-    "inbox_rows_before": 3172,
+    "inbox_rows_after": 3174,
+    "inbox_rows_before": 3174,
     "preserved": true
   },
   "cutoff": "2026-07-19T16:00:00+00:00",
@@ -32,23 +32,23 @@
     15,
     16,
     34,
-    191
+    193
   ],
   "processed_count": 0,
   "reconciliation": {
     "completed": 0,
     "processing_before": 0,
     "requeued": 0,
-    "row_total_after": 3172,
-    "row_total_before": 3172,
+    "row_total_after": 3174,
+    "row_total_before": 3174,
     "unresolved": []
   },
-  "run_id": "tgg-window-dryrun-20260722-v2",
-  "selected_ids_sha256": "f338a19d09481e85a4f8703ef88da8b4579d3af668ddec9373812063b54805df",
-  "selected_total": 256,
+  "run_id": "tgg-window-dryrun-20260722-v3",
+  "selected_ids_sha256": "b156f6e79d723329b77e40092a647ba69ec8f9e17c2c827180ed09fc69b39d6e",
+  "selected_total": 258,
   "statuses": {
     "completed": 1,
-    "pending": 255
+    "pending": 257
   },
   "test_result": {
     "failed": 0,
