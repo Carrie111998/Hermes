@@ -2139,6 +2139,9 @@ def test_offline_interactive_fixture_records_frames_exit_and_delayed_index(
         "FAKE_CLAUDE_SCENARIO": "delayed_transcript_indexing",
         "FAKE_CLAUDE_INDEX_DELAY": "0.01",
     }
+    # A host entrypoint (e.g. a desktop-launched runner) would be recorded in the
+    # fixture's spawn event and break the exact-equality assertion below.
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     process = subprocess.Popen(
         [sys.executable, str(fixture), "--session-id", "offline-uuid"],
         cwd=tmp_path,
