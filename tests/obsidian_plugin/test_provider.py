@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 from plugins.memory.obsidian import ObsidianMemoryProvider
@@ -47,3 +48,23 @@ def test_index_db_created_outside_vault(tmp_path):
 def test_get_tool_schemas_empty_in_phase_a(tmp_path):
     vault = tmp_path / "vault"; vault.mkdir()
     assert _provider(tmp_path, vault).get_tool_schemas() == []
+
+
+def test_prefetch_works_from_background_thread(tmp_path):
+    # Reproduces the MemoryManager per-turn background-thread prefetch.
+    vault = tmp_path / "vault"
+    (vault / "forsakringar").mkdir(parents=True)
+    (vault / "forsakringar" / "bil.md").write_text(
+        "# Bilförsäkring\nFolksam helförsäkring", encoding="utf-8"
+    )
+    p = ObsidianMemoryProvider(config={"vault_path": str(vault), "top_k": 3})
+    p.initialize(session_id="s", hermes_home=str(tmp_path))  # init on THIS thread
+
+    result = {}
+
+    def _bg():
+        result["out"] = p.prefetch("bilförsäkring folksam")  # prefetch on ANOTHER thread
+
+    t = threading.Thread(target=_bg)
+    t.start(); t.join()
+    assert "Bilförsäkring" in result["out"] or "Folksam" in result["out"]

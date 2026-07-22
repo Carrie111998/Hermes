@@ -34,7 +34,8 @@ def _load_plugin_config() -> dict:
         with open(config_path, encoding="utf-8-sig") as f:
             all_config = yaml.safe_load(f) or {}
         return cfg_get(all_config, "plugins", "obsidian", default={}) or {}
-    except Exception:
+    except Exception as exc:
+        logger.debug("obsidian plugin config load failed: %s", exc)
         return {}
 
 
@@ -60,8 +61,9 @@ class ObsidianMemoryProvider(MemoryProvider):
             self._index.sync_vault(
                 self._cfg.vault_path, exclude_dirs=self._cfg.exclude_dirs
             )
-        except OSError:
-            pass  # vault unreadable — provider degrades to empty recall
+        except OSError as exc:
+            logger.warning("obsidian vault sync failed: %s", exc)
+            # vault unreadable — provider degrades to empty recall
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return []  # Phase A: context-only, no tools
@@ -71,7 +73,8 @@ class ObsidianMemoryProvider(MemoryProvider):
             return ""
         try:
             hits = self._index.search(query, top_k=self._cfg.top_k)
-        except Exception:
+        except Exception as exc:
+            logger.warning("obsidian prefetch failed: %s", exc)
             return ""
         if not hits:
             return ""
