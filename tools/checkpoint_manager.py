@@ -1136,17 +1136,6 @@ class CheckpointManager:
             return
         _run_git(["update-ref", ref, new_parent], store, working_dir)
 
-        # Reclaim objects from the dropped commits.
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, working_dir,
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, working_dir, timeout=_GIT_TIMEOUT * 3,
-        )
-        _repair_bare_repo_dirs(store)
-
     def _enforce_size_cap(self, store: Path) -> None:
         """If total store size exceeds ``max_total_size_mb``, drop oldest
         checkpoints across ALL projects until under the cap.
