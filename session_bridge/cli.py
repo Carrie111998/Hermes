@@ -33,6 +33,7 @@ from .characterize import (
     claim_claude_visibility_characterization_abort,
     characterize_claude_visibility,
     cleanup_characterized_claude_visibility,
+    load_codex_characterization_origins,
     retire_aborted_claude_visibility_characterization,
     run_live_characterization,
 )
@@ -2022,7 +2023,13 @@ class ProductionBackend:
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
             self._codex_client = CodexAppServerClient(codex_bin=codex_command[0])
-        codex = CodexSourceAdapter(self._codex_client, marker_secret=marker_secret)
+        codex = CodexSourceAdapter(
+            self._codex_client,
+            marker_secret=marker_secret,
+            trusted_origins=lambda: load_codex_characterization_origins(
+                marker_secret=marker_secret
+            ),
+        )
         page = codex.list_claude_visibility_sources(
             after=after,
             state_db_only=state_db_only,
@@ -2049,9 +2056,11 @@ class ProductionBackend:
         if provider != "all":
             raise ConfigurationFailure("characterization_requires_all_providers")
         try:
+            marker_key = resolve_marker_key()
             with _temporary_environment("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1"):
                 report_path = run_live_characterization(
                     claude_projects_root=_CLAUDE_PROJECTS_ROOT,
+                    provenance_secret=marker_key,
                 )
             gate = resolve_characterization_gate()
         except LiveCharacterizationError as exc:
@@ -2332,7 +2341,11 @@ class ProductionBackend:
                         codex_bin=codex_command[0]
                     )
                 codex_source = CodexSourceAdapter(
-                    self._codex_client, marker_secret=marker_key
+                    self._codex_client,
+                    marker_secret=marker_key,
+                    trusted_origins=lambda: load_codex_characterization_origins(
+                        marker_secret=marker_key
+                    ),
                 )
                 source_adapters[Provider.CODEX] = codex_source
             target_adapters: dict[Provider, object] = {}

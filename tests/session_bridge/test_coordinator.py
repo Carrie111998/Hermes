@@ -69,6 +69,7 @@ _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
 _CLAUDE_PROGRESS_KEY = "session-bridge:scan:claude:progress"
 _CODEX_PENDING_KEY = "session-bridge:scan:codex:pending"
 _CODEX_PROGRESS_KEY = "session-bridge:scan:codex:progress"
+_CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
 _ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
 
 
@@ -368,7 +369,14 @@ class _BacklogCodexAdapter:
     def project_thread(self, summary: CodexThreadSummary) -> SessionProjection:
         self.projected_native_ids.append(summary.native_id)
         self.operations.append(("project", summary.native_id))
-        return _scan_projection(Provider.CODEX, summary.native_id)
+        projection = _scan_projection(Provider.CODEX, summary.native_id)
+        if summary.trusted_origin_bridge_id is None:
+            return projection
+        return replace(
+            projection,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=summary.trusted_origin_bridge_id,
+        )
 
 
 class _FullHistoryClaudeAdapter:
@@ -2015,6 +2023,89 @@ async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_los
         "indexed_total": 3,
         "remaining": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_codex_scan_revisits_cataloged_native_when_trusted_origin_appears() -> (
+    None
+):
+    native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    bridge_id = "characterization-11111111-1111-4111-8111-111111111111-codex"
+    summary = CodexThreadSummary(
+        **{
+            **_codex_summary(native_id, 300.0).__dict__,
+            "trusted_origin_bridge_id": bridge_id,
+        }
+    )
+    operations: list[tuple[object, ...]] = []
+
+    class CatalogedNativeStore(_StateStore):
+        def get_external_session(self, session_id: str) -> dict[str, Any] | None:
+            if session_id != f"codex:{native_id}":
+                return None
+            return {
+                "session_id": session_id,
+                "provider": Provider.CODEX.value,
+                "native_id": native_id,
+                "origin_kind": OriginKind.NATIVE.value,
+                "origin_bridge_id": None,
+            }
+
+    store = CatalogedNativeStore(operations, existing_native_ids={native_id})
+    store.states[_CODEX_SEEN_KEY] = {"version": 1, "native_ids": [native_id]}
+    adapter = _BacklogCodexAdapter(
+        inventory_batches=[[summary], []],
+        summaries_by_native_id={native_id: summary},
+        operations=operations,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: adapter},
+    )
+
+    result = await coordinator.scan_once(Provider.CODEX)
+
+    assert result.discovered == 1
+    assert result.indexed == 1
+    assert result.failed == 0
+    assert store.upsert_attempts == [native_id]
+    assert store.projections[0].origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+    assert store.projections[0].origin_bridge_id == bridge_id
+
+
+@pytest.mark.asyncio
+async def test_codex_scan_does_not_trust_seen_cache_without_catalog_provenance() -> (
+    None
+):
+    native_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    bridge_id = "characterization-22222222-2222-4222-8222-222222222222-codex"
+    summary = CodexThreadSummary(
+        **{
+            **_codex_summary(native_id, 300.0).__dict__,
+            "trusted_origin_bridge_id": bridge_id,
+        }
+    )
+    operations: list[tuple[object, ...]] = []
+    store = _StateStore(operations, existing_native_ids={native_id})
+    store.states[_CODEX_SEEN_KEY] = {"version": 1, "native_ids": [native_id]}
+    adapter = _BacklogCodexAdapter(
+        inventory_batches=[[summary], []],
+        summaries_by_native_id={native_id: summary},
+        operations=operations,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: adapter},
+    )
+
+    result = await coordinator.scan_once(Provider.CODEX)
+
+    assert result.discovered == 1
+    assert result.indexed == 1
+    assert store.projections[0].origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+    assert store.projections[0].origin_bridge_id == bridge_id
 
 
 @pytest.mark.asyncio

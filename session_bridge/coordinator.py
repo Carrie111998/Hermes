@@ -2951,18 +2951,20 @@ class SessionBridgeCoordinator:
             {"version": 1, "native_ids": sorted(native_ids)},
         )
 
-    async def _cataloged_codex_ids(self, native_ids: Sequence[str]) -> set[str]:
+    async def _cataloged_codex_rows(
+        self, native_ids: Sequence[str]
+    ) -> dict[str, Mapping[str, Any]]:
         reader = getattr(self._store, "get_external_session", None)
         if not callable(reader):
-            return set()
-        cataloged: set[str] = set()
+            return {}
+        cataloged: dict[str, Mapping[str, Any]] = {}
         for native_id in native_ids:
             row = await asyncio.to_thread(
                 reader,
                 canonical_session_id(Provider.CODEX, native_id),
             )
             if isinstance(row, Mapping):
-                cataloged.add(native_id)
+                cataloged[native_id] = row
         return cataloged
 
     async def _load_continuation_reconcile_cursor(self) -> str | None:
@@ -3806,12 +3808,34 @@ class SessionBridgeCoordinator:
             inventory_ids.append(native_id)
 
         seen_ids = await self._load_codex_seen_ids()
-        cataloged_ids = await self._cataloged_codex_ids(inventory_ids)
+        cataloged_rows = await self._cataloged_codex_rows(inventory_ids)
+        cataloged_ids = set(cataloged_rows)
         genuinely_new_ids = [
             native_id
             for native_id in inventory_ids
             if native_id not in seen_ids and native_id not in cataloged_ids
         ]
+        trusted_origin_changed_ids: list[str] = []
+        for native_id in inventory_ids:
+            summary = summaries_by_native_id[native_id]
+            trusted_bridge_id = getattr(
+                summary, "trusted_origin_bridge_id", None
+            )
+            if trusted_bridge_id is None:
+                continue
+            cataloged = cataloged_rows.get(native_id)
+            if cataloged is None:
+                trusted_origin_changed_ids.append(native_id)
+                continue
+            if (
+                cataloged.get("origin_bridge_id") != trusted_bridge_id
+                or cataloged.get("origin_kind")
+                not in {
+                    OriginKind.BRIDGE_PLACEHOLDER.value,
+                    OriginKind.BRIDGE_CONTINUATION.value,
+                }
+            ):
+                trusted_origin_changed_ids.append(native_id)
         backfill_processed = await self._load_backfill_processed(
             provider,
             discovery_mode,
@@ -3828,6 +3852,7 @@ class SessionBridgeCoordinator:
         staged_ids = _merge_native_ids(
             backfill_ids,
             genuinely_new_ids,
+            trusted_origin_changed_ids,
             pending_ids,
         )
         await self._save_pending(provider, staged_ids)

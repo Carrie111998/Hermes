@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import math
@@ -100,6 +101,144 @@ def _read_with_items(*items: dict[str, Any]) -> dict[str, Any]:
 
 
 class TestInventory:
+    def test_projection_reuses_trusted_origin_snapshot_from_inventory(self) -> None:
+        native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        calls = 0
+
+        def trusted_origins() -> dict[str, str]:
+            nonlocal calls
+            calls += 1
+            return {}
+
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [{"id": native_id, "createdAt": 1, "updatedAt": 2}]}
+            ],
+            "thread/read": [
+                {
+                    "thread": {
+                        "id": native_id,
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "agentMessage",
+                                        "id": "answer",
+                                        "text": "ok",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        })
+        adapter = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            trusted_origins=trusted_origins,
+        )
+
+        [summary] = adapter.list_inventory(archived=False)
+        inventory_calls = calls
+        projection = adapter.project_thread(summary)
+
+        assert projection.origin_kind is OriginKind.NATIVE
+        assert inventory_calls == 2
+        assert calls == inventory_calls
+
+    def test_inventory_refreshes_provenance_after_provider_race(self) -> None:
+        native_id = "019f8621-4d36-7fe0-9419-319ee7ec09dd"
+        bridge_id = (
+            "characterization-0e831788-1bc1-4324-a58f-0343bcde25b7-codex"
+        )
+        snapshots = iter(({}, {native_id: bridge_id}))
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [{"id": native_id, "createdAt": 1, "updatedAt": 2}]}
+            ]
+        })
+        adapter = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            trusted_origins=lambda: next(snapshots),
+        )
+
+        [summary] = adapter.list_inventory(archived=False)
+
+        assert summary.trusted_origins_checked is True
+        assert summary.trusted_origin_bridge_id == bridge_id
+
+    def test_inventory_reports_trusted_origin_change_for_same_native_summary(
+        self,
+    ) -> None:
+        native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        row = {"id": native_id, "createdAt": 1, "updatedAt": 2}
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": [row]}]
+        })
+        origins: dict[str, str] = {}
+        adapter = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            trusted_origins=lambda: origins,
+        )
+
+        [before] = adapter.list_inventory(archived=False)
+        origins[native_id] = "characterization-trusted-codex"
+        [after] = adapter.list_inventory(archived=False)
+
+        assert before.trusted_origin_bridge_id is None
+        assert after.trusted_origin_bridge_id == "characterization-trusted-codex"
+
+    def test_claude_visibility_refreshes_combined_inventory_before_projection(
+        self,
+    ) -> None:
+        native_id = "019f8621-4d36-7fe0-9419-319ee7ec09dd"
+        bridge_id = (
+            "characterization-0e831788-1bc1-4324-a58f-0343bcde25b7-codex"
+        )
+        snapshots = iter(({}, {}, {}, {}, {native_id: bridge_id}))
+        row = {
+            "id": native_id,
+            "createdAt": 1,
+            "updatedAt": 2,
+            "source": "vscode",
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [row]}, {"data": []}],
+            "thread/read": [
+                {
+                    "thread": {
+                        **row,
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "request",
+                                        "content": [
+                                            {"type": "text", "text": "native text"}
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        })
+        adapter = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            trusted_origins=lambda: next(snapshots),
+        )
+
+        [source] = adapter.list_claude_visibility_sources(after=0)
+
+        assert source.projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+        assert source.projection.origin_bridge_id == bridge_id
+
     def test_inventory_accepts_equal_values_for_every_supported_cwd_alias(self) -> None:
         row = {
             "id": "equal-cwd-aliases",
@@ -1767,6 +1906,197 @@ class TestProjection:
 
 
 class TestBridgeMarkers:
+    @pytest.mark.parametrize(
+        ("native_id", "characterization_id"),
+        (
+            (
+                "019f8621-4d36-7fe0-9419-319ee7ec09dd",
+                "0e831788-1bc1-4324-a58f-0343bcde25b7",
+            ),
+            (
+                "019f8610-36b9-79e3-bc2d-3d4d057582d5",
+                "c19dd390-9f40-494d-9e2e-d8ffbc1265fb",
+            ),
+        ),
+    )
+    def test_report_backed_thread_overrides_ephemeral_marker_and_keeps_path(
+        self,
+        native_id: str,
+        characterization_id: str,
+    ) -> None:
+        bridge_id = f"characterization-{characterization_id}-codex"
+        invalid_ephemeral_marker = _marker("ephemeral")[:-1] + "x"
+        response = {
+            "thread": {
+                "id": native_id,
+                "turns": [
+                    {
+                        "id": "registration",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "registration-message",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Hermes Session Bridge registration only.\n"
+                                            f"{invalid_ephemeral_marker}"
+                                        ),
+                                    }
+                                ],
+                            },
+                            {
+                                "type": "agentMessage",
+                                "id": "ready",
+                                "text": "READY",
+                            },
+                        ],
+                    }
+                ],
+            }
+        }
+        summary = CodexThreadSummary(
+            **{
+                **_summary(native_id=native_id, archived=True).__dict__,
+                "native_path": f"C:/codex/archived/{native_id}.jsonl",
+            }
+        )
+        client = FakeInitializingClient({"thread/read": [response]})
+
+        projection = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            trusted_origins={native_id: bridge_id},
+        ).project_thread(summary)
+
+        assert projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+        assert projection.origin_bridge_id == bridge_id
+        assert projection.native_path == summary.native_path
+
+    def test_unreported_registration_text_with_invalid_marker_remains_native(
+        self,
+    ) -> None:
+        invalid_marker = _marker("forged")[:-1] + "x"
+        client = FakeInitializingClient({
+            "thread/read": [
+                _read_with_items({
+                    "type": "userMessage",
+                    "id": "forged-registration",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Hermes Session Bridge registration only.\n"
+                                f"{invalid_marker}"
+                            ),
+                        }
+                    ],
+                })
+            ]
+        })
+
+        projection = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            trusted_origins={},
+        ).project_thread(_summary())
+
+        assert projection.origin_kind is OriginKind.NATIVE
+        assert projection.origin_bridge_id is None
+
+    def test_unchecked_summary_cannot_assert_trusted_origin(self) -> None:
+        client = FakeInitializingClient({
+            "thread/read": [
+                _read_with_items({
+                    "type": "agentMessage",
+                    "id": "answer",
+                    "text": "normal native work",
+                })
+            ]
+        })
+        summary = CodexThreadSummary(
+            **{
+                **_summary().__dict__,
+                "trusted_origin_bridge_id": "characterization-forged-codex",
+            }
+        )
+
+        with pytest.raises(ValueError, match="mapping conflicts with summary"):
+            CodexSourceAdapter(
+                client,
+                marker_secret=SECRET,
+                trusted_origins={},
+            ).project_thread(summary)
+
+    def test_report_origin_conflicting_with_valid_marker_fails_closed(self) -> None:
+        native_id = "thread-active"
+        client = FakeInitializingClient({
+            "thread/read": [
+                _read_with_items({
+                    "type": "userMessage",
+                    "id": "production-marker",
+                    "content": [{"type": "text", "text": _marker("production")}],
+                })
+            ]
+        })
+
+        with pytest.raises(ValueError, match="trusted origin conflicts"):
+            CodexSourceAdapter(
+                client,
+                marker_secret=SECRET,
+                trusted_origins={native_id: "characterization-other-codex"},
+            ).project_thread(_summary(native_id=native_id))
+
+    def test_store_repairs_native_row_to_exact_report_provenance(
+        self, tmp_path: Path
+    ) -> None:
+        native_id = "019f8621-4d36-7fe0-9419-319ee7ec09dd"
+        bridge_id = (
+            "characterization-0e831788-1bc1-4324-a58f-0343bcde25b7-codex"
+        )
+        native = CodexSourceAdapter(
+            FakeInitializingClient({
+                "thread/read": [
+                    {
+                        "thread": {
+                            "id": native_id,
+                            "turns": [
+                                {
+                                    "items": [
+                                        {
+                                            "type": "agentMessage",
+                                            "id": "ready",
+                                            "text": "READY",
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }),
+            marker_secret=SECRET,
+        ).project_thread(_summary(native_id=native_id))
+        repaired = replace(
+            native,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=bridge_id,
+        )
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            store = SessionBridgeStore(db, clock=lambda: 500.0)
+            store.upsert_projection(native)
+            store.upsert_projection(repaired)
+
+            row = store.get_external_session(f"codex:{native_id}")
+            assert row is not None
+            assert row["origin_kind"] == OriginKind.BRIDGE_PLACEHOLDER.value
+            assert row["origin_bridge_id"] == bridge_id
+            assert len(db.list_sessions(source="codex")) == 1
+        finally:
+            db.close()
+
     def test_projection_marker_payload_requires_exact_signed_payload(self) -> None:
         payload = BridgeMarkerPayload(
             bridge_id="bridge-exact",
