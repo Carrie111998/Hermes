@@ -61,6 +61,7 @@ import {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
+  isGatewayAuthRejection,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
@@ -7543,7 +7544,9 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       }
     }
 
-    const err = new Error(error.message) as any
+    const err = new Error(error.message, { cause: error }) as any
+
+    err.kind = error.kind || 'unknown'
     err.sshError = error.kind || 'unknown'
     err.isSshBootstrap = true
     throw err
