@@ -1653,6 +1653,7 @@ async def process_live_records(
     config_path: Path,
     state_db: Path,
     runner: Any | None = None,
+    defer_provider_errors: bool = False,
 ) -> dict[str, Any]:
     """Process live durable records through the replay orchestrator.
 
@@ -1718,25 +1719,45 @@ async def process_live_records(
         )
     )
     handled: list[dict[str, Any]] = []
+    provider_errors: list[str] = []
     for row in _turn_rows(state_db, replay_run_id=run_id):
-        turn_id = _assert_completed_turn(
-            row,
-            provider=provider,
-            model=model,
-            require_response=False,
-        )
+        try:
+            turn_id = _assert_completed_turn(
+                row,
+                provider=provider,
+                model=model,
+                require_response=False,
+            )
+        except ConsumerError as exc:
+            detail = str(exc)
+            try:
+                error_payload = json.loads(row["error_json"] or "null")
+            except (TypeError, ValueError, KeyError, IndexError):
+                error_payload = None
+            if error_payload:
+                detail = f"{detail}: {json.dumps(error_payload, sort_keys=True)}"
+            provider_errors.append(detail)
+            continue
         try:
             refs = json.loads(row["message_refs_json"] or "[]")
         except (TypeError, ValueError, KeyError, IndexError):
             refs = []
         ids = [str(ref) for ref in refs if ref]
         handled.append({"message_ids": ids, "turn_id": turn_id})
+    captured_outbound = [dict(entry) for entry in result.outbound]
+    if not handled and not provider_errors:
+        captured_error = _captured_provider_error(captured_outbound)
+        if captured_error:
+            provider_errors.append(captured_error)
+    if provider_errors and not defer_provider_errors:
+        raise ConsumerError(provider_errors[0])
     return {
         "provider": provider,
         "model": model,
         "processed": int(result.processed or 0),
         "handled": handled,
-        "captured_outbound": [dict(entry) for entry in result.outbound],
+        "captured_outbound": captured_outbound,
+        "provider_errors": provider_errors,
         "outbound_sent": 0,
         "submitted_message_ids": [record.message_id for record in records],
     }
@@ -1795,6 +1816,69 @@ def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
         "content": content,
         "reply_to": str(reply_to) if reply_to else None,
     }
+
+
+def _captured_provider_error(
+    captured_outbound: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Return a provider/model error notice captured instead of a PA turn."""
+    markers = (
+        "authenticationerror",
+        "missing authentication header",
+        "http 401",
+        "provider error",
+        "model error",
+    )
+    for entry in captured_outbound:
+        parsed = _parse_captured_send(entry)
+        if parsed is None:
+            continue
+        body = str(parsed["content"]).strip()
+        lowered = body.lower()
+        if any(marker in lowered for marker in markers):
+            return body
+    return None
+
+
+def _captured_audit_entries(
+    captured_outbound: Sequence[Mapping[str, Any]],
+    *,
+    batch: Sequence[InboxRecord],
+    handled: Sequence[Mapping[str, Any]],
+    start_index: int,
+) -> list[dict[str, Any]]:
+    """Normalize captured bodies while retaining the adapter's raw metadata."""
+    batch_message_ids = [record.message_id for record in batch]
+    batch_chat_ids = sorted({record.chat_id for record in batch})
+    turn_ids = sorted(
+        {
+            str(group.get("turn_id"))
+            for group in handled
+            if group.get("turn_id")
+        }
+    )
+    normalized: list[dict[str, Any]] = []
+    for offset, entry in enumerate(captured_outbound):
+        parsed = _parse_captured_send(entry)
+        raw = dict(entry)
+        normalized.append(
+            {
+                "capture_index": start_index + offset,
+                "kind": str(entry.get("kind") or ""),
+                "chat_id": (
+                    str(parsed["chat_id"])
+                    if parsed is not None
+                    else str(entry.get("chat_id") or "") or None
+                ),
+                "batch_chat_ids": batch_chat_ids,
+                "message_ids": batch_message_ids,
+                "turn_ids": turn_ids,
+                "reply_to": parsed.get("reply_to") if parsed is not None else None,
+                "body": parsed.get("content") if parsed is not None else None,
+                "raw": raw,
+            }
+        )
+    return normalized
 
 
 def _parse_captured_media(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2169,11 +2253,35 @@ def _write_status(path: Path, payload: Mapping[str, Any]) -> None:
     _atomic_write_json(path, {"version": 1, "updated_at": _utc_now(), **dict(payload)})
 
 
-def _new_gateway_runner() -> Any:
+@contextlib.contextmanager
+def _runtime_config_context(config_path: Path | None):
+    """Bind config loading to the explicit Hermes runtime home."""
+    if config_path is None:
+        yield
+        return
+    resolved = config_path.resolve()
+    if resolved.name != "config.yaml":
+        raise ConsumerError(
+            "explicit Hermes runtime config must be named config.yaml: "
+            f"{resolved}"
+        )
+    previous = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(resolved.parent)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
+
+
+def _new_gateway_runner(config_path: Path | None = None) -> Any:
     from gateway.config import load_gateway_config
     from gateway.run import GatewayRunner
 
-    return GatewayRunner(load_gateway_config())
+    with _runtime_config_context(config_path):
+        return GatewayRunner(load_gateway_config())
 
 
 async def _process_claimed_chat_batch(
@@ -2795,6 +2903,7 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
             "outbound_sent": 0,
             "processed_message_ids": processed,
             "captured_outbound": 0,
+            "captured_outbound_entries": [],
             "mutations": mutations,
         }
         case_before: dict[str, int] | None = None
@@ -2838,74 +2947,97 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                 for record in pending:
                     grouped.setdefault(record.chat_id, []).append(record)
                 ordered = sorted(grouped.items(), key=lambda item: item[1][0].seq)
-                runner = _new_gateway_runner()
-                for chat_id, chat_records in ordered:
-                    for start in range(0, len(chat_records), batch_size):
-                        batch = chat_records[start : start + batch_size]
-                        inbox.claim(batch)
-                        try:
-                            result = await process_live_records(
-                                batch,
-                                config_path=config_path,
-                                state_db=state_db,
-                                runner=runner,
-                            )
-                            submitted = {
-                                str(value)
-                                for value in result.get("submitted_message_ids") or []
-                            }
-                            expected = {record.message_id for record in batch}
-                            if submitted != expected:
-                                raise ConsumerError(
-                                    "bounded processor evidence mismatch"
+                with _runtime_config_context(config_path):
+                    runner = _new_gateway_runner(config_path)
+                    for chat_id, chat_records in ordered:
+                        for start in range(0, len(chat_records), batch_size):
+                            batch = chat_records[start : start + batch_size]
+                            inbox.claim(batch)
+                            try:
+                                result = await process_live_records(
+                                    batch,
+                                    config_path=config_path,
+                                    state_db=state_db,
+                                    runner=runner,
+                                    defer_provider_errors=True,
                                 )
-                            if int(result.get("outbound_sent") or 0) != 0:
-                                raise ConsumerError(
-                                    "capture-only invariant violated: outbound sent"
+                                batch_captures = _captured_audit_entries(
+                                    result.get("captured_outbound") or [],
+                                    batch=batch,
+                                    handled=result.get("handled") or [],
+                                    start_index=captured,
                                 )
-                            turn_for_message: dict[str, str] = {}
-                            for group in result.get("handled") or []:
-                                for message_id in group.get("message_ids") or []:
-                                    turn_for_message[str(message_id)] = str(
-                                        group.get("turn_id") or ""
-                                    )
-                            if set(turn_for_message) - expected:
-                                raise ConsumerError(
-                                    "bounded turn evidence escaped selected batch"
-                                )
-                            inbox.finish_processed_batch(
-                                batch, turn_for_message=turn_for_message
-                            )
-                            processed.extend(record.message_id for record in batch)
-                            captured += len(result.get("captured_outbound") or [])
-                            mutations.append(
-                                {
-                                    "status": "completed",
-                                    "chat_id": chat_id,
-                                    "message_ids": [
-                                        record.message_id for record in batch
-                                    ],
-                                    "completed": len(turn_for_message),
-                                    "skipped": len(batch) - len(turn_for_message),
-                                    "captured_outbound": len(
+                                audit["captured_outbound_entries"].extend(batch_captures)
+                                captured += len(batch_captures)
+                                audit["captured_outbound"] = captured
+                                provider_errors = [
+                                    str(value)
+                                    for value in result.get("provider_errors") or []
+                                    if str(value).strip()
+                                ]
+                                if not provider_errors and not result.get("handled"):
+                                    captured_error = _captured_provider_error(
                                         result.get("captured_outbound") or []
-                                    ),
+                                    )
+                                    if captured_error:
+                                        provider_errors.append(captured_error)
+                                if provider_errors:
+                                    raise ConsumerError(provider_errors[0])
+                                submitted = {
+                                    str(value)
+                                    for value in result.get("submitted_message_ids") or []
                                 }
-                            )
-                            audit["captured_outbound"] = captured
-                        except Exception as exc:
-                            inbox.finish(batch, status="failed", error=str(exc))
-                            mutations.append(
-                                {
-                                    "status": "failed",
-                                    "chat_id": chat_id,
-                                    "message_ids": [
-                                        record.message_id for record in batch
-                                    ],
-                                    "error_class": type(exc).__name__,
-                                }
-                            )
-                            raise
+                                expected = {record.message_id for record in batch}
+                                if submitted != expected:
+                                    raise ConsumerError(
+                                        "bounded processor evidence mismatch"
+                                    )
+                                if int(result.get("outbound_sent") or 0) != 0:
+                                    raise ConsumerError(
+                                        "capture-only invariant violated: outbound sent"
+                                    )
+                                turn_for_message: dict[str, str] = {}
+                                for group in result.get("handled") or []:
+                                    for message_id in group.get("message_ids") or []:
+                                        turn_for_message[str(message_id)] = str(
+                                            group.get("turn_id") or ""
+                                        )
+                                if set(turn_for_message) - expected:
+                                    raise ConsumerError(
+                                        "bounded turn evidence escaped selected batch"
+                                    )
+                                inbox.finish_processed_batch(
+                                    batch, turn_for_message=turn_for_message
+                                )
+                                processed.extend(record.message_id for record in batch)
+                                mutations.append(
+                                    {
+                                        "status": "completed",
+                                        "chat_id": chat_id,
+                                        "message_ids": [
+                                            record.message_id for record in batch
+                                        ],
+                                        "completed": len(turn_for_message),
+                                        "skipped": len(batch) - len(turn_for_message),
+                                        "captured_outbound": len(
+                                            result.get("captured_outbound") or []
+                                        ),
+                                    }
+                                )
+                            except Exception as exc:
+                                inbox.requeue(batch, reason=f"bounded-retry: {exc}")
+                                mutations.append(
+                                    {
+                                        "status": "retryable",
+                                        "chat_id": chat_id,
+                                        "message_ids": [
+                                            record.message_id for record in batch
+                                        ],
+                                        "error_class": type(exc).__name__,
+                                        "error": str(exc),
+                                    }
+                                )
+                                raise
 
             case_after = _sqlite_table_counts(case_db)
             row_total_after = inbox.total()
@@ -2940,6 +3072,7 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
             return 0
         except Exception as exc:
             failures.append(type(exc).__name__)
+            audit["error"] = str(exc)
             audit["captured_outbound"] = captured
             if case_before is not None:
                 case_after = _sqlite_table_counts(case_db)

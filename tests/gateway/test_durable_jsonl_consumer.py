@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 from types import SimpleNamespace
 from pathlib import Path
@@ -1243,6 +1244,48 @@ async def test_management_reuses_stable_persistent_chat_namespace(tmp_path, monk
     assert all({message["chatId"] for message in plan.messages} == {"management@g.us"} for plan in plans)
 
 
+@pytest.mark.asyncio
+async def test_process_live_records_defers_structured_provider_error(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({
+        "model": {"provider": "test-provider", "default": "test-model"},
+        "pa": {"enabled": True},
+    }))
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "CREATE TABLE pa_turns("
+            "turn_id TEXT,replay_run_id TEXT,message_refs_json TEXT,"
+            "turn_status TEXT,provider TEXT,model TEXT,raw_turn_envelope_json TEXT,"
+            "error_json TEXT,started_at REAL)"
+        )
+
+    class Runner:
+        async def replay(self, plan):
+            with sqlite3.connect(state_db) as conn:
+                conn.execute(
+                    "INSERT INTO pa_turns VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        "failed-turn", plan.run_id, json.dumps(["provider-fail"]),
+                        "failed", "test-provider", "test-model", "{}",
+                        json.dumps({"message": "HTTP 401 Missing Authentication header"}),
+                        1.0,
+                    ),
+                )
+            return SimpleNamespace(processed=1, outbound=[])
+
+    record = consumer.InboxRecord(
+        seq=1, message_id="provider-fail", chat_id="site@g.us",
+        start_offset=0, end_offset=1, raw=_message("provider-fail", "site@g.us"),
+    )
+    result = await consumer.process_live_records(
+        [record], config_path=config, state_db=state_db, runner=Runner(),
+        defer_provider_errors=True,
+    )
+    assert result["handled"] == []
+    assert "HTTP 401 Missing Authentication header" in result["provider_errors"][0]
+
+
 def _seed_bounded_state(tmp_path: Path):
     chats = ["amk@g.us", "hg@g.us", "pg@g.us", "sk@g.us"]
     inbox = consumer.DurableInbox(tmp_path / "bounded-inbox.db")
@@ -1367,7 +1410,7 @@ def test_bounded_dry_run_is_read_only_and_predicts_reconciliation(
 def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
     inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
     monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
-    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda: object())
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
 
     async def fake_process(records, **kwargs):
         return {
@@ -1376,7 +1419,12 @@ def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
                 "message_ids": [record.message_id for record in records],
                 "turn_id": "turn-new",
             }],
-            "captured_outbound": [{"chat_id": records[0].chat_id}],
+            "captured_outbound": [{
+                "kind": "send",
+                "args": [records[0].chat_id, "captured fixture response"],
+                "kwargs": {"reply_to": records[0].message_id},
+                "replay_run_id": "fixture-run",
+            }],
             "outbound_sent": 0,
         }
 
@@ -1398,6 +1446,23 @@ def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
     assert audit["zero_real_sends"] is True
     assert audit["outbound_sent"] == 0
     assert len(audit["processed_message_ids"]) == 4
+    assert audit["captured_outbound"] == 4
+    assert audit["captured_outbound_entries"][0] == {
+        "capture_index": 0,
+        "kind": "send",
+        "chat_id": "hg@g.us",
+        "batch_chat_ids": ["hg@g.us"],
+        "message_ids": ["bounded-1"],
+        "turn_ids": ["turn-new"],
+        "reply_to": "bounded-1",
+        "body": "captured fixture response",
+        "raw": {
+            "kind": "send",
+            "args": ["hg@g.us", "captured fixture response"],
+            "kwargs": {"reply_to": "bounded-1"},
+            "replay_run_id": "fixture-run",
+        },
+    }
     assert audit["conservation"]["preserved"] is True
     assert inbox.counts() == {"completed": 5}
 
@@ -1432,14 +1497,25 @@ def test_bounded_partial_failure_persists_mutation_and_conservation_audit(
 ):
     inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
     monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
-    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda: object())
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
     calls = 0
 
-    async def first_succeeds_second_fails(records, **kwargs):
+    async def first_succeeds_second_provider_fails(records, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise RuntimeError("fixture failure")
+            body = "AuthenticationError: HTTP 401 Missing Authentication header"
+            return {
+                "submitted_message_ids": [record.message_id for record in records],
+                "handled": [],
+                "provider_errors": [body],
+                "captured_outbound": [{
+                    "kind": "send",
+                    "args": [records[0].chat_id, body],
+                    "kwargs": {},
+                }],
+                "outbound_sent": 0,
+            }
         with sqlite3.connect(case_db) as conn:
             conn.execute("INSERT INTO cases DEFAULT VALUES")
             conn.execute(
@@ -1456,7 +1532,9 @@ def test_bounded_partial_failure_persists_mutation_and_conservation_audit(
             "outbound_sent": 0,
         }
 
-    monkeypatch.setattr(consumer, "process_live_records", first_succeeds_second_fails)
+    monkeypatch.setattr(
+        consumer, "process_live_records", first_succeeds_second_provider_fails
+    )
     args = argparse.Namespace(
         inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
         case_db=str(case_db), canonical_env=str(canonical),
@@ -1465,15 +1543,146 @@ def test_bounded_partial_failure_persists_mutation_and_conservation_audit(
         audit=str(tmp_path / "partial-audit.json"), run_id="partial-test",
         dry_run=False, lock_file=str(tmp_path / "consumer.lock"),
     )
-    with pytest.raises(consumer.ConsumerError, match="RuntimeError"):
+    with pytest.raises(consumer.ConsumerError, match="HTTP 401"):
         asyncio.run(consumer.run_bounded_backplay(args))
     audit = json.loads(Path(args.audit).read_text())
     assert audit["ok"] is False
     assert audit["case_count_delta"]["cases"] == 1
     assert audit["conservation"]["preserved"] is True
-    assert [row["status"] for row in audit["mutations"]] == ["completed", "failed"]
+    assert [row["status"] for row in audit["mutations"]] == ["completed", "retryable"]
+    assert audit["captured_outbound_entries"][0]["body"].startswith(
+        "AuthenticationError"
+    )
+    assert inbox.counts() == {"completed": 2, "pending": 3}
     assert audit["business_mutations"] == [{
         "rowid": 1, "id": "audit-1", "action": "update",
         "target_kind": "case", "target_id": "case-1",
         "source_surface": "fixture", "ts": "now",
     }]
+
+
+def test_bounded_provider_error_is_retryable_and_capture_is_durable(
+    tmp_path, monkeypatch
+):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    seen_config_paths = []
+
+    def runner_factory(config_path=None):
+        seen_config_paths.append(config_path)
+        assert Path(config_path) == config.resolve()
+        assert Path(os.environ["HERMES_HOME"]) == config.parent.resolve()
+        return object()
+
+    monkeypatch.setattr(consumer, "_new_gateway_runner", runner_factory)
+
+    async def provider_error(records, **kwargs):
+        assert kwargs["defer_provider_errors"] is True
+        assert Path(os.environ["HERMES_HOME"]) == config.parent.resolve()
+        body = "AuthenticationError: HTTP 401 Missing Authentication header"
+        return {
+            "submitted_message_ids": [record.message_id for record in records],
+            "handled": [],
+            "provider_errors": [body],
+            "captured_outbound": [{
+                "kind": "send",
+                "args": [records[0].chat_id, body],
+                "kwargs": {},
+                "replay_run_id": "provider-error-run",
+            }],
+            "outbound_sent": 0,
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", provider_error)
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "provider-error-audit.json"),
+        run_id="provider-error-test", dry_run=False,
+        lock_file=str(tmp_path / "consumer.lock"),
+    )
+    with pytest.raises(consumer.ConsumerError, match="HTTP 401 Missing Authentication"):
+        asyncio.run(consumer.run_bounded_backplay(args))
+
+    audit = json.loads(Path(args.audit).read_text())
+    assert audit["ok"] is False
+    assert "HTTP 401 Missing Authentication" in audit["error"]
+    assert audit["captured_outbound"] == 1
+    capture = audit["captured_outbound_entries"][0]
+    assert capture["body"].endswith("Missing Authentication header")
+    assert capture["chat_id"] == "hg@g.us"
+    assert capture["message_ids"] == ["bounded-1"]
+    assert capture["turn_ids"] == []
+    assert capture["raw"]["replay_run_id"] == "provider-error-run"
+    assert audit["mutations"][0]["status"] == "retryable"
+    assert audit["conservation"]["preserved"] is True
+    assert inbox.counts() == {"completed": 1, "pending": 4}
+    assert seen_config_paths == [config.resolve()]
+
+
+def test_bounded_captured_provider_error_fallback_is_retryable(tmp_path, monkeypatch):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    async def captured_error_without_structured_turn(records, **kwargs):
+        return {
+            "submitted_message_ids": [record.message_id for record in records],
+            "handled": [],
+            "captured_outbound": [{
+                "kind": "send",
+                "args": [records[0].chat_id, "HTTP 401 Missing Authentication header"],
+                "kwargs": {},
+            }],
+            "outbound_sent": 0,
+        }
+
+    monkeypatch.setattr(
+        consumer, "process_live_records", captured_error_without_structured_turn
+    )
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "captured-error-audit.json"), run_id="fallback-test",
+        dry_run=False, lock_file=str(tmp_path / "consumer.lock"),
+    )
+    with pytest.raises(consumer.ConsumerError, match="HTTP 401"):
+        asyncio.run(consumer.run_bounded_backplay(args))
+    assert inbox.counts() == {"completed": 1, "pending": 4}
+
+
+def test_bounded_legitimate_consumed_no_turn_is_terminal_skipped(tmp_path, monkeypatch):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
+
+    async def consumed_no_turn(records, **kwargs):
+        return {
+            "submitted_message_ids": [record.message_id for record in records],
+            "handled": [],
+            "captured_outbound": [],
+            "provider_errors": [],
+            "outbound_sent": 0,
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", consumed_no_turn)
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "no-turn-audit.json"), run_id="no-turn-test",
+        dry_run=False, lock_file=str(tmp_path / "consumer.lock"),
+    )
+    assert asyncio.run(consumer.run_bounded_backplay(args)) == 0
+    audit = json.loads(Path(args.audit).read_text())
+    assert audit["ok"] is True
+    assert audit["captured_outbound_entries"] == []
+    assert audit["zero_real_sends"] is True
+    assert audit["conservation"]["preserved"] is True
+    assert all(row["skipped"] == len(row["message_ids"]) for row in audit["mutations"])
+    assert inbox.counts() == {"completed": 1, "skipped": 4}
