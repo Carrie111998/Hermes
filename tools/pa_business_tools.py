@@ -1504,6 +1504,14 @@ _CREATE_JOB_NO_ALIASES = ("reportedJobNo", "reported_job_no", "job_no", "jobno",
 def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload = dict(args)
 
+    # New source documents are their own citation. Bind the current turn's
+    # exact message ids mechanically so the case and its opening observation
+    # retain the same evidence the model read.
+    if not payload.get("evidenceMessageRefs") and not payload.get("evidence_message_refs"):
+        current_refs = _current_turn_source_refs()
+        if current_refs:
+            payload["evidenceMessageRefs"] = current_refs
+
     # Alias coercion: the model sometimes invents sibling names for the job
     # number param (PG day-26 run passed reportedJobNo); the backend only
     # honors jobNo and silently mints a WA/JOB placeholder otherwise.

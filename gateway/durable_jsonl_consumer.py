@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -3111,13 +3112,13 @@ def _business_audit_delta(path: Path, *, after_rowid: int) -> list[dict[str, Any
         if not exists:
             return []
         rows = conn.execute(
-            "SELECT rowid,id,action,target_kind,target_id,source_surface,ts "
+            "SELECT rowid AS audit_rowid,id,action,target_kind,target_id,source_surface,ts "
             "FROM ps_audit_log WHERE rowid>? ORDER BY rowid",
             (int(after_rowid),),
         ).fetchall()
         return [
             {
-                "rowid": int(row["rowid"]),
+                "rowid": int(row["audit_rowid"]),
                 "id": str(row["id"]),
                 "action": str(row["action"]),
                 "target_kind": str(row["target_kind"]),
@@ -3127,6 +3128,131 @@ def _business_audit_delta(path: Path, *, after_rowid: int) -> list[dict[str, Any
             }
             for row in rows
         ]
+    finally:
+        conn.close()
+
+
+def _inject_bounded_source_evidence(
+    case_db: Path,
+    records: Sequence[InboxRecord],
+    *,
+    before_image_path: Path,
+    run_id: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Make exact bounded inbox rows citable by the Systems job-number gate.
+
+    The capture inbox is the durable source for these rows, while Systems' citation
+    gate reads ``bridge_message_log``.  This message-id-scoped convergence copies
+    only the selected source documents and records the complete pre-mutation image.
+    Existing identical source refs are preserved; divergent identities fail closed.
+    """
+    conn = sqlite3.connect(case_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = [
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(bridge_message_log)")
+        ]
+        required = {
+            "local_id", "source", "source_ref", "chat_jid", "chat_name",
+            "zone", "channel_type", "sender_id", "from_me", "ts", "sgt",
+            "text", "message_kind", "has_media", "media_refs", "quoted_text",
+            "reply_to_source_ref", "raw_json",
+        }
+        if not required.issubset(columns):
+            raise ConsumerError("bridge_message_log schema cannot accept source evidence")
+
+        refs = [record.message_id for record in records]
+        if len(refs) != len(set(refs)):
+            raise ConsumerError("bounded source evidence contains duplicate message ids")
+        existing: dict[str, dict[str, Any]] = {}
+        if refs:
+            placeholders = ",".join("?" for _ in refs)
+            for row in conn.execute(
+                f"SELECT * FROM bridge_message_log WHERE source_ref IN ({placeholders})",
+                refs,
+            ):
+                existing[str(row["source_ref"])] = dict(row)
+        _atomic_write_json(
+            before_image_path,
+            {
+                "artifact_type": "tgg_bounded_source_evidence_before_image",
+                "run_id": run_id,
+                "created_at": _utc_now(),
+                "selected_message_ids": refs,
+                "existing_rows": list(existing.values()),
+            },
+        )
+
+        rows: list[tuple[Any, ...]] = []
+        skipped = 0
+        sgt_zone = ZoneInfo("Asia/Singapore")
+        for record in records:
+            item = _bridge_item(record.raw)
+            raw_message_id = str(item.get("messageId") or "")
+            raw_chat_id = str(item.get("chatId") or "")
+            if raw_message_id != record.message_id or raw_chat_id != record.chat_id:
+                raise ConsumerError(
+                    "bounded source evidence identity diverges from inbox selection"
+                )
+            raw_json = json.dumps(record.raw, ensure_ascii=False, sort_keys=True)
+            prior = existing.get(record.message_id)
+            if prior is not None:
+                if str(prior.get("chat_jid")) != record.chat_id:
+                    raise ConsumerError(
+                        f"source evidence conflict for {record.message_id}"
+                    )
+                skipped += 1
+                continue
+            timestamp = int(_record_ingress_timestamp(record).timestamp())
+            sgt = datetime.fromtimestamp(timestamp, tz=sgt_zone).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            media_refs = item.get("mediaUrls") or item.get("media") or []
+            if isinstance(media_refs, (str, bytes, Mapping)):
+                media_refs = [media_refs]
+            rows.append(
+                (
+                    "whatsapp-capture",
+                    record.message_id,
+                    record.chat_id,
+                    str(item.get("chatName") or record.chat_id),
+                    "",
+                    "group" if bool(item.get("isGroup", record.chat_id.endswith("@g.us"))) else "direct",
+                    str(item.get("senderId") or "") or None,
+                    int(bool(item.get("fromMe"))),
+                    timestamp,
+                    sgt,
+                    str(item.get("body") or item.get("text") or ""),
+                    str(item.get("mediaType") or ("media" if item.get("hasMedia") else "text")),
+                    int(bool(item.get("hasMedia") or media_refs)),
+                    json.dumps(list(media_refs), ensure_ascii=False, sort_keys=True),
+                    str(item.get("quotedText") or ""),
+                    str(item.get("quotedMessageId") or "") or None,
+                    raw_json,
+                )
+            )
+        if not dry_run and rows:
+            with conn:
+                conn.executemany(
+                    """
+                    INSERT INTO bridge_message_log
+                      (source,source_ref,chat_jid,chat_name,zone,channel_type,
+                       sender_id,from_me,ts,sgt,text,message_kind,has_media,
+                       media_refs,quoted_text,reply_to_source_ref,raw_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    rows,
+                )
+        return {
+            "selected": len(records),
+            "inserted": 0 if dry_run else len(rows),
+            "would_insert": len(rows),
+            "already_present": skipped,
+            "before_image": str(before_image_path),
+            "dry_run": dry_run,
+        }
     finally:
         conn.close()
 
@@ -3387,6 +3513,20 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
             audit["business_audit_before"] = business_cursor_before
             row_total_before = inbox.total()
 
+            if getattr(args, "inject_source_evidence", False):
+                source_before_image = getattr(args, "source_before_image", None)
+                if not source_before_image:
+                    raise ConsumerError(
+                        "--source-before-image is required with --inject-source-evidence"
+                    )
+                audit["source_evidence_injection"] = _inject_bounded_source_evidence(
+                    case_db,
+                    selected,
+                    before_image_path=Path(source_before_image).resolve(),
+                    run_id=run_id,
+                    dry_run=dry_run,
+                )
+
             if readjudicated_draft_ids or pending_manager_draft_ids:
                 draft_before_image = getattr(args, "draft_before_image", None)
                 if not draft_before_image:
@@ -3415,7 +3555,6 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                     before_image_path=Path(before_image).resolve(),
                     run_id=run_id,
                     dry_run=dry_run,
-                    source_state=str(getattr(args, "draft_source_state", "draft")),
                 )
 
             reconciliation = inbox.reconcile_window_processing(
@@ -3553,6 +3692,7 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                     before_image_path=Path(args.draft_before_image).resolve(),
                     run_id=run_id,
                     dry_run=dry_run,
+                    source_state=str(getattr(args, "draft_source_state", "draft")),
                 )
 
             case_after = _sqlite_table_counts(case_db)
@@ -3674,6 +3814,8 @@ def build_parser() -> argparse.ArgumentParser:
     bounded.add_argument("--message-group-file")
     bounded.add_argument("--requeue-selected", action="store_true")
     bounded.add_argument("--before-image")
+    bounded.add_argument("--inject-source-evidence", action="store_true")
+    bounded.add_argument("--source-before-image")
     bounded.add_argument("--readjudicated-draft-id-file")
     bounded.add_argument("--pending-manager-draft-id-file")
     bounded.add_argument("--manager-chat-id")
