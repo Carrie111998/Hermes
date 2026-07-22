@@ -76,7 +76,7 @@ def get_config() -> Dict[str, Any]:
 
 
 def register(ctx):
-    """Register workflow tools, the workflow_analyst auxiliary, and kanban lifecycle hooks."""
+    """Register workflow tools, the workflow_analyst auxiliary, kanban hooks, and the skill."""
     ctx.register_auxiliary_task(
         key="workflow_analyst",
         display_name="Workflow analyst",
@@ -86,6 +86,15 @@ def register(ctx):
             "extra_body": {},
         },
     )
+
+    # --- Register the workflow-engine skill ------------------------------------
+    skill_path = Path(__file__).parent / "skills" / "workflow-engine" / "SKILL.md"
+    if skill_path.exists():
+        ctx.register_skill(
+            "workflow-engine",
+            skill_path,
+            "Run DAG-based pipelines via workflow_start",
+        )
 
     # --- Agent-facing workflow tools -------------------------------------------
     from plugins.workflow.tools import (
