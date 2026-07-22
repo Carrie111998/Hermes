@@ -526,6 +526,11 @@ def _seed_bounded_state(tmp_path: Path):
     with sqlite3.connect(case_db) as conn:
         conn.execute("CREATE TABLE cases(id INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO cases DEFAULT VALUES")
+        conn.execute(
+            "CREATE TABLE ps_audit_log("
+            "id TEXT,action TEXT,target_kind TEXT,target_id TEXT,"
+            "source_surface TEXT,ts TEXT)"
+        )
     canonical = tmp_path / "canonical.env"
     canonical.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=test-token\n")
     config = tmp_path / "config.yaml"
@@ -595,6 +600,7 @@ def test_bounded_dry_run_is_read_only_and_predicts_reconciliation(
         service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
         cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
         audit=str(tmp_path / "dry-audit.json"), run_id="dry-test", dry_run=True,
+        lock_file=str(tmp_path / "consumer.lock"),
     )
     assert asyncio.run(consumer.run_bounded_backplay(args)) == 0
     assert inbox.db_path.read_bytes() == before_bytes
@@ -634,6 +640,7 @@ def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
         service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
         cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
         audit=str(tmp_path / "execute-audit.json"), run_id="execute-test", dry_run=False,
+        lock_file=str(tmp_path / "consumer.lock"),
     )
     assert asyncio.run(consumer.run_bounded_backplay(args)) == 0
     audit = json.loads(Path(args.audit).read_text())
@@ -642,3 +649,77 @@ def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
     assert len(audit["processed_message_ids"]) == 4
     assert audit["conservation"]["preserved"] is True
     assert inbox.counts() == {"completed": 5}
+
+
+def test_bounded_live_refuses_while_ordinary_consumer_holds_lock(
+    tmp_path, monkeypatch
+):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    lock_file = tmp_path / "consumer.lock"
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "locked-audit.json"), run_id="locked-test",
+        dry_run=False, lock_file=str(lock_file),
+    )
+    before = inbox.counts()
+    with consumer.SingletonLock(lock_file):
+        with pytest.raises(consumer.ConsumerError, match="singleton"):
+            asyncio.run(consumer.run_bounded_backplay(args))
+    assert inbox.counts() == before
+    assert not Path(args.audit).exists()
+
+
+def test_bounded_partial_failure_persists_mutation_and_conservation_audit(
+    tmp_path, monkeypatch
+):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda: object())
+    calls = 0
+
+    async def first_succeeds_second_fails(records, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("fixture failure")
+        with sqlite3.connect(case_db) as conn:
+            conn.execute("INSERT INTO cases DEFAULT VALUES")
+            conn.execute(
+                "INSERT INTO ps_audit_log VALUES(?,?,?,?,?,?)",
+                ("audit-1", "update", "case", "case-1", "fixture", "now"),
+            )
+        return {
+            "submitted_message_ids": [record.message_id for record in records],
+            "handled": [{
+                "message_ids": [record.message_id for record in records],
+                "turn_id": "turn-new",
+            }],
+            "captured_outbound": [],
+            "outbound_sent": 0,
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", first_succeeds_second_fails)
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "partial-audit.json"), run_id="partial-test",
+        dry_run=False, lock_file=str(tmp_path / "consumer.lock"),
+    )
+    with pytest.raises(consumer.ConsumerError, match="RuntimeError"):
+        asyncio.run(consumer.run_bounded_backplay(args))
+    audit = json.loads(Path(args.audit).read_text())
+    assert audit["ok"] is False
+    assert audit["case_count_delta"]["cases"] == 1
+    assert audit["conservation"]["preserved"] is True
+    assert [row["status"] for row in audit["mutations"]] == ["completed", "failed"]
+    assert audit["business_mutations"] == [{
+        "rowid": 1, "id": "audit-1", "action": "update",
+        "target_kind": "case", "target_id": "case-1",
+        "source_surface": "fixture", "ts": "now",
+    }]
