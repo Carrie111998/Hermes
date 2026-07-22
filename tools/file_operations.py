@@ -346,6 +346,21 @@ def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]
     return result.stdout, None
 
 
+def _native_result_path(path: str) -> str:
+    """Return a shell-derived search result path in native host form.
+
+    On Windows ``_escape_shell_arg`` rewrites drive-qualified roots to the
+    Git Bash ``/c/Users/x`` form before embedding them in the command (bash
+    would otherwise eat backslashes), and MSYS ``find`` / ``rg`` echo that
+    root back verbatim in every result line. The rest of the stack consumes
+    these paths natively (``WindowsPath``, read/patch tools, the agent), so
+    translate them back with the env-layer's ``_msys_to_windows_path``.
+    No-op off Windows and for paths that aren't in MSYS form.
+    """
+    from tools.environments.local import _msys_to_windows_path
+    return _msys_to_windows_path(path)
+
+
 def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     """Separate rg/grep diagnostic lines from real match output.
 
@@ -2746,9 +2761,9 @@ class ShellFileOperations(FileOperations):
                 continue
             parts = line.split(' ', 1)
             if len(parts) == 2 and parts[0].replace('.', '').isdigit():
-                files.append(parts[1])
+                files.append(_native_result_path(parts[1]))
             else:
-                files.append(line)
+                files.append(_native_result_path(line))
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
@@ -2798,7 +2813,7 @@ class ShellFileOperations(FileOperations):
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.strip().split('\n') if f]
+        all_files = [_native_result_path(f) for f in stdout.strip().split('\n') if f]
 
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
@@ -2809,7 +2824,7 @@ class ShellFileOperations(FileOperations):
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
-            all_files = [f for f in stdout.strip().split('\n') if f]
+            all_files = [_native_result_path(f) for f in stdout.strip().split('\n') if f]
 
         page = all_files[offset:offset + limit]
 
@@ -2895,7 +2910,7 @@ class ShellFileOperations(FileOperations):
         stdout = payload
         # Parse results based on output mode
         if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split('\n') if f]
+            all_files = [_native_result_path(f) for f in stdout.strip().split('\n') if f]
             total = len(all_files)
             page = all_files[offset:offset + limit]
             return SearchResult(
@@ -2912,7 +2927,7 @@ class ShellFileOperations(FileOperations):
                     parts = line.rsplit(':', 1)
                     if len(parts) == 2:
                         try:
-                            counts[parts[0]] = int(parts[1])
+                            counts[_native_result_path(parts[0])] = int(parts[1])
                         except ValueError:
                             pass
             return SearchResult(
@@ -2939,7 +2954,7 @@ class ShellFileOperations(FileOperations):
                 m = _match_re.match(line)
                 if m:
                     matches.append(SearchMatch(
-                        path=(m.group(1) or '') + m.group(2),
+                        path=_native_result_path((m.group(1) or '') + m.group(2)),
                         line_number=int(m.group(3)),
                         content=m.group(4)[:500]
                     ))
@@ -2951,7 +2966,7 @@ class ShellFileOperations(FileOperations):
                     parsed = _parse_search_context_line(line)
                     if parsed:
                         matches.append(SearchMatch(
-                            path=parsed[0],
+                            path=_native_result_path(parsed[0]),
                             line_number=parsed[1],
                             content=parsed[2][:500]
                         ))
@@ -3021,7 +3036,7 @@ class ShellFileOperations(FileOperations):
 
         stdout = payload
         if output_mode == "files_only":
-            all_files = [f for f in stdout.strip().split('\n') if f]
+            all_files = [_native_result_path(f) for f in stdout.strip().split('\n') if f]
             total = len(all_files)
             page = all_files[offset:offset + limit]
             return SearchResult(
@@ -3038,7 +3053,7 @@ class ShellFileOperations(FileOperations):
                     parts = line.rsplit(':', 1)
                     if len(parts) == 2:
                         try:
-                            counts[parts[0]] = int(parts[1])
+                            counts[_native_result_path(parts[0])] = int(parts[1])
                         except ValueError:
                             pass
             return SearchResult(
@@ -3063,7 +3078,7 @@ class ShellFileOperations(FileOperations):
                 m = _match_re.match(line)
                 if m:
                     matches.append(SearchMatch(
-                        path=(m.group(1) or '') + m.group(2),
+                        path=_native_result_path((m.group(1) or '') + m.group(2)),
                         line_number=int(m.group(3)),
                         content=m.group(4)[:500]
                     ))
@@ -3073,7 +3088,7 @@ class ShellFileOperations(FileOperations):
                     parsed = _parse_search_context_line(line)
                     if parsed:
                         matches.append(SearchMatch(
-                            path=parsed[0],
+                            path=_native_result_path(parsed[0]),
                             line_number=parsed[1],
                             content=parsed[2][:500]
                         ))

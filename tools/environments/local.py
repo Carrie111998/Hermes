@@ -903,7 +903,15 @@ def _prepend_git_bash_dirs(existing_path: str) -> str:
     lets the non-login ``bash -c`` fallback find coreutils; in the healthy
     case the session snapshot re-exports the full login PATH inside the shell,
     so this only matters when that snapshot is absent.
+
+    The platform check must live *here*, not only inside the cached
+    ``_git_bash_bin_dirs`` builder: the module cache is populated once on a
+    real Windows host, and a later caller running with ``_IS_WINDOWS``
+    patched False (the POSIX-simulating env tests) would otherwise get the
+    cached Windows dirs injected into a POSIX PATH.
     """
+    if not _IS_WINDOWS:
+        return existing_path
     git_dirs = _git_bash_bin_dirs()
     if not git_dirs:
         return existing_path

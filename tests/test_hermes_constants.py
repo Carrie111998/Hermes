@@ -34,11 +34,23 @@ class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
     def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
-        """When HERMES_HOME is not set, returns ~/.hermes."""
+        """When HERMES_HOME is not set, returns the platform default."""
+        import sys as _sys
+
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
-        assert get_default_hermes_root() == tmp_path / ".hermes"
+        if _sys.platform == "win32":
+            # Hermetic: keep the real %LOCALAPPDATA% (and any hermes root
+            # under it) out of the patched-home scenario.
+            monkeypatch.setenv(
+                "LOCALAPPDATA", str(tmp_path / "AppData" / "Local")
+            )
+            assert (
+                get_default_hermes_root()
+                == tmp_path / "AppData" / "Local" / "hermes"
+            )
+        else:
+            assert get_default_hermes_root() == tmp_path / ".hermes"
 
     def test_hermes_home_is_native(self, tmp_path, monkeypatch):
         """When HERMES_HOME = ~/.hermes, returns ~/.hermes."""
@@ -214,9 +226,58 @@ class TestGetProcessHermesHome:
         assert get_process_hermes_home() == home
 
     def test_env_unset_returns_platform_default(self, tmp_path, monkeypatch):
+        import sys as _sys
+
         monkeypatch.delenv("HERMES_HOME", raising=False)
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        assert get_process_hermes_home() == tmp_path / ".hermes"
+        if _sys.platform == "win32":
+            # Hermetic: the real %LOCALAPPDATA% (and any hermes root under
+            # it) must not leak into the patched-home scenario.
+            monkeypatch.setenv(
+                "LOCALAPPDATA", str(tmp_path / "AppData" / "Local")
+            )
+            assert (
+                get_process_hermes_home()
+                == tmp_path / "AppData" / "Local" / "hermes"
+            )
+        else:
+            assert get_process_hermes_home() == tmp_path / ".hermes"
+
+    def test_env_unset_uninitialized_native_keeps_initialized_legacy_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Fork guard (2026-07-09 incident): an uninitialized LOCALAPPDATA
+        location must not shadow a live legacy ``~/.hermes`` installation
+        when ``HERMES_HOME`` is unset."""
+        import sys
+
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+        legacy = tmp_path / ".hermes"
+        legacy.mkdir()
+        (legacy / "config.yaml").touch()
+        assert get_process_hermes_home() == legacy
+
+    def test_env_unset_initialized_native_root_wins_over_legacy(
+        self, tmp_path, monkeypatch
+    ):
+        """An initialized platform-native root keeps upstream behaviour even
+        when a legacy ``~/.hermes`` root also exists."""
+        import sys
+
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
+        native = tmp_path / "AppData" / "Local" / "hermes"
+        native.mkdir(parents=True)
+        (native / "config.yaml").touch()
+        legacy = tmp_path / ".hermes"
+        legacy.mkdir()
+        (legacy / "config.yaml").touch()
+        assert get_process_hermes_home() == native
 
     def test_ignores_context_local_override(self, tmp_path, monkeypatch):
         launch_home = tmp_path / "launch-home"

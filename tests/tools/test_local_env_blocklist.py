@@ -512,8 +512,13 @@ class TestSanePathIncludesHomebrew:
         assert "/opt/homebrew/bin" in path_entries
         assert "/opt/homebrew/sbin" in path_entries
 
-    def test_make_run_env_does_not_duplicate_existing_sane_entries(self):
+    def test_make_run_env_does_not_duplicate_existing_sane_entries(self, monkeypatch):
+        # Neutralize the Windows git-bash coreutils prepend (covered by
+        # test_local_env_windows_msys.py) so a host Git install can't inject
+        # entries into this POSIX-shaped PATH. No-op on POSIX runners.
+        from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
+        monkeypatch.setattr(local_mod, "_git_bash_bin_dirs_cache", [])
         existing_env = {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}
         with patch.dict(os.environ, existing_env, clear=True):
             result = _make_run_env({})
@@ -558,10 +563,16 @@ class TestSanePathIncludesHomebrew:
         assert "/opt/homebrew/bin" in path_entries
 
     def test_make_run_env_leaves_windows_path_unchanged(self, monkeypatch):
+        # Pin the narrow contract: _make_run_env itself does not reorder,
+        # dedupe, or rewrite a Windows PATH. The (deliberate) git-bash
+        # coreutils prepend is a separate concern covered by
+        # test_local_env_windows_msys.py — neutralize it here so a Git
+        # install on the host machine doesn't leak into this assertion.
         from tools.environments import local as local_mod
         from tools.environments.local import _make_run_env
         windows_env = {"PATH": r"C:\Windows\System32;C:\Program Files\Git\bin"}
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_git_bash_bin_dirs_cache", [])
         with patch.dict(os.environ, windows_env, clear=True):
             result = _make_run_env({})
         assert result["PATH"] == windows_env["PATH"]
@@ -571,6 +582,7 @@ class TestSanePathIncludesHomebrew:
         from tools.environments.local import _make_run_env
         windows_env = {"Path": r"C:\Windows\System32;C:\Program Files\Git\bin"}
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(local_mod, "_git_bash_bin_dirs_cache", [])
         with patch.object(local_mod.os, "environ", windows_env):
             result = _make_run_env({})
         assert result["Path"] == windows_env["Path"]
