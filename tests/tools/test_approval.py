@@ -1636,6 +1636,56 @@ class TestEtcPatternsUnaffectedByRefactor:
             assert dangerous is False, cmd
 
 
+class TestTeeSystemConfigPath:
+    """Dedicated tee + _SYSTEM_CONFIG_PATH pattern with distinct approval key.
+
+    The broad tee + _SENSITIVE_WRITE_TARGET pattern already classifies /etc
+    writes as dangerous, but the task requires a dedicated system-config
+    pairing with a unique description ("overwrite system config path via tee")
+    so that pattern key collision with other _SENSITIVE_WRITE_TARGET paths
+    (~/.ssh, shell rc files, etc.) is avoided.
+    """
+
+    def test_tee_system_config_hosts(self):
+        """tee targeting /etc/hosts -> dangerous=True"""
+        dangerous, key, desc = detect_dangerous_command("echo malicious | tee /etc/hosts")
+        assert dangerous is True
+        assert key == "overwrite system config path via tee"
+        assert desc == "overwrite system config path via tee"
+
+    def test_tee_append_system_config(self):
+        """tee -a targeting /etc/passwd -> dangerous=True"""
+        dangerous, key, desc = detect_dangerous_command("cat evil | tee -a /etc/passwd")
+        assert dangerous is True
+        assert key == "overwrite system config path via tee"
+        assert desc == "overwrite system config path via tee"
+
+    def test_tee_piped_to_system_config(self):
+        """piped output to tee targeting /etc/resolv.conf -> dangerous=True"""
+        dangerous, key, desc = detect_dangerous_command(
+            "echo 'nameserver 8.8.8.8' | tee /etc/resolv.conf"
+        )
+        assert dangerous is True
+        assert key == "overwrite system config path via tee"
+        assert desc == "overwrite system config path via tee"
+
+    def test_tee_macos_private_etc(self):
+        """tee targeting /private/etc mirror path -> dangerous=True"""
+        dangerous, key, desc = detect_dangerous_command(
+            "echo payload | tee /private/etc/hosts"
+        )
+        assert dangerous is True
+        assert key == "overwrite system config path via tee"
+        assert desc == "overwrite system config path via tee"
+
+    def test_tee_non_system_path_safe(self):
+        """tee /tmp/output.txt -> dangerous=False"""
+        dangerous, key, desc = detect_dangerous_command("echo hello | tee /tmp/output.txt")
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+
 # =========================================================================
 # Gateway approval timeout = deny, NOT consent (#24912)
 #

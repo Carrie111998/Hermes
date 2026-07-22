@@ -775,6 +775,7 @@ DANGEROUS_PATTERNS = [
     # `echo <base64> | openssl base64 -d | bash` decodes arbitrary commands.
     (r'\bopenssl\b.*\b(?:base64|enc)\b[^|]*\s+-[dD]\b[^|]*\|\s*\b(bash|sh|zsh|ksh|dash)\b',
      "pipe openssl-decoded content to shell (possible command obfuscation)"),
+    (rf'\btee\b.*["\']?{_SYSTEM_CONFIG_PATH}', "overwrite system config path via tee"),
     (rf'\btee\b.*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system file via tee"),
     (rf'>>?\s*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system file via redirection"),
     (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_WRITE_TARGET_BOUNDARY}', "overwrite project env/config via tee"),
