@@ -263,6 +263,144 @@ def test_handle_approve_all(hermes_home):
     assert len(store.user_entries) == 2
 
 
+def test_handle_approve_reports_discard_failure(hermes_home, monkeypatch):
+    """Interactive approval must not claim success if cleanup fails."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    rec = wa.stage_write(
+        "memory",
+        {"action": "add", "target": "user", "content": "retain me"},
+        summary="retain me",
+        origin="foreground",
+    )
+    monkeypatch.setattr(wa, "discard_pending", lambda subsystem, pending_id: False)
+
+    out = handle_pending_subcommand(
+        wa.MEMORY, ["approve", rec["id"]], memory_store=store
+    )
+
+    assert "Approved 0 memory write(s)." in out
+    assert f"{rec['id']}: replay succeeded but pending record could not be discarded" in out
+
+
+def test_approve_pending_native_replays_and_discards(hermes_home):
+    from hermes_cli.write_approval_commands import approve_pending_native
+    from tools.memory_tool import MemoryStore
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    rec = wa.stage_write(
+        "memory",
+        {"action": "add", "target": "user", "content": "native approval"},
+        summary="native approval",
+        origin="foreground",
+    )
+
+    result = approve_pending_native(wa.MEMORY, rec["id"], memory_store=store)
+
+    assert result == {
+        "success": True,
+        "subsystem": "memory",
+        "pending_id": rec["id"],
+        "replayed": True,
+        "discarded": True,
+        "target": "user",
+    }
+    assert "native approval" in store.user_entries
+
+
+
+def test_approve_pending_native_retains_record_on_replay_failure(hermes_home):
+    from hermes_cli.write_approval_commands import approve_pending_native
+    from tools import write_approval as wa
+
+    rec = wa.stage_write(
+        "skills",
+        {"action": "patch", "name": "missing-skill", "old_string": "x", "new_string": "y"},
+        summary="failed replay",
+        origin="background_review",
+    )
+
+    result = approve_pending_native(wa.SKILLS, rec["id"])
+
+    assert result["success"] is False
+    assert result["replayed"] is False
+    assert result["discarded"] is False
+    assert wa.get_pending(wa.SKILLS, rec["id"]) is not None
+
+
+def test_reject_pending_native_discards_record(hermes_home):
+    from hermes_cli.write_approval_commands import reject_pending_native
+    from tools import write_approval as wa
+
+    rec = wa.stage_write(
+        "skills",
+        {"action": "create", "name": "rejected-skill"},
+        summary="reject me",
+        origin="background_review",
+    )
+
+    result = reject_pending_native(wa.SKILLS, rec["id"])
+
+    assert result["success"] is True
+    assert result["replayed"] is False
+    assert result["discarded"] is True
+    assert wa.get_pending(wa.SKILLS, rec["id"]) is None
+
+
+def test_native_pending_disposition_reports_missing_record(hermes_home):
+    from hermes_cli.write_approval_commands import (
+        approve_pending_native,
+        reject_pending_native,
+    )
+    from tools import write_approval as wa
+
+    for dispose in (approve_pending_native, reject_pending_native):
+        result = dispose(wa.SKILLS, "missing-record")
+        assert result["success"] is False
+        assert result["replayed"] is False
+        assert result["discarded"] is False
+        assert result["error"] == "pending record not found: missing-record"
+
+
+def test_native_pending_disposition_rejects_unsupported_subsystem(hermes_home):
+    from hermes_cli.write_approval_commands import (
+        approve_pending_native,
+        reject_pending_native,
+    )
+
+    for dispose in (approve_pending_native, reject_pending_native):
+        result = dispose("unsupported", "record")
+        assert result["success"] is False
+        assert result["replayed"] is False
+        assert result["discarded"] is False
+        assert result["error"] == "unsupported subsystem: unsupported"
+
+
+def test_reject_pending_native_reports_discard_failure(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import reject_pending_native
+    from tools import write_approval as wa
+
+    rec = wa.stage_write(
+        "skills",
+        {"action": "create", "name": "retain-on-reject-failure"},
+        summary="reject failure",
+        origin="background_review",
+    )
+    monkeypatch.setattr(wa, "discard_pending", lambda subsystem, pending_id: False)
+
+    result = reject_pending_native(wa.SKILLS, rec["id"])
+
+    assert result["success"] is False
+    assert result["replayed"] is False
+    assert result["discarded"] is False
+    assert result["error"] == "pending record could not be discarded"
+    assert wa.get_pending(wa.SKILLS, rec["id"]) is not None
+
+
 def test_handle_reject(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa

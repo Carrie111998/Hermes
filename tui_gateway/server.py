@@ -4123,7 +4123,9 @@ def _on_tool_progress(
     _args: dict | None = None,
     **_kwargs,
 ):
-    if not _tool_progress_enabled(sid):
+    # Subagent lifecycle events feed the Desktop Agents view and must remain
+    # observable even when ordinary per-tool progress is disabled.
+    if not _tool_progress_enabled(sid) and not event_type.startswith("subagent."):
         return
     if event_type == "tool.started" and name:
         # `_on_tool_start` already emits the authoritative `tool.start` with

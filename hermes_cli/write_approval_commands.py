@@ -124,12 +124,13 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, failed = 0, []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
-        if ok:
-            wa.discard_pending(subsystem, rec["id"])
+        result = approve_pending_native(subsystem, rec["id"], memory_store)
+        if result["success"]:
             applied += 1
         else:
-            failed.append(f"{rec['id']}: {msg}")
+            failed.append(
+                f"{rec['id']}: {result.get('error', 'native replay failed')}"
+            )
 
     out = [f"Approved {applied} {subsystem} write(s)."]
     if failed:
@@ -155,6 +156,64 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e)
 
 
+def _new_pending_result(subsystem: str, pending_id: str) -> dict:
+    return {
+        "success": False,
+        "subsystem": subsystem,
+        "pending_id": pending_id,
+        "replayed": False,
+        "discarded": False,
+    }
+
+
+def _dispose_pending_native(
+    subsystem: str,
+    pending_id: str,
+    *,
+    memory_store=None,
+    replay: bool,
+) -> dict:
+    """Apply or discard one pending record with structured evidence."""
+    result = _new_pending_result(subsystem, pending_id)
+    if subsystem not in {wa.MEMORY, wa.SKILLS}:
+        result["error"] = f"unsupported subsystem: {subsystem}"
+        return result
+    record = wa.get_pending(subsystem, pending_id)
+    if not record:
+        result["error"] = f"pending record not found: {pending_id}"
+        return result
+    payload = record.get("payload") or {}
+    result["target"] = payload.get("name") or payload.get("target")
+    if replay:
+        ok, message = _apply_one(subsystem, record, memory_store)
+        if not ok:
+            result["error"] = message or "native replay failed"
+            return result
+        result["replayed"] = True
+    result["discarded"] = wa.discard_pending(subsystem, pending_id)
+    if not result["discarded"]:
+        result["error"] = (
+            "replay succeeded but pending record could not be discarded"
+            if replay
+            else "pending record could not be discarded"
+        )
+        return result
+    result["success"] = True
+    return result
+
+
+def approve_pending_native(subsystem: str, pending_id: str, memory_store=None) -> dict:
+    """Apply one pending write through the native replay path."""
+    return _dispose_pending_native(
+        subsystem, pending_id, memory_store=memory_store, replay=True
+    )
+
+
+def reject_pending_native(subsystem: str, pending_id: str) -> dict:
+    """Reject one pending record with structured discard evidence."""
+    return _dispose_pending_native(subsystem, pending_id, replay=False)
+
+
 def _reject(subsystem: str, rest: List[str]) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
@@ -162,12 +221,18 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     if target.lower() == "all":
         n = 0
         for rec in wa.list_pending(subsystem):
-            if wa.discard_pending(subsystem, rec["id"]):
+            if reject_pending_native(subsystem, rec["id"])["success"]:
                 n += 1
         return f"Rejected {n} pending {subsystem} write(s)."
-    if wa.discard_pending(subsystem, target):
+    result = reject_pending_native(subsystem, target)
+    if result["success"]:
         return f"Rejected pending {subsystem} write '{target}'."
-    return f"No pending {subsystem} write with id '{target}'."
+    if result.get("error") == f"pending record not found: {target}":
+        return f"No pending {subsystem} write with id '{target}'."
+    return (
+        f"Failed to reject pending {subsystem} write '{target}': "
+        f"{result.get('error', '')}"
+    )
 
 
 def _diff(rest: List[str]) -> str:
