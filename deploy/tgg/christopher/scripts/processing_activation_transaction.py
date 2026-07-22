@@ -404,11 +404,19 @@ def media_backlog_preflight(
             item: Any = None
             try:
                 event = json.loads(raw_line)
-                item = event.get("item") or event.get("payload") or event
+                item = (
+                    event.get("normalized")
+                    or event.get("item")
+                    or event.get("payload")
+                    or event
+                )
                 if not isinstance(item, dict):
                     raise ValueError("event item is not an object")
-                media_type = str(item.get("mediaType") or item.get("mimeType") or "")
-                if not item.get("hasMedia") or (media_type and not media_type.startswith("image/")):
+                media_type = str(
+                    item.get("mediaType") or item.get("mimeType") or ""
+                ).split(";", 1)[0].strip().lower()
+                is_image = media_type == "image" or media_type.startswith("image/")
+                if not item.get("hasMedia") or not is_image:
                     continue
                 values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths")
                 if isinstance(values, (str, dict)):

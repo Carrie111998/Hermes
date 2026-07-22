@@ -99,10 +99,172 @@ def test_media_retention_refuses_source_path_escape(tmp_path, monkeypatch):
     config = _retention_config(tmp_path, allowed, tmp_path / "retained")
     monkeypatch.setattr(consumer, "_converge_retained_media", lambda *a, **k: {})
     raw = _message("ESCAPE")
-    raw.update({"hasMedia": True, "mediaUrls": [str(outside)]})
+    raw.update(
+        {"hasMedia": True, "mediaType": "image", "mediaUrls": [str(outside)]}
+    )
     record = consumer.InboxRecord(1, "ESCAPE", "test-group@g.us", 0, 1, raw)
     with pytest.raises(consumer.MediaRetentionError, match="escapes configured roots"):
         consumer.retain_record_media(record, config_path=config)
+
+
+def test_production_normalized_video_is_not_retained(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    video = capture / "clip.mp4"
+    video.write_bytes(b"not-an-image-video-fixture")
+    retained = tmp_path / "retained"
+    config = _retention_config(tmp_path, capture, retained)
+    calls = []
+    monkeypatch.setattr(
+        consumer, "_converge_retained_media", lambda *a, **k: calls.append((a, k))
+    )
+    normalized = _message("VIDEO-1")
+    normalized.update({
+        "hasMedia": True, "mediaType": "video", "mediaUrls": [str(video)]
+    })
+    record = consumer.InboxRecord(
+        1, "VIDEO-1", "test-group@g.us", 0, 1,
+        {"type": "whatsapp_capture_event", "normalized": normalized},
+    )
+    assert consumer.retain_record_media(record, config_path=config) == {
+        "retained": 0, "bytes": 0, "operation": False,
+    }
+    assert calls == []
+    assert not retained.exists()
+
+
+@pytest.mark.asyncio
+async def test_pending_production_video_bypasses_retention_and_completes(
+    tmp_path, monkeypatch
+):
+    args = _enabled_consumer_args(tmp_path, [])
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    video = capture / "pending.mp4"
+    video.write_bytes(b"video-fixture")
+    config = Path(args.config)
+    data = yaml.safe_load(config.read_text())
+    data["pa"]["media_retention"] = {
+        "enabled": True,
+        "media_root": str(tmp_path / "retained"),
+        "source_roots": [str(capture)],
+        "operation": "tgg_media_retention",
+        "min_free_percent": 0,
+    }
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    normalized = _message("VIDEO-PENDING", "site@g.us")
+    normalized.update(
+        {
+            "hasMedia": True,
+            "mediaType": "video",
+            "mediaUrls": [str(video)],
+        }
+    )
+    _write_jsonl(
+        Path(args.source),
+        [{"type": "whatsapp_capture_event", "normalized": normalized}],
+    )
+
+    async def fake_process(records, **kwargs):
+        assert [record.message_id for record in records] == ["VIDEO-PENDING"]
+        return {
+            "submitted_message_ids": ["VIDEO-PENDING"],
+            "handled": [
+                {"message_ids": ["VIDEO-PENDING"], "turn_id": "turn-video"}
+            ],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda: object())
+
+    assert await consumer.run_consumer(args) == 0
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    assert inbox.counts() == {"completed": 1}
+    assert inbox.retention_counts() == {
+        "retention_total": 0,
+        "retention_failures": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_production_normalized_missing_image_stays_pending_and_once_survives(
+    tmp_path, monkeypatch
+):
+    args = _enabled_consumer_args(tmp_path, [])
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    retained = tmp_path / "retained"
+    config = Path(args.config)
+    data = yaml.safe_load(config.read_text())
+    data["pa"]["media_retention"] = {
+        "enabled": True, "media_root": str(retained),
+        "source_roots": [str(capture)], "operation": "tgg_media_retention",
+        "min_free_percent": 0,
+    }
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    normalized = _message("MISSING-IMAGE", "management@g.us")
+    normalized.update({
+        "hasMedia": True, "mediaType": "image",
+        "mediaUrls": [str(capture / "already-evicted.jpg")],
+        "timestamp": 1784630163.917,
+    })
+    _write_jsonl(
+        Path(args.source),
+        [{"type": "whatsapp_capture_event", "normalized": normalized}],
+    )
+    assert await consumer.run_consumer(args) == 0
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    assert inbox.counts() == {"pending": 1}
+    assert inbox.retention_counts()["retention_failures"] == 1
+    status = json.loads(Path(args.status_file).read_text())
+    assert status["state"] == "held-pending"
+    assert "media source is unavailable" in status["retention_hold"]
+
+
+@pytest.mark.asyncio
+async def test_one_chat_retention_hold_does_not_kill_other_chat(tmp_path, monkeypatch):
+    args = _enabled_consumer_args(tmp_path, [])
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    config = Path(args.config)
+    data = yaml.safe_load(config.read_text())
+    data["pa"]["media_retention"] = {
+        "enabled": True, "media_root": str(tmp_path / "retained"),
+        "source_roots": [str(capture)], "operation": "tgg_media_retention",
+        "min_free_percent": 0,
+    }
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    missing = _message("MISSING", "management@g.us")
+    missing.update({
+        "hasMedia": True, "mediaType": "image",
+        "mediaUrls": [str(capture / "gone.jpg")], "timestamp": 1784630163.917,
+    })
+    healthy = _message("HEALTHY", "site@g.us")
+    _write_jsonl(Path(args.source), [
+        {"type": "whatsapp_capture_event", "normalized": missing}, healthy,
+    ])
+
+    async def fake_process(records, **kwargs):
+        assert [record.message_id for record in records] == ["HEALTHY"]
+        return {
+            "submitted_message_ids": ["HEALTHY"],
+            "handled": [{"message_ids": ["HEALTHY"], "turn_id": "turn-healthy"}],
+            "captured_outbound": [],
+        }
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda: object())
+    assert await consumer.run_consumer(args) == 0
+    inbox = consumer.DurableInbox(Path(args.inbox))
+    assert inbox.counts() == {"completed": 1, "pending": 1}
+    with inbox.connect() as conn:
+        states = {
+            row["message_id"]: row["status"]
+            for row in conn.execute("SELECT message_id,status FROM ingress_events")
+        }
+    assert states == {"MISSING": "pending", "HEALTHY": "completed"}
+    assert "media source is unavailable" in (inbox.retention_last_error() or "")
 
 
 def test_retention_operation_resolves_from_real_overlay_registry(tmp_path, monkeypatch):

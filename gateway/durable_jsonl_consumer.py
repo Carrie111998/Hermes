@@ -657,7 +657,8 @@ class DurableInbox:
         return {str(row["status"]): int(row["n"]) for row in rows}
 
     def record_retention(
-        self, record: InboxRecord, *, retained: int | None = None, failed: bool = False
+        self, record: InboxRecord, *, retained: int | None = None,
+        failed: bool = False,
     ) -> None:
         with self.connect() as conn:
             if failed:
@@ -668,7 +669,7 @@ class DurableInbox:
                 )
             elif retained is not None:
                 conn.execute(
-                    "UPDATE ingress_events SET retained_media_count=? "
+                    "UPDATE ingress_events SET retained_media_count=?, last_error=NULL "
                     "WHERE seq=? AND status='processing'",
                     (max(0, int(retained)), record.seq),
                 )
@@ -680,6 +681,17 @@ class DurableInbox:
                 "COALESCE(SUM(retention_failures),0) FROM ingress_events"
             ).fetchone()
         return {"retention_total": int(row[0]), "retention_failures": int(row[1])}
+
+    def retention_last_error(self) -> str | None:
+        """Newest unresolved retention hold, independent across chat lanes."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT last_error FROM ingress_events "
+                "WHERE status IN ('pending','processing') "
+                "AND last_error LIKE 'media-retention-retry:%' "
+                "ORDER BY updated_at DESC, seq DESC LIMIT 1"
+            ).fetchone()
+        return str(row[0]) if row else None
 
     def total(self) -> int:
         return sum(self.counts().values())
@@ -830,6 +842,7 @@ def _retention_status(
     return {
         **inbox.retention_counts(),
         **_media_root_metrics(config_path, inspect=inspect_media),
+        "retention_hold": inbox.retention_last_error(),
     }
 
 
@@ -882,7 +895,10 @@ def _contained_existing_file(value: Any, roots: Sequence[Path]) -> Path:
     text = str(value or "")
     if text.startswith("file://"):
         text = text[7:]
-    candidate = Path(text).expanduser().resolve(strict=True)
+    try:
+        candidate = Path(text).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise MediaRetentionError(f"media source is unavailable: {exc}") from exc
     if not candidate.is_file() or not any(candidate.is_relative_to(root) for root in roots):
         raise MediaRetentionError("media source escapes configured roots or is not a file")
     return candidate
@@ -896,12 +912,19 @@ def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
         raise MediaRetentionError("event media collection is not a list")
     result: list[tuple[Any, str | None]] = []
     event_mime = item.get("mediaType") or item.get("mimeType")
+    event_kind = str(event_mime or "").split("/", 1)[0].strip().lower()
+    if event_kind != "image":
+        return []
     for value in values:
         mime = (
             value.get("mime") or value.get("mimeType") or value.get("contentType")
             if isinstance(value, Mapping) else event_mime
         )
-        result.append((value, str(mime) if mime else None))
+        declared = str(mime) if mime else None
+        kind = str(declared or "").split("/", 1)[0].strip().lower()
+        if kind != "image":
+            continue
+        result.append((value, declared))
     return result
 
 
@@ -950,7 +973,9 @@ def _converge_retained_media(
     return dict(result)
 
 
-def retain_record_media(record: InboxRecord, *, config_path: Path) -> dict[str, Any]:
+def _retain_record_media_impl(
+    record: InboxRecord, *, config_path: Path
+) -> dict[str, Any]:
     """Retain one event's images and converge its configured system ledger.
 
     Files land before the idempotent operation.  Therefore a crash after the
@@ -963,6 +988,11 @@ def retain_record_media(record: InboxRecord, *, config_path: Path) -> dict[str, 
     item = _bridge_item(record.raw)
     media = _event_media(item)
     if not media:
+        coarse_kind = str(
+            item.get("mediaType") or item.get("mimeType") or ""
+        ).split("/", 1)[0].strip().lower()
+        if coarse_kind != "image":
+            return {"retained": 0, "bytes": 0, "operation": False}
         if item.get("hasMedia") is True:
             raise MediaRetentionError(
                 "mandatory inbound media has no resolvable capture path"
@@ -1047,6 +1077,16 @@ def retain_record_media(record: InboxRecord, *, config_path: Path) -> dict[str, 
             raise
         raise MediaRetentionError(f"media retention convergence failed: {exc}") from exc
     return {"retained": len(retained), "bytes": total_bytes, "operation": True}
+
+
+def retain_record_media(record: InboxRecord, *, config_path: Path) -> dict[str, Any]:
+    """Normalize fallible retention I/O to the retryable retention class."""
+    try:
+        return _retain_record_media_impl(record, config_path=config_path)
+    except MediaRetentionError:
+        raise
+    except OSError as exc:
+        raise MediaRetentionError(f"media retention I/O failed: {exc}") from exc
 
 
 def retain_claimed_media(records: Sequence[InboxRecord], *, config_path: Path) -> dict[str, int]:
@@ -1758,7 +1798,7 @@ async def _process_claimed_chat_batch(
                 retention = await asyncio.to_thread(
                     retain_record_media, record, config_path=config_path
                 )
-            except MediaRetentionError:
+            except MediaRetentionError as exc:
                 inbox.record_retention(record, failed=True)
                 raise
             inbox.record_retention(record, retained=int(retention["retained"]))
@@ -1848,7 +1888,16 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 for chat_id in done_chats:
                     task = tasks.pop(chat_id)
                     lanes.pop(chat_id, None)
-                    await task
+                    try:
+                        await task
+                    except MediaRetentionError as exc:
+                        # This chat's claimed rows are already pending again.
+                        # Keep the other chat lanes and the daemon alive; the
+                        # durable status exposes the hold until a retry clears it.
+                        print(
+                            f"media retention HELD/PENDING: chat={chat_id} error={exc}",
+                            file=sys.stderr,
+                        )
 
                 config_enabled = processing_enabled(config_path)
                 gate = processing_gate_state(gate_path)
@@ -1928,7 +1977,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     status_path,
                     {
                         **retention_status,
-                        "state": "running",
+                        "state": (
+                            "held-pending" if inbox.retention_last_error() else "running"
+                        ),
                         "processing_enabled": True,
                         "config_enabled": True,
                         "gate_enabled": True,
@@ -2022,7 +2073,17 @@ async def run_consumer(args: argparse.Namespace) -> int:
 
                 if args.once:
                     if tasks:
-                        await asyncio.gather(*tasks.values())
+                        outcomes = await asyncio.gather(
+                            *tasks.values(), return_exceptions=True
+                        )
+                        for outcome in outcomes:
+                            if isinstance(outcome, MediaRetentionError):
+                                print(
+                                    f"media retention HELD/PENDING: {outcome}",
+                                    file=sys.stderr,
+                                )
+                            elif isinstance(outcome, BaseException):
+                                raise outcome
                         tasks.clear()
                         lanes.clear()
                     counts = inbox.counts()
@@ -2037,7 +2098,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                             **_retention_status(
                                 inbox, config_path, inspect_media=True
                             ),
-                            "state": "running",
+                            "state": (
+                                "held-pending" if inbox.retention_last_error() else "running"
+                            ),
                             "processing_enabled": True,
                             "config_enabled": True,
                             "gate_enabled": True,
@@ -2071,7 +2134,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                         **_retention_status(
                             inbox, config_path, inspect_media=True
                         ),
-                        "state": "running",
+                        "state": (
+                            "held-pending" if inbox.retention_last_error() else "running"
+                        ),
                         "processing_enabled": True,
                         "config_enabled": True,
                         "gate_enabled": True,
