@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.transports.acp_client import ACPClient, ACPClientError
+from agent.transports.acp_session_mapping import ACPSessionBinding, ACPSessionMapper
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,9 @@ class ACPClientSession:
         auto_approve_permissions: bool = False,
         client_factory: Optional[Callable[..., ACPClient]] = None,
         session_start_timeout: float = 30.0,
+        mapper: Optional[ACPSessionMapper] = None,
+        hermes_session_id: str = "",
+        provider: str = "",
     ) -> None:
         """
         Args:
@@ -198,6 +202,16 @@ class ACPClientSession:
                 allow-kind option is present.  **Never** selects a reject-kind
                 option — bypass mode must not deny.
             client_factory: Inject a custom ACPClient constructor for testing.
+            mapper: Optional :class:`ACPSessionMapper` for persisting
+                Hermes↔ACP session bindings so a resumed Hermes session can
+                reattach to the same ACP session. When ``None`` (default) the
+                resume and persistence paths are skipped and behaviour is
+                identical to before — existing callers are unaffected.
+            hermes_session_id: Hermes session id this ACP session is bound to.
+                Required together with ``mapper`` for resume/persistence.
+            provider: ACP provider name (e.g. ``"claude"``) identifying which
+                binding to resume when a Hermes session drives several ACP
+                providers.
         """
         self._command = command
         self._args = list(args or [])
@@ -218,6 +232,9 @@ class ACPClientSession:
         self._auto_approve_permissions = auto_approve_permissions
         self._client_factory = client_factory or ACPClient
         self._session_start_timeout = session_start_timeout
+        self._mapper = mapper
+        self._hermes_session_id = hermes_session_id
+        self._provider = provider
 
         self._client: Optional[ACPClient] = None
         self._session_id: Optional[str] = None
@@ -242,6 +259,31 @@ class ACPClientSession:
             client_version=_get_hermes_version(),
             timeout=self._session_start_timeout,
         )
+
+        # --- Resume attempt (if mapper is configured) ---
+        # Before paying for a fresh session/new, try to reattach to a persisted
+        # ACP session for this Hermes session. Falls through to session/new when
+        # there is no binding, the binding is stale, or the server reports the
+        # session gone (-32002 resourceNotFound — marked stale so the next call
+        # goes straight to session/new).
+        if self._mapper and self._hermes_session_id:
+            binding = self._mapper.lookup(self._hermes_session_id, self._provider)
+            if binding and binding.status == "active":
+                try:
+                    self._client.request("session/resume", {
+                        "sessionId": binding.acp_session_id,
+                        "cwd": cwd or binding.cwd,
+                    })
+                    self._session_id = binding.acp_session_id
+                    self._pin_model_and_permission()
+                    self._mapper.update_activity(self._hermes_session_id)
+                    return self._session_id
+                except Exception as exc:
+                    if self._is_resource_not_found(exc):
+                        self._mapper.mark_stale(self._hermes_session_id)
+                    else:
+                        raise
+
         # Build session/new params.  ``_meta`` is an opaque vendor passthrough
         # — the core does not construct any vendor-specific structures.  When
         # the caller supplied a non-empty ``session_meta`` dict, it is forwarded
@@ -275,26 +317,46 @@ class ACPClientSession:
             cwd or os.getcwd(),
         )
 
-        # Model pin: send session/set_config_option to override the ACP server's
-        # default model. Only sent when a model is explicitly configured; servers
-        # that don't support set_config_option are tolerated; servers that support
-        # it but reject the value raise loud.
+        # Pin model and permission mode on the fresh session. Raises loud on a
+        # value rejection (clearing the session id so the next ensure_started()
+        # call retries instead of short-circuiting on the idempotency guard).
+        self._pin_model_and_permission()
+
+        # --- Persist binding (if mapper is configured) ---
+        # Recorded only after session/new + config pins succeed, so a binding is
+        # never persisted for a session that failed to pin its model/mode.
+        if self._mapper and self._hermes_session_id:
+            self._mapper.bind(ACPSessionBinding(
+                hermes_session_id=self._hermes_session_id,
+                acp_session_id=self._session_id,
+                provider=self._provider or "unknown",
+                cwd=cwd or "",
+                model=self._model,
+                permission_mode=self._permission_mode,
+                created_at=time.time(),
+                last_active_at=time.time(),
+            ))
+
+        return self._session_id
+
+    def _pin_model_and_permission(self) -> None:
+        """Send set_config_option to pin model and permission_mode on the
+        current session.
+
+        Shared by the resume path and the session/new path so a resumed
+        session honors the same configured model/mode as a freshly created
+        one. On an ACPClientError value rejection ``self._session_id`` is
+        cleared (so the next ensure_started() retries instead of
+        short-circuiting on the idempotency guard) and the error re-raises so
+        run_turn can surface it without retiring.
+        """
         if self._model:
             try:
                 self._send_config_option(self._session_id, "model", self._model)
             except ACPClientError:
-                # Mismatch detected: clear session so ensure_started does not
-                # short-circuit on the next call (idempotency guard at top of
-                # method checks self._session_id is not None).  Re-raise so
-                # run_turn can surface the config error without retiring.
                 self._session_id = None
                 raise
 
-        # Permission-mode pin: same two-layer strategy as the model pin. Sent
-        # only when a permission_mode is explicitly configured. Servers that do
-        # not implement set_config_option are tolerated; servers that accept
-        # the call but silently reject the value raise loud so the caller knows
-        # the mode did not take.
         if self._permission_mode:
             try:
                 self._send_config_option(
@@ -304,7 +366,15 @@ class ACPClientSession:
                 self._session_id = None
                 raise
 
-        return self._session_id
+    @staticmethod
+    def _is_resource_not_found(exc: Exception) -> bool:
+        """Check if an ACP error is a -32002 resourceNotFound (session expired/deleted)."""
+        # ACP SDK raises exceptions with a 'code' attribute or message containing the code
+        code = getattr(exc, "code", None)
+        if code == -32002:
+            return True
+        msg = str(exc).lower()
+        return "resource not found" in msg or "-32002" in msg
 
     def _send_config_option(
         self, session_id: str, config_id: str, value: str,
@@ -527,6 +597,14 @@ class ACPClientSession:
                 pass
             self._client = None
         self._session_id = None
+
+        # Mark any persisted binding stale so the next session for this Hermes
+        # session does not try to resume a closed ACP session. Best-effort.
+        if self._mapper and self._hermes_session_id:
+            try:
+                self._mapper.mark_stale(self._hermes_session_id)
+            except Exception:
+                pass
 
     def __enter__(self) -> "ACPClientSession":
         return self
