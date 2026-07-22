@@ -181,8 +181,169 @@ def test_floats_mirror_to_source_activity(db, tmp_path) -> None:
 
     result = worker.run_once()
 
-    assert result == {"examined": 1, "floated": 1, "skipped": 0}
+    assert result == {
+        "examined": 1,
+        "floated": 1,
+        "skipped": 0,
+        "registered": 0,
+        "throttled": 0,
+    }
     assert mirror_path.stat().st_mtime == pytest.approx(5_000.0)
+
+
+def _registry_records(registry_root: Path) -> list[dict]:
+    import json
+
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(registry_root.glob("local_*.json"))
+    ]
+
+
+def test_creates_ccd_registry_record_for_visible_mirror(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    identity, _ = _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    worker = ClaudeMirrorFloatWorker(
+        store,
+        min_interval_seconds=900.0,
+        registry_root=registry,
+        id_factory=lambda: "11111111-2222-4333-8444-555555555555",
+    )
+
+    result = worker.run_once()
+
+    assert result["registered"] == 1
+    records = _registry_records(registry)
+    assert len(records) == 1
+    record = records[0]
+    assert record["sessionId"] == "local_11111111-2222-4333-8444-555555555555"
+    assert record["cliSessionId"] == identity.claude_uuid
+    assert record["lastActivityAt"] == 5_000_000
+    assert record["title"] == "claude session"
+    assert record["cwd"] == "C:/workspace/project"
+    assert record["isArchived"] is False
+    assert record["permissionMode"] == "default"
+
+
+def test_registry_record_is_idempotent_by_cli_session_id(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+
+    first = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+    second = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+
+    assert first["registered"] == 1
+    assert second["registered"] == 0
+    assert len(_registry_records(registry)) == 1
+
+
+def test_registry_record_floats_on_new_source_activity(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db,
+        store,
+        tmp_path,
+        suffix="1",
+        source_last_active=5_000.0,
+        mirror_mtime=1_000.0,
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+
+    store.upsert_projection(
+        _projection(
+            _message("source-1-later", "another meaningful request"),
+            provider=Provider.CODEX,
+            native_id="source-1",
+            last_active=9_000.0,
+        )
+    )
+    result = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+
+    assert result["floated"] == 1
+    records = _registry_records(registry)
+    assert len(records) == 1
+    assert records[0]["lastActivityAt"] == 9_000_000
+
+
+def test_registry_tolerates_malformed_foreign_record(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    (registry / "local_broken.json").write_text("{not json", encoding="utf-8")
+    foreign = registry / "local_foreign.json"
+    foreign.write_text('{"sessionId": "local_foreign"}', encoding="utf-8")
+
+    result = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_root=registry
+    ).run_once()
+
+    assert result["registered"] == 1
+    assert foreign.read_text(encoding="utf-8") == '{"sessionId": "local_foreign"}'
+
+
+def test_run_once_is_internally_throttled(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db, store, tmp_path, source_last_active=5_000.0, mirror_mtime=1_000.0
+    )
+    clock = {"now": 0.0}
+    worker = ClaudeMirrorFloatWorker(
+        store,
+        min_interval_seconds=900.0,
+        run_min_interval_seconds=300.0,
+        monotonic=lambda: clock["now"],
+    )
+
+    first = worker.run_once()
+    clock["now"] = 10.0
+    second = worker.run_once()
+    clock["now"] = 400.0
+    third = worker.run_once()
+
+    assert first["examined"] == 1
+    assert second == {
+        "examined": 0,
+        "floated": 0,
+        "skipped": 0,
+        "registered": 0,
+        "throttled": 1,
+    }
+    assert third["examined"] == 1
+
+
+def test_discover_registry_root_picks_single_leaf(tmp_path) -> None:
+    from session_bridge.mirror_float import discover_ccd_registry_root
+
+    base = tmp_path / "claude-code-sessions"
+    leaf = base / "org-a" / "user-b"
+    leaf.mkdir(parents=True)
+    (leaf / "local_x.json").write_text("{}", encoding="utf-8")
+    empty = base / "org-a" / "user-c"
+    empty.mkdir(parents=True)
+
+    assert discover_ccd_registry_root(base) == leaf
+    assert discover_ccd_registry_root(tmp_path / "absent") is None
 
 
 def test_skips_bump_within_min_interval(db, tmp_path) -> None:
@@ -194,7 +355,13 @@ def test_skips_bump_within_min_interval(db, tmp_path) -> None:
 
     result = worker.run_once()
 
-    assert result == {"examined": 1, "floated": 0, "skipped": 0}
+    assert result == {
+        "examined": 1,
+        "floated": 0,
+        "skipped": 0,
+        "registered": 0,
+        "throttled": 0,
+    }
     assert mirror_path.stat().st_mtime == pytest.approx(1_000.0)
 
 
@@ -205,7 +372,13 @@ def test_skips_missing_mirror_file_without_raising(db, tmp_path) -> None:
 
     result = worker.run_once()
 
-    assert result == {"examined": 1, "floated": 0, "skipped": 1}
+    assert result == {
+        "examined": 1,
+        "floated": 0,
+        "skipped": 1,
+        "registered": 0,
+        "throttled": 0,
+    }
 
 
 def test_refuses_mirror_with_foreign_origin(db, tmp_path) -> None:
@@ -220,7 +393,13 @@ def test_refuses_mirror_with_foreign_origin(db, tmp_path) -> None:
 
     result = worker.run_once()
 
-    assert result == {"examined": 1, "floated": 0, "skipped": 1}
+    assert result == {
+        "examined": 1,
+        "floated": 0,
+        "skipped": 1,
+        "registered": 0,
+        "throttled": 0,
+    }
     assert mirror_path.stat().st_mtime == pytest.approx(1_000.0)
 
 
@@ -326,5 +505,11 @@ def test_hermes_source_resolves_via_canonical_fallback(db, tmp_path) -> None:
 
     result = worker.run_once()
 
-    assert result == {"examined": 1, "floated": 1, "skipped": 0}
+    assert result == {
+        "examined": 1,
+        "floated": 1,
+        "skipped": 0,
+        "registered": 0,
+        "throttled": 0,
+    }
     assert mirror_path.stat().st_mtime == pytest.approx(5_000.0)
