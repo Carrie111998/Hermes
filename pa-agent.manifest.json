@@ -229,6 +229,12 @@
       "targetPath": "home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/runtime-slots/gpt-5.6-luna-low/christopher_tgg_constitution.yaml",
       "mode": "644",
       "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/durable_jsonl_consumer.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/durable_jsonl_consumer.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
     }
   ],
   "requiredEnv": [
