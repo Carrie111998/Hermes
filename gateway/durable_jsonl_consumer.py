@@ -3009,6 +3009,55 @@ def _read_id_file(path: Path) -> list[str]:
     return list(dict.fromkeys(value for value in values if value and not value.startswith("#")))
 
 
+def _read_message_groups(
+    path: Path, *, records: Sequence[InboxRecord]
+) -> list[tuple[str, list[InboxRecord]]]:
+    """Load a prior-turn grouping without changing the selected message set."""
+    if not path.is_file():
+        raise ConsumerError(f"bounded replay message-group file is missing: {path}")
+    by_id = {record.message_id: record for record in records}
+    groups: list[tuple[str, list[InboxRecord]]] = []
+    seen: set[str] = set()
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ConsumerError(
+                f"bounded replay message-group JSON invalid at line {line_no}"
+            ) from exc
+        ids = [str(value).strip() for value in payload.get("message_ids") or []]
+        if not ids:
+            raise ConsumerError(f"bounded replay message-group {line_no} is empty")
+        duplicate = [value for value in ids if value in seen]
+        if duplicate:
+            raise ConsumerError(
+                f"bounded replay message-group duplicates message id {duplicate[0]}"
+            )
+        missing = [value for value in ids if value not in by_id]
+        if missing:
+            raise ConsumerError(
+                f"bounded replay message-group references unselected id {missing[0]}"
+            )
+        batch = [by_id[value] for value in ids]
+        chat_ids = {record.chat_id for record in batch}
+        declared_chat = str(payload.get("chat_id") or "")
+        if len(chat_ids) != 1 or (declared_chat and declared_chat not in chat_ids):
+            raise ConsumerError(
+                f"bounded replay message-group {line_no} crosses or misstates chat"
+            )
+        groups.append((next(iter(chat_ids)), batch))
+        seen.update(ids)
+    if seen != set(by_id):
+        omitted = sorted(set(by_id) - seen)
+        raise ConsumerError(
+            "bounded replay message-group partition omitted selected ids: "
+            + ",".join(omitted[:10])
+        )
+    return groups
+
+
 def assert_no_window_orphans(statuses: Mapping[str, str]) -> None:
     remaining = sum(1 for value in statuses.values() if value == "processing")
     if remaining:
@@ -3238,6 +3287,7 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
     )
     readjudicated_draft_file = getattr(args, "readjudicated_draft_id_file", None)
     pending_manager_draft_file = getattr(args, "pending_manager_draft_id_file", None)
+    message_group_file = getattr(args, "message_group_file", None)
     readjudicated_draft_ids = (
         _read_int_id_file(Path(readjudicated_draft_file).resolve())
         if readjudicated_draft_file
@@ -3270,6 +3320,11 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                 raise ConsumerError("bounded replay cutoff is required for chat-window mode")
             selected = inbox.bounded_window(chat_ids=chat_ids, cutoff=cutoff)
         statuses_before = inbox.window_statuses(selected)
+        message_groups = (
+            _read_message_groups(Path(message_group_file).resolve(), records=selected)
+            if message_group_file
+            else []
+        )
         preflight = {
             "run_id": run_id,
             "mode": "dry-run" if dry_run else "capture-execute",
@@ -3278,6 +3333,8 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                 "chat_ids": list(chat_ids),
                 "cutoff": cutoff.isoformat() if cutoff is not None else None,
                 "message_id_file": str(Path(message_id_file).resolve()) if message_id_file else None,
+                "message_group_file": str(Path(message_group_file).resolve()) if message_group_file else None,
+                "message_group_count": len(message_groups),
                 "selected_message_ids": [record.message_id for record in selected],
             },
             "selection": _window_counts(selected, statuses_before),
@@ -3373,15 +3430,28 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                     for record in selected
                     if statuses.get(str(record.seq)) == "pending"
                 ]
-                grouped: dict[str, list[InboxRecord]] = {}
-                for record in pending:
-                    grouped.setdefault(record.chat_id, []).append(record)
-                ordered = sorted(grouped.items(), key=lambda item: item[1][0].seq)
+                if message_groups:
+                    pending_ids = {record.message_id for record in pending}
+                    ordered_batches = [
+                        (chat_id, [record for record in group if record.message_id in pending_ids])
+                        for chat_id, group in message_groups
+                    ]
+                    ordered_batches = [item for item in ordered_batches if item[1]]
+                else:
+                    grouped: dict[str, list[InboxRecord]] = {}
+                    for record in pending:
+                        grouped.setdefault(record.chat_id, []).append(record)
+                    ordered_batches = []
+                    for chat_id, chat_records in sorted(
+                        grouped.items(), key=lambda item: item[1][0].seq
+                    ):
+                        ordered_batches.extend(
+                            (chat_id, chat_records[start : start + batch_size])
+                            for start in range(0, len(chat_records), batch_size)
+                        )
                 with _runtime_config_context(config_path):
                     runner = _new_gateway_runner(config_path)
-                    for chat_id, chat_records in ordered:
-                        for start in range(0, len(chat_records), batch_size):
-                            batch = chat_records[start : start + batch_size]
+                    for chat_id, batch in ordered_batches:
                             inbox.claim(batch)
                             try:
                                 result = await process_live_records(
@@ -3596,6 +3666,7 @@ def build_parser() -> argparse.ArgumentParser:
     bounded.add_argument("--chat-id", action="append")
     bounded.add_argument("--cutoff")
     bounded.add_argument("--message-id-file")
+    bounded.add_argument("--message-group-file")
     bounded.add_argument("--requeue-selected", action="store_true")
     bounded.add_argument("--before-image")
     bounded.add_argument("--readjudicated-draft-id-file")
