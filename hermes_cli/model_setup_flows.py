@@ -219,6 +219,7 @@ def _model_flow_openrouter(config, current_model=""):
         openrouter_models,
         current_model=current_model,
         pricing=pricing,
+        filter_provider="openrouter",
         confirm_provider="openrouter",
         confirm_base_url=OPENROUTER_BASE_URL,
         confirm_api_key=_resolved or existing_key,
@@ -287,7 +288,10 @@ def _model_flow_ai_gateway(config, current_model=""):
     pricing = get_pricing_for_provider("ai-gateway", force_refresh=True)
 
     selected = _prompt_model_selection(
-        models_list, current_model=current_model, pricing=pricing
+        models_list,
+        current_model=current_model,
+        pricing=pricing,
+        filter_provider="ai-gateway",
     )
     if selected:
         _save_model_choice(selected)
@@ -581,6 +585,7 @@ def _model_flow_nous(config, current_model="", args=None):
         unavailable_models=unavailable_models,
         portal_url=_nous_portal_url,
         unavailable_message=unavailable_message,
+        filter_provider="nous",
         confirm_provider="nous",
         confirm_base_url=creds.get("base_url", ""),
         confirm_api_key=creds.get("api_key", ""),
@@ -696,6 +701,7 @@ def _model_flow_openai_codex(config, current_model=""):
     selected = _prompt_model_selection(
         codex_models,
         current_model=current_model,
+        filter_provider="openai-codex",
         confirm_provider="openai-codex",
         confirm_base_url=DEFAULT_CODEX_BASE_URL,
         confirm_api_key=_codex_token or "",
@@ -780,7 +786,11 @@ def _model_flow_xai_oauth(_config, current_model="", *, args=None):
         pass
 
     models = list(_PROVIDER_MODELS.get("xai-oauth") or _PROVIDER_MODELS.get("xai") or [])
-    selected = _prompt_model_selection(models, current_model=current_model or (models[0] if models else "grok-build-0.1"))
+    selected = _prompt_model_selection(
+        models,
+        current_model=current_model or (models[0] if models else "grok-build-0.1"),
+        filter_provider="xai-oauth",
+    )
     if selected:
         _save_model_choice(selected)
         _update_config_for_provider("xai-oauth", base_url)
@@ -826,6 +836,7 @@ def _model_flow_qwen_oauth(_config, current_model=""):
     selected = _prompt_model_selection(
         models,
         current_model=default,
+        filter_provider="qwen-oauth",
         confirm_provider="qwen-oauth",
         confirm_base_url=DEFAULT_QWEN_BASE_URL,
     )
@@ -880,6 +891,7 @@ def _model_flow_minimax_oauth(config, current_model="", args=None):
     selected = _prompt_model_selection(
         model_ids,
         current_model,
+        filter_provider="minimax-oauth",
         confirm_provider="minimax-oauth",
         confirm_base_url=creds["base_url"],
     )
@@ -1830,6 +1842,7 @@ def _model_flow_copilot(config, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=normalized_current_model,
+            filter_provider=provider_id,
             confirm_provider=provider_id,
             confirm_base_url=effective_base,
             confirm_api_key=api_key,
@@ -1971,6 +1984,7 @@ def _model_flow_copilot_acp(config, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=normalized_current_model,
+            filter_provider=provider_id,
             confirm_provider=provider_id,
             confirm_base_url=effective_base,
             confirm_api_key=catalog_api_key,
@@ -2069,6 +2083,7 @@ def _model_flow_kimi(config, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=current_model,
+            filter_provider=provider_id,
             confirm_provider=provider_id,
             confirm_base_url=effective_base,
             confirm_api_key=existing_key,
@@ -2182,6 +2197,7 @@ def _model_flow_stepfun(config, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=current_model,
+            filter_provider=provider_id,
             confirm_provider=provider_id,
             confirm_base_url=effective_base,
             confirm_api_key=existing_key,
@@ -2275,6 +2291,7 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=current_model,
+            filter_provider="custom",
             confirm_provider="custom",
             confirm_base_url=mantle_base_url,
             confirm_api_key=existing_key,
@@ -2488,6 +2505,7 @@ def _model_flow_bedrock(config, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=current_model,
+            filter_provider="bedrock",
             confirm_provider="bedrock",
             confirm_base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
         )
@@ -2595,6 +2613,7 @@ def _model_flow_vertex(config, current_model=""):
     selected = _prompt_model_selection(
         model_list,
         current_model=current_model,
+        filter_provider="vertex",
         confirm_provider="vertex",
         confirm_base_url=base_url_preview,
     )
@@ -2962,6 +2981,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             model_list,
             current_model=current_model,
             pricing=pricing,
+            filter_provider=provider_id,
             confirm_provider=provider_id,
             confirm_base_url=effective_base,
             confirm_api_key=existing_key,
@@ -3119,6 +3139,7 @@ def _model_flow_anthropic(config, current_model=""):
         selected = _prompt_model_selection(
             model_list,
             current_model=current_model,
+            filter_provider="anthropic",
             confirm_provider="anthropic",
         )
     else:
