@@ -153,3 +153,38 @@ def test_env_dist_tilde_expanded_for_web_server(main_mod, monkeypatch, tmp_path)
 
     import os
     assert os.environ["HERMES_WEB_DIST"] == str(dist)
+
+
+def test_already_built_dist_without_env_starts_server(
+    main_mod, monkeypatch, tmp_path
+):
+    """Regression (2026-07-22 boot, upstream v2026.7.20 merge): default dist
+    already built + NO HERMES_WEB_DIST + no --skip-build fell into the env-var
+    validation branch and KeyError'd on os.environ["HERMES_WEB_DIST"], killing
+    every dashboard relaunch (laptop-monitor's :9119 restart breaker tripped).
+    This path must start the server using the built dist, no build, no crash."""
+    _wire_common(main_mod, monkeypatch)
+    monkeypatch.delenv("HERMES_WEB_DIST", raising=False)
+
+    built = tmp_path / "web_dist"
+    (built / "assets").mkdir(parents=True)
+    (built / "index.html").write_text("<html></html>", encoding="utf-8")
+    (built / "assets" / "app.js").write_text("//", encoding="utf-8")
+
+    started = []
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.web_server",
+        types.SimpleNamespace(
+            start_server=lambda **k: started.append(k), WEB_DIST=built
+        ),
+    )
+    builds = []
+    monkeypatch.setattr(
+        main_mod, "_build_web_ui", lambda *a, **k: builds.append(a) or True
+    )
+
+    main_mod.cmd_dashboard(_args())
+
+    assert len(started) == 1
+    assert builds == []  # already built -> no rebuild, and crucially no KeyError

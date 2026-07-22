@@ -12693,6 +12693,15 @@ def cmd_dashboard(args):
             print("  Or drop --skip-build to build automatically.")
             sys.exit(1)
         print(f"→ Skipping web UI build (--skip-build); using dist at {_dist_root}")
+    elif "HERMES_WEB_DIST" not in os.environ:
+        # No env override, not headless, not --skip-build, and the build
+        # branch above was skipped because _already_built — the default dist
+        # is present and valid, nothing to validate or rewrite. Without this
+        # branch the else below KeyError'd on HERMES_WEB_DIST every time the
+        # dashboard relaunched with a pre-built dist (first hit: laptop-monitor's
+        # dashboard-restart after the 2026-07-22 boot; upstream v2026.7.20 merge
+        # regression).
+        print(f"→ Using already-built web dist at {_WEB_DIST_CHECK}")
     else:
         # HERMES_WEB_DIST is set without --skip-build: the build is skipped
         # (the env var points at a caller-managed dist), so validate it the
