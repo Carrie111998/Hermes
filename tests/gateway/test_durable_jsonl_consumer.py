@@ -490,3 +490,155 @@ async def test_management_reuses_stable_persistent_chat_namespace(tmp_path, monk
         "agent:live-drain:persistent-chat",
     ]
     assert all({message["chatId"] for message in plan.messages} == {"management@g.us"} for plan in plans)
+
+
+def _seed_bounded_state(tmp_path: Path):
+    chats = ["amk@g.us", "hg@g.us", "pg@g.us", "sk@g.us"]
+    inbox = consumer.DurableInbox(tmp_path / "bounded-inbox.db")
+    source = tmp_path / "bounded.jsonl"
+    values = []
+    for index, chat in enumerate(chats):
+        message = _message(f"bounded-{index}", chat)
+        message["timestamp"] = "2026-07-20T00:00:00+08:00"
+        values.append(message)
+    extra = _message("bounded-amk-orphan", chats[0])
+    extra["timestamp"] = 1784476801
+    values.append(extra)
+    _write_jsonl(source, values)
+    cursor = tmp_path / "bounded.cursor"
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor, max_records=20)
+    records = inbox.pending(limit=20)
+    inbox.claim([records[0], records[-1]])
+
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as conn:
+        conn.execute(
+            "CREATE TABLE pa_turns(turn_id TEXT, message_refs_json TEXT, "
+            "turn_status TEXT, error_json TEXT, completed_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO pa_turns VALUES(?,?,?,?,?)",
+            ("turn-existing", json.dumps([records[0].message_id]), "completed", None,
+             "2026-07-20T01:00:00+00:00"),
+        )
+    case_db = tmp_path / "case.db"
+    with sqlite3.connect(case_db) as conn:
+        conn.execute("CREATE TABLE cases(id INTEGER PRIMARY KEY)")
+        conn.execute("INSERT INTO cases DEFAULT VALUES")
+    canonical = tmp_path / "canonical.env"
+    canonical.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=test-token\n")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({
+        "model": {"provider": "test-provider", "default": "test-model"},
+        "pa": {"enabled": True},
+    }))
+    return inbox, chats, state_db, case_db, canonical, config
+
+
+def test_bounded_window_reconciliation_is_scoped_and_conserving(tmp_path):
+    inbox, chats, state_db, *_ = _seed_bounded_state(tmp_path)
+    cutoff = consumer._parse_ingress_timestamp("2026-07-20T00:00:00+08:00")
+    selected = inbox.bounded_window(chat_ids=chats, cutoff=cutoff)
+    assert len(selected) == 5
+    before = inbox.total()
+    preview = inbox.reconcile_window_processing(selected, state_db, dry_run=True)
+    assert preview["completed"] == 1
+    assert preview["requeued"] == 1
+    assert preview["unresolved"] == []
+    assert inbox.counts() == {"pending": 3, "processing": 2}
+
+    applied = inbox.reconcile_window_processing(selected, state_db, dry_run=False)
+    assert applied["completed"] == 1
+    assert applied["requeued"] == 1
+    assert inbox.total() == before
+    assert inbox.counts() == {"completed": 1, "pending": 4}
+
+
+def test_bounded_refusal_guards_cover_window_count_orphan_and_token(tmp_path):
+    inbox, chats, state_db, _, canonical, _ = _seed_bounded_state(tmp_path)
+    cutoff = consumer._parse_ingress_timestamp("2026-07-20T00:00:00+08:00")
+    selected = inbox.bounded_window(chat_ids=chats, cutoff=cutoff)
+
+    with pytest.raises(consumer.ConsumerError, match="denominator mismatch"):
+        consumer.assert_bounded_selection(
+            selected, chat_ids=chats, cutoff=cutoff, expected_total=6
+        )
+    outside = consumer.InboxRecord(
+        seq=999, message_id="outside", chat_id="not-allowed@g.us",
+        start_offset=0, end_offset=1,
+        raw={**_message("outside", "not-allowed@g.us"), "timestamp": 1784476801},
+    )
+    with pytest.raises(consumer.ConsumerError, match="out-of-window"):
+        consumer.assert_bounded_selection(
+            [*selected, outside], chat_ids=chats, cutoff=cutoff, expected_total=6
+        )
+    with pytest.raises(consumer.ConsumerError, match="processing/orphan"):
+        consumer.assert_no_window_orphans({"1": "pending", "2": "processing"})
+    with pytest.raises(consumer.ConsumerError, match="mismatch"):
+        consumer.assert_service_token_hash(
+            canonical, "CHRISTOPHER_TGG_PS_SERVICE_TOKEN",
+            environ={"CHRISTOPHER_TGG_PS_SERVICE_TOKEN": "wrong-token"},
+        )
+
+
+def test_bounded_dry_run_is_read_only_and_predicts_reconciliation(
+    tmp_path, monkeypatch
+):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    before_bytes = inbox.db_path.read_bytes()
+    before_stat = inbox.db_path.stat()
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "dry-audit.json"), run_id="dry-test", dry_run=True,
+    )
+    assert asyncio.run(consumer.run_bounded_backplay(args)) == 0
+    assert inbox.db_path.read_bytes() == before_bytes
+    assert inbox.db_path.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert inbox.counts() == {"pending": 3, "processing": 2}
+    audit = json.loads(Path(args.audit).read_text())
+    assert audit["reconciliation"]["completed"] == 1
+    assert audit["reconciliation"]["requeued"] == 1
+    assert audit["processed_message_ids"] == []
+    assert audit["zero_real_sends"] is True
+
+
+def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
+    inbox, chats, state_db, case_db, canonical, config = _seed_bounded_state(tmp_path)
+    monkeypatch.setenv("CHRISTOPHER_TGG_PS_SERVICE_TOKEN", "test-token")
+    monkeypatch.setattr(consumer, "_new_gateway_runner", lambda: object())
+
+    async def fake_process(records, **kwargs):
+        return {
+            "submitted_message_ids": [record.message_id for record in records],
+            "handled": [{
+                "message_ids": [record.message_id for record in records],
+                "turn_id": "turn-new",
+            }],
+            "captured_outbound": [{"chat_id": records[0].chat_id}],
+            "outbound_sent": 0,
+        }
+
+    def forbidden_delivery(*args, **kwargs):
+        raise AssertionError("bounded execution must never call real delivery")
+
+    monkeypatch.setattr(consumer, "process_live_records", fake_process)
+    monkeypatch.setattr(consumer, "deliver_management_replies", forbidden_delivery)
+    args = argparse.Namespace(
+        inbox=str(inbox.db_path), config=str(config), state_db=str(state_db),
+        case_db=str(case_db), canonical_env=str(canonical),
+        service_token_env="CHRISTOPHER_TGG_PS_SERVICE_TOKEN", chat_id=chats,
+        cutoff="2026-07-20T00:00:00+08:00", expected_total=5, batch_size=2,
+        audit=str(tmp_path / "execute-audit.json"), run_id="execute-test", dry_run=False,
+    )
+    assert asyncio.run(consumer.run_bounded_backplay(args)) == 0
+    audit = json.loads(Path(args.audit).read_text())
+    assert audit["zero_real_sends"] is True
+    assert audit["outbound_sent"] == 0
+    assert len(audit["processed_message_ids"]) == 4
+    assert audit["conservation"]["preserved"] is True
+    assert inbox.counts() == {"completed": 5}

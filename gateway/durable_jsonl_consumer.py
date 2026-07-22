@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
@@ -34,6 +35,70 @@ import yaml
 
 CURSOR_VERSION = 1
 INBOX_SCHEMA_VERSION = 1
+
+
+def _parse_ingress_timestamp(value: Any) -> datetime:
+    """Normalize bridge timestamps without guessing the timezone.
+
+    The capture bridge has emitted both unix seconds/milliseconds and ISO-8601
+    strings.  Naive strings are refused because a bounded production replay
+    must not silently move its cutoff with the host timezone.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if number > 10_000_000_000:
+            number /= 1000.0
+        return datetime.fromtimestamp(number, tz=timezone.utc)
+    text = str(value or "").strip()
+    if not text:
+        raise ConsumerError("inbox record has no ingress timestamp")
+    if text.replace(".", "", 1).isdigit():
+        return _parse_ingress_timestamp(float(text))
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ConsumerError(f"invalid ingress timestamp: {text!r}") from exc
+    if parsed.tzinfo is None:
+        raise ConsumerError("naive ingress timestamp is forbidden")
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_ingress_timestamp(record: "InboxRecord") -> datetime:
+    for key in ("timestamp", "ingressTimestamp", "ingress_ts", "receivedAt"):
+        if key in record.raw:
+            return _parse_ingress_timestamp(record.raw[key])
+    raise ConsumerError(f"inbox record {record.message_id} has no ingress timestamp")
+
+
+def _secret_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _env_file_value(path: Path, name: str) -> str:
+    if not path.is_file():
+        raise ConsumerError(f"canonical service-token source is missing: {path}")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key.strip() == name:
+            return value.strip().strip('"').strip("'")
+    raise ConsumerError(f"canonical service-token source has no {name}")
+
+
+def assert_service_token_hash(
+    canonical_env: Path, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> str:
+    canonical = _env_file_value(canonical_env, env_name)
+    current = (environ if environ is not None else os.environ).get(env_name, "")
+    if not canonical or not current:
+        raise ConsumerError("service-token hash guard refused: token absent")
+    canonical_hash = _secret_hash(canonical)
+    current_hash = _secret_hash(current)
+    if current_hash != canonical_hash:
+        raise ConsumerError("service-token hash guard refused: running process mismatch")
+    return canonical_hash
 
 
 class ConsumerError(RuntimeError):
@@ -201,16 +266,27 @@ class InboxRecord:
 class DurableInbox:
     """Consumer-owned durable inbox and source cursor staging ledger."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, read_only: bool = False):
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self.read_only = read_only
+        if read_only:
+            if not self.db_path.is_file():
+                raise ConsumerError(f"read-only inbox is missing: {self.db_path}")
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30)
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=30
+            )
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -438,6 +514,93 @@ class DurableInbox:
         management = [item for item in ordered if item[0] in priority]
         site = [item for item in ordered if item[0] not in priority]
         return management, site
+
+    def bounded_window(
+        self, *, chat_ids: Sequence[str], cutoff: datetime
+    ) -> list[InboxRecord]:
+        """Return the exact existing-inbox window, FIFO, with no claims."""
+        wanted = frozenset(str(value) for value in chat_ids)
+        if not wanted:
+            raise ConsumerError("bounded replay requires at least one chat id")
+        if cutoff.tzinfo is None:
+            raise ConsumerError("bounded replay cutoff must be timezone-aware")
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "FROM ingress_events ORDER BY seq"
+            ).fetchall()
+        selected: list[InboxRecord] = []
+        for row in rows:
+            if str(row["chat_id"]) not in wanted:
+                continue
+            record = InboxRecord(
+                seq=int(row["seq"]), message_id=str(row["message_id"]),
+                chat_id=str(row["chat_id"]), start_offset=int(row["start_offset"]),
+                end_offset=int(row["end_offset"]), raw=json.loads(row["raw_json"]),
+            )
+            if _record_ingress_timestamp(record) >= cutoff.astimezone(timezone.utc):
+                selected.append(record)
+        return selected
+
+    def window_statuses(self, records: Sequence[InboxRecord]) -> dict[str, str]:
+        if not records:
+            return {}
+        seqs = [record.seq for record in records]
+        placeholders = ",".join("?" for _ in seqs)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT seq,status FROM ingress_events WHERE seq IN ({placeholders})",
+                seqs,
+            ).fetchall()
+        return {str(row["seq"]): str(row["status"]) for row in rows}
+
+    def reconcile_window_processing(
+        self, records: Sequence[InboxRecord], state_db: Path, *, dry_run: bool
+    ) -> dict[str, Any]:
+        """Reconcile only selected processing rows, optionally without writes."""
+        turn_by_message = _completed_turn_refs(state_db)
+        statuses = self.window_statuses(records)
+        processing = [r for r in records if statuses.get(str(r.seq)) == "processing"]
+        completed = [r for r in processing if r.message_id in turn_by_message]
+        requeued = [r for r in processing if r.message_id not in turn_by_message]
+        before = self.total()
+        if not dry_run and processing:
+            now = _utc_now()
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                for record in completed:
+                    conn.execute(
+                        "UPDATE ingress_events SET status='completed',pa_turn_id=?,"
+                        "last_error=NULL,updated_at=? WHERE seq=? AND status='processing'",
+                        (turn_by_message[record.message_id], now, record.seq),
+                    )
+                for record in requeued:
+                    conn.execute(
+                        "UPDATE ingress_events SET status='pending',"
+                        "last_error='bounded-orphan-requeued',updated_at=? "
+                        "WHERE seq=? AND status='processing'", (now, record.seq),
+                    )
+                after = int(conn.execute("SELECT COUNT(*) FROM ingress_events").fetchone()[0])
+                if after != before:
+                    raise ConsumerError("bounded reconciliation violated row conservation")
+                conn.commit()
+        after = self.total()
+        if after != before:
+            raise ConsumerError("bounded reconciliation violated row conservation")
+        predicted = dict(statuses)
+        for record in completed:
+            predicted[str(record.seq)] = "completed"
+        for record in requeued:
+            predicted[str(record.seq)] = "pending"
+        unresolved = [r.message_id for r in records if predicted.get(str(r.seq)) == "processing"]
+        if unresolved:
+            raise ConsumerError("bounded reconciliation left unresolved processing rows")
+        return {
+            "completed": len(completed), "requeued": len(requeued),
+            "processing_before": len(processing), "unresolved": unresolved,
+            "row_total_before": before, "row_total_after": after,
+            "predicted_statuses": predicted,
+        }
 
     def newest_pending_for_chats(
         self, chats: frozenset[str] | set[str]
@@ -696,6 +859,34 @@ class DurableInbox:
                 "WHERE delivery_key=?",
                 (status, bridge_message_id, error, delivery_key),
             )
+
+
+def _completed_turn_refs(state_db: Path) -> dict[str, str]:
+    refs: dict[str, str] = {}
+    if not state_db.exists():
+        return refs
+    conn = sqlite3.connect(state_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if "pa_turns" not in tables:
+            return refs
+        for row in conn.execute(
+            "SELECT turn_id,message_refs_json FROM pa_turns "
+            "WHERE turn_status='completed' AND error_json IS NULL ORDER BY completed_at"
+        ):
+            try:
+                values = json.loads(row["message_refs_json"] or "[]")
+            except (TypeError, ValueError):
+                values = []
+            for value in values:
+                if value:
+                    refs[str(value)] = str(row["turn_id"])
+        return refs
+    finally:
+        conn.close()
 
 
 def processing_enabled(config_path: Path) -> bool:
@@ -1667,6 +1858,198 @@ async def run_fixture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _window_counts(
+    records: Sequence[InboxRecord], statuses: Mapping[str, str]
+) -> dict[str, Any]:
+    per_chat: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {}
+    for record in records:
+        status = statuses.get(str(record.seq), "missing")
+        per_chat.setdefault(record.chat_id, {})[status] = (
+            per_chat.setdefault(record.chat_id, {}).get(status, 0) + 1
+        )
+        totals[status] = totals.get(status, 0) + 1
+    return {"total": len(records), "per_chat": per_chat, "statuses": totals}
+
+
+def assert_bounded_selection(
+    records: Sequence[InboxRecord], *, chat_ids: Sequence[str], cutoff: datetime,
+    expected_total: int,
+) -> None:
+    allowed = frozenset(chat_ids)
+    if len(allowed) != 4:
+        raise ConsumerError("bounded replay requires exactly four unique chat ids")
+    if len({record.message_id for record in records}) != len(records):
+        raise ConsumerError("bounded replay selection contains duplicate message ids")
+    if len(records) != expected_total:
+        raise ConsumerError(
+            "bounded replay denominator mismatch: "
+            f"expected={expected_total} selected={len(records)}"
+        )
+    for record in records:
+        if record.chat_id not in allowed or _record_ingress_timestamp(record) < cutoff:
+            raise ConsumerError(
+                f"bounded replay selected out-of-window row {record.message_id}"
+            )
+
+
+def assert_no_window_orphans(statuses: Mapping[str, str]) -> None:
+    remaining = sum(1 for value in statuses.values() if value == "processing")
+    if remaining:
+        raise ConsumerError(
+            f"bounded replay reconciliation left {remaining} processing/orphan rows"
+        )
+
+
+def _sqlite_table_counts(path: Path) -> dict[str, int]:
+    if not path.is_file():
+        raise ConsumerError(f"case database is missing: {path}")
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = [str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )]
+        return {
+            table: int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+async def run_bounded_backplay(args: argparse.Namespace) -> int:
+    """One-shot, capture-only execution over an existing inbox window."""
+    dry_run = bool(args.dry_run)
+    inbox = DurableInbox(Path(args.inbox).resolve(), read_only=dry_run)
+    state_db = Path(args.state_db).resolve()
+    case_db = Path(args.case_db).resolve()
+    config_path = Path(args.config).resolve()
+    audit_path = Path(args.audit).resolve()
+    chat_ids = tuple(dict.fromkeys(str(value) for value in args.chat_id))
+    cutoff = _parse_ingress_timestamp(args.cutoff)
+    expected_total = int(args.expected_total)
+    batch_size = max(1, int(args.batch_size))
+    run_id = str(args.run_id or f"bounded-{uuid.uuid4().hex[:12]}")
+
+    selected = inbox.bounded_window(chat_ids=chat_ids, cutoff=cutoff)
+    statuses_before = inbox.window_statuses(selected)
+    preflight = {
+        "run_id": run_id,
+        "mode": "dry-run" if dry_run else "capture-execute",
+        "window": {
+            "chat_ids": list(chat_ids), "cutoff": cutoff.isoformat(),
+            "selected_message_ids": [record.message_id for record in selected],
+        },
+        "selection": _window_counts(selected, statuses_before),
+    }
+    # This line is deliberately emitted before reconciliation or claim.
+    print(json.dumps({"bounded_backplay_preclaim": preflight}, sort_keys=True))
+
+    failures: list[str] = []
+    audit: dict[str, Any] = {
+        **preflight, "started_at": _utc_now(), "batch_size": batch_size,
+        "failures": failures, "zero_real_sends": True, "outbound_sent": 0,
+    }
+    try:
+        assert_bounded_selection(
+            selected, chat_ids=chat_ids, cutoff=cutoff, expected_total=expected_total
+        )
+        token_hash = assert_service_token_hash(
+            Path(args.canonical_env).resolve(), args.service_token_env
+        )
+        audit["service_token_hash"] = token_hash
+        case_before = _sqlite_table_counts(case_db)
+        audit["case_counts_before"] = case_before
+        row_total_before = inbox.total()
+        reconciliation = inbox.reconcile_window_processing(
+            selected, state_db, dry_run=dry_run
+        )
+        assert_no_window_orphans(reconciliation["predicted_statuses"])
+        audit["reconciliation"] = {
+            key: value for key, value in reconciliation.items()
+            if key != "predicted_statuses"
+        }
+
+        processed: list[str] = []
+        captured = 0
+        mutations: list[dict[str, Any]] = []
+        if not dry_run:
+            statuses = inbox.window_statuses(selected)
+            pending = [r for r in selected if statuses.get(str(r.seq)) == "pending"]
+            grouped: dict[str, list[InboxRecord]] = {}
+            for record in pending:
+                grouped.setdefault(record.chat_id, []).append(record)
+            ordered = sorted(grouped.items(), key=lambda item: item[1][0].seq)
+            runner = _new_gateway_runner()
+            for chat_id, chat_records in ordered:
+                for start in range(0, len(chat_records), batch_size):
+                    batch = chat_records[start : start + batch_size]
+                    inbox.claim(batch)
+                    try:
+                        result = await process_live_records(
+                            batch, config_path=config_path, state_db=state_db, runner=runner
+                        )
+                        submitted = {str(v) for v in result.get("submitted_message_ids") or []}
+                        expected = {record.message_id for record in batch}
+                        if submitted != expected:
+                            raise ConsumerError("bounded processor evidence mismatch")
+                        if int(result.get("outbound_sent") or 0) != 0:
+                            raise ConsumerError("capture-only invariant violated: outbound sent")
+                        turn_for_message: dict[str, str] = {}
+                        for group in result.get("handled") or []:
+                            for message_id in group.get("message_ids") or []:
+                                turn_for_message[str(message_id)] = str(group.get("turn_id") or "")
+                        if set(turn_for_message) - expected:
+                            raise ConsumerError("bounded turn evidence escaped selected batch")
+                        inbox.finish_processed_batch(batch, turn_for_message=turn_for_message)
+                        processed.extend(record.message_id for record in batch)
+                        captured += len(result.get("captured_outbound") or [])
+                        mutations.append({
+                            "chat_id": chat_id,
+                            "message_ids": [record.message_id for record in batch],
+                            "completed": len(turn_for_message),
+                            "skipped": len(batch) - len(turn_for_message),
+                            "captured_outbound": len(result.get("captured_outbound") or []),
+                        })
+                    except Exception as exc:
+                        inbox.finish(batch, status="failed", error=str(exc))
+                        raise
+        case_after = _sqlite_table_counts(case_db)
+        row_total_after = inbox.total()
+        if row_total_after != row_total_before:
+            raise ConsumerError(
+                "bounded replay conservation failed: "
+                f"before={row_total_before} after={row_total_after}"
+            )
+        audit.update({
+            "processed_message_ids": processed,
+            "captured_outbound": captured,
+            "mutations": mutations,
+            "case_counts_after": case_after,
+            "case_count_delta": {
+                table: case_after.get(table, 0) - case_before.get(table, 0)
+                for table in sorted(set(case_before) | set(case_after))
+            },
+            "conservation": {
+                "inbox_rows_before": row_total_before,
+                "inbox_rows_after": row_total_after,
+                "preserved": True,
+            },
+            "completed_at": _utc_now(), "ok": True,
+        })
+        _atomic_write_json(audit_path, audit)
+        print(json.dumps(audit, sort_keys=True))
+        return 0
+    except Exception as exc:
+        failures.append(f"{type(exc).__name__}: {exc}")
+        audit.update({"ok": False, "completed_at": _utc_now()})
+        _atomic_write_json(audit_path, audit)
+        if isinstance(exc, ConsumerError):
+            raise
+        raise ConsumerError(f"bounded replay failed: {exc}") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1703,6 +2086,25 @@ def build_parser() -> argparse.ArgumentParser:
     fixture.add_argument("--report", required=True)
     fixture.add_argument("--run-id", required=True)
     fixture.add_argument("--max-records", type=int, default=10)
+
+    bounded = sub.add_parser(
+        "bounded-backplay", help="Run one capture-only existing-inbox window"
+    )
+    bounded.add_argument("--inbox", required=True)
+    bounded.add_argument("--config", required=True)
+    bounded.add_argument("--state-db", required=True)
+    bounded.add_argument("--case-db", required=True)
+    bounded.add_argument("--canonical-env", required=True)
+    bounded.add_argument(
+        "--service-token-env", default="CHRISTOPHER_TGG_PS_SERVICE_TOKEN"
+    )
+    bounded.add_argument("--chat-id", action="append", required=True)
+    bounded.add_argument("--cutoff", required=True)
+    bounded.add_argument("--expected-total", type=int, required=True)
+    bounded.add_argument("--batch-size", type=int, default=25)
+    bounded.add_argument("--audit", required=True)
+    bounded.add_argument("--run-id")
+    bounded.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -1719,6 +2121,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return asyncio.run(run_consumer(args))
         if args.command == "fixture":
             return asyncio.run(run_fixture(args))
+        if args.command == "bounded-backplay":
+            return asyncio.run(run_bounded_backplay(args))
         raise ConsumerError(f"unknown command {args.command}")
     except ConsumerError as exc:
         print(f"consumer error: {exc}", file=sys.stderr)
