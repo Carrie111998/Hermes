@@ -2287,6 +2287,17 @@ def compress_context(
             agent._compression_warning = _cc_msg
             agent._emit_status(_cc_msg)
 
+        try:
+            from agent.compression_handoff import maybe_trigger_compression_handoff
+
+            maybe_trigger_compression_handoff(
+                agent,
+                compressed,
+                approx_tokens=approx_tokens,
+            )
+        except Exception as _handoff_err:
+            logger.debug("auto handoff-on-compression skipped: %s", _handoff_err)
+
         # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
         # the completed old session before its details are lost. In in-place mode
         # there is no old id (same session); ``in_place=True`` tells hooks the

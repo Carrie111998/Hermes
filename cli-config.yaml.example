@@ -814,6 +814,18 @@ agent:
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
 
+  # Optionally write a bounded, redacted handoff packet after repeated context
+  # compression. mode "platform" additionally queues a durable handoff request
+  # to the configured gateway platform; this feature never rotates sessions
+  # directly while compression is in flight.
+  # auto_handoff_on_compression:
+  #   enabled: false
+  #   after_compressions: 2
+  #   max_auto_handoffs: 1
+  #   mode: packet
+  #   platform: ""
+  #   handoff_artifact_dir: handoffs
+
   # After the agent edits code without fresh passing verification, nudge it to
   # verify before finishing. The default "auto" enables it on interactive
   # coding surfaces (CLI, TUI, desktop) and programmatic callers, and disables

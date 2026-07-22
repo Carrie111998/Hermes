@@ -1775,6 +1775,25 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Bounded packet-only handoff after repeated context compression. This
+    # deliberately uses the durable SessionDB handoff surface and never rotates
+    # sessions itself while compression is in flight.
+    try:
+        from agent.compression_handoff import configure_auto_handoff_on_compression
+
+        configure_auto_handoff_on_compression(agent, _agent_section)
+    except Exception as _handoff_cfg_err:
+        _ra().logger.warning(
+            "Auto handoff-on-compression config ignored: %s", _handoff_cfg_err
+        )
+        agent._auto_handoff_on_compression_enabled = False
+        agent._auto_handoff_after_compressions = 2
+        agent._auto_handoff_max_auto_handoffs = 1
+        agent._auto_handoff_mode = "packet"
+        agent._auto_handoff_platform = ""
+        agent._auto_handoff_artifact_dir = "handoffs"
+        agent._auto_handoff_count = 0
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
