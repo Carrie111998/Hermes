@@ -1,0 +1,3 @@
+name: obsidian
+version: 0.1.0
+description: "Obsidian vault memory — local FTS5 retrieval over markdown notes (vault = source of truth, disposable SQLite index)."
