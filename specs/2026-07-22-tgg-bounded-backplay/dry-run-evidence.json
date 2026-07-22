@@ -1,0 +1,59 @@
+{
+  "business_mutation_count": 0,
+  "captured_outbound": 0,
+  "case_delta_nonzero": {},
+  "chat_count": 4,
+  "conservation": {
+    "inbox_rows_after": 3174,
+    "inbox_rows_before": 3174,
+    "preserved": true
+  },
+  "cutoff": "2026-07-19T16:00:00+00:00",
+  "db_hashes_unchanged": {
+    "case": true,
+    "inbox": true,
+    "state": true
+  },
+  "guard_refusals": {
+    "denominator_mismatch": true,
+    "ordinary_consumer_lock_held": true,
+    "orphan_remains": true,
+    "outside_window": true,
+    "service_token_hash_mismatch": true
+  },
+  "live_run_gate": {
+    "go": false,
+    "reason": "running Christopher process still lacks the canonical Systems service token; no deploy or live mutation performed"
+  },
+  "mode": "dry-run",
+  "ok": true,
+  "outbound_sent": 0,
+  "per_chat_counts": [
+    15,
+    16,
+    34,
+    193
+  ],
+  "processed_count": 0,
+  "reconciliation": {
+    "completed": 0,
+    "processing_before": 0,
+    "requeued": 0,
+    "row_total_after": 3174,
+    "row_total_before": 3174,
+    "unresolved": []
+  },
+  "run_id": "tgg-window-dryrun-20260722-v3",
+  "selected_ids_sha256": "b156f6e79d723329b77e40092a647ba69ec8f9e17c2c827180ed09fc69b39d6e",
+  "selected_total": 258,
+  "statuses": {
+    "completed": 1,
+    "pending": 257
+  },
+  "test_result": {
+    "failed": 0,
+    "file": "tests/gateway/test_durable_jsonl_consumer.py",
+    "passed": 21
+  },
+  "zero_real_sends": true
+}
