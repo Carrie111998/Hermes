@@ -1271,3 +1271,30 @@ Task 24 production checkpoint (`af4868054`) first strict no-retry post-commit ar
 **Tests (formal Git-only isolated archive, pre-commit with file-retry):** full HTR manifest **1487 passed** (26 files); **0 failed**; **0 skipped** — strict no-retry post-commit exposed pre-existing test defect; repaired in Task 24.1
 
 **Next implementation:** Task 25 — Human-gated single-API invoke pilot.
+
+---
+
+## Task 25 — Human-Gated Single-API Invoke Pilot (ready for checkpoint, 2026-07-22)
+
+**Base:** Task 24.1 `40f4d01638f3d2f3c16c9c8ef451ab1c20fc21f0`
+
+### Delivered
+
+- Public API: `invoke_approved_run_completion(approval_id, *, claim_id, base_dir=None)` → pilot bound API **`complete_run_manually` only**
+- One continuous `_approval_use_session`: validate → claim → invoke once → post-observe → mandatory verification → outcome v2 (`consumed` | `ambiguous`)
+- Private in-session helpers: `_claim_approval_during_session`, `_record_use_outcome_during_session` — not exported; PID/thread/token/run-key/depth guarded
+- Outcome v2 binds reason and diagnostic evidence; boolean `safe_to_retry` validated before enforcing Task 25 `false` contract; non-null `project_repository_checkpoint` fail-closed
+- `consumed` requires complete verification; `ambiguous` is fail-stop and non-retryable
+- No generic lifecycle router, CLI, retry, reconciliation, marker cleanup/recovery, or Recovery Run
+
+### Non-goals confirmed
+
+- Task 26 reconciliation **not implemented**
+- General, unattended, and multi-API lifecycle invocation **remain disabled**
+- `tests/htr/test_run_completion.py` and deferred files untouched
+
+### Verification
+
+**Tests (formal Git-only isolated archive, pre-commit, zero retries):** full HTR manifest **1623 passed** (27 files); **0 failed**; **0 skipped**
+
+**Next:** Task 26 — ambiguous outcome reconciliation (not started).

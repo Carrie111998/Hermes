@@ -72,7 +72,7 @@ Exceptional legal/security/data-governance correction of a finalized original ru
 
 ## 2. Write-path gate
 
-**No Phase 2 lifecycle invoke path may be enabled before Task 25 is implemented.** Task 22 immutable finalized-run enforcement ✅. Task 23 durable run write barrier ✅. Task 24 authoritative approval control ✅.
+**No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.** Task 22 immutable finalized-run enforcement ✅. Task 23 durable run write barrier ✅. Task 24 authoritative approval control ✅. Task 25 human-gated invoke pilot ✅ (checkpoint pending).
 
 | Work | Status |
 |------|--------|
@@ -81,7 +81,7 @@ Exceptional legal/security/data-governance correction of a finalized original ru
 | Immutable finalized-run seal (Task 22) | ✅ Done |
 | Durable run write barrier (Task 23) | ✅ Done |
 | Approval persistence (Task 24) | ✅ Done (control plane only; invoke disabled) |
-| Human-gated lifecycle invoke (Task 25) | ❌ Not started |
+| Human-gated lifecycle invoke (Task 25) | ✅ Implemented — `complete_run_manually` pilot only; ready for checkpoint |
 | Bounded repair / unattended automation | ❌ No |
 | Recovery/Successor Run creation | ❌ No (Task 27+) |
 
@@ -122,7 +122,7 @@ Runtime must not append events or write SoT directly. Writes only through allowl
 
 **Task 24 authoritative approval control (checkpointed):** project-scoped SoT at `{runs_root}/.control/approvals/{approval_id}/` with immutable O_EXCL records (`issue.json`, optional `revoke.json`, singleton `claim.json`, singleton `outcome.json`); separate `htr.approval.digest.v1`; mandatory expiry (max 24h); explicit `event_id` for event-appending APIs; read validation advisory only; dedicated `_approval_control_barrier` reusing Task 23 marker without lifecycle seal bypass; internal `_approval_use_session` for Task 25 continuous marker; no lifecycle invoke; no writes to run-tree `approvals.jsonl`; no Recovery/retry/repair/marker reconciliation.
 
-**First human-gated invoke (Task 25) must include:** pre-observe, plan + approval validation, lock (Task 23 ✅), re-observe, stale rejection, one allowlisted API, **mandatory post-observe verification**, ambiguous-outcome handling, fail-stop (no blind retry). Verification cannot be deferred to a later task for the first write path.
+**First human-gated invoke (Task 25 — ready for checkpoint):** pre-observe, plan + approval validation, lock (Task 23 ✅), claim inside one continuous approval-use session, **single** allowlisted API (`complete_run_manually`), **mandatory post-observe verification**, outcome v2 (`consumed` | `ambiguous`), fail-stop (no blind retry). Verification cannot be deferred. Task 26 reconciliation not implemented. No retry, repair, marker recovery, or Recovery/Successor Runs.
 
 Ambiguous outcomes include: not started; completed and verified; failed before mutation; may-have-completed (lost ack); SoT/event disagree; post-write verification failed; escalation required.
 
@@ -166,7 +166,7 @@ read-only observability          ← Task 19 ✅
 → immutable finalized-run enforcement ← Task 22 ✅
 → durable run write barrier          ← Task 23 ✅
 → authoritative scoped approval      ← Task 24 ✅
-→ human-gated single-API invoke  ← Task 25 (next; not started)
+→ human-gated single-API invoke  ← Task 25 ✅ (ready for checkpoint)
 → ambiguous-outcome reconciliation ← Task 26
 → Recovery/Successor Run protocol ← Task 27
 → bounded retry and repair       ← Task 28
@@ -219,6 +219,7 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Phase 2 **implementation has started** (read-only foundation + immutable seal).
 - Task 20 records Policy C; Task 22 **implements finalized-run seal**; Task 23 **implements durable run write barrier**.
 - Recovery/Successor protocol remains **defined, not implemented** (Task 27+).
-- Task 24 **checkpointed** — authoritative approval control delivered; lifecycle invoke remains disabled until Task 25.
-- No Phase 2 lifecycle invoke path is enabled yet (Task 25 next; not started).
+- Task 24 **checkpointed** — authoritative approval control delivered.
+- Task 25 **implemented** — narrow `complete_run_manually` pilot only; ready for checkpoint; Task 26 reconciliation not started.
+- No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

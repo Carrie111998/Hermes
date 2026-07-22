@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,6 +57,7 @@ CLAIM_SCHEMA_VERSION = "1"
 CLAIM_DIGEST_PROJECTION_VERSION = "htr.approval.claim.digest.v1"
 REVOKE_SCHEMA_VERSION = "1"
 OUTCOME_SCHEMA_VERSION = "1"
+OUTCOME_SCHEMA_VERSION_V2 = "2"
 
 APPROVAL_KIND_LIFECYCLE_MUTATION = "lifecycle_mutation"
 
@@ -64,6 +66,7 @@ OUTCOME_AMBIGUOUS = "ambiguous"
 
 REVOKE_DIGEST_PROJECTION_VERSION = "htr.approval.revoke.digest.v1"
 OUTCOME_DIGEST_PROJECTION_VERSION = "htr.approval.outcome.digest.v1"
+OUTCOME_DIGEST_PROJECTION_VERSION_V2 = "htr.approval.outcome.digest.v2"
 
 MAX_APPROVAL_LIFETIME = timedelta(hours=24)
 
@@ -300,7 +303,70 @@ def _outcome_digest_projection(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compute_outcome_digest(body: dict[str, Any]) -> str:
+    if body.get("outcome_schema_version") == OUTCOME_SCHEMA_VERSION_V2:
+        return _sha256_digest(_outcome_digest_projection_v2(body))
     return _sha256_digest(_outcome_digest_projection(body))
+
+
+def _outcome_digest_projection_v2(body: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "outcome_digest_projection_version": OUTCOME_DIGEST_PROJECTION_VERSION_V2,
+        "outcome_schema_version": body["outcome_schema_version"],
+        "approval_id": body["approval_id"],
+        "approval_digest": body["approval_digest"],
+        "claim_id": body["claim_id"],
+        "claim_digest": body["claim_digest"],
+        "outcome_class": body["outcome_class"],
+        "recorded_at": body["recorded_at"],
+        "outcome_evidence": body["outcome_evidence"],
+    }
+
+
+def _validate_outcome_evidence_v2(
+    evidence: dict[str, Any],
+    *,
+    outcome_class: str,
+) -> None:
+    if not isinstance(evidence, dict):
+        raise ApprovalValidationError("outcome_evidence must be a JSON object")
+    required = (
+        "reason_code",
+        "error_classification",
+        "bound_api",
+        "event_id",
+        "pre_observation_digest",
+        "mutation_may_have_committed",
+        "safe_to_retry",
+        "verification_reason_codes",
+    )
+    for field in required:
+        if field not in evidence:
+            raise ApprovalValidationError(f"outcome_evidence missing {field!r}")
+    if "post_observation_digest" not in evidence:
+        raise ApprovalValidationError("outcome_evidence missing post_observation_digest")
+    if not isinstance(evidence["reason_code"], str) or not evidence["reason_code"]:
+        raise ApprovalValidationError("outcome_evidence.reason_code must be non-empty")
+    if not isinstance(evidence["safe_to_retry"], bool):
+        raise ApprovalValidationError("outcome_evidence.safe_to_retry must be boolean")
+    if evidence["safe_to_retry"] is not False:
+        raise ApprovalValidationError("Task 25 outcome_evidence.safe_to_retry must be false")
+    if not isinstance(evidence["verification_reason_codes"], list):
+        raise ApprovalValidationError("outcome_evidence.verification_reason_codes must be a list")
+    if not isinstance(evidence["mutation_may_have_committed"], bool):
+        raise ApprovalValidationError(
+            "outcome_evidence.mutation_may_have_committed must be boolean"
+        )
+    if outcome_class == OUTCOME_CONSUMED and evidence["reason_code"] != "verified_success":
+        raise ApprovalValidationError("consumed v2 outcome requires reason_code verified_success")
+    if outcome_class == OUTCOME_AMBIGUOUS:
+        if evidence["reason_code"] == "verified_success":
+            raise ApprovalValidationError(
+                "ambiguous v2 outcome cannot use reason_code verified_success"
+            )
+        if evidence.get("error_classification") == "verified_success":
+            raise ApprovalValidationError(
+                "ambiguous v2 outcome cannot use error_classification verified_success"
+            )
 
 
 @contextmanager
@@ -358,8 +424,85 @@ def _approval_use_session(
     base_dir: Path | None = None,
 ) -> Iterator[RunWriteContext]:
     """Internal Task 25 hook: hold marker across validate/claim/invoke/outcome."""
+    validate_id(run_id, "run")
+    prior = getattr(_approval_use_session_local, "session", None)
     with _approval_control_barrier(run_id, base_dir) as ctx:
-        yield ctx
+        entry = _thread_active_entry()
+        if entry is None or entry.depth <= 0:
+            raise RunExecutionLockBoundaryViolationError(
+                "approval-use session requires active run marker"
+            )
+        _approval_use_session_local.session = {
+            "run_id": run_id,
+            "base_dir": base_dir,
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "token": entry.token,
+            "key": entry.key,
+            "ctx": ctx,
+        }
+        try:
+            yield ctx
+        finally:
+            if prior is None:
+                if hasattr(_approval_use_session_local, "session"):
+                    delattr(_approval_use_session_local, "session")
+            else:
+                _approval_use_session_local.session = prior
+
+
+_approval_use_session_local = threading.local()
+
+
+def _require_active_approval_use_session(
+    approval_id: str,
+    base_dir: Path | None,
+) -> str:
+    """Validate Task 25 in-session helper ownership and approval/run binding."""
+    session = getattr(_approval_use_session_local, "session", None)
+    if session is None:
+        raise ApprovalStateError(
+            "approval-use session required for in-session control write",
+            approval_id=approval_id,
+        )
+    if session["pid"] != os.getpid():
+        raise RunExecutionLockBoundaryViolationError(
+            "approval-use session is not owned by this process"
+        )
+    if session["thread_id"] != threading.get_ident():
+        raise RunExecutionLockBoundaryViolationError(
+            "approval-use session is not owned by this thread"
+        )
+    entry = _thread_active_entry()
+    if entry is None or entry.depth <= 0:
+        raise ApprovalStateError(
+            "approval-use session requires active run marker depth",
+            approval_id=approval_id,
+        )
+    if entry.owner_pid != os.getpid() or entry.owner_thread_id != threading.get_ident():
+        raise RunExecutionLockBoundaryViolationError(
+            "active run marker is not owned by this thread"
+        )
+    if entry.token != session["token"] or entry.key != session["key"]:
+        raise RunExecutionLockBoundaryViolationError(
+            "active run marker token does not match approval-use session"
+        )
+    if entry.key[2] != session["run_id"]:
+        raise RunExecutionLockBoundaryViolationError(
+            "cross-run approval-use session mismatch"
+        )
+    if session["base_dir"] != base_dir:
+        raise ApprovalValidationError(
+            "base_dir does not match active approval-use session"
+        )
+    bundle = _load_bundle(approval_id, base_dir)
+    run_id = bundle["issue"]["run_id"]
+    if run_id != session["run_id"]:
+        raise ApprovalStateError(
+            "approval run_id does not match active approval-use session",
+            approval_id=approval_id,
+        )
+    return run_id
 
 
 def _mark_control_write_started() -> None:
@@ -384,7 +527,9 @@ def _readonly_exact_replay(
     if existing is None:
         return None
     if _canonical_json(existing) == _canonical_json(expected):
-        _reject_replay_under_occupied_marker(run_id, base_dir)
+        entry = _thread_active_entry()
+        if entry is None or entry.key[2] != run_id:
+            _reject_replay_under_occupied_marker(run_id, base_dir)
         return existing
     raise ApprovalConflictError(
         f"{label} already exists with conflicting semantics for {approval_id!r}",
@@ -1027,6 +1172,86 @@ def _assert_approval_active_for_claim(bundle: dict[str, Any], *, now: datetime |
         raise ApprovalStateError("approval is expired", approval_id=issue["approval_id"])
 
 
+def _build_claim_record_body(
+    fresh: dict[str, Any],
+    approval_id: str,
+    claim_id: str,
+    claimant: str,
+    base_dir: Path | None,
+) -> dict[str, Any]:
+    issue = fresh["issue"]
+    run_id = issue["run_id"]
+    intent = PlanningIntent(
+        requested_action=issue["bound_api"],
+        action_inputs=_argument_entries_to_inputs(issue["bound_arguments"]),
+        project_repository_checkpoint=issue.get("project_repository_checkpoint"),
+        htr_runs_root=str(base_dir) if base_dir is not None else None,
+    )
+    plan = _revalidated_plan_for_issue(
+        run_id,
+        intent,
+        base_dir,
+        expected_plan_digest=issue["plan_digest"],
+    )
+    if plan["plan_digest"] != issue["plan_digest"]:
+        raise ApprovalValidationError("plan digest mismatch at claim")
+    if plan["source"]["source_observation_digest"] != issue["source_observation_digest"]:
+        raise ApprovalValidationError("observation digest mismatch at claim")
+    replay_claimed_at = (
+        fresh["claim"]["claimed_at"] if fresh["claim"] is not None else _utc_now_iso()
+    )
+    body = {
+        "record_kind": "approval_claim",
+        "claim_schema_version": CLAIM_SCHEMA_VERSION,
+        "approval_id": approval_id,
+        "approval_digest": issue["approval_digest"],
+        "claim_id": claim_id,
+        "claimant_id": claimant,
+        "executor_id": issue["executor_id"],
+        "source_observation_digest": plan["source"]["source_observation_digest"],
+        "plan_digest": plan["plan_digest"],
+        "bound_api": issue["bound_api"],
+        "bound_arguments": issue["bound_arguments"],
+        "claimed_at": replay_claimed_at,
+    }
+    body["claim_digest"] = _compute_claim_digest(body)
+    return body
+
+
+def _claim_approval_during_session(
+    approval_id: str,
+    claim_id: str,
+    *,
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Persist claim.json while the caller holds ``_approval_use_session`` (Task 25)."""
+    validate_id(approval_id, "approval")
+    if not isinstance(claim_id, str) or not claim_id.strip():
+        raise ApprovalValidationError("claim_id must be a non-empty string")
+    run_id = _require_active_approval_use_session(approval_id, base_dir)
+    bundle = _load_bundle(approval_id, base_dir)
+    issue = bundle["issue"]
+    if issue["run_id"] != run_id:
+        raise ApprovalStateError(
+            "approval run_id does not match active approval-use session",
+            approval_id=approval_id,
+        )
+    claimant = _validate_identity_string(issue["executor_id"], field="claimant_id")
+    if bundle["claim"] is not None:
+        raise ApprovalStateError("approval already claimed", approval_id=approval_id)
+    _evaluate_seal_for_lifecycle_claim(run_id, base_dir)
+    body = _build_claim_record_body(bundle, approval_id, claim_id.strip(), claimant, base_dir)
+    _assert_approval_active_for_claim(bundle)
+    _mark_control_write_started()
+    return _create_immutable_record(
+        approval_id,
+        "claim.json",
+        body,
+        digest_field="claim_digest",
+        base_dir=base_dir,
+    )
+
+
 def claim_approval(
     approval_id: str,
     claim_id: str,
@@ -1045,41 +1270,9 @@ def claim_approval(
         raise ApprovalValidationError("claimant_id must equal issue executor_id")
 
     def _build_claim_body(fresh: dict[str, Any]) -> dict[str, Any]:
-        intent = PlanningIntent(
-            requested_action=fresh["issue"]["bound_api"],
-            action_inputs=_argument_entries_to_inputs(fresh["issue"]["bound_arguments"]),
-            project_repository_checkpoint=fresh["issue"].get("project_repository_checkpoint"),
-            htr_runs_root=str(base_dir) if base_dir is not None else None,
+        return _build_claim_record_body(
+            fresh, approval_id, claim_id.strip(), claimant, base_dir
         )
-        plan = _revalidated_plan_for_issue(
-            run_id,
-            intent,
-            base_dir,
-            expected_plan_digest=fresh["issue"]["plan_digest"],
-        )
-        if plan["plan_digest"] != fresh["issue"]["plan_digest"]:
-            raise ApprovalValidationError("plan digest mismatch at claim")
-        if plan["source"]["source_observation_digest"] != fresh["issue"]["source_observation_digest"]:
-            raise ApprovalValidationError("observation digest mismatch at claim")
-        replay_claimed_at = (
-            fresh["claim"]["claimed_at"] if fresh["claim"] is not None else _utc_now_iso()
-        )
-        body = {
-            "record_kind": "approval_claim",
-            "claim_schema_version": CLAIM_SCHEMA_VERSION,
-            "approval_id": approval_id,
-            "approval_digest": fresh["issue"]["approval_digest"],
-            "claim_id": claim_id.strip(),
-            "claimant_id": claimant,
-            "executor_id": fresh["issue"]["executor_id"],
-            "source_observation_digest": plan["source"]["source_observation_digest"],
-            "plan_digest": plan["plan_digest"],
-            "bound_api": fresh["issue"]["bound_api"],
-            "bound_arguments": fresh["issue"]["bound_arguments"],
-            "claimed_at": replay_claimed_at,
-        }
-        body["claim_digest"] = _compute_claim_digest(body)
-        return body
 
     _evaluate_seal_for_lifecycle_claim(run_id, base_dir)
     body = _build_claim_body(bundle)
@@ -1148,11 +1341,105 @@ def _argument_entries_to_inputs(bound_arguments: dict[str, Any]) -> dict[str, An
     return inputs
 
 
+def _build_outcome_record(
+    *,
+    approval_id: str,
+    issue: dict[str, Any],
+    claim: dict[str, Any],
+    claim_id: str,
+    outcome_class: str,
+    recorded_at: str,
+    outcome_evidence: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str]:
+    if outcome_evidence is not None:
+        _validate_outcome_evidence_v2(evidence=outcome_evidence, outcome_class=outcome_class)
+        record = {
+            "record_kind": "approval_outcome",
+            "outcome_schema_version": OUTCOME_SCHEMA_VERSION_V2,
+            "approval_id": approval_id,
+            "approval_digest": issue["approval_digest"],
+            "claim_id": claim_id,
+            "claim_digest": _record_fingerprint(claim, "claim_digest"),
+            "outcome_class": outcome_class,
+            "recorded_at": recorded_at,
+            "outcome_evidence": outcome_evidence,
+        }
+        record["outcome_digest"] = _compute_outcome_digest(record)
+        return record, "outcome_digest"
+    record = {
+        "record_kind": "approval_outcome",
+        "outcome_schema_version": OUTCOME_SCHEMA_VERSION,
+        "approval_id": approval_id,
+        "approval_digest": issue["approval_digest"],
+        "claim_id": claim_id,
+        "claim_digest": _record_fingerprint(claim, "claim_digest"),
+        "outcome_class": outcome_class,
+        "recorded_at": recorded_at,
+    }
+    return record, "claim_digest"
+
+
+def _record_use_outcome_during_session(
+    approval_id: str,
+    claim_id: str,
+    outcome_class: str,
+    *,
+    outcome_evidence: dict[str, Any] | None = None,
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Persist outcome.json while the caller holds ``_approval_use_session`` (Task 25)."""
+    if outcome_class not in {OUTCOME_CONSUMED, OUTCOME_AMBIGUOUS}:
+        raise ApprovalValidationError(
+            f"outcome_class must be {OUTCOME_CONSUMED!r} or {OUTCOME_AMBIGUOUS!r}"
+        )
+    validate_id(approval_id, "approval")
+    _require_active_approval_use_session(approval_id, base_dir)
+    bundle = _load_bundle(approval_id, base_dir)
+    issue = bundle["issue"]
+    if bundle["claim"] is None:
+        raise ApprovalStateError("cannot record outcome without claim", approval_id=approval_id)
+    if bundle["claim"].get("claim_id") != claim_id:
+        raise ApprovalStateError("claim_id does not match existing claim", approval_id=approval_id)
+    if bundle["revoke"] is not None:
+        raise ApprovalStateError("cannot record outcome for revoked approval", approval_id=approval_id)
+    replay_recorded_at = (
+        bundle["outcome"]["recorded_at"] if bundle["outcome"] is not None else _utc_now_iso()
+    )
+    record, digest_field = _build_outcome_record(
+        approval_id=approval_id,
+        issue=issue,
+        claim=bundle["claim"],
+        claim_id=claim_id,
+        outcome_class=outcome_class,
+        recorded_at=replay_recorded_at,
+        outcome_evidence=outcome_evidence,
+    )
+    replay = _readonly_exact_replay(
+        bundle["outcome"],
+        record,
+        run_id=issue["run_id"],
+        base_dir=base_dir,
+        approval_id=approval_id,
+        label="outcome.json",
+    )
+    if replay is not None:
+        return replay
+    _mark_control_write_started()
+    return _create_immutable_record(
+        approval_id,
+        "outcome.json",
+        record,
+        digest_field=digest_field,
+        base_dir=base_dir,
+    )
+
+
 def record_use_outcome(
     approval_id: str,
     claim_id: str,
     outcome_class: str,
     *,
+    outcome_evidence: dict[str, Any] | None = None,
     base_dir: Path | None = None,
 ) -> dict[str, Any]:
     if outcome_class not in {OUTCOME_CONSUMED, OUTCOME_AMBIGUOUS}:
@@ -1173,16 +1460,15 @@ def record_use_outcome(
     replay_recorded_at = (
         bundle["outcome"]["recorded_at"] if bundle["outcome"] is not None else _utc_now_iso()
     )
-    record = {
-        "record_kind": "approval_outcome",
-        "outcome_schema_version": OUTCOME_SCHEMA_VERSION,
-        "approval_id": approval_id,
-        "approval_digest": issue["approval_digest"],
-        "claim_id": claim_id,
-        "claim_digest": _record_fingerprint(bundle["claim"], "claim_digest"),
-        "outcome_class": outcome_class,
-        "recorded_at": replay_recorded_at,
-    }
+    record, digest_field = _build_outcome_record(
+        approval_id=approval_id,
+        issue=issue,
+        claim=bundle["claim"],
+        claim_id=claim_id,
+        outcome_class=outcome_class,
+        recorded_at=replay_recorded_at,
+        outcome_evidence=outcome_evidence,
+    )
     replay = _readonly_exact_replay(
         bundle["outcome"],
         record,
@@ -1199,16 +1485,15 @@ def record_use_outcome(
         replay_recorded_at = (
             fresh["outcome"]["recorded_at"] if fresh["outcome"] is not None else _utc_now_iso()
         )
-        record = {
-            "record_kind": "approval_outcome",
-            "outcome_schema_version": OUTCOME_SCHEMA_VERSION,
-            "approval_id": approval_id,
-            "approval_digest": fresh["issue"]["approval_digest"],
-            "claim_id": claim_id,
-            "claim_digest": _record_fingerprint(fresh["claim"], "claim_digest"),
-            "outcome_class": outcome_class,
-            "recorded_at": replay_recorded_at,
-        }
+        record, digest_field = _build_outcome_record(
+            approval_id=approval_id,
+            issue=fresh["issue"],
+            claim=fresh["claim"],
+            claim_id=claim_id,
+            outcome_class=outcome_class,
+            recorded_at=replay_recorded_at,
+            outcome_evidence=outcome_evidence,
+        )
         replay = _readonly_exact_replay(
             fresh["outcome"],
             record,
@@ -1224,7 +1509,7 @@ def record_use_outcome(
             approval_id,
             "outcome.json",
             record,
-            digest_field="claim_digest",
+            digest_field=digest_field,
             base_dir=base_dir,
         )
     return created

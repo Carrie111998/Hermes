@@ -1,14 +1,35 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-21 (Task 24.1 execution-lock test harness repair; parent Task 24 `af4868054`)
+**Last updated:** 2026-07-22 (Task 25 ready for checkpoint; parent Task 24.1 `40f4d016`)
 
 ---
 
 ## Active Task
 
-**Task 25 — Human-gated single-API invoke pilot** — blocked until Task 24 checkpoint ✅ and Task 24.1 harness repair ✅. See `09_PHASE2_RUNTIME_BOUNDARY.md`.
+**Task 26 — Ambiguous outcome reconciliation** — **not started**. Task 25 human-gated invoke pilot is implemented and ready for checkpoint on base `40f4d016`.
 
-**All Phase 2 lifecycle invoke remains disabled** until Task 25 is implemented.
+**General Phase 2 lifecycle invoke remains disabled** outside the narrow Task 25 pilot API (`complete_run_manually` only). No CLI, generic invoke router, unattended execution, retry, repair, or marker recovery.
+
+---
+
+## Completed (pending checkpoint)
+
+### Task 25 — Human-gated single-API invoke pilot
+
+**Status:** ✅ Implemented — ready for checkpoint (parent Task 24.1 `40f4d01638f3d2f3c16c9c8ef451ab1c20fc21f0`)
+**Depends on:** Task 24.1 `40f4d016`
+
+**Delivered:**
+
+- `htr/invoke_run_completion.py` — `invoke_approved_run_completion` pilot bound to **`complete_run_manually` only**
+- One continuous `_approval_use_session`: approval claim, lifecycle invoke, mandatory post-observe verification, outcome v2 (`consumed` | `ambiguous`)
+- Outcome v2 binds reason and diagnostic evidence; `safe_to_retry=false`; non-null external `project_repository_checkpoint` fail-closed
+- `consumed` requires complete verification; `ambiguous` is fail-stop and non-retryable
+- No CLI, generic invoke router, retry, reconciliation, marker recovery, or Recovery/Successor Runs
+
+**Tests (formal Git-only isolated archive, pre-commit, zero retries):** full HTR manifest **1623 passed** (27 files); **0 failed**; **0 skipped**
+
+**Explicitly not implemented:** Task 26 reconciliation; general/unattended/multi-API lifecycle invocation
 
 ---
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Final
 
 RunStatus = str
@@ -207,6 +208,100 @@ class ApprovalStateError(ApprovalControlError):
 
     def __init__(self, message: str, **kwargs: Any) -> None:
         super().__init__(message, error_code=ERROR_CODE_APPROVAL_STATE, **kwargs)
+
+
+ERROR_CODE_INVOKE_STALE: Final = "INVOKE_STALE_REJECTION"
+ERROR_CODE_INVOKE_AMBIGUOUS: Final = "INVOKE_AMBIGUOUS_OUTCOME"
+ERROR_CODE_INVOKE_OUTCOME_PERSISTENCE: Final = "INVOKE_OUTCOME_PERSISTENCE_FAILED"
+ERROR_CODE_INVOKE_CLEANUP_DURABILITY: Final = "INVOKE_CLEANUP_DURABILITY_FAILED"
+
+
+class InvokeRunCompletionError(HTRStateError):
+    """Base error for Task 25 human-gated run-completion invoke."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        approval_id: str | None = None,
+        claim_id: str | None = None,
+        reason_code: str | None = None,
+        mutation_may_have_committed: bool = False,
+        safe_to_retry: bool = False,
+        outcome_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.approval_id = approval_id
+        self.claim_id = claim_id
+        self.reason_code = reason_code
+        self.mutation_may_have_committed = mutation_may_have_committed
+        self.safe_to_retry = safe_to_retry
+        self.outcome_evidence = outcome_evidence
+
+
+class InvokeStaleApprovalError(InvokeRunCompletionError):
+    """Raised when pre-claim validation rejects the approval as stale."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_INVOKE_STALE,
+            safe_to_retry=False,
+            **kwargs,
+        )
+
+
+class InvokeAmbiguousOutcomeError(InvokeRunCompletionError):
+    """Raised after a durable claim when invoke outcome is ambiguous."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_INVOKE_AMBIGUOUS,
+            safe_to_retry=False,
+            **kwargs,
+        )
+
+
+class InvokeOutcomePersistenceError(InvokeRunCompletionError):
+    """Raised when outcome.json cannot be persisted after claim."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_INVOKE_OUTCOME_PERSISTENCE,
+            safe_to_retry=False,
+            **kwargs,
+        )
+
+
+class InvokeCleanupDurabilityError(InvokeRunCompletionError):
+    """Raised when marker cleanup fails after a consumed outcome."""
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_INVOKE_CLEANUP_DURABILITY,
+            safe_to_retry=False,
+            **kwargs,
+        )
+
+
+@dataclass(frozen=True)
+class InvokeRunCompletionResult:
+    """Immutable success result for Task 25 run-completion invoke."""
+
+    approval_id: str
+    claim_id: str
+    run_id: str
+    event_id: str
+    completion_record_fingerprint: str
+    event_semantic_fingerprint: str
+    pre_observation_digest: str
+    post_observation_digest: str
+    outcome_digest: str
 
 
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:

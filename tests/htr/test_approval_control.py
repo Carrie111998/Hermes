@@ -35,6 +35,7 @@ from htr.approval_control import (
     revoke_approval,
     validate_approval,
 )
+from htr.approval_control import OUTCOME_SCHEMA_VERSION_V2
 from htr import execution_lock as _el
 from htr.execution_lock import (
     LOCKS_DIR_NAME,
@@ -1086,15 +1087,60 @@ def test_revoke_vs_claim_race_one_valid_serialization(tmp_path):
     p2.join(timeout=15)
     results = {slot_revoke.get(timeout=2), slot_claim.get(timeout=2)}
     assert len(results) == 2
-    if "revoked" in results and "claimed" not in results:
+    bundle = get_approval(issue["approval_id"], base_dir=tmp_path)
+    claim_path = paths.approval_claim_path(issue["approval_id"], tmp_path)
+
+    if bundle["revoke"] is not None and bundle["claim"] is None:
+        assert "revoked" in results
+        assert "claimed" not in results
         with pytest.raises(ApprovalStateError):
             claim_approval(issue["approval_id"], "claim-late", "bob", base_dir=tmp_path)
-    else:
-        assert "claimed" in results
-        revoke_approval(issue["approval_id"], "alice", "after claim", base_dir=tmp_path)
-        assert paths.approval_claim_path(issue["approval_id"], tmp_path).is_file()
-        with pytest.raises(ApprovalStateError):
-            claim_approval(issue["approval_id"], "claim-late", "bob", base_dir=tmp_path)
+        return
+
+    assert bundle["claim"] is not None
+    assert "claimed" in results
+    assert claim_path.is_file()
+    assert bundle["claim"]["claim_id"] == "claim-race"
+    with pytest.raises(ApprovalStateError):
+        claim_approval(issue["approval_id"], "claim-late", "bob", base_dir=tmp_path)
+    assert claim_path.is_file()
+    assert get_approval(issue["approval_id"], base_dir=tmp_path)["claim"]["claim_id"] == "claim-race"
+
+
+def test_revoke_before_claim_blocks_claim_deterministic(tmp_path):
+    run_id = _run_with_completion_only(tmp_path)
+    issue = issue_approval(
+        run_id,
+        _review_intent(run_id, tmp_path, new_event_id()),
+        approver_id="alice",
+        executor_id="bob",
+        expires_at=_expires_in(),
+        base_dir=tmp_path,
+    )
+    revoke_approval(issue["approval_id"], "alice", "cancel", base_dir=tmp_path)
+    with pytest.raises(ApprovalStateError):
+        claim_approval(issue["approval_id"], "claim-late", "bob", base_dir=tmp_path)
+    bundle = get_approval(issue["approval_id"], base_dir=tmp_path)
+    assert bundle["revoke"] is not None
+    assert bundle["claim"] is None
+
+
+def test_claim_before_revoke_retains_claim_deterministic(tmp_path):
+    run_id = _run_with_completion_only(tmp_path)
+    issue = issue_approval(
+        run_id,
+        _review_intent(run_id, tmp_path, new_event_id()),
+        approver_id="alice",
+        executor_id="bob",
+        expires_at=_expires_in(),
+        base_dir=tmp_path,
+    )
+    claim_approval(issue["approval_id"], "claim-first", "bob", base_dir=tmp_path)
+    revoke_approval(issue["approval_id"], "alice", "cancel", base_dir=tmp_path)
+    bundle = get_approval(issue["approval_id"], base_dir=tmp_path)
+    assert bundle["claim"]["claim_id"] == "claim-first"
+    assert paths.approval_claim_path(issue["approval_id"], tmp_path).is_file()
+    assert bundle["revoke"] is not None
 
 
 def test_symlinked_control_root_fails_closed(tmp_path):
@@ -2241,6 +2287,800 @@ def test_ambiguous_outcome_exact_replay_zero_write(tmp_path):
     with _zero_write_guard():
         second = record_use_outcome(
             issue["approval_id"], "claim-amb-zw", OUTCOME_AMBIGUOUS, base_dir=tmp_path
+        )
+    assert second == first
+    assert _approval_fs_snapshot(tmp_path) == snap
+
+
+def test_v2_consumed_outcome_requires_evidence(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2", "bob", base_dir=tmp_path)
+    evidence = {
+        "reason_code": "verified_success",
+        "error_classification": "verified_success",
+        "bound_api": "review_run_manually",
+        "event_id": new_event_id(),
+        "pre_observation_digest": issue["source_observation_digest"],
+        "post_observation_digest": issue["source_observation_digest"],
+        "mutation_may_have_committed": True,
+        "safe_to_retry": False,
+        "verification_reason_codes": [],
+        "observed_record_fingerprint": None,
+        "observed_event_fingerprint": None,
+    }
+    outcome = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2",
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    assert outcome["outcome_schema_version"] == "2"
+    assert outcome["outcome_digest"].startswith("sha256:")
+    assert "claim_digest" in outcome
+    assert outcome["outcome_evidence"]["reason_code"] == "verified_success"
+
+
+def test_v2_consumed_exact_replay_zero_write(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-replay", "bob", base_dir=tmp_path)
+    evidence = {
+        "reason_code": "verified_success",
+        "error_classification": "verified_success",
+        "bound_api": "review_run_manually",
+        "event_id": new_event_id(),
+        "pre_observation_digest": issue["source_observation_digest"],
+        "post_observation_digest": issue["source_observation_digest"],
+        "mutation_may_have_committed": True,
+        "safe_to_retry": False,
+        "verification_reason_codes": [],
+        "observed_record_fingerprint": None,
+        "observed_event_fingerprint": None,
+    }
+    first = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-replay",
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    snap = _approval_fs_snapshot(tmp_path)
+    with _zero_write_guard():
+        second = record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-replay",
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+    assert second == first
+    assert _approval_fs_snapshot(tmp_path) == snap
+
+
+def test_v2_ambiguous_exact_replay_zero_write(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-amb-replay", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        reason_code="post_verification_mismatch",
+        error_classification="post_verification_mismatch",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    first = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-amb-replay",
+        OUTCOME_AMBIGUOUS,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    snap = _approval_fs_snapshot(tmp_path)
+    with _zero_write_guard():
+        second = record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-amb-replay",
+            OUTCOME_AMBIGUOUS,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+    assert second == first
+    assert _approval_fs_snapshot(tmp_path) == snap
+
+
+def test_v2_ambiguous_evidence_conflict_fails_closed(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-conflict", "bob", base_dir=tmp_path)
+    evidence = {
+        "reason_code": "claimed_invoke_not_started",
+        "error_classification": "claimed_invoke_not_started",
+        "bound_api": "review_run_manually",
+        "event_id": new_event_id(),
+        "pre_observation_digest": issue["source_observation_digest"],
+        "post_observation_digest": None,
+        "mutation_may_have_committed": False,
+        "safe_to_retry": False,
+        "verification_reason_codes": [],
+        "observed_record_fingerprint": None,
+        "observed_event_fingerprint": None,
+    }
+    record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-conflict",
+        OUTCOME_AMBIGUOUS,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    conflicting = dict(evidence)
+    conflicting["reason_code"] = "invoke_raised_commit_unknown"
+    with pytest.raises(ApprovalConflictError):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-conflict",
+            OUTCOME_AMBIGUOUS,
+            outcome_evidence=conflicting,
+            base_dir=tmp_path,
+        )
+
+
+def test_v1_outcome_still_works_without_evidence(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v1-only", "bob", base_dir=tmp_path)
+    outcome = record_use_outcome(
+        issue["approval_id"], "claim-v1-only", OUTCOME_CONSUMED, base_dir=tmp_path
+    )
+    assert outcome["outcome_schema_version"] == "1"
+    assert "outcome_digest" not in outcome
+    assert outcome["claim_digest"].startswith("sha256:")
+
+
+# --- Task 25 hardening: in-session helpers and v2 outcome digests ---
+
+
+def test_in_session_helpers_not_exported_in_public_all():
+    assert "_claim_approval_during_session" not in approval_control.__all__
+    assert "_record_use_outcome_during_session" not in approval_control.__all__
+    assert hasattr(approval_control, "_claim_approval_during_session")
+    assert hasattr(approval_control, "_record_use_outcome_during_session")
+
+
+def test_claim_during_session_without_active_session_raises(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    with pytest.raises(ApprovalStateError, match="approval-use session"):
+        approval_control._claim_approval_during_session(
+            issue["approval_id"],
+            "claim-no-session",
+            base_dir=tmp_path,
+        )
+
+
+def test_record_outcome_during_session_without_active_session_raises(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    with pytest.raises(ApprovalStateError, match="approval-use session"):
+        approval_control._record_use_outcome_during_session(
+            issue["approval_id"],
+            "claim-no-session",
+            OUTCOME_CONSUMED,
+            base_dir=tmp_path,
+        )
+
+
+def test_in_session_helpers_reject_wrong_thread(tmp_path):
+    run_id, issue = _issue_fixture(tmp_path)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def holder() -> None:
+        with approval_control._approval_use_session(run_id, tmp_path):
+            barrier.wait(timeout=5)
+            barrier.wait(timeout=5)
+
+    def challenger() -> None:
+        barrier.wait(timeout=5)
+        try:
+            approval_control._claim_approval_during_session(
+                issue["approval_id"],
+                "claim-wrong-thread",
+                base_dir=tmp_path,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        barrier.wait(timeout=5)
+
+    holder_thread = threading.Thread(target=holder)
+    challenger_thread = threading.Thread(target=challenger)
+    holder_thread.start()
+    challenger_thread.start()
+    holder_thread.join(timeout=10)
+    challenger_thread.join(timeout=10)
+    assert len(errors) == 1
+    assert isinstance(errors[0], ApprovalStateError)
+    assert "approval-use session" in str(errors[0])
+
+
+GOLDEN_OUTCOME_V2_CONSUMED_BYTES = (
+    '{"approval_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+    '"approval_id":"apr_golden000001",'
+    '"claim_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",'
+    '"claim_id":"claim-golden-001","outcome_class":"consumed",'
+    '"outcome_digest_projection_version":"htr.approval.outcome.digest.v2",'
+    '"outcome_evidence":{"bound_api":"complete_run_manually","error_classification":"verified_success",'
+    '"event_id":"evt_golden000001","mutation_may_have_committed":true,'
+    '"observed_event_fingerprint":"fp-event","observed_record_fingerprint":"fp-record",'
+    '"post_observation_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+    '"pre_observation_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    '"reason_code":"verified_success","safe_to_retry":false,"verification_reason_codes":[]},'
+    '"outcome_schema_version":"2","recorded_at":"2026-01-01T00:00:00+00:00"}'
+)
+GOLDEN_OUTCOME_V2_CONSUMED_DIGEST = (
+    "sha256:3dd1cfb06ad31c4e237c4b33436d6348c592bde58c87721f43ed94a9b4bbdf08"
+)
+GOLDEN_OUTCOME_V2_AMBIGUOUS_BYTES = (
+    '{"approval_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+    '"approval_id":"apr_golden000001",'
+    '"claim_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",'
+    '"claim_id":"claim-golden-001","outcome_class":"ambiguous",'
+    '"outcome_digest_projection_version":"htr.approval.outcome.digest.v2",'
+    '"outcome_evidence":{"bound_api":"complete_run_manually",'
+    '"error_classification":"post_verification_mismatch","event_id":"evt_golden000001",'
+    '"mutation_may_have_committed":true,"observed_event_fingerprint":"fp-event",'
+    '"observed_record_fingerprint":"fp-record",'
+    '"post_observation_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+    '"pre_observation_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    '"reason_code":"post_verification_mismatch","safe_to_retry":false,'
+    '"verification_reason_codes":["event_actor_mismatch"]},'
+    '"outcome_schema_version":"2","recorded_at":"2026-01-01T00:00:00+00:00"}'
+)
+GOLDEN_OUTCOME_V2_AMBIGUOUS_DIGEST = (
+    "sha256:3f0f5f1fda68f2d8c5333e5b60c57810b6a9bcec0fa2091827dc1bd87650447f"
+)
+
+
+def _sample_v2_outcome_evidence(**overrides: Any) -> dict[str, Any]:
+    base = {
+        "reason_code": "verified_success",
+        "error_classification": "verified_success",
+        "bound_api": "review_run_manually",
+        "event_id": "evt_golden000001",
+        "pre_observation_digest": "sha256:" + "a" * 64,
+        "post_observation_digest": "sha256:" + "b" * 64,
+        "mutation_may_have_committed": True,
+        "safe_to_retry": False,
+        "verification_reason_codes": [],
+        "observed_record_fingerprint": "fp-record",
+        "observed_event_fingerprint": "fp-event",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_v2_outcome_golden_digest_projections_stable():
+    from htr.action_plan import _canonical_json
+
+    consumed = {
+        "outcome_schema_version": OUTCOME_SCHEMA_VERSION_V2,
+        "approval_id": "apr_golden000001",
+        "approval_digest": "sha256:" + "d" * 64,
+        "claim_id": "claim-golden-001",
+        "claim_digest": "sha256:" + "e" * 64,
+        "outcome_class": OUTCOME_CONSUMED,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "outcome_evidence": _sample_v2_outcome_evidence(
+            bound_api="complete_run_manually",
+        ),
+    }
+    ambiguous = {
+        **consumed,
+        "outcome_class": OUTCOME_AMBIGUOUS,
+        "outcome_evidence": _sample_v2_outcome_evidence(
+            bound_api="complete_run_manually",
+            reason_code="post_verification_mismatch",
+            error_classification="post_verification_mismatch",
+            post_observation_digest="sha256:" + "c" * 64,
+            verification_reason_codes=["event_actor_mismatch"],
+        ),
+    }
+    assert (
+        _canonical_json(approval_control._outcome_digest_projection_v2(consumed))
+        == GOLDEN_OUTCOME_V2_CONSUMED_BYTES
+    )
+    assert approval_control._compute_outcome_digest(consumed) == GOLDEN_OUTCOME_V2_CONSUMED_DIGEST
+    assert (
+        _canonical_json(approval_control._outcome_digest_projection_v2(ambiguous))
+        == GOLDEN_OUTCOME_V2_AMBIGUOUS_BYTES
+    )
+    assert approval_control._compute_outcome_digest(ambiguous) == GOLDEN_OUTCOME_V2_AMBIGUOUS_DIGEST
+
+
+def test_v2_outcome_digest_authoritative_field_sensitivity():
+    base = {
+        "outcome_schema_version": OUTCOME_SCHEMA_VERSION_V2,
+        "approval_id": "apr_digest000001",
+        "approval_digest": "sha256:" + "d" * 64,
+        "claim_id": "claim-digest-001",
+        "claim_digest": "sha256:" + "e" * 64,
+        "outcome_class": OUTCOME_CONSUMED,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "outcome_evidence": _sample_v2_outcome_evidence(),
+    }
+    golden = approval_control._compute_outcome_digest(base)
+    for key in ("approval_id", "claim_id", "outcome_class", "recorded_at"):
+        mutated = dict(base)
+        mutated[key] = "changed"
+        assert approval_control._compute_outcome_digest(mutated) != golden
+    evidence_mutated = dict(base)
+    evidence_mutated["outcome_evidence"] = _sample_v2_outcome_evidence(reason_code="changed")
+    assert approval_control._compute_outcome_digest(evidence_mutated) != golden
+    presentation = dict(base)
+    presentation["record_kind"] = "approval_outcome"
+    assert "record_kind" not in approval_control._outcome_digest_projection_v2(base)
+
+
+def test_v2_outcome_presentation_fields_excluded_from_digest_projection():
+    body = {
+        "outcome_schema_version": OUTCOME_SCHEMA_VERSION_V2,
+        "approval_id": "apr_pres000001",
+        "approval_digest": "sha256:" + "d" * 64,
+        "claim_id": "claim-pres-001",
+        "claim_digest": "sha256:" + "e" * 64,
+        "outcome_class": OUTCOME_CONSUMED,
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "outcome_evidence": _sample_v2_outcome_evidence(),
+        "record_kind": "approval_outcome",
+        "presentation_note": "ignored",
+    }
+    projection = approval_control._outcome_digest_projection_v2(body)
+    assert "record_kind" not in projection
+    assert "presentation_note" not in projection
+    assert approval_control._compute_outcome_digest(body) == approval_control._compute_outcome_digest(
+        {k: v for k, v in body.items() if k not in {"record_kind", "presentation_note"}}
+    )
+
+
+def test_v2_outcome_invalid_reason_code_for_consumed_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-bad-reason", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        reason_code="post_verification_mismatch",
+        error_classification="post_verification_mismatch",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(ApprovalValidationError, match="verified_success"):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-bad-reason",
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_outcome_invalid_safe_to_retry_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-retry", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        safe_to_retry=True,
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(ApprovalValidationError, match="safe_to_retry must be false"):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-retry",
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "claim_suffix"),
+    [
+        (0, "zero"),
+        (1, "one"),
+        ("false", "str-false"),
+        ("true", "str-true"),
+        (None, "null"),
+        ([], "list"),
+        ({}, "dict"),
+        (0.0, "float-zero"),
+    ],
+)
+def test_v2_non_boolean_safe_to_retry_values_rejected(tmp_path, bad_value, claim_suffix):
+    _, issue = _issue_fixture(tmp_path)
+    claim_id = f"claim-v2-retry-type-{claim_suffix}"
+    claim_approval(issue["approval_id"], claim_id, "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        safe_to_retry=bad_value,
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(ApprovalValidationError, match="safe_to_retry must be boolean"):
+        record_use_outcome(
+            issue["approval_id"],
+            claim_id,
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_outcome_conflicting_evidence_replay_fails_closed(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-ev-conflict", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        reason_code="post_verification_mismatch",
+        error_classification="post_verification_mismatch",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-ev-conflict",
+        OUTCOME_AMBIGUOUS,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    conflicting = dict(evidence)
+    conflicting["reason_code"] = "invoke_raised_commit_unknown"
+    conflicting["error_classification"] = "invoke_raised_commit_unknown"
+    with pytest.raises(ApprovalConflictError):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-ev-conflict",
+            OUTCOME_AMBIGUOUS,
+            outcome_evidence=conflicting,
+            base_dir=tmp_path,
+        )
+
+
+
+def test_v1_outcome_conflicting_replay_fails_closed(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v1-conflict", "bob", base_dir=tmp_path)
+    record_use_outcome(
+        issue["approval_id"], "claim-v1-conflict", OUTCOME_CONSUMED, base_dir=tmp_path
+    )
+    with pytest.raises(ApprovalConflictError):
+        record_use_outcome(
+            issue["approval_id"], "claim-v1-conflict", OUTCOME_AMBIGUOUS, base_dir=tmp_path
+        )
+
+
+def test_v2_missing_evidence_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-missing-ev", "bob", base_dir=tmp_path)
+    with pytest.raises(ApprovalValidationError, match="missing"):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-missing-ev",
+            OUTCOME_CONSUMED,
+            outcome_evidence={
+                "reason_code": "verified_success",
+                "error_classification": "verified_success",
+                "bound_api": issue["bound_api"],
+                "event_id": new_event_id(),
+                "pre_observation_digest": issue["source_observation_digest"],
+                "mutation_may_have_committed": True,
+                "safe_to_retry": False,
+                "verification_reason_codes": [],
+            },
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_malformed_evidence_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-malformed", "bob", base_dir=tmp_path)
+    with pytest.raises(ApprovalValidationError, match="JSON object"):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-malformed",
+            OUTCOME_CONSUMED,
+            outcome_evidence="not-an-object",
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_unknown_reason_code_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-unknown-reason", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        reason_code="totally_unknown_reason",
+        error_classification="totally_unknown_reason",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    outcome = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-unknown-reason",
+        OUTCOME_AMBIGUOUS,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    assert outcome["outcome_evidence"]["reason_code"] == "totally_unknown_reason"
+
+
+def test_v2_invalid_ambiguous_reason_combination_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-bad-combo", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        reason_code="verified_success",
+        error_classification="verified_success",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(
+        ApprovalValidationError,
+        match="ambiguous v2 outcome cannot use reason_code verified_success",
+    ):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-bad-combo",
+            OUTCOME_AMBIGUOUS,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+def test_v2_non_boolean_mutation_may_have_committed_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-mutation-type", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        mutation_may_have_committed="yes",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(ApprovalValidationError, match="mutation_may_have_committed must be boolean"):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-mutation-type",
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_invalid_verification_reason_codes_type_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-vrc-type", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        verification_reason_codes="not-a-list",
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(ApprovalValidationError, match="verification_reason_codes"):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-vrc-type",
+            OUTCOME_AMBIGUOUS,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+
+def _record_v2_consumed_with_evidence(tmp_path, issue, claim_id: str) -> dict[str, Any]:
+    evidence = _sample_v2_outcome_evidence(
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    return record_use_outcome(
+        issue["approval_id"],
+        claim_id,
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+
+
+def test_v2_wrong_approval_digest_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-bad-apr-digest", "bob", base_dir=tmp_path)
+    _record_v2_consumed_with_evidence(tmp_path, issue, "claim-v2-bad-apr-digest")
+    issue_path = paths.approval_issue_path(issue["approval_id"], tmp_path)
+    raw = json.loads(issue_path.read_text(encoding="utf-8"))
+    raw["approval_digest"] = "sha256:" + "0" * 64
+    issue_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ApprovalConflictError):
+        _record_v2_consumed_with_evidence(tmp_path, issue, "claim-v2-bad-apr-digest")
+
+
+def test_v2_wrong_claim_digest_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-bad-claim-digest", "bob", base_dir=tmp_path)
+    _record_v2_consumed_with_evidence(tmp_path, issue, "claim-v2-bad-claim-digest")
+    claim_path = paths.approval_claim_path(issue["approval_id"], tmp_path)
+    raw = json.loads(claim_path.read_text(encoding="utf-8"))
+    raw["claim_digest"] = "sha256:" + "1" * 64
+    claim_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ApprovalConflictError):
+        _record_v2_consumed_with_evidence(tmp_path, issue, "claim-v2-bad-claim-digest")
+
+
+def test_v2_wrong_bound_api_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-bad-bound-api", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-bad-bound-api",
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    conflicting = dict(evidence)
+    conflicting["bound_api"] = "complete_run_manually"
+    with pytest.raises(ApprovalConflictError):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-bad-bound-api",
+            OUTCOME_CONSUMED,
+            outcome_evidence=conflicting,
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_wrong_event_id_rejected(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-bad-event", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-bad-event",
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    conflicting = dict(evidence)
+    conflicting["event_id"] = new_event_id()
+    with pytest.raises(ApprovalConflictError):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-bad-event",
+            OUTCOME_CONSUMED,
+            outcome_evidence=conflicting,
+            base_dir=tmp_path,
+        )
+
+
+def test_v2_explicit_null_post_observation_digest_allowed(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-null-post", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        reason_code="claimed_invoke_not_started",
+        error_classification="claimed_invoke_not_started",
+        post_observation_digest=None,
+        pre_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    outcome = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-null-post",
+        OUTCOME_AMBIGUOUS,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    assert outcome["outcome_evidence"]["post_observation_digest"] is None
+
+
+def test_v2_explicit_null_observed_fingerprints_allowed(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-null-fp", "bob", base_dir=tmp_path)
+    evidence = _sample_v2_outcome_evidence(
+        observed_record_fingerprint=None,
+        observed_event_fingerprint=None,
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    outcome = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-null-fp",
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence,
+        base_dir=tmp_path,
+    )
+    assert outcome["outcome_evidence"]["observed_record_fingerprint"] is None
+    assert outcome["outcome_evidence"]["observed_event_fingerprint"] is None
+
+
+def test_v2_insertion_order_independence_for_digest(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-order", "bob", base_dir=tmp_path)
+    evidence_a = {
+        "reason_code": "verified_success",
+        "error_classification": "verified_success",
+        "bound_api": issue["bound_api"],
+        "event_id": new_event_id(),
+        "pre_observation_digest": issue["source_observation_digest"],
+        "post_observation_digest": issue["source_observation_digest"],
+        "mutation_may_have_committed": True,
+        "safe_to_retry": False,
+        "verification_reason_codes": [],
+        "observed_record_fingerprint": "fp-record",
+        "observed_event_fingerprint": "fp-event",
+    }
+    evidence_b = {
+        "observed_event_fingerprint": "fp-event",
+        "observed_record_fingerprint": "fp-record",
+        "verification_reason_codes": [],
+        "safe_to_retry": False,
+        "mutation_may_have_committed": True,
+        "post_observation_digest": issue["source_observation_digest"],
+        "pre_observation_digest": issue["source_observation_digest"],
+        "event_id": evidence_a["event_id"],
+        "bound_api": issue["bound_api"],
+        "error_classification": "verified_success",
+        "reason_code": "verified_success",
+    }
+    first = record_use_outcome(
+        issue["approval_id"],
+        "claim-v2-order",
+        OUTCOME_CONSUMED,
+        outcome_evidence=evidence_a,
+        base_dir=tmp_path,
+    )
+    snap = _approval_fs_snapshot(tmp_path)
+    with _zero_write_guard():
+        second = record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-order",
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence_b,
+            base_dir=tmp_path,
+        )
+    assert second == first
+    assert _approval_fs_snapshot(tmp_path) == snap
+
+
+def test_v2_v1_not_interchangeable_schema_versions(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v2-v1-mix", "bob", base_dir=tmp_path)
+    v1 = record_use_outcome(
+        issue["approval_id"], "claim-v2-v1-mix", OUTCOME_CONSUMED, base_dir=tmp_path
+    )
+    assert v1["outcome_schema_version"] != OUTCOME_SCHEMA_VERSION_V2
+    evidence = _sample_v2_outcome_evidence(
+        pre_observation_digest=issue["source_observation_digest"],
+        post_observation_digest=issue["source_observation_digest"],
+        bound_api=issue["bound_api"],
+    )
+    with pytest.raises(ApprovalConflictError):
+        record_use_outcome(
+            issue["approval_id"],
+            "claim-v2-v1-mix",
+            OUTCOME_CONSUMED,
+            outcome_evidence=evidence,
+            base_dir=tmp_path,
+        )
+
+
+def test_v1_outcome_exact_replay_zero_write_unchanged_after_v2_additions(tmp_path):
+    _, issue = _issue_fixture(tmp_path)
+    claim_approval(issue["approval_id"], "claim-v1-zw-retest", "bob", base_dir=tmp_path)
+    first = record_use_outcome(
+        issue["approval_id"], "claim-v1-zw-retest", OUTCOME_CONSUMED, base_dir=tmp_path
+    )
+    snap = _approval_fs_snapshot(tmp_path)
+    with _zero_write_guard():
+        second = record_use_outcome(
+            issue["approval_id"], "claim-v1-zw-retest", OUTCOME_CONSUMED, base_dir=tmp_path
         )
     assert second == first
     assert _approval_fs_snapshot(tmp_path) == snap

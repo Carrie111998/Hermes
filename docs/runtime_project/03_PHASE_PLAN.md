@@ -2,7 +2,7 @@
 
 **Baseline:** Architecture Baseline v1.0
 **Date:** 2026-07-18
-**Updated:** 2026-07-21 (Task 23 durable run write barrier checkpointed; parent Task 22 `896961d0`)
+**Updated:** 2026-07-22 (Task 25 ready for checkpoint on base `40f4d016`; parent Task 24.1)
 
 ---
 
@@ -56,9 +56,9 @@ Phase 2 defines controlled runtime integration and safe-automation progression.
 1. **Immutable finalization:** valid `run_final_closure_record` → original run sealed against all normal committed HTR mutation APIs (Task 22 ✅).
 2. **Recovery/Successor Run:** remediation via linked successor run; original never reopened/unlocked/edited (Task 27+).
 
-**Write-path gate:** no Phase 2 lifecycle invoke before Task 25 human-gated invoke (Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval control ✅).
+**Write-path gate:** Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval control ✅. **Task 25** delivers the narrow human-gated invoke pilot for `complete_run_manually` only — no general lifecycle router, CLI, retry, reconciliation, or Recovery Run. Task 25 is **implemented and ready for this checkpoint**.
 
-**Accepted progression:** observe (✅) → action plan (✅ Task 21) → immutable seal (✅ Task 22) → write barrier (✅ Task 23) → approval (✅ Task 24) → human-gated invoke (Task 25 — next, not started) → reconciliation → Recovery/Successor protocol → bounded repair → …
+**Accepted progression:** observe (✅) → action plan (✅ Task 21) → immutable seal (✅ Task 22) → write barrier (✅ Task 23) → approval (✅ Task 24) → human-gated invoke (**Task 25 — ready for checkpoint**) → reconciliation (Task 26 — not started) → Recovery/Successor protocol → bounded repair → …
 
 **Historical note:** Phase 1 (Task 17.1) documented chain-terminal closure without global API hard lock; Policy C is forward-looking Phase 2 enforcement.
 
