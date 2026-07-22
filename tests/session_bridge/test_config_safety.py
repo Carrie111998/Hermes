@@ -294,6 +294,7 @@ _CLAUDE_VISIBILITY_DEFAULTS = {
     "emergency_daily_cost_usd": Decimal("0.50"),
     "process_timeout_seconds": 120,
     "discovery_timeout_seconds": 30,
+    "float_activity": False,
 }
 
 
@@ -359,6 +360,7 @@ def test_claude_visibility_config_parses_every_valid_override(
         "emergency_daily_cost_usd": "0.75",
         "process_timeout_seconds": 180,
         "discovery_timeout_seconds": 45,
+        "float_activity": True,
     }
 
     config = _load_with_claude_visibility(monkeypatch, configured)
