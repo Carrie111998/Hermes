@@ -5036,6 +5036,32 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    @staticmethod
+    def _group_diagnostic_replacement(event: MessageEvent, text: str | None) -> str | None:
+        """Return a concise group-safe failure notice for internal diagnostics.
+
+        Group channels are operator surfaces. Raw provider diagnostics are noisy,
+        but dropping them is worse for explicitly addressed operational tasks: the
+        group sees no reply and assumes the task may have happened. Convert known
+        model-empty failures into a short, action-safe notice instead.
+        """
+        if not text:
+            return None
+        source = getattr(event, "source", None)
+        if getattr(source, "chat_type", None) not in {"group", "channel", "thread"}:
+            return None
+        lowered = text.lower()
+        diagnostic_markers = (
+            "empty response from model",
+            "empty response (no content",
+            "empty response after",
+            "no fallback available",
+            "model returned empty",
+        )
+        if not any(marker in lowered for marker in diagnostic_markers):
+            return None
+        return "Hank hit a model error before completing this. No change was made — please retry or tag Hank again."
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -5174,6 +5200,15 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+
+                _group_diag_replacement = self._group_diagnostic_replacement(event, text_content)
+                if _group_diag_replacement:
+                    logger.info(
+                        "[%s] Rewriting group diagnostic response for %s",
+                        self.name, event.source.chat_id,
+                    )
+                    text_content = _group_diag_replacement
+                    response = _group_diag_replacement
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status

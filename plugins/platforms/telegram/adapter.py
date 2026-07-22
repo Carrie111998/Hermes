@@ -252,6 +252,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig
+from hermes_constants import get_hermes_home
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -7456,6 +7457,97 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Ignoring invalid Telegram thread id: %r", self.name, value)
         return ignored
 
+    @staticmethod
+    def _coerce_participation_mode(value) -> Optional[str]:
+        if value is None:
+            return None
+        mode = str(value).strip().lower()
+        aliases = {"on": "active", "open": "active", "dm": "active", "off": "muted", "mute": "muted", "silent": "muted"}
+        mode = aliases.get(mode, mode)
+        return mode if mode in {"active", "passive", "muted"} else None
+
+    def _telegram_participation_policy(self) -> dict:
+        raw = self.config.extra.get("participation_policy")
+        if raw is None:
+            raw = self.config.extra.get("participation")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                logger.warning("[%s] Ignoring invalid Telegram participation_policy JSON", self.name)
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _telegram_passive_reaction(self) -> str:
+        policy = self._telegram_participation_policy()
+        reaction = policy.get("passive_reaction", self.config.extra.get("passive_reaction", "\U0001f440"))
+        return str(reaction or "\U0001f440")
+
+    @staticmethod
+    def _topic_key(chat_id: str, thread_id: Optional[str]) -> str:
+        return f"{chat_id}:{thread_id or 'main'}"
+
+    def _participation_mode_for_message(self, message: Message) -> Optional[str]:
+        """Return active/passive/muted for this group topic, or None for legacy gates.
+
+        DMs intentionally return ``active`` via the caller's existing non-group path.
+        Group topics can be addressed by exact ``chat_id:thread_id`` keys; root or
+        General-topic messages use ``chat_id:main`` / ``chat_id:1`` as applicable.
+        """
+        if not self._is_group_chat(message):
+            return "active"
+        policy = self._telegram_participation_policy()
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = self._effective_message_thread_id(message)
+        keys = [self._topic_key(chat_id, thread_id)]
+        if thread_id in {None, self._GENERAL_TOPIC_THREAD_ID}:
+            keys.append(self._topic_key(chat_id, "main"))
+
+        threads = policy.get("threads", {})
+        if isinstance(threads, dict):
+            for key in keys:
+                mode = self._coerce_participation_mode(threads.get(key))
+                if mode:
+                    return mode
+        elif isinstance(threads, list):
+            for entry in threads:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("chat_id", "")) != chat_id:
+                    continue
+                entry_thread = str(entry.get("thread_id", "main" if thread_id is None else thread_id))
+                if entry_thread in {str(thread_id), "main" if thread_id is None else ""}:
+                    mode = self._coerce_participation_mode(entry.get("mode"))
+                    if mode:
+                        return mode
+
+        chats = policy.get("chats", {})
+        if isinstance(chats, dict):
+            mode = self._coerce_participation_mode(chats.get(chat_id))
+            if mode:
+                return mode
+        elif isinstance(chats, list):
+            for entry in chats:
+                if isinstance(entry, dict) and str(entry.get("chat_id", "")) == chat_id:
+                    mode = self._coerce_participation_mode(entry.get("mode"))
+                    if mode:
+                        return mode
+
+        return self._coerce_participation_mode(policy.get("default_group_mode"))
+
+    def _message_is_direct_bot_trigger(self, message: Message, *, guest_mention: Optional[bool] = None) -> bool:
+        if self._is_reply_to_bot(message):
+            return True
+        if guest_mention is True:
+            return True
+        if guest_mention is None or not self._telegram_guest_mode():
+            if self._message_mentions_bot(message):
+                return True
+        return self._message_matches_mention_patterns(message)
+
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns")
@@ -8104,21 +8196,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if allowed and chat_id_str not in allowed:
             return guest_mention
 
+        participation_mode = self._participation_mode_for_message(message)
+        if participation_mode == "muted":
+            return False
+        if participation_mode == "active":
+            return True
+        if participation_mode == "passive":
+            return self._message_is_direct_bot_trigger(message, guest_mention=guest_mention)
+
         if guest_mention:
             return True
+
         if chat_id_str in self._telegram_free_response_chats():
             return True
         if self._telegram_is_free_response_topic(message):
             return True
         if not self._telegram_require_mention():
             return True
-        if self._is_reply_to_bot(message):
-            return True
-        # When guest_mode is True, _is_guest_mention already called
-        # _message_mentions_bot above — skip the redundant second call.
-        if not self._telegram_guest_mode() and self._message_mentions_bot(message):
-            return True
-        return self._message_matches_mention_patterns(message)
+        return self._message_is_direct_bot_trigger(message, guest_mention=guest_mention)
 
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
@@ -8144,6 +8239,124 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[%s] Lazy-registered %d commands for forum chat %s", self.name, len(bot_commands), chat_id)
             except Exception as e:
                 logger.warning("[%s] Forum command lazy-registration failed: %s", self.name, _redact_telegram_error_text(e))
+
+    def _hank_participation_command(self, message: Message) -> tuple[Optional[str], bool]:
+        text = (getattr(message, "text", None) or "").strip()
+        if not text:
+            return None, False
+        parts = text.split()
+        command = parts[0].split("@", 1)[0].lower()
+        if command != "/hank":
+            return None, False
+        if len(parts) < 2:
+            return "status", True
+        action = parts[1].lower()
+        if action in {"active", "passive", "mute", "muted", "status"}:
+            return ("muted" if action == "mute" else action), True
+        return None, True
+
+    async def _send_participation_notice(self, message: Message, text: str) -> None:
+        if not self._bot:
+            return
+        kwargs = {"chat_id": getattr(getattr(message, "chat", None), "id", None), "text": text}
+        thread_id = self._effective_message_thread_id(message)
+        if thread_id is not None:
+            kwargs["message_thread_id"] = int(thread_id)
+        try:
+            await self._bot.send_message(**kwargs)
+        except Exception as exc:
+            logger.debug("[%s] participation notice send failed: %s", self.name, exc)
+
+    def _set_participation_mode_in_memory(self, message: Message, mode: str) -> str:
+        policy = dict(self._telegram_participation_policy())
+        threads = dict(policy.get("threads") or {}) if isinstance(policy.get("threads"), dict) else {}
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = self._effective_message_thread_id(message)
+        key = self._topic_key(chat_id, thread_id)
+        threads[key] = mode
+        policy["threads"] = threads
+        policy.setdefault("passive_reaction", "\U0001f440")
+        self.config.extra["participation_policy"] = policy
+        return key
+
+    def _persist_participation_policy(self) -> None:
+        try:
+            import yaml
+        except Exception as exc:
+            logger.warning("[%s] Cannot persist Telegram participation policy; PyYAML unavailable: %s", self.name, exc)
+            return
+        config_path = get_hermes_home() / "config.yaml"
+        try:
+            data = yaml.safe_load(config_path.read_text()) or {}
+            telegram_cfg = data.setdefault("telegram", {})
+            extra = telegram_cfg.setdefault("extra", {})
+            extra["participation_policy"] = self.config.extra.get("participation_policy", {})
+            tmp = config_path.with_suffix(config_path.suffix + ".tmp")
+            tmp.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+            atomic_replace(tmp, config_path)
+        except Exception as exc:
+            logger.warning("[%s] Failed to persist Telegram participation policy: %s", self.name, exc)
+
+    async def _handle_hank_participation_command(self, message: Message) -> bool:
+        action, is_hank_command = self._hank_participation_command(message)
+        if not is_hank_command:
+            return False
+        if action is None:
+            await self._send_participation_notice(message, "Use: /hank active here, /hank passive here, /hank mute here, or /hank status here")
+            return True
+        if action == "status":
+            mode = self._participation_mode_for_message(message) or "legacy"
+            await self._send_participation_notice(message, f"Hank participation here: {mode}")
+            return True
+        key = self._set_participation_mode_in_memory(message, action)
+        self._persist_participation_policy()
+        label = {"active": "active — Hank responds here without being tagged", "passive": "passive — Hank reacts 👀 unless tagged/assigned", "muted": "muted — Hank stays fully silent except admin commands"}[action]
+        await self._send_participation_notice(message, f"Set Hank participation for {key}: {label}")
+        return True
+
+    async def _maybe_passive_react(self, message: Message) -> None:
+        if not self._is_group_chat(message):
+            return
+        if self._participation_mode_for_message(message) != "passive":
+            return
+        if self._message_is_direct_bot_trigger(message):
+            return
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        message_id = str(getattr(message, "message_id", ""))
+        if chat_id and message_id:
+            await self._set_reaction(chat_id, message_id, self._telegram_passive_reaction())
+
+    def _apply_participation_session_lane(self, message: Message, event: MessageEvent) -> MessageEvent:
+        """Route configured participation chats away from stale legacy group sessions.
+
+        Existing Leadership-style groups may already have old per-user group
+        sessions with stale instructions or broken model state. Once a chat/topic
+        opts into participation_policy, model-dispatched messages should use a
+        clean Hank participation lane while preserving the real Telegram chat and
+        thread routing fields for delivery.
+        """
+        mode = self._participation_mode_for_message(message)
+        if mode not in {"active", "passive"}:
+            return event
+        if mode == "passive" and not self._message_is_direct_bot_trigger(message):
+            return event
+        source = getattr(event, "source", None)
+        if not source or not self._is_group_chat(message):
+            return event
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = self._effective_message_thread_id(message) or "main"
+        user_id = getattr(getattr(message, "from_user", None), "id", None) or getattr(source, "user_id", None) or "group"
+        try:
+            source.user_id_alt = f"hank-participation-v2:{chat_id}:{thread_id}:{user_id}"
+        except Exception:
+            pass
+        prompt = (
+            "Telegram participation policy is gateway behavior only. "
+            "When this message is delivered to you, answer the user's request normally. "
+            "Do not mention silence rules, participation modes, tags, routing, or why you are allowed to answer."
+        )
+        event.channel_prompt = f"{event.channel_prompt}\n\n{prompt}" if event.channel_prompt else prompt
+        return event
 
     def _effective_update_message(self, update: Update) -> Optional[Message]:
         """Return the message-like payload for normal messages and channel posts.
@@ -8177,6 +8390,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         if not self._should_process_message(msg):
+            await self._maybe_passive_react(msg)
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
@@ -8186,14 +8400,13 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._apply_participation_session_lane(msg, event)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
-            return
-        if not self._should_process_message(msg, is_command=True):
             return
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
@@ -8202,12 +8415,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        if await self._handle_hank_participation_command(msg):
+            return
+        if not self._should_process_message(msg, is_command=True):
+            await self._maybe_passive_react(msg)
+            return
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._apply_participation_session_lane(msg, event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8223,6 +8442,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         if not self._should_process_message(msg):
+            await self._maybe_passive_react(msg)
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
             return
@@ -8255,6 +8475,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._apply_participation_session_lane(msg, event)
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -8427,6 +8648,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         if not self._should_process_message(update.message):
+            await self._maybe_passive_react(update.message)
             if self._should_observe_unmentioned_group_message(update.message):
                 _m = update.message
                 _observe_type = self._media_message_type(_m)
@@ -8453,12 +8675,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
+            event = self._apply_participation_session_lane(msg, event)
             await self.handle_message(event)
             return
 
         # Apply observe attribution after caption is set; sticker is handled above
         # because _handle_sticker overwrites event.text with its vision description.
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._apply_participation_session_lane(msg, event)
 
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).

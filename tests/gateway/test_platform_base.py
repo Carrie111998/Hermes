@@ -10,6 +10,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
+    MessageType,
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
@@ -19,6 +20,46 @@ from gateway.platforms.base import (
     _log_safe_path,
     _prefix_within_utf16_limit,
 )
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+def test_group_model_empty_response_diagnostic_is_rewritten():
+    event = MessageEvent(
+        text="@Hank test",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-5417189586",
+            chat_type="group",
+            user_id="8497127776",
+        ),
+        message_id="42",
+    )
+
+    assert BasePlatformAdapter._group_diagnostic_replacement(
+        event,
+        "⚠️ Empty response from model after 3 retries. No fallback available.",
+    ) == "Hank hit a model error before completing this. No change was made — please retry or tag Hank again."
+
+
+def test_dm_model_empty_response_diagnostic_is_not_rewritten():
+    event = MessageEvent(
+        text="test",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="8497127776",
+            chat_type="dm",
+            user_id="8497127776",
+        ),
+        message_id="43",
+    )
+
+    assert BasePlatformAdapter._group_diagnostic_replacement(
+        event,
+        "⚠️ Empty response from model after 3 retries. No fallback available.",
+    ) is None
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):

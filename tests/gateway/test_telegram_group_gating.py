@@ -22,6 +22,7 @@ def _make_adapter(
     group_allowed_chats=None,
     guest_mode=None,
     observe_unmentioned_group_messages=None,
+    participation_policy=None,
     bot_username="hermes_bot",
 ):
     from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -65,11 +66,13 @@ def _make_adapter(
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if participation_policy is not None:
+        extra["participation_policy"] = participation_policy
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(enabled=True, token="***", extra=extra)
-    adapter._bot = SimpleNamespace(id=999, username=bot_username)
+    adapter._bot = SimpleNamespace(id=999, username=bot_username, set_message_reaction=AsyncMock(), send_message=AsyncMock())
     adapter._message_handler = AsyncMock()
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -157,6 +160,110 @@ def test_group_messages_can_be_opened_via_config():
     adapter = _make_adapter(require_mention=False)
 
     assert adapter._should_process_message(_group_message("hello everyone")) is True
+
+
+def test_participation_policy_active_thread_allows_untagged_group_message():
+    adapter = _make_adapter(
+        require_mention=True,
+        participation_policy={"threads": {"-100:55": "active"}},
+    )
+
+    assert adapter._should_process_message(_group_message("hello", thread_id=55)) is True
+
+
+def test_participation_policy_accepts_json_string_from_config_set():
+    adapter = _make_adapter(
+        require_mention=False,
+        participation_policy='{"chats":{"-100":"passive"},"passive_reaction":"👀"}',
+    )
+
+    assert adapter._should_process_message(_group_message("side chatter")) is False
+
+
+def test_participation_policy_passive_thread_requires_direct_trigger():
+    adapter = _make_adapter(
+        require_mention=False,
+        participation_policy={"threads": {"-100:55": "passive"}},
+    )
+    text = "@hermes_bot check this"
+
+    assert adapter._should_process_message(_group_message("side chatter", thread_id=55)) is False
+    assert adapter._should_process_message(
+        _group_message(text, thread_id=55, entities=[_mention_entity(text)])
+    ) is True
+
+
+def test_participation_policy_direct_trigger_uses_clean_session_lane():
+    adapter = _make_adapter(
+        require_mention=False,
+        participation_policy={"chats": {"-100": "passive"}},
+    )
+    text = "@hermes_bot check this"
+    msg = _group_message(text, entities=[_mention_entity(text)])
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=1005)
+
+    event = adapter._apply_participation_session_lane(msg, event)
+
+    assert event.source.chat_id == "-100"
+    assert event.source.thread_id is None
+    assert event.source.user_id_alt == "hank-participation-v2:-100:main:111"
+    assert "answer the user's request normally" in event.channel_prompt
+    assert "Do not mention silence rules" in event.channel_prompt
+
+
+def test_participation_policy_muted_thread_drops_even_mentions():
+    adapter = _make_adapter(
+        require_mention=False,
+        participation_policy={"threads": {"-100:55": "muted"}},
+    )
+    text = "@hermes_bot check this"
+
+    assert adapter._should_process_message(
+        _group_message(text, thread_id=55, entities=[_mention_entity(text)])
+    ) is False
+
+
+def test_participation_policy_passive_skipped_message_reacts_without_dispatch():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=False,
+            participation_policy={"threads": {"-100:55": "passive"}, "passive_reaction": "\U0001f440"},
+        )
+        update = SimpleNamespace(
+            update_id=1002,
+            message=_group_message("Jacob this is for you", thread_id=55),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        adapter._bot.set_message_reaction.assert_awaited_once_with(
+            chat_id=-100,
+            message_id=42,
+            reaction="\U0001f440",
+        )
+
+    asyncio.run(_run())
+
+
+def test_hank_participation_command_sets_thread_mode_without_agent_dispatch(monkeypatch):
+    async def _run():
+        adapter = _make_adapter(participation_policy={})
+        monkeypatch.setattr(adapter, "_persist_participation_policy", lambda: None)
+        update = SimpleNamespace(
+            update_id=1004,
+            message=_group_message("/hank active here", thread_id=55),
+            effective_message=None,
+        )
+
+        await adapter._handle_command(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert adapter.config.extra["participation_policy"]["threads"]["-100:55"] == "active"
+        adapter._bot.send_message.assert_awaited_once()
+
+    asyncio.run(_run())
 
 
 def test_unmentioned_group_messages_can_be_observed_without_dispatching():
