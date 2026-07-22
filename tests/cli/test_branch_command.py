@@ -95,6 +95,30 @@ class TestBranchCommandCLI:
         new_session = session_db.get_session(cli_instance.session_id)
         assert new_session["parent_session_id"] == original_id
 
+    def test_branch_inherits_exact_persisted_local_parent_cwd(
+        self, cli_instance, session_db, tmp_path, monkeypatch
+    ):
+        from cli import HermesCLI
+
+        cwd = str(tmp_path / "project")
+        session_db.update_session_cwd(cli_instance.session_id, cwd)
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "cli")
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        assert session_db.get_session(cli_instance.session_id)["cwd"] == cwd
+
+    def test_branch_does_not_infer_cwd_when_parent_has_none(
+        self, cli_instance, session_db, monkeypatch
+    ):
+        from cli import HermesCLI
+
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "cli")
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        assert session_db.get_session(cli_instance.session_id)["cwd"] is None
+
     def test_branch_ends_original_session(self, cli_instance, session_db):
         """The original session should be marked as ended with 'branched' reason."""
         from cli import HermesCLI

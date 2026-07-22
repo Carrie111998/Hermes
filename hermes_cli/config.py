@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import importlib
 import json
 import logging
 import os
@@ -27,11 +28,22 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Callable, Iterator, Optional, List, Tuple, Set
 
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+try:
+    _fcntl: Any = importlib.import_module("fcntl")
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None
+
+try:
+    _msvcrt: Any = importlib.import_module("msvcrt")
+except ImportError:  # pragma: no cover - POSIX
+    _msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +269,13 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_FILE_LOCK_TIMEOUT_SECONDS = 10.0
+_CONFIG_FILE_LOCK_POLL_SECONDS = 0.05
+_CONFIG_FILE_LOCK_HOLDER = threading.local()
+
+
+class ConfigPersistenceRejected(RuntimeError):
+    """A config transaction was rejected before its requested state persisted."""
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -749,6 +768,93 @@ from utils import atomic_replace, fast_safe_load
 def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
+
+
+def _canonical_config_target(config_path: Path) -> Path:
+    """Return the real write target used to identify a config lock."""
+
+    expanded = os.path.abspath(os.path.expanduser(str(config_path)))
+    return Path(os.path.realpath(expanded))
+
+
+@contextmanager
+def _config_file_lock(config_path: Optional[Path] = None) -> Iterator[None]:
+    """Serialize config writers across processes with an adjacent sidecar.
+
+    The sidecar is intentionally persistent: kernel advisory-lock ownership is
+    released when the file handle or process exits, so a surviving ``.lock``
+    file is not stale ownership. Deleting it would create an inode-replacement
+    race in which two processes could lock different files at the same path.
+    """
+
+    target_path = _canonical_config_target(config_path or get_config_path())
+    target_key = os.path.normcase(str(target_path))
+    lock_path = target_path.with_name(f"{target_path.name}.lock")
+    depth = getattr(_CONFIG_FILE_LOCK_HOLDER, "depth", 0)
+    if depth:
+        if getattr(_CONFIG_FILE_LOCK_HOLDER, "target_key", None) != target_key:
+            raise RuntimeError("config_lock_reentrancy_target_mismatch")
+        _CONFIG_FILE_LOCK_HOLDER.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_HOLDER.depth -= 1
+        return
+
+    if _fcntl is None and _msvcrt is None:  # pragma: no cover - supported OSes have one
+        raise RuntimeError("config_lock_unavailable")
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    acquired = False
+    try:
+        if _msvcrt is not None:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+
+        deadline = time.monotonic() + max(0.0, _CONFIG_FILE_LOCK_TIMEOUT_SECONDS)
+        while True:
+            try:
+                if _fcntl is not None:
+                    getattr(_fcntl, "flock")(
+                        lock_file.fileno(),
+                        getattr(_fcntl, "LOCK_EX") | getattr(_fcntl, "LOCK_NB"),
+                    )
+                else:
+                    assert _msvcrt is not None
+                    lock_file.seek(0)
+                    _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except (BlockingIOError, OSError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("config_lock_timeout")
+                time.sleep(_CONFIG_FILE_LOCK_POLL_SECONDS)
+
+        _CONFIG_FILE_LOCK_HOLDER.depth = 1
+        _CONFIG_FILE_LOCK_HOLDER.target_key = target_key
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_HOLDER.depth = 0
+            _CONFIG_FILE_LOCK_HOLDER.target_key = None
+    finally:
+        if acquired:
+            try:
+                if _fcntl is not None:
+                    getattr(_fcntl, "flock")(
+                        lock_file.fileno(), getattr(_fcntl, "LOCK_UN")
+                    )
+                else:
+                    assert _msvcrt is not None
+                    lock_file.seek(0)
+                    _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_UNLCK, 1)
+            except (OSError, PermissionError):
+                pass
+        lock_file.close()
+
 
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
@@ -3206,6 +3312,19 @@ DEFAULT_CONFIG = {
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
+    },
+
+    "session_bridge": {
+        "sidebar": {
+            "enabled": False,
+            "continuous": False,
+            "backfill_days": 30,
+            "continuous_batch_limit": 5,
+            "manual_batch_limit": 10,
+            "lease_seconds": 300,
+            "max_attempts": 5,
+            "heartbeat_grace_seconds": 120,
+        },
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
@@ -7129,8 +7248,9 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """
     from utils import atomic_yaml_write
 
-    require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    with _CONFIG_LOCK, _config_file_lock(config_path):
+        require_readable_config_before_write(config_path)
+        atomic_yaml_write(config_path, data, **kwargs)
 
 
 def load_config() -> Dict[str, Any]:
@@ -7186,19 +7306,23 @@ def write_platform_config_field(
     user's raw config file. Dashboard routes use the default loaded-config path
     so they retain their existing profile-scoped ``load_config`` behavior.
     """
-    config = read_raw_config() if raw else load_config()
-    platforms = config.setdefault("platforms", {})
-    if not isinstance(platforms, dict):
-        platforms = {}
-        config["platforms"] = platforms
+    def update(config: Dict[str, Any]) -> None:
+        platforms = config.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            config["platforms"] = platforms
 
-    platform_config = platforms.setdefault(platform_key, {})
-    if not isinstance(platform_config, dict):
-        platform_config = {}
-        platforms[platform_key] = platform_config
+        platform_config = platforms.setdefault(platform_key, {})
+        if not isinstance(platform_config, dict):
+            platform_config = {}
+            platforms[platform_key] = platform_config
 
-    platform_config[field_key] = value
-    save_config(config)
+        platform_config[field_key] = value
+
+    if raw:
+        mutate_raw_config_with_save_policy(update)
+    else:
+        mutate_config(update)
 
 
 TERMINAL_CONFIG_ENV_MAP = {
@@ -7512,13 +7636,95 @@ _COMMENTED_SECTIONS = """
 """
 
 
+def mutate_raw_config(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    sort_keys: bool = False,
+) -> Dict[str, Any]:
+    """Mutate only user-authored YAML as one cross-process transaction.
+
+    This is the canonical path for read-modify-write callers that must not
+    materialize merged defaults. Full-file replacement callers should use
+    :func:`atomic_config_write`; callers editing merged runtime config should
+    use :func:`mutate_config`.
+    """
+
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    config_path = get_config_path()
+    with _CONFIG_LOCK, _config_file_lock(config_path):
+        require_readable_config_before_write(config_path)
+        config = read_raw_config()
+        original = copy.deepcopy(config)
+        result = mutator(config)
+        if result is not None:
+            raise TypeError("config mutator must update in place and return None")
+        if config != original:
+            atomic_config_write(config_path, config, sort_keys=sort_keys)
+        return copy.deepcopy(config)
+
+
+def mutate_raw_config_with_save_policy(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+) -> Dict[str, Any]:
+    """Mutate raw user YAML while retaining ``save_config`` authorization.
+
+    Some callers intentionally read only user-authored values, but historically
+    persisted through :func:`save_config`. This keeps that raw read shape while
+    preserving the full managed-install write lock and managed-leaf stripping.
+    """
+
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    config_path = get_config_path()
+    with _CONFIG_LOCK, _config_file_lock(config_path):
+        config = read_raw_config()
+        result = mutator(config)
+        if result is not None:
+            raise TypeError("config mutator must update in place and return None")
+        save_config(
+            config,
+            strip_defaults=strip_defaults,
+            preserve_keys=preserve_keys,
+        )
+        return read_raw_config()
+
+
+def mutate_config(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+) -> Dict[str, Any]:
+    """Load, mutate, and atomically save config as one cross-process transaction."""
+
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    with _CONFIG_LOCK, _config_file_lock():
+        config = load_config()
+        result = mutator(config)
+        if result is not None:
+            raise TypeError("config mutator must update in place and return None")
+        persisted = save_config(
+            config,
+            strip_defaults=strip_defaults,
+            preserve_keys=preserve_keys,
+        )
+        if not persisted:
+            raise ConfigPersistenceRejected("config_persistence_rejected")
+        return load_config()
+
+
 def save_config(
     config: Dict[str, Any],
     *,
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
     merge_existing: bool = False,
-):
+) -> bool:
     """Save configuration to ~/.hermes/config.yaml.\n
 
     Default values from ``DEFAULT_CONFIG`` are not written to disk unless
@@ -7533,10 +7739,10 @@ def save_config(
     Full-document replacement callers (dashboard raw YAML editor, callers that
     already deep-merge) must leave this False so intentional deletions survive.
     """
-    with _CONFIG_LOCK:
+    with _CONFIG_LOCK, _config_file_lock():
         if is_managed():
             managed_error("save configuration")
-            return
+            return False
         # Managed scope: strip any leaf the managed layer pins, so a bulk write
         # (wizard / programmatic save) never persists a user value that would
         # silently lose to managed on the next load. Single-key `config set`
@@ -7626,6 +7832,7 @@ def save_config(
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        return True
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -8766,19 +8973,9 @@ def set_config_value(key: str, value: str, force: bool = False):
     # "did you mean" hint, without blocking legitimate unknown keys.
     is_known, suggestion = _validate_config_key(key)
 
-    # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
+    # Otherwise it goes to config.yaml (raw user config only — mutate_raw_config
+    # below reads/writes the un-merged user YAML, never dumping defaults back).
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
@@ -8787,49 +8984,53 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
-    coerced_value: Any = value
+    parsed_value: Any = value
     if not isinstance(_default_value_for_key(key), str):
         if value.lower() in {'true', 'yes', 'on'}:
-            coerced_value = True
+            parsed_value = True
         elif value.lower() in {'false', 'no', 'off'}:
-            coerced_value = False
+            parsed_value = False
         elif value.isdigit():
-            coerced_value = int(value)
+            parsed_value = int(value)
         elif value.replace('.', '', 1).isdigit():
-            coerced_value = float(value)
+            parsed_value = float(value)
 
-    value = coerced_value
-    _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
     # ignored. Mirrors the load-time migration in _normalize_root_model_keys.
     _alias_norm = key.strip().lower()
+    persisted_key = key
     if _alias_norm in ("model.api_base", "api_base"):
-        user_config = _normalize_root_model_keys(user_config)
-        key = "model.base_url"
+        persisted_key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    def update(user_config: Dict[str, Any]) -> None:
+        _set_nested(user_config, key, parsed_value)
+        if _alias_norm in ("model.api_base", "api_base"):
+            normalized = _normalize_root_model_keys(user_config)
+            assert isinstance(normalized, dict)
+            user_config.clear()
+            user_config.update(normalized)
+
+    mutate_raw_config(update, sort_keys=False)
+    key = persisted_key
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
     if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
+        save_env_value(env_var, _terminal_env_value(parsed_value))
 
     # Mask the echoed value when the (possibly nested) key is credential-shaped
     # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
     _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(parsed_value, str) and parsed_value:
         from agent.redact import mask_secret
-        _display_value = mask_secret(value)
+        _display_value = mask_secret(parsed_value)
     else:
-        _display_value = value
+        _display_value = parsed_value
     print(f"✓ Set {key} = {_display_value} in {config_path}")
 
     # Post-write unknown-key notice (#34067): value IS saved, but tell the

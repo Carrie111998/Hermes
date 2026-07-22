@@ -204,7 +204,7 @@ vision = []
 # `request.url` can be bypassed. We pin a patched Starlette directly in every
 # extra that exposes a Starlette-backed server surface so pip/uv can't resolve
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
-mcp = ["mcp==1.26.0", "starlette==1.0.1"]  # starlette: CVE-2026-48710
+mcp = ["mcp==1.26.0", "starlette==1.0.1", "watchfiles==1.1.1"]  # starlette: CVE-2026-48710
 nemo-relay = ["nemo-relay>=0.5,<1.0"]
 homeassistant = ["aiohttp==3.14.1"]
 sms = ["aiohttp==3.14.1"]
@@ -308,6 +308,7 @@ all = [
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+hermes-session-bridge = "session_bridge.entrypoint:main"
 
 [tool.setuptools]
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
@@ -338,6 +339,7 @@ locales = ["locales/*.yaml"]
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
 gateway = ["assets/**/*"]
+session_bridge = ["assets/**/*"]
 plugins = [
   "*/dashboard/manifest.json",
   "*/dashboard/dist/*",
@@ -360,7 +362,7 @@ plugins = [
 # install stops discovering events/intent_applier/control_center/graphs/
 # pipeline_state/reply_handlers/obs/curator/artifact_surface). `providers`/
 # `providers.*`, `hermes_cli.*`, and `cron.*` are upstream-new — keep them.
-include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "events", "events.*", "intent_applier", "intent_applier.*", "control_center", "control_center.*", "graphs", "graphs.*", "pipeline_state", "pipeline_state.*", "reply_handlers", "reply_handlers.*", "obs", "obs.*", "curator", "curator.*", "artifact_surface", "artifact_surface.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "events", "events.*", "intent_applier", "intent_applier.*", "control_center", "control_center.*", "graphs", "graphs.*", "pipeline_state", "pipeline_state.*", "reply_handlers", "reply_handlers.*", "obs", "obs.*", "curator", "curator.*", "artifact_surface", "artifact_surface.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "session_bridge", "session_bridge.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

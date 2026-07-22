@@ -11,7 +11,12 @@ import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
+import {
+  bridgeProviderLabel,
+  bridgeSidebarStateLabel,
+  handoffOriginSource,
+  sessionSourceLabel
+} from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $backgroundRunningSessionIds } from '@/store/composer-status'
@@ -86,6 +91,23 @@ export function SidebarSessionRow({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
+  const bridgeProvider = bridgeProviderLabel(session.bridge_provider)
+
+  const bridgeMirrorState = session.bridge_mirror_state
+    ? {
+        catalog_only: r.bridgeCatalogOnly,
+        continued: r.bridgeContinued,
+        diverged: r.bridgeDiverged,
+        failed: r.bridgeFailed,
+        mirrored: r.bridgeMirrored,
+        queued: r.bridgeQueued
+      }[session.bridge_mirror_state]
+    : null
+
+  const bridgeProviderDescription = bridgeProvider ? r.bridgeProvider(bridgeProvider) : null
+  const bridgeMirrorStateDescription = bridgeMirrorState ? r.bridgeMirrorState(bridgeMirrorState) : null
+  const bridgeSidebarState = bridgeSidebarStateLabel(session.bridge_sidebar_state)
+  const bridgeSidebarStateDescription = bridgeSidebarState ? `Codex sidebar: ${bridgeSidebarState}` : null
   // True when a clarify prompt in this session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
   // True when the session's most recent turn finished in the background (while
@@ -256,6 +278,47 @@ export function SidebarSessionRow({
                 platformName={handoffLabel}
               />
             </Tip>
+          ) : null}
+          {bridgeProvider ? (
+            <span
+              aria-label={bridgeProviderDescription ?? undefined}
+              className="shrink-0 rounded-[3px] border border-(--ui-border) px-1 py-px text-[0.5625rem] font-medium leading-none text-(--ui-text-tertiary)"
+              title={bridgeProviderDescription ?? undefined}
+            >
+              {bridgeProvider}
+            </span>
+          ) : null}
+          {bridgeMirrorState ? (
+            <span
+              aria-label={bridgeMirrorStateDescription ?? undefined}
+              className={cn(
+                'shrink-0 rounded-[3px] px-1 py-px text-[0.5625rem] font-medium leading-none',
+                session.bridge_mirror_state === 'diverged' || session.bridge_mirror_state === 'failed'
+                  ? 'bg-destructive/10 text-destructive'
+                  : session.bridge_mirror_state === 'queued'
+                    ? 'bg-(--ui-accent)/10 text-(--ui-accent)'
+                    : 'bg-(--ui-control-background) text-(--ui-text-tertiary)'
+              )}
+              title={bridgeMirrorStateDescription ?? undefined}
+            >
+              {bridgeMirrorState}
+            </span>
+          ) : null}
+          {bridgeSidebarState ? (
+            <span
+              aria-label={bridgeSidebarStateDescription ?? undefined}
+              className={cn(
+                'shrink-0 rounded-[3px] px-1 py-px text-[0.5625rem] font-medium leading-none',
+                session.bridge_sidebar_state === 'failed'
+                  ? 'bg-destructive/10 text-destructive'
+                  : session.bridge_sidebar_state === 'pending' || session.bridge_sidebar_state === 'retrying'
+                    ? 'bg-(--ui-accent)/10 text-(--ui-accent)'
+                    : 'bg-(--ui-control-background) text-(--ui-text-tertiary)'
+              )}
+              title={bridgeSidebarStateDescription ?? undefined}
+            >
+              {bridgeSidebarState}
+            </span>
           ) : null}
           <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
             {title}

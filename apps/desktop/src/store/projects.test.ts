@@ -17,7 +17,8 @@ import {
   pickProjectFolder,
   projectNameForCwd,
   refreshProjects,
-  refreshWorktrees
+  refreshWorktrees,
+  resolveNewSessionCwd
 } from './projects'
 
 vi.mock('@/i18n', () => ({
@@ -193,6 +194,7 @@ describe('createProject', () => {
     vi.clearAllMocks()
     $sidebarAgentsGrouped.set(false)
     $activeProjectId.set(null)
+    $projectScope.set(ALL_PROJECTS)
     $projectsRpcAvailable.set(null)
   })
 
@@ -217,6 +219,8 @@ describe('createProject', () => {
     expect(request).toHaveBeenCalledWith('projects.create', expect.objectContaining({ name: 'Demo' }))
     expect($sidebarAgentsGrouped.get()).toBe(true)
     expect($activeProjectId.get()).toBe('p_new')
+    expect($projectScope.get()).toBe('p_new')
+    expect(resolveNewSessionCwd()).toBe('/srv/demo')
   })
 
   it('marks the backend stale and surfaces a friendly error when projects.create is missing', async () => {

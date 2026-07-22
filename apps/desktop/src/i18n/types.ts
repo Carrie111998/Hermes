@@ -1429,6 +1429,14 @@ export interface Translations {
       backgroundRunning: string
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
+      bridgeProvider: (provider: string) => string
+      bridgeMirrorState: (state: string) => string
+      bridgeCatalogOnly: string
+      bridgeContinued: string
+      bridgeDiverged: string
+      bridgeFailed: string
+      bridgeMirrored: string
+      bridgeQueued: string
       renamed: string
       renameFailed: string
       renameTitle: string

@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import os
 import sqlite3
 import time
 import json
@@ -75,6 +76,63 @@ def db(tmp_path):
     session_db.close()
 
 
+@pytest.mark.parametrize(
+    ("platform", "cwd", "expected"),
+    [
+        ("windows", None, False),
+        ("windows", "", False),
+        ("windows", "C:\\" + "x" * 4095, False),
+        ("windows", "C:\\work\\project", True),
+        ("windows", "C:/work/project", True),
+        ("windows", "\\\\server\\share", True),
+        ("windows", "\\\\server\\share\\project", True),
+        ("windows", "//server/share/project", True),
+        ("windows", "é:\\work\\project", False),
+        ("windows", "C:", False),
+        ("windows", "C:\\", True),
+        ("windows", "C:/", True),
+        ("windows", "C:work\\project", False),
+        ("windows", "\\work\\project", False),
+        ("windows", "/work/project", False),
+        ("windows", "\\\\\\server\\share\\project", False),
+        ("windows", "///server/share/project", False),
+        ("windows", "\\\\server", False),
+        ("windows", "\\\\?\\C:\\work\\project", False),
+        ("windows", "\\\\.\\C:\\work\\project", False),
+        ("windows", "C:\\work\\\\project", False),
+        ("windows", "C:/work//project", False),
+        ("windows", "C:\\work\\.\\project", False),
+        ("windows", "C:\\work\\..\\project", False),
+        ("windows", " C:\\work\\project", False),
+        ("windows", "C:\\work\\project ", False),
+        ("windows", "C:\\work\\pro\tject", False),
+        ("windows", "C:\\work\\pro\x1fject", False),
+        ("windows", "C:\\work\\pro\x85ject", False),
+        ("posix", "/", True),
+        ("posix", "", False),
+        ("posix", "/" + "x" * 4096, False),
+        ("posix", "/work", True),
+        ("posix", "/work/project", True),
+        ("posix", "//server/share", False),
+        ("posix", "///server/share", False),
+        ("posix", "/work//project", False),
+        ("posix", "/work/./project", False),
+        ("posix", "/work/../project", False),
+        ("posix", "work/project", False),
+        ("posix", " /work/project", False),
+        ("posix", "/work/project\n", False),
+        ("posix", "/work/pro\tject", False),
+        ("posix", "/work/pro\x85ject", False),
+        ("posix", "/work\\..\\project", True),
+        ("unknown", "/work/project", False),
+    ],
+)
+def test_canonical_absolute_cwd_has_explicit_platform_semantics(
+    platform, cwd, expected
+):
+    assert hermes_state._is_canonical_absolute_cwd(cwd, platform=platform) is expected
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================
@@ -128,6 +186,68 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["model"] == "real-model"
         assert session["source"] == "cli"
+
+    @pytest.mark.parametrize("source", ["cli", "tui"])
+    def test_local_child_cwd_returns_exact_persisted_parent_cwd(
+        self, db, tmp_path, source
+    ):
+        cwd = str(tmp_path / "project")
+        db.create_session("parent", source=source, cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", source) == cwd
+
+    @pytest.mark.parametrize(
+        ("parent_source", "child_source", "cwd"),
+        [
+            ("cli", "cli", None),
+            ("telegram", "telegram", "C:/work/project"),
+            ("cli", "telegram", "C:/work/project"),
+            ("cli", "cli", "relative/project"),
+            ("cli", "cli", " C:/work/project"),
+            ("cli", "cli", "C:/work/project\n"),
+            ("cli", "cli", "C:/work/pro\tject"),
+            ("cli", "cli", "C:/work/pro\x1fject"),
+            ("cli", "cli", "C:\\work\\.\\project"),
+            ("cli", "cli", "C:\\work\\\\project"),
+            ("cli", "cli", "\\\\\\server\\share\\project"),
+            ("cli", "cli", "///server/share/project"),
+        ],
+    )
+    def test_local_child_cwd_rejects_non_authoritative_parent_metadata(
+        self, db, parent_source, child_source, cwd
+    ):
+        db.create_session("parent", source=parent_source, cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", child_source) is None
+
+    def test_local_child_cwd_rejects_missing_or_identity_mismatched_parent(
+        self, db, monkeypatch, tmp_path
+    ):
+        assert db.get_inheritable_local_child_cwd("missing", "cli") is None
+
+        cwd = str(tmp_path / "project")
+        monkeypatch.setattr(
+            db,
+            "get_session",
+            lambda _session_id: {"id": "different", "source": "cli", "cwd": cwd},
+        )
+        assert db.get_inheritable_local_child_cwd("parent", "cli") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path qualification")
+    @pytest.mark.parametrize("cwd", ["\\work\\project", "/work/project"])
+    def test_local_child_cwd_rejects_windows_root_relative_paths(self, db, cwd):
+        db.create_session("parent", source="cli", cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", "cli") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows path qualification")
+    @pytest.mark.parametrize(
+        "cwd", ["C:\\work\\project", "C:/work/project", "\\\\server\\share\\project"]
+    )
+    def test_local_child_cwd_accepts_windows_fully_qualified_paths(self, db, cwd):
+        db.create_session("parent", source="cli", cwd=cwd)
+
+        assert db.get_inheritable_local_child_cwd("parent", "cli") == cwd
 
     def test_update_session_cwd_persists_git_branch(self, db):
         db.create_session(session_id="s1", source="cli")

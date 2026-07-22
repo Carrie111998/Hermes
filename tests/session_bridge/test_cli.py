@@ -1,0 +1,5035 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field, replace
+from datetime import timezone
+from pathlib import Path
+from threading import Event, Thread
+import time
+from typing import Any, Mapping
+
+import pytest
+
+from agent.transports.codex_app_server import CodexAppServerError
+
+# The canonical runner uses ``env -i``. Windows' stdlib ignores HOME and needs
+# USERPROFILE for ``Path.home()`` during imported-module initialization.
+if os.name == "nt" and "USERPROFILE" not in os.environ:
+    os.environ["USERPROFILE"] = os.environ["HOME"]
+
+from hermes_state import SessionDB
+from session_bridge.catalog import UnifiedCatalog
+from session_bridge.characterize import (
+    CharacterizationGateError,
+    _write_characterization_record,
+    characterize_claude_visibility,
+)
+from session_bridge.claude_visibility import (
+    ClaudeVisibilityCandidate,
+    derive_claude_visibility_identity,
+)
+from session_bridge.cli import (
+    ConfigurationFailure,
+    ProductionBackend,
+    ProviderDegraded,
+    RolloutGateBlocked,
+    _run_continuous_visibility_worker,
+    _claude_characterization_open_work_allowed,
+    _sync_claude_characterization_records,
+    main,
+)
+from session_bridge.codex_adapter import SidebarThreadVerifier
+from session_bridge.config import (
+    BridgeConfig,
+    CatalogConfig,
+    MirrorsConfig,
+    ServiceConfig,
+    SidebarConfig,
+)
+from session_bridge.coordinator import ScanSummary
+from session_bridge.mirror import MirrorPolicy, enqueue_mirror_job
+from session_bridge.models import (
+    BridgeMarkerPayload,
+    OriginKind,
+    ProjectedMessage,
+    Provider,
+    SessionProjection,
+    SidebarJobState,
+    encode_bridge_marker,
+)
+from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
+from session_bridge.sidebar_executor import (
+    CodexAppServerSidebarDelivery,
+    SidebarExecutionResult,
+    SidebarExecutor,
+)
+from session_bridge.store import SessionBridgeStore
+
+
+@dataclass
+class FakeBackend:
+    characterization: str = "passed"
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    preview: dict[str, Any] = field(
+        default_factory=lambda: {
+            "session_id": "claude:source",
+            "target_provider": "codex",
+            "would_enqueue": True,
+            "reason": "eligible",
+        }
+    )
+    status_payload: dict[str, Any] = field(
+        default_factory=lambda: {"healthy": True, "total_sessions": 3}
+    )
+    scan_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "provider": "all",
+            "discovered": 4,
+            "indexed": 4,
+            "rebuilt": 0,
+            "failed": 0,
+        }
+    )
+    backfill_apply_payload: dict[str, Any] | None = None
+    sidebar_status_payload: dict[str, Any] = field(
+        default_factory=lambda: {"healthy": True, "counts": {"pending": 0}}
+    )
+    sidebar_backfill_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "mode": "dry_run",
+            "days": 30,
+            "limit": 10,
+            "examined": 0,
+            "queued": 0,
+            "by_provider": {"claude": 0, "hermes": 0},
+            "failed": 0,
+            "excluded": 0,
+            "excluded_by_reason": {"source_cwd_missing": 0},
+        }
+    )
+    sidebar_run_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "idle",
+            "job_id": None,
+            "thread_id": None,
+            "error_code": None,
+        }
+    )
+    sidebar_terminal_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_thread_unrecoverable",
+        }
+    )
+    sidebar_precreate_terminal_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "precutover_create_unrecoverable",
+        }
+    )
+    claude_visibility_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "continuous": False,
+            "counts": {
+                "claude_pending": 0,
+                "claude_leased": 0,
+                "claude_retry": 0,
+                "claude_visible": 0,
+                "claude_failed": 0,
+            },
+            "retry_codes": {},
+            "failed_codes": {},
+            "usage": {
+                "local_day": "2026-07-17",
+                "attempts": 0,
+                "reserved_cost_usd": "0",
+            },
+            "lineage": {
+                "unlinked_visible": 0,
+                "repairable": 0,
+                "blocked": 0,
+                "blocker_codes": {},
+            },
+            "candidates": [],
+            "exclusions": [],
+            "open_reasons": [],
+            "fatal_reasons": [],
+            "degraded_reasons": [],
+        }
+    )
+    calls: list[tuple[Any, ...]] = field(default_factory=list)
+
+    def close(self) -> None:
+        self.calls.append(("close",))
+
+    def serve(self) -> None:
+        self.calls.append(("serve",))
+
+    def scan(
+        self, *, provider: str, all_history: bool, newest_first: bool
+    ) -> dict[str, Any]:
+        self.calls.append(("scan", provider, all_history, newest_first))
+        return dict(self.scan_payload)
+
+    def status(self) -> dict[str, Any]:
+        self.calls.append(("status",))
+        return dict(self.status_payload)
+
+    def sidebar_status(self) -> dict[str, Any]:
+        self.calls.append(("sidebar_status",))
+        return dict(self.sidebar_status_payload)
+
+    def sidebar_backfill(self, *, days: int, limit: int, apply: bool) -> dict[str, Any]:
+        self.calls.append(("sidebar_backfill", days, limit, apply))
+        return {
+            **self.sidebar_backfill_payload,
+            "mode": "apply" if apply else "dry_run",
+        }
+
+    def set_sidebar_continuous(self, *, enabled: bool) -> dict[str, Any]:
+        self.calls.append(("set_sidebar_continuous", enabled))
+        return {"enabled": enabled, "continuous": enabled}
+
+    def sidebar_run_once(self) -> dict[str, Any]:
+        self.calls.append(("sidebar_run_once",))
+        return dict(self.sidebar_run_payload)
+
+    def sidebar_acknowledge_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        codex_thread_id: str,
+        expected_error_code: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_acknowledge_unrecoverable",
+            job_id,
+            codex_thread_id,
+            expected_error_code,
+        ))
+        return dict(self.sidebar_terminal_payload)
+
+    def sidebar_acknowledge_precreate_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_acknowledge_precreate_unrecoverable",
+            job_id,
+            expected_error_code,
+        ))
+        return dict(self.sidebar_precreate_terminal_payload)
+
+    def claude_visibility_status(self) -> dict[str, Any]:
+        self.calls.append(("claude_visibility_status",))
+        return dict(self.claude_visibility_payload)
+
+    def claude_visibility_backfill(self, *, days: int, limit: int, apply: bool):
+        self.calls.append(("claude_visibility_backfill", days, limit, apply))
+        return {
+            **self.claude_visibility_payload,
+            "mode": "apply" if apply else "dry_run",
+            "dry_run": not apply,
+            "applied": apply,
+            "enqueued": 0,
+        }
+
+    def reconcile_claude_visibility_lineage(
+        self, *, limit: int, apply: bool, cursor: Mapping[str, Any] | None = None
+    ):
+        self.calls.append(("reconcile_claude_visibility_lineage", limit, apply, cursor))
+        return {
+            "mode": "apply" if apply else "dry_run",
+            "scanned": 1,
+            "repairable": 1,
+            "repaired": 1 if apply else 0,
+            "remaining": 0 if apply else 1,
+            "blocker_codes": {},
+            "next_cursor": None,
+            "has_more": False,
+            "complete": apply,
+        }
+
+    def set_claude_visibility_continuous(self, *, enabled: bool):
+        self.calls.append(("set_claude_visibility_continuous", enabled))
+        return {"enabled": False, "continuous": enabled}
+
+    def claude_visibility_run_once(self):
+        self.calls.append(("claude_visibility_run_once",))
+        return {
+            "enabled": True,
+            "status": "no_due_job",
+            "degraded": False,
+            "fatal": False,
+        }
+
+    def abort_claude_visibility_characterization(
+        self, *, expected_job_id: str, expected_reserved_claude_uuid: str
+    ):
+        self.calls.append((
+            "abort_claude_visibility_characterization",
+            expected_job_id,
+            expected_reserved_claude_uuid,
+        ))
+        return {
+            "status": "aborted_exact_absence",
+            "job_id": expected_job_id,
+            "reserved_claude_uuid": expected_reserved_claude_uuid,
+            "replacement_created": False,
+            "active_record_retired": True,
+        }
+
+    def characterize(self, *, provider: str) -> dict[str, Any]:
+        self.calls.append(("characterize", provider))
+        return {"passed": True, "report": "characterization/report.json"}
+
+    def characterization_status(self) -> str:
+        self.calls.append(("characterization_status",))
+        return self.characterization
+
+    def backfill_candidates(self, *, days: int) -> list[dict[str, Any]]:
+        self.calls.append(("backfill_candidates", days))
+        return [dict(candidate) for candidate in self.candidates]
+
+    def apply_backfill(self, *, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        self.calls.append((
+            "apply_backfill",
+            tuple(item["canonical_id"] for item in candidates),
+        ))
+        return dict(
+            self.backfill_apply_payload
+            or {
+                "authorized": len(candidates),
+                "claimed": len(candidates),
+                "succeeded": len(candidates),
+                "retried": 0,
+                "manual_failure": 0,
+                "degraded": False,
+                "halted": False,
+            }
+        )
+
+    def mirror_preview(self, *, session_id: str, target: str) -> dict[str, Any]:
+        self.calls.append(("mirror_preview", session_id, target))
+        return dict(self.preview)
+
+    def apply_mirror(self, *, session_id: str, target: str) -> dict[str, Any]:
+        self.calls.append(("apply_mirror", session_id, target))
+        return {
+            "session_id": session_id,
+            "target_provider": target,
+            "state": "queued",
+            "degraded": False,
+        }
+
+
+def _run(
+    argv: list[str],
+    backend: FakeBackend,
+    *,
+    automatic_creation: bool = False,
+) -> int:
+    config = BridgeConfig(mirrors=MirrorsConfig(automatic_creation=automatic_creation))
+    return main(
+        argv,
+        config_loader=lambda: config,
+        backend_factory=lambda _config: backend,
+    )
+
+
+def _json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    return json.loads(capsys.readouterr().out)
+
+
+def test_serve_dispatches_and_closes_runtime(capsys):
+    backend = FakeBackend()
+
+    assert _run(["serve"], backend) == 0
+
+    assert backend.calls == [("serve",), ("close",)]
+    assert _json_output(capsys)["status"] == "stopped"
+
+
+def test_sidebar_skill_cli_installs_without_loading_bridge_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installed = tmp_path / "codex" / "skills" / "session-sidebar-sync"
+    calls: list[None] = []
+    monkeypatch.setattr(
+        "session_bridge.cli.install_sidebar_skill",
+        lambda: calls.append(None) or installed,
+    )
+
+    result = main(
+        ["install-sidebar-skill"],
+        config_loader=lambda: pytest.fail("installer must not load bridge config"),
+        backend_factory=lambda _config: pytest.fail("installer must not start backend"),
+    )
+
+    assert result == 0
+    assert calls == [None]
+    assert _json_output(capsys) == {
+        "status": "installed",
+        "path": str(installed),
+    }
+
+
+def test_sidebar_skill_cli_sanitizes_install_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "session_bridge.cli.install_sidebar_skill",
+        lambda: (_ for _ in ()).throw(PermissionError("private destination")),
+    )
+
+    assert main(["install-sidebar-skill"]) == 2
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {"error": "configuration_error"}
+    assert "private destination" not in rendered
+
+
+def test_claude_skill_cli_installs_without_loading_bridge_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installed = tmp_path / "claude" / "skills" / "session-bridge"
+    calls: list[None] = []
+    monkeypatch.setattr(
+        "session_bridge.cli.install_claude_skill",
+        lambda: calls.append(None) or installed,
+    )
+
+    result = main(
+        ["install-claude-skill"],
+        config_loader=lambda: pytest.fail("installer must not load bridge config"),
+        backend_factory=lambda _config: pytest.fail("installer must not start backend"),
+    )
+
+    assert result == 0
+    assert calls == [None]
+    assert _json_output(capsys) == {"status": "installed", "path": str(installed)}
+
+
+def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+
+    assert _run(["sidebar-status", "--json"], backend) == 0
+    assert _json_output(capsys)["healthy"] is True
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", "--dry-run"],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["mode"] == "dry_run"
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", "--apply"],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["mode"] == "apply"
+    assert _run(["sidebar-continuous", "--enable"], backend) == 0
+    assert _json_output(capsys) == {"continuous": True, "enabled": True}
+    assert _run(["sidebar-continuous", "--disable"], backend) == 0
+    assert _json_output(capsys) == {"continuous": False, "enabled": False}
+
+    assert backend.calls == [
+        ("sidebar_status",),
+        ("close",),
+        ("sidebar_backfill", 30, 10, False),
+        ("close",),
+        ("sidebar_backfill", 30, 10, True),
+        ("close",),
+        ("set_sidebar_continuous", True),
+        ("close",),
+        ("set_sidebar_continuous", False),
+        ("close",),
+    ]
+    assert not any(
+        call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit"),
+    [
+        ("idle", 0),
+        ("visible", 0),
+        ("retry", 3),
+        ("failed", 3),
+        ("unsettled", 3),
+    ],
+)
+def test_sidebar_run_once_dispatches_once_emits_only_the_sanitized_result_and_closes(
+    status: str,
+    expected_exit: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend(
+        sidebar_run_payload={
+            "status": status,
+            "job_id": "sidebar-job-1",
+            "thread_id": "native-thread-1",
+            "error_code": "broker_time_budget" if status == "retry" else None,
+            "private_detail": "C:/private/provider-detail-must-not-render",
+        }
+    )
+
+    assert _run(["sidebar-run-once"], backend) == expected_exit
+
+    assert backend.calls == [("sidebar_run_once",), ("close",)]
+    expected = {"status": status}
+    if status == "retry":
+        expected["error_code"] = "broker_time_budget"
+    assert _json_output(capsys) == expected
+
+
+def test_sidebar_run_once_rejects_a_nonfixed_error_code_without_rendering_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_error = "C:/private/provider-detail-must-not-render"
+    backend = FakeBackend(
+        sidebar_run_payload={
+            "status": "retry",
+            "job_id": "sidebar-job-1",
+            "thread_id": "native-thread-1",
+            "error_code": private_error,
+        }
+    )
+
+    assert _run(["sidebar-run-once"], backend) == 3
+
+    assert backend.calls == [("sidebar_run_once",), ("close",)]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {"error": "provider_degraded"}
+    assert private_error not in rendered
+
+
+def test_sidebar_terminal_acknowledgement_requires_exact_operator_authority_and_sanitizes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "a" * 64
+    thread_id = "019f-operator-terminal-thread"
+    backend = FakeBackend(
+        sidebar_terminal_payload={
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_thread_unrecoverable",
+            "job_id": job_id,
+            "codex_thread_id": thread_id,
+            "evidence_digest": "e" * 64,
+            "private_detail": "C:/private/provider-detail",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-acknowledge-unrecoverable",
+                "--job-id",
+                job_id,
+                "--codex-thread-id",
+                thread_id,
+                "--expected-error-code",
+                "native_create_ambiguous",
+                "--confirm",
+                "native-thread-unrecoverable",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_acknowledge_unrecoverable",
+            job_id,
+            thread_id,
+            "native_create_ambiguous",
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "acknowledged",
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_thread_unrecoverable",
+    }
+    for private in (job_id, thread_id, "e" * 64, "private/provider-detail"):
+        assert private not in rendered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        [
+            "sidebar-acknowledge-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--codex-thread-id",
+            "019f-terminal-thread",
+            "--expected-error-code",
+            "native_create_ambiguous",
+        ],
+        [
+            "sidebar-acknowledge-unrecoverable",
+            "--job-id",
+            "not-a-full-job-id",
+            "--codex-thread-id",
+            "019f-terminal-thread",
+            "--expected-error-code",
+            "native_create_ambiguous",
+            "--confirm",
+            "native-thread-unrecoverable",
+        ],
+        [
+            "sidebar-acknowledge-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "a" * 64,
+            "--codex-thread-id",
+            "019f-terminal-thread",
+            "--expected-error-code",
+            "marker_conflict",
+            "--confirm",
+            "native-thread-unrecoverable",
+        ],
+    ),
+)
+def test_sidebar_terminal_acknowledgement_parser_rejects_incomplete_authority(
+    argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
+def test_sidebar_precreate_acknowledgement_requires_exact_operator_authority_and_sanitizes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "b" * 64
+    backend = FakeBackend(
+        sidebar_precreate_terminal_payload={
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "precutover_create_unrecoverable",
+            "job_id": job_id,
+            "recovery_key": "hermes-session-bridge-create-v1:private",
+            "evidence_digest": "f" * 64,
+            "private_detail": "C:/private/provider-detail",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "sidebar-acknowledge-precreate-unrecoverable",
+                "--job-id",
+                job_id,
+                "--expected-error-code",
+                "native_create_ambiguous",
+                "--confirm",
+                "precutover-create-unrecoverable",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    assert backend.calls == [
+        (
+            "sidebar_acknowledge_precreate_unrecoverable",
+            job_id,
+            "native_create_ambiguous",
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "acknowledged",
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "precutover_create_unrecoverable",
+    }
+    for private in (job_id, "hermes-session-bridge-create-v1", "f" * 64, "private"):
+        assert private not in rendered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        [
+            "sidebar-acknowledge-precreate-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "b" * 64,
+            "--expected-error-code",
+            "native_create_ambiguous",
+        ],
+        [
+            "sidebar-acknowledge-precreate-unrecoverable",
+            "--job-id",
+            "not-a-full-job-id",
+            "--expected-error-code",
+            "native_create_ambiguous",
+            "--confirm",
+            "precutover-create-unrecoverable",
+        ],
+        [
+            "sidebar-acknowledge-precreate-unrecoverable",
+            "--job-id",
+            "sidebar-job:" + "b" * 64,
+            "--expected-error-code",
+            "marker_conflict",
+            "--confirm",
+            "precutover-create-unrecoverable",
+        ],
+    ),
+)
+def test_sidebar_precreate_acknowledgement_parser_rejects_incomplete_authority(
+    argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
+class _TerminalProbeClient:
+    def __init__(self, *, scenario: str, thread_id: str) -> None:
+        self.scenario = scenario
+        self.thread_id = thread_id
+        self._initialized = False
+        self.initialize_calls = 0
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.closed = False
+
+    def initialize(self, *, timeout: float, **kwargs: object) -> dict[str, object]:
+        assert timeout > 0
+        assert kwargs == {"capabilities": {"experimentalApi": True}}
+        self.initialize_calls += 1
+        self._initialized = True
+        return {}
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, object]:
+        assert timeout > 0
+        exact_params = dict(params or {})
+        self.calls.append((method, exact_params))
+        assert exact_params["threadId"] == self.thread_id
+        if method == "thread/read":
+            assert exact_params == {
+                "threadId": self.thread_id,
+                "includeTurns": True,
+            }
+            if self.scenario in {"unrecoverable", "resume_transient"}:
+                raise CodexAppServerError(
+                    code=-32600,
+                    message=f"thread not loaded: {self.thread_id}",
+                )
+            if self.scenario == "read_transient":
+                raise TimeoutError("private provider timeout")
+            observed = (
+                "019f-different-thread"
+                if self.scenario == "malformed"
+                else self.thread_id
+            )
+            return {
+                "thread": {
+                    "id": observed,
+                    "cwd": "C:/workspace/project",
+                    "turns": [],
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "thread/resume":
+            assert exact_params == {"threadId": self.thread_id}
+            if self.scenario == "resume_transient":
+                raise TimeoutError("private resume timeout")
+            if self.scenario == "unrecoverable":
+                raise CodexAppServerError(
+                    code=-32600,
+                    message=f"no rollout found for thread id {self.thread_id}",
+                )
+        raise AssertionError(f"forbidden provider method: {method}")
+
+    def close(self, timeout: float = 3.0) -> None:
+        del timeout
+        self.closed = True
+
+
+def _production_terminal_resolution_backend(
+    tmp_path: Path,
+    *,
+    scenario: str,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+    _TerminalProbeClient,
+]:
+    db = SessionDB(tmp_path / f"terminal-{scenario}.db")
+    tokens = iter((f"terminal-{scenario}-lease",))
+    store = SessionBridgeStore(db, sidebar_token_factory=lambda: next(tokens))
+    source_session_id = f"hermes:terminal-{scenario}"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] terminal evidence",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=f"hermes-session-bridge-create-v1:terminal-{scenario}",
+        now=110.0,
+    )
+    thread_id = f"019f-terminal-provider-{scenario}"
+    store.bind_sidebar_thread(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        now=120.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=150.0,
+    )
+    client = _TerminalProbeClient(scenario=scenario, thread_id=thread_id)
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    return backend, store, failed, reservation, client
+
+
+def test_production_terminal_acknowledgement_derives_exact_evidence_and_replays(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, reservation, client = (
+        _production_terminal_resolution_backend(tmp_path, scenario="unrecoverable")
+    )
+    source_session_id = failed["source_session_id"]
+    before_job = store.get_sidebar_job_for_source(source_session_id)
+    before_reservation = store.get_sidebar_create_reservation(source_session_id)
+    try:
+        first = backend.sidebar_acknowledge_unrecoverable(
+            job_id=failed["id"],
+            codex_thread_id=failed["codex_thread_id"],
+            expected_error_code="native_create_ambiguous",
+        )
+        replay = backend.sidebar_acknowledge_unrecoverable(
+            job_id=failed["id"],
+            codex_thread_id=failed["codex_thread_id"],
+            expected_error_code="native_create_ambiguous",
+        )
+
+        assert first == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_thread_unrecoverable",
+        }
+        assert replay == {**first, "status": "already_acknowledged"}
+        assert store.get_sidebar_job_for_source(source_session_id) == before_job
+        assert (
+            store.get_sidebar_create_reservation(source_session_id)
+            == before_reservation
+            == reservation
+        )
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_terminal_resolutions"
+        ).fetchall()
+        assert len(audit["evidence_digest"]) == 64
+        assert set(audit["evidence_digest"]) <= set("0123456789abcdef")
+        assert audit["codex_thread_id"] == failed["codex_thread_id"]
+        assert client.initialize_calls == 1
+        assert [method for method, _params in client.calls] == [
+            "thread/read",
+            "thread/resume",
+            "thread/read",
+            "thread/resume",
+        ]
+    finally:
+        backend.close()
+    assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_methods", "expected_exception"),
+    (
+        ("materialized", ["thread/read"], RolloutGateBlocked),
+        ("read_transient", ["thread/read"], ProviderDegraded),
+        ("resume_transient", ["thread/read", "thread/resume"], ProviderDegraded),
+        ("malformed", ["thread/read"], ProviderDegraded),
+    ),
+)
+def test_production_terminal_acknowledgement_never_writes_without_exact_evidence(
+    tmp_path: Path,
+    scenario: str,
+    expected_methods: list[str],
+    expected_exception: type[Exception],
+) -> None:
+    backend, store, failed, _reservation, client = (
+        _production_terminal_resolution_backend(tmp_path, scenario=scenario)
+    )
+    before = store.get_sidebar_job_for_source(failed["source_session_id"])
+    try:
+        with pytest.raises(expected_exception):
+            backend.sidebar_acknowledge_unrecoverable(
+                job_id=failed["id"],
+                codex_thread_id=failed["codex_thread_id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert [method for method, _params in client.calls] == expected_methods
+        assert store.get_sidebar_job_for_source(failed["source_session_id"]) == before
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_terminal_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+def test_production_terminal_acknowledgement_rejects_noncanonical_job_before_probe(
+    tmp_path: Path,
+) -> None:
+    backend, store, failed, _reservation, client = (
+        _production_terminal_resolution_backend(tmp_path, scenario="unrecoverable")
+    )
+    store.db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET idempotency_key = ? WHERE id = ?",
+            ("corrupt-terminal-idempotency", failed["id"]),
+        )
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked, match="sidebar_terminal_snapshot_mismatch"
+        ):
+            backend.sidebar_acknowledge_unrecoverable(
+                job_id=failed["id"],
+                codex_thread_id=failed["codex_thread_id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert client.calls == []
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_terminal_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+class _PrecreateProbeVerifier:
+    def __init__(self, scenario: str) -> None:
+        self.scenario = scenario
+        self.marker_calls: list[BridgeMarkerPayload] = []
+        self.terminal_marker_calls: list[BridgeMarkerPayload] = []
+        self.recovery_calls: list[tuple[str, str, float]] = []
+        self.create_calls: list[object] = []
+
+    def find_by_marker(self, expected: BridgeMarkerPayload) -> object | None:
+        self.marker_calls.append(expected)
+        if self.scenario == "marker_error":
+            raise TimeoutError("private marker probe timeout")
+        if self.scenario == "marker_match":
+            return object()
+        return None
+
+    def find_by_marker_including_archived(
+        self,
+        expected: BridgeMarkerPayload,
+    ) -> object | None:
+        self.terminal_marker_calls.append(expected)
+        if self.scenario == "marker_error":
+            raise TimeoutError("private marker probe timeout")
+        if self.scenario in {"marker_match", "archived_marker_match"}:
+            return object()
+        return None
+
+    @property
+    def all_marker_calls(self) -> list[BridgeMarkerPayload]:
+        return [*self.marker_calls, *self.terminal_marker_calls]
+
+    def find_by_recovery_key(
+        self,
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        self.recovery_calls.append((recovery_key, expected_cwd, deadline))
+        if self.scenario == "recovery_error":
+            raise TimeoutError("private recovery probe timeout")
+        if self.scenario == "recovery_match":
+            return "019f-private-recovered-thread"
+        return None
+
+    def create_thread(self, *_args: object, **_kwargs: object) -> None:
+        self.create_calls.append(object())
+        raise AssertionError("precreate terminal proof must never create")
+
+
+def _production_precreate_resolution_backend(
+    tmp_path: Path,
+    *,
+    marker_secret: bytes,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    SidebarCandidate,
+]:
+    db = SessionDB(tmp_path / "precreate-terminal.db")
+    tokens = iter(("precreate-terminal-token",))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    source_session_id = "hermes:precreate-terminal"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] precreate terminal evidence",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    queued = store.enqueue_sidebar_job(candidate)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET state = ?, next_attempt_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (SidebarJobState.RETRY.value, 105.0, 105.0, queued["id"]),
+        )
+    )
+    store.apply_sidebar_create_reservation_cutover(
+        marker_secret=marker_secret,
+        now=110.0,
+    )
+    lease = store.claim_sidebar_jobs(now=120.0, limit=1)[0]
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=130.0,
+    )
+    reservation = store.get_sidebar_create_reservation(source_session_id)
+    cutover = store.get_state("session-bridge:sidebar:create-reservation-cutover:v1")
+    assert reservation is not None
+    assert cutover is not None
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    return backend, store, failed, reservation, cutover, candidate
+
+
+def test_production_precreate_acknowledgement_probes_exact_identities_and_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, reservation, _cutover, candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    before_job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        first = backend.sidebar_acknowledge_precreate_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+        replay = backend.sidebar_acknowledge_precreate_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+
+        assert first == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "precutover_create_unrecoverable",
+        }
+        assert replay == {**first, "status": "already_acknowledged"}
+        assert (
+            verifier.all_marker_calls
+            == [
+                BridgeMarkerPayload(
+                    bridge_id=candidate.bridge_id,
+                    source_session_id=candidate.source_session_id,
+                    target_provider=Provider.CODEX,
+                    policy_generation=1,
+                )
+            ]
+            * 2
+        )
+        assert [
+            (recovery_key, cwd)
+            for recovery_key, cwd, _deadline in verifier.recovery_calls
+        ] == [(reservation["recovery_key"], candidate.cwd)] * 2
+        assert all(
+            isinstance(deadline, float) and deadline > 0
+            for _recovery_key, _cwd, deadline in verifier.recovery_calls
+        )
+        assert verifier.create_calls == []
+        assert (
+            store.get_sidebar_job_for_source(candidate.source_session_id) == before_job
+        )
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_precreate_resolutions"
+        ).fetchall()
+        assert audit["resolution_code"] == "precutover_create_unrecoverable"
+        assert len(audit["evidence_digest"]) == 64
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_exception", "expected_recovery_calls"),
+    (
+        ("marker_match", RolloutGateBlocked, 0),
+        ("recovery_match", RolloutGateBlocked, 1),
+        ("marker_error", ProviderDegraded, 0),
+        ("recovery_error", ProviderDegraded, 1),
+    ),
+)
+def test_production_precreate_acknowledgement_never_writes_without_two_zero_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_exception: type[Exception],
+    expected_recovery_calls: int,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, _reservation, _cutover, candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier(scenario)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        with pytest.raises(expected_exception):
+            backend.sidebar_acknowledge_precreate_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert len(verifier.all_marker_calls) == 1
+        assert len(verifier.recovery_calls) == expected_recovery_calls
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_precreate_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+def test_production_precreate_acknowledgement_archived_marker_blocks_without_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, _reservation, _cutover, candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("archived_marker_match")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+    )
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        with pytest.raises(RolloutGateBlocked, match="native_thread_materialized"):
+            backend.sidebar_acknowledge_precreate_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert verifier.marker_calls == []
+        assert len(verifier.terminal_marker_calls) == 1
+        assert verifier.recovery_calls == []
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+        assert (
+            store.db._conn.execute(
+                "SELECT COUNT(*) FROM session_sidebar_precreate_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        backend.close()
+
+
+def test_production_precreate_acknowledgement_rejects_cutover_drift_before_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"precreate-cli-marker-secret"
+    backend, store, failed, _reservation, cutover, _candidate = (
+        _production_precreate_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    cutover["quarantined_job_ids"] = []
+    store.set_state(
+        "session-bridge:sidebar:create-reservation-cutover:v1",
+        cutover,
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_precreate_snapshot_mismatch",
+        ):
+            backend.sidebar_acknowledge_precreate_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+        assert verifier.marker_calls == []
+        assert verifier.recovery_calls == []
+    finally:
+        backend.close()
+
+
+def test_claude_visibility_exact_commands_route_with_safe_defaults(capsys) -> None:
+    backend = FakeBackend()
+
+    assert _run(["claude-visibility-status", "--json"], backend) == 0
+    assert _json_output(capsys)["counts"]["claude_pending"] == 0
+    assert (
+        _run(
+            [
+                "claude-visibility-backfill",
+                "--days",
+                "30",
+                "--limit",
+                "10",
+                "--dry-run",
+            ],
+            backend,
+        )
+        == 0
+    )
+    dry_run = _json_output(capsys)
+    assert dry_run["mode"] == "dry_run"
+    assert dry_run["dry_run"] is True
+    assert dry_run["applied"] is False
+    assert (
+        _run(
+            ["claude-visibility-backfill", "--days", "30", "--limit", "10", "--apply"],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["mode"] == "apply"
+    assert _run(["claude-visibility-continuous", "--enable"], backend) == 0
+    assert _json_output(capsys) == {"continuous": True, "enabled": False}
+    assert _run(["claude-visibility-continuous", "--disable"], backend) == 0
+    assert _json_output(capsys) == {"continuous": False, "enabled": False}
+    assert _run(["claude-visibility-run-once"], backend) == 0
+    assert _json_output(capsys)["status"] == "no_due_job"
+
+    assert backend.calls == [
+        ("claude_visibility_status",),
+        ("close",),
+        ("claude_visibility_backfill", 30, 10, False),
+        ("close",),
+        ("claude_visibility_backfill", 30, 10, True),
+        ("close",),
+        ("set_claude_visibility_continuous", True),
+        ("close",),
+        ("set_claude_visibility_continuous", False),
+        ("close",),
+        ("claude_visibility_run_once",),
+        ("close",),
+    ]
+
+
+def test_claude_visibility_backfill_defaults_to_explicit_dry_run_json(capsys) -> None:
+    backend = FakeBackend()
+
+    assert (
+        _run(["claude-visibility-backfill", "--days", "30", "--limit", "10"], backend)
+        == 0
+    )
+
+    assert _json_output(capsys) == {
+        **backend.claude_visibility_payload,
+        "mode": "dry_run",
+        "applied": False,
+        "dry_run": True,
+        "enqueued": 0,
+    }
+    assert backend.calls == [("claude_visibility_backfill", 30, 10, False), ("close",)]
+
+
+def test_claude_visibility_backfill_validation_precedes_backend_mutation(
+    capsys,
+) -> None:
+    backend = FakeBackend()
+
+    with pytest.raises(SystemExit):
+        _run(["claude-visibility-backfill", "--days", "0", "--limit", "10"], backend)
+    with pytest.raises(SystemExit):
+        _run(["claude-visibility-backfill", "--days", "30", "--limit", "11"], backend)
+    with pytest.raises(SystemExit):
+        _run(
+            [
+                "claude-visibility-backfill",
+                "--days",
+                "30",
+                "--limit",
+                "10",
+                "--dry-run",
+                "--apply",
+            ],
+            backend,
+        )
+
+    assert backend.calls == []
+
+
+def test_claude_visibility_lineage_reconcile_requires_explicit_apply_confirmation(
+    capsys,
+) -> None:
+    backend = FakeBackend()
+
+    assert (
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--limit",
+                "25",
+                "--dry-run",
+            ],
+            backend,
+        )
+        != 0
+    )
+    assert _json_output(capsys) == {
+        "mode": "dry_run",
+        "scanned": 1,
+        "repairable": 1,
+        "repaired": 0,
+        "remaining": 1,
+        "blocker_codes": {},
+        "has_more": False,
+        "complete": False,
+    }
+    assert (
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--limit",
+                "25",
+                "--apply",
+            ],
+            backend,
+        )
+        != 0
+    )
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": "historical_lineage_repair_confirmation_required",
+    }
+    assert (
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--limit",
+                "25",
+                "--apply",
+                "--confirm-historical-repair",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["mode"] == "apply"
+    assert backend.calls == [
+        ("reconcile_claude_visibility_lineage", 25, False, None),
+        ("close",),
+        ("close",),
+        ("reconcile_claude_visibility_lineage", 25, True, None),
+        ("close",),
+    ]
+
+
+def test_claude_visibility_lineage_reconcile_passes_cursor_and_never_succeeds_partial_apply(
+    capsys,
+) -> None:
+    cursor = {
+        "after_visible_at": 100.0,
+        "after_job_id": "job-a",
+        "high_water_visible_at": 101.0,
+        "high_water_job_id": "job-b",
+    }
+
+    class PartialBackend(FakeBackend):
+        def reconcile_claude_visibility_lineage(
+            self,
+            *,
+            limit: int,
+            apply: bool,
+            cursor: Mapping[str, Any] | None = None,
+        ):
+            self.calls.append((
+                "reconcile_claude_visibility_lineage",
+                limit,
+                apply,
+                cursor,
+            ))
+            return {
+                "mode": "apply",
+                "scanned": 1,
+                "repairable": 1,
+                "repaired": 1,
+                "remaining": 2,
+                "blocker_codes": {},
+                "next_cursor": cursor,
+                "has_more": True,
+                "complete": False,
+            }
+
+    backend = PartialBackend()
+    result = _run(
+        [
+            "claude-visibility-reconcile-lineage",
+            "--limit",
+            "1",
+            "--cursor",
+            json.dumps(cursor),
+            "--apply",
+            "--confirm-historical-repair",
+        ],
+        backend,
+    )
+
+    assert result != 0
+    assert _json_output(capsys)["complete"] is False
+    assert backend.calls[0] == (
+        "reconcile_claude_visibility_lineage",
+        1,
+        True,
+        cursor,
+    )
+
+
+def test_claude_visibility_lineage_reconcile_rejects_non_object_cursor_before_backend(
+    capsys,
+) -> None:
+    backend = FakeBackend()
+
+    with pytest.raises(SystemExit):
+        _run(
+            [
+                "claude-visibility-reconcile-lineage",
+                "--cursor",
+                "[]",
+                "--dry-run",
+            ],
+            backend,
+        )
+
+    assert backend.calls == []
+
+
+def test_production_lineage_cursor_auth_rejects_mode_replay_and_forgery_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker_key = b"c" * 32
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    identities = []
+    for index in range(3):
+        candidate = ClaudeVisibilityCandidate(
+            source_session_id=f"codex:cli-lineage-source-{index}",
+            source_provider=Provider.CODEX,
+            native_name=f"[Codex] CLI lineage {index}",
+            source_cwd=str(tmp_path),
+            git_root=str(tmp_path),
+            git_branch="main",
+            git_head=f"head-{index}",
+            worktree_id=f"worktree-{index}",
+            eligible_at=100.0,
+        )
+        identity = derive_claude_visibility_identity(candidate, marker_key)
+        identities.append(identity)
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CODEX,
+                native_id=f"cli-lineage-source-{index}",
+                title=candidate.native_name,
+                cwd=str(tmp_path),
+                started_at=90.0,
+                last_active=100.0,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"source-{index}",
+                        ordinal=0,
+                        role="user",
+                        content="meaningful source request",
+                        timestamp=100.0,
+                    ),
+                ),
+                native_cursor=f"source-cursor-{index}",
+                native_hash=f"source-hash-{index}",
+            )
+        )
+        store.enqueue_claude_visibility_job(candidate, identity, marker_key)
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=identity.claude_uuid,
+                title=f"Claude lineage target {index}",
+                cwd=str(tmp_path),
+                started_at=100.0,
+                last_active=100.0,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"target-{index}",
+                        ordinal=0,
+                        role="user",
+                        content="signed registration",
+                        timestamp=100.0,
+                    ),
+                ),
+                native_cursor=f"target-cursor-{index}",
+                native_hash=f"target-hash-{index}",
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id=identity.bridge_id,
+            )
+        )
+        db._execute_write(
+            lambda conn, job_id=identity.job_id: conn.execute(
+                """UPDATE session_claude_visibility_jobs
+                   SET state = 'claude_visible', completion_digest = ?,
+                       visible_at = 100, updated_at = 100 WHERE id = ?""",
+                ("a" * 64, job_id),
+            )
+        )
+
+    def link_rows() -> list[tuple[str, str]]:
+        with db._lock:
+            conn = db._conn
+            assert conn is not None
+            return [
+                (str(row["id"]), str(row["bridge_id"]))
+                for row in conn.execute(
+                    "SELECT id, bridge_id FROM session_links ORDER BY id"
+                ).fetchall()
+            ]
+
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(backend, "close", lambda: None)
+    try:
+        dry_run = backend.reconcile_claude_visibility_lineage(
+            limit=1,
+            apply=False,
+        )
+        before_mode_replay = link_rows()
+        assert (
+            _run(
+                [
+                    "claude-visibility-reconcile-lineage",
+                    "--limit",
+                    "1",
+                    "--cursor",
+                    json.dumps(dry_run["next_cursor"]),
+                    "--apply",
+                    "--confirm-historical-repair",
+                ],
+                backend,
+            )
+            != 0
+        )
+        assert _json_output(capsys) == {"error": "configuration_error"}
+        assert link_rows() == before_mode_replay == []
+
+        first_apply = backend.reconcile_claude_visibility_lineage(
+            limit=1,
+            apply=True,
+        )
+        cursor = dict(first_apply["next_cursor"])
+        ordered_job_ids = sorted(identity.job_id for identity in identities)
+        forged = {**cursor, "after_job_id": ordered_job_ids[1]}
+        before_forgery = link_rows()
+        assert (
+            _run(
+                [
+                    "claude-visibility-reconcile-lineage",
+                    "--limit",
+                    "1",
+                    "--cursor",
+                    json.dumps(forged),
+                    "--apply",
+                    "--confirm-historical-repair",
+                ],
+                backend,
+            )
+            != 0
+        )
+        assert _json_output(capsys) == {"error": "configuration_error"}
+        assert link_rows() == before_forgery
+    finally:
+        db.close()
+
+
+def test_claude_visibility_status_blocks_on_unlinked_visible_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": "2026-07-21",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+                "lineage": {
+                    "unlinked_visible": 2,
+                    "repairable": 1,
+                    "blocked": 1,
+                    "blocker_codes": {"claude_lineage_missing_source": 1},
+                },
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["lineage"] == {
+        "unlinked_visible": 2,
+        "repairable": 1,
+        "blocked": 1,
+        "blocker_codes": {"claude_lineage_missing_source": 1},
+    }
+    assert result["open_reasons"] == ["unlinked_visible_lineage"]
+    assert result["fatal_reasons"] == ["claude_lineage_missing_source"]
+    assert result["degraded_reasons"] == [
+        "claude_lineage_missing_source",
+        "unlinked_visible_lineage",
+    ]
+
+
+def test_claude_visibility_apply_and_run_once_use_typed_nonzero_contract(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend(
+        claude_visibility_payload={
+            "enabled": True,
+            "continuous": False,
+            "counts": {},
+            "retry_codes": {},
+            "failed_codes": {"unknown_error_code": 1},
+            "usage": {},
+            "candidates": [],
+            "exclusions": [],
+            "open_reasons": [],
+            "fatal_reasons": ["unknown_retry"],
+            "degraded_reasons": [],
+        }
+    )
+    assert (
+        _run(
+            ["claude-visibility-backfill", "--days", "30", "--limit", "10", "--apply"],
+            backend,
+        )
+        != 0
+    )
+    _json_output(capsys)
+
+    monkeypatch.setattr(
+        backend,
+        "claude_visibility_run_once",
+        lambda: {
+            "enabled": True,
+            "status": "degraded",
+            "degraded": True,
+            "fatal": False,
+        },
+    )
+    assert _run(["claude-visibility-run-once"], backend) != 0
+    _json_output(capsys)
+
+
+@pytest.mark.parametrize("apply", (False, True))
+def test_sidebar_backfill_candidate_failures_exit_degraded(
+    capsys: pytest.CaptureFixture[str],
+    apply: bool,
+) -> None:
+    backend = FakeBackend(
+        sidebar_backfill_payload={
+            "mode": "apply" if apply else "dry_run",
+            "days": 30,
+            "limit": 10,
+            "examined": 1,
+            "queued": 0,
+            "by_provider": {"claude": 0, "hermes": 0},
+            "failed": 1,
+        }
+    )
+    mode = "--apply" if apply else "--dry-run"
+
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
+            backend,
+        )
+        == 3
+    )
+    assert _json_output(capsys)["failed"] == 1
+
+
+@pytest.mark.parametrize("apply", (False, True))
+def test_sidebar_backfill_exclusions_do_not_exit_degraded(
+    capsys: pytest.CaptureFixture[str],
+    apply: bool,
+) -> None:
+    backend = FakeBackend(
+        sidebar_backfill_payload={
+            "mode": "apply" if apply else "dry_run",
+            "days": 30,
+            "limit": 10,
+            "examined": 1,
+            "queued": 0,
+            "by_provider": {"claude": 0, "hermes": 0},
+            "failed": 0,
+            "excluded": 1,
+            "excluded_by_reason": {"source_cwd_missing": 1},
+        }
+    )
+    mode = "--apply" if apply else "--dry-run"
+
+    assert (
+        _run(
+            ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["excluded_by_reason"] == {"source_cwd_missing": 1}
+
+
+def test_sidebar_backfill_rejects_a_limit_above_ten() -> None:
+    with pytest.raises(SystemExit):
+        main(["sidebar-backfill", "--days", "30", "--limit", "11", "--dry-run"])
+
+
+class _SidebarStatusStore:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def sidebar_delivery_status(self, *, now: float) -> dict[str, Any]:
+        assert now == 1_000.0
+        return dict(self.payload)
+
+
+def _production_sidebar_backend(
+    payload: dict[str, Any], *, grace_seconds: int = 120
+) -> ProductionBackend:
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            sidebar=replace(
+                SidebarConfig(),
+                enabled=True,
+                heartbeat_grace_seconds=grace_seconds,
+            ),
+        )
+    )
+    backend._store = _SidebarStatusStore(payload)  # type: ignore[assignment]
+    backend._catalog = object()  # type: ignore[assignment]
+    return backend
+
+
+def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 0},
+        "counts": {"pending": 0, "leased": 0, "retry": 0, "visible": 0, "failed": 0},
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {"p50": None, "p95": None, "p99": None},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["degraded_reasons"] == []
+    assert status["last_successful_heartbeat_at"] is None
+
+    fresh_pending = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"pending": 1},
+        "oldest_pending_age_seconds": 180.0,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+    assert fresh_pending.sidebar_status()["healthy"] is True
+
+
+def test_sidebar_status_preserves_raw_failures_but_waives_exact_terminal_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {"native_thread_unrecoverable": 1},
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["degraded_reasons"] == []
+    assert status["counts"]["sidebar_failed"] == 1
+    assert status["blocking_failed_count"] == 0
+    assert status["terminally_resolved_failed_count"] == 1
+    assert status["ineffective_terminal_resolution_count"] == 0
+    assert status["terminal_resolution_ledger_valid"] is True
+    assert status["terminal_resolutions"] == {
+        "total": 1,
+        "effective": 1,
+        "ineffective": 0,
+        "by_resolution_code": {
+            "native_thread_unrecoverable": 1,
+            "precutover_create_unrecoverable": 0,
+        },
+    }
+    assert status["execution_blockers"] == []
+
+
+def test_sidebar_status_accepts_and_preserves_precreate_terminal_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 1},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {
+                "native_thread_unrecoverable": 0,
+                "precutover_create_unrecoverable": 1,
+            },
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 0,
+        "precutover_create_unrecoverable": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("ledger_valid", "ineffective", "blockers"),
+    (
+        (
+            True,
+            1,
+            ["sidebar_failed", "sidebar_terminal_resolution_mismatch"],
+        ),
+        (
+            False,
+            0,
+            ["sidebar_failed", "sidebar_terminal_resolution_ledger_invalid"],
+        ),
+    ),
+)
+def test_sidebar_status_fails_closed_for_ineffective_or_invalid_terminal_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_valid: bool,
+    ineffective: int,
+    blockers: list[str],
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 1,
+        "terminally_resolved_failed_count": 0,
+        "ineffective_terminal_resolution_count": ineffective,
+        "terminal_resolution_ledger_valid": ledger_valid,
+        "terminal_resolutions": {
+            "total": ineffective,
+            "effective": 0,
+            "ineffective": ineffective,
+            "by_resolution_code": {"native_thread_unrecoverable": 0},
+        },
+        "execution_blockers": blockers,
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is False
+    assert status["degraded_reasons"] == blockers
+    assert status["execution_blockers"] == blockers
+    assert status["counts"]["sidebar_failed"] == 1
+
+
+def test_sidebar_status_preserves_exclusion_count_without_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 0},
+        "counts": {"sidebar_excluded": 7},
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["counts"]["sidebar_excluded"] == 7
+    assert status["healthy"] is True
+    assert status["degraded_reasons"] == []
+
+
+def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 2, "hermes": 1},
+        "counts": {"pending": 1, "leased": 0, "retry": 0, "visible": 2, "failed": 0},
+        "oldest_pending_age_seconds": 181.0,
+        "last_heartbeat_at": 819.0,
+        "last_visible_task_id": "019f-secret-thread-identifier",
+        "recent_error_codes": ["broker_time_budget"],
+        "delivery_latency_seconds": {"p50": 1.0, "p95": 2.0, "p99": 2.0},
+    })
+
+    status = backend.sidebar_status()
+    rendered = json.dumps(status, sort_keys=True)
+
+    assert status["healthy"] is False
+    assert status["degraded_reasons"] == [
+        "broker_heartbeat_stale",
+        "oldest_pending_stale",
+    ]
+    expected_tag = hashlib.sha256(b"019f-secret-thread-identifier").hexdigest()[:16]
+    assert status["last_visible_task_id"] == f"task:{expected_tag}"
+    assert "019f-secret-thread-identifier" not in rendered
+    assert "lease_token" not in rendered
+    assert "marker" not in rendered
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    (
+        "C:/private/task",
+        "../private-task",
+        "secret\nsecond-line",
+        "\x00control",
+        "_leading-symbol",
+        "a" * 513,
+        "",
+    ),
+)
+def test_sidebar_status_never_redacts_hostile_task_ids_by_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+    hostile_id: str,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 0},
+        "counts": {},
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": hostile_id,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    assert backend.sidebar_status()["last_visible_task_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("oldest_age", "heartbeat_at", "healthy", "reasons"),
+    (
+        (179.0, 1.0, True, []),
+        (180.0, None, True, []),
+        (
+            181.0,
+            None,
+            False,
+            ["broker_heartbeat_stale", "oldest_pending_stale"],
+        ),
+        (
+            181.0,
+            819.0,
+            False,
+            ["broker_heartbeat_stale", "oldest_pending_stale"],
+        ),
+        (181.0, 999.0, False, ["oldest_pending_stale"]),
+    ),
+)
+def test_sidebar_status_alerts_only_for_work_older_than_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    oldest_age: float,
+    heartbeat_at: float | None,
+    healthy: bool,
+    reasons: list[str],
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"pending": 1},
+        "oldest_pending_age_seconds": oldest_age,
+        "last_heartbeat_at": heartbeat_at,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is healthy
+    assert status["degraded_reasons"] == reasons
+
+
+@pytest.mark.parametrize(
+    ("age", "healthy"),
+    ((0.0, True), (181.0, False)),
+)
+def test_sidebar_status_includes_leased_only_actionable_work(
+    monkeypatch: pytest.MonkeyPatch,
+    age: float,
+    healthy: bool,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"leased": 1},
+        "oldest_pending_age_seconds": age,
+        "last_heartbeat_at": 1.0,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    assert backend.sidebar_status()["healthy"] is healthy
+
+
+def test_sidebar_continuous_preserves_unrelated_hermes_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = {
+        "theme": "midnight",
+        "session_bridge": {
+            "sidebar": {"enabled": True, "continuous": False, "backfill_days": 30},
+            "future_key": {"keep": "exactly"},
+        },
+    }
+    saved: list[tuple[dict[str, Any], set[tuple[str, ...]] | None]] = []
+
+    def mutate_config(mutator, **kwargs):
+        value = json.loads(json.dumps(loaded))
+        mutator(value)
+        saved.append((value, kwargs.get("preserve_keys")))
+        return value
+
+    monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
+    backend = ProductionBackend(BridgeConfig())
+
+    result = backend.set_sidebar_continuous(enabled=True)
+
+    assert result == {"enabled": False, "continuous": True}
+    assert saved == [
+        (
+            {
+                "theme": "midnight",
+                "session_bridge": {
+                    "sidebar": {
+                        "enabled": True,
+                        "continuous": True,
+                        "backfill_days": 30,
+                    },
+                    "future_key": {"keep": "exactly"},
+                },
+            },
+            {("session_bridge", "sidebar", "continuous")},
+        )
+    ]
+
+
+def test_claude_visibility_continuous_preserves_unrelated_config_and_enabled_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = {
+        "theme": "midnight",
+        "session_bridge": {
+            "claude_visibility": {
+                "enabled": False,
+                "continuous": False,
+                "backfill_days": 30,
+            },
+            "future_key": {"keep": "exactly"},
+        },
+    }
+    saved = []
+
+    def mutate_config(mutator, **kwargs):
+        value = json.loads(json.dumps(loaded))
+        mutator(value)
+        saved.append((value, kwargs.get("preserve_keys")))
+        return value
+
+    monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
+    backend = ProductionBackend(BridgeConfig())
+
+    result = backend.set_claude_visibility_continuous(enabled=True)
+
+    assert result == {"enabled": False, "continuous": True}
+    assert saved == [
+        (
+            {
+                "theme": "midnight",
+                "session_bridge": {
+                    "claude_visibility": {
+                        "enabled": False,
+                        "continuous": True,
+                        "backfill_days": 30,
+                    },
+                    "future_key": {"keep": "exactly"},
+                },
+            },
+            {("session_bridge", "claude_visibility", "continuous")},
+        )
+    ]
+
+
+def test_claude_visibility_continuous_postwrite_mismatch_keeps_runtime_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.config.mutate_config",
+        lambda _mutator, **_kwargs: {
+            "session_bridge": {"claude_visibility": {"continuous": False}}
+        },
+    )
+    backend = ProductionBackend(BridgeConfig())
+
+    with pytest.raises(
+        ConfigurationFailure, match="claude_visibility_continuous_not_persisted"
+    ):
+        backend.set_claude_visibility_continuous(enabled=True)
+
+    assert backend.config.claude_visibility.continuous is False
+
+
+def test_claude_visibility_status_does_not_construct_delivery_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "usage": {
+                    "local_day": "2026-07-17",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+            }
+
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config,
+            claude_visibility=replace(config.claude_visibility, enabled=True),
+        )
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(AssertionError("marker key")),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda _name: (_ for _ in ()).throw(AssertionError("delivery executable")),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("registrar")),
+    )
+
+    result = backend.claude_visibility_status()
+
+    assert result["enabled"] is True
+    assert result["candidates"] == []
+    assert result["degraded_reasons"] == []
+    assert result["last_cycle"] == {"tracked": False, "value": None}
+    assert result["last_empty_cycle"] == {"tracked": False, "value": None}
+    assert result["last_registrar_result"] == {"tracked": False, "value": None}
+
+
+def test_claude_visibility_preflight_blocks_before_any_runtime_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    events: list[object] = []
+
+    def resolve_executable(_name: str) -> tuple[str, ...]:
+        events.append("resolve_executable")
+        return ("claude",)
+
+    def preflight(command: tuple[str, ...]) -> None:
+        events.append(("preflight", command))
+        return None
+
+    monkeypatch.setattr("session_bridge.cli.resolve_cli_executable", resolve_executable)
+    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(AssertionError("marker resolution")),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("source construction")
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("registrar construction")
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeVisibilityCoordinator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("coordinator construction")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(AssertionError("store/claim/cost access")),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_claude_visibility_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("inventory access")
+        ),
+    )
+
+    with pytest.raises(ProviderDegraded, match="claude_visibility_preflight_failed"):
+        backend.claude_visibility_run_once()
+
+    assert events == ["resolve_executable", ("preflight", ("claude",))]
+    assert backend._claude_visibility_coordinator is None
+
+
+def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    events: list[object] = []
+    store = object()
+    source = object()
+    coordinator = object()
+
+    def resolve_executable(_name: str) -> tuple[str, ...]:
+        events.append("resolve_executable")
+        return ("claude",)
+
+    def preflight(command: tuple[str, ...]) -> dict[str, str]:
+        events.append(("preflight", command))
+        return {
+            "version": "2.1.216",
+            "authentication": "available",
+            "theme": "light",
+        }
+
+    def marker_key() -> bytes:
+        events.append("marker")
+        return b"m" * 32
+
+    def source_factory(*_args: Any, **_kwargs: Any) -> object:
+        events.append("source")
+        return source
+
+    def store_factory() -> object:
+        events.append("store")
+        return store
+
+    def registrar_factory(*args: Any, **kwargs: Any) -> object:
+        events.append(("registrar", args, kwargs))
+        assert kwargs["startup_theme"] == "light"
+        return object()
+
+    def coordinator_factory(**kwargs: Any) -> object:
+        events.append(("coordinator", kwargs))
+        return coordinator
+
+    monkeypatch.setattr("session_bridge.cli.resolve_cli_executable", resolve_executable)
+    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", marker_key)
+    monkeypatch.setattr("session_bridge.cli.ClaudeSourceAdapter", source_factory)
+    monkeypatch.setattr("session_bridge.cli.ClaudeNativeRegistrar", registrar_factory)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeVisibilityCoordinator", coordinator_factory
+    )
+    monkeypatch.setattr(backend, "_require_store", store_factory)
+
+    assert backend._claude_visibility_runtime() is coordinator
+
+    assert events[:5] == [
+        "resolve_executable",
+        ("preflight", ("claude",)),
+        "marker",
+        "source",
+        "store",
+    ]
+    registrar_event = events[5]
+    assert isinstance(registrar_event, tuple)
+    assert registrar_event[0] == "registrar"
+    assert events[6][0] == "coordinator"  # type: ignore[index]
+
+    events.clear()
+    assert backend._claude_visibility_runtime() is coordinator
+    assert events == ["resolve_executable", ("preflight", ("claude",))]
+
+
+def test_characterization_preflight_blocks_before_store_or_registrar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    events: list[object] = []
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+
+    def preflight(command: tuple[str, ...]) -> None:
+        events.append(("preflight", command))
+        return None
+
+    monkeypatch.setattr("session_bridge.cli._claude_visibility_preflight", preflight)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(AssertionError("marker resolution")),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(AssertionError("store/claim/cost access")),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("registrar construction")
+        ),
+    )
+
+    with pytest.raises(ProviderDegraded, match="claude_visibility_preflight_failed"):
+        backend.characterize_claude_visibility()
+
+    assert events == [("preflight", ("claude",))]
+
+
+@pytest.mark.parametrize("sync_fails", [False, True])
+def test_characterization_cleanup_syncs_exact_terminal_record_before_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sync_fails: bool,
+) -> None:
+    operation_id = "16161616-1616-4616-8616-161616161616"
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    completed_root = source_root / ".cleanup-completed"
+    completed_root.mkdir(parents=True)
+    completed_state = _characterization_state(
+        operation_id, phase="completed", source_root=source_root
+    )
+    calls: list[dict[str, object]] = []
+
+    class Store:
+        def record_claude_visibility_characterization(self, **kwargs):
+            calls.append(kwargs)
+            if sync_fails:
+                raise ValueError("synthetic terminal append failure")
+            return {"status": "cleanup_completed"}
+
+    def cleanup(**_kwargs):
+        _write_characterization_record(
+            completed_root / f"{operation_id}.json",
+            completed_state,
+            b"k" * 32,
+        )
+        return {
+            "passed": True,
+            "cleanup": "removed_exact_characterization",
+        }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.cleanup_characterized_claude_visibility", cleanup
+    )
+
+    token = {"id": operation_id, "capability": "x" * 43}
+    if sync_fails:
+        with pytest.raises(
+            ConfigurationFailure, match="characterization_record_invalid"
+        ):
+            backend.characterize_claude_visibility(cleanup_token=token)
+    else:
+        result = backend.characterize_claude_visibility(cleanup_token=token)
+        assert result["cleanup"] == "removed_exact_characterization"
+    assert (completed_root / f"{operation_id}.json").exists()
+    assert len(calls) == 1
+    assert calls[0]["operation_id"] == operation_id
+    assert calls[0]["cleanup_completed"] is True
+
+
+@pytest.mark.parametrize("fatal_kind", ["unknown_retry", "raw_fatal"])
+def test_characterization_status_fatal_blocks_before_native_or_low_level_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_kind: str,
+) -> None:
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    active_state: dict[str, object] | None = None
+    if fatal_kind == "unknown_retry":
+        source_root.mkdir(parents=True)
+        active_state = _characterization_state(
+            "15151515-1515-4515-8515-151515151515",
+            phase="launching",
+            source_root=source_root,
+        )
+        _write_characterization_record(
+            source_root / ".claude-visibility-operation.json",
+            active_state,
+            b"k" * 32,
+        )
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            assert active_state is not None
+            return {"status": "registered"}
+
+        def claude_visibility_status(self, _now):
+            state = "claude_retry" if fatal_kind == "unknown_retry" else None
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": int(state == "claude_retry"),
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": (
+                    {"future_unknown_retry": 1} if fatal_kind == "unknown_retry" else {}
+                ),
+                "failed_codes": {},
+                "fatal": (
+                    [{"code": "unknown_job_state"}] if fatal_kind == "raw_fatal" else []
+                ),
+                "lineage": {
+                    "unlinked_visible": 0,
+                    "repairable": 0,
+                    "blocked": 0,
+                    "blocker_codes": {},
+                },
+                "characterizations": (
+                    []
+                    if active_state is None
+                    else [{"job_id": active_state["job_id"], "state": state}]
+                ),
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable", lambda _name: ("claude",)
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._claude_visibility_preflight",
+        lambda _command: {"theme": "light"},
+    )
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: pytest.fail("fatal status must block native source"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.characterize_claude_visibility",
+        lambda **_kwargs: pytest.fail("fatal status must block low-level work"),
+    )
+
+    with pytest.raises(RolloutGateBlocked, match="claude_visibility_not_idle"):
+        backend.characterize_claude_visibility()
+
+
+def test_characterization_replays_terminal_abort_before_native_or_new_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    source_root.mkdir(parents=True)
+    operation_id = "19191919-1919-4919-8919-191919191919"
+    active = _characterization_state(
+        operation_id, phase="launching", source_root=source_root
+    )
+    _write_characterization_record(
+        source_root / ".claude-visibility-operation.json", active, b"k" * 32
+    )
+    calls: list[object] = []
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            return {"status": "registered"}
+
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": 0,
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "lineage": {
+                    "unlinked_visible": 0,
+                    "repairable": 0,
+                    "blocked": 0,
+                    "blocker_codes": {},
+                },
+                "characterizations": [],
+            }
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            calls.append(("terminal", kwargs))
+            assert kwargs["launch_aborted"] is True
+            return {
+                "status": "already_aborted",
+                "job_id": active["job_id"],
+                "reserved_claude_uuid": active["reserved_claude_uuid"],
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda _name: pytest.fail("terminal abort replay must not resolve Claude"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **kwargs: calls.append(("retire", kwargs)) or {"status": "retired"},
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: pytest.fail(
+            "terminal abort must not read native data"
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.characterize_claude_visibility",
+        lambda **_kwargs: pytest.fail("terminal abort must not start new work"),
+    )
+
+    result = backend.characterize_claude_visibility()
+
+    assert result == {
+        "status": "aborted_exact_absence",
+        "job_id": active["job_id"],
+        "reserved_claude_uuid": active["reserved_claude_uuid"],
+        "replacement_created": False,
+        "active_record_retired": True,
+        "replayed": True,
+    }
+    assert [call[0] for call in calls] == ["terminal", "retire"]
+
+
+def _characterization_state(
+    operation_id: str, *, phase: str, source_root: Path
+) -> dict[str, object]:
+    source_session_id = f"codex:{operation_id}"
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=source_session_id,
+        source_provider=Provider.CODEX,
+        native_name="[Codex] Verify native Claude session visibility and exact-ID resume metadata.",
+        source_cwd=str(source_root / f"claude-visibility-{operation_id}"),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, b"k" * 32)
+    return {
+        "schema_version": 2,
+        "operation_id": operation_id,
+        "phase": phase,
+        "created_at": 100.0,
+        "expires_at": 200.0,
+        "source_provider": "codex",
+        "source_session_id": source_session_id,
+        "bridge_id": identity.bridge_id,
+        "job_id": identity.job_id,
+        "reserved_claude_uuid": identity.claude_uuid,
+        "native_name": candidate.native_name,
+        "source_cwd": candidate.source_cwd,
+        "signed_marker": identity.signed_marker,
+        "transcript_path": None,
+        "transcript_identity": None,
+        "sentinel_nonce": "nonce",
+        "cleanup_authorized_at": 150.0 if phase == "completed" else None,
+        "cleanup_capability_hash": "a" * 64,
+    }
+
+
+def test_characterization_record_sync_is_authenticated_bounded_and_phase_aware(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    completed = root / ".cleanup-completed"
+    completed.mkdir()
+    active_id = "11111111-1111-4111-8111-111111111111"
+    completed_id = "22222222-2222-4222-8222-222222222222"
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json",
+        _characterization_state(active_id, phase="launching", source_root=root),
+        b"k" * 32,
+    )
+    _write_characterization_record(
+        completed / f"{completed_id}.json",
+        _characterization_state(completed_id, phase="completed", source_root=root),
+        b"k" * 32,
+    )
+
+    class Store:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def enqueue_claude_visibility_characterization(
+            self,
+            _candidate,
+            _identity,
+            _marker_secret,
+            *,
+            operation_id,
+            evidence_digest,
+        ):
+            self.calls.append({
+                "operation_id": operation_id,
+                "evidence_digest": evidence_digest,
+                "cleanup_completed": False,
+            })
+            return {"status": "registered"}
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"status": "recorded"}
+
+    store = Store()
+    result = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=b"k" * 32,
+        include_active=True,
+        include_completed=True,
+    )
+
+    assert result == {"registered": 2, "cleanup_completed": 1}
+    assert [call["operation_id"] for call in store.calls] == [
+        active_id,
+        completed_id,
+    ]
+    assert store.calls[0]["cleanup_completed"] is False
+    assert store.calls[1]["cleanup_completed"] is True
+    assert all(len(str(call["evidence_digest"])) == 64 for call in store.calls)
+
+
+def test_characterization_restart_sync_atomically_recovers_missing_job_before_claim(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    operation_id = "14141414-1414-4414-8414-141414141414"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+
+    synced = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=b"k" * 32,
+        include_active=True,
+        include_completed=False,
+    )
+    raw = store.claude_visibility_status(100.0)
+
+    assert synced == {"registered": 1, "cleanup_completed": 0}
+    assert raw["counts"]["claude_pending"] == 1
+    assert raw["characterizations"] == [
+        {"job_id": state["job_id"], "state": "claude_pending"}
+    ]
+    assert _claude_characterization_open_work_allowed(
+        raw,
+        active_operation=True,
+        active_job_id=str(state["job_id"]),
+    )
+    claim = store.claim_claude_visibility_job(
+        100.0,
+        60,
+        25,
+        "0.50",
+        "0.02",
+        expected_job_id=str(state["job_id"]),
+    )
+    assert claim.claimed
+    assert claim.reserved_claude_uuid == state["reserved_claude_uuid"]
+    db.close()
+
+
+def test_characterization_restart_sync_backfills_exact_preledger_retry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    operation_id = "16161616-1616-4616-8616-161616161616"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id=str(state["source_session_id"]),
+        source_provider=Provider.CODEX,
+        native_name=str(state["native_name"]),
+        source_cwd=str(state["source_cwd"]),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=float(state["created_at"]),
+    )
+    identity = derive_claude_visibility_identity(candidate, b"k" * 32)
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    store.enqueue_claude_visibility_job(candidate, identity, b"k" * 32)
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_claude_visibility_jobs
+               SET state = 'claude_retry', attempts = 7,
+                   next_attempt_at = 100, error_code = 'creation_ambiguous',
+                   error_detail = 'legacy ambiguous create', updated_at = 99
+               WHERE id = ?""",
+            (identity.job_id,),
+        )
+    )
+    before = dict(
+        db._conn.execute(
+            "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+            (identity.job_id,),
+        ).fetchone()
+    )
+
+    synced = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=b"k" * 32,
+        include_active=True,
+        include_completed=False,
+    )
+
+    assert synced == {"registered": 1, "cleanup_completed": 0}
+    assert (
+        dict(
+            db._conn.execute(
+                "SELECT * FROM session_claude_visibility_jobs WHERE id = ?",
+                (identity.job_id,),
+            ).fetchone()
+        )
+        == before
+    )
+    assert store.claude_visibility_status(100.0)["characterizations"] == [
+        {"job_id": identity.job_id, "state": "claude_retry"}
+    ]
+    db.close()
+
+
+def test_characterization_restart_sync_refuses_to_create_second_open_job(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    operation_id = "18181818-1818-4818-8818-181818181818"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate = ClaudeVisibilityCandidate(
+        source_session_id="codex:unrelated-open",
+        source_provider=Provider.CODEX,
+        native_name="[Codex] unrelated",
+        source_cwd="C:/work/unrelated",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    identity = derive_claude_visibility_identity(candidate, b"k" * 32)
+    store.enqueue_claude_visibility_job(candidate, identity, b"k" * 32)
+
+    with pytest.raises(ConfigurationFailure, match="characterization_record_invalid"):
+        _sync_claude_characterization_records(
+            store=store,
+            source_root=root,
+            marker_secret=b"k" * 32,
+            include_active=True,
+            include_completed=False,
+        )
+
+    raw = store.claude_visibility_status(100.0)
+    assert raw["counts"]["claude_pending"] == 1
+    assert raw["characterizations"] == []
+    db.close()
+
+
+def test_lineage_apply_syncs_completed_characterization_before_store_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[object] = []
+
+    class Store:
+        def reconcile_claude_visibility_lineage(self, **kwargs):
+            events.append(("reconcile", kwargs))
+            return {
+                "scanned": 0,
+                "repairable": 0,
+                "repaired": 0,
+                "remaining": 0,
+                "blocker_codes": {},
+                "next_cursor": None,
+                "has_more": False,
+                "complete": True,
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    store = Store()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli._sync_claude_characterization_records",
+        lambda **kwargs: (
+            events.append(("sync", kwargs)) or {"registered": 1, "cleanup_completed": 1}
+        ),
+    )
+
+    result = backend.reconcile_claude_visibility_lineage(limit=25, apply=True)
+
+    assert result["complete"] is True
+    assert events[0][0] == "sync"  # type: ignore[index]
+    assert events[0][1]["include_active"] is False  # type: ignore[index]
+    assert events[0][1]["include_completed"] is True  # type: ignore[index]
+    assert events[1][0] == "reconcile"  # type: ignore[index]
+
+
+def test_characterization_abort_cli_requires_explicit_confirmation(capsys) -> None:
+    backend = FakeBackend()
+
+    job_id = "claude-visibility-job:test"
+    reserved_uuid = "11111111-1111-4111-8111-111111111111"
+    assert (
+        _run(
+            [
+                "claude-visibility-abort-characterization",
+                "--job-id",
+                job_id,
+                "--reserved-claude-uuid",
+                reserved_uuid,
+            ],
+            backend,
+        )
+        == 4
+    )
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": "characterization_exact_absence_confirmation_required",
+    }
+    assert not any(
+        call[0] == "abort_claude_visibility_characterization" for call in backend.calls
+    )
+
+    assert (
+        _run(
+            [
+                "claude-visibility-abort-characterization",
+                "--confirm-exact-absence",
+                "--job-id",
+                job_id,
+                "--reserved-claude-uuid",
+                reserved_uuid,
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys) == {
+        "status": "aborted_exact_absence",
+        "job_id": job_id,
+        "reserved_claude_uuid": reserved_uuid,
+        "replacement_created": False,
+        "active_record_retired": True,
+    }
+
+
+@pytest.mark.parametrize("phase", ["launched", "ready"])
+def test_characterization_abort_rejects_unretirable_active_phase_before_store_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "55555555-5555-4555-8555-555555555555"
+    state = _characterization_state(operation_id, phase=phase, source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        backend,
+        "_require_store",
+        lambda: (_ for _ in ()).throw(AssertionError("store must remain untouched")),
+    )
+
+    with pytest.raises(RolloutGateBlocked, match="characterization_abort_not_active"):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("registrar_status", "expected_gate"),
+    [
+        ("absent", None),
+        ("visible", "characterization_native_session_materialized"),
+        ("failed", "characterization_exact_id_conflict"),
+    ],
+)
+def test_characterization_abort_reconciles_only_exact_uuid_and_never_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registrar_status: str,
+    expected_gate: str | None,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "66666666-6666-4666-8666-666666666666"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    calls: list[tuple[object, ...]] = []
+
+    class Claim:
+        claimed = True
+        status = "claimed"
+        job_id = state["job_id"]
+        reserved_claude_uuid = state["reserved_claude_uuid"]
+        lease_kind = "reconciliation"
+        launch_permitted = False
+        registration_reserved = False
+        requires_exact_id_reconciliation = True
+
+    class Store:
+        abort_calls = 0
+
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            calls.append(("register",))
+            return {
+                "status": "registered",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            calls.append(("record", kwargs))
+            assert kwargs["launch_aborted"] is True
+            self.abort_calls += 1
+            if self.abort_calls == 1:
+                return {
+                    "status": "reconciliation_required",
+                    "job_id": state["job_id"],
+                    "reserved_claude_uuid": state["reserved_claude_uuid"],
+                }
+            return {
+                "status": "launch_aborted",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def claim_claude_visibility_reconciliation(self, *args, **kwargs):
+            calls.append(("claim", args, kwargs))
+            assert kwargs == {"expected_job_id": state["job_id"]}
+            return Claim()
+
+    class Registrar:
+        def process(self, claim):
+            calls.append(("process", claim))
+            assert claim is not None
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": registrar_status,
+                    "job_id": state["job_id"],
+                    "reserved_claude_uuid": state["reserved_claude_uuid"],
+                    "error_code": None,
+                },
+            )()
+
+    store = Store()
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter",
+        lambda *_args, **_kwargs: calls.append(("source",)) or object(),
+    )
+
+    def registrar_factory(*args, **kwargs):
+        calls.append(("registrar", args, kwargs))
+        assert kwargs["claude_command"] == ()
+        return Registrar()
+
+    monkeypatch.setattr("session_bridge.cli.ClaudeNativeRegistrar", registrar_factory)
+    monkeypatch.setattr(
+        "session_bridge.cli.claim_claude_visibility_characterization_abort",
+        lambda **kwargs: (
+            calls.append(("abort-intent", kwargs))
+            or {
+                "status": "claimed",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+                "operation": state,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda *_args, **_kwargs: pytest.fail("abort must not resolve a launcher"),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **kwargs: calls.append(("retire", kwargs)) or {"status": "retired"},
+    )
+
+    with pytest.raises(
+        RolloutGateBlocked, match="characterization_abort_identity_mismatch"
+    ):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id="claude-visibility-job:reviewed-other-job",
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+    assert store.abort_calls == 0
+
+    if expected_gate is not None:
+        with pytest.raises(RolloutGateBlocked, match=expected_gate):
+            backend.abort_claude_visibility_characterization(
+                expected_job_id=str(state["job_id"]),
+                expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+            )
+        assert store.abort_calls == 1
+    else:
+        result = backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+        assert result == {
+            "status": "aborted_exact_absence",
+            "job_id": state["job_id"],
+            "reserved_claude_uuid": state["reserved_claude_uuid"],
+            "replacement_created": False,
+            "active_record_retired": True,
+        }
+        assert store.abort_calls == 2
+        assert len([call for call in calls if call[0] == "retire"]) == 1
+    [claim_call] = [call for call in calls if call[0] == "claim"]
+    assert claim_call[2] == {"expected_job_id": state["job_id"]}
+    assert len([call for call in calls if call[0] == "process"]) == 1
+
+
+def test_characterization_abort_registers_crash_before_enqueue_then_proves_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "67676767-6767-4767-8767-676767676767"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    disposable = Path(str(state["source_cwd"]))
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps({"operation_id": operation_id, "nonce": "nonce"}),
+        encoding="utf-8",
+    )
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    claims: list[object] = []
+
+    class Registrar:
+        def process(self, claim):
+            assert not (root / ".claude-visibility-operation.json").exists()
+            assert (root / ".abort-claims" / f"{operation_id}.json").exists()
+            claims.append(claim)
+            store.record_claude_visibility_exact_id_absent(
+                claim.job_id,
+                claim.lease_digest,
+                claim.reserved_claude_uuid,
+                claim.attempt_ordinal,
+                "b" * 64,
+            )
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": "absent",
+                    "job_id": claim.job_id,
+                    "reserved_claude_uuid": claim.reserved_claude_uuid,
+                    "error_code": None,
+                },
+            )()
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: Registrar(),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **_kwargs: {"status": "retired"},
+    )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result == {
+        "status": "aborted_exact_absence",
+        "job_id": state["job_id"],
+        "reserved_claude_uuid": state["reserved_claude_uuid"],
+        "replacement_created": False,
+        "active_record_retired": True,
+    }
+    assert len(claims) == 1
+    assert claims[0].lease_kind == "reconciliation"
+    assert claims[0].attempt_ordinal == 0
+    assert (
+        database._conn.execute(
+            "SELECT COUNT(*) FROM session_claude_registration_usage"
+        ).fetchone()[0]
+        == 0
+    )
+    assert [
+        row[0]
+        for row in database._conn.execute(
+            """SELECT event_kind
+               FROM session_claude_visibility_characterization_events
+               WHERE job_id = ? ORDER BY event_kind""",
+            (state["job_id"],),
+        ).fetchall()
+    ] == ["launch_aborted", "registered"]
+    database.close()
+
+
+def test_characterization_abort_claim_survives_crash_before_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import session_bridge.cli as cli_module
+
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    projects = tmp_path / "projects"
+    root.mkdir(parents=True)
+    projects.mkdir()
+    operation_id = "68686868-6868-4868-8868-686868686868"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    disposable = Path(str(state["source_cwd"]))
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps({"operation_id": operation_id, "nonce": "nonce"}),
+        encoding="utf-8",
+    )
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    original_record = cli_module._record_claude_characterization_payload
+    crash_once = True
+
+    def crash_before_registration(**kwargs):
+        nonlocal crash_once
+        if crash_once and kwargs.get("ensure_registered") is True:
+            crash_once = False
+            raise RuntimeError("simulated crash before registration")
+        return original_record(**kwargs)
+
+    class Registrar:
+        def process(self, claim):
+            store.record_claude_visibility_exact_id_absent(
+                claim.job_id,
+                claim.lease_digest,
+                claim.reserved_claude_uuid,
+                claim.attempt_ordinal,
+                "b" * 64,
+            )
+            return type(
+                "Outcome",
+                (),
+                {
+                    "status": "absent",
+                    "job_id": claim.job_id,
+                    "reserved_claude_uuid": claim.reserved_claude_uuid,
+                    "error_code": None,
+                },
+            )()
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli._record_claude_characterization_payload",
+        crash_before_registration,
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: Registrar(),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash before registration"):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+
+    assert not (root / ".claude-visibility-operation.json").exists()
+    assert (root / ".abort-claims" / f"{operation_id}.json").exists()
+    assert (
+        database._conn.execute(
+            "SELECT COUNT(*) FROM session_claude_visibility_jobs"
+        ).fetchone()[0]
+        == 0
+    )
+    with pytest.raises(RuntimeError, match="characterization_abort_in_progress"):
+        characterize_claude_visibility(
+            source_root=root,
+            projects_root=projects,
+            reserve=lambda _projection: pytest.fail("abort claim must block reserve"),
+            registrar=object(),
+            restarted_source=lambda: pytest.fail(
+                "abort claim must block source discovery"
+            ),
+            marker_secret=b"k" * 32,
+        )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result["status"] == "aborted_exact_absence"
+    assert result["replacement_created"] is False
+    assert (root / ".abort-completed" / f"{operation_id}.json").exists()
+    database.close()
+
+
+def test_characterization_abort_replays_exact_absence_after_crash_before_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    root.mkdir(parents=True)
+    operation_id = "69696969-6969-4969-8969-696969696969"
+    state = _characterization_state(operation_id, phase="launching", source_root=root)
+    disposable = Path(str(state["source_cwd"]))
+    disposable.mkdir()
+    (disposable / ".session-bridge-characterization.json").write_text(
+        json.dumps({"operation_id": operation_id, "nonce": "nonce"}),
+        encoding="utf-8",
+    )
+    _write_characterization_record(
+        root / ".claude-visibility-operation.json", state, b"k" * 32
+    )
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    process_calls = 0
+
+    class Registrar:
+        def process(self, claim):
+            nonlocal process_calls
+            process_calls += 1
+            store.record_claude_visibility_exact_id_absent(
+                claim.job_id,
+                claim.lease_digest,
+                claim.reserved_claude_uuid,
+                claim.attempt_ordinal,
+                "b" * 64,
+            )
+            raise RuntimeError("simulated crash after exact absence")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: store)
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeSourceAdapter", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.ClaudeNativeRegistrar",
+        lambda *_args, **_kwargs: Registrar(),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash after exact absence"):
+        backend.abort_claude_visibility_characterization(
+            expected_job_id=str(state["job_id"]),
+            expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+        )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result["status"] == "aborted_exact_absence"
+    assert process_calls == 1
+    assert (
+        database._conn.execute(
+            """SELECT COUNT(*)
+           FROM session_claude_visibility_characterization_events
+           WHERE job_id = ? AND event_kind = 'launch_aborted'""",
+            (state["job_id"],),
+        ).fetchone()[0]
+        == 1
+    )
+    database.close()
+
+
+def test_characterization_abort_replays_claimed_filesystem_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = (
+        tmp_path / "session-bridge" / "characterization" / "claude-visibility-sources"
+    )
+    claims = root / ".abort-claims"
+    claims.mkdir(parents=True)
+    operation_id = "88888888-8888-4888-8888-888888888888"
+    state = _characterization_state(
+        operation_id, phase="abort_disposable_removing", source_root=root
+    )
+    _write_characterization_record(claims / f"{operation_id}.json", state, b"k" * 32)
+    events: list[tuple[str, object]] = []
+
+    class Store:
+        def enqueue_claude_visibility_characterization(self, *_args, **_kwargs):
+            events.append(("register", None))
+            return {
+                "status": "registered",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            events.append(("record", kwargs))
+            return {
+                "status": "already_aborted",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+            }
+
+        def claim_claude_visibility_reconciliation(self, *_args, **_kwargs):
+            raise AssertionError("replay must not acquire another lease")
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"k" * 32)
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr(
+        "session_bridge.cli.claim_claude_visibility_characterization_abort",
+        lambda **kwargs: (
+            events.append(("abort-intent", kwargs))
+            or {
+                "status": "claimed",
+                "job_id": state["job_id"],
+                "reserved_claude_uuid": state["reserved_claude_uuid"],
+                "operation": state,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.retire_aborted_claude_visibility_characterization",
+        lambda **kwargs: events.append(("retire", kwargs)) or {"status": "retired"},
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda *_args, **_kwargs: pytest.fail("replay must not resolve a launcher"),
+    )
+
+    result = backend.abort_claude_visibility_characterization(
+        expected_job_id=str(state["job_id"]),
+        expected_reserved_claude_uuid=str(state["reserved_claude_uuid"]),
+    )
+
+    assert result == {
+        "status": "aborted_exact_absence",
+        "job_id": state["job_id"],
+        "reserved_claude_uuid": state["reserved_claude_uuid"],
+        "replacement_created": False,
+        "active_record_retired": True,
+        "replayed": True,
+    }
+    assert [event[0] for event in events] == [
+        "abort-intent",
+        "register",
+        "record",
+        "retire",
+    ]
+    assert events[3][1]["expected_operation_id"] == operation_id  # type: ignore[index]
+
+
+def test_claude_visibility_status_reports_durable_open_work_while_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    "claude_pending": 0,
+                    "claude_leased": 0,
+                    "claude_retry": 1,
+                    "claude_visible": 0,
+                    "claude_failed": 0,
+                },
+                "retry_codes": {"creation_ambiguous": 1},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": "2026-07-18",
+                    "attempts": 1,
+                    "reserved_cost_usd": "0.02",
+                },
+            }
+
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["enabled"] is False
+    assert result["counts"]["claude_retry"] == 1
+    assert result["retry_codes"] == {"creation_ambiguous": 1}
+    assert result["usage"]["attempts"] == 1
+    assert result["open_reasons"] == ["open_visibility_work"]
+
+
+@pytest.mark.parametrize(
+    ("counts", "active_operation", "allowed"),
+    [
+        ({"claude_retry": 1}, True, False),
+        ({"claude_retry": 1}, False, False),
+        ({"claude_retry": 2}, True, False),
+        ({"claude_leased": 1}, True, False),
+        ({"claude_failed": 1}, True, False),
+        ({"claude_pending": 1}, True, False),
+    ],
+)
+def test_characterization_recovery_allows_only_one_owned_open_job(
+    counts: dict[str, int], active_operation: bool, allowed: bool
+) -> None:
+    complete = {
+        state: counts.get(state, 0)
+        for state in (
+            "claude_pending",
+            "claude_leased",
+            "claude_retry",
+            "claude_failed",
+        )
+    }
+
+    assert (
+        _claude_characterization_open_work_allowed(
+            {"counts": complete}, active_operation=active_operation
+        )
+        is allowed
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["claude_pending", "claude_leased", "claude_retry"],
+)
+def test_characterization_recovery_allows_only_exact_authenticated_open_job(
+    state: str,
+) -> None:
+    raw = {
+        "counts": {
+            candidate: int(candidate == state)
+            for candidate in (
+                "claude_pending",
+                "claude_leased",
+                "claude_retry",
+                "claude_failed",
+            )
+        },
+        "characterizations": [
+            {"job_id": "claude-visibility-job:exact", "state": state}
+        ],
+    }
+
+    assert _claude_characterization_open_work_allowed(
+        raw,
+        active_operation=True,
+        active_job_id="claude-visibility-job:exact",
+    )
+    assert not _claude_characterization_open_work_allowed(
+        raw,
+        active_operation=True,
+        active_job_id="claude-visibility-job:other",
+    )
+
+
+@pytest.mark.parametrize(
+    ("failed_codes", "allowed"),
+    [({"bridge_conflict": 1}, True), ({"future_failure": 1}, False)],
+)
+def test_characterization_recovery_allows_only_exact_auth_recoverable_failed_job(
+    failed_codes: dict[str, int], allowed: bool
+) -> None:
+    raw = {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_failed": 1,
+        },
+        "characterizations": [
+            {
+                "job_id": "claude-visibility-job:exact",
+                "state": "claude_failed",
+            }
+        ],
+        "failed_codes": failed_codes,
+        "retry_codes": {},
+    }
+
+    assert (
+        _claude_characterization_open_work_allowed(
+            raw,
+            active_operation=True,
+            active_job_id="claude-visibility-job:exact",
+        )
+        is allowed
+    )
+
+
+def test_claude_visibility_status_exposes_durable_cycle_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracked = {
+        "tracked": True,
+        "value": {
+            "at": 100.0,
+            "sequence": 1,
+            "status": "no_due_job",
+            "error_code": None,
+            "empty_verified": True,
+        },
+    }
+
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "fatal": [],
+                "usage": {
+                    "local_day": "2026-07-17",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+                "last_cycle": tracked,
+                "last_empty_cycle": {"tracked": True, "value": 100.0},
+                "last_registrar_result": {"tracked": False, "value": None},
+            }
+
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["last_cycle"] == tracked
+    assert result["last_empty_cycle"] == {"tracked": True, "value": 100.0}
+
+
+def test_claude_visibility_status_exposes_sanitized_unknown_state_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReadOnlyStore:
+        def claude_visibility_status(self, _now):
+            return {
+                "counts": {
+                    state: 0
+                    for state in (
+                        "claude_pending",
+                        "claude_leased",
+                        "claude_retry",
+                        "claude_visible",
+                        "claude_failed",
+                    )
+                },
+                "retry_codes": {},
+                "failed_codes": {},
+                "usage": {
+                    "local_day": "2026-07-17",
+                    "attempts": 0,
+                    "reserved_cost_usd": "0",
+                },
+                "fatal": [
+                    {
+                        "code": "unknown_job_state",
+                        "state": "future_state",
+                        "error_code": "future-code",
+                        "count": 1,
+                    }
+                ],
+            }
+
+    config = BridgeConfig()
+    backend = ProductionBackend(
+        replace(
+            config, claude_visibility=replace(config.claude_visibility, enabled=True)
+        )
+    )
+    monkeypatch.setattr(backend, "_require_store", lambda: ReadOnlyStore())
+
+    result = backend.claude_visibility_status()
+
+    assert result["fatal_reasons"] == ["unknown_job_state"]
+    assert result["fatal"] == [
+        {
+            "code": "unknown_job_state",
+            "state": "future_state",
+            "error_code": "future-code",
+            "count": 1,
+        }
+    ]
+
+
+def test_claude_visibility_json_is_one_sanitized_stdout_document(capsys) -> None:
+    backend = FakeBackend()
+    backend.claude_visibility_payload["secret_detail"] = "must-not-leak"
+    backend.claude_visibility_payload["tuple_value"] = ("stable", 1)
+
+    assert _run(["claude-visibility-status", "--json"], backend) == 0
+
+    stdout = capsys.readouterr().out
+    assert stdout.count("\n") == 1
+    payload = json.loads(stdout)
+    assert "secret_detail" not in payload
+    assert payload["tuple_value"] == ["stable", 1]
+
+
+def test_sidebar_continuous_full_managed_rejects_without_runtime_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli.config import save_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    save_config(
+        {"session_bridge": {"sidebar": {"continuous": False}}},
+        strip_defaults=False,
+    )
+    original = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+    backend = ProductionBackend(BridgeConfig())
+
+    exit_code = main(
+        ["sidebar-continuous", "--enable"],
+        config_loader=lambda: backend.config,
+        backend_factory=lambda _config: backend,
+    )
+
+    rendered = capsys.readouterr().out
+    assert exit_code == 2
+    assert json.loads(rendered) == {"error": "configuration_error"}
+    assert "sensitive" not in rendered
+    assert backend.config.sidebar.continuous is False
+    assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == original
+
+
+def test_sidebar_continuous_managed_leaf_reports_effective_value_without_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import managed_scope
+
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    (managed / "config.yaml").write_text(
+        "session_bridge:\n  sidebar:\n    continuous: false\n",
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    backend = ProductionBackend(BridgeConfig())
+
+    with pytest.raises(ConfigurationFailure, match="sidebar_continuous_not_persisted"):
+        backend.set_sidebar_continuous(enabled=True)
+
+    assert backend.config.sidebar.continuous is False
+
+
+def test_sidebar_continuous_mutation_exception_does_not_change_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(
+        "hermes_cli.config.mutate_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("sensitive persistence failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="sensitive persistence failure"):
+        backend.set_sidebar_continuous(enabled=True)
+
+    assert backend.config.sidebar.continuous is False
+
+
+def test_mutate_config_serializes_competing_updates_without_lost_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.config as config_module
+
+    durable: dict[str, Any] = {"existing": {"keep": True}}
+    first_inside = Event()
+    release_first = Event()
+    second_inside = Event()
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: json.loads(json.dumps(durable)),
+    )
+
+    def save_config(value, **_kwargs):
+        durable.clear()
+        durable.update(json.loads(json.dumps(value)))
+        return True
+
+    monkeypatch.setattr(config_module, "save_config", save_config)
+
+    def first_mutation(value: dict[str, Any]) -> None:
+        value["sidebar_writer"] = True
+        first_inside.set()
+        assert release_first.wait(timeout=5)
+
+    def second_mutation(value: dict[str, Any]) -> None:
+        second_inside.set()
+        value["concurrent_writer"] = True
+
+    first = Thread(target=lambda: config_module.mutate_config(first_mutation))
+    second = Thread(target=lambda: config_module.mutate_config(second_mutation))
+    first.start()
+    assert first_inside.wait(timeout=5)
+    second.start()
+    assert not second_inside.wait(timeout=0.1)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert durable == {
+        "existing": {"keep": True},
+        "sidebar_writer": True,
+        "concurrent_writer": True,
+    }
+
+
+def test_production_serve_blocks_automatic_mode_without_passing_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(
+        BridgeConfig(mirrors=MirrorsConfig(automatic_creation=True))
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_characterization_gate",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            CharacterizationGateError("failed", "failed")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_provider_runtime",
+        lambda **_kwargs: pytest.fail("provider runtime must not start"),
+    )
+
+    with pytest.raises(RolloutGateBlocked) as raised:
+        backend.serve()
+
+    assert raised.value.gate == "characterization_failed"
+
+
+def test_production_serve_applies_sidebar_create_cutover_before_public_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: events.append("cutover"),
+        raising=False,
+    )
+
+    def fail_provider_runtime(**_kwargs: Any) -> None:
+        assert events == ["cutover"]
+        events.append("provider_runtime")
+        raise RuntimeError("stop before serving")
+
+    monkeypatch.setattr(backend, "_provider_runtime", fail_provider_runtime)
+
+    with pytest.raises(ProviderDegraded, match="service_start_failed"):
+        backend.serve()
+
+    assert events == ["cutover", "provider_runtime"]
+
+
+def test_production_serve_preserves_sidebar_cutover_configuration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(
+        backend,
+        "_apply_sidebar_create_reservation_cutover",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ConfigurationFailure("sidebar_create_reservation_cutover_invalid")
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_provider_runtime",
+        lambda **_kwargs: pytest.fail("provider runtime must not start"),
+    )
+
+    with pytest.raises(
+        ConfigurationFailure,
+        match="^sidebar_create_reservation_cutover_invalid$",
+    ):
+        backend.serve()
+
+
+def test_continuous_visibility_worker_keeps_start_to_start_interval() -> None:
+    calls: list[str] = []
+    waits: list[float] = []
+    moments = iter((10.0, 46.5))
+
+    class StopAfterOneCycle:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            waits.append(timeout)
+            return True
+
+    _run_continuous_visibility_worker(
+        run_once=lambda: calls.append("run"),
+        close=lambda: calls.append("close"),
+        stop=StopAfterOneCycle(),
+        interval_seconds=60.0,
+        monotonic=lambda: next(moments),
+    )
+
+    assert calls == ["run", "close"]
+    assert waits == [pytest.approx(23.5)]
+
+
+def test_scan_defaults_to_catalog_only_all_history_newest_first(capsys):
+    backend = FakeBackend()
+
+    assert _run(["scan"], backend, automatic_creation=True) == 0
+
+    assert backend.calls[:1] == [("scan", "all", True, True)]
+    payload = _json_output(capsys)
+    assert payload["indexed"] == 4
+    assert "automatic_creation" not in json.dumps(payload)
+
+
+def test_scan_provider_failure_returns_degraded_exit(capsys):
+    backend = FakeBackend(
+        scan_payload={
+            "provider": "codex",
+            "discovered": 3,
+            "indexed": 2,
+            "rebuilt": 0,
+            "failed": 1,
+        }
+    )
+
+    assert _run(["scan", "--provider", "codex"], backend) == 3
+    assert _json_output(capsys)["failed"] == 1
+
+
+def test_claude_only_runtime_never_spawns_codex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: pytest.fail("Codex must not start for Claude-only scan"),
+    )
+    try:
+        coordinator = backend._provider_runtime(
+            targets=False,
+            catalog_only=True,
+            providers=(Provider.CLAUDE,),
+        )
+        assert set(coordinator._adapters) == {Provider.CLAUDE}
+    finally:
+        backend.close()
+
+
+def test_production_runtime_wires_exact_cwd_permission_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    captured: dict[str, object] = {}
+    sentinel = lambda cwd: cwd == str(tmp_path)
+
+    def coordinator_factory(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.SessionBridgeCoordinator",
+        coordinator_factory,
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._production_codex_permission_preflight",
+        sentinel,
+        raising=False,
+    )
+    try:
+        backend._provider_runtime(
+            targets=False,
+            catalog_only=True,
+            providers=(Provider.CLAUDE,),
+        )
+    finally:
+        backend.close()
+
+    assert captured["permission_preflight"] is sentinel
+
+
+def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_key = b"m" * 32
+    now = time.time()
+    thread_id = "task.native-123"
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: "production-composition-lease",
+    )
+    source = SessionProjection(
+        provider=Provider.CLAUDE,
+        native_id="production-composition",
+        title="Production composition",
+        cwd=str(tmp_path),
+        started_at=now - 20,
+        last_active=now - 10,
+        messages=(
+            ProjectedMessage(
+                native_event_id="production-composition-request",
+                ordinal=0,
+                role="user",
+                content="Prove the production sidebar verifier path",
+                timestamp=now - 10,
+            ),
+        ),
+        native_cursor="cursor-production-composition",
+        native_hash="hash-production-composition",
+    )
+    store.upsert_projection(source)
+    source_id = "claude:production-composition"
+    bridge_id = sidebar_bridge_id(source_id)
+    store.enqueue_sidebar_job(
+        SidebarCandidate(
+            source_session_id=source_id,
+            provider=Provider.CLAUDE,
+            bridge_id=bridge_id,
+            title="[Claude] Production composition",
+            cwd=str(tmp_path),
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=now - 10,
+        )
+    )
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id=source_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_key,
+    )
+
+    class ProtocolCodexClient:
+        def __init__(self) -> None:
+            self.published = False
+            self.calls: list[str] = []
+            self.closed = False
+
+        def request(
+            self, method: str, params: dict[str, Any], timeout: float
+        ) -> dict[str, Any]:
+            self.calls.append(method)
+            if method == "thread/list":
+                if self.published and params.get("archived") is False:
+                    return {
+                        "data": [
+                            {
+                                "id": thread_id,
+                                "title": "Native task",
+                                "cwd": str(tmp_path),
+                                "createdAt": now,
+                                "updatedAt": now,
+                                "revision": "revision-1",
+                            }
+                        ]
+                    }
+                return {"data": []}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": thread_id,
+                        "turns": [
+                            {
+                                "id": "registration-turn",
+                                "status": "completed",
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "registration-item",
+                                        "content": [{"type": "text", "text": marker}],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"unexpected production request: {method}")
+
+        def take_notification(self, timeout: float = 0.0) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = ProtocolCodexClient()
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            service=replace(ServiceConfig(), reconcile_seconds=0.0),
+            sidebar=replace(SidebarConfig(), enabled=True, continuous=True),
+        )
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: client,
+    )
+    try:
+        coordinator = backend._provider_runtime(
+            targets=True,
+            catalog_only=False,
+            providers=(Provider.CODEX,),
+        )
+        assert isinstance(coordinator._sidebar_verifier, SidebarThreadVerifier)
+        assert isinstance(coordinator._sidebar_executor, SidebarExecutor)
+        assert isinstance(
+            coordinator._sidebar_executor._native,
+            CodexAppServerSidebarDelivery,
+        )
+        assert coordinator._sidebar_executor._native._client is client
+
+        claim = asyncio.run(
+            coordinator.claim_sidebar_jobs_for_delivery(now=now, limit=1)
+        )[0]
+        assert store.sidebar_delivery_status(now=now)["last_heartbeat_at"] == now
+        client.published = True
+        committed = asyncio.run(
+            coordinator.commit_sidebar_job(
+                lease_token=claim.lease_token,
+                codex_thread_id=thread_id,
+            )
+        )
+    finally:
+        backend.close()
+
+    assert committed["state"] == "sidebar_visible"
+    assert "thread/read" in client.calls
+    assert client.closed is True
+
+
+def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_key = b"m" * 32
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(
+        replace(BridgeConfig(), sidebar=replace(SidebarConfig(), enabled=True))
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    executor_calls: list[str] = []
+    construction_order: list[str] = []
+    captured: dict[str, Any] = {}
+    real_cutover = store.apply_sidebar_create_reservation_cutover
+
+    def record_cutover(**kwargs: Any) -> dict[str, Any]:
+        construction_order.append("cutover")
+        return real_cutover(**kwargs)
+
+    monkeypatch.setattr(
+        store, "apply_sidebar_create_reservation_cutover", record_cutover
+    )
+
+    class ProtocolCodexClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = ProtocolCodexClient()
+
+    class OneCycleExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            executor_calls.append("run_once")
+            return SidebarExecutionResult(status="idle")
+
+    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
+        construction_order.append("executor")
+        captured.update(kwargs)
+        return OneCycleExecutor()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: client,
+    )
+    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
+
+    try:
+        result = backend.sidebar_run_once()
+    finally:
+        backend.close()
+
+    assert result == {
+        "status": "idle",
+        "job_id": None,
+        "thread_id": None,
+        "error_code": None,
+    }
+    assert executor_calls == ["run_once"]
+    assert construction_order == ["cutover", "executor"]
+    assert captured["store"] is store
+    assert isinstance(captured["verifier"], SidebarThreadVerifier)
+    assert isinstance(captured["native"], CodexAppServerSidebarDelivery)
+    assert captured["marker_secret"] == marker_key
+    assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("sidebar", "expected_gate"),
+    [
+        (SidebarConfig(enabled=False, continuous=False), "sidebar_disabled"),
+        (
+            SidebarConfig(enabled=True, continuous=True),
+            "sidebar_continuous_worker_active",
+        ),
+    ],
+)
+def test_production_sidebar_run_once_refuses_before_executor_construction(
+    sidebar: SidebarConfig,
+    expected_gate: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(replace(BridgeConfig(), sidebar=sidebar))
+    executor_constructions: list[str] = []
+
+    def unexpected_executor_construction() -> None:
+        executor_constructions.append("constructed")
+        raise AssertionError("sidebar executor must not be constructed")
+
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_executor",
+        unexpected_executor_construction,
+    )
+
+    with pytest.raises(RolloutGateBlocked) as exc_info:
+        backend.sidebar_run_once()
+
+    assert exc_info.value.gate == expected_gate
+    assert executor_constructions == []
+
+
+def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_key = b"m" * 32
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            sidebar=replace(SidebarConfig(), enabled=True, continuous=False),
+        )
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+
+    class ProtocolCodexClient:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    provider_client = ProtocolCodexClient("provider")
+    sidebar_client = ProtocolCodexClient("sidebar")
+    monkeypatch.setattr(backend, "_codex_client", provider_client)
+    captured: dict[str, Any] = {}
+
+    class OneCycleExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            return SidebarExecutionResult(status="idle")
+
+    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
+        captured.update(kwargs)
+        return OneCycleExecutor()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: sidebar_client,
+    )
+    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
+
+    try:
+        assert backend.sidebar_run_once()["status"] == "idle"
+        assert captured["native"]._client is sidebar_client
+        assert captured["verifier"]._source_adapter._client is sidebar_client
+        assert backend._codex_client is provider_client
+        assert backend._sidebar_codex_client is sidebar_client
+    finally:
+        backend.close()
+
+    assert provider_client.close_count == 1
+    assert sidebar_client.close_count == 1
+
+
+def test_production_backend_close_closes_both_codex_transports_once_and_resets_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+
+    class ProtocolCodexClient:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    provider_client = ProtocolCodexClient()
+    sidebar_client = ProtocolCodexClient()
+    monkeypatch.setattr(backend, "_codex_client", provider_client)
+    monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(backend, "_sidebar_executor", object())
+
+    backend.close()
+    backend.close()
+
+    assert provider_client.close_count == 1
+    assert sidebar_client.close_count == 1
+    assert backend._codex_client is None
+    assert backend._sidebar_codex_client is None
+    assert backend._sidebar_executor is None
+
+
+def test_production_backend_close_attempts_all_cleanup_when_first_client_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+
+    class CloseProbe:
+        def __init__(self, *, failure: Exception | None = None) -> None:
+            self.failure = failure
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.failure is not None:
+                raise self.failure
+
+    provider_client = CloseProbe(failure=RuntimeError("provider close failed"))
+    sidebar_client = CloseProbe()
+    database = CloseProbe()
+    monkeypatch.setattr(backend, "_codex_client", provider_client)
+    monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(backend, "_db", database)
+
+    with pytest.raises(RuntimeError, match="provider close failed"):
+        backend.close()
+    backend.close()
+
+    assert provider_client.close_count == 1
+    assert sidebar_client.close_count == 1
+    assert database.close_count == 1
+    assert backend._codex_client is None
+    assert backend._sidebar_codex_client is None
+    assert backend._db is None
+
+
+def test_production_all_provider_scan_isolates_provider_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    runtime_calls: list[Provider] = []
+    releases: list[None] = []
+
+    class ClaudeCoordinator:
+        async def scan_all_history(self, provider: Provider) -> ScanSummary:
+            assert provider is Provider.CLAUDE
+            return ScanSummary(
+                provider=provider,
+                discovered=2,
+                indexed=2,
+                rebuilt=1,
+                failed=0,
+                duration_ms=4.0,
+            )
+
+    def provider_runtime(**kwargs: Any) -> ClaudeCoordinator:
+        selected = kwargs["providers"][0]
+        runtime_calls.append(selected)
+        if selected is Provider.CODEX:
+            raise RuntimeError("synthetic Codex startup failure")
+        return ClaudeCoordinator()
+
+    monkeypatch.setattr(backend, "_provider_runtime", provider_runtime)
+    monkeypatch.setattr(
+        backend,
+        "_release_provider_runtime",
+        lambda: releases.append(None),
+    )
+
+    result = backend.scan(provider="all", all_history=True, newest_first=True)
+
+    assert result == {
+        "provider": None,
+        "discovered": 2,
+        "indexed": 2,
+        "rebuilt": 1,
+        "failed": 1,
+        "duration_ms": 4.0,
+    }
+    assert runtime_calls == [Provider.CLAUDE, Provider.CODEX]
+    assert len(releases) == 2
+
+
+def test_status_json_is_sanitized_and_degradation_sets_exit_three(capsys):
+    backend = FakeBackend(
+        status_payload={
+            "healthy": False,
+            "total_sessions": 3,
+            "token": "do-not-print",
+            "context_pack": "do-not-print",
+            "nested": {"native_path": "C:/private/session.jsonl", "ok": 1},
+        }
+    )
+
+    assert _run(["status", "--json"], backend) == 3
+
+    rendered = capsys.readouterr().out
+    assert "do-not-print" not in rendered
+    assert "private/session" not in rendered
+    assert json.loads(rendered)["nested"] == {"ok": 1}
+
+
+def test_characterize_runs_both_providers(capsys):
+    backend = FakeBackend()
+
+    assert _run(["characterize", "--provider", "all"], backend) == 0
+
+    assert backend.calls[:1] == [("characterize", "all")]
+    assert _json_output(capsys)["passed"] is True
+
+
+def test_backfill_dry_run_is_newest_first_and_never_applies(capsys):
+    backend = FakeBackend(
+        candidates=[
+            {
+                "canonical_id": "claude:older",
+                "provider": "claude",
+                "target_provider": "codex",
+                "last_active": 10.0,
+                "eligible": True,
+                "reason": "eligible",
+                "token": "hidden",
+            },
+            {
+                "canonical_id": "codex:newer",
+                "provider": "codex",
+                "target_provider": "claude",
+                "last_active": 20.0,
+                "eligible": True,
+                "reason": "eligible",
+            },
+        ]
+    )
+
+    assert _run(["backfill", "--days", "30", "--dry-run"], backend) == 0
+
+    payload = _json_output(capsys)
+    assert [item["canonical_id"] for item in payload["candidates"]] == [
+        "codex:newer",
+        "claude:older",
+    ]
+    assert "hidden" not in json.dumps(payload)
+    assert not any(call[0] == "apply_backfill" for call in backend.calls)
+
+
+def test_production_backfill_plan_excludes_an_existing_queued_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+
+    def projection(native_id: str, last_active: float) -> SessionProjection:
+        return SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=native_id,
+            title=native_id,
+            cwd=str(tmp_path),
+            started_at=last_active - 20.0,
+            last_active=last_active,
+            messages=(
+                ProjectedMessage(
+                    native_event_id=f"event-{native_id}",
+                    ordinal=0,
+                    role="user",
+                    content="meaningful work",
+                    timestamp=last_active - 10.0,
+                ),
+            ),
+            native_cursor=f"cursor-{native_id}",
+            native_hash=f"hash-{native_id}",
+        )
+
+    store.upsert_projection(projection("queued", 190.0))
+    store.upsert_projection(projection("eligible", 180.0))
+    enqueue_mirror_job(
+        store,
+        "claude:queued",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+        require_unmapped=True,
+    )
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 200.0)
+    try:
+        planned = backend.backfill_candidates(days=30)
+    finally:
+        backend.close()
+
+    assert [candidate["canonical_id"] for candidate in planned] == ["claude:eligible"]
+
+
+def test_production_backfill_plan_drains_past_rejected_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+
+    def projection(native_id: str, last_active: float) -> SessionProjection:
+        return SessionProjection(
+            provider=Provider.CLAUDE,
+            native_id=native_id,
+            title=native_id,
+            cwd=str(tmp_path),
+            started_at=last_active - 20.0,
+            last_active=last_active,
+            messages=(
+                ProjectedMessage(
+                    native_event_id=f"event-{native_id}",
+                    ordinal=0,
+                    role="user",
+                    content="meaningful work",
+                    timestamp=last_active - 10.0,
+                ),
+            ),
+            native_cursor=f"cursor-{native_id}",
+            native_hash=f"hash-{native_id}",
+        )
+
+    store.upsert_projection(projection("newer", 190.0))
+    store.upsert_projection(projection("older", 180.0))
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 200.0)
+    monkeypatch.setattr("session_bridge.cli._BACKFILL_PAGE_SIZE", 1)
+    original_preview = backend._catalog.mirror_preview
+    monkeypatch.setattr(
+        backend._catalog,
+        "mirror_preview",
+        lambda session_id, target: (
+            {"would_enqueue": False}
+            if session_id == "claude:newer"
+            else original_preview(session_id, target)
+        ),
+    )
+    try:
+        planned = backend.backfill_candidates(days=30)
+    finally:
+        backend.close()
+
+    assert [candidate["canonical_id"] for candidate in planned] == ["claude:older"]
+
+
+def test_production_backfill_plan_fails_visibly_at_planning_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    for native_id, last_active in (("newer", 190.0), ("older", 180.0)):
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=native_id,
+                title=native_id,
+                cwd=str(tmp_path),
+                started_at=last_active - 20.0,
+                last_active=last_active,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"event-{native_id}",
+                        ordinal=0,
+                        role="user",
+                        content="meaningful work",
+                        timestamp=last_active - 10.0,
+                    ),
+                ),
+                native_cursor=f"cursor-{native_id}",
+                native_hash=f"hash-{native_id}",
+            )
+        )
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 200.0)
+    monkeypatch.setattr("session_bridge.cli._BACKFILL_PAGE_SIZE", 1)
+    monkeypatch.setattr("session_bridge.cli._MAX_PLANNED_SESSIONS", 1)
+    try:
+        with pytest.raises(ProviderDegraded, match="backfill_plan_truncated"):
+            backend.backfill_candidates(days=30)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("gate", ["missing", "failed", "invalid", "version_drift"])
+def test_backfill_apply_refuses_absent_or_failed_characterization(gate, capsys):
+    backend = FakeBackend(characterization=gate)
+
+    assert (
+        _run(
+            [
+                "backfill",
+                "--days",
+                "30",
+                "--apply",
+                "--confirm-one-shot",
+            ],
+            backend,
+        )
+        == 4
+    )
+
+    assert _json_output(capsys) == {
+        "error": "rollout_gate_blocked",
+        "gate": f"characterization_{gate}",
+    }
+    assert not any(call[0] == "apply_backfill" for call in backend.calls)
+
+
+def test_backfill_apply_requires_auto_mode_or_explicit_one_shot(capsys):
+    backend = FakeBackend()
+
+    assert _run(["backfill", "--days", "30", "--apply"], backend) == 4
+
+    assert _json_output(capsys)["gate"] == "one_shot_confirmation_required"
+
+
+def test_mutation_refuses_when_catalog_is_disabled(capsys):
+    backend = FakeBackend()
+    config = BridgeConfig(
+        catalog=CatalogConfig(enabled=False),
+        mirrors=MirrorsConfig(automatic_creation=True),
+    )
+
+    result = main(
+        ["backfill", "--days", "30", "--apply"],
+        config_loader=lambda: config,
+        backend_factory=lambda _config: backend,
+    )
+
+    assert result == 4
+    assert _json_output(capsys)["gate"] == "catalog_disabled"
+    assert not any(call[0] == "apply_backfill" for call in backend.calls)
+
+
+def test_backfill_apply_caps_and_preserves_newest_first(capsys):
+    backend = FakeBackend(
+        candidates=[
+            {
+                "canonical_id": f"claude:{index}",
+                "provider": "claude",
+                "target_provider": "codex",
+                "last_active": float(index),
+                "eligible": True,
+                "reason": "eligible",
+            }
+            for index in range(12)
+        ]
+    )
+
+    assert (
+        _run(
+            [
+                "backfill",
+                "--days",
+                "30",
+                "--apply",
+                "--confirm-one-shot",
+                "--max-create",
+                "10",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    apply = next(call for call in backend.calls if call[0] == "apply_backfill")
+    # The default durable global creation rate is six per minute.
+    assert apply[1] == tuple(f"claude:{index}" for index in range(11, 5, -1))
+    assert _json_output(capsys)["authorized"] == 6
+
+
+def test_backfill_partial_gate_preserves_prior_outcome_in_output(capsys):
+    backend = FakeBackend(
+        candidates=[
+            {
+                "canonical_id": "claude:first",
+                "provider": "claude",
+                "target_provider": "codex",
+                "last_active": 20.0,
+                "eligible": True,
+                "reason": "eligible",
+            }
+        ],
+        backfill_apply_payload={
+            "authorized": 1,
+            "claimed": 1,
+            "succeeded": 1,
+            "retried": 0,
+            "manual_failure": 0,
+            "degraded": False,
+            "halted": True,
+            "partial": True,
+            "gate": "backfill_candidate_invalid",
+        },
+    )
+
+    result = _run(["backfill", "--apply", "--confirm-one-shot"], backend)
+
+    assert result == 4
+    payload = _json_output(capsys)
+    assert payload["succeeded"] == 1
+    assert payload["gate"] == "backfill_candidate_invalid"
+
+
+def test_mirror_dry_run_and_apply_use_same_preview_gate(capsys):
+    backend = FakeBackend()
+
+    assert (
+        _run(
+            ["mirror", "claude:source", "--target", "codex", "--dry-run"],
+            backend,
+        )
+        == 0
+    )
+    assert _json_output(capsys)["would_enqueue"] is True
+
+    backend.calls.clear()
+    assert (
+        _run(
+            [
+                "mirror",
+                "claude:source",
+                "--target",
+                "codex",
+                "--apply",
+                "--confirm-one-shot",
+            ],
+            backend,
+        )
+        == 0
+    )
+    assert ("apply_mirror", "claude:source", "codex") in backend.calls
+    _json_output(capsys)
+
+
+def test_mirror_apply_blocks_ineligible_or_uncharacterized_source(capsys):
+    backend = FakeBackend(
+        preview={
+            "session_id": "claude:source",
+            "target_provider": "codex",
+            "would_enqueue": False,
+            "reason": "already_mapped",
+        }
+    )
+
+    assert (
+        _run(
+            [
+                "mirror",
+                "claude:source",
+                "--target",
+                "codex",
+                "--apply",
+                "--confirm-one-shot",
+            ],
+            backend,
+        )
+        == 4
+    )
+    assert _json_output(capsys)["gate"] == "mirror_already_mapped"
+    assert not any(call[0] == "apply_mirror" for call in backend.calls)
+
+
+def test_invalid_unsafe_configuration_returns_two_without_echo(capsys):
+    backend = FakeBackend()
+
+    result = main(
+        ["status", "--json"],
+        config_loader=lambda: (_ for _ in ()).throw(
+            ValueError("unsafe config contains bearer do-not-print")
+        ),
+        backend_factory=lambda _config: backend,
+    )
+
+    assert result == 2
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {"error": "configuration_error"}
+    assert "do-not-print" not in rendered
+    assert backend.calls == []

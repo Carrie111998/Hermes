@@ -3,6 +3,7 @@ import { normalize } from '@/lib/text'
 const SOURCE_LABELS: Record<string, string> = {
   api_server: 'API',
   bluebubbles: 'iMessage',
+  claude: 'Claude',
   cli: 'CLI',
   codex: 'Codex',
   desktop: 'Desktop',
@@ -26,6 +27,7 @@ const SOURCE_LABELS: Record<string, string> = {
 
 const SOURCE_ALIASES: Record<string, string[]> = {
   bluebubbles: ['apple messages', 'imessage'],
+  claude: ['anthropic', 'claude code', 'claude-code'],
   cli: ['terminal'],
   desktop: ['app', 'gui'],
   local: ['machine'],
@@ -40,7 +42,7 @@ const SOURCE_ALIASES: Record<string, string[]> = {
 // platform. A handoff *from* one of these isn't a platform origin worth a badge.
 // Exported so the recents fetch can keep these in the main list while the
 // messaging fetch excludes them.
-export const LOCAL_SESSION_SOURCE_IDS = ['cli', 'codex', 'desktop', 'gateway', 'local', 'tui']
+export const LOCAL_SESSION_SOURCE_IDS = ['claude', 'cli', 'codex', 'desktop', 'gateway', 'local', 'tui']
 const LOCAL_SOURCE_IDS = new Set(LOCAL_SESSION_SOURCE_IDS)
 
 // External messaging platforms that each get their own self-managed sidebar
@@ -123,4 +125,63 @@ export function sessionSourceSearchTerms(source: null | string | undefined): str
   }
 
   return [id, label ?? '', ...(SOURCE_ALIASES[id] ?? [])].filter(Boolean)
+}
+
+const BRIDGE_MIRROR_STATE_LABELS: Record<string, string> = {
+  catalog_only: 'Catalog only',
+  continued: 'Continued',
+  diverged: 'Diverged',
+  failed: 'Failed',
+  mirrored: 'Mirrored',
+  queued: 'Queued'
+}
+
+const BRIDGE_MIRROR_STATE_ALIASES: Record<string, string[]> = {
+  catalog_only: ['カタログのみ', '仅目录', '僅目錄'],
+  continued: ['継続', '已继续', '已繼續'],
+  diverged: ['分岐', '已分歧'],
+  failed: ['失敗', '失败'],
+  mirrored: ['ミラー済み', '已镜像', '已鏡像'],
+  queued: ['待機中', '已排队', '已排隊']
+}
+
+export function bridgeProviderLabel(provider: null | string | undefined): string | null {
+  return sessionSourceLabel(provider)
+}
+
+export function bridgeProviderSearchTerms(provider: null | string | undefined): string[] {
+  return sessionSourceSearchTerms(provider)
+}
+
+export function bridgeMirrorStateLabel(state: null | string | undefined): string | null {
+  const id = normalizeSessionSource(state)
+
+  return id ? (BRIDGE_MIRROR_STATE_LABELS[id] ?? null) : null
+}
+
+export function bridgeMirrorStateSearchTerms(state: null | string | undefined): string[] {
+  const id = normalizeSessionSource(state)
+  const label = bridgeMirrorStateLabel(id)
+
+  return id && label ? [id, label, ...(BRIDGE_MIRROR_STATE_ALIASES[id] ?? [])] : []
+}
+
+const BRIDGE_SIDEBAR_STATE_LABELS: Record<string, string> = {
+  failed: 'Failed',
+  pending: 'Pending',
+  retrying: 'Retrying',
+  visible: 'Visible in Codex'
+}
+
+export function bridgeSidebarStateLabel(state: null | string | undefined): string | null {
+  const id = normalizeSessionSource(state)
+
+  return id ? (BRIDGE_SIDEBAR_STATE_LABELS[id] ?? null) : null
+}
+
+export function bridgeSidebarStateSearchTerms(state: null | string | undefined): string[] {
+  const id = normalizeSessionSource(state)
+  const label = bridgeSidebarStateLabel(id)
+
+  return id && label ? ['codex sidebar', id, label] : []
 }
