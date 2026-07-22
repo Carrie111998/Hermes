@@ -1838,7 +1838,7 @@ def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 _CAPTURED_IMAGE_MEDIA_RE = re.compile(
-    r"MEDIA:\s*(?P<path>(?:file://)?(?:~/|/)\S+\.(?:png|jpe?g|gif|webp))",
+    r"MEDIA:\s*(?P<path>(?:file://)?(?:~/|/)\S+)",
     re.IGNORECASE,
 )
 
@@ -1871,6 +1871,55 @@ def _expand_captured_send(send: Mapping[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return expanded
+
+
+def _resolve_captured_media_path(
+    raw_path: Any, retention: Mapping[str, Any]
+) -> Path:
+    """Resolve a captured local path or configured opaque media reference.
+
+    Business tools expose retained files using ``media_ref_prefix`` rather
+    than leaking the host filesystem root.  Convert only an exact
+    ``<configured-prefix>/<single-basename>`` reference.  Absolute local paths
+    remain supported, but both forms terminate at the same retained-root and
+    regular-file checks in the caller.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    text = str(raw_path or "").strip()
+    if not text or any(marker in text for marker in ("?", "#", "\r", "\n")):
+        raise MediaRetentionError("captured media reference is invalid")
+    if text.startswith("file://"):
+        parsed = urlsplit(text)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            raise MediaRetentionError("captured media file URI is invalid")
+        text = unquote(parsed.path)
+
+    ref_prefix = str(retention["ref_prefix"])
+    prefix = f"{ref_prefix}/"
+    if text.startswith(prefix):
+        basename = text[len(prefix):]
+        if (
+            not basename
+            or basename in {".", ".."}
+            or "/" in basename
+            or "\\" in basename
+            or "%" in basename
+            or Path(basename).name != basename
+        ):
+            raise MediaRetentionError("captured media reference is not opaque")
+        candidate = Path(retention["root"]) / basename
+    else:
+        candidate = Path(text).expanduser()
+
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise MediaRetentionError("captured media file is unavailable") from exc
+    root = Path(retention["root"])
+    if not resolved.is_file() or not resolved.is_relative_to(root):
+        raise MediaRetentionError("captured media path escapes retained-media root")
+    return resolved
 
 
 def _captured_provider_error(
@@ -2210,9 +2259,7 @@ def deliver_management_replies(
                 summary["suppressed"] += 1
                 continue
             try:
-                media_path = Path(send["path"]).expanduser().resolve(strict=True)
-                if not media_path.is_file() or not media_path.is_relative_to(retention["root"]):
-                    raise MediaRetentionError("captured media path escapes retained-media root")
+                media_path = _resolve_captured_media_path(send["path"], retention)
                 media_mime, _ = _validated_image_type(media_path, None)
                 media_identity = hashlib.sha256(media_path.read_bytes()).hexdigest()
             except (OSError, MediaRetentionError):

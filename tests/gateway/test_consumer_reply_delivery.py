@@ -90,7 +90,9 @@ def _handled(*message_ids: str) -> list[dict]:
     return [{"message_ids": list(message_ids), "turn_id": "turn-current"}]
 
 
-def _enable_media_retention(config_path: Path, media_root: Path) -> None:
+def _enable_media_retention(
+    config_path: Path, media_root: Path, *, ref_prefix: str = "/media"
+) -> None:
     import yaml
     data = yaml.safe_load(config_path.read_text())
     data["pa"]["media_retention"] = {
@@ -98,6 +100,7 @@ def _enable_media_retention(config_path: Path, media_root: Path) -> None:
         "media_root": str(media_root),
         "source_roots": [str(media_root)],
         "operation": "tgg_media_retention",
+        "media_ref_prefix": ref_prefix,
     }
     config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
@@ -207,6 +210,103 @@ def test_streamed_media_directive_becomes_one_native_media_send(
             },
         )
     ]
+
+
+def test_streamed_case_media_ref_resolves_to_retained_file_and_native_send(
+    inbox: DurableInbox, config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_root = tmp_path / "retained"
+    media_root.mkdir()
+    basename = "export_backfill_hg_7F263A59C4E0C211C37C29A1.jpg"
+    photo = media_root / basename
+    photo.write_bytes(b"\xff\xd8\xffcase-photo")
+    _enable_media_retention(
+        config_path, media_root, ref_prefix="/media/tgg/hermes"
+    )
+    sent: list[tuple[str, dict]] = []
+
+    def fake_urlopen(request, timeout=0):
+        sent.append((request.full_url, json.loads(request.data)))
+        return _FakeResponse({"success": True, "messageId": "WA-CASE-MEDIA-REF"})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[
+            _captured(
+                MGMT_CHAT,
+                "SK/JOB/2606/2372 — first retained photo:\n\n"
+                f"MEDIA:/media/tgg/hermes/{basename}",
+            )
+        ],
+        batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
+    )
+
+    assert summary == {
+        "delivered": 1,
+        "undelivered": 0,
+        "suppressed": 0,
+        "duplicate": 0,
+    }
+    assert sent == [
+        (
+            "http://127.0.0.1:3011/send-media",
+            {
+                "chatId": MGMT_CHAT,
+                "replyTo": "MSG1",
+                "filePath": str(photo),
+                "mediaType": "image",
+                "caption": "SK/JOB/2606/2372 — first retained photo:",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "media_ref",
+    [
+        "/media/tgg/hermes/../case-photo.jpg",
+        "/media/tgg/hermes/nested/case-photo.jpg",
+        "/media/tgg/hermes/case-photo.jpg?download=1",
+        "/media/tgg/hermes/case-photo.jpg#fragment",
+        "/media/tgg/other/case-photo.jpg",
+    ],
+)
+def test_streamed_case_media_ref_refuses_non_opaque_or_mismatched_reference(
+    media_ref: str,
+    inbox: DurableInbox,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_root = tmp_path / "retained"
+    media_root.mkdir()
+    (media_root / "case-photo.jpg").write_bytes(b"\xff\xd8\xffcase-photo")
+    _enable_media_retention(
+        config_path, media_root, ref_prefix="/media/tgg/hermes"
+    )
+    calls: list = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: calls.append(a))
+
+    summary = deliver_management_replies(
+        inbox,
+        config_path=config_path,
+        captured_outbound=[_captured(MGMT_CHAT, f"MEDIA:{media_ref}")],
+        batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
+    )
+
+    assert summary == {
+        "delivered": 0,
+        "undelivered": 0,
+        "suppressed": 1,
+        "duplicate": 0,
+    }
+    assert not calls
 
 
 def test_streamed_media_directive_outside_retained_root_is_not_sent_as_text(
