@@ -1691,3 +1691,135 @@ def test_bounded_legitimate_consumed_no_turn_is_terminal_skipped(tmp_path, monke
     assert audit["conservation"]["preserved"] is True
     assert all(row["skipped"] == len(row["message_ids"]) for row in audit["mutations"])
     assert inbox.counts() == {"completed": 1, "skipped": 4}
+
+
+def test_message_id_selection_is_exact_and_missing_refuses(tmp_path):
+    inbox, *_ = _seed_bounded_state(tmp_path)
+    selected = inbox.message_id_selection(["bounded-3", "bounded-1"])
+    assert [record.message_id for record in selected] == ["bounded-1", "bounded-3"]
+    consumer.assert_message_id_selection(
+        selected,
+        expected_message_ids=["bounded-3", "bounded-1"],
+        expected_total=2,
+    )
+    with pytest.raises(consumer.ConsumerError, match="missing from inbox"):
+        inbox.message_id_selection(["bounded-1", "not-present"])
+
+
+def test_readjudication_reset_writes_before_image_and_conserves(tmp_path):
+    inbox, *_ = _seed_bounded_state(tmp_path)
+    records = inbox.message_id_selection(["bounded-1", "bounded-2"])
+    with inbox.connect() as conn:
+        conn.execute(
+            "UPDATE ingress_events SET status='completed',pa_turn_id='old-turn' "
+            "WHERE message_id='bounded-1'"
+        )
+    before_count = inbox.total()
+    before_image = tmp_path / "readjudication-before.json"
+    result = inbox.requeue_selected_for_readjudication(
+        records,
+        before_image_path=before_image,
+        run_id="readjudication-test",
+        dry_run=False,
+    )
+    assert result["selected"] == 2
+    assert result["cas_updated"] == 2
+    assert result["status_before"] == {"completed": 1, "pending": 1}
+    image = json.loads(before_image.read_text())
+    assert image["selected_count"] == 2
+    assert {row["message_id"]: row["status"] for row in image["rows"]} == {
+        "bounded-1": "completed",
+        "bounded-2": "pending",
+    }
+    assert inbox.total() == before_count
+    with inbox.connect() as conn:
+        rows = conn.execute(
+            "SELECT message_id,status,pa_turn_id,last_error FROM ingress_events "
+            "WHERE message_id IN ('bounded-1','bounded-2') ORDER BY message_id"
+        ).fetchall()
+    assert [(row["message_id"], row["status"], row["pa_turn_id"]) for row in rows] == [
+        ("bounded-1", "pending", None),
+        ("bounded-2", "pending", None),
+    ]
+    assert all(row["last_error"] == "readjudication:readjudication-test" for row in rows)
+
+
+def test_readjudication_dry_run_writes_nothing(tmp_path):
+    inbox, *_ = _seed_bounded_state(tmp_path)
+    records = inbox.message_id_selection(["bounded-1"])
+    before = inbox.db_path.read_bytes()
+    before_image = tmp_path / "must-not-exist.json"
+    result = inbox.requeue_selected_for_readjudication(
+        records,
+        before_image_path=before_image,
+        run_id="dry-readjudication",
+        dry_run=True,
+    )
+    assert result["cas_updated"] == 0
+    assert inbox.db_path.read_bytes() == before
+    assert not before_image.exists()
+
+
+def test_readjudication_draft_transitions_are_audited_and_dry_run_is_read_only(
+    tmp_path,
+):
+    case_db = tmp_path / "case.db"
+    conn = sqlite3.connect(case_db)
+    conn.executescript("""
+        CREATE TABLE draft_outbound (
+          id INTEGER PRIMARY KEY, case_id INTEGER, channel TEXT NOT NULL,
+          recipient TEXT, body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'draft',
+          created_by TEXT NOT NULL, approved_by TEXT, sent_at INTEGER,
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE ps_audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_slug TEXT NOT NULL,
+          actor_kind TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+          target_kind TEXT, target_id TEXT, before_json TEXT, after_json TEXT,
+          source_surface TEXT NOT NULL, summary TEXT NOT NULL, ts INTEGER NOT NULL
+        );
+        INSERT INTO draft_outbound VALUES
+          (1,NULL,'clarification',NULL,'one','draft','christopher',NULL,NULL,1,1),
+          (2,NULL,'clarification',NULL,'two','draft','christopher',NULL,NULL,1,1);
+    """)
+    conn.commit()
+    conn.close()
+    before = case_db.read_bytes()
+    before_image = tmp_path / "draft-before.json"
+    preview = consumer._transition_readjudication_drafts(
+        case_db,
+        readjudicated_ids=[1],
+        pending_manager_ids=[2],
+        manager_chat_id="manager@g.us",
+        before_image_path=before_image,
+        run_id="draft-test",
+        dry_run=True,
+    )
+    assert preview == {"readjudicated": 1, "pending_manager": 1, "dry_run": True}
+    assert case_db.read_bytes() == before
+    assert not before_image.exists()
+
+    result = consumer._transition_readjudication_drafts(
+        case_db,
+        readjudicated_ids=[1],
+        pending_manager_ids=[2],
+        manager_chat_id="manager@g.us",
+        before_image_path=before_image,
+        run_id="draft-test",
+        dry_run=False,
+    )
+    assert result["readjudicated"] == 1
+    assert result["pending_manager"] == 1
+    image = json.loads(before_image.read_text())
+    assert [row["id"] for row in image["draft_outbound"]] == [1, 2]
+    conn = sqlite3.connect(case_db)
+    rows = conn.execute(
+        "SELECT id,state,recipient FROM draft_outbound ORDER BY id"
+    ).fetchall()
+    actions = conn.execute("SELECT action,target_id FROM ps_audit_log ORDER BY id").fetchall()
+    conn.close()
+    assert rows == [(1, "readjudicated", None), (2, "pending_manager", "manager@g.us")]
+    assert actions == [
+        ("clarification.readjudicated", "1"),
+        ("clarification.pending_manager", "2"),
+    ]
