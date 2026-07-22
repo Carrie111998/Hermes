@@ -8,6 +8,16 @@ Spec: edna `specs/2026-07-21-tgg-turn-on-backplay-investigation/report.md` §3, 
 
 Two concrete gaps against the parent WB's own DoD criteria were found against `5a5d4da4c`. See §1-§3 below for the original findings and what was already clear.
 
+## Note on final reviewed tip
+
+The correction request named target `479005e8e`. While this re-review was in progress, one further commit landed on `worker/333f647a` ahead of that target: `0568e810d` ("fix(gateway): acquire bounded replay lock before inbox init", 08:56:11 SGT — after the correction request was sent, before this verdict was pushed). Reviewed and independently verified below in **Round 2b**; the final terminal verdict covers the actual branch tip (`0568e810d`), not only the originally-named `479005e8e`.
+
+## Round 2b — follow-up commit `0568e810d` — Verdict: CLEAR (additive hardening, no regression)
+
+`0568e810d` moves `DurableInbox(inbox_path, read_only=dry_run)` construction from *before* `with lock_context:` to *inside* it. This matters because a non-read-only `DurableInbox.__init__` runs `_init_schema()` (`CREATE TABLE/INDEX IF NOT EXISTS`, a write-mode connection) — in `479005e8e` this construction happened before the exclusivity lock was acquired, so a live `bounded-backplay` invocation would open a write connection and touch the inbox DB's schema *before* being refused for a held lock. My round-2 lock repro (`/tmp/edna-repro-lock.py`) only asserted `inbox.counts()` was unchanged on refusal — row counts, not file bytes — so it would not have caught this. `0568e810d` closes it by deferring inbox construction until after the lock is held.
+
+Independently re-verified on the actual current tip (not `479005e8e` alone): re-ran `tests/gateway/test_durable_jsonl_consumer.py` — 21/21 pass at sane concurrency. Wrote a new repro (`/tmp/edna-repro-lock-v2.py`) checking full byte-identity + mtime of the inbox file (not just counts) across a refused-while-locked run: `inbox file byte-identical on refusal: True`, `inbox mtime unchanged on refusal: True`, `audit file exists after refusal: False`. Confirms the refused path now leaves genuinely zero footprint on the inbox file, matching the updated test `test_bounded_live_refuses_while_ordinary_consumer_holds_lock` (which now asserts the same byte/mtime identity). No other code paths touched; scope is exactly the construction reordering plus the strengthened test assertion.
+
 ## Round 2 — correction diff `f0b08c54d..479005e8e` — Verdict: CLEAR
 
 Correction commit `479005e8e2733ef93a56ac1fb64534b796421ead` ("fix(tgg): close bounded replay audit and lock gaps"). 3 files, +389/-110: `gateway/durable_jsonl_consumer.py`, `tests/gateway/test_durable_jsonl_consumer.py`, `specs/2026-07-22-tgg-bounded-backplay/dry-run-evidence.json`.
