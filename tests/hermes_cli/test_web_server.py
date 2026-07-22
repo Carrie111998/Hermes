@@ -688,6 +688,40 @@ class TestWebServerEndpoints:
 
 
 
+    def test_get_session_messages_pages_compacted_history_from_end(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("dashboard-history", "desktop")
+            db.append_message("dashboard-history", "user", "old")
+            db.append_message("dashboard-history", "assistant", "old reply")
+            db.archive_and_compact(
+                "dashboard-history", [{"role": "system", "content": "summary"}]
+            )
+            db.append_message("dashboard-history", "user", "recent")
+            db.append_message("dashboard-history", "assistant", "recent reply")
+        finally:
+            db.close()
+
+        response = self.client.get(
+            "/api/sessions/dashboard-history/messages"
+            "?include_compacted=true&from_end=true&limit=2"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [message["content"] for message in payload["messages"]] == [
+            "recent",
+            "recent reply",
+        ]
+        assert payload["pagination"] == {
+            "limit": 2,
+            "offset": 3,
+            "returned": 2,
+            "total": 5,
+        }
+
     def test_update_hermes_returns_docker_guidance_without_spawning(self, monkeypatch):
         import hermes_cli.web_server as web_server
 
