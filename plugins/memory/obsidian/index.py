@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 
 from plugins.memory.obsidian.chunker import chunk_markdown
@@ -80,3 +81,43 @@ class ObsidianIndex:
             (path,),
         )
         return cur.fetchone()[0]
+
+    def sync_vault(
+        self,
+        vault_path: str,
+        exclude_dirs: "tuple[str, ...]" = (".git", ".obsidian", ".trash"),
+    ) -> dict:
+        """Inkrementell sync: walk valvet, diffa content_hash, re-indexera ändrat."""
+        existing = self.indexed_paths()
+        seen: set[str] = set()
+        summary = {"added": 0, "updated": 0, "deleted": 0, "unchanged": 0}
+
+        for root, dirs, files in os.walk(vault_path):
+            dirs[:] = [d for d in dirs if d not in exclude_dirs]
+            for fn in files:
+                if not fn.endswith(".md"):
+                    continue
+                abspath = os.path.join(root, fn)
+                rel = os.path.relpath(abspath, vault_path)
+                seen.add(rel)
+                try:
+                    with open(abspath, encoding="utf-8") as fh:
+                        text = fh.read()
+                    mtime = os.path.getmtime(abspath)
+                except OSError:
+                    continue
+                chash = _hash(text)
+                if rel not in existing:
+                    self.upsert_note(rel, text, mtime)
+                    summary["added"] += 1
+                elif existing[rel][1] != chash:
+                    self.upsert_note(rel, text, mtime)
+                    summary["updated"] += 1
+                else:
+                    summary["unchanged"] += 1
+
+        for rel in existing:
+            if rel not in seen:
+                self.delete_note(rel)
+                summary["deleted"] += 1
+        return summary
