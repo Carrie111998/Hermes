@@ -4649,6 +4649,7 @@ def test_characterization_report_preserves_only_sanitized_claude_failure_metrics
             claude_executable="fake-claude",
             codex_executable="fake-codex",
             cwd=tmp_path,
+            provenance_secret=SECRET,
         )
 
     report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
@@ -4712,6 +4713,7 @@ def test_live_characterization_preserves_direct_runtime_argv_prefixes(
         report_root=tmp_path / "reports",
         claude_projects_root=tmp_path / "projects",
         cwd=tmp_path,
+        provenance_secret=SECRET,
     )
 
     assert version_calls == [

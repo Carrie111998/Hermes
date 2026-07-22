@@ -2305,7 +2305,6 @@ def _bind_codex_origin_guard(
     _write_characterization_record(path, current, marker_secret)
 
 
-def _retire_codex_origin_guard(path: Path, *, marker_secret: bytes) -> None:
 def _retire_codex_origin_guard(
     path: Path,
     *,

@@ -2093,7 +2093,7 @@ class TestBridgeMarkers:
             assert row is not None
             assert row["origin_kind"] == OriginKind.BRIDGE_PLACEHOLDER.value
             assert row["origin_bridge_id"] == bridge_id
-            assert len(db.list_sessions(source="codex")) == 1
+            assert len(db.list_sessions_rich(source="codex")) == 1
         finally:
             db.close()
 
