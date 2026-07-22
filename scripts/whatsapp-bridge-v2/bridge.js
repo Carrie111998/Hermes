@@ -32,6 +32,7 @@ import { tmpdir } from 'os';
 import QRCode from 'qrcode';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedChat, matchesAllowedUser, parseAllowedUsers, parseIdentifierList } from './allowlist.js';
+import { createSenderKeyFanoutManager } from './sender-key-fanout.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -112,7 +113,8 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+async function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+  const fanoutContext = await senderKeyFanout?.prepareGroupSend(chatId, { action: 'send' });
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -120,8 +122,16 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
       timeoutMs,
     );
   });
-  return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
-    .finally(() => clearTimeout(timer));
+  try {
+    const result = await Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise]);
+    senderKeyFanout?.completeGroupSend(fanoutContext, { result });
+    return result;
+  } catch (error) {
+    senderKeyFanout?.completeGroupSend(fanoutContext, { error });
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function formatOutgoingMessage(message) {
@@ -525,6 +535,7 @@ function sendOptionsForReplyTo(replyTo) {
 
 let sock = null;
 let connectionState = 'disconnected';
+let senderKeyFanout = null;
 let latestQr = '';
 let latestQrAt = null;
 let lastDisconnectReason = null;
@@ -536,6 +547,8 @@ async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  senderKeyFanout = createSenderKeyFanoutManager({ authKeys: state.keys });
+
   sock = makeWASocket({
     version,
     auth: state,
@@ -544,6 +557,7 @@ async function startSocket() {
     browser: ['Papercut Agents', 'Desktop', '1.0'],
     syncFullHistory: SYNC_FULL_HISTORY,
     markOnlineOnConnect: false,
+    userDevicesCache: senderKeyFanout.userDevicesCache,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
@@ -551,6 +565,7 @@ async function startSocket() {
       return stored?.message || { conversation: '' };
     },
   });
+  senderKeyFanout.bindSocket(sock);
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); flushStore(); });
 
