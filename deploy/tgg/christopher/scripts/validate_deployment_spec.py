@@ -132,6 +132,43 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("Hermes must not connect its built-in WhatsApp gateway")
     if spec["channels"]["whatsapp"]["consumer"]["mode"] != "durable-jsonl-tail":
         raise RuntimeError("WhatsApp consumer must use the durable JSONL tail")
+    retention = spec["channels"]["whatsapp"].get("mediaRetention")
+    expected_retention = {
+        "enabled": True,
+        "sourceGate": "pa.enabled-and-processing-gate",
+        "sourceRoots": ["/var/lib/tgg-capture/whatsapp/media"],
+        "mediaRoot": "/home/pclaw/.systems-pcl/data/media",
+        "convergenceOperation": "tgg_media_retention",
+        "retrievalOperation": "tgg_case_media",
+        "retrievalTool": "tgg_case_photos",
+        "ordering": "retain-and-converge-before-model-and-inbox-completion",
+        "failureDisposition": "retry-pending",
+        "activationBacklogPreflight": "all-image-paths-from-current-cursor-must-resolve",
+        "minimumRealVolumeFreePercent": 20,
+        "pathContract": "opaque-media-refs-resolved-under-configured-root",
+        "delivery": {
+            "route": "/send-media",
+            "destination": "current-triggering-management-chat-only",
+            "durableKey": "chat-id-plus-current-inbound-anchor-plus-media-identity-plus-ordinal",
+            "unknownOutcome": "durable-undelivered-no-blind-retry",
+            "staleOrNonManagement": "suppress",
+        },
+        "rollback": "disable-retention-and-media-send-preserve-retained-data-and-cursors",
+    }
+    if retention != expected_retention:
+        raise RuntimeError("WhatsApp media-retention contract drifted")
+    expected_status_media_fields = [
+        "retention_total",
+        "retention_failures",
+        "media_root_count",
+        "media_root_bytes",
+        "media_volume_free_percent",
+    ]
+    if (
+        spec["channels"]["whatsapp"]["consumer"].get("statusMediaFields")
+        != expected_status_media_fields
+    ):
+        raise RuntimeError("consumer media-status contract drifted")
     if spec["channels"]["whatsapp"]["prohibitedConsumerSurface"]["path"] != "/messages":
         raise RuntimeError("the destructive bridge route must stay prohibited")
 
@@ -182,6 +219,14 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         constitution = _load_yaml(constitution_path)
         if config["pa"]["enabled"] is not False:
             raise RuntimeError(f"slot {slot} enables PA")
+        if config["pa"].get("media_retention") != {
+            "enabled": True,
+            "media_root": "/home/pclaw/.systems-pcl/data/media",
+            "source_roots": ["/var/lib/tgg-capture/whatsapp/media"],
+            "operation": "tgg_media_retention",
+            "min_free_percent": 20,
+        }:
+            raise RuntimeError(f"slot {slot} media-retention config drifted")
         if config["platforms"]["whatsapp"]["enabled"] is not False:
             raise RuntimeError(f"slot {slot} enables the built-in WhatsApp gateway")
         if config["group_sessions_per_user"] is not False:

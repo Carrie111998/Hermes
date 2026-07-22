@@ -182,7 +182,7 @@ TOOLSETS = {
         "description": "Opt-in PA business-fact bridge for configured HTTP endpoints or local commands",
         "tools": [
             "pa_business_read", "pa_business_write",
-            "tgg_case_lookup", "tgg_case_query", "tgg_case_search",
+            "tgg_case_lookup", "tgg_case_photos", "tgg_case_query", "tgg_case_search",
             "tgg_message_history_search", "message_history_search",
             "tgg_clarification_request", "clarification_request",
             "tgg_case_observation", "tgg_case_create",
@@ -195,7 +195,7 @@ TOOLSETS = {
         "description": "Client-specific custom operations bridge for configured HTTP endpoints or local commands",
         "tools": [
             "pa_business_read", "pa_business_write",
-            "tgg_case_lookup", "tgg_case_query", "tgg_case_search",
+            "tgg_case_lookup", "tgg_case_photos", "tgg_case_query", "tgg_case_search",
             "tgg_message_history_search", "message_history_search",
             "tgg_clarification_request", "clarification_request",
             "tgg_case_observation", "tgg_case_create",

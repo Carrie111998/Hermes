@@ -168,6 +168,22 @@ assert status["site_concurrency"] == 4
 assert status["chat_batch_size"] == 25
 assert isinstance(status["state_total"], int) and status["state_total"] >= 0
 assert sum(status["inbox"].values()) == status["state_total"]
+for key in (
+    "retention_total",
+    "retention_failures",
+    "media_root_count",
+    "media_root_bytes",
+):
+    assert isinstance(status.get(key), int) and status[key] >= 0, (key, status.get(key))
+free_percent = status.get("media_volume_free_percent")
+if config_enabled:
+    assert isinstance(free_percent, (int, float)), free_percent
+    assert free_percent >= float(config["pa"]["media_retention"]["min_free_percent"]), (
+        free_percent,
+        config["pa"]["media_retention"]["min_free_percent"],
+    )
+else:
+    assert free_percent is None or isinstance(free_percent, (int, float)), free_percent
 if not config_enabled:
     assert status["source_opened"] is False
     assert status["cursor_advanced"] is False

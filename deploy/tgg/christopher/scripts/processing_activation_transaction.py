@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import time
 import uuid
@@ -22,6 +23,7 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -365,6 +367,112 @@ def read_states(config_bytes: bytes, gate_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def media_backlog_preflight(
+    config_path: Path,
+    cursor_path: Path,
+) -> dict[str, Any]:
+    """Fail activation if paused capture backlog cannot be retained safely."""
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    retention = (config.get("pa") or {}).get("media_retention") or {}
+    if retention.get("enabled") is not True:
+        raise RuntimeError("media retention must be enabled before processing activation")
+    media_root = Path(str(retention.get("media_root") or "")).resolve(strict=True)
+    source_roots = retention.get("source_roots") or []
+    if not isinstance(source_roots, list) or not source_roots:
+        raise RuntimeError("media retention source_roots are missing")
+    roots = tuple(Path(str(value)).resolve(strict=True) for value in source_roots)
+    min_free = float(retention.get("min_free_percent", 20))
+    usage = shutil.disk_usage(media_root)
+    free_percent = usage.free / usage.total * 100 if usage.total else 0.0
+    if free_percent < min_free:
+        raise RuntimeError(
+            f"media retention volume below activation floor: {free_percent:.3f}% < {min_free:.3f}%"
+        )
+
+    cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+    source_path = Path(str(cursor.get("source_path") or ""))
+    offset = int(cursor.get("offset", cursor.get("initial_offset", 0)))
+    if not source_path.is_file() or offset < 0 or offset > source_path.stat().st_size:
+        raise RuntimeError("capture backlog source/cursor is not resolvable")
+    events = images = image_bytes = 0
+    failures: list[str] = []
+    with source_path.open("rb") as handle:
+        handle.seek(offset)
+        for line_no, raw_line in enumerate(handle, 1):
+            if not raw_line.strip():
+                continue
+            item: Any = None
+            try:
+                event = json.loads(raw_line)
+                item = (
+                    event.get("normalized")
+                    or event.get("item")
+                    or event.get("payload")
+                    or event
+                )
+                if not isinstance(item, dict):
+                    raise ValueError("event item is not an object")
+                media_type = str(
+                    item.get("mediaType") or item.get("mimeType") or ""
+                ).split(";", 1)[0].strip().lower()
+                is_image = media_type == "image" or media_type.startswith("image/")
+                if not item.get("hasMedia") or not is_image:
+                    continue
+                values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths")
+                if isinstance(values, (str, dict)):
+                    values = [values]
+                if not isinstance(values, list) or not values:
+                    raise ValueError("image event has no media paths")
+                events += 1
+                for value in values:
+                    if isinstance(value, dict):
+                        value = (
+                            value.get("path")
+                            or value.get("filePath")
+                            or value.get("localPath")
+                            or value.get("url")
+                        )
+                    text = str(value or "")
+                    if text.startswith("file://"):
+                        text = text[7:]
+                    path = Path(text).resolve(strict=True)
+                    if not path.is_file() or not any(path.is_relative_to(root) for root in roots):
+                        raise ValueError("image path escapes source roots or is missing")
+                    with path.open("rb") as media_handle:
+                        prefix = media_handle.read(16)
+                    if not any(
+                        prefix[offset : offset + len(signature)] == signature
+                        for signature, offset in (
+                            (b"\xff\xd8\xff", 0),
+                            (b"\x89PNG\r\n\x1a\n", 0),
+                            (b"GIF8", 0),
+                            (b"WEBP", 8),
+                        )
+                    ):
+                        raise ValueError("media bytes are not a supported image")
+                    images += 1
+                    image_bytes += path.stat().st_size
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                message_id = "unknown"
+                if isinstance(item, dict):
+                    message_id = str(item.get("messageId") or "unknown")
+                failures.append(f"line+{line_no} message={message_id}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "capture media backlog preflight failed "
+            f"({len(failures)} unresolved); first={failures[0]}"
+        )
+    return {
+        "events": events,
+        "images": images,
+        "bytes": image_bytes,
+        "sourceOffset": offset,
+        "sourceSize": source_path.stat().st_size,
+        "mediaVolumeFreePercent": round(free_percent, 3),
+        "minimumFreePercent": min_free,
+    }
+
+
 def apply_transition(
     *,
     mode: str,
@@ -528,11 +636,13 @@ def run_fixed_remote(request: dict[str, Any]) -> dict[str, Any]:
         if deployed_transaction_sha256 != request.get("remoteTransactionSha256"):
             raise RuntimeError("deployed activation transaction does not match the signed grant")
         grant = verify_controller_grant(request)
+        media_preflight = media_backlog_preflight(CONFIG_PATH, CURSOR_PATH)
         consume_controller_grant(grant)
         credential_env_before = HERMES_ENV_PATH.read_bytes()
         credential = materialize_ps_service_token()
     else:
         credential = None
+        media_preflight = None
     try:
         result = apply_transition(
             mode=mode,
@@ -551,6 +661,7 @@ def run_fixed_remote(request: dict[str, Any]) -> dict[str, Any]:
         raise
     if credential is not None:
         result["psServiceCredential"] = credential
+        result["mediaBacklogPreflight"] = media_preflight
     return result
 
 

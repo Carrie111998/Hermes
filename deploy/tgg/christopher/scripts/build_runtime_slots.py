@@ -45,6 +45,15 @@ SLOTS: dict[str, dict] = {
 }
 
 MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
+MEDIA_RETENTION_BLOCK = (
+    "  media_retention:\n"
+    "    enabled: true\n"
+    "    media_root: /home/pclaw/.systems-pcl/data/media\n"
+    "    source_roots:\n"
+    "    - /var/lib/tgg-capture/whatsapp/media\n"
+    "    operation: tgg_media_retention\n"
+    "    min_free_percent: 20\n"
+)
 
 # Chat-scoped inbound allowlist (2026-07-20, teren-ratified; WB 0cd5698b).
 # STAGED, NOT ACTIVATED: this only NARROWS which chats inbound processing would
@@ -153,7 +162,7 @@ EVENT_LABELS_NEW = (
 
 NEW_OPERATIONS = ("tgg_clarification_raise", "tgg_attention_raise", "tgg_case_wc_attach")
 NEW_INSTRUCTION_COUNT = 13
-MGMT_NEW_INSTRUCTION_COUNT = 11
+MGMT_NEW_INSTRUCTION_COUNT = 12
 
 # The ingest brief is unscoped (no `business_operations` block at all), which
 # grants it the full registry — that is exactly what makes it reachable for
@@ -177,6 +186,8 @@ INGEST_DENIED_OPERATIONS_SNIPPET = (
     "    business_operations:\n"
     "      denied:\n"
     "      - tgg_attention_annotate\n"
+    "      - tgg_case_media\n"
+    "      - tgg_media_retention\n"
 )
 
 # The management brief is the only brief with a `web` toolset, so this block is
@@ -229,6 +240,7 @@ CANONICAL_OPERATIONS = {
     "tgg_case_create",
     "tgg_case_list",
     "tgg_case_lookup",
+    "tgg_case_media",
     "tgg_case_observation",
     "tgg_case_query",
     "tgg_case_search",
@@ -239,6 +251,7 @@ CANONICAL_OPERATIONS = {
     "work_costing_lookup",
     "work_costing_upsert",
 }
+CONFIGURED_OPERATIONS = CANONICAL_OPERATIONS | {"tgg_media_retention"}
 OPERATION_REFERENCE_RE = re.compile(
     r"\boperation\s+([a-z][a-z0-9]*_[a-z0-9_]+)\b"
 )
@@ -307,7 +320,7 @@ def _safe_config(source: str, slot: dict) -> str:
     rendered = _replace_once(
         source,
         "pa:\n  enabled: true\n",
-        "pa:\n  enabled: false\n",
+        "pa:\n  enabled: false\n" + MEDIA_RETENTION_BLOCK,
         label="pa.enabled",
     )
     rendered = _replace_once(
@@ -411,6 +424,12 @@ def _constitution(source: str, slot: dict) -> str:
         MGMT_TOOLSETS_ANCHOR + mgmt_operations_snippet,
         label="management toolsets block",
     )
+    rendered = _replace_once(
+        rendered,
+        "      - /always\n      compression:\n",
+        "      - /always\n      max_output_tokens: 8192\n      compression:\n",
+        label="management output token cap",
+    )
     # The June baseline names a cross-client operation that is not present in
     # Christopher's runtime registry (once in each job brief). Keep the existing
     # out-of-scope behavior, but remove the impossible tool call.
@@ -442,6 +461,13 @@ def _validate(
     constitution = yaml.safe_load(constitution_path.read_text(encoding="utf-8"))
 
     assert config["pa"]["enabled"] is False
+    assert config["pa"]["media_retention"] == {
+        "enabled": True,
+        "media_root": "/home/pclaw/.systems-pcl/data/media",
+        "source_roots": ["/var/lib/tgg-capture/whatsapp/media"],
+        "operation": "tgg_media_retention",
+        "min_free_percent": 20,
+    }
     assert config["group_sessions_per_user"] is False
     assert config["platforms"]["whatsapp"]["enabled"] is False
     assert config["model"]["provider"] == "openai-direct-primary"
@@ -490,15 +516,18 @@ def _validate(
         assert config["agent"]["reasoning_effort"] == effort
 
     operations = config["pa"]["overlay"]["client"]["business_bridge"]["operations"]
-    assert set(operations) == CANONICAL_OPERATIONS, (
-        sorted(set(operations) - CANONICAL_OPERATIONS),
-        sorted(CANONICAL_OPERATIONS - set(operations)),
+    assert set(operations) == CONFIGURED_OPERATIONS, (
+        sorted(set(operations) - CONFIGURED_OPERATIONS),
+        sorted(CONFIGURED_OPERATIONS - set(operations)),
     )
     for name in NEW_OPERATIONS:
         assert name in operations, name
         assert operations[name]["type"] == "http"
         assert operations[name]["method"] == "POST"
     assert operations["tgg_case_wc_attach"]["path_params"] == ["jobNo"]
+    assert operations["tgg_case_media"]["method"] == "GET"
+    assert operations["tgg_case_media"]["path_params"] == ["jobNo"]
+    assert operations["tgg_media_retention"]["method"] == "POST"
 
     assert constitution["runtime"] == {
         "provider": "openai-direct-primary",
@@ -596,6 +625,7 @@ def _validate(
 
     # ── Management chat: behavior section + business-operation scope ──────────
     mgmt_brief = constitution["job_briefs"]["tgg_management"]
+    assert mgmt_brief["response_policy"]["max_output_tokens"] == 8192
     mgmt_instructions = mgmt_brief["instructions"]
     assert (
         len(mgmt_instructions)
@@ -677,6 +707,9 @@ def _validate(
     assert "group allowlists" in mgmt_joined
     assert "deleting or purging data" in mgmt_joined
     assert "Nothing you send goes to anyone outside this chat" in mgmt_joined
+    assert "call tgg_case_photos with that job number" in mgmt_joined
+    assert "destination is always this fresh management chat" in mgmt_joined
+    assert "Never invent a numeric case id" in mgmt_joined
     assert "Never relay site-group content wholesale" in mgmt_joined
     assert "not a courtesy" in mgmt_joined
 
@@ -692,7 +725,9 @@ def _validate(
         sorted(permitted - CANONICAL_OPERATIONS),
         sorted(CANONICAL_OPERATIONS - permitted),
     )
-    assert permitted == set(operations), sorted(permitted ^ set(operations))
+    assert permitted == set(operations) - {"tgg_media_retention"}, sorted(
+        permitted ^ (set(operations) - {"tgg_media_retention"})
+    )
     # The writes the rulings name, spelled out for the reader.
     for required in (
         "tgg_case_observation",  # attach evidence / notes
@@ -718,7 +753,11 @@ def _validate(
     # means the allow-filter is skipped entirely — this narrows, never widens.
     ingest_scope = ingest_brief["business_operations"]
     assert set(ingest_scope) == {"denied"}, sorted(ingest_scope)
-    assert ingest_scope["denied"] == ["tgg_attention_annotate"], ingest_scope["denied"]
+    assert ingest_scope["denied"] == [
+        "tgg_attention_annotate",
+        "tgg_case_media",
+        "tgg_media_retention",
+    ], ingest_scope["denied"]
 
     # Prose and mechanism must agree: no management instruction may tell
     # Christopher to call an operation the scope denies him, or he is being

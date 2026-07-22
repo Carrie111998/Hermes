@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from tools.registry import registry, tool_error, tool_result
@@ -58,6 +59,7 @@ class PABusinessBridgeConfig:
     # ``operations`` so they can never execute; kept here only so the refusal
     # can say "not permitted in this chat" instead of "unknown operation".
     denied_operations: frozenset[str] = frozenset()
+    media_root: Path | None = None
 
 
 class OperationNotPermitted(ValueError):
@@ -147,6 +149,7 @@ def load_business_bridge_config(
         auth = client_bridge["auth"]
     if client_bridge.get("tenant"):
         tenant = str(client_bridge.get("tenant"))
+    media_root = _configured_media_root(config, client_bridge=client_bridge)
     raw_operations = section.get("operations", {})
     client_operations = client_bridge.get("operations", {})
     if client_operations:
@@ -228,7 +231,26 @@ def load_business_bridge_config(
         tenant=tenant,
         auth=dict(auth) if isinstance(auth, Mapping) else None,
         denied_operations=denied,
+        media_root=media_root,
     )
+
+
+def _configured_media_root(
+    config: Mapping[str, Any] | None,
+    *,
+    client_bridge: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Read the client-configured Systems media root without inventing paths."""
+    if isinstance(client_bridge, Mapping) and client_bridge.get("media_root"):
+        return Path(str(client_bridge["media_root"])).expanduser()
+    if not isinstance(config, Mapping):
+        return None
+    pa = config.get("pa")
+    retention = pa.get("media_retention") if isinstance(pa, Mapping) else None
+    if not isinstance(retention, Mapping):
+        return None
+    raw = retention.get("media_root") or retention.get("root")
+    return Path(str(raw)).expanduser() if raw else None
 
 
 def _job_brief_business_operations(pa_context: Any | None) -> Mapping[str, Any]:
@@ -1056,6 +1078,129 @@ def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
     return _handle_tgg_read("tgg_case_lookup", {"jobNo": args.get("jobNo")})
 
 
+_TGG_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp"})
+_TGG_IMAGE_MIMES = frozenset(
+    {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
+)
+_TGG_IMAGE_SIGNATURES = (
+    ("image/jpeg", b"\xff\xd8\xff", 0),
+    ("image/png", b"\x89PNG\r\n\x1a\n", 0),
+    ("image/gif", b"GIF8", 0),
+    ("image/webp", b"WEBP", 8),
+)
+
+
+def _case_media_items(result: Mapping[str, Any]) -> list[Any]:
+    """Extract only the compact case-media endpoint's documented file list."""
+    candidates: list[Any] = [
+        result.get("files"),
+        result.get("media"),
+        result.get("items"),
+    ]
+    data = result.get("data")
+    if isinstance(data, Mapping):
+        candidates.extend((data.get("files"), data.get("media"), data.get("items")))
+        case = data.get("case")
+        if isinstance(case, Mapping):
+            candidates.extend((case.get("files"), case.get("media"), case.get("items")))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return candidate
+    return []
+
+
+def _resolve_case_photo(item: Any, media_root: Path) -> tuple[str, str] | None:
+    """Resolve one opaque /media ref to an existing contained image.
+
+    The Systems API is allowed to name only opaque refs.  Local paths are
+    derived here so the model never supplies a filesystem path to the lookup.
+    """
+    mime = ""
+    if isinstance(item, Mapping):
+        raw_ref = item.get("ref") or item.get("url") or item.get("mediaRef")
+        mime = str(
+            item.get("mime") or item.get("mimeType") or item.get("contentType") or ""
+        ).split(";", 1)[0].strip().lower()
+    else:
+        raw_ref = item
+    ref = str(raw_ref or "").strip()
+    parsed = urllib.parse.urlsplit(ref)
+    # Absolute URLs, query strings and fragments are not opaque media refs.
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("INVALID_MEDIA_REF: case media must be an opaque /media/... ref")
+    path = urllib.parse.unquote(parsed.path)
+    if not path.startswith("/media/") or path == "/media/":
+        raise ValueError("INVALID_MEDIA_REF: case media must be an opaque /media/... ref")
+    relative = path.removeprefix("/media/")
+    root = media_root.expanduser().resolve(strict=True)
+    candidate = (root / relative).resolve(strict=True)
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        raise ValueError("INVALID_MEDIA_REF: case media is missing or escapes configured root")
+    suffix = candidate.suffix.lower()
+    if mime and mime not in _TGG_IMAGE_MIMES:
+        return None
+    if suffix not in _TGG_IMAGE_EXTENSIONS:
+        return None
+    prefix = candidate.read_bytes()[:16]
+    detected = next(
+        (
+            detected_mime
+            for detected_mime, signature, offset in _TGG_IMAGE_SIGNATURES
+            if prefix[offset : offset + len(signature)] == signature
+        ),
+        None,
+    )
+    if detected is None:
+        return None
+    if mime and not (
+        mime == detected or (mime == "image/jpg" and detected == "image/jpeg")
+    ):
+        raise ValueError("PROVENANCE_DIVERGENCE: case media MIME does not match bytes")
+    return path, str(candidate)
+
+
+def _handle_tgg_case_photos(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    job_no = str(args.get("job_no") or "").strip().upper()
+    if not job_no or not re.fullmatch(JOB_NO_RE, job_no):
+        return tool_error(
+            "INVALID_JOB_NO: tgg_case_photos requires a real job number such as "
+            "SK/JOB/2604/2376; numeric case ids and free text are not accepted"
+        )
+    try:
+        bridge = _load_runtime_bridge_config()
+        if bridge.media_root is None:
+            raise ValueError("MEDIA_ROOT_NOT_CONFIGURED: case photo root is unavailable")
+        result = execute_business_operation(
+            bridge,
+            operation="tgg_case_media",
+            payload={"jobNo": job_no},
+        )
+        if result.get("ok") is False or int(result.get("status_code") or 200) >= 400:
+            return tool_result(result)
+        photos: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in _case_media_items(result):
+            resolved = _resolve_case_photo(item, bridge.media_root)
+            if resolved is None:
+                continue
+            ref, local_path = resolved
+            if local_path in seen:
+                continue
+            seen.add(local_path)
+            photos.append({"media_ref": ref, "image_path": local_path})
+        response: dict[str, Any] = {
+            "ok": True,
+            "jobNo": job_no,
+            "photos": photos,
+            "count": len(photos),
+        }
+        if not photos:
+            response["message"] = "no retained case photos"
+        return tool_result(response)
+    except Exception as exc:
+        return tool_error(exc)
+
+
 def _handle_tgg_case_query(args: Mapping[str, Any], **_kwargs: Any) -> str:
     return _handle_tgg_read("tgg_case_query", {"sql": args.get("sql")})
 
@@ -1578,6 +1723,27 @@ TGG_CASE_LOOKUP_SCHEMA = {
 }
 
 
+TGG_CASE_PHOTOS_SCHEMA = {
+    "name": "tgg_case_photos",
+    "description": (
+        "Retrieve retained image files for one TGG case by exact job number. "
+        "Returns a bounded list of validated local image paths derived from "
+        "opaque Systems media refs. Known cases with no photos return count 0."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "job_no": {
+                "type": "string",
+                "description": "Exact job number, e.g. SK/JOB/2604/2376.",
+            },
+        },
+        "required": ["job_no"],
+        "additionalProperties": False,
+    },
+}
+
+
 TGG_CASE_QUERY_SCHEMA = {
     "name": "tgg_case_query",
     "description": (
@@ -1965,6 +2131,14 @@ registry.register(
     toolset="pa-business",
     schema=TGG_CASE_LOOKUP_SCHEMA,
     handler=_handle_tgg_case_lookup,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_photos",
+    toolset="pa-business",
+    schema=TGG_CASE_PHOTOS_SCHEMA,
+    handler=_handle_tgg_case_photos,
     check_fn=_bridge_available,
 )
 

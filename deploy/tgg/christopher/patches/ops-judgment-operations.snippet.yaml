@@ -67,3 +67,23 @@
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
+          tgg_case_media:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/media
+            path_params:
+            - jobNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_media_retention:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/messages/media-retention
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 20

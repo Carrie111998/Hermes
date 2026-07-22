@@ -169,6 +169,96 @@ def test_split_initial_state_refuses_before_stopping_service(tmp_path: Path) -> 
     assert service.stops == 0 and service.starts == 0
 
 
+def _media_preflight_fixture(
+    tmp_path: Path,
+    media_value: str | None,
+    *,
+    media_type: str = "image",
+) -> tuple[Path, Path]:
+    source_root = tmp_path / "capture-media"
+    systems_root = tmp_path / "systems-media"
+    source_root.mkdir()
+    systems_root.mkdir()
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        json.dumps(
+            {
+                "normalized": {
+                    "messageId": "wa-1",
+                    "chatId": "120363421424519051@g.us",
+                    "hasMedia": True,
+                    "mediaType": media_type,
+                    "mediaUrls": [media_value] if media_value is not None else [],
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "media-config.yaml"
+    config.write_text(
+        "pa:\n"
+        "  media_retention:\n"
+        "    enabled: true\n"
+        f"    media_root: {systems_root}\n"
+        "    source_roots:\n"
+        f"    - {source_root}\n"
+        "    operation: tgg_media_retention\n"
+        "    min_free_percent: 0\n",
+        encoding="utf-8",
+    )
+    cursor = tmp_path / "media-cursor.json"
+    cursor.write_text(
+        json.dumps({"source_path": str(events), "offset": 0, "initial_offset": 0}),
+        encoding="utf-8",
+    )
+    return config, cursor
+
+
+def test_media_backlog_preflight_proves_all_pending_images_resolvable(tmp_path: Path) -> None:
+    photo = tmp_path / "capture-media" / "one.jpg"
+    config, cursor = _media_preflight_fixture(tmp_path, str(photo))
+    photo.write_bytes(b"\xff\xd8\xff\xe0fixture")
+
+    result = module.media_backlog_preflight(config, cursor)
+
+    assert result["events"] == 1
+    assert result["images"] == 1
+    assert result["bytes"] == photo.stat().st_size
+    assert result["sourceOffset"] == 0
+
+
+def test_media_backlog_preflight_holds_activation_on_missing_cache_file(tmp_path: Path) -> None:
+    missing = tmp_path / "capture-media" / "missing.jpg"
+    config, cursor = _media_preflight_fixture(tmp_path, str(missing))
+
+    with pytest.raises(RuntimeError, match="backlog preflight failed.*unresolved"):
+        module.media_backlog_preflight(config, cursor)
+
+
+def test_media_backlog_preflight_skips_normalized_video_event(tmp_path: Path) -> None:
+    video = tmp_path / "capture-media" / "pending.mp4"
+    config, cursor = _media_preflight_fixture(
+        tmp_path, str(video), media_type="video"
+    )
+    video.write_bytes(b"not-an-image")
+
+    result = module.media_backlog_preflight(config, cursor)
+
+    assert result["events"] == 0
+    assert result["images"] == 0
+    assert result["bytes"] == 0
+
+
+def test_media_backlog_preflight_holds_normalized_image_without_cache_path(
+    tmp_path: Path,
+) -> None:
+    config, cursor = _media_preflight_fixture(tmp_path, None, media_type="image")
+
+    with pytest.raises(RuntimeError, match="image event has no media paths"):
+        module.media_backlog_preflight(config, cursor)
+
+
 def test_activation_grant_is_signature_context_expiry_and_replay_bound(tmp_path: Path) -> None:
     private = Ed25519PrivateKey.generate()
     public_path = tmp_path / "controller.pub"
@@ -385,6 +475,7 @@ def test_activation_failure_after_credential_materialization_restores_env(
     monkeypatch.setattr(module, "HERMES_ENV_PATH", target)
     monkeypatch.setattr(module, "verify_controller_grant", lambda _request: {"grantId": "fixture"})
     monkeypatch.setattr(module, "consume_controller_grant", lambda _grant: None)
+    monkeypatch.setattr(module, "media_backlog_preflight", lambda *_args: {"ok": True})
     monkeypatch.setattr(
         module,
         "materialize_ps_service_token",

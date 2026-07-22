@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from tools.pa_business_tools import (
+    PABusinessBridgeConfig,
     TenantScopeMismatch,
     execute_business_operation,
     load_business_bridge_config,
@@ -772,6 +773,7 @@ def test_pa_business_toolset_is_registered_without_all_tools():
         "pa_business_read",
         "pa_business_write",
         "tgg_case_lookup",
+        "tgg_case_photos",
         "tgg_case_query",
         "tgg_case_search",
         "tgg_message_history_search",
@@ -790,6 +792,107 @@ def test_pa_business_toolset_is_registered_without_all_tools():
     assert custom is not None
     assert set(custom["tools"]) == expected
     assert set(resolve_toolset("custom")) == expected
+
+
+def _jpeg(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xd8\xff\xe0fixture")
+
+
+def test_tgg_case_photos_resolves_opaque_refs_under_configured_root(
+    monkeypatch, tmp_path
+):
+    import tools.pa_business_tools as pbt
+
+    root = tmp_path / "systems-media"
+    photo = root / "retained" / "one.jpg"
+    _jpeg(photo)
+    bridge = PABusinessBridgeConfig(operations={}, media_root=root)
+    monkeypatch.setattr(pbt, "_load_runtime_bridge_config", lambda: bridge)
+    monkeypatch.setattr(
+        pbt,
+        "execute_business_operation",
+        lambda *_a, **_kw: {
+            "ok": True,
+            "data": {
+                "media": [
+                    {"ref": "/media/retained/one.jpg", "mimeType": "image/jpeg"},
+                    {"ref": "/media/retained/one.jpg", "mimeType": "image/jpeg"},
+                    {"ref": "/media/retained/note.txt", "mimeType": "text/plain"},
+                ]
+            },
+        },
+    )
+    (root / "retained" / "note.txt").write_text("not an image")
+
+    result = json.loads(pbt._handle_tgg_case_photos({"job_no": "SK/JOB/2604/2376"}))
+
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["photos"] == [
+        {"media_ref": "/media/retained/one.jpg", "image_path": str(photo.resolve())}
+    ]
+
+
+def test_tgg_case_photos_known_case_without_media_is_graceful(monkeypatch, tmp_path):
+    import tools.pa_business_tools as pbt
+
+    root = tmp_path / "systems-media"
+    root.mkdir()
+    monkeypatch.setattr(
+        pbt,
+        "_load_runtime_bridge_config",
+        lambda: PABusinessBridgeConfig(operations={}, media_root=root),
+    )
+    monkeypatch.setattr(
+        pbt,
+        "execute_business_operation",
+        lambda *_a, **_kw: {"ok": True, "data": {"files": [], "count": 0}},
+    )
+
+    result = json.loads(pbt._handle_tgg_case_photos({"job_no": "SK/JOB/2604/2376"}))
+
+    assert result == {
+        "ok": True,
+        "jobNo": "SK/JOB/2604/2376",
+        "photos": [],
+        "count": 0,
+        "message": "no retained case photos",
+    }
+
+
+@pytest.mark.parametrize("job_no", ["123", "42", "/tmp/photo.jpg", "SK/JOB/1/2"])
+def test_tgg_case_photos_accepts_only_real_job_numbers(job_no):
+    import tools.pa_business_tools as pbt
+
+    result = json.loads(pbt._handle_tgg_case_photos({"job_no": job_no}))
+    assert "error" in result
+    assert "INVALID_JOB_NO" in result["error"]
+
+
+def test_tgg_case_photos_refuses_traversal_without_path_disclosure(monkeypatch, tmp_path):
+    import tools.pa_business_tools as pbt
+
+    root = tmp_path / "systems-media"
+    root.mkdir()
+    outside = tmp_path / "secret.jpg"
+    _jpeg(outside)
+    monkeypatch.setattr(
+        pbt,
+        "_load_runtime_bridge_config",
+        lambda: PABusinessBridgeConfig(operations={}, media_root=root),
+    )
+    monkeypatch.setattr(
+        pbt,
+        "execute_business_operation",
+        lambda *_a, **_kw: {"ok": True, "files": [{"ref": "/media/../secret.jpg"}]},
+    )
+
+    result = json.loads(pbt._handle_tgg_case_photos({"job_no": "SK/JOB/2604/2376"}))
+
+    assert "error" in result
+    assert "INVALID_MEDIA_REF" in result["error"]
+    assert str(outside) not in result["error"]
 
 
 def test_tenant_scoped_http_operation_injects_client_auth(fake_business_endpoint):
