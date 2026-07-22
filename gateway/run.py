@@ -17515,6 +17515,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # we must inspect the result before claiming success — otherwise
             # the log line is misleading and hides real delivery failures.
             if result is not None and getattr(result, "success", True) is False:
+                # Telegram deliberately rejects normal adapter sends until the
+                # first getUpdates round-trip proves that polling is healthy.
+                # On a fresh gateway boot that round-trip is normally an idle
+                # long poll, so the restart acknowledgement was guaranteed to
+                # be rejected here even though the Bot API send path was ready.
+                # Use the plugin's one-shot REST sender for this lifecycle
+                # message.  It has an independent HTTP client and is already
+                # the supported fallback for out-of-process Telegram delivery.
+                if (
+                    platform is Platform.TELEGRAM
+                    and getattr(result, "error", None) == "send_path_degraded"
+                ):
+                    try:
+                        from plugins.platforms.telegram.adapter import _standalone_send
+
+                        fallback = await _standalone_send(
+                            platform_cfg,
+                            str(chat_id),
+                            "♻ Gateway restarted successfully. Your session continues.",
+                            thread_id=thread_id,
+                        )
+                        if isinstance(fallback, dict) and fallback.get("success"):
+                            logger.info(
+                                "Sent restart notification to %s:%s via standalone Telegram delivery",
+                                platform_str,
+                                chat_id,
+                            )
+                            return (
+                                str(platform_str),
+                                str(chat_id),
+                                str(thread_id) if thread_id else None,
+                            )
+                        logger.warning(
+                            "Restart notification fallback to %s:%s was not delivered: %s",
+                            platform_str,
+                            chat_id,
+                            (fallback or {}).get("error", "standalone sender returned no success"),
+                        )
+                        return None
+                    except Exception as fallback_error:
+                        logger.warning(
+                            "Restart notification fallback to %s:%s failed: %s",
+                            platform_str,
+                            chat_id,
+                            fallback_error,
+                        )
+                        return None
                 logger.warning(
                     "Restart notification to %s:%s was not delivered: %s",
                     platform_str,
