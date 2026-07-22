@@ -875,7 +875,7 @@ WSL_ENVIRONMENT_HINT = (
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh",
-    "managed_modal",
+    "managed_modal", "k8s-agent-sandbox",
 })
 
 
@@ -890,6 +890,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
+    "k8s-agent-sandbox": "an Agent Sandbox workspace (Linux)",
 }
 
 

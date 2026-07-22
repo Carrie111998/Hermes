@@ -163,7 +163,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "k8s-agent-sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -705,7 +705,7 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
       ``skills/plugins/cron/memories`` directory.
     * sandbox-mirror (#32049) — writes that hit the
       ``…/sandboxes/<backend>/<task>/home/.hermes/…`` mirror created by a
-      non-local terminal backend (Docker, Daytona, etc.), where the host
+      non-local terminal backend (Docker, Daytona, k8s-agent-sandbox, etc.), where the host
       Hermes process never reads the mirror and the authoritative file is
       left untouched.
     * container-mirror (#32049 follow-up) — writes from inside a Docker
