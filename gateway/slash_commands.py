@@ -2911,7 +2911,6 @@ class GatewaySlashCommandsMixin:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
-                    ephemeral_user_context=event.ephemeral_user_context,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -3647,6 +3646,7 @@ class GatewaySlashCommandsMixin:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                ephemeral_user_context=event.ephemeral_user_context,
             )
         )
         self._background_tasks.add(_task)

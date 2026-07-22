@@ -2487,6 +2487,13 @@ def run_conversation(
         )
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
+            # Repair can delete or merge entries before the live user turn.
+            # Re-anchor both trackers before deciding which API copy receives
+            # current-turn-only context or which DB row gets the clean override.
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
@@ -3157,6 +3164,14 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages, conversation_history
                 )
+                # The compressor rebuilds ``messages`` and may move the
+                # surviving current user turn. Re-anchor before the next loop
+                # rebuilds the API copy; otherwise volatile current-turn
+                # context can be omitted or attached to a historical user row.
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
                 # This preflight iteration never reaches the provider whether
                 # we skip the turn (handoff guard below) or re-run the loop —
                 # refund the consumed call/budget in BOTH cases, mirroring the
@@ -8224,6 +8239,13 @@ def run_conversation(
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
+                        # Post-tool compaction can move the surviving live user
+                        # turn. Keep API-only platform context anchored to that
+                        # turn before the next provider request is assembled.
+                        current_turn_user_idx = reanchor_current_turn_user_idx(
+                            messages, user_message
+                        )
+                        agent._persist_user_message_idx = current_turn_user_idx
                         if _should_skip_model_call_for_reference_handoff(
                             messages, user_message
                         ):

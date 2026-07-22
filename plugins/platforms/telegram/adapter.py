@@ -9,6 +9,7 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -18,7 +19,7 @@ import re
 import threading
 import time
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -638,8 +639,14 @@ class TelegramAdapter(BasePlatformAdapter):
     # so a 10–20s blip delivers now. Same idea as QQBot._wait_for_reconnection.
     _RECONNECT_WAIT_SECONDS = 15.0
     _RECONNECT_POLL_INTERVAL = 0.5
-    _BACKGROUND_LOCATION_STATE_VERSION = 1
+    # Version 2 namespaces records by Telegram bot identity. Version 1 keys
+    # were only chat/sender scoped, so reusing a profile with another bot token
+    # could expose the first bot's location state to the second bot.
+    _BACKGROUND_LOCATION_STATE_VERSION = 2
     _BACKGROUND_LOCATION_MAX_SUBJECTS = 512
+    _BACKGROUND_LOCATION_MAX_STATE_BYTES = 2 * 1024 * 1024
+    _BACKGROUND_LOCATION_INDEFINITE_LIVE_PERIOD = 0x7FFFFFFF
+    _BACKGROUND_LOCATION_WRITE_TIMEOUT_SECONDS = 10.0
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -719,22 +726,29 @@ class TelegramAdapter(BasePlatformAdapter):
         # as plain text, which is worse than degraded table/task-list rendering
         # for command snippets and mobile handoffs.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
-        # Location shares can be passive telemetry rather than conversational
-        # turns.  Keep this opt-in for compatibility: when enabled, accepted
-        # location and venue updates are persisted under the active profile and
-        # never dispatched to the agent loop. The latest value is attached as
-        # API-only per-turn user context to the same sender's later
-        # text/command turns.
+        # Active live-location shares can be passive telemetry rather than
+        # conversational turns. Keep this opt-in for compatibility: accepted
+        # live updates are persisted under the active profile and never
+        # dispatched to the agent loop. Fixed pins and venues remain ordinary
+        # user messages. The latest live snapshot is attached as API-only
+        # per-turn user context to the same sender's later text/command turns.
         self._background_locations_enabled: bool = self._coerce_bool_extra(
             "background_locations", False
         )
         from hermes_constants import get_hermes_home
 
+        self._background_location_bot_scope = self._resolve_background_location_bot_scope(
+            config.token
+        )
         self._background_location_state_path = (
-            get_hermes_home() / "state" / "telegram_background_locations.json"
+            get_hermes_home()
+            / "state"
+            / "telegram_background_locations"
+            / f"{self._background_location_bot_scope}.json"
         )
         self._background_location_records: Optional[Dict[str, dict]] = None
         self._background_location_write_lock = asyncio.Lock()
+        self._background_location_write_thread: Optional[threading.Thread] = None
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
@@ -4531,6 +4545,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         
         try:
+            # State loading is bounded but still performs disk I/O. Warm the
+            # cache off-loop before polling/webhook handlers can accept an
+            # update, keeping normal text and command dispatch non-blocking.
+            if self._background_locations_enabled:
+                await asyncio.to_thread(self._load_background_location_records)
+
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
@@ -9936,25 +9956,44 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _background_location_subject_key(message: Message) -> Optional[str]:
+    def _resolve_background_location_bot_scope(token: Any) -> str:
+        """Return a non-secret stable identifier for the configured bot.
+
+        Telegram bot tokens begin with the numeric bot ID, which remains stable
+        across token rotation. Tests and defensive callers may provide a token
+        without that shape; hash it so the raw credential is never persisted.
+        """
+        raw_token = str(token or "")
+        bot_id, separator, _secret = raw_token.partition(":")
+        if separator and bot_id.isdigit():
+            return bot_id
+        return f"token-{hashlib.sha256(raw_token.encode('utf-8')).hexdigest()[:16]}"
+
+    def _background_location_subject_key(self, message: Message) -> Optional[str]:
         """Return a privacy-scoped key for one Telegram sender.
 
-        Include the chat as well as the sender so an exact location shared in a
-        private chat can never surface in a group conversation. A DM's topics
-        share the same chat ID, so the location remains useful across them.
-        Prefer ``sender_chat`` when present because Telegram may also provide a
-        synthetic ``from_user`` for anonymous-admin/on-behalf-of messages.
-        Otherwise scope ordinary messages to their user and destination chat.
+        Include bot identity, chat, and sender so an exact location cannot
+        cross bot credentials, conversations, or users. A DM's topics share
+        the same chat ID, so the location remains useful across them. Fail
+        closed for ``sender_chat`` messages: Telegram uses that shared persona
+        for anonymous-admin/on-behalf-of posts, so it cannot identify the
+        individual who should receive the coordinates on a later turn.
         """
+        prefix = f"bot:{self._background_location_bot_scope}"
         chat_id = getattr(getattr(message, "chat", None), "id", None)
         sender_chat_id = getattr(getattr(message, "sender_chat", None), "id", None)
-        if sender_chat_id is not None and chat_id is not None:
-            return f"chat:{chat_id}:sender_chat:{sender_chat_id}"
+        if sender_chat_id is not None:
+            return None
         user_id = getattr(getattr(message, "from_user", None), "id", None)
         if user_id is not None and chat_id is not None:
-            return f"chat:{chat_id}:user:{user_id}"
-        if chat_id is not None:
-            return f"chat:{chat_id}"
+            key = f"{prefix}:chat:{chat_id}:user:{user_id}"
+            chat_type = str(
+                getattr(getattr(message, "chat", None), "type", "") or ""
+            ).lower()
+            thread_id = self._effective_message_thread_id(message)
+            if chat_type not in {"private", "dm"} and thread_id is not None:
+                key += f":thread:{thread_id}"
+            return key
         return None
 
     def _load_background_location_records(self) -> Dict[str, dict]:
@@ -9972,19 +10011,45 @@ class TelegramAdapter(BasePlatformAdapter):
         if path is None:
             from hermes_constants import get_hermes_home
 
-            path = get_hermes_home() / "state" / "telegram_background_locations.json"
+            path = (
+                get_hermes_home()
+                / "state"
+                / "telegram_background_locations"
+                / f"{self._background_location_bot_scope}.json"
+            )
             self._background_location_state_path = path
 
         records: Dict[str, dict] = {}
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            raw_records = payload.get("locations", {}) if isinstance(payload, dict) else {}
+            with path.open("rb") as state_file:
+                raw_payload = state_file.read(
+                    self._BACKGROUND_LOCATION_MAX_STATE_BYTES + 1
+                )
+            if len(raw_payload) > self._BACKGROUND_LOCATION_MAX_STATE_BYTES:
+                raise ValueError("background location state exceeds size limit")
+            payload = json.loads(raw_payload)
+            if not isinstance(payload, dict) or payload.get("version") != (
+                self._BACKGROUND_LOCATION_STATE_VERSION
+            ):
+                raise ValueError("unsupported background location state version")
+            raw_records = payload.get("locations", {})
             if isinstance(raw_records, dict):
-                records = {
-                    str(key): value
+                valid_records = [
+                    (str(key), value)
                     for key, value in raw_records.items()
-                    if isinstance(value, dict)
-                }
+                    if (
+                        str(key).startswith("bot:")
+                        and isinstance(value, dict)
+                        and value.get("source") == "live_location"
+                    )
+                ]
+                valid_records.sort(
+                    key=lambda item: str(item[1].get("recorded_at", "")),
+                    reverse=True,
+                )
+                records = dict(
+                    valid_records[: self._BACKGROUND_LOCATION_MAX_SUBJECTS]
+                )
         except FileNotFoundError:
             pass
         except (OSError, ValueError, TypeError):
@@ -10052,11 +10117,62 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return a non-negative integer without accepting booleans."""
         if isinstance(value, bool):
             return None
+        if isinstance(value, timedelta):
+            seconds = value.total_seconds()
+            if seconds < 0 or not seconds.is_integer():
+                return None
+            return int(seconds)
         try:
             number = int(value)
         except (TypeError, ValueError):
             return None
         return number if number >= 0 else None
+
+    def _active_live_location_period(self, location: Any) -> Optional[int]:
+        """Return an active live-share period, excluding fixed location pins."""
+        live_period = self._coerce_nonnegative_int(
+            getattr(location, "live_period", None)
+        )
+        return live_period if live_period not in (None, 0) else None
+
+    def _is_background_live_location_update(
+        self, update: Update, message: Message
+    ) -> bool:
+        """Whether an update belongs to the silent live-location lifecycle.
+
+        Fixed pins and venues are ordinary conversational input. Telegram sends
+        active live locations with ``live_period`` and uses an edited copy
+        without that field to stop a live share, so both shapes must remain on
+        the background path.
+        """
+        if getattr(message, "venue", None) is not None:
+            return False
+        location = getattr(message, "location", None)
+        if location is None:
+            return False
+        if self._active_live_location_period(location) is not None:
+            return True
+        if not (
+            getattr(update, "edited_message", None)
+            or getattr(update, "edited_channel_post", None)
+        ):
+            return False
+
+        # A stop update has no ``live_period`` either, so identify it by the
+        # already-retained live message. This keeps an unexpected edited fixed
+        # pin on the normal conversational route instead of dropping it.
+        subject_key = self._background_location_subject_key(message)
+        existing = (
+            self._load_background_location_records().get(subject_key)
+            if subject_key is not None
+            else None
+        )
+        return (
+            isinstance(existing, dict)
+            and existing.get("source") == "live_location"
+            and str(existing.get("message_id", ""))
+            == str(getattr(message, "message_id", ""))
+        )
 
     @classmethod
     def _background_location_candidate_is_newer(
@@ -10092,12 +10208,9 @@ class TelegramAdapter(BasePlatformAdapter):
         coordinates are sensitive data.
         """
         subject_key = self._background_location_subject_key(message)
-        venue = getattr(message, "venue", None)
-        location = (
-            getattr(venue, "location", None)
-            if venue is not None
-            else getattr(message, "location", None)
-        )
+        if getattr(message, "venue", None) is not None:
+            return False
+        location = getattr(message, "location", None)
         if subject_key is None or location is None:
             return False
 
@@ -10111,25 +10224,56 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[Telegram] Ignoring background location with invalid coordinates")
             return False
 
-        live_period = getattr(location, "live_period", None)
+        live_period = self._active_live_location_period(location)
         edited = bool(
             getattr(update, "edited_message", None)
             or getattr(update, "edited_channel_post", None)
         )
-        source_kind = "venue" if venue is not None else (
-            "live_location" if live_period is not None or edited else "location"
+        records = dict(self._load_background_location_records())
+        existing_record = records.get(subject_key)
+        telegram_timestamp = self._background_location_timestamp(
+            getattr(message, "edit_date", None) or getattr(message, "date", None)
         )
+        update_id = self._coerce_nonnegative_int(getattr(update, "update_id", None))
+
+        # Telegram exposes ``Location.live_period`` only while a live location
+        # is active. An edited copy of the same live-location message without
+        # that field is its stop update; remove the retained coordinate.
+        if (
+            edited
+            and live_period is None
+            and isinstance(existing_record, dict)
+            and existing_record.get("source") == "live_location"
+            and str(existing_record.get("message_id", ""))
+            == str(getattr(message, "message_id", ""))
+        ):
+            stop_marker: Dict[str, Any] = {}
+            if telegram_timestamp:
+                stop_marker["telegram_timestamp"] = telegram_timestamp
+            if update_id is not None:
+                stop_marker["update_id"] = str(update_id)
+            if self._background_location_candidate_is_newer(
+                existing_record, stop_marker
+            ):
+                records.pop(subject_key, None)
+                return self._write_background_location_records(records)
+            return True
+
+        # Static pins never enter background state. The only non-live update
+        # accepted here is the edited stop record handled above.
+        if live_period is None:
+            return False
+
         now = datetime.now(timezone.utc)
         record: Dict[str, Any] = {
             "latitude": latitude,
             "longitude": longitude,
             "recorded_at": now.isoformat(),
-            "source": source_kind,
+            "source": "live_location",
             "is_edited_update": edited,
             "chat_id": str(getattr(getattr(message, "chat", None), "id", "")),
             "message_id": str(getattr(message, "message_id", "")),
         }
-        update_id = self._coerce_nonnegative_int(getattr(update, "update_id", None))
         if update_id is not None:
             record["update_id"] = str(update_id)
 
@@ -10143,9 +10287,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if thread_id is not None:
             record["thread_id"] = str(thread_id)
 
-        telegram_timestamp = self._background_location_timestamp(
-            getattr(message, "edit_date", None) or getattr(message, "date", None)
-        )
         if telegram_timestamp:
             record["telegram_timestamp"] = telegram_timestamp
 
@@ -10155,36 +10296,16 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if number is not None:
                 record[key] = number
-        try:
-            if live_period is not None and int(live_period) > 0:
-                record["live_period"] = int(live_period)
-        except (TypeError, ValueError):
-            pass
+        record["live_period"] = live_period
+        live_started_at = self._parse_background_location_datetime(
+            self._background_location_timestamp(getattr(message, "date", None))
+        ) or now
+        record["live_started_at"] = live_started_at.isoformat()
+        if live_period != self._BACKGROUND_LOCATION_INDEFINITE_LIVE_PERIOD:
+            record["live_expires_at"] = (
+                live_started_at + timedelta(seconds=live_period)
+            ).isoformat()
 
-        if venue is not None:
-            from gateway.session import neutralize_untrusted_inline_text
-
-            venue_data = {}
-            raw_title = getattr(venue, "title", None)
-            raw_address = getattr(venue, "address", None)
-            title = (
-                neutralize_untrusted_inline_text(raw_title, max_chars=240)
-                if raw_title
-                else ""
-            )
-            address = (
-                neutralize_untrusted_inline_text(raw_address, max_chars=240)
-                if raw_address
-                else ""
-            )
-            if title:
-                venue_data["title"] = title
-            if address:
-                venue_data["address"] = address
-            if venue_data:
-                record["venue"] = venue_data
-
-        records = dict(self._load_background_location_records())
         if not self._background_location_candidate_is_newer(
             records.get(subject_key),
             record,
@@ -10203,6 +10324,10 @@ class TelegramAdapter(BasePlatformAdapter):
             records.clear()
             records.update(newest)
 
+        return self._write_background_location_records(records)
+
+    def _write_background_location_records(self, records: Dict[str, dict]) -> bool:
+        """Atomically replace bot-scoped state and publish the cache on success."""
         payload = {
             "version": self._BACKGROUND_LOCATION_STATE_VERSION,
             "locations": records,
@@ -10230,28 +10355,64 @@ class TelegramAdapter(BasePlatformAdapter):
         update: Update,
         message: Message,
     ) -> bool:
-        """Serialize an atomic whole-state write without blocking the event loop.
+        """Run one bounded atomic write without blocking shutdown on stuck I/O.
 
-        A cancelled coroutine still waits for its worker while holding the lock:
-        ``asyncio.to_thread`` cannot stop an in-flight write, and releasing the
-        lock early would let the next update race that whole-state replacement.
+        Filesystem syscalls cannot be cancelled safely. The worker is therefore
+        a daemon thread, while this coroutine has a deadline. If cancellation or
+        a timeout leaves the worker alive, later updates fail closed instead of
+        racing a second whole-state replacement.
         """
         async with self._background_location_write_lock:
-            write_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self._record_background_location,
-                    update,
-                    message,
+            active_thread = self._background_location_write_thread
+            if active_thread is not None and active_thread.is_alive():
+                logger.warning(
+                    "[Telegram] Background location state write is still in "
+                    "progress; dropping a newer update to avoid a file race"
                 )
+                return False
+
+            loop = asyncio.get_running_loop()
+            result_future = loop.create_future()
+
+            def _resolve_result(result: bool) -> None:
+                if not result_future.done():
+                    result_future.set_result(result)
+
+            def _write() -> None:
+                try:
+                    result = bool(self._record_background_location(update, message))
+                except BaseException:
+                    logger.warning(
+                        "[Telegram] Unexpected background location write failure",
+                        exc_info=True,
+                    )
+                    result = False
+                try:
+                    loop.call_soon_threadsafe(_resolve_result, result)
+                except RuntimeError:
+                    # The event loop may already be closed during shutdown. The
+                    # daemon worker can finish independently without blocking it.
+                    pass
+
+            worker = threading.Thread(
+                target=_write,
+                name="telegram-background-location-writer",
+                daemon=True,
             )
+            self._background_location_write_thread = worker
+            worker.start()
             try:
-                return await asyncio.shield(write_task)
-            except asyncio.CancelledError:
-                # ``to_thread`` cannot stop the worker. Keep the lock until it
-                # exits so a replacement/reconnect update cannot race a
-                # whole-state write that is still in flight.
-                await asyncio.shield(write_task)
-                raise
+                return await asyncio.wait_for(
+                    asyncio.shield(result_future),
+                    timeout=self._BACKGROUND_LOCATION_WRITE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Telegram] Background location state write exceeded %.1fs; "
+                    "continuing without waiting for the filesystem",
+                    self._BACKGROUND_LOCATION_WRITE_TIMEOUT_SECONDS,
+                )
+                return False
 
     def _is_background_location_authorized(self, message: Message) -> bool:
         """Require a definitive gateway auth decision before retaining state.
@@ -10323,19 +10484,29 @@ class TelegramAdapter(BasePlatformAdapter):
         if latitude is None or longitude is None:
             return None
 
-        source = record.get("source")
-        if source not in {"location", "live_location", "venue"}:
-            source = "location"
+        if record.get("source") != "live_location":
+            return None
+        live_period = self._coerce_nonnegative_int(record.get("live_period"))
+        if live_period is None:
+            return None
+        if live_period != self._BACKGROUND_LOCATION_INDEFINITE_LIVE_PERIOD:
+            expires_at = self._parse_background_location_datetime(
+                record.get("live_expires_at")
+            )
+            if expires_at is None or datetime.now(timezone.utc) >= expires_at:
+                return None
         recorded_at = self._parse_background_location_datetime(
             record.get("telegram_timestamp")
         ) or self._parse_background_location_datetime(record.get("recorded_at"))
         lines = [
             "[Background Telegram location context]",
-            "This is passive, user-shared telemetry and may be stale; use it only "
-            "when relevant to the user's explicit request.",
+            "Source: live_location",
+            "This is the latest snapshot of an active live location share, "
+            "not a fixed one-time pin.",
+            "The recorded position may be stale; use it only when relevant to "
+            "the user's explicit request.",
             "Recorded at (UTC): "
             + (recorded_at.isoformat() if recorded_at is not None else "unknown"),
-            f"Source: {source}",
             f"Latitude: {latitude}",
             f"Longitude: {longitude}",
         ]
@@ -10435,7 +10606,13 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg:
             return
-        if getattr(self, "_background_locations_enabled", False):
+        background_locations_enabled = getattr(
+            self, "_background_locations_enabled", False
+        )
+        if (
+            background_locations_enabled
+            and self._is_background_live_location_update(update, msg)
+        ):
             if not self._is_background_location_authorized(msg):
                 logger.warning(
                     "[Telegram] Blocked unauthorized background location in chat %s",
@@ -10474,8 +10651,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if lat is None or lon is None:
             return
 
-        # Build a text message with coordinates and context
-        parts = ["[The user shared a location pin.]"]
+        # Fixed pins and venues are intentional user messages, not ambient
+        # telemetry. They enter the ordinary conversation transcript and can
+        # use the immediately adjacent user text as their instruction.
+        if background_locations_enabled:
+            parts = [
+                "[The user shared a one-time venue location.]"
+                if venue
+                else "[The user shared a one-time location pin.]"
+            ]
+        else:
+            parts = ["[The user shared a location pin.]"]
         if venue:
             title = getattr(venue, "title", None)
             address = getattr(venue, "address", None)
@@ -10486,32 +10672,62 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append(f"latitude: {lat}")
         parts.append(f"longitude: {lon}")
         parts.append(f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}")
-        parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
+        if background_locations_enabled:
+            parts.append(
+                "Use this pin to continue any clear request in the recent "
+                "conversation. If no request is clear, acknowledge it briefly "
+                "and ask what the user would like to do with it."
+            )
+        else:
+            parts.append(
+                "Ask what they'd like to find nearby (restaurants, cafes, etc.) "
+                "and any preferences."
+            )
 
-        event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
+        event = self._build_message_event(
+            msg,
+            # With background live locations enabled, this branch contains
+            # only fixed pins/venues. Treat them as ordinary text turns so
+            # normal batching and busy-input semantics apply in both orders.
+            MessageType.TEXT if background_locations_enabled else MessageType.LOCATION,
+            update_id=update.update_id,
+        )
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
-        await self.handle_message(event)
+        if background_locations_enabled:
+            # Reuse the short, sender-scoped text batch window so a user can
+            # send "find coffee near me" and a pin as one ordinary turn.
+            self._enqueue_text_event(event)
+        else:
+            await self.handle_message(event)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Telegram client-side splits)
     # ------------------------------------------------------------------
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for text message batching.
+        """Session- and sender-scoped key for text message batching.
 
         Applies the installed topic-recovery hook first so DM-topic batches
         coalesce on (and dispatch to) the recovered lane rather than the
-        raw inbound ``message_thread_id`` Telegram may have attached.
+        raw inbound ``message_thread_id`` Telegram may have attached. Sender
+        scoping is independent of downstream shared-session policy: ingress
+        chunks from different people must never share volatile user context.
         """
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        sender_id = str(getattr(event.source, "user_id", "") or "").strip()
+        if not sender_id:
+            raw_message = getattr(event, "raw_message", None)
+            sender = getattr(raw_message, "from_user", None)
+            sender_id = str(getattr(sender, "id", "") or "").strip()
+        return f"{session_key}:ingress-sender:{sender_id or 'unknown'}"
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -10536,9 +10752,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            # A live-location snapshot is volatile per-turn state, not part of
-            # the text aggregation.  Prefer the newest non-empty snapshot so
-            # split Telegram messages do not retain stale coordinates.
+            # A location snapshot is volatile per-turn state, not part of the
+            # text aggregation. Prefer the newest non-empty snapshot so split
+            # Telegram messages do not retain stale coordinates.
             incoming_context = getattr(event, "ephemeral_user_context", None)
             if isinstance(incoming_context, str) and incoming_context.strip():
                 existing.ephemeral_user_context = incoming_context

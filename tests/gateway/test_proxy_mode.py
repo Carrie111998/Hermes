@@ -159,13 +159,11 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
-            ephemeral_user_context="Location: 1.0, 2.0",
         )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
-        assert runner._run_agent_via_proxy.call_args.kwargs["ephemeral_user_context"] == "Location: 1.0, 2.0"
 
 
 class TestRunAgentViaProxy:
@@ -200,7 +198,6 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
-                        ephemeral_user_context="Location: 1.0, 2.0",
                     )
 
         # Verify request URL
@@ -218,7 +215,6 @@ class TestRunAgentViaProxy:
         assert messages[1] == {"role": "user", "content": "Hello"}
         assert messages[2] == {"role": "assistant", "content": "Hi there!"}
         assert messages[3] == {"role": "user", "content": "How are you?"}
-        assert session.captured_json["hermes_ephemeral_user_context"] == "Location: 1.0, 2.0"
 
         # Verify streaming is requested
         assert session.captured_json["stream"] is True

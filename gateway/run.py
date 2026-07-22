@@ -18213,7 +18213,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ephemeral_user_context=event.ephemeral_user_context,
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
-            return "Location context requires a new turn — /steer queued for the next turn."
+            return "Volatile platform context requires a new turn — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
                 accepted = running_agent.steer(steer_text)
@@ -24875,6 +24875,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        ephemeral_user_context: Optional[str] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -24886,12 +24887,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
+                ephemeral_user_context,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
+                ephemeral_user_context,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -24937,6 +24940,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        ephemeral_user_context: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -25037,6 +25041,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
+                        ephemeral_user_context=ephemeral_user_context,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
