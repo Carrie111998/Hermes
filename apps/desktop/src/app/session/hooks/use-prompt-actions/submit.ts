@@ -667,11 +667,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               onRecovered: recoveredId => {
                 // Rebind before the retry: if that retry fails, outer cleanup
                 // must clear the recovered runtime rather than the stale id.
+                const staleSessionId = sessionId
                 sessionId = recoveredId
 
                 if (targetIsCurrentView()) {
                   activeSessionIdRef.current = recoveredId
                   setActiveSessionId(recoveredId)
+                }
+
+                // Move the optimistic turn to the recovered runtime before the
+                // retry so later stream/error cleanup cannot strand duplicates.
+                if (staleSessionId !== recoveredId) {
+                  seedOptimistic(recoveredId)
+                  dropOptimistic(staleSessionId)
                 }
               }
             },
