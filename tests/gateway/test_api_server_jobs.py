@@ -11,6 +11,7 @@ Covers:
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -552,6 +553,19 @@ class TestRunJob:
                     caller="http_api:api_server",
                     reason=None,
                 )
+
+    @pytest.mark.asyncio
+    async def test_run_job_refuses_during_gateway_drain(self, adapter):
+        app = _create_app(adapter)
+        runner = SimpleNamespace(_draining=False, _external_drain_active=True)
+
+        with patch("gateway.run._gateway_runner_ref", lambda: runner):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                payload = await resp.json()
+
+        assert resp.status == 503
+        assert payload["error"]["code"] == "gateway_draining"
 
 
 # ---------------------------------------------------------------------------

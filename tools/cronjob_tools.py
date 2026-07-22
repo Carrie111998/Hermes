@@ -638,8 +638,18 @@ def _execute_job_now(
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
-            return {"claimed": False, "success": False,
-                    "error": "Job is already being fired by the scheduler; not run again."}
+            # claim_job_for_fire returns False for paused/disabled/missing
+            # jobs too — don't mislabel those as "already being fired"
+            # (#60703): that message sends the user chasing a phantom
+            # in-flight run when the job simply isn't runnable.
+            refreshed = get_job(job_id)
+            if refreshed is None:
+                reason = "Job no longer exists; nothing to run."
+            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                reason = "Job is paused/disabled; resume it before running."
+            else:
+                reason = "Job is already being fired by the scheduler; not run again."
+            return {"claimed": False, "success": False, "error": reason}
 
         # The claim already advanced next_run_at for recurring jobs, so the
         # refreshed job carries the post-fire schedule state for the audit
@@ -871,7 +881,7 @@ def cronjob(
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
-                result["execution_skipped"] = (
+                result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
             elif exec_result.get("error"):

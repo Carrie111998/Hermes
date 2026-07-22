@@ -122,7 +122,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     for platform, adapter in adapters.items():
         try:
             if platform == Platform.DISCORD:
-                platforms["discord"] = _build_discord(adapter)
+                platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
         except Exception as e:
@@ -226,7 +226,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     """
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
-        return _build_from_sessions("slack")
+        return await asyncio.to_thread(_build_from_sessions, "slack")
 
     channels: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -270,7 +270,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             continue
 
     # Merge in DM/group entries discovered from session history.
-    for entry in _build_from_sessions("slack"):
+    for entry in await asyncio.to_thread(_build_from_sessions, "slack"):
         if entry.get("id") not in seen_ids:
             channels.append(entry)
             seen_ids.add(entry.get("id"))

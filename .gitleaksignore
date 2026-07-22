@@ -1,0 +1,6 @@
+# 0.19.0 merge (2026-07-21): upstream test fixtures, verified non-secrets
+tests/gateway/test_api_server_bind_guard.py:generic-api-key:165
+tests/hermes_cli/test_auth_provider_gate.py:generic-api-key:187
+tests/run_agent/test_malformed_tool_arguments.py:generic-api-key:30
+tests/run_agent/test_tool_batch_segmentation.py:generic-api-key:227
+tests/test_hermes_constants.py:generic-api-key:693

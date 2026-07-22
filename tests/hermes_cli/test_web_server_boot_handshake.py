@@ -195,7 +195,11 @@ def test_get_status_local_pid_probe_does_not_block_event_loop():
     release_timer.start()
     try:
         with (
-            patch.object(web_server_mod, "get_running_pid", _blocking_pid_probe),
+            # get_status() now dispatches through get_running_pid_cached (v0.19.0
+            # upstream caching layer) instead of calling get_running_pid directly,
+            # still off the event loop via asyncio.to_thread — patch the symbol
+            # actually invoked so this test keeps exercising the real dispatch path.
+            patch.object(web_server_mod, "get_running_pid_cached", _blocking_pid_probe),
             patch.object(web_server_mod, "_resolve_restart_drain_timeout", lambda: 180.0),
         ):
             asyncio.run(_run())
