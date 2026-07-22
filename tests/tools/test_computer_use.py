@@ -3803,7 +3803,15 @@ class TestStartupTimeoutPhaseDetail:
 
         import asyncio
         from unittest.mock import patch as _patch
-        with _patch.object(session._ready_event, "wait", return_value=False), \
+        import tools.computer_use.cua_backend as cua_backend_mod
+        # _start_lifecycle_locked() reassigns self._ready_event to a fresh
+        # threading.Event(), so patching wait on a pre-made instance never
+        # takes — stub the module's Event factory so the replacement event
+        # times out immediately instead of blocking the real 30s.
+        fake_ready = MagicMock()
+        fake_ready.wait.return_value = False
+        with _patch.object(cua_backend_mod, "threading",
+                           MagicMock(Event=MagicMock(return_value=fake_ready))), \
              _patch.object(asyncio, "run_coroutine_threadsafe", return_value=MagicMock()), \
              _patch.object(_CuaDriverSession, "_lifecycle_coro", lambda self: None):
             try:
@@ -3832,7 +3840,13 @@ class TestStartupTimeoutPhaseDetail:
         fake_bridge._loop = MagicMock()
         session._bridge = fake_bridge
 
-        with _patch.object(session._ready_event, "wait", return_value=False), \
+        import tools.computer_use.cua_backend as cua_backend_mod
+        # Same Event-factory stub as above: the pre-made event is replaced
+        # inside _start_lifecycle_locked(), so patch the factory, not it.
+        fake_ready = MagicMock()
+        fake_ready.wait.return_value = False
+        with _patch.object(cua_backend_mod, "threading",
+                           MagicMock(Event=MagicMock(return_value=fake_ready))), \
              _patch.object(asyncio, "run_coroutine_threadsafe", return_value=MagicMock()), \
              _patch.object(_CuaDriverSession, "_lifecycle_coro", lambda self: None):
             try:
