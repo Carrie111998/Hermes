@@ -1034,15 +1034,6 @@ def write_runtime_status(
         pass
 
 
-def _pid_is_alive(pid: int) -> bool:
-    """Return True if a process with the given PID exists."""
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-    return True
-
-
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """Read the persisted gateway runtime health/status information.
 
@@ -1065,7 +1056,7 @@ def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]
         return record
 
     pid = record.get("pid")
-    if pid is not None and not _pid_is_alive(pid):
+    if pid is not None and not _pid_exists(pid):
         record = dict(record)
         record["gateway_state"] = "stopped"
         record["exit_reason"] = record.get("exit_reason") or "pid_not_found"
