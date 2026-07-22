@@ -2424,12 +2424,17 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
     return set(manager.get_portable_mcp_servers())
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook on loaded plugins.
+def invoke_hook(
+    hook_name: str, *, _timeout_s: Optional[float] = None, **kwargs: Any
+) -> List[Any]:
+    """Invoke a lifecycle hook on all loaded plugins.
+
+    ``_timeout_s`` (keyword-only, opt-in) bounds each callback — see
+    ``PluginManager.invoke_hook``. Omit it to keep the prior unbounded behavior.
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+    return get_plugin_manager().invoke_hook(hook_name, _timeout_s=_timeout_s, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
