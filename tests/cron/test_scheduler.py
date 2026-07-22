@@ -3360,6 +3360,13 @@ class TestBuildJobPromptSilentHint:
         system_pos = result.index("do NOT use send_message")
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
+    def test_execution_id_is_not_made_a_recorder_requirement(self):
+        result = _build_job_prompt({
+            "prompt": "Generate a report",
+            "execution_id": "attempt-42",
+        })
+        assert "scheduler execution_id" not in result
+        assert "--execution-id" not in result
 
 
 class TestParseWakeGate:

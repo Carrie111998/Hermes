@@ -647,3 +647,68 @@ def verification_status(
         "session_id": sid,
         "changed_paths": changed_paths,
     }
+
+
+def evidence_bundle_input(
+    *,
+    session_id: str | None,
+    cwd: str | Path | None,
+) -> dict[str, Any]:
+    """Translate the passive runtime ledger into writer-ready Bundle input.
+
+    This deliberately returns no verdict or execution link: those values are
+    writer-owned and only become authoritative when a CLOSE record is appended.
+    The default requires an independent verifier, so a maker's own terminal
+    result cannot silently become a final pass.
+    """
+    status_snapshot = verification_status(session_id=session_id, cwd=cwd)
+    runtime_status = status_snapshot.get("status")
+    evidence = status_snapshot.get("evidence")
+    bundle: dict[str, Any] = {
+        "schema_version": 1,
+        "requirements": {
+            "tests": {"required": True, "minimum_passed": 1},
+            "audits": {"required": False, "minimum_passed": 0},
+            "independent_verifier": True,
+        },
+        "code_diff": None,
+        "report_diff": None,
+        "test_results": [],
+        "audit_results": [],
+        "ci_provenance": None,
+        "fail_closed_gaps": [],
+        "verifier": {
+            "family": "unknown",
+            "provenance_ref": None,
+            "provenance_sha256": None,
+        },
+    }
+    if not isinstance(evidence, dict):
+        gap = "verification_evidence_not_applicable" if runtime_status == "not_applicable" else "verification_evidence_unverified"
+        bundle["fail_closed_gaps"].append(gap)
+        return bundle
+
+    status = runtime_status if runtime_status in {"passed", "failed", "stale", "unverified"} else "unverified"
+    kind = str(evidence.get("kind") or "test")
+    category = "test_results" if kind == "test" else "audit_results"
+    event_id = evidence.get("id")
+    evidence_id = f"verification-event-{event_id}" if isinstance(event_id, int) else "verification-event-unknown"
+    scope = evidence.get("scope") if evidence.get("scope") in {"targeted", "full"} else "unknown"
+    command = evidence.get("command") if isinstance(evidence.get("command"), str) else None
+    exit_code = evidence.get("exit_code") if isinstance(evidence.get("exit_code"), int) else None
+    ref = f"{_db_path()}#event:{event_id}" if isinstance(event_id, int) else None
+    bundle[category].append(
+        {
+            "id": evidence_id,
+            "status": status,
+            "scope": scope,
+            "command": command,
+            "exit_code": exit_code,
+            "ref": ref,
+            "sha256": None,
+            "summary": str(evidence.get("output_summary") or ""),
+        }
+    )
+    if status in {"stale", "unverified"}:
+        bundle["fail_closed_gaps"].append(f"verification_evidence_{status}")
+    return bundle

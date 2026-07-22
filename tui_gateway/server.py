@@ -6953,17 +6953,13 @@ def _(rid, params: dict) -> dict:
     upgrades targeted evidence into a repository-wide guarantee.
     """
     try:
-        from agent.verification_evidence import verification_status
+        from agent.verification_evidence import evidence_bundle_input, verification_status
 
-        return _ok(
-            rid,
-            {
-                "verification": verification_status(
-                    session_id=params.get("session_id") or params.get("session_key"),
-                    cwd=params.get("cwd"),
-                )
-            },
-        )
+        session_id = params.get("session_id") or params.get("session_key")
+        cwd = params.get("cwd")
+        verification = verification_status(session_id=session_id, cwd=cwd)
+        verification["evidence_bundle"] = evidence_bundle_input(session_id=session_id, cwd=cwd)
+        return _ok(rid, {"verification": verification})
     except Exception:
         logger.exception("verification.status failed")
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})

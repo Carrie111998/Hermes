@@ -15,6 +15,7 @@ import contextvars
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -4207,6 +4209,66 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def evidence_bundle_verdict_for_job(job_id: str, *, not_before: float) -> Optional[str]:
+    """Return the current v2 Bundle verdict, or None for legacy/no record.
+
+    Records are correlated by ``task_id`` plus the start boundary of this run.
+    The writer serializes timestamps with second precision, so the scheduler
+    floors its microsecond-precision start time to that shared precision.
+    ``execution_id`` remains optional foreign linkage and never gates a v2
+    record's required-output verdict.
+    """
+    root = _get_hermes_home() / "execution-records"
+    if not root.is_dir():
+        return None
+    latest = None
+    for path in root.glob("**/*.jsonl"):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            meta = record.get("meta", {}) if isinstance(record, dict) else {}
+            if (
+                meta.get("schema_version") != 2
+                or meta.get("task_source") != "cron"
+                or meta.get("task_id") != job_id
+            ):
+                continue
+            try:
+                timestamp = datetime.fromisoformat(str(meta.get("timestamp", "")).replace("Z", "+00:00"))
+                if timestamp.tzinfo is None:
+                    continue
+                epoch = timestamp.timestamp()
+            except ValueError:
+                continue
+            if epoch < math.floor(not_before):
+                continue
+            if latest is None or epoch > latest[0]:
+                latest = (epoch, record)
+    if latest is None:
+        return None
+    events = latest[1].get("events")
+    if not isinstance(events, list):
+        return None
+    bundles = [
+        event.get("details", {}).get("evidence_bundle")
+        for event in events
+        if isinstance(event, dict)
+        and event.get("node") == "CHECK"
+        and event.get("action") == "evidence_bundle_materialized"
+        and isinstance(event.get("details"), dict)
+    ]
+    if len(bundles) != 1 or not isinstance(bundles[0], dict):
+        return None
+    verdict = bundles[0].get("verdict")
+    return verdict if verdict in {"pass", "fail", "needs_review"} else None
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4273,9 +4335,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        run_started_at = _hermes_now().timestamp()
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                dict(job, execution_id=str(execution_id)),
+                defer_agent_teardown=_deferred_agents,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4315,6 +4379,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 ):
                     success = False
                     error = "Required output policy violated: canonical output artifact is missing or empty"
+                if success:
+                    evidence_verdict = evidence_bundle_verdict_for_job(
+                        str(job["id"]),
+                        not_before=run_started_at,
+                    )
+                    if evidence_verdict in {"fail", "needs_review"}:
+                        success = False
+                        error = (
+                            "Required output policy violated: evidence bundle verdict is "
+                            f"{evidence_verdict}"
+                        )
             delivery_mode = _normalize_deliver_value(job.get("deliver", "local"))
             receipt_context: Optional[dict[str, Any]] = None
             if delivery_mode == "local":

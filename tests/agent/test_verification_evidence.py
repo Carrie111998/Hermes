@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent.verification_evidence import (
     classify_verification_command,
+    evidence_bundle_input,
     mark_workspace_edited,
     record_terminal_result,
     verification_status,
@@ -88,6 +89,67 @@ def test_records_passed_then_marks_stale_after_edit(tmp_path, monkeypatch):
     status = verification_status(session_id="s1", cwd=tmp_path)
     assert status["status"] == "stale"
     assert status["changed_paths"] == [str(tmp_path / "src" / "app.ts")]
+
+
+def test_bundle_input_translates_passed_runtime_test_without_writer_owned_fields(tmp_path, monkeypatch):
+    """Runtime ledger may describe proof, but the record writer owns verdict/link injection."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    event = record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="12 passed",
+    )
+    assert event is not None
+
+    bundle = evidence_bundle_input(session_id="s1", cwd=tmp_path)
+
+    assert bundle["requirements"] == {
+        "tests": {"required": True, "minimum_passed": 1},
+        "audits": {"required": False, "minimum_passed": 0},
+        "independent_verifier": True,
+    }
+    assert bundle["test_results"] == [{
+        "id": f"verification-event-{event['id']}",
+        "status": "passed",
+        "scope": "full",
+        "command": "pnpm test",
+        "exit_code": 0,
+        "ref": f"{tmp_path / '.hermes' / 'verification_evidence.db'}#event:{event['id']}",
+        "sha256": None,
+        "summary": "12 passed",
+    }]
+    assert bundle["audit_results"] == []
+    assert bundle["fail_closed_gaps"] == []
+    assert bundle["verifier"] == {
+        "family": "unknown",
+        "provenance_ref": None,
+        "provenance_sha256": None,
+    }
+    assert "verdict" not in bundle
+    assert "execution_record_link" not in bundle
+
+
+def test_bundle_input_marks_stale_runtime_evidence_as_named_fail_closed_gap(tmp_path, monkeypatch):
+    """A post-test edit cannot be silently reused as fresh execution evidence."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    event = record_terminal_result(
+        command="pnpm test",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="green",
+    )
+    assert event is not None
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[str(tmp_path / "src" / "app.ts")])
+
+    bundle = evidence_bundle_input(session_id="s1", cwd=tmp_path)
+
+    assert bundle["test_results"][0]["status"] == "stale"
+    assert bundle["fail_closed_gaps"] == ["verification_evidence_stale"]
 
 
 def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch):

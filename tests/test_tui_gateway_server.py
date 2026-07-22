@@ -10711,6 +10711,8 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
     assert verification["status"] == "passed"
     assert verification["evidence"]["canonical_command"] == "pnpm run test"
     assert verification["evidence"]["scope"] == "full"
+    assert verification["evidence_bundle"]["test_results"][0]["status"] == "passed"
+    assert verification["evidence_bundle"]["requirements"]["independent_verifier"] is True
 
 
 def test_verification_status_outside_workspace_is_not_applicable(monkeypatch, tmp_path):

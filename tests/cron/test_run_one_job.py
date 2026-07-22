@@ -398,6 +398,67 @@ def test_required_output_silent_response_fails_before_delivery(monkeypatch, tmp_
     assert "Required output policy violated" in delivered[0]
 
 
+def test_required_output_needs_review_bundle_fails_before_delivery(monkeypatch, tmp_path):
+    artifact = tmp_path / "critical-report.md"
+    marks = []
+    delivered = []
+    monkeypatch.setattr(s, "create_execution", lambda *_args, **_kwargs: {"id": "evidence-execution"})
+    monkeypatch.setattr(s, "mark_execution_running", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "run_job", lambda *_args, **_kwargs: (True, "canonical report", "report", None))
+    monkeypatch.setattr(s, "evidence_bundle_verdict_for_job", lambda *_args, **_kwargs: "needs_review")
+
+    def save_output(_job_id, output):
+        artifact.write_text(output, encoding="utf-8")
+        return artifact
+
+    monkeypatch.setattr(s, "save_job_output", save_output)
+    monkeypatch.setattr(s, "mark_job_run", lambda _job_id, ok, error=None, **_kwargs: marks.append((ok, error)))
+    monkeypatch.setattr(s, "_deliver_result", lambda _job, content, **_kwargs: delivered.append(content) or None)
+
+    assert s.run_one_job({
+        "id": "evidence-job",
+        "name": "evidence",
+        "deliver": "telegram:123",
+        "required_output": True,
+    }) is True
+
+    assert marks == [(False, "Required output policy violated: evidence bundle verdict is needs_review")]
+    assert len(delivered) == 1
+    assert "needs_review" in delivered[0]
+
+
+def test_evidence_bundle_verdict_for_job_accepts_current_v2_record_without_execution_id(monkeypatch, tmp_path):
+    import json
+    from datetime import datetime, timezone
+
+    root = tmp_path / "execution-records"
+    root.mkdir()
+    # The scheduler starts late in a second, while the writer deliberately
+    # serializes timestamps only to whole-second precision.
+    not_before = datetime(2026, 7, 22, 5, 0, 0, 985_000, tzinfo=timezone.utc).timestamp()
+    record = {
+        "meta": {
+            "schema_version": 2,
+            "task_source": "cron",
+            "task_id": "evidence-job",
+            # execution_id is foreign linkage and intentionally omitted.
+            "timestamp": "2026-07-22T05:00:00+00:00",
+        },
+        "events": [{
+            "node": "CHECK",
+            "action": "evidence_bundle_materialized",
+            "details": {"evidence_bundle": {"verdict": "needs_review"}},
+        }],
+    }
+    (root / "records.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+
+    assert s.evidence_bundle_verdict_for_job(
+        "evidence-job", not_before=not_before
+    ) == "needs_review"
+
+
 def test_external_silence_records_suppressed_receipt_without_sending(monkeypatch, tmp_path):
     import json
 
