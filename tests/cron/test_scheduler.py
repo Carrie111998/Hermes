@@ -3360,13 +3360,59 @@ class TestBuildJobPromptSilentHint:
         system_pos = result.index("do NOT use send_message")
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
-    def test_execution_id_is_not_made_a_recorder_requirement(self):
+    def test_execution_id_injected_when_present(self):
+        """When scheduler provides execution_id, the prompt MUST contain it
+        as --execution-id so the cron agent correlates the execution record."""
+        execution_id = "a34ca666667c49a59636a6d5b105bee6"
+        job_id = "5bed64a3b208"
         result = _build_job_prompt({
             "prompt": "Generate a report",
-            "execution_id": "attempt-42",
+            "id": job_id,
+            "execution_id": execution_id,
         })
-        assert "scheduler execution_id" not in result
+        assert "--execution-id" in result
+        assert execution_id in result
+        assert "--task-id" in result
+        assert job_id in result
+        assert "SCHEDULER EXECUTION CONTEXT" in result
+
+    def test_execution_id_not_injected_when_absent(self):
+        """When scheduler does NOT provide execution_id, the context block
+        is absent and --execution-id is not mentioned."""
+        result = _build_job_prompt({
+            "prompt": "Generate a report",
+            "id": "5bed64a3b208",
+        })
+        assert "SCHEDULER EXECUTION CONTEXT" not in result
         assert "--execution-id" not in result
+
+    def test_parallel_jobs_get_different_execution_ids(self):
+        """Two concurrent _build_job_prompt calls with different execution_ids
+        must produce prompts scoped to their own IDs (no cross-contamination)."""
+        result_a = _build_job_prompt({
+            "prompt": "Report A",
+            "id": "job-a",
+            "execution_id": "exec-a-111",
+        })
+        result_b = _build_job_prompt({
+            "prompt": "Report B",
+            "id": "job-b",
+            "execution_id": "exec-b-222",
+        })
+        assert "exec-a-111" in result_a
+        assert "exec-b-222" not in result_a
+        assert "exec-b-222" in result_b
+        assert "exec-a-111" not in result_b
+
+    def test_execution_context_does_not_replace_run_id(self):
+        """The execution context must instruct the agent that execution_id
+        is correlation only, not a replacement for run_id."""
+        result = _build_job_prompt({
+            "prompt": "Generate a report",
+            "id": "job-abc",
+            "execution_id": "exec-xyz",
+        })
+        assert "must NOT replace run_id" in result
 
 
 class TestParseWakeGate:

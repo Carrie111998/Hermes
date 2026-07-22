@@ -2730,6 +2730,27 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+
+    # Expose the scheduler execution ID + job ID so the cron agent can
+    # populate meta.execution_id / meta.job_id in the execution record v2.
+    # These come from the per-job dict — no process-global env, so parallel
+    # jobs never share state.
+    execution_id = str(job.get("execution_id") or "")
+    job_id_val = str(job.get("id") or "")
+    if execution_id:
+        cron_hint += (
+            "[SCHEDULER EXECUTION CONTEXT]\n"
+            f"execution_id: {execution_id}\n"
+            f"job_id: {job_id_val}\n\n"
+            "When you call record_execution.py, you MUST pass the above "
+            "execution_id and job_id as follows:\n"
+            f"  --execution-id \"{execution_id}\"\n"
+            f"  --task-id \"{job_id_val}\"\n"
+            "Never use placeholder values or omit these flags. "
+            "The execution_id is the scheduler's attempt ID for correlation "
+            "only; it must NOT replace run_id.\n\n"
+        )
+
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
