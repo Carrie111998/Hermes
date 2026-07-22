@@ -1,22 +1,39 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-22 (Task 25 ready for checkpoint; parent Task 24.1 `40f4d016`)
+**Last updated:** 2026-07-22 (Task 25 closed at `c6a9e305`; Task 26A checkpoint approved — read-only reconciliation inspection complete; Task 26B/26C not started/not approved; entire Task 26 not complete)
 
 ---
 
 ## Active Task
 
-**Task 26 — Ambiguous outcome reconciliation** — **not started**. Task 25 human-gated invoke pilot is implemented and ready for checkpoint on base `40f4d016`.
-
-**General Phase 2 lifecycle invoke remains disabled** outside the narrow Task 25 pilot API (`complete_run_manually` only). No CLI, generic invoke router, unattended execution, retry, repair, or marker recovery.
+**None** — Task 26 umbrella incomplete. Task 26B/26C **not started/not approved**. Retry, repair, and marker disposition **remain prohibited**.
 
 ---
 
-## Completed (pending checkpoint)
+## Completed (checkpointed)
+
+### Task 26A — Read-only execution reconciliation inspection
+
+**Status:** ✅ Checkpoint approved — read-only reconciliation inspection complete (parent Task 25 `c6a9e305`)
+**Depends on:** Task 25 `c6a9e305`
+
+**Delivered:**
+
+- `htr/reconciliation_inspection.py` — `inspect_run_completion_reconciliation` (read-only; `complete_run_manually` pilot only)
+- Independent axes: approval control, marker, lifecycle evidence; derived `overall_classification`
+- `safe_to_retry=false` and `marker_disposition_allowed=false` always
+- Semantic inspection digest `htr.reconciliation.inspection.digest.v1` (presentation `observed_at` excluded)
+- `tests/htr/test_reconciliation_inspection.py` — **34 tests**
+
+**Explicitly not implemented:** Task 26B durable reconciliation cases; Task 26C marker disposition; retry; repair; Recovery/Successor Runs; CLI
+
+---
+
+## Completed (checkpointed)
 
 ### Task 25 — Human-gated single-API invoke pilot
 
-**Status:** ✅ Implemented — ready for checkpoint (parent Task 24.1 `40f4d01638f3d2f3c16c9c8ef451ab1c20fc21f0`)
+**Status:** ✅ Checkpointed (`c6a9e30542ac2a37bbe83e1f55b0b0f85e443e9b`; parent Task 24.1 `40f4d016`)
 **Depends on:** Task 24.1 `40f4d016`
 
 **Delivered:**

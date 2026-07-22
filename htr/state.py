@@ -304,6 +304,84 @@ class InvokeRunCompletionResult:
     outcome_digest: str
 
 
+ERROR_CODE_RECONCILIATION_INSPECTION: Final = "RECONCILIATION_INSPECTION_FAILED"
+ERROR_CODE_RECONCILIATION_UNSUPPORTED: Final = "RECONCILIATION_UNSUPPORTED_APPROVAL"
+ERROR_CODE_RECONCILIATION_EVIDENCE: Final = "RECONCILIATION_EVIDENCE_INTEGRITY"
+
+
+class ReconciliationInspectionError(HTRStateError):
+    """Base error for Task 26A read-only reconciliation inspection."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = ERROR_CODE_RECONCILIATION_INSPECTION,
+        approval_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.approval_id = approval_id
+
+
+class ReconciliationUnsupportedApprovalError(ReconciliationInspectionError):
+    """Raised when approval is outside Task 26A pilot scope."""
+
+    def __init__(self, message: str, *, approval_id: str | None = None) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_RECONCILIATION_UNSUPPORTED,
+            approval_id=approval_id,
+        )
+
+
+class ReconciliationEvidenceIntegrityError(ReconciliationInspectionError):
+    """Raised when inspection cannot resolve trustworthy identity/evidence."""
+
+    def __init__(self, message: str, *, approval_id: str | None = None) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_RECONCILIATION_EVIDENCE,
+            approval_id=approval_id,
+        )
+
+
+@dataclass(frozen=True)
+class RunCompletionReconciliationInspection:
+    """Immutable read-only reconciliation inspection for Task 25 pilot."""
+
+    inspection_schema_version: str
+    inspection_projection_version: str
+    approval_id: str
+    approval_digest: str
+    claim_id: str | None
+    claim_digest: str | None
+    outcome_class: str | None
+    outcome_digest: str | None
+    run_id: str
+    bound_api: str
+    event_id: str
+    htr_runs_root_path_digest: str
+    approval_control_state: str
+    marker_state: str
+    lifecycle_evidence_state: str
+    integrity_state: str
+    overall_classification: str
+    reason_codes: tuple[str, ...]
+    observed_completion_record_fingerprint: str | None
+    observed_event_semantic_fingerprint: str | None
+    observed_manifest_status: str | None
+    current_observation_semantic_digest: str | None
+    source_observation_digest: str
+    inspection_semantic_digest: str
+    safe_to_retry: bool
+    marker_disposition_allowed: bool
+    reconciliation_case_required: bool
+    recovery_protocol_required: bool
+    observed_at: str | None
+
+
+
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:
     """Return True when *to_status* is legal from *from_status*."""
     if from_status not in TASK_STATUSES or to_status not in TASK_STATUSES:

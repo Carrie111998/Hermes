@@ -2,6 +2,31 @@
 
 ---
 
+## 2026-07-22 — Task 26A: Read-only execution reconciliation inspection (checkpoint approved)
+
+**Implementer:** Cursor (isolated candidate tree; parent Task 25 `c6a9e305`)
+**Scope:** `htr/reconciliation_inspection.py`, `htr/state.py`, `htr/__init__.py`, `tests/htr/test_reconciliation_inspection.py`, runtime docs
+**Production Runtime modified:** Yes — read-only inspection API only
+**Marker mutation:** No — strictly read-only; no bootstrap/acquire/disposition
+**Task 26B/26C:** Not started
+**Verification:** `tests/htr/test_reconciliation_inspection.py` — **34 passed**; full tracked HTR suite **1657 passed** (28 files; baseline 1623 + 34)
+
+### Contract
+
+- Public API: `inspect_run_completion_reconciliation(approval_id, *, base_dir=None)`
+- Pilot scope: `complete_run_manually` approvals only
+- Always `safe_to_retry=false`, `marker_disposition_allowed=false`
+- Three independent evidence axes + derived `overall_classification`
+- Semantic digest: `htr.reconciliation.inspection.digest.v1` (excludes `observed_at`)
+
+### Explicitly not implemented
+
+- Durable reconciliation cases (Task 26B)
+- Marker disposition protocol (Task 26C)
+- Retry, repair, invoke, Recovery/Successor Runs, CLI
+
+---
+
 ## 2026-07-18 — Task 3: Task Card + Result Contract + Artifact Manifest
 
 **Implementer:** Cursor

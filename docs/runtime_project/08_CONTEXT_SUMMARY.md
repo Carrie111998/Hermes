@@ -1,14 +1,14 @@
 # Context Summary — HTR (for GPT-5.6-Sol)
 
 **Generated:** 2026-07-22
-**Task:** Task 25 — Human-gated single-API invoke pilot (ready for checkpoint)
-**Status:** Task 24 production checkpointed `af4868054`; **Task 24.1 checkpointed `40f4d016`**; **Task 25 implemented and ready for this checkpoint**; general lifecycle invoke remains disabled outside the Task 25 pilot API; **Task 26 not started**
+**Task:** Task 26A — Read-only execution reconciliation inspection (checkpoint approved)
+**Status:** Task 25 checkpointed `c6a9e305`; **Task 26A checkpoint approved** — read-only reconciliation inspection complete; **Task 26B/26C not started/not approved**; retry, repair, and marker disposition remain prohibited; **entire Task 26 not complete**; general lifecycle invoke remains disabled outside Task 25 pilot API
 
 ---
 
 ## 1. One-paragraph state
 
-Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1ed651`) delivered read-only observe. Task 20 (`2fa580b5`) accepted **Policy C** (docs). Task 21 delivered read-only derived action plans. Task 22 enforces Policy C immutable seal at all 25 public/run-aware mutation boundaries. Task 23 adds a run-scoped durable write barrier for those same 25 mutators. **Task 24** (`af4868054`) adds authoritative approval control. **Task 24.1** (`40f4d016`) repaired the execution-lock contention test harness. **Task 25** (ready for checkpoint on `40f4d016`) adds `invoke_approved_run_completion` for approved `complete_run_manually` only — one continuous marker across claim, invoke, verification, and outcome; no CLI, generic router, retry, reconciliation, or Recovery Run. **Task 26 reconciliation has not started.**
+Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1ed651`) delivered read-only observe. Task 20 (`2fa580b5`) accepted **Policy C** (docs). Task 21 delivered read-only derived action plans. Task 22 enforces Policy C immutable seal at all 25 public/run-aware mutation boundaries. Task 23 adds a run-scoped durable write barrier for those same 25 mutators. **Task 24** (`af4868054`) adds authoritative approval control. **Task 24.1** (`40f4d016`) repaired the execution-lock contention test harness. **Task 25** (`c6a9e305`) adds `invoke_approved_run_completion` for approved `complete_run_manually` only. **Task 26A** (checkpoint approved) adds read-only `inspect_run_completion_reconciliation` — derived evidence only; no case persistence, marker disposition, retry, or Recovery Run. **Task 26B/26C not started.**
 
 ---
 
@@ -18,7 +18,7 @@ Phase 1 remains **semantically closed** at Task 17.1 `8fea4daa0`. Task 19 (`57a1
 |-----------|---------|
 | **Immutable finalization** | Valid closure → original run sealed against normal HTR mutation (Task 22 ✅) |
 | **Recovery/Successor Run** | Remediation in separate linked run (Task 27+) |
-| **Write-path gate** | Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval control ✅; Task 25 human-gated invoke pilot ✅ (checkpoint pending) |
+| Write-path gate | Task 22 seal ✅; Task 23 write barrier ✅; Task 24 approval + Task 25 invoke ✅ (`c6a9e305`); Task 26A read-only inspection ✅ (checkpoint approved) |
 | **Read-only paths** | Observe and plan allowed on finalized runs; literal zero-write replay/rejection preserved |
 
 ---

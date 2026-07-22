@@ -122,7 +122,9 @@ Runtime must not append events or write SoT directly. Writes only through allowl
 
 **Task 24 authoritative approval control (checkpointed):** project-scoped SoT at `{runs_root}/.control/approvals/{approval_id}/` with immutable O_EXCL records (`issue.json`, optional `revoke.json`, singleton `claim.json`, singleton `outcome.json`); separate `htr.approval.digest.v1`; mandatory expiry (max 24h); explicit `event_id` for event-appending APIs; read validation advisory only; dedicated `_approval_control_barrier` reusing Task 23 marker without lifecycle seal bypass; internal `_approval_use_session` for Task 25 continuous marker; no lifecycle invoke; no writes to run-tree `approvals.jsonl`; no Recovery/retry/repair/marker reconciliation.
 
-**First human-gated invoke (Task 25 — ready for checkpoint):** pre-observe, plan + approval validation, lock (Task 23 ✅), claim inside one continuous approval-use session, **single** allowlisted API (`complete_run_manually`), **mandatory post-observe verification**, outcome v2 (`consumed` | `ambiguous`), fail-stop (no blind retry). Verification cannot be deferred. Task 26 reconciliation not implemented. No retry, repair, marker recovery, or Recovery/Successor Runs.
+**First human-gated invoke (Task 25 — checkpointed `c6a9e305`):** pre-observe, plan + approval validation, lock (Task 23 ✅), claim inside one continuous approval-use session, **single** allowlisted API (`complete_run_manually`), **mandatory post-observe verification**, outcome v2 (`consumed` | `ambiguous`), fail-stop (no blind retry). Verification cannot be deferred. No retry, repair, marker recovery, or Recovery/Successor Runs.
+
+**Task 26A read-only reconciliation inspection (checkpoint approved — complete):** `inspect_run_completion_reconciliation` for the Task 25 `complete_run_manually` pilot only. Inspects approval/control evidence, read-only marker metadata, and lifecycle JSON/event/manifest correspondence; returns derived `RunCompletionReconciliationInspection` with independent axes and `overall_classification`. Always `safe_to_retry=false` and `marker_disposition_allowed=false`. Literal read-only — no `.control/reconciliation` store, no marker bootstrap/acquire/disposition, no invoke/retry/repair. Semantic digest `htr.reconciliation.inspection.digest.v1`. **Task 26B** (durable cases) and **Task 26C** (marker disposition protocol) **not started**. Existing markers remain `occupied_unknown` to normal writers.
 
 Ambiguous outcomes include: not started; completed and verified; failed before mutation; may-have-completed (lost ack); SoT/event disagree; post-write verification failed; escalation required.
 
@@ -166,8 +168,9 @@ read-only observability          ← Task 19 ✅
 → immutable finalized-run enforcement ← Task 22 ✅
 → durable run write barrier          ← Task 23 ✅
 → authoritative scoped approval      ← Task 24 ✅
-→ human-gated single-API invoke  ← Task 25 ✅ (ready for checkpoint)
-→ ambiguous-outcome reconciliation ← Task 26
+→ human-gated single-API invoke  ← Task 25 ✅ (`c6a9e305`)
+→ read-only reconciliation inspection ← Task 26A ✅ (checkpoint approved)
+→ durable reconciliation cases / marker disposition ← Task 26B / 26C (not started)
 → Recovery/Successor Run protocol ← Task 27
 → bounded retry and repair       ← Task 28
 → selective unattended automation
@@ -203,8 +206,11 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 | 22 | Immutable finalized-run enforcement | ✅ Task 22 |
 | 23 | Durable run write barrier | ✅ Task 23 |
 | 24 | Approval control schema + API | ✅ Task 24 |
-| 25 | Human-gated single-API invoke pilot | Next (not started) |
-| 26 | Execution reconciliation / ambiguous outcomes | |
+| 25 | Human-gated single-API invoke pilot | ✅ `c6a9e305` |
+| 26A | Read-only reconciliation inspection | ✅ Checkpoint approved (read-only complete) |
+| 26B | Durable reconciliation cases | Not started |
+| 26C | Marker disposition protocol | Not started |
+| 26 | Execution reconciliation (umbrella) | Split 26A/26B/26C |
 | 27 | Recovery/Successor Run protocol | Architect schema task |
 | 28 | Bounded retry/repair framework | |
 | 29 | Advisory artifact/link inspection | |
@@ -220,6 +226,7 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Task 20 records Policy C; Task 22 **implements finalized-run seal**; Task 23 **implements durable run write barrier**.
 - Recovery/Successor protocol remains **defined, not implemented** (Task 27+).
 - Task 24 **checkpointed** — authoritative approval control delivered.
-- Task 25 **implemented** — narrow `complete_run_manually` pilot only; ready for checkpoint; Task 26 reconciliation not started.
+- Task 25 **checkpointed** (`c6a9e305`) — narrow `complete_run_manually` pilot only.
+- Task 26A **checkpoint approved** — read-only reconciliation inspection complete; retry, repair, and marker disposition remain prohibited; Task 26B/26C not started/not approved; entire Task 26 not complete.
 - No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.
