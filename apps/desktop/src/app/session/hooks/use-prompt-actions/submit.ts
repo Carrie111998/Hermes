@@ -648,7 +648,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
-          await withSessionNotFoundResume(
+          const { sessionId: usedSessionId } = await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
             liveId =>
@@ -665,6 +665,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               requestGateway,
               driftReason: sessionDriftReason,
               onRecovered: recoveredId => {
+                // Rebind before the retry: if that retry fails, outer cleanup
+                // must clear the recovered runtime rather than the stale id.
+                sessionId = recoveredId
+
                 if (targetIsCurrentView()) {
                   activeSessionIdRef.current = recoveredId
                   setActiveSessionId(recoveredId)
@@ -676,6 +680,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
+          // From this point onward the recovered runtime owns all success/error
+          // cleanup. A failed retry must not strand busy state or attach its
+          // error to the stale runtime session.
+          sessionId = usedSessionId
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
