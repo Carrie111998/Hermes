@@ -1,7 +1,7 @@
 ---
 name: workflow-engine
 description: "Run DAG-based pipelines via workflow_start — fire-and-forget with kanban notification."
-version: 3.0.0
+version: 3.1.0
 author: Newton
 license: MIT
 metadata:
@@ -27,6 +27,24 @@ The workflow engine is a **plugin** that registers `workflow_start` and related 
 
 **Don't use for:** single tool calls, simple sequential tasks a single agent can handle, or anything that needs real-time interaction mid-workflow (use `delegate_task` for that).
 
+## Prerequisites
+
+- The `workflow` plugin must be enabled in `~/.hermes/config.yaml`:
+  ```yaml
+  plugins:
+    enabled:
+      - workflow
+  ```
+- Your profile must have `"workflow"` in its toolsets:
+  ```yaml
+  tools:
+    toolsets:
+      - hermes-cli
+      - workflow
+  ```
+- `HERMES_FLEET_PIPELINES` must point to the directory containing pipeline YAMLs
+- The gateway must be running (it runs the kanban dispatcher and notifier)
+
 ## How to Run
 
 ### Quick reference
@@ -44,7 +62,7 @@ The workflow engine is a **plugin** that registers `workflow_start` and related 
 
 ```python
 workflow_start(
-    workflow="ideation",
+    workflow="my-pipeline",
     context={"topic": "Should we adopt X?"},
     inputs={"detail_level": "deep"},
     board="my-board",  # optional board override
@@ -55,8 +73,8 @@ Returns immediately:
 ```json
 {
   "status": "dispatched",
-  "workflow": "ideation",
-  "message": "Workflow 'ideation' started — cards created, final node will notify on completion"
+  "workflow": "my-pipeline",
+  "message": "Workflow 'my-pipeline' started — cards created, final node will notify on completion"
 }
 ```
 
@@ -85,14 +103,14 @@ The calling agent is not blocked — the supervisor runs in the background.
 
 When a card blocks with a non-LOOP reason, the engine:
 
-1. Detects the block in `_monitor_layer`
+1. Detects the block in the monitoring loop
 2. Calls the analyst to evaluate the situation
 3. Pushes a structured assessment to your session:
 
-> ⚠️ Workflow anomaly: **qa-review** blocked in **ideation**
-> **Summary:** Coverage below threshold
-> **Detail:** The qa-review node blocked because coverage was 60% vs 80% required.
-> **Action:** Newton needs to improve test coverage before re-verification.
+> ⚠️ Workflow anomaly: **node-name** blocked in **pipeline-name**
+> **Summary:** One-line summary of what happened
+> **Detail:** Explanation of the failure and its impact
+> **Action:** What you should do next
 
 You don't need to poll or subscribe to every card — the engine handles detection and notification automatically.
 
@@ -138,10 +156,10 @@ Workflows declare a `roles:` block mapping role names to profile names. Nodes re
 
 ```yaml
 roles:
-  analyst: nikola
-  coder: newton
-  qa: raven
-  security: ada
+  analyst: analyst-profile
+  coder: coder-profile
+  reviewer: reviewer-profile
+  security: security-profile
 
 nodes:
   analyst-spec:
@@ -153,6 +171,8 @@ nodes:
     depends_on:
       - analyst-spec
 ```
+
+To change the agent for a role, edit one line in `roles:`. The workflow is portable — give it to someone and they just change the profile names in the roles block.
 
 ### Node fields
 
@@ -181,7 +201,7 @@ Up to 3 cycles; the 4th rejection escalates to the orchestrator.
 Variables resolve from:
 1. Engine-injected context: `{run_id}`, `{date}`
 2. Input parameters: `{inputs.topic}`, `{inputs.pr_link}`
-3. Upstream node outputs: `{researcher.findings}`, `{setup.raw-context}`
+3. Upstream node outputs: `{upstream-node.output-name}`
 
 ## Pitfalls
 
@@ -192,10 +212,13 @@ Variables resolve from:
 | Node stuck "running" but worker completed | Kanban dispatcher polls the wrong board | Verify card is on the expected board |
 | Template substitution failure | Context dict missing a key referenced in YAML | Ensure ALL `{placeholders}` in YAML are in the context dict |
 | Workflow doesn't resume after unblock | Engine already returned — no monitoring loop | Expected. Kanban dispatcher picks up unblocked cards on next tick |
-| Unexpected block, no notification | Analyst or adapter unavailable | Check logs; fallback is "escalate to Sherlock" |
+| Unexpected block, no notification | Analyst or adapter unavailable | Check logs for errors |
+| Plugin tools not visible to LLM | `"workflow"` not in agent's toolsets | Add `"workflow"` to `tools.toolsets` in agent config |
 
 ## Verification Checklist
 
+- [ ] Plugin enabled: `plugins: enabled: [workflow]` in config
+- [ ] Toolset enabled: `"workflow"` in agent's `tools.toolsets`
 - [ ] Pipeline exists: `workflow_list()` shows it
 - [ ] Pipeline validates: `workflow_validate(workflow="name")` returns `valid: true`
 - [ ] All required inputs provided
