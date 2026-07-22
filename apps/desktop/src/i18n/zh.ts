@@ -1889,6 +1889,7 @@ export const zh: Translations = {
       handoffOrigin: platform => `从 ${platform} 转接`,
       ownedByProfile: profile => `配置档：${profile}`,
       bridgeProvider: provider => `提供方：${provider}`,
+      sessionDriver: driver => `驱动方：${driver}`,
       bridgeMirrorState: state => `镜像状态：${state}`,
       bridgeCatalogOnly: '仅目录',
       bridgeContinued: '已继续',

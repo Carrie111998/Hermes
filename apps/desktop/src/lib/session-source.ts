@@ -106,6 +106,29 @@ export function handoffOriginSource(
   return id
 }
 
+// Driver slugs (persisted by hermes_state.detect_session_driver) that map to a
+// harness with an existing source label; unknown slugs fall back to the
+// generic capitalized rendering in sessionSourceLabel.
+const DRIVER_SOURCE_IDS: Record<string, string> = {
+  'claude-code': 'claude',
+  codex: 'codex'
+}
+
+/**
+ * Label for the agent that DROVE a local session (recorded at creation from
+ * the spawning process environment) — distinct from bridge_provider, which
+ * identifies whose transcript a catalog row mirrors.
+ */
+export function sessionDriverLabel(driver: null | string | undefined): string | null {
+  const id = normalizeSessionSource(driver)
+
+  if (!id) {
+    return null
+  }
+
+  return sessionSourceLabel(DRIVER_SOURCE_IDS[id] ?? id)
+}
+
 export function sessionSourceLabel(source: null | string | undefined): string | null {
   const id = normalizeSessionSource(source)
 
