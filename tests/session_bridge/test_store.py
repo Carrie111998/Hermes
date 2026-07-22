@@ -964,6 +964,7 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
         "claude_visibility_security_v24",
         "claude_auth_recovery_call_started_v25",
         "claude_characterization_abort_max_attempts_v27",
+        "claude_characterization_events_v28",
     }
     first._conn.execute(
         """UPDATE session_claude_visibility_jobs
@@ -3937,6 +3938,120 @@ def test_characterization_pending_without_launch_can_reconcile_exact_absence_for
         "claude_visible": 0,
         "claude_failed": 0,
     }
+
+
+def test_legacy_characterization_table_allows_store_launch_abort_after_v28(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v26-characterization-store.db"
+    database = SessionDB(path)
+    store = SessionBridgeStore(
+        database, clock=lambda: 100.0, local_timezone=timezone.utc
+    )
+    operation_id = "47474747-4747-4747-8747-474747474747"
+    candidate, identity = _claude_characterization_identity(operation_id)
+    store.enqueue_claude_visibility_characterization(
+        candidate,
+        identity,
+        _CLAUDE_MARKER_SECRET,
+        operation_id=operation_id,
+        evidence_digest="a" * 64,
+    )
+    reconciliation = store.claim_claude_visibility_reconciliation(
+        100.0, 60, expected_job_id=identity.job_id
+    )
+    store.record_claude_visibility_exact_id_absent(
+        identity.job_id,
+        reconciliation.lease_digest,
+        identity.claude_uuid,
+        0,
+        "b" * 64,
+    )
+    database.close()
+
+    legacy = sqlite3.connect(path)
+    try:
+        legacy.execute("PRAGMA foreign_keys=ON")
+        legacy.executescript(
+            """DROP TRIGGER trg_claude_characterization_event_identity;
+            DROP TRIGGER trg_claude_characterization_cleanup_order;
+            DROP TRIGGER trg_claude_characterization_abort_order;
+            DROP TRIGGER trg_claude_characterization_event_no_update;
+            DROP TRIGGER trg_claude_characterization_event_no_delete;
+            ALTER TABLE session_claude_visibility_characterization_events
+                RENAME TO session_claude_visibility_characterization_events_v27;
+            CREATE TABLE session_claude_visibility_characterization_events (
+                job_id TEXT NOT NULL,
+                event_kind TEXT NOT NULL CHECK (
+                    event_kind IN ('registered', 'cleanup_completed')
+                ),
+                operation_id TEXT NOT NULL,
+                source_session_id TEXT NOT NULL,
+                bridge_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                reserved_claude_uuid TEXT NOT NULL,
+                evidence_digest TEXT NOT NULL CHECK (
+                    length(evidence_digest) = 64
+                    AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+                created_at REAL NOT NULL,
+                PRIMARY KEY (job_id, event_kind),
+                UNIQUE (operation_id, event_kind),
+                UNIQUE (source_session_id, event_kind),
+                UNIQUE (bridge_id, event_kind),
+                UNIQUE (idempotency_key, event_kind),
+                UNIQUE (reserved_claude_uuid, event_kind),
+                FOREIGN KEY (job_id, reserved_claude_uuid)
+                    REFERENCES session_claude_visibility_jobs(
+                        id, reserved_claude_uuid
+                    ) ON DELETE RESTRICT
+            );
+            INSERT INTO session_claude_visibility_characterization_events
+            SELECT *
+            FROM session_claude_visibility_characterization_events_v27;
+            DROP TABLE session_claude_visibility_characterization_events_v27;
+            DELETE FROM session_bridge_migrations
+            WHERE migration_name = 'claude_characterization_events_v28';
+            UPDATE schema_version SET version = 27;
+            """
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    upgraded = SessionDB(path)
+    try:
+        migrated_store = SessionBridgeStore(
+            upgraded, clock=lambda: 100.0, local_timezone=timezone.utc
+        )
+        terminal = migrated_store.record_claude_visibility_characterization(
+            job_id=identity.job_id,
+            operation_id=operation_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=identity.bridge_id,
+            idempotency_key=identity.idempotency_key,
+            reserved_claude_uuid=identity.claude_uuid,
+            native_name=candidate.native_name,
+            source_cwd=candidate.source_cwd,
+            signed_marker=identity.signed_marker,
+            evidence_digest="a" * 64,
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            cleanup_completed=False,
+            launch_aborted=True,
+        )
+        assert terminal["status"] == "launch_aborted"
+        assert _rows(
+            upgraded,
+            """SELECT event_kind FROM
+                   session_claude_visibility_characterization_events
+               WHERE job_id = ? ORDER BY event_kind""",
+            (identity.job_id,),
+        ) == [
+            {"event_kind": "launch_aborted"},
+            {"event_kind": "registered"},
+        ]
+    finally:
+        upgraded.close()
 
 
 def test_characterization_abort_consumes_exact_absence_after_max_attempt_failure(

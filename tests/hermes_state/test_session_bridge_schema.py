@@ -331,57 +331,467 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
         conn.close()
 
 
-def test_v26_database_replaces_abort_trigger_for_exact_max_attempt_absence(tmp_path):
-    db_path = tmp_path / "v26-characterization-abort-trigger.db"
+CLAUDE_CHARACTERIZATION_EVENT_COLUMNS = (
+    "job_id",
+    "event_kind",
+    "operation_id",
+    "source_session_id",
+    "bridge_id",
+    "idempotency_key",
+    "reserved_claude_uuid",
+    "evidence_digest",
+    "created_at",
+)
+
+CLAUDE_CHARACTERIZATION_EVENT_UNIQUE_COLUMNS = {
+    ("job_id", "event_kind"),
+    ("operation_id", "event_kind"),
+    ("source_session_id", "event_kind"),
+    ("bridge_id", "event_kind"),
+    ("idempotency_key", "event_kind"),
+    ("reserved_claude_uuid", "event_kind"),
+}
+
+CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES = {
+    "trg_claude_characterization_event_identity",
+    "trg_claude_characterization_cleanup_order",
+    "trg_claude_characterization_abort_order",
+    "trg_claude_characterization_event_no_update",
+    "trg_claude_characterization_event_no_delete",
+}
+
+
+def _normalized_sql(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def _characterization_trigger_sql(
+    conn: sqlite3.Connection,
+) -> dict[str, str]:
+    return {
+        row[0]: _normalized_sql(row[1])
+        for row in conn.execute(
+            """SELECT name, sql FROM sqlite_master
+               WHERE type = 'trigger'
+                 AND tbl_name =
+                     'session_claude_visibility_characterization_events'"""
+        ).fetchall()
+    }
+
+
+def _characterization_event_rows(
+    conn: sqlite3.Connection,
+) -> list[tuple]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT "
+            + ", ".join(CLAUDE_CHARACTERIZATION_EVENT_COLUMNS)
+            + " FROM session_claude_visibility_characterization_events "
+            "ORDER BY job_id, event_kind"
+        ).fetchall()
+    ]
+
+
+def _characterization_unique_columns(
+    conn: sqlite3.Connection,
+) -> set[tuple[str, ...]]:
+    column_sets = set()
+    for index in conn.execute(
+        "PRAGMA index_list('session_claude_visibility_characterization_events')"
+    ).fetchall():
+        if index[2] == 1:
+            column_sets.add(
+                tuple(
+                    row[2]
+                    for row in conn.execute(
+                        f'PRAGMA index_info("{index[1]}")'
+                    ).fetchall()
+                )
+            )
+    return column_sets
+
+
+def _characterization_foreign_keys(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[str, str, str, str], ...]:
+    return tuple(
+        (row[3], row[4], row[2], row[6])
+        for row in conn.execute(
+            "PRAGMA foreign_key_list("
+            "'session_claude_visibility_characterization_events')"
+        ).fetchall()
+    )
+
+
+def _characterization_table_sql(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type = 'table'
+             AND name =
+                 'session_claude_visibility_characterization_events'"""
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _prepare_legacy_characterization_events_database(
+    db_path: Path, *, schema_version: int
+) -> tuple[list[tuple], dict[str, str], str]:
     current = hermes_state.SessionDB(db_path)
-    current.close()
+    try:
+        current._conn.execute(
+            """INSERT INTO session_claude_visibility_jobs (
+                   id, source_session_id, bridge_id, idempotency_key,
+                   reserved_claude_uuid, native_name, source_provider,
+                   source_cwd, signed_marker, state, attempts,
+                   next_attempt_at, eligible_at, created_at, updated_at
+               ) VALUES (
+                   'legacy-job', 'codex:legacy-operation', 'legacy-bridge',
+                   'legacy-idempotency',
+                   '11111111-1111-4111-8111-111111111111',
+                   '[Codex] legacy characterization', 'codex', 'C:/legacy',
+                   'legacy-signed-marker', 'claude_retry', 7,
+                   100, 100, 100, 100
+               )"""
+        )
+        current._conn.execute(
+            """INSERT INTO session_claude_visibility_characterization_events (
+                   job_id, event_kind, operation_id, source_session_id,
+                   bridge_id, idempotency_key, reserved_claude_uuid,
+                   evidence_digest, created_at
+               ) VALUES (
+                   'legacy-job', 'registered',
+                   '22222222-2222-4222-8222-222222222222',
+                   'codex:legacy-operation', 'legacy-bridge',
+                   'legacy-idempotency',
+                   '11111111-1111-4111-8111-111111111111', ?, 100.125
+               )""",
+            ("a" * 64,),
+        )
+        current._conn.commit()
+        expected_rows = _characterization_event_rows(current._conn)
+        expected_trigger_sql = _characterization_trigger_sql(current._conn)
+    finally:
+        current.close()
+
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("DROP TRIGGER trg_claude_characterization_abort_order")
-        conn.execute(
-            """CREATE TRIGGER trg_claude_characterization_abort_order
-               BEFORE INSERT ON session_claude_visibility_characterization_events
-               WHEN NEW.event_kind = 'launch_aborted' AND NOT EXISTS (
-                   SELECT 1 FROM session_claude_visibility_jobs AS job
-                   WHERE job.id = NEW.job_id AND job.state = 'claude_retry'
-               )
-               BEGIN
-                   SELECT RAISE(
-                       ABORT,
-                       'Claude characterization abort is not anchored'
-                   );
-               END"""
+        conn.execute("PRAGMA foreign_keys=ON")
+        for trigger_name in CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES:
+            conn.execute(f'DROP TRIGGER "{trigger_name}"')
+        conn.executescript(
+            """ALTER TABLE session_claude_visibility_characterization_events
+                   RENAME TO
+                       session_claude_visibility_characterization_events_new;
+               CREATE TABLE session_claude_visibility_characterization_events (
+                   job_id TEXT NOT NULL,
+                   event_kind TEXT NOT NULL CHECK (
+                       event_kind IN ('registered', 'cleanup_completed')
+                   ),
+                   operation_id TEXT NOT NULL,
+                   source_session_id TEXT NOT NULL,
+                   bridge_id TEXT NOT NULL,
+                   idempotency_key TEXT NOT NULL,
+                   reserved_claude_uuid TEXT NOT NULL,
+                   evidence_digest TEXT NOT NULL CHECK (
+                       length(evidence_digest) = 64
+                       AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+                   ),
+                   created_at REAL NOT NULL,
+                   PRIMARY KEY (job_id, event_kind),
+                   UNIQUE (operation_id, event_kind),
+                   UNIQUE (source_session_id, event_kind),
+                   UNIQUE (bridge_id, event_kind),
+                   UNIQUE (idempotency_key, event_kind),
+                   UNIQUE (reserved_claude_uuid, event_kind),
+                   FOREIGN KEY (job_id, reserved_claude_uuid)
+                       REFERENCES session_claude_visibility_jobs(
+                           id, reserved_claude_uuid
+                       ) ON DELETE RESTRICT
+               );
+               INSERT INTO session_claude_visibility_characterization_events
+               SELECT *
+               FROM session_claude_visibility_characterization_events_new;
+               DROP TABLE
+                   session_claude_visibility_characterization_events_new;
+            """
         )
+        for trigger_sql in expected_trigger_sql.values():
+            conn.execute(trigger_sql)
         conn.execute(
-            "DELETE FROM session_bridge_migrations "
-            "WHERE migration_name = 'claude_characterization_abort_max_attempts_v27'"
+            """DELETE FROM session_bridge_migrations
+               WHERE migration_name = 'claude_characterization_events_v28'"""
         )
-        conn.execute("UPDATE schema_version SET version = 26")
+        if schema_version == 26:
+            conn.execute(
+                """DELETE FROM session_bridge_migrations
+                   WHERE migration_name =
+                       'claude_characterization_abort_max_attempts_v27'"""
+            )
+        conn.execute("UPDATE schema_version SET version = ?", (schema_version,))
         conn.commit()
+        legacy_sql = conn.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type = 'table'
+                 AND name =
+                     'session_claude_visibility_characterization_events'"""
+        ).fetchone()[0]
     finally:
         conn.close()
 
+    return expected_rows, expected_trigger_sql, legacy_sql
+
+
+@pytest.mark.parametrize("legacy_version", (26, 27))
+def test_legacy_database_rebuilds_characterization_events_for_launch_abort(
+    tmp_path, legacy_version
+):
+    db_path = tmp_path / f"v{legacy_version}-characterization-events.db"
+    expected_rows, expected_trigger_sql, legacy_sql = (
+        _prepare_legacy_characterization_events_database(
+            db_path, schema_version=legacy_version
+        )
+    )
+    assert "'launch_aborted'" not in _normalized_sql(legacy_sql)
+
     upgraded = hermes_state.SessionDB(db_path)
     try:
-        trigger_sql = upgraded._conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-            ("trg_claude_characterization_abort_order",),
-        ).fetchone()[0]
-        version = upgraded._conn.execute(
-            "SELECT version FROM schema_version"
-        ).fetchone()[0]
-        migration_count = upgraded._conn.execute(
-            "SELECT COUNT(*) FROM session_bridge_migrations WHERE migration_name = ?",
-            ("claude_characterization_abort_max_attempts_v27",),
-        ).fetchone()[0]
+        table_sql = _characterization_table_sql(upgraded._conn)
+        migrations = {
+            row[0]
+            for row in upgraded._conn.execute(
+                """SELECT migration_name FROM session_bridge_migrations
+                   WHERE migration_name LIKE 'claude_characterization_%'"""
+            ).fetchall()
+        }
+
+        assert "'launch_aborted'" in _normalized_sql(table_sql)
+        assert (
+            upgraded._conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            == hermes_state.SCHEMA_VERSION
+        )
+        assert migrations == {
+            "claude_characterization_abort_max_attempts_v27",
+            "claude_characterization_events_v28",
+        }
+        assert _characterization_event_rows(upgraded._conn) == expected_rows
+        assert _characterization_trigger_sql(upgraded._conn) == expected_trigger_sql
+        assert set(expected_trigger_sql) == (
+            CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES
+        )
+        assert _characterization_unique_columns(upgraded._conn) == (
+            CLAUDE_CHARACTERIZATION_EVENT_UNIQUE_COLUMNS
+        )
+        assert _characterization_foreign_keys(upgraded._conn) == (
+            (
+                "job_id",
+                "id",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+            (
+                "reserved_claude_uuid",
+                "reserved_claude_uuid",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+        )
+        assert (
+            upgraded._conn.execute(
+                """SELECT 1 FROM sqlite_master
+               WHERE type = 'table'
+                 AND name =
+                     '_session_claude_visibility_characterization_events_v28'"""
+            ).fetchone()
+            is None
+        )
+        assert (
+            upgraded._conn.execute(
+                """PRAGMA foreign_key_check(
+                   'session_claude_visibility_characterization_events'
+               )"""
+            ).fetchall()
+            == []
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+            upgraded._conn.execute(
+                """INSERT INTO
+                       session_claude_visibility_characterization_events (
+                           job_id, event_kind, operation_id, source_session_id,
+                           bridge_id, idempotency_key, reserved_claude_uuid,
+                           evidence_digest, created_at
+                       ) VALUES (
+                           'missing-job', 'registered', 'missing-operation',
+                           'missing-session', 'missing-bridge',
+                           'missing-idempotency',
+                           '33333333-3333-4333-8333-333333333333', ?, 101
+                       )""",
+                ("b" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="cleanup is not anchored"):
+            upgraded._conn.execute(
+                """INSERT INTO
+                       session_claude_visibility_characterization_events (
+                           job_id, event_kind, operation_id, source_session_id,
+                           bridge_id, idempotency_key, reserved_claude_uuid,
+                           evidence_digest, created_at
+                       ) VALUES (
+                           'legacy-job', 'cleanup_completed',
+                           '33333333-3333-4333-8333-333333333333',
+                           'codex:legacy-operation', 'legacy-bridge',
+                           'legacy-idempotency',
+                           '11111111-1111-4111-8111-111111111111', ?, 102
+                       )""",
+                ("c" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="abort is not anchored"):
+            upgraded._conn.execute(
+                """INSERT INTO
+                       session_claude_visibility_characterization_events (
+                           job_id, event_kind, operation_id, source_session_id,
+                           bridge_id, idempotency_key, reserved_claude_uuid,
+                           evidence_digest, created_at
+                       ) VALUES (
+                           'legacy-job', 'launch_aborted',
+                           '44444444-4444-4444-8444-444444444444',
+                           'codex:legacy-operation', 'legacy-bridge',
+                           'legacy-idempotency',
+                           '11111111-1111-4111-8111-111111111111', ?, 103
+                       )""",
+                ("d" * 64,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            upgraded._conn.execute(
+                """UPDATE session_claude_visibility_characterization_events
+                   SET created_at = 200 WHERE job_id = 'legacy-job'"""
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            upgraded._conn.execute(
+                """DELETE FROM
+                       session_claude_visibility_characterization_events
+                   WHERE job_id = 'legacy-job'"""
+            )
+        upgraded._conn.rollback()
     finally:
         upgraded.close()
 
-    normalized = " ".join(trigger_sql.split())
-    assert "job.state = 'claude_failed'" in normalized
-    assert "job.error_code = 'max_attempts_exhausted'" in normalized
-    assert version == hermes_state.SCHEMA_VERSION
-    assert migration_count == 1
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        assert _characterization_table_sql(reopened._conn) == table_sql
+        assert _characterization_event_rows(reopened._conn) == expected_rows
+        assert _characterization_trigger_sql(reopened._conn) == expected_trigger_sql
+        assert (
+            reopened._conn.execute(
+                """SELECT COUNT(*) FROM session_bridge_migrations
+               WHERE migration_name =
+                   'claude_characterization_events_v28'"""
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            reopened._conn.execute(
+                """SELECT 1 FROM sqlite_master
+               WHERE type = 'table'
+                 AND name =
+                     '_session_claude_visibility_characterization_events_v28'"""
+            ).fetchone()
+            is None
+        )
+    finally:
+        reopened.close()
+
+
+def test_v28_characterization_event_rebuild_rolls_back_and_reopens(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "v27-characterization-events-rollback.db"
+    expected_rows, expected_trigger_sql, legacy_sql = (
+        _prepare_legacy_characterization_events_database(db_path, schema_version=27)
+    )
+
+    failing_db = object.__new__(hermes_state.SessionDB)
+    failing_db._conn = sqlite3.connect(db_path)
+    failing_db._conn.execute("PRAGMA foreign_keys=ON")
+
+    def fail_after_table_rebuild(_cursor):
+        raise RuntimeError("forced trigger rebuild failure")
+
+    monkeypatch.setattr(
+        failing_db,
+        "_create_claude_characterization_event_triggers",
+        fail_after_table_rebuild,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="forced trigger rebuild failure"):
+            failing_db._apply_claude_characterization_events_v28_migration(
+                failing_db._conn.cursor()
+            )
+        assert not failing_db._conn.in_transaction
+    finally:
+        failing_db._conn.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert _characterization_table_sql(conn) == legacy_sql
+        assert _characterization_event_rows(conn) == expected_rows
+        assert _characterization_trigger_sql(conn) == expected_trigger_sql
+        assert _characterization_unique_columns(conn) == (
+            CLAUDE_CHARACTERIZATION_EVENT_UNIQUE_COLUMNS
+        )
+        assert _characterization_foreign_keys(conn) == (
+            (
+                "job_id",
+                "id",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+            (
+                "reserved_claude_uuid",
+                "reserved_claude_uuid",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+        )
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 27
+        assert (
+            conn.execute(
+                """SELECT COUNT(*) FROM session_bridge_migrations
+               WHERE migration_name =
+                   'claude_characterization_events_v28'"""
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                """SELECT 1 FROM sqlite_master
+               WHERE type = 'table'
+                 AND name =
+                     '_session_claude_visibility_characterization_events_v28'"""
+            ).fetchone()
+            is None
+        )
+    finally:
+        conn.close()
+
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        assert "'launch_aborted'" in _normalized_sql(
+            _characterization_table_sql(reopened._conn)
+        )
+        assert _characterization_event_rows(reopened._conn) == expected_rows
+        assert _characterization_trigger_sql(reopened._conn) == expected_trigger_sql
+        assert (
+            reopened._conn.execute(
+                """SELECT COUNT(*) FROM session_bridge_migrations
+               WHERE migration_name =
+                   'claude_characterization_events_v28'"""
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        reopened.close()
 
 
 def test_reopening_current_database_repairs_missing_sidebar_indexes_without_data_loss(

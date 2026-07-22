@@ -199,7 +199,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -1407,6 +1407,137 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_session_claude_reconciliation_unconsumed_a
     WHERE outcome = 'absent' AND consumed_at IS NULL;
 """
 
+_CLAUDE_CHARACTERIZATION_EVENTS_TABLE_V28_SQL = """
+CREATE TABLE _session_claude_visibility_characterization_events_v28 (
+    job_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL CHECK (
+        event_kind IN ('registered', 'cleanup_completed', 'launch_aborted')
+    ),
+    operation_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (job_id, event_kind),
+    UNIQUE (operation_id, event_kind),
+    UNIQUE (source_session_id, event_kind),
+    UNIQUE (bridge_id, event_kind),
+    UNIQUE (idempotency_key, event_kind),
+    UNIQUE (reserved_claude_uuid, event_kind),
+    FOREIGN KEY (job_id, reserved_claude_uuid)
+        REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
+        ON DELETE RESTRICT
+)
+"""
+
+_CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_SQL = (
+    """CREATE TRIGGER trg_claude_characterization_event_identity
+       BEFORE INSERT ON session_claude_visibility_characterization_events
+       WHEN NOT EXISTS (
+           SELECT 1 FROM session_claude_visibility_jobs AS job
+           WHERE job.id = NEW.job_id
+             AND job.source_session_id = NEW.source_session_id
+             AND job.bridge_id = NEW.bridge_id
+             AND job.idempotency_key = NEW.idempotency_key
+             AND job.reserved_claude_uuid = NEW.reserved_claude_uuid
+       )
+       BEGIN
+           SELECT RAISE(ABORT, 'Claude characterization identity mismatch');
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_cleanup_order
+       BEFORE INSERT ON session_claude_visibility_characterization_events
+       WHEN NEW.event_kind = 'cleanup_completed' AND (
+           NOT EXISTS (
+               SELECT 1 FROM session_claude_visibility_characterization_events
+               WHERE job_id = NEW.job_id AND event_kind = 'registered'
+           )
+           OR NOT EXISTS (
+               SELECT 1 FROM session_claude_visibility_jobs
+               WHERE id = NEW.job_id AND state = 'claude_visible'
+                 AND completion_digest IS NOT NULL AND visible_at IS NOT NULL
+           )
+       )
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization cleanup is not anchored'
+           );
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_abort_order
+       BEFORE INSERT ON session_claude_visibility_characterization_events
+       WHEN NEW.event_kind = 'launch_aborted' AND (
+           NOT EXISTS (
+               SELECT 1 FROM session_claude_visibility_characterization_events
+               WHERE job_id = NEW.job_id AND event_kind = 'registered'
+           )
+           OR NOT EXISTS (
+               SELECT 1
+               FROM session_claude_visibility_jobs AS job
+               JOIN session_claude_visibility_reconciliations AS reconciliation
+                 ON reconciliation.job_id = job.id
+                AND reconciliation.reserved_claude_uuid = job.reserved_claude_uuid
+                AND reconciliation.attempt_ordinal = job.attempts
+               WHERE job.id = NEW.job_id
+                 AND (
+                     job.state = 'claude_retry'
+                     OR (
+                         job.state = 'claude_failed'
+                         AND job.error_code = 'max_attempts_exhausted'
+                     )
+                 )
+                 AND reconciliation.outcome = 'absent'
+                 AND reconciliation.consumed_at IS NULL
+           )
+       )
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization abort is not anchored'
+           );
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_event_no_update
+       BEFORE UPDATE ON session_claude_visibility_characterization_events
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization events are append-only'
+           );
+       END""",
+    """CREATE TRIGGER trg_claude_characterization_event_no_delete
+       BEFORE DELETE ON session_claude_visibility_characterization_events
+       BEGIN
+           SELECT RAISE(
+               ABORT,
+               'Claude characterization events are append-only'
+           );
+       END""",
+)
+
+_CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES = (
+    "trg_claude_characterization_event_identity",
+    "trg_claude_characterization_cleanup_order",
+    "trg_claude_characterization_abort_order",
+    "trg_claude_characterization_event_no_update",
+    "trg_claude_characterization_event_no_delete",
+)
+
+_CLAUDE_CHARACTERIZATION_EVENT_COLUMNS = (
+    "job_id",
+    "event_kind",
+    "operation_id",
+    "source_session_id",
+    "bridge_id",
+    "idempotency_key",
+    "reserved_claude_uuid",
+    "evidence_digest",
+    "created_at",
+)
+
 # Indexes that reference columns added in later schema versions must be
 # created AFTER _reconcile_columns() has had a chance to ADD them on
 # existing databases. SCHEMA_SQL above is run by sqlite executescript
@@ -2206,6 +2337,206 @@ class SessionDB:
                 connection.rollback()
             raise
 
+    @staticmethod
+    def _drop_claude_characterization_event_triggers(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        for trigger_name in _CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES:
+            cursor.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+
+    @staticmethod
+    def _create_claude_characterization_event_triggers(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        for trigger_sql in _CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_SQL:
+            cursor.execute(trigger_sql)
+
+    @staticmethod
+    def _validate_claude_characterization_events_v28(
+        cursor: sqlite3.Cursor,
+        *,
+        expected_rows: int | None = None,
+    ) -> None:
+        table_name = "session_claude_visibility_characterization_events"
+        schema_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if schema_row is None or schema_row[0] is None:
+            raise RuntimeError("Claude characterization event table is missing")
+        normalized_schema = " ".join(str(schema_row[0]).split())
+        if "'launch_aborted'" not in normalized_schema:
+            raise RuntimeError("Claude characterization event CHECK is stale")
+
+        columns = tuple(
+            row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        )
+        if columns != _CLAUDE_CHARACTERIZATION_EVENT_COLUMNS:
+            raise RuntimeError("Claude characterization event columns changed")
+
+        unique_column_sets: set[tuple[str, ...]] = set()
+        for index_row in cursor.execute(
+            f'PRAGMA index_list("{table_name}")'
+        ).fetchall():
+            if int(index_row[2]) != 1:
+                continue
+            index_name = str(index_row[1]).replace('"', '""')
+            unique_column_sets.add(
+                tuple(
+                    row[2]
+                    for row in cursor.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    ).fetchall()
+                )
+            )
+        expected_unique = {
+            ("job_id", "event_kind"),
+            ("operation_id", "event_kind"),
+            ("source_session_id", "event_kind"),
+            ("bridge_id", "event_kind"),
+            ("idempotency_key", "event_kind"),
+            ("reserved_claude_uuid", "event_kind"),
+        }
+        if unique_column_sets != expected_unique:
+            raise RuntimeError("Claude characterization event uniqueness changed")
+
+        foreign_keys = tuple(
+            (row[3], row[4], row[2], row[6])
+            for row in cursor.execute(
+                f'PRAGMA foreign_key_list("{table_name}")'
+            ).fetchall()
+        )
+        if foreign_keys != (
+            (
+                "job_id",
+                "id",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+            (
+                "reserved_claude_uuid",
+                "reserved_claude_uuid",
+                "session_claude_visibility_jobs",
+                "RESTRICT",
+            ),
+        ):
+            raise RuntimeError("Claude characterization event foreign key changed")
+        if (
+            cursor.execute(f'PRAGMA foreign_key_check("{table_name}")').fetchone()
+            is not None
+        ):
+            raise RuntimeError("Claude characterization event foreign key violation")
+
+        triggers = {
+            row[0]
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND tbl_name = ?",
+                (table_name,),
+            ).fetchall()
+        }
+        if triggers != set(_CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES):
+            raise RuntimeError("Claude characterization event triggers changed")
+        if expected_rows is not None:
+            actual_rows = cursor.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if int(actual_rows) != expected_rows:
+                raise RuntimeError("Claude characterization event row count changed")
+
+    def _apply_claude_characterization_events_v28_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Rebuild the v26/v27 event table so launch-abort is persistable."""
+
+        migration_name = "claude_characterization_events_v28"
+        table_name = "session_claude_visibility_characterization_events"
+        temporary_name = "_session_claude_visibility_characterization_events_v28"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                self._validate_claude_characterization_events_v28(cursor)
+                connection.commit()
+                return
+
+            table_row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if table_row is None or table_row[0] is None:
+                raise RuntimeError("Claude characterization event table is missing")
+            source_rows = int(
+                cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+            )
+            if "'launch_aborted'" not in " ".join(str(table_row[0]).split()):
+                if (
+                    cursor.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                        (temporary_name,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise RuntimeError(
+                        "Claude characterization event migration temp table exists"
+                    )
+                self._drop_claude_characterization_event_triggers(cursor)
+                cursor.execute(_CLAUDE_CHARACTERIZATION_EVENTS_TABLE_V28_SQL)
+                column_list = ", ".join(
+                    f'"{column}"' for column in _CLAUDE_CHARACTERIZATION_EVENT_COLUMNS
+                )
+                cursor.execute(
+                    f'INSERT INTO "{temporary_name}" ({column_list}) '
+                    f'SELECT {column_list} FROM "{table_name}"'
+                )
+                copied_rows = int(
+                    cursor.execute(
+                        f'SELECT COUNT(*) FROM "{temporary_name}"'
+                    ).fetchone()[0]
+                )
+                if copied_rows != source_rows:
+                    raise RuntimeError(
+                        "Claude characterization event row count changed"
+                    )
+                missing = cursor.execute(
+                    f'SELECT 1 FROM (SELECT {column_list} FROM "{table_name}" '
+                    f'EXCEPT SELECT {column_list} FROM "{temporary_name}") LIMIT 1'
+                ).fetchone()
+                extra = cursor.execute(
+                    f'SELECT 1 FROM (SELECT {column_list} FROM "{temporary_name}" '
+                    f'EXCEPT SELECT {column_list} FROM "{table_name}") LIMIT 1'
+                ).fetchone()
+                if missing is not None or extra is not None:
+                    raise RuntimeError("Claude characterization event rows changed")
+                cursor.execute(f'DROP TABLE "{table_name}"')
+                cursor.execute(
+                    f'ALTER TABLE "{temporary_name}" RENAME TO "{table_name}"'
+                )
+            else:
+                self._drop_claude_characterization_event_triggers(cursor)
+
+            self._create_claude_characterization_event_triggers(cursor)
+            self._validate_claude_characterization_events_v28(
+                cursor, expected_rows=source_rows
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
     def _apply_claude_auth_recovery_call_started_migration(
         self, cursor: sqlite3.Cursor
     ) -> None:
@@ -2289,6 +2620,7 @@ class SessionDB:
         # run after bridge-column reconciliation and must not wait for FTS.
         self._apply_bridge_migrations(cursor)
         self._apply_claude_characterization_abort_trigger_migration(cursor)
+        self._apply_claude_characterization_events_v28_migration(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
