@@ -17,6 +17,79 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def _inject_hermes_history_to_acp(agent, hermes_session_id, provider, cwd, mapper):
+    """Best-effort: carry this Hermes session's history into a fresh ACP session.
+
+    Renders the Hermes conversation (read from the session DB) as a Claude
+    Code JSONL transcript at ``~/.claude/projects/<sanitized-cwd>/<id>.jsonl``
+    and pre-binds a new ACP session id to it, so the first ``ensure_started()``
+    resumes into a session that already holds the conversation context. This
+    is what makes a Native -> ACP runtime switch seamless.
+
+    Never raises: a failure logs at debug and the caller proceeds with a plain
+    (un-injected) ``session/new``. ``redact=False`` is intentional -- the
+    transcript is written to a local file for context continuity, not uploaded.
+    """
+    import re
+    import uuid as _uuid
+    from pathlib import Path
+
+    from agent.trace_upload import build_trace_jsonl, load_session_messages
+    from agent.transports.acp_session_mapping import ACPSessionBinding
+
+    if not cwd:
+        cwd = os.getcwd()
+
+    # Export this session's history. A brand-new session has no messages yet,
+    # so there is nothing to carry over -- bail out without binding.
+    messages, meta = load_session_messages(hermes_session_id)
+    if not messages:
+        return
+
+    model = getattr(agent, "model", None) or meta.get("model") or ""
+
+    # New ACP session id that resume will target. The transcript file is named
+    # <id>.jsonl and the embedded sessionId field must equal <id> -- Claude
+    # Code keys both off the same value (verified against real transcripts), so
+    # a mismatch would make resume fail to load the history.
+    acp_session_id = str(_uuid.uuid4())
+    jsonl = build_trace_jsonl(
+        messages,
+        session_id=acp_session_id,
+        model=model,
+        cwd=cwd,
+        redact=False,  # local file write for context continuity, not upload
+    )
+    if not jsonl.strip():
+        return
+
+    # Claude Code stores transcripts under ~/.claude/projects/<sanitized-cwd>/,
+    # where EVERY non-alphanumeric char in the absolute cwd becomes '-'
+    # (per-char, not collapsed: /home/nbot/.hermes -> -home-nbot--hermes, so
+    # both '/' and '.' map to '-' independently). Matching this exactly is
+    # required for resume to locate the file.
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    project_dir = Path.home() / ".claude" / "projects" / sanitized
+    project_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = project_dir / f"{acp_session_id}.jsonl"
+    transcript_path.write_text(jsonl + "\n", encoding="utf-8")
+
+    mapper.bind(ACPSessionBinding(
+        hermes_session_id=hermes_session_id,
+        acp_session_id=acp_session_id,
+        provider=provider,
+        cwd=cwd,
+        model=model or None,
+        status="active",
+    ))
+    logger.debug(
+        "Injected Hermes history into ACP session %s (%d messages, cwd=%s)",
+        acp_session_id[:8],
+        len(messages),
+        cwd,
+    )
+
+
 def run_acp_client_turn(
     agent,
     *,
@@ -38,6 +111,20 @@ def run_acp_client_turn(
     process exit — no explicit teardown hook on AIAgent.
     """
     from agent.transports.acp_client_session import ACPClientSession
+
+    # cwd priority: agent.session_cwd > HERMES_ACP_SESSION_CWD env > os.getcwd()
+    # HERMES_ACP_SESSION_CWD lets operators point the ACP session at a per-agent
+    # sandbox directory (containing CLAUDE.md + .claude/settings.local.json) on
+    # the gateway launch env without requiring a new config key in the provider
+    # resolver chain.  Production Janet and janet_test run as separate processes
+    # with distinct HERMES_HOME, so the env var is scoped to the right gateway.
+    # Computed up here, before session creation, because the creation block
+    # also needs it for the Native->ACP history injection below.
+    cwd = (
+        getattr(agent, "session_cwd", None)
+        or os.environ.get("HERMES_ACP_SESSION_CWD", "").strip()
+        or os.getcwd()
+    )
 
     if not hasattr(agent, "_acp_session") or agent._acp_session is None:
         command = getattr(agent, "acp_command", None) or "acp-agent"
@@ -103,6 +190,28 @@ def run_acp_client_turn(
                 exc_info=True,
             )
 
+        # Session binding + Native->ACP history injection: when this Hermes
+        # session has an id and a backing DB, give the ACPClientSession a
+        # mapper so ensure_started() can resume a previously-bound ACP session,
+        # and pre-seed a Claude Code transcript from the existing Hermes
+        # conversation so a runtime switch keeps its context. Best-effort --
+        # any failure leaves the session to start fresh via session/new.
+        hermes_session_id = getattr(agent, "session_id", "") or ""
+        provider = command
+        mapper = None
+        if hermes_session_id:
+            try:
+                from agent.transports.acp_session_mapping import (
+                    SQLiteACPSessionMapper,
+                )
+                mapper = SQLiteACPSessionMapper()
+            except Exception:
+                logger.debug(
+                    "ACP session mapper init failed",
+                    exc_info=True,
+                )
+                mapper = None
+
         agent._acp_session = ACPClientSession(
             command=command,
             args=list(args),
@@ -112,23 +221,34 @@ def run_acp_client_turn(
             on_delta=on_delta,
             approval_callback=approval_callback,
             auto_approve_permissions=auto_approve_permissions,
+            mapper=mapper,
+            hermes_session_id=hermes_session_id,
+            provider=provider,
         )
+
+        # Inject existing Hermes history into the fresh ACP session (first
+        # creation only). Skipped when a binding already exists -- the resume
+        # path in ensure_started() handles that -- or when there is no backing
+        # session DB to export from. Never blocks session creation.
+        if (
+            mapper
+            and hermes_session_id
+            and getattr(agent, "_session_db", None) is not None
+        ):
+            try:
+                if not mapper.lookup(hermes_session_id, provider):
+                    _inject_hermes_history_to_acp(
+                        agent, hermes_session_id, provider, cwd, mapper
+                    )
+            except Exception:
+                logger.debug(
+                    "ACP history injection failed",
+                    exc_info=True,
+                )
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow before the early return reaches us.
     # Do NOT append again — that would duplicate.
-
-    # cwd priority: agent.session_cwd > HERMES_ACP_SESSION_CWD env > os.getcwd()
-    # HERMES_ACP_SESSION_CWD lets operators point the ACP session at a per-agent
-    # sandbox directory (containing CLAUDE.md + .claude/settings.local.json) on
-    # the gateway launch env without requiring a new config key in the provider
-    # resolver chain.  Production Janet and janet_test run as separate processes
-    # with distinct HERMES_HOME, so the env var is scoped to the right gateway.
-    cwd = (
-        getattr(agent, "session_cwd", None)
-        or os.environ.get("HERMES_ACP_SESSION_CWD", "").strip()
-        or os.getcwd()
-    )
 
     try:
         turn = agent._acp_session.run_turn(user_input=user_message, cwd=cwd)
