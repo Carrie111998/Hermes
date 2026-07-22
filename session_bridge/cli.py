@@ -60,7 +60,11 @@ from .coordinator import (
     SessionBridgeCoordinator,
 )
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
-from .mirror_float import ClaudeMirrorFloatWorker
+from .mirror_float import (
+    ClaudeMirrorFloatWorker,
+    default_ccd_sessions_base,
+    discover_ccd_registry_root,
+)
 from .mirror import (
     BatchProgress,
     DiscoveryMode,
@@ -2390,7 +2394,12 @@ class ProductionBackend:
                 else None
             )
             mirror_float = (
-                ClaudeMirrorFloatWorker(self._require_store())
+                ClaudeMirrorFloatWorker(
+                    self._require_store(),
+                    registry_root=discover_ccd_registry_root(
+                        default_ccd_sessions_base()
+                    ),
+                )
                 if (
                     not catalog_only
                     and effective_config.claude_visibility.enabled

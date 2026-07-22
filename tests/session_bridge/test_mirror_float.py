@@ -480,8 +480,13 @@ def _serve_runtime_coordinator(db, monkeypatch, *, float_activity: bool):
 def test_serve_runtime_wires_mirror_float_when_configured(
     db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    sentinel = Path("C:/sentinel-registry")
+    monkeypatch.setattr(
+        "session_bridge.cli.discover_ccd_registry_root", lambda base: sentinel
+    )
     coordinator = _serve_runtime_coordinator(db, monkeypatch, float_activity=True)
     assert isinstance(coordinator._mirror_float, ClaudeMirrorFloatWorker)
+    assert coordinator._mirror_float._registry_root == sentinel
 
 
 def test_serve_runtime_omits_mirror_float_when_disabled(
