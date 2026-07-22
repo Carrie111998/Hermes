@@ -159,6 +159,27 @@ spec:
         access: read-only
         ordering: append-before-volatile-queue
         mediaRoot: /var/lib/tgg-capture/whatsapp/media
+      mediaRetention:
+        enabled: true
+        sourceGate: pa.enabled-and-processing-gate
+        sourceRoots:
+          - /var/lib/tgg-capture/whatsapp/media
+        mediaRoot: /home/pclaw/.systems-pcl/data/media
+        convergenceOperation: tgg_media_retention
+        retrievalOperation: tgg_case_media
+        retrievalTool: tgg_case_photos
+        ordering: retain-and-converge-before-model-and-inbox-completion
+        failureDisposition: retry-pending
+        activationBacklogPreflight: all-image-paths-from-current-cursor-must-resolve
+        minimumRealVolumeFreePercent: 20
+        pathContract: opaque-media-refs-resolved-under-configured-root
+        delivery:
+          route: /send-media
+          destination: current-triggering-management-chat-only
+          durableKey: chat-id-plus-current-inbound-anchor-plus-media-identity-plus-ordinal
+          unknownOutcome: durable-undelivered-no-blind-retry
+          staleOrNonManagement: suppress
+        rollback: disable-retention-and-media-send-preserve-retained-data-and-cursors
       consumer:
         implementation: gateway/durable_jsonl_consumer.py
         mode: durable-jsonl-tail
@@ -171,6 +192,12 @@ spec:
         outboundDelivery: disabled
         liveTestInputAllowed: false
         fixtureTestOnly: true
+        statusMediaFields:
+          - retention_total
+          - retention_failures
+          - media_root_count
+          - media_root_bytes
+          - media_volume_free_percent
       prohibitedConsumerSurface:
         method: GET
         path: /messages
@@ -296,6 +323,9 @@ spec:
     - production inbox and post-boundary production turn count are zero
     - owned Hermes service and health timer are active
     - the destructive /messages route is absent from the consumer unit
+    - retained media is contained under the configured Systems media root and converges before model execution
+    - low real-volume free space or unresolvable mandatory media fails health and holds processing
+    - management permits tgg_case_media while ops ingest denies case media and retention operations
     - the configured OpenAI slot and Gemini auxiliary model are reachable
     - a fixture-only controlled inbound produces a completed pa_turn on the deployed stack
     - the isolated turn records exact provider and model with a non-empty response

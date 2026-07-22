@@ -18,8 +18,10 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -38,6 +40,10 @@ INBOX_SCHEMA_VERSION = 1
 
 class ConsumerError(RuntimeError):
     """Fail-closed consumer contract violation."""
+
+
+class MediaRetentionError(ConsumerError):
+    """Retryable failure before a claimed event reaches the model."""
 
 
 def _utc_now() -> str:
@@ -229,6 +235,7 @@ class DurableInbox:
                     status TEXT NOT NULL
                         CHECK (status IN ('delivered','undelivered')),
                     bridge_message_id TEXT,
+                    provider_outcome TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL
                 );
@@ -246,6 +253,8 @@ class DurableInbox:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     pa_turn_id TEXT,
                     last_error TEXT,
+                    retained_media_count INTEGER NOT NULL DEFAULT 0,
+                    retention_failures INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -253,6 +262,25 @@ class DurableInbox:
                     ON ingress_events(status, seq);
                 """
             )
+            # Existing consumer DBs predate durable provider-outcome detail.
+            reply_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(reply_deliveries)")
+            }
+            if "provider_outcome" not in reply_columns:
+                conn.execute("ALTER TABLE reply_deliveries ADD COLUMN provider_outcome TEXT")
+            ingress_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(ingress_events)")
+            }
+            if "retained_media_count" not in ingress_columns:
+                conn.execute(
+                    "ALTER TABLE ingress_events ADD COLUMN retained_media_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "retention_failures" not in ingress_columns:
+                conn.execute(
+                    "ALTER TABLE ingress_events ADD COLUMN retention_failures "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 "INSERT INTO ingress_meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -628,6 +656,31 @@ class DurableInbox:
             ).fetchall()
         return {str(row["status"]): int(row["n"]) for row in rows}
 
+    def record_retention(
+        self, record: InboxRecord, *, retained: int | None = None, failed: bool = False
+    ) -> None:
+        with self.connect() as conn:
+            if failed:
+                conn.execute(
+                    "UPDATE ingress_events SET retention_failures=retention_failures+1 "
+                    "WHERE seq=? AND status='processing'",
+                    (record.seq,),
+                )
+            elif retained is not None:
+                conn.execute(
+                    "UPDATE ingress_events SET retained_media_count=? "
+                    "WHERE seq=? AND status='processing'",
+                    (max(0, int(retained)), record.seq),
+                )
+
+    def retention_counts(self) -> dict[str, int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(retained_media_count),0),"
+                "COALESCE(SUM(retention_failures),0) FROM ingress_events"
+            ).fetchone()
+        return {"retention_total": int(row[0]), "retention_failures": int(row[1])}
+
     def total(self) -> int:
         return sum(self.counts().values())
 
@@ -686,15 +739,17 @@ class DurableInbox:
         *,
         status: str,
         bridge_message_id: str | None = None,
+        provider_outcome: str | None = None,
         error: str | None = None,
     ) -> None:
         if status not in {"delivered", "undelivered"}:
             raise ValueError(f"invalid reply delivery status {status!r}")
         with self.connect() as conn:
             conn.execute(
-                "UPDATE reply_deliveries SET status=?, bridge_message_id=?, error=? "
+                "UPDATE reply_deliveries SET status=?, bridge_message_id=?, "
+                "provider_outcome=?, error=? "
                 "WHERE delivery_key=?",
-                (status, bridge_message_id, error, delivery_key),
+                (status, bridge_message_id, provider_outcome, error, delivery_key),
             )
 
 
@@ -702,6 +757,306 @@ def processing_enabled(config_path: Path) -> bool:
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     pa = data.get("pa") if isinstance(data, dict) else None
     return bool(pa.get("enabled")) if isinstance(pa, dict) else False
+
+
+def _retention_config(config_path: Path) -> dict[str, Any] | None:
+    """Return the opt-in generic media-retention contract.
+
+    TGG supplies the values, but the consumer only understands roots and a
+    configured business-operation name.  Client/case semantics stay behind
+    that operation.
+    """
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    pa = data.get("pa") if isinstance(data, Mapping) else None
+    raw = pa.get("media_retention") if isinstance(pa, Mapping) else None
+    if not isinstance(raw, Mapping) or raw.get("enabled") is not True:
+        return None
+    root_value = str(raw.get("media_root") or raw.get("root") or "").strip()
+    root = Path(root_value).expanduser()
+    source_roots = raw.get("source_roots") or raw.get("allowed_source_roots") or []
+    operation = str(raw.get("operation") or raw.get("retention_operation") or "")
+    if not root_value:
+        raise MediaRetentionError("media retention root is not configured")
+    if isinstance(source_roots, (str, bytes)):
+        source_roots = [source_roots]
+    if not isinstance(source_roots, Sequence) or not source_roots:
+        raise MediaRetentionError("media retention source_roots are not configured")
+    if not operation:
+        raise MediaRetentionError("media retention operation is not configured")
+    return {
+        "root": root.resolve(),
+        "source_roots": tuple(Path(str(p)).expanduser().resolve() for p in source_roots),
+        "operation": operation,
+        "min_free_percent": float(raw.get("min_free_percent", 20)),
+    }
+
+
+def _media_root_metrics(
+    config_path: Path, *, inspect: bool, count_root: bool = True
+) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "media_root_count": 0,
+        "media_root_bytes": 0,
+        "media_volume_free_percent": None,
+    }
+    config = _retention_config(config_path)
+    if config is None or not inspect:
+        return metrics
+    root: Path = config["root"]
+    volume_path = root
+    while not volume_path.exists() and volume_path != volume_path.parent:
+        volume_path = volume_path.parent
+    try:
+        usage = shutil.disk_usage(volume_path)
+    except OSError as exc:
+        raise MediaRetentionError(f"media volume is not measurable: {exc}") from exc
+    free_percent = (usage.free / usage.total * 100) if usage.total else 0.0
+    metrics["media_volume_free_percent"] = round(free_percent, 3)
+    if root.exists() and count_root:
+        if not root.is_dir():
+            raise MediaRetentionError("configured media root is not a directory")
+        for directory, _, filenames in os.walk(root, followlinks=False):
+            for filename in filenames:
+                candidate = Path(directory) / filename
+                if candidate.is_file():
+                    metrics["media_root_count"] += 1
+                    metrics["media_root_bytes"] += candidate.stat().st_size
+    return metrics
+
+
+def _retention_status(
+    inbox: DurableInbox, config_path: Path, *, inspect_media: bool
+) -> dict[str, Any]:
+    return {
+        **inbox.retention_counts(),
+        **_media_root_metrics(config_path, inspect=inspect_media),
+    }
+
+
+def _assert_media_headroom(config_path: Path, status: Mapping[str, Any]) -> None:
+    config = _retention_config(config_path)
+    if config is None:
+        return
+    free = status.get("media_volume_free_percent")
+    if free is None:
+        raise MediaRetentionError("media volume free space is unknown")
+    if float(free) < float(config["min_free_percent"]):
+        raise MediaRetentionError(
+            "media volume free space below configured floor: "
+            f"{float(free):.3f}% < {config['min_free_percent']:.3f}%"
+        )
+
+
+_IMAGE_SIGNATURES: tuple[tuple[str, str, bytes, int], ...] = (
+    ("image/jpeg", "jpg", b"\xff\xd8\xff", 0),
+    ("image/png", "png", b"\x89PNG\r\n\x1a\n", 0),
+    ("image/gif", "gif", b"GIF8", 0),
+    ("image/webp", "webp", b"WEBP", 8),
+)
+
+
+def _validated_image_type(path: Path, declared: str | None) -> tuple[str, str]:
+    with path.open("rb") as handle:
+        prefix = handle.read(16)
+    detected = next(
+        ((mime, ext) for mime, ext, signature, offset in _IMAGE_SIGNATURES
+         if prefix[offset:offset + len(signature)] == signature),
+        None,
+    )
+    if detected is None:
+        raise MediaRetentionError(f"retention source is not a supported image: {path.name}")
+    mime, ext = detected
+    declared = str(declared or "").split(";", 1)[0].strip().lower()
+    if declared and "/" in declared and declared != mime:
+        # image/jpg is a widespread non-standard spelling for image/jpeg.
+        if not (declared == "image/jpg" and mime == "image/jpeg"):
+            raise MediaRetentionError(
+                f"PROVENANCE_DIVERGENCE: declared MIME {declared} != {mime}"
+            )
+    return mime, ext
+
+
+def _contained_existing_file(value: Any, roots: Sequence[Path]) -> Path:
+    if isinstance(value, Mapping):
+        value = value.get("path") or value.get("filePath") or value.get("localPath") or value.get("url")
+    text = str(value or "")
+    if text.startswith("file://"):
+        text = text[7:]
+    candidate = Path(text).expanduser().resolve(strict=True)
+    if not candidate.is_file() or not any(candidate.is_relative_to(root) for root in roots):
+        raise MediaRetentionError("media source escapes configured roots or is not a file")
+    return candidate
+
+
+def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
+    values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
+    if isinstance(values, (str, bytes, Mapping)):
+        values = [values]
+    if not isinstance(values, Sequence):
+        raise MediaRetentionError("event media collection is not a list")
+    result: list[tuple[Any, str | None]] = []
+    event_mime = item.get("mediaType") or item.get("mimeType")
+    for value in values:
+        mime = (
+            value.get("mime") or value.get("mimeType") or value.get("contentType")
+            if isinstance(value, Mapping) else event_mime
+        )
+        result.append((value, str(mime) if mime else None))
+    return result
+
+
+def _converge_retained_media(
+    config_path: Path, *, operation: str, payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    from types import SimpleNamespace
+
+    from agent.pa_constitution import resolve_context
+    from tools.pa_business_tools import execute_business_operation, load_business_bridge_config
+
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    resolved = resolve_context(
+        config_data,
+        {
+            "source": {
+                "platform": "whatsapp",
+                "chat_id": str(payload.get("chat_jid") or ""),
+            }
+        },
+    )
+    if resolved is None:
+        raise MediaRetentionError("media retention could not resolve client context")
+    # Retention is pre-model ingress infrastructure, not a model-callable job
+    # operation. Reuse the resolved tenant/auth/operation registry while
+    # deliberately avoiding job-brief allow/deny scope (ops correctly denies
+    # the model from invoking this internal write itself).
+    internal_context = SimpleNamespace(
+        constitution=resolved.constitution,
+        job_brief=None,
+        job_type="media_retention_internal",
+    )
+    bridge = load_business_bridge_config(config_data, pa_context=internal_context)
+    result = execute_business_operation(bridge, operation=operation, payload=payload)
+    data = result.get("data") if isinstance(result, Mapping) else None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("ok") is not True
+        or not isinstance(data, Mapping)
+        or "ledgerChanged" not in data
+        or "observationsChanged" not in data
+    ):
+        raise MediaRetentionError(
+            "media retention convergence returned an invalid Systems envelope"
+        )
+    return dict(result)
+
+
+def retain_record_media(record: InboxRecord, *, config_path: Path) -> dict[str, Any]:
+    """Retain one event's images and converge its configured system ledger.
+
+    Files land before the idempotent operation.  Therefore a crash after the
+    rename or operation is safe to replay, while changed bytes/MIME at the
+    same source ordinal fail closed.
+    """
+    config = _retention_config(config_path)
+    if config is None:
+        return {"retained": 0, "bytes": 0, "operation": False}
+    item = _bridge_item(record.raw)
+    media = _event_media(item)
+    if not media:
+        if item.get("hasMedia") is True:
+            raise MediaRetentionError(
+                "mandatory inbound media has no resolvable capture path"
+            )
+        return {"retained": 0, "bytes": 0, "operation": False}
+    chat_id = str(item.get("chatId") or record.chat_id)
+    message_id = str(item.get("messageId") or record.message_id)
+    if chat_id != record.chat_id or message_id != record.message_id:
+        raise MediaRetentionError("PROVENANCE_DIVERGENCE: inbox/event identity mismatch")
+    identity_digest = hashlib.sha256(
+        (chat_id + "\0" + message_id).encode("utf-8")
+    ).hexdigest()
+    source_key = f"whatsapp-capture-v1:{identity_digest}"
+    filename_prefix = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:24]
+    root: Path = config["root"]
+    root.mkdir(parents=True, exist_ok=True, mode=0o750)
+    _assert_media_headroom(
+        config_path,
+        _media_root_metrics(config_path, inspect=True, count_root=False),
+    )
+    retained: list[dict[str, Any]] = []
+    total_bytes = 0
+    for ordinal, (raw_path, declared_mime) in enumerate(media):
+        source = _contained_existing_file(raw_path, config["source_roots"])
+        mime, ext = _validated_image_type(source, declared_mime)
+        content = source.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        target = (root / f"{filename_prefix}_{ordinal}.{ext}").resolve()
+        if not target.is_relative_to(root):
+            raise MediaRetentionError("derived retention target escapes configured root")
+        ordinal_candidates = list(root.glob(f"{filename_prefix}_{ordinal}.*"))
+        if ordinal_candidates and target not in ordinal_candidates:
+            raise MediaRetentionError(
+                f"PROVENANCE_DIVERGENCE: retained ordinal {ordinal} MIME changed"
+            )
+        if target.exists():
+            existing = target.read_bytes()
+            existing_mime, _ = _validated_image_type(target, mime)
+            if hashlib.sha256(existing).hexdigest() != digest or existing_mime != mime:
+                raise MediaRetentionError(
+                    f"PROVENANCE_DIVERGENCE: retained ordinal {ordinal} changed"
+                )
+        else:
+            tmp = root / f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, target)
+                directory_fd = os.open(root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp.unlink()
+        total_bytes += len(content)
+        retained.append({
+            "source_key": source_key,
+            "media_ordinal": ordinal,
+            "digest": digest,
+            "mime": mime,
+            "ref": f"/media/{target.name}",
+        })
+
+    try:
+        _converge_retained_media(
+            config_path,
+            operation=config["operation"],
+            payload={
+                "message_id": message_id,
+                "source_key": source_key,
+                "chat_jid": chat_id,
+                "media": retained,
+            },
+        )
+    except Exception as exc:
+        if isinstance(exc, MediaRetentionError):
+            raise
+        raise MediaRetentionError(f"media retention convergence failed: {exc}") from exc
+    return {"retained": len(retained), "bytes": total_bytes, "operation": True}
+
+
+def retain_claimed_media(records: Sequence[InboxRecord], *, config_path: Path) -> dict[str, int]:
+    totals = {"retained": 0, "bytes": 0, "events": 0}
+    for record in records:
+        result = retain_record_media(record, config_path=config_path)
+        totals["retained"] += int(result["retained"])
+        totals["bytes"] += int(result["bytes"])
+        totals["events"] += int(bool(result["retained"]))
+    return totals
 
 
 def processing_gate_state(gate_path: Path) -> dict[str, Any]:
@@ -999,6 +1354,55 @@ def _parse_captured_send(entry: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _parse_captured_media(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Expand captured native image calls into one bounded item per file."""
+    if not isinstance(entry, Mapping):
+        return []
+    kind = str(entry.get("kind") or "")
+    if kind not in {"send_image_file", "send_multiple_images"}:
+        return []
+    args = list(entry.get("args") or [])
+    kwargs = dict(entry.get("kwargs") or {})
+    chat_id = str(kwargs.get("chat_id") or (args[0] if args else "") or "")
+    reply_to = kwargs.get("reply_to")
+    if reply_to is None and kind == "send_image_file" and len(args) > 3:
+        reply_to = args[3]
+    if not chat_id:
+        return []
+    if kind == "send_image_file":
+        path = kwargs.get("image_path") or (args[1] if len(args) > 1 else None)
+        caption = kwargs.get("caption") or (args[2] if len(args) > 2 else None)
+        values: Sequence[Any] = [(path, caption)] if path else []
+    else:
+        values = kwargs.get("images") or (args[1] if len(args) > 1 else [])
+        if isinstance(values, (str, bytes, Mapping)):
+            values = [values]
+    parsed: list[dict[str, Any]] = []
+    for ordinal, value in enumerate(values if isinstance(values, Sequence) else []):
+        if isinstance(value, Mapping):
+            path = value.get("image_path") or value.get("path") or value.get("url")
+            caption = value.get("caption") or value.get("alt_text")
+        elif isinstance(value, (list, tuple)):
+            path = value[0] if value else None
+            caption = value[1] if len(value) > 1 else None
+        else:
+            path, caption = value, None
+        text = str(path or "")
+        if text.startswith("file://"):
+            from urllib.parse import unquote
+            text = unquote(text[7:])
+        if text:
+            parsed.append({
+                "send_kind": "media",
+                "chat_id": chat_id,
+                "path": text,
+                "caption": str(caption) if caption else None,
+                "reply_to": str(reply_to) if reply_to else None,
+                "ordinal": ordinal,
+            })
+    return parsed
+
+
 def _timestamp_epoch_seconds(value: Any) -> float | None:
     """Normalize bridge/gate timestamp shapes to epoch seconds."""
     if isinstance(value, Mapping):
@@ -1155,11 +1559,13 @@ def deliver_management_replies(
     from urllib.error import HTTPError, URLError
 
     summary = {"delivered": 0, "undelivered": 0, "suppressed": 0, "duplicate": 0}
-    sends = [
+    sends: list[dict[str, Any]] = [
         parsed
         for parsed in (_parse_captured_send(entry) for entry in captured_outbound)
         if parsed is not None
     ]
+    for entry in captured_outbound:
+        sends.extend(_parse_captured_media(entry))
     if not sends:
         return summary
     gate_epoch = _timestamp_epoch_seconds(gate_changed_at)
@@ -1208,21 +1614,50 @@ def deliver_management_replies(
         # differences into distinct sends.  Once a reply is claimed for an
         # inbound WA message, no second rendering/model response may send it
         # again.  ``anchor`` is the source-native messageId, not replay-1.
-        delivery_key = f"{chat_id}::{anchor or 'no-anchor'}"
+        if send.get("send_kind", "text") == "media":
+            retention = _retention_config(config_path)
+            if retention is None:
+                summary["suppressed"] += 1
+                continue
+            try:
+                media_path = Path(send["path"]).expanduser().resolve(strict=True)
+                if not media_path.is_file() or not media_path.is_relative_to(retention["root"]):
+                    raise MediaRetentionError("captured media path escapes retained-media root")
+                media_mime, _ = _validated_image_type(media_path, None)
+                media_identity = hashlib.sha256(media_path.read_bytes()).hexdigest()
+            except (OSError, MediaRetentionError):
+                summary["suppressed"] += 1
+                continue
+            delivery_key = (
+                f"media::{chat_id}::{anchor}::{media_identity}::{send['ordinal']}"
+            )
+        else:
+            delivery_key = f"{chat_id}::{anchor or 'no-anchor'}"
         if not inbox.claim_reply_delivery(
             delivery_key, chat_id=chat_id, reply_to_message_id=anchor
         ):
             summary["duplicate"] += 1
             continue
-        body = json.dumps(
-            {
+        body_payload: dict[str, Any] = {
                 "chatId": chat_id,
-                "message": send["content"],
                 "replyTo": {"messageId": anchor},
-            }
-        ).encode()
+        }
+        endpoint = "send"
+        if send.get("send_kind", "text") == "media":
+            endpoint = "send-media"
+            body_payload.update({
+                "filePath": str(media_path),
+                "mediaType": "image",
+            })
+            if send.get("caption"):
+                body_payload["caption"] = send["caption"]
+            # The bridge's media route currently consumes a scalar native id.
+            body_payload["replyTo"] = anchor
+        else:
+            body_payload["message"] = send["content"]
+        body = json.dumps(body_payload).encode()
         request = Request(
-            f"{bridge_url}/send",
+            f"{bridge_url}/{endpoint}",
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1241,6 +1676,7 @@ def deliver_management_replies(
                     delivery_key,
                     status="delivered",
                     bridge_message_id=str(payload.get("messageId") or ""),
+                    provider_outcome=str(payload.get("outcome") or "delivered"),
                 )
                 summary["delivered"] += 1
             else:
@@ -1253,6 +1689,7 @@ def deliver_management_replies(
                 inbox.record_reply_delivery(
                     delivery_key,
                     status="undelivered",
+                    provider_outcome=str(payload.get("outcome") or "unconfirmed"),
                     error=f"http-{status_code}-unconfirmed: {json.dumps(payload)[:200]}",
                 )
                 summary["undelivered"] += 1
@@ -1313,6 +1750,18 @@ async def _process_claimed_chat_batch(
         raise ConsumerError(f"scheduler produced a mixed-chat batch: {sorted(chat_ids)}")
     inbox.claim(records)
     try:
+        # The inbox claim, not the source cursor, is the retry boundary.  Media
+        # retention and its system convergence must complete before Hermes can
+        # reason over the event or terminal its row.
+        for record in records:
+            try:
+                retention = await asyncio.to_thread(
+                    retain_record_media, record, config_path=config_path
+                )
+            except MediaRetentionError:
+                inbox.record_retention(record, failed=True)
+                raise
+            inbox.record_retention(record, retained=int(retention["retained"]))
         async with _management_typing_presence(
             records,
             config_path=config_path,
@@ -1348,6 +1797,9 @@ async def _process_claimed_chat_batch(
         inbox.finish_processed_batch(records, turn_for_message=turn_for_message)
     except asyncio.CancelledError:
         inbox.requeue(records, reason="graceful-cancellation")
+        raise
+    except MediaRetentionError as exc:
+        inbox.requeue(records, reason=f"media-retention-retry: {exc}")
         raise
     except Exception as exc:
         inbox.finish(records, status="failed", error=str(exc))
@@ -1417,6 +1869,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     _write_status(
                         status_path,
                         {
+                            **_retention_status(
+                                inbox, config_path, inspect_media=False
+                            ),
                             "state": "standby",
                             "processing_enabled": False,
                             "config_enabled": config_enabled,
@@ -1443,12 +1898,36 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     await asyncio.sleep(args.poll_seconds)
                     continue
 
+                retention_status = _retention_status(
+                    inbox, config_path, inspect_media=True
+                )
+                try:
+                    _assert_media_headroom(config_path, retention_status)
+                except MediaRetentionError as exc:
+                    _write_status(
+                        status_path,
+                        {
+                            **retention_status,
+                            "state": "held",
+                            "processing_enabled": False,
+                            "config_enabled": True,
+                            "gate_enabled": True,
+                            "gate_generation": int(gate["generation"]),
+                            "pid": os.getpid(),
+                            "source_opened": False,
+                            "cursor_advanced": False,
+                            "retention_hold": str(exc),
+                            "inbox": inbox.counts(),
+                        },
+                    )
+                    raise
                 if runner is None:
                     runner = _new_gateway_runner()
 
                 _write_status(
                     status_path,
                     {
+                        **retention_status,
                         "state": "running",
                         "processing_enabled": True,
                         "config_enabled": True,
@@ -1555,6 +2034,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                     _write_status(
                         status_path,
                         {
+                            **_retention_status(
+                                inbox, config_path, inspect_media=True
+                            ),
                             "state": "running",
                             "processing_enabled": True,
                             "config_enabled": True,
@@ -1586,6 +2068,9 @@ async def run_consumer(args: argparse.Namespace) -> int:
                 _write_status(
                     status_path,
                     {
+                        **_retention_status(
+                            inbox, config_path, inspect_media=True
+                        ),
                         "state": "running",
                         "processing_enabled": True,
                         "config_enabled": True,

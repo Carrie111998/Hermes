@@ -35,6 +35,174 @@ def _write_jsonl(path: Path, values: list[dict]) -> None:
     )
 
 
+def _png_bytes(payload: bytes = b"fixture") -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + payload
+
+
+def _retention_config(tmp_path: Path, source_root: Path, media_root: Path) -> Path:
+    path = tmp_path / "retention-config.yaml"
+    path.write_text(yaml.safe_dump({
+        "pa": {
+            "enabled": True,
+            "media_retention": {
+                "enabled": True,
+                "media_root": str(media_root),
+                "source_roots": [str(source_root)],
+                "operation": "tgg_media_retention",
+            },
+        },
+    }), encoding="utf-8")
+    return path
+
+
+def test_media_retention_is_atomic_idempotent_and_provenance_bound(tmp_path, monkeypatch):
+    source_root = tmp_path / "capture"
+    source_root.mkdir()
+    source = source_root / "photo.png"
+    source.write_bytes(_png_bytes())
+    media_root = tmp_path / "systems-media"
+    config = _retention_config(tmp_path, source_root, media_root)
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        consumer, "_converge_retained_media",
+        lambda config_path, **kwargs: calls.append(kwargs["payload"])
+        or {
+            "ok": True,
+            "data": {"ledgerChanged": False, "observationsChanged": False},
+        },
+    )
+    raw = _message("M-IMAGE", "management@g.us")
+    raw.update({"hasMedia": True, "mediaType": "image/png", "mediaUrls": [str(source)]})
+    record = consumer.InboxRecord(1, "M-IMAGE", "management@g.us", 0, 1, raw)
+
+    first = consumer.retain_record_media(record, config_path=config)
+    second = consumer.retain_record_media(record, config_path=config)
+    assert first == second == {"retained": 1, "bytes": len(_png_bytes()), "operation": True}
+    files = list(media_root.glob("*.png"))
+    assert len(files) == 1
+    assert files[0].read_bytes() == _png_bytes()
+    assert calls[0] == calls[1]
+    assert calls[0]["message_id"] == "M-IMAGE"
+    assert calls[0]["media"][0]["media_ordinal"] == 0
+    assert calls[0]["media"][0]["ref"] == f"/media/{files[0].name}"
+
+    files[0].write_bytes(_png_bytes(b"changed"))
+    with pytest.raises(consumer.MediaRetentionError, match="PROVENANCE_DIVERGENCE"):
+        consumer.retain_record_media(record, config_path=config)
+
+
+def test_media_retention_refuses_source_path_escape(tmp_path, monkeypatch):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_png_bytes())
+    config = _retention_config(tmp_path, allowed, tmp_path / "retained")
+    monkeypatch.setattr(consumer, "_converge_retained_media", lambda *a, **k: {})
+    raw = _message("ESCAPE")
+    raw.update({"hasMedia": True, "mediaUrls": [str(outside)]})
+    record = consumer.InboxRecord(1, "ESCAPE", "test-group@g.us", 0, 1, raw)
+    with pytest.raises(consumer.MediaRetentionError, match="escapes configured roots"):
+        consumer.retain_record_media(record, config_path=config)
+
+
+def test_retention_operation_resolves_from_real_overlay_registry(tmp_path, monkeypatch):
+    canonical = Path("deploy/tgg/christopher/config.yaml")
+    data = yaml.safe_load(canonical.read_text())
+    data["pa"]["enabled"] = True
+    data["pa"]["constitution_path"] = str(
+        Path("deploy/tgg/christopher/christopher_tgg_constitution.yaml").resolve()
+    )
+    config = tmp_path / "actual-shape.yaml"
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    observed = {}
+
+    def fake_execute(bridge, operation, payload, **kwargs):
+        observed.update(operation=operation, known=set(bridge.operations), payload=payload)
+        return {
+            "ok": True,
+            "data": {"ledgerChanged": False, "observationsChanged": False},
+        }
+
+    monkeypatch.setattr("tools.pa_business_tools.execute_business_operation", fake_execute)
+    result = consumer._converge_retained_media(
+        config,
+        operation="tgg_media_retention",
+        payload={"chat_jid": "120363421424519051@g.us", "message_id": "M1"},
+    )
+    assert result == {
+        "ok": True,
+        "data": {"ledgerChanged": False, "observationsChanged": False},
+    }
+    assert observed["operation"] == "tgg_media_retention"
+    assert "tgg_media_retention" in observed["known"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"ok": False, "error": "rejected"},
+        {"ok": True, "data": {}},
+        {"ledgerChanged": False, "observationsChanged": False},
+    ],
+)
+def test_retention_convergence_rejects_non_contract_systems_envelope(
+    tmp_path, monkeypatch, response
+):
+    canonical = Path("deploy/tgg/christopher/config.yaml")
+    data = yaml.safe_load(canonical.read_text())
+    data["pa"]["enabled"] = True
+    data["pa"]["constitution_path"] = str(
+        Path("deploy/tgg/christopher/christopher_tgg_constitution.yaml").resolve()
+    )
+    config = tmp_path / "actual-shape.yaml"
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.pa_business_tools.execute_business_operation",
+        lambda *args, **kwargs: response,
+    )
+
+    with pytest.raises(
+        consumer.MediaRetentionError, match="invalid Systems envelope"
+    ):
+        consumer._converge_retained_media(
+            config,
+            operation="tgg_media_retention",
+            payload={
+                "chat_jid": "120363421424519051@g.us",
+                "message_id": "M1",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_retention_failure_requeues_before_model(tmp_path, monkeypatch):
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    source = tmp_path / "events.jsonl"
+    _write_jsonl(source, [_message("retry-media")])
+    cursor = tmp_path / "cursor.json"
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    records = inbox.pending(limit=1)
+    config = tmp_path / "config.yaml"
+    config.write_text("pa:\n  enabled: true\n", encoding="utf-8")
+    model_called = False
+    def fail_retention(*args, **kwargs):
+        raise consumer.MediaRetentionError("systems unavailable")
+    async def model(*args, **kwargs):
+        nonlocal model_called
+        model_called = True
+    monkeypatch.setattr(consumer, "retain_record_media", fail_retention)
+    monkeypatch.setattr(consumer, "process_live_records", model)
+    with pytest.raises(consumer.MediaRetentionError, match="systems unavailable"):
+        await consumer._process_claimed_chat_batch(
+            inbox, records, config_path=config, state_db=tmp_path / "state.db",
+            gate_changed_at="2026-07-21T00:00:00+00:00", runner=object(),
+        )
+    assert model_called is False
+    assert inbox.counts() == {"pending": 1}
+    assert inbox.retention_counts() == {"retention_total": 0, "retention_failures": 1}
+
+
 def test_stage_is_durable_before_cursor_and_idempotent(tmp_path):
     source = tmp_path / "events.jsonl"
     cursor_path = tmp_path / "cursor.json"
@@ -127,7 +295,65 @@ def test_disabled_once_does_not_require_or_open_source(tmp_path):
     assert status["gate_enabled"] is False
     assert status["source_opened"] is False
     assert status["cursor_advanced"] is False
+    assert {
+        "retention_total", "retention_failures", "media_root_count",
+        "media_root_bytes", "media_volume_free_percent",
+    } <= set(status)
     assert not Path(args.cursor).exists()
+
+
+def test_disabled_retention_does_not_touch_media_root(tmp_path):
+    media_root = tmp_path / "must-not-exist"
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({
+        "pa": {
+            "enabled": False,
+            "media_retention": {
+                "enabled": True, "media_root": str(media_root),
+                "source_roots": [str(tmp_path / "capture")],
+                "operation": "tgg_media_retention", "min_free_percent": 20,
+            },
+        },
+    }), encoding="utf-8")
+    gate = tmp_path / "gate.json"
+    gate.write_text(json.dumps({"version": 1, "enabled": False, "generation": 0}))
+    args = argparse.Namespace(
+        config=str(config), source=str(tmp_path / "missing.jsonl"),
+        cursor=str(tmp_path / "missing.cursor"), inbox=str(tmp_path / "inbox.db"),
+        status_file=str(tmp_path / "status.json"), lock_file=str(tmp_path / "lock"),
+        state_db=str(tmp_path / "state.db"), processing_gate=str(gate), once=True,
+        poll_seconds=.01, max_records=10,
+    )
+    assert asyncio.run(consumer.run_consumer(args)) == 0
+    assert not media_root.exists()
+    status = json.loads(Path(args.status_file).read_text())
+    assert status["media_root_count"] == 0
+    assert status["media_root_bytes"] == 0
+    assert status["media_volume_free_percent"] is None
+
+
+@pytest.mark.asyncio
+async def test_low_media_volume_holds_before_source_open(tmp_path, monkeypatch):
+    args = _enabled_consumer_args(tmp_path, [_message("not-staged")])
+    config = Path(args.config)
+    data = yaml.safe_load(config.read_text())
+    data["pa"]["media_retention"] = {
+        "enabled": True, "media_root": str(tmp_path / "retained"),
+        "source_roots": [str(tmp_path)], "operation": "tgg_media_retention",
+        "min_free_percent": 20,
+    }
+    config.write_text(yaml.safe_dump(data), encoding="utf-8")
+    monkeypatch.setattr(
+        consumer.shutil, "disk_usage",
+        lambda path: consumer.shutil._ntuple_diskusage(total=100, used=90, free=10),
+    )
+    with pytest.raises(consumer.MediaRetentionError, match="below configured floor"):
+        await consumer.run_consumer(args)
+    status = json.loads(Path(args.status_file).read_text())
+    assert status["state"] == "held"
+    assert status["source_opened"] is False
+    assert status["media_volume_free_percent"] == 10.0
+    assert consumer.SourceCursor.from_path(Path(args.cursor)).offset == 0
 
 
 def test_root_gate_blocks_accidentally_enabled_config_without_opening_source(tmp_path):

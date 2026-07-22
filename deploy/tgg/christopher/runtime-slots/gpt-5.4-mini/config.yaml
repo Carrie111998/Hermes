@@ -10,6 +10,13 @@ agent:
   max_turns: 12
 pa:
   enabled: false
+  media_retention:
+    enabled: true
+    media_root: /home/pclaw/.systems-pcl/data/media
+    source_roots:
+    - /var/lib/tgg-capture/whatsapp/media
+    operation: tgg_media_retention
+    min_free_percent: 20
   constitution_path: /home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml
   overlay:
     identity:
@@ -199,6 +206,26 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
+          tgg_case_media:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/media
+            path_params:
+            - jobNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_media_retention:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/messages/media-retention
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 20
           agent_config_read:
             type: http
             tenant: tgg

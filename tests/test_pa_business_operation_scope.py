@@ -3,8 +3,8 @@
 Christopher runs one process across TGG's ingest chats and its management
 chats. The selector picks the job brief; the brief's ``business_operations``
 block decides which configured operations survive into the runtime registry for
-that chat. These tests pin the guarantee that the management chats cannot reach
-the ingest write path — mechanically, not by prompt wording.
+that chat. Management carries the full case-shaped registry; ingest cannot read
+case photos or invoke the runtime-only media-retention convergence operation.
 """
 
 from pathlib import Path
@@ -34,8 +34,8 @@ TGG_CONSTITUTION = DEPLOY_ROOT / "christopher_tgg_constitution.yaml"
 MGMT_CHAT_ID = "120363426509183563@g.us"
 INGEST_CHAT_ID = "120363403088884777@g.us"
 
-# Operations that must never be reachable from a management chat.
-INGEST_WRITE_OPERATIONS = (
+# Case-shaped operations management is explicitly authorized to use.
+MANAGEMENT_CASE_OPERATIONS = (
     "tgg_case_create",
     "tgg_case_observation",
     "tgg_case_update",
@@ -151,9 +151,8 @@ def test_business_operations_participate_in_the_job_hash():
 
 def test_management_chat_cannot_reach_ingest_write_operations():
     bridge = _bridge(MGMT_CHAT_ID)
-    for operation in INGEST_WRITE_OPERATIONS:
-        assert operation not in bridge.operations, operation
-        assert operation in bridge.denied_operations, operation
+    for operation in MANAGEMENT_CASE_OPERATIONS:
+        assert operation in bridge.operations, operation
 
 
 def test_management_chat_keeps_the_reads_its_instructions_depend_on():
@@ -186,17 +185,16 @@ def test_management_chat_resolves_the_new_attention_operations():
         assert operation in bridge.operations, operation
 
 
-def test_management_chat_still_denies_ingest_write_operations():
-    """Regression guard: the new ops must not widen management's write surface."""
+def test_management_chat_allows_case_photos_but_not_retention_primitive():
     bridge = _bridge(MGMT_CHAT_ID)
-    for operation in INGEST_WRITE_OPERATIONS:
-        assert operation not in bridge.operations, operation
-        assert operation in bridge.denied_operations, operation
+    assert "tgg_case_media" in bridge.operations
+    assert "tgg_media_retention" not in bridge.operations
+    assert "tgg_media_retention" in bridge.denied_operations
 
 
-def test_management_operation_count_is_sixteen():
+def test_management_operation_count_is_twenty_four():
     bridge = _bridge(MGMT_CHAT_ID)
-    assert len(bridge.operations) == 16, sorted(bridge.operations)
+    assert len(bridge.operations) == 24, sorted(bridge.operations)
 
 
 def test_ingest_chat_resolves_the_new_attention_reads():
@@ -212,10 +210,17 @@ def test_ingest_chat_does_not_resolve_attention_annotate():
     assert "tgg_attention_annotate" in ingest.denied_operations
 
 
+def test_ingest_chat_denies_case_media_and_retention_primitive():
+    ingest = _bridge(INGEST_CHAT_ID)
+    for operation in ("tgg_case_media", "tgg_media_retention"):
+        assert operation not in ingest.operations
+        assert operation in ingest.denied_operations
+
+
 def test_ingest_chat_still_resolves_its_write_operations():
     """Proof the denied-only block did not accidentally allow-filter the brief."""
     ingest = _bridge(INGEST_CHAT_ID)
-    for operation in INGEST_WRITE_OPERATIONS:
+    for operation in MANAGEMENT_CASE_OPERATIONS:
         assert operation in ingest.operations, operation
 
 
@@ -233,12 +238,12 @@ def test_scoping_does_not_invent_operations():
 
 
 def test_denied_operation_refuses_at_execution():
-    bridge = _bridge(MGMT_CHAT_ID)
+    bridge = _bridge(INGEST_CHAT_ID)
     with pytest.raises(OperationNotPermitted) as excinfo:
         execute_business_operation(
             bridge,
-            operation="tgg_case_create",
-            payload={"zone": "z", "address": "a", "problem": "p", "source": "whatsapp"},
+            operation="tgg_case_media",
+            payload={"jobNo": "SK/JOB/2606/2372"},
         )
     assert excinfo.value.code == "OPERATION_NOT_PERMITTED"
     # The refusal names what IS available so the model can self-correct.
@@ -246,9 +251,9 @@ def test_denied_operation_refuses_at_execution():
 
 
 def test_denied_operation_is_distinguishable_from_a_typo():
-    bridge = _bridge(MGMT_CHAT_ID)
+    bridge = _bridge(INGEST_CHAT_ID)
     with pytest.raises(ValueError) as denied:
-        execute_business_operation(bridge, operation="tgg_case_create", payload={})
+        execute_business_operation(bridge, operation="tgg_case_media", payload={})
     with pytest.raises(ValueError) as unknown:
         execute_business_operation(bridge, operation="tgg_case_bogus", payload={})
     assert isinstance(denied.value, OperationNotPermitted)
@@ -256,15 +261,15 @@ def test_denied_operation_is_distinguishable_from_a_typo():
     assert "unknown PA business operation" in str(unknown.value)
 
 
-def test_legacy_alias_cannot_bypass_the_scope():
-    """Aliases resolve to canonical names BEFORE the permission check."""
-    bridge = _bridge(MGMT_CHAT_ID)
-    # tgg_case_update_state is a legacy alias for the denied tgg_case_update.
-    with pytest.raises(OperationNotPermitted) as excinfo:
-        execute_business_operation(
-            bridge, operation="tgg_case_update_state", payload={"jobNo": "SK/JOB/1/1"}
-        )
-    assert "tgg_case_update" in str(excinfo.value)
+def test_legacy_case_update_alias_remains_available_to_management(monkeypatch):
+    import tools.pa_business_tools as pbt
+
+    monkeypatch.setattr(pbt, "_execute_http_operation", lambda *_a, **_kw: {"ok": True})
+    assert execute_business_operation(
+        _bridge(MGMT_CHAT_ID),
+        operation="tgg_case_update_state",
+        payload={"jobNo": "SK/JOB/2606/2372"},
+    ) == {"ok": True}
 
 
 def test_permitted_operation_passes_the_scope_check(monkeypatch):
@@ -298,8 +303,9 @@ def test_deployed_management_brief_declares_the_scope():
     assert resolved.job_type == "tgg_management"
     scope = resolved.job_brief.business_operations
     assert set(scope) == {"allowed"}
-    for operation in INGEST_WRITE_OPERATIONS:
-        assert operation not in scope["allowed"], operation
+    for operation in MANAGEMENT_CASE_OPERATIONS + ("tgg_case_media",):
+        assert operation in scope["allowed"], operation
+    assert "tgg_media_retention" not in scope["allowed"]
 
 
 def test_every_management_selector_shares_the_scope():
@@ -318,5 +324,5 @@ def test_every_management_selector_shares_the_scope():
     assert MGMT_CHAT_ID in mgmt_chats
     for chat_id in mgmt_chats:
         bridge = _bridge(chat_id)
-        for operation in INGEST_WRITE_OPERATIONS:
-            assert operation not in bridge.operations, (chat_id, operation)
+        for operation in MANAGEMENT_CASE_OPERATIONS + ("tgg_case_media",):
+            assert operation in bridge.operations, (chat_id, operation)

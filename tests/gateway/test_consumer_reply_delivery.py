@@ -90,6 +90,28 @@ def _handled(*message_ids: str) -> list[dict]:
     return [{"message_ids": list(message_ids), "turn_id": "turn-current"}]
 
 
+def _enable_media_retention(config_path: Path, media_root: Path) -> None:
+    import yaml
+    data = yaml.safe_load(config_path.read_text())
+    data["pa"]["media_retention"] = {
+        "enabled": True,
+        "media_root": str(media_root),
+        "source_roots": [str(media_root)],
+        "operation": "tgg_media_retention",
+    }
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+def _captured_images(chat_id: str, paths: list[Path], reply_to: str = "MSG1") -> dict:
+    return {
+        "message_id": "replay-media",
+        "kind": "send_multiple_images",
+        "args": [chat_id, [[f"file://{path}", f"photo {i}"] for i, path in enumerate(paths)]],
+        "kwargs": {"reply_to": reply_to},
+        "delivery_mode": "capture",
+    }
+
+
 def test_selector_chats_are_whatsapp_management_only(config_path: Path) -> None:
     chats = _management_selector_chats(config_path)
     assert chats == frozenset({MGMT_CHAT})
@@ -100,6 +122,98 @@ def test_parse_extracts_send_and_rejects_other_kinds() -> None:
     assert parsed == {"chat_id": MGMT_CHAT, "content": "reply text", "reply_to": "MSG1"}
     assert _parse_captured_send({**_captured(MGMT_CHAT), "kind": "send_image"}) is None
     assert _parse_captured_send({"kind": "send", "args": [], "kwargs": {}}) is None
+
+
+def test_multi_photo_delivery_uses_send_media_and_distinct_durable_keys(
+    inbox: DurableInbox, config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_root = tmp_path / "retained"
+    media_root.mkdir()
+    paths = [media_root / "a.png", media_root / "b.png"]
+    for index, path in enumerate(paths):
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([index]))
+    _enable_media_retention(config_path, media_root)
+    sent: list[tuple[str, dict]] = []
+    def fake_urlopen(request, timeout=0):
+        sent.append((request.full_url, json.loads(request.data)))
+        return _FakeResponse({"success": True, "messageId": f"WA-{len(sent)}"})
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    kwargs = dict(
+        config_path=config_path,
+        captured_outbound=[_captured_images(MGMT_CHAT, paths)],
+        batch_records=[_record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
+    )
+    first = deliver_management_replies(inbox, **kwargs)
+    second = deliver_management_replies(inbox, **kwargs)
+    assert first["delivered"] == 2
+    assert second["duplicate"] == 2
+    assert len(sent) == 2
+    assert all(url.endswith("/send-media") for url, _ in sent)
+    assert [body["filePath"] for _, body in sent] == [str(path) for path in paths]
+    assert all(body["chatId"] == MGMT_CHAT and body["replyTo"] == "MSG1" for _, body in sent)
+    with inbox.connect() as conn:
+        keys = [row[0] for row in conn.execute(
+            "SELECT delivery_key FROM reply_deliveries ORDER BY delivery_key"
+        )]
+    assert len(keys) == 2 and all(key.startswith(f"media::{MGMT_CHAT}::MSG1::") for key in keys)
+
+
+def test_media_delivery_refuses_non_management_missing_and_path_escape(
+    inbox: DurableInbox, config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_root = tmp_path / "retained"
+    media_root.mkdir()
+    valid = media_root / "valid.png"
+    valid.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\noutside")
+    _enable_media_retention(config_path, media_root)
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: calls.append(a))
+    captured = [
+        _captured_images(SITE_CHAT, [valid]),
+        _captured_images(MGMT_CHAT, [outside]),
+        _captured_images(MGMT_CHAT, [media_root / "missing.png"]),
+    ]
+    summary = deliver_management_replies(
+        inbox, config_path=config_path, captured_outbound=captured,
+        batch_records=[_record(SITE_CHAT), _record(MGMT_CHAT)],
+        gate_changed_at=GATE_CHANGED_AT, handled_groups=_handled("MSG1"),
+    )
+    assert summary["suppressed"] == 3
+    assert not calls
+
+
+def test_media_unknown_outcome_is_not_retried(
+    inbox: DurableInbox, config_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_root = tmp_path / "retained"
+    media_root.mkdir()
+    path = media_root / "photo.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\nphoto")
+    _enable_media_retention(config_path, media_root)
+    calls = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda request, timeout=0: calls.append(request) or _FakeResponse(
+            {"outcome": "unknown", "retrySafe": False}, status=202
+        ),
+    )
+    kwargs = dict(
+        config_path=config_path, captured_outbound=[_captured_images(MGMT_CHAT, [path])],
+        batch_records=[_record(MGMT_CHAT)], gate_changed_at=GATE_CHANGED_AT,
+        handled_groups=_handled("MSG1"),
+    )
+    assert deliver_management_replies(inbox, **kwargs)["undelivered"] == 1
+    assert deliver_management_replies(inbox, **kwargs)["duplicate"] == 1
+    assert len(calls) == 1
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT status,provider_outcome FROM reply_deliveries"
+        ).fetchone()
+    assert (row["status"], row["provider_outcome"]) == ("undelivered", "unknown")
 
 
 def test_site_selector_response_never_delivers(

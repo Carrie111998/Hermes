@@ -14,6 +14,7 @@
       - tgg_case_create
       - tgg_case_list
       - tgg_case_lookup
+      - tgg_case_media
       - tgg_case_observation
       - tgg_case_query
       - tgg_case_search
