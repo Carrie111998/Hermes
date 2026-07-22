@@ -946,6 +946,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notify_on_complete: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -973,6 +974,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=notify_on_complete,
         )
 
         pty_scope_attempted = False
@@ -1195,6 +1197,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notify_on_complete: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1216,6 +1219,7 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
         )
 
         # Run the command in the sandbox with output capture
@@ -1658,6 +1662,7 @@ class ProcessRegistry:
         retain that legacy behavior even when a filter is provided. When a
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
+
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
