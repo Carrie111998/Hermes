@@ -3151,6 +3151,7 @@ def _transition_readjudication_drafts(
     before_image_path: Path,
     run_id: str,
     dry_run: bool,
+    source_state: str = "draft",
 ) -> dict[str, Any]:
     """Close stale drafts or hold them for the manager, with row-level audit."""
     readjudicated = tuple(dict.fromkeys(int(value) for value in readjudicated_ids))
@@ -3177,10 +3178,12 @@ def _transition_readjudication_drafts(
             raise ConsumerError(
                 f"draft transition denominator mismatch: missing={sorted(set(all_ids) - found)}"
             )
-        not_draft = [int(row["id"]) for row in rows if str(row["state"]) != "draft"]
-        if not_draft:
+        wrong_state = [
+            int(row["id"]) for row in rows if str(row["state"]) != source_state
+        ]
+        if wrong_state:
             raise ConsumerError(
-                f"draft transition refuses non-draft rows: {not_draft}"
+                f"draft transition refuses rows outside {source_state}: {wrong_state}"
             )
         before = [dict(row) for row in rows]
         before_payload = {
@@ -3208,9 +3211,9 @@ def _transition_readjudication_drafts(
         with conn:
             for draft_id in readjudicated:
                 changed = conn.execute(
-                    "UPDATE draft_outbound SET state='readjudicated',updated_at=? "
-                    "WHERE id=? AND state='draft'",
-                    (now, draft_id),
+                    "UPDATE draft_outbound SET state='readjudicated',recipient=NULL,updated_at=? "
+                    "WHERE id=? AND state=?",
+                    (now, draft_id, source_state),
                 ).rowcount
                 if changed != 1:
                     raise ConsumerError(f"draft {draft_id} readjudication CAS failed")
@@ -3237,8 +3240,8 @@ def _transition_readjudication_drafts(
             for draft_id in pending_manager:
                 changed = conn.execute(
                     "UPDATE draft_outbound SET state='pending_manager',recipient=?,updated_at=? "
-                    "WHERE id=? AND state='draft'",
-                    (manager_chat_id, now, draft_id),
+                    "WHERE id=? AND state=?",
+                    (manager_chat_id, now, draft_id, source_state),
                 ).rowcount
                 if changed != 1:
                     raise ConsumerError(f"draft {draft_id} pending-manager CAS failed")
@@ -3398,6 +3401,7 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                     before_image_path=Path(draft_before_image).resolve(),
                     run_id=run_id,
                     dry_run=True,
+                    source_state=str(getattr(args, "draft_source_state", "draft")),
                 )
 
             if getattr(args, "requeue_selected", False):
@@ -3411,6 +3415,7 @@ async def run_bounded_backplay(args: argparse.Namespace) -> int:
                     before_image_path=Path(before_image).resolve(),
                     run_id=run_id,
                     dry_run=dry_run,
+                    source_state=str(getattr(args, "draft_source_state", "draft")),
                 )
 
             reconciliation = inbox.reconcile_window_processing(
@@ -3672,6 +3677,9 @@ def build_parser() -> argparse.ArgumentParser:
     bounded.add_argument("--readjudicated-draft-id-file")
     bounded.add_argument("--pending-manager-draft-id-file")
     bounded.add_argument("--manager-chat-id")
+    bounded.add_argument(
+        "--draft-source-state", choices=("draft", "pending_manager"), default="draft"
+    )
     bounded.add_argument("--draft-before-image")
     bounded.add_argument("--expected-total", type=int, required=True)
     bounded.add_argument("--batch-size", type=int, default=25)
