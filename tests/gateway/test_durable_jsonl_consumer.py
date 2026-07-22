@@ -107,6 +107,32 @@ def test_media_retention_refuses_source_path_escape(tmp_path, monkeypatch):
         consumer.retain_record_media(record, config_path=config)
 
 
+def test_media_retention_normalizes_source_read_oserror(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    source = capture / "photo.png"
+    source.write_bytes(_png_bytes())
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    raw = _message("SOURCE-RACE")
+    raw.update(
+        {"hasMedia": True, "mediaType": "image", "mediaUrls": [str(source)]}
+    )
+    record = consumer.InboxRecord(
+        1, "SOURCE-RACE", "test-group@g.us", 0, 1, raw
+    )
+    original_read_bytes = Path.read_bytes
+
+    def fail_source_read(path):
+        if path == source:
+            raise OSError("capture download disappeared")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_source_read)
+
+    with pytest.raises(consumer.MediaRetentionError, match="retention I/O failed"):
+        consumer.retain_record_media(record, config_path=config)
+
+
 def test_production_normalized_video_is_not_retained(tmp_path, monkeypatch):
     capture = tmp_path / "capture"
     capture.mkdir()
