@@ -24,3 +24,8 @@ def test_overrides():
 
 def test_none_config_uses_defaults():
     assert build_obsidian_config(None).vault_path == "/srv/dj/obsidian"
+
+
+def test_explicit_empty_exclude_dirs_respected():
+    c = build_obsidian_config({"exclude_dirs": []})
+    assert c.exclude_dirs == ()  # explicit empty must NOT fall back to defaults

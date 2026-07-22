@@ -14,8 +14,8 @@ DEFAULT_EXCLUDES = (".git", ".obsidian", ".trash")
 class ObsidianConfig:
     vault_path: str = DEFAULT_VAULT
     top_k: int = DEFAULT_TOP_K
-    exclude_dirs: tuple = DEFAULT_EXCLUDES
-    pinned: tuple = ()
+    exclude_dirs: tuple[str, ...] = DEFAULT_EXCLUDES
+    pinned: tuple[str, ...] = ()
 
 
 def build_obsidian_config(cfg: "Mapping[str, Any] | None") -> ObsidianConfig:
@@ -25,6 +25,6 @@ def build_obsidian_config(cfg: "Mapping[str, Any] | None") -> ObsidianConfig:
     return ObsidianConfig(
         vault_path=str(cfg.get("vault_path", DEFAULT_VAULT)),
         top_k=int(cfg.get("top_k", DEFAULT_TOP_K)),
-        exclude_dirs=tuple(excludes) if excludes else DEFAULT_EXCLUDES,
-        pinned=tuple(str(p) for p in pinned) if pinned else (),
+        exclude_dirs=tuple(excludes) if excludes is not None else DEFAULT_EXCLUDES,
+        pinned=tuple(str(p) for p in pinned) if pinned is not None else (),
     )
