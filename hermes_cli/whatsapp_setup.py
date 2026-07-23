@@ -180,7 +180,8 @@ def _system_gateway_pid_if_owned(old_pid: Optional[int]) -> Optional[int]:
 
 def _raise_if_system_gateway_requires_root(old_pid: Optional[int]) -> Optional[int]:
     system_pid = _system_gateway_pid_if_owned(old_pid)
-    if system_pid is not None and os.geteuid() != 0:  # windows-footgun: linux-only helper
+    geteuid = getattr(os, "geteuid", None)
+    if system_pid is not None and (geteuid is None or geteuid() != 0):
         raise RuntimeError(
             "The running gateway is a system service and cannot be quiesced "
             "without root. Stop it first with "
