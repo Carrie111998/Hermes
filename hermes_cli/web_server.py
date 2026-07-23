@@ -8466,7 +8466,7 @@ async def start_whatsapp_onboarding(
         from hermes_cli.whatsapp_setup import prepare_whatsapp_pairing
 
         try:
-            prepare_whatsapp_pairing()
+            prepare_whatsapp_pairing(profile=effective_profile)
         except RuntimeError as exc:
             raise HTTPException(
                 status_code=503,

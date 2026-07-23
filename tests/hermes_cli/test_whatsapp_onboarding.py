@@ -313,7 +313,7 @@ def test_start_whatsapp_onboarding_replaces_existing_session_exclusively(monkeyp
     monkeypatch.setattr(
         whatsapp_setup,
         "prepare_whatsapp_pairing",
-        lambda: (
+        lambda **kwargs: (
             events.append(("disabled-and-restarted", old_proc.terminated))
             or True
         ),
@@ -360,7 +360,7 @@ def test_start_whatsapp_onboarding_returns_before_bridge_spawn(monkeypatch, tmp_
 
     ws._whatsapp_onboarding_sessions.clear()
     monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: tmp_path / "session")
-    monkeypatch.setattr(whatsapp_setup, "prepare_whatsapp_pairing", lambda: False)
+    monkeypatch.setattr(whatsapp_setup, "prepare_whatsapp_pairing", lambda **kwargs: False)
     monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda size: "pairing-start")
     monkeypatch.setattr(ws.threading, "Thread", FakeThread)
 
@@ -404,7 +404,12 @@ def test_start_whatsapp_onboarding_honors_query_profile(monkeypatch, tmp_path):
     ws._whatsapp_onboarding_sessions.clear()
     monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
     monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: tmp_path / "work-session")
-    monkeypatch.setattr(whatsapp_setup, "prepare_whatsapp_pairing", lambda: False)
+    captured_profile = {}
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **kwargs: captured_profile.update(kwargs) or False,
+    )
     monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda size: "profile-pairing")
     monkeypatch.setattr(ws.threading, "Thread", FakeThread)
 
@@ -417,6 +422,7 @@ def test_start_whatsapp_onboarding_honors_query_profile(monkeypatch, tmp_path):
 
     assert result["pairing_id"] == "profile-pairing"
     assert profiles == ["work"]
+    assert captured_profile == {"profile": "work"}
     record = ws._whatsapp_onboarding_sessions["profile-pairing"]
     assert record.profile == "work"
     assert record.session_path == str(tmp_path / "work-session")

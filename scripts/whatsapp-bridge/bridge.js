@@ -45,6 +45,7 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
   resolvePairTimeoutSeconds,
+  writePairEventAndExit,
 } from './bridge_helpers.js';
 
 // Terminal contract with the Python adapter: unlike generic startup failures,
@@ -1123,10 +1124,14 @@ if (PAIR_ONLY) {
     console.log();
   }
   pairTimeoutTimer = setTimeout(() => {
-    emitPairEvent({ event: 'error', error: 'pair_timeout' });
-    if (!PAIR_JSON) {
-      console.error(`✗ WhatsApp pairing timed out after ${PAIR_TIMEOUT_SECONDS} seconds.`);
+    if (PAIR_JSON) {
+      writePairEventAndExit(
+        { event: 'error', error: 'pair_timeout' },
+        { code: 124 },
+      );
+      return;
     }
+    console.error(`✗ WhatsApp pairing timed out after ${PAIR_TIMEOUT_SECONDS} seconds.`);
     process.exit(124);
   }, PAIR_TIMEOUT_SECONDS * 1000);
   pairTimeoutTimer.unref?.();

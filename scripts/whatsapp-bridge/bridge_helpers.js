@@ -18,6 +18,26 @@ export function resolvePairTimeoutSeconds(rawValue, fallbackSeconds = 600) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallbackSeconds;
 }
 
+export function writePairEventAndExit(event, {
+  stream = process.stdout,
+  exit = process.exit,
+  code = 1,
+  now = Date.now,
+} = {}) {
+  let line;
+  try {
+    line = `${JSON.stringify({ ts: now(), ...event })}\n`;
+  } catch {
+    exit(code);
+    return;
+  }
+  try {
+    stream.write(line, () => exit(code));
+  } catch {
+    exit(code);
+  }
+}
+
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
