@@ -47,6 +47,9 @@ class AuditEvent(enum.Enum):
     SESSION_VERIFY_FAILURE = "session_verify_failure"
     WS_TICKET_MINTED = "ws_ticket_minted"
     WS_TICKET_REJECTED = "ws_ticket_rejected"
+    HANDOFF_TICKET_MINTED = "handoff_ticket_minted"
+    HANDOFF_TICKET_CONSUMED = "handoff_ticket_consumed"
+    HANDOFF_TICKET_REJECTED = "handoff_ticket_rejected"
     TOKEN_AUTH_SUCCESS = "token_auth_success"
     TOKEN_AUTH_FAILURE = "token_auth_failure"
     # RFC 8252 native-app (system-browser + loopback + PKCE) flow.

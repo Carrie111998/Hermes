@@ -31,12 +31,15 @@ from hermes_cli.dashboard_auth.base import (
 )
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
+    detect_https,
     read_session_cookies,
     read_session_provider,
     read_sso_attempt_cookie,
+    set_session_cookies,
     set_session_provider_cookie,
     set_sso_attempt_cookie,
 )
+from hermes_cli.dashboard_auth.prefix import prefix_from_request
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
@@ -375,13 +378,21 @@ async def gated_auth_middleware(
     at, _rt = read_session_cookies(request)
     provider_hint = read_session_provider(request)
     if not at and not _rt:
-        # Neither token present — no session at all. Nothing to verify or
-        # refresh. Before falling back to the /login interstitial, try to
-        # silently bounce the user through the portal OAuth flow: the portal
-        # auto-approves org members and 302s straight back when they already
-        # hold a portal session, so the interstitial click is pure friction
-        # for the common case. The one-shot loop-guard inside _auto_sso_response
-        # prevents a ping-pong when the portal genuinely has no session.
+        # Neither token present — no session at all. Before bouncing to
+        # login / auto-SSO, try a single-use ?handoff=<ticket> consume
+        # (QR phone-path). Valid ticket → set resume-scoped session
+        # cookies and 302 to the same path with the handoff param
+        # stripped so the ticket never lingers in the URL/history.
+        # Invalid / expired / already-used ticket → normal unauth flow
+        # (no error leak about handoff state).
+        handoff = (request.query_params.get("handoff") or "").strip()
+        if handoff:
+            handoff_resp = _handoff_consume_response(request, handoff)
+            if handoff_resp is not None:
+                return handoff_resp
+        # Silently bounce the user through the portal OAuth flow when
+        # eligible: the portal auto-approves org members and 302s
+        # straight back when they already hold a portal session.
         auto = _auto_sso_response(request)
         if auto is not None:
             return auto
@@ -403,49 +414,56 @@ async def gated_auth_middleware(
     # good refresh token — defeating the whole transparent-refresh feature.
     session = None
     if at:
-        # Try every registered provider's verify_session in turn. A provider
-        # that doesn't recognise the token returns None and we move on; the
-        # first provider that returns a Session wins.
-        #
-        # A provider may instead raise ProviderError (its IDP/JWKS is
-        # unreachable, so it can neither confirm nor deny the token). With
-        # multiple providers stacked, that MUST NOT abort the chain — the
-        # token may belong to a *different*, reachable provider. (Concretely:
-        # a self-hosted-OIDC session hits the `nous` provider first, which
-        # tries to reach Nous Portal's JWKS; if that's unreachable it raises,
-        # but the `self-hosted` provider can still verify the token.) So we
-        # remember the unreachable error and keep going. Only if NO provider
-        # verifies the token AND at least one was unreachable do we surface a
-        # 503 — distinguishing "transient IDP outage" (don't force re-login)
-        # from "token genuinely invalid" (fall through to refresh/relogin).
-        unreachable_provider: str | None = None
-        for provider in _ordered_session_providers(provider_hint):
-            try:
-                session = provider.verify_session(access_token=at)
-            except ProviderError as e:
-                _log.warning(
-                    "dashboard-auth: provider %r unreachable during verify: %s",
-                    provider.name, e,
+        # Handoff-minted cookie ATs are verified first via a process-local
+        # HMAC path. They carry scopes=("resume",) only — never superuser /
+        # API_SERVER_KEY / wildcard — and never a refresh token.
+        from hermes_cli.dashboard_auth.ws_tickets import verify_handoff_session_token
+
+        session = verify_handoff_session_token(at)
+        if session is None:
+            # Try every registered provider's verify_session in turn. A provider
+            # that doesn't recognise the token returns None and we move on; the
+            # first provider that returns a Session wins.
+            #
+            # A provider may instead raise ProviderError (its IDP/JWKS is
+            # unreachable, so it can neither confirm nor deny the token). With
+            # multiple providers stacked, that MUST NOT abort the chain — the
+            # token may belong to a *different*, reachable provider. (Concretely:
+            # a self-hosted-OIDC session hits the `nous` provider first, which
+            # tries to reach Nous Portal's JWKS; if that's unreachable it raises,
+            # but the `self-hosted` provider can still verify the token.) So we
+            # remember the unreachable error and keep going. Only if NO provider
+            # verifies the token AND at least one was unreachable do we surface a
+            # 503 — distinguishing "transient IDP outage" (don't force re-login)
+            # from "token genuinely invalid" (fall through to refresh/relogin).
+            unreachable_provider: str | None = None
+            for provider in _ordered_session_providers(provider_hint):
+                try:
+                    session = provider.verify_session(access_token=at)
+                except ProviderError as e:
+                    _log.warning(
+                        "dashboard-auth: provider %r unreachable during verify: %s",
+                        provider.name, e,
+                    )
+                    audit_log(
+                        AuditEvent.SESSION_VERIFY_FAILURE,
+                        provider=provider.name,
+                        reason="provider_unreachable",
+                        ip=_client_ip(request),
+                    )
+                    if unreachable_provider is None:
+                        unreachable_provider = provider.name
+                    continue
+                if session is not None:
+                    break
+            if session is None and unreachable_provider is not None:
+                # No provider could verify the token and at least one couldn't be
+                # reached — treat as a transient outage rather than forcing a
+                # re-login through a (possibly also-unreachable) refresh.
+                return JSONResponse(
+                    {"detail": f"Auth provider {unreachable_provider!r} unreachable"},
+                    status_code=503,
                 )
-                audit_log(
-                    AuditEvent.SESSION_VERIFY_FAILURE,
-                    provider=provider.name,
-                    reason="provider_unreachable",
-                    ip=_client_ip(request),
-                )
-                if unreachable_provider is None:
-                    unreachable_provider = provider.name
-                continue
-            if session is not None:
-                break
-        if session is None and unreachable_provider is not None:
-            # No provider could verify the token and at least one couldn't be
-            # reached — treat as a transient outage rather than forcing a
-            # re-login through a (possibly also-unreachable) refresh.
-            return JSONResponse(
-                {"detail": f"Auth provider {unreachable_provider!r} unreachable"},
-                status_code=503,
-            )
 
     if session is None:
         # Access token is expired/invalid. Before forcing re-login, try to
@@ -529,6 +547,93 @@ async def gated_auth_middleware(
             prefix=prefix_from_request(request),
         )
     return response
+
+
+def _strip_handoff_query(request: Request) -> str:
+    """Same path + query with ``handoff`` removed (ticket never stays in URL)."""
+    from urllib.parse import urlencode
+
+    pairs = [
+        (k, v)
+        for k, v in request.query_params.multi_items()
+        if k != "handoff"
+    ]
+    query = urlencode(pairs)
+    path = request.url.path or "/"
+    return f"{path}?{query}" if query else path
+
+
+def _handoff_consume_response(request: Request, handoff: str) -> Response | None:
+    """Consume a single-use handoff ticket and mint resume-scoped cookies.
+
+    On success returns a 302 to the same path with ``handoff`` stripped and
+    Set-Cookie headers for a least-privilege browser session
+    (``scopes=("resume",)``, no refresh token, never superuser).
+
+    On invalid/expired/replay returns ``None`` so the caller falls through
+    to the normal unauth flow — intentionally no error leak about handoff
+    validity.
+    """
+    import time
+
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        HANDOFF_SCOPES,
+        TicketInvalid,
+        consume_handoff_ticket,
+    )
+
+    try:
+        info = consume_handoff_ticket(handoff)
+    except TicketInvalid as exc:
+        audit_log(
+            AuditEvent.HANDOFF_TICKET_REJECTED,
+            reason=str(exc)[:80],
+            ip=_client_ip(request),
+        )
+        return None
+
+    scopes = tuple(info.get("scopes") or HANDOFF_SCOPES)
+    forbidden = {"*", "superuser", "API_SERVER_KEY"}
+    if forbidden.intersection(scopes):
+        audit_log(
+            AuditEvent.HANDOFF_TICKET_REJECTED,
+            reason="forbidden_scope",
+            ip=_client_ip(request),
+        )
+        return None
+
+    access_token = info.get("access_token") or ""
+    if not access_token:
+        audit_log(
+            AuditEvent.HANDOFF_TICKET_REJECTED,
+            reason="missing_access_token",
+            ip=_client_ip(request),
+        )
+        return None
+
+    expires_at = int(info.get("access_token_expires_at") or 0)
+    expires_in = max(60, expires_at - int(time.time())) if expires_at else 60
+    location = _strip_handoff_query(request)
+    resp = RedirectResponse(url=location, status_code=302)
+    # Never issue a refresh token via handoff — resume-scoped AT only.
+    set_session_cookies(
+        resp,
+        access_token=access_token,
+        refresh_token="",
+        access_token_expires_in=expires_in,
+        use_https=detect_https(request),
+        prefix=prefix_from_request(request),
+        provider=str(info.get("provider") or "handoff"),
+    )
+    audit_log(
+        AuditEvent.HANDOFF_TICKET_CONSUMED,
+        provider=str(info.get("provider") or ""),
+        user_id=str(info.get("user_id") or ""),
+        ip=_client_ip(request),
+        session_id=str(info.get("session_id") or ""),
+        profile=str(info.get("profile") or ""),
+    )
+    return resp
 
 
 def _expires_in_seconds(session) -> int:

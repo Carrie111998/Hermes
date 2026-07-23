@@ -788,6 +788,7 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "scopes": list(getattr(sess, "scopes", ()) or ()),
     }
 
 
@@ -826,6 +827,68 @@ async def api_auth_ws_ticket(request: Request):
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+
+
+# ---------------------------------------------------------------------------
+# Auth-required: phone-handoff ticket (QR path)
+# ---------------------------------------------------------------------------
+
+
+class _HandoffTicketBody(BaseModel):
+    session_id: str
+    profile: str = ""
+
+
+@router.post("/api/auth/handoff-ticket", name="auth_handoff_ticket")
+async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
+    """Mint a single-use phone-handoff ticket for a chat session.
+
+    Cookie-authenticated desk session only. Unauthenticated callers are
+    rejected by the gate (and defensively here). The ticket binds
+    ``session_id`` + optional ``profile`` and, on consume via
+    ``?handoff=``, mints a resume-scoped browser session cookie — never
+    ``API_SERVER_KEY`` / superuser / ``*`` scope.
+    """
+    sess = getattr(request.state, "session", None)
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        HANDOFF_TTL_SECONDS,
+        mint_handoff_ticket,
+    )
+
+    try:
+        ticket = mint_handoff_ticket(
+            session_id=session_id,
+            profile=body.profile or "",
+            user_id=sess.user_id,
+            email=getattr(sess, "email", "") or "",
+            display_name=getattr(sess, "display_name", "") or "",
+            org_id=getattr(sess, "org_id", "") or "",
+            provider=sess.provider,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    audit_log(
+        AuditEvent.HANDOFF_TICKET_MINTED,
+        provider=sess.provider,
+        user_id=sess.user_id,
+        ip=_client_ip(request),
+        session_id=session_id,
+        profile=body.profile or "",
+    )
+    return {
+        "ticket": ticket,
+        "ttl_seconds": HANDOFF_TTL_SECONDS,
+        "session_id": session_id,
+        "profile": body.profile or "",
+    }
 
 
 # ---------------------------------------------------------------------------

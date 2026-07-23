@@ -10,9 +10,14 @@ from typing import Optional
 class Session:
     """A verified identity. Returned by ``complete_login`` and ``verify_session``.
 
-    All fields are mandatory. Providers that don't have a concept of orgs
-    should set ``org_id`` to an empty string. ``access_token`` and
-    ``refresh_token`` are opaque to Hermes — provider-specific.
+    All fields through ``refresh_token`` are mandatory. Providers that don't
+    have a concept of orgs should set ``org_id`` to an empty string.
+    ``access_token`` and ``refresh_token`` are opaque to Hermes —
+    provider-specific.
+
+    ``scopes`` is optional and defaults to empty (unscoped interactive
+    browser session). Handoff-minted sessions set ``scopes=("resume",)`` and
+    never carry superuser / ``*`` / ``API_SERVER_KEY``.
     """
 
     user_id: str
@@ -23,6 +28,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
