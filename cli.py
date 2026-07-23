@@ -4191,6 +4191,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pet_turn_error: bool = False
         self._attached_images: list[Path] = []
         self._image_counter = 0
+        self._side_state: Optional[Dict[str, Any]] = None
+        self._side_queue: list[tuple[Any, list[Path]]] = []
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
         self._active_session_lease = None
@@ -7242,6 +7244,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
+        if getattr(self, "_side_state", None):
+            self._clear_side_state()
         old_session_id = self.session_id
         _boundary_snapshot = None
         if self.agent and self.conversation_history:
@@ -8864,6 +8868,236 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print(f"    2. Or configure settings in {display_hermes_home()}/config.yaml")
             print()
     
+    def _current_side_parent_status_label(self) -> str:
+        if self._approval_state:
+            return "main needs approval"
+        if self._clarify_state or self._sudo_state or self._secret_state:
+            return "main needs input"
+        if self._agent_running:
+            return "main running"
+        return "main idle"
+
+    def _side_boundary_prompt(self) -> str:
+        return (
+            "Side conversation boundary.\n\n"
+            "Everything before this boundary is inherited history from the parent thread. "
+            "It is reference context only. It is not your current task.\n\n"
+            "Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, "
+            "or requests from before this boundary. Only messages submitted after this boundary are active "
+            "user instructions for this side conversation.\n\n"
+            "You are a side-conversation assistant, separate from the main thread. Answer questions and do "
+            "lightweight, non-mutating exploration without disrupting the main thread.\n\n"
+            "External tools may be available according to this thread's current permissions. Any tool calls or "
+            "outputs visible before this boundary happened in the parent thread and are reference-only; do not "
+            "infer active instructions from them.\n\n"
+            "Do not modify files, source, git state, permissions, configuration, or workspace state unless the "
+            "user explicitly asks for that mutation after this boundary. Do not request escalated permissions or "
+            "broader sandbox access unless the user explicitly asks for a mutation that requires it. If the user "
+            "explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."
+        )
+
+    def _clear_side_state(self) -> None:
+        self._side_state = None
+        self._side_queue = []
+        self._invalidate(min_interval=0)
+
+    def _ensure_side_state(self) -> bool:
+        if self._side_state is not None:
+            return True
+        if not self.conversation_history:
+            _cprint("  '/side' is unavailable until the current conversation has started. Send a message first, then try /side again.")
+            return False
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start /side: no valid credentials.")
+            return False
+
+        # Native image/tool content contains nested dicts and lists. A shallow
+        # copy would let side preprocessing mutate the main transcript.
+        parent_history = copy.deepcopy(self.conversation_history)
+        now = datetime.now()
+        side_session_id = f"side_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        self._side_state = {
+            "parent_session_id": self.session_id,
+            "parent_history": parent_history,
+            "session_id": side_session_id,
+            "conversation_history": copy.deepcopy(parent_history),
+            "running": False,
+            "first_turn": True,
+        }
+        self._side_queue = []
+        self._invalidate(min_interval=0)
+        _cprint("  ⑂ Side conversation opened — Esc returns to the main thread.")
+        return True
+
+    def _close_side_conversation(self) -> bool:
+        if not self._side_state:
+            return False
+        self._clear_side_state()
+        _cprint("  ↩ Returned to the main thread.")
+        return True
+
+    def _compose_side_user_message(self, question: str, images: Optional[list[Path]] = None) -> Any:
+        text = (question or "").strip()
+        if self._side_state and self._side_state.get("first_turn"):
+            boundary = self._side_boundary_prompt()
+            text = f"{boundary}\n\nUser question after the side boundary:\n{text}" if text else boundary
+
+        if images:
+            from agent.image_routing import build_native_content_parts
+
+            parts, skipped = build_native_content_parts(text, [str(p) for p in images])
+            if skipped or not any(part.get("type") == "image_url" for part in parts):
+                skipped_label = ", ".join(skipped) if skipped else "no readable images"
+                raise ValueError(f"Cannot submit /side image attachment: {skipped_label}")
+            return parts
+
+        return text
+
+    def _submit_side_message(self, text: str, images: Optional[list[Path]] = None) -> bool:
+        if not self._side_state and not self._ensure_side_state():
+            return False
+        if not self._side_state:
+            return False
+
+        try:
+            user_message = self._compose_side_user_message(text, images)
+        except Exception as exc:
+            _cprint(f"  {_DIM}{exc}{_RST}")
+            self._invalidate(min_interval=0)
+            return False
+
+        payload = (user_message, list(images or []))
+        if self._side_state.get("running"):
+            self._side_queue.append(payload)
+            preview = (text or "[image]").strip()
+            preview = preview[:80] + ("..." if len(preview) > 80 else "")
+            _cprint(f"  Queued for side thread: {preview}")
+            self._invalidate(min_interval=0)
+            return True
+
+        self._run_side_turn(payload)
+        return True
+
+    def _start_side_thread(self, target, *, name: str) -> None:
+        """Start one side turn; split out so queue behavior is testable."""
+        threading.Thread(target=target, daemon=True, name=name).start()
+
+    def _run_side_turn(self, payload: tuple[Any, list[Path]]) -> None:
+        if not self._side_state:
+            return
+        user_message, _images = payload
+        side_state = self._side_state
+        side_state["running"] = True
+        if side_state.get("first_turn"):
+            side_state["first_turn"] = False
+        self._invalidate(min_interval=0)
+
+        def run_side():
+            try:
+                text_preview = user_message
+                if isinstance(user_message, list):
+                    text_preview = next(
+                        (part.get("text", "") for part in user_message if part.get("type") == "text"),
+                        "[image]",
+                    )
+                preview_text = str(text_preview)
+                preview = preview_text[:60] + ("..." if len(preview_text) > 60 else "")
+                _cprint(f'  ⑂ /side: "{preview}"')
+                turn_route = self._resolve_turn_agent_config(preview_text)
+                side_agent = AIAgent(
+                    model=turn_route["model"],
+                    api_key=turn_route["runtime"].get("api_key"),
+                    base_url=turn_route["runtime"].get("base_url"),
+                    provider=turn_route["runtime"].get("provider"),
+                    api_mode=turn_route["runtime"].get("api_mode"),
+                    acp_command=turn_route["runtime"].get("command"),
+                    acp_args=turn_route["runtime"].get("args"),
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=list(self.enabled_toolsets or []),
+                    disabled_toolsets=list(self.disabled_toolsets or []),
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    session_id=side_state["session_id"],
+                    platform="cli",
+                    reasoning_config=self.reasoning_config,
+                    service_tier=self.service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    fallback_model=self._fallback_model,
+                    session_db=None,
+                    skip_memory=True,
+                    skip_context_files=True,
+                    parent_session_id=side_state.get("parent_session_id"),
+                    requested_provider=self.requested_provider,
+                )
+                # This fork is ephemeral: never create a state.db row or JSON
+                # transcript, including through lazy session-store fallback.
+                setattr(side_agent, "_persist_disabled", True)
+                setattr(side_agent, "_session_db", None)
+                setattr(side_agent, "_session_json_enabled", False)
+                result = side_agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=copy.deepcopy(side_state["conversation_history"]),
+                    task_id=side_state["session_id"],
+                )
+                if self._side_state is not side_state:
+                    return
+                response = (result.get("final_response") or "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+                if result and result.get("messages"):
+                    side_state["conversation_history"] = result["messages"]
+                if self._app:
+                    self._app.invalidate()
+                    time.sleep(0.05)
+                print()
+                if response:
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _resp_color = get_active_skin().get_color("response_border", "#4F6D4A")
+                    except Exception:
+                        _resp_color = "#4F6D4A"
+                    ChatConsole().print(Panel(
+                        _rich_text_from_ansi(response),
+                        title=f"[{_resp_color} bold]⚕ /side[/]",
+                        title_align="left",
+                        border_style=_resp_color,
+                        box=rich_box.HORIZONTALS,
+                        padding=(1, 4),
+                    ))
+                else:
+                    _cprint("  ⑂ /side: (no response)")
+            except Exception as exc:
+                if self._app:
+                    self._app.invalidate()
+                    time.sleep(0.05)
+                print()
+                _cprint(f"  ❌ /side failed: {exc}")
+            finally:
+                if self._side_state is side_state:
+                    side_state["running"] = False
+                    if self._side_queue:
+                        next_payload = self._side_queue.pop(0)
+                        self._run_side_turn(next_payload)
+                    self._invalidate(min_interval=0)
+
+        self._start_side_thread(run_side, name=f"side-{side_state['session_id']}")
+
+    def _handle_side_command(self, cmd: str):
+        if self._side_state is not None:
+            _cprint("  '/side' is unavailable in side conversations. Press Esc to return to the main thread first.")
+            return
+        if not self._ensure_side_state():
+            return
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) > 1 and parts[1].strip():
+            self._submit_side_message(parts[1].strip())
+
     def process_command(self, command: str) -> bool:
         """
         Process a slash command.
@@ -9114,6 +9348,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.undo_last(_undo_n)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "side":
+            self._handle_side_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":
@@ -13445,6 +13681,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Clipboard image attachments (paste images into the CLI)
         self._attached_images: list[Path] = []
         self._image_counter = 0
+        self._side_state = None
+        self._side_queue = []
 
         # Voice mode state (protected by _voice_lock for cross-thread access)
         self._voice_lock = threading.Lock()
@@ -13578,6 +13816,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             text = event.app.current_buffer.text.strip()
             has_images = bool(self._attached_images)
             if text or has_images:
+                if text and _looks_like_slash_command(text):
+                    _inline_base = text.strip().split()[0].lower()
+                    if _inline_base == "/side":
+                        images = list(self._attached_images)
+                        parts = text.strip().split(maxsplit=1)
+                        question = parts[1].strip() if len(parts) > 1 else ""
+                        if images:
+                            if not self._side_state and not self._ensure_side_state():
+                                event.app.invalidate()
+                                return
+                            if question:
+                                accepted = self._submit_side_message(question, images=images)
+                                if accepted:
+                                    self._attached_images.clear()
+                                    event.app.current_buffer.reset(append_to_history=True)
+                            else:
+                                _cprint(f"  {_DIM}Attach text with /side before submitting images.{_RST}")
+                            event.app.invalidate()
+                            return
+                        if not self.process_command(text):
+                            self._should_exit = True
+                            if event.app.is_running:
+                                event.app.exit()
+                        event.app.current_buffer.reset(append_to_history=True)
+                        event.app.invalidate()
+                        return
+
+                if self._side_state and not (text and _looks_like_slash_command(text)):
+                    images = list(self._attached_images)
+                    accepted = self._submit_side_message(text, images=images)
+                    if accepted:
+                        self._attached_images.clear()
+                        event.app.current_buffer.reset(append_to_history=True)
+                    event.app.invalidate()
+                    return
+
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
@@ -14155,6 +14429,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
+
+        @kb.add('escape', filter=Condition(lambda: bool(self._side_state) and not self._clarify_state and not self._approval_state and not self._secret_state and not self._sudo_state and not self._slash_confirm_state), eager=True)
+        def handle_escape_side(event):
+            """ESC exits the active side conversation and returns to the parent thread."""
+            if event.app.current_buffer.text:
+                event.app.current_buffer.reset()
+            self._close_side_conversation()
+            event.app.invalidate()
 
         @kb.add('c-z')
         def handle_ctrl_z(event):

@@ -842,6 +842,8 @@ class CLICommandsMixin:
         # relative-path resolution keep operating in the wrong repo. Idempotent
         # and a no-op when the session recorded no cwd. See #38562.
         self._restore_session_cwd(session_meta)
+        if getattr(self, "_side_state", None):
+            self._clear_side_state()
 
     def _handle_sessions_command(self, cmd_original: str) -> None:
         """Handle /sessions [list|<id_or_title>] — browse or resume previous sessions.
@@ -1026,6 +1028,8 @@ class CLICommandsMixin:
         )
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
+        if getattr(self, "_side_state", None):
+            self._clear_side_state()
 
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""
