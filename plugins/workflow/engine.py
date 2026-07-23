@@ -2224,7 +2224,10 @@ class WorkflowEngine:
             if not has_loops:
                 # Simple path: no loop zones — create all cards at once
                 last_layer_card_ids: list[str] = []
-                for layer in layers:
+                for layer_idx, layer in enumerate(layers):
+                    # Only attach files to the first layer — downstream
+                    # nodes consume upstream outputs, not the original input.
+                    self._current_attachments = attachments or [] if layer_idx == 0 else []
                     for nid in layer:
                         node = workflow.nodes[nid]
                         state = states[nid]
