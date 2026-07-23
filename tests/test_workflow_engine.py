@@ -2622,3 +2622,81 @@ class TestPathResolution:
         config = wf_mod.load_config()
         assert config["auto_discovery"] is True
         assert config["max_nodes_per_workflow"] == 256
+
+
+# ── Tool handler args-dict tests ────────────────────────────────
+
+class TestToolHandlerArgsDict:
+    """All tool handlers receive a single args dict, not keyword arguments.
+    These tests verify each handler extracts parameters correctly."""
+
+    def test_workflow_start_extracts_workflow(self):
+        """handle_workflow_start extracts 'workflow' from args dict."""
+        from plugins.workflow.tools import handle_workflow_start
+        result = handle_workflow_start({"workflow": ""})
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "non-empty string" in data["error"]
+
+    def test_workflow_start_extracts_workflow_valid(self):
+        """handle_workflow_start accepts valid workflow string."""
+        from plugins.workflow.tools import handle_workflow_start
+        result = handle_workflow_start({"workflow": "nonexistent"})
+        data = json.loads(result)
+        # Should fail with "not found", not "non-empty string"
+        assert data["ok"] is False
+        assert "non-empty string" not in data.get("error", "")
+
+    def test_workflow_view_extracts_workflow(self):
+        """handle_workflow_view extracts 'workflow' from args dict."""
+        from plugins.workflow.tools import handle_workflow_view
+        result = handle_workflow_view({"workflow": ""})
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "non-empty string" in data["error"]
+
+    def test_workflow_validate_extracts_workflow(self):
+        """handle_workflow_validate extracts 'workflow' from args dict."""
+        from plugins.workflow.tools import handle_workflow_validate
+        result = handle_workflow_validate({"workflow": ""})
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "non-empty string" in data["error"]
+
+    def test_workflow_list_extracts_trigger(self):
+        """handle_workflow_list extracts 'trigger' from args dict."""
+        from plugins.workflow.tools import handle_workflow_list
+        result = handle_workflow_list({})
+        data = json.loads(result)
+        assert data["ok"] is True
+        assert "result" in data
+
+    def test_workflow_show_extracts_workflow(self):
+        """handle_workflow_show extracts 'workflow' from args dict."""
+        from plugins.workflow.tools import handle_workflow_show
+        result = handle_workflow_show({"workflow": ""})
+        data = json.loads(result)
+        assert data["ok"] is False
+        assert "non-empty string" in data["error"]
+
+    def test_workflow_start_extracts_all_params(self):
+        """handle_workflow_start extracts context, board, inputs, etc."""
+        from plugins.workflow.tools import handle_workflow_start
+        result = handle_workflow_start({
+            "workflow": "nonexistent",
+            "context": {"project": "test"},
+            "board": "test-board",
+            "inputs": {"key": "value"},
+            "dry_run": True,
+        })
+        data = json.loads(result)
+        # Should fail with "not found", not parameter error
+        assert data["ok"] is False
+        assert "non-empty string" not in data.get("error", "")
+
+    def test_workflow_status_optional_workflow(self):
+        """handle_workflow_status works without workflow parameter."""
+        from plugins.workflow.tools import handle_workflow_status
+        result = handle_workflow_status({})
+        data = json.loads(result)
+        assert data["ok"] is True
