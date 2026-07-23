@@ -201,7 +201,11 @@ def _find_state_for_card(task_id: str):
 
     Returns (state_dict, state_file_path) or None.
     """
-    state_dir = Path.home() / ".hermes" / "workspace" / "docs" / "fleet-pipelines" / ".engine-state"
+    # State files live in .engine-state/ under the workflow files directory
+    wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+    if not wf_dir:
+        wf_dir = str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines"))
+    state_dir = Path(wf_dir) / ".engine-state"
     if not state_dir.exists():
         return None
     for state_file in sorted(state_dir.glob("*_state.json"), reverse=True):
@@ -223,7 +227,10 @@ def _find_verify_nodes(workflow_name: str):
     Returns {verify_node_id: revision_node_id} — nodes where a
     revision node depends on the verify node (loop pattern).
     """
-    wf_files = Path.home() / ".hermes" / "workspace" / "docs" / "fleet-pipelines"
+    wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+    if not wf_dir:
+        wf_dir = str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines"))
+    wf_files = Path(wf_dir)
     import yaml
     wf_path = wf_files / f"{workflow_name}.yaml"
     if not wf_path.exists():
@@ -284,7 +291,10 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                 return
 
             # Find the implementer's card (the node this verify depends on)
-            wf_files = Path.home() / ".hermes" / "workspace" / "docs" / "fleet-pipelines"
+            wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+            if not wf_dir:
+                wf_dir = str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines"))
+            wf_files = Path(wf_dir)
             import yaml
             wf_path = wf_files / f"{workflow_name}.yaml"
             if not wf_path.exists():
