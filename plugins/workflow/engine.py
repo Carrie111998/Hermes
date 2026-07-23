@@ -253,7 +253,7 @@ class WorkflowEngine:
                     Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"
                 )
         self.workflows_dir = Path(workflows_dir)
-        self.kanban_board = "fleet-workflow"
+        self.kanban_board = ""  # Set by three-tier resolution in execute()
         WorkflowEngine.STATE_DIR = self.workflows_dir / ".engine-state"
         self.STATE_DIR.mkdir(parents=True, exist_ok=True)
         # Job log DB at ~/.hermes/workflows/executions.db
