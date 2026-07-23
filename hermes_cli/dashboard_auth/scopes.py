@@ -212,11 +212,14 @@ def scope_denial_detail(request: Request, sess: Any) -> str:
 def is_handoff_consume_request(request: Request) -> bool:
     """True only for exact canonical GET ``/chat`` at the ASGI boundary.
 
-    F-02 / Oscar M2 / F-01 (slice 1.3): no last-segment match and no
-    client-controlled ``X-Forwarded-Prefix`` in the authorisation decision.
-    Reject trailing slash, nested paths, API-shaped paths, doubled slashes,
-    and non-canonical encodings. Rejected attempts must not consume the
-    ticket.
+    F-02 / Oscar M2 / F-01 (slice 1.3) + F-02 slice 1.4: no last-segment
+    match and no client-controlled ``X-Forwarded-Prefix`` in the
+    authorisation decision. Reject trailing slash, nested paths, API-shaped
+    paths, doubled slashes, and non-canonical encodings. Rejected attempts
+    must not consume the ticket.
+
+    ASGI ``raw_path`` must be present as bytes/bytearray exactly ``b"/chat"``.
+    Missing, None, wrong type, or non-canonical wire bytes fail closed.
 
     After a successful consume, callers may still use a normalised prefix for
     external redirect Location and cookie Path only.
@@ -228,17 +231,12 @@ def is_handoff_consume_request(request: Request) -> bool:
     if path != "/chat":
         return False
 
-    # ASGI raw_path is the on-the-wire bytes before decoding. When present,
-    # require exact b"/chat" so %2F / %63 / prefix tricks cannot mint.
+    # Slice 1.4 F-02: fail closed when raw_path is absent or non-canonical.
+    # Optional ASGI key must not default-authorise decoded path lookalikes.
     raw = request.scope.get("raw_path")
-    if raw is not None:
-        if isinstance(raw, (bytes, bytearray)):
-            if bytes(raw) != b"/chat":
-                return False
-        else:
-            if str(raw) != "/chat":
-                return False
-    return True
+    if not isinstance(raw, (bytes, bytearray)):
+        return False
+    return bytes(raw) == b"/chat"
 
 
 def handoff_redirect_location(info: dict, *, prefix: str = "") -> str:

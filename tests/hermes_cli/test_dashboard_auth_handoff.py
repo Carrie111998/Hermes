@@ -524,26 +524,42 @@ def test_hostile_path_does_not_consume_handoff(gated_app, hostile_path):
     assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
 
 
+def _handoff_scope_request(
+    path: str,
+    *,
+    raw: object | None = ...,
+    omit_raw: bool = False,
+    headers: list | None = None,
+    method: str = "GET",
+):
+    """Build a Starlette Request with optional ASGI raw_path control."""
+    from starlette.requests import Request
+
+    scope: dict = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": path,
+        "query_string": b"",
+        "headers": headers or [],
+        "client": ("1.2.3.4", 1234),
+        "server": ("fly-app.fly.dev", 443),
+    }
+    if not omit_raw:
+        if raw is ...:
+            scope["raw_path"] = path.encode("ascii")
+        else:
+            scope["raw_path"] = raw
+    return Request(scope)
+
+
 def test_encoded_path_variants_do_not_consume_handoff(gated_app):
     """M2: encoded separators / letters must not satisfy exact /chat."""
     from hermes_cli.dashboard_auth.scopes import is_handoff_consume_request
-    from starlette.requests import Request
 
-    def _req(path: str, raw: bytes | None = None, headers: list | None = None) -> Request:
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "https",
-            "path": path,
-            "raw_path": raw if raw is not None else path.encode("ascii"),
-            "query_string": b"",
-            "headers": headers or [],
-            "client": ("1.2.3.4", 1234),
-            "server": ("fly-app.fly.dev", 443),
-        }
-        return Request(scope)
+    _req = _handoff_scope_request
 
     # Decoded lookalikes that must fail when raw_path is non-canonical.
     assert not is_handoff_consume_request(_req("/chat", raw=b"/%63hat"))
@@ -553,8 +569,9 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
     )
     assert not is_handoff_consume_request(_req("/chat/", raw=b"/chat/"))
     assert not is_handoff_consume_request(_req("/nested/chat", raw=b"/nested/chat"))
-    # Canonical exact path is accepted.
+    # Canonical exact path is accepted (bytes and bytearray).
     assert is_handoff_consume_request(_req("/chat", raw=b"/chat"))
+    assert is_handoff_consume_request(_req("/chat", raw=bytearray(b"/chat")))
     # F-01: client X-Forwarded-Prefix must not redefine consume path.
     assert is_handoff_consume_request(
         _req(
@@ -590,6 +607,84 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
     r_ok = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r_ok.status_code == 302
     assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+def test_missing_or_non_byte_raw_path_does_not_authorise_consume():
+    """F-02 slice 1.4: absent/None/str/wrong-type raw_path fail closed."""
+    from hermes_cli.dashboard_auth.scopes import is_handoff_consume_request
+
+    _req = _handoff_scope_request
+
+    assert not is_handoff_consume_request(_req("/chat", omit_raw=True))
+    assert not is_handoff_consume_request(_req("/chat", raw=None))
+    assert not is_handoff_consume_request(_req("/chat", raw="/chat"))
+    assert not is_handoff_consume_request(_req("/chat", raw=memoryview(b"/chat")))
+    assert not is_handoff_consume_request(_req("/chat", raw=123))
+    assert not is_handoff_consume_request(_req("/chat", raw=b"/%63hat"))
+    # Non-GET still rejected even with canonical raw.
+    assert not is_handoff_consume_request(
+        _req("/chat", raw=b"/chat", method="POST")
+    )
+    assert is_handoff_consume_request(_req("/chat", raw=b"/chat"))
+
+
+def test_missing_raw_path_live_middleware_does_not_consume(gated_app):
+    """F-02 slice 1.4: ASGI wrapper stripping raw_path must not burn ticket.
+
+    Oscar proof shape: decoded path /chat (incl. /%63hat decode) with raw_path
+    removed must not set cookie; same ticket then consumes once on exact /chat.
+    """
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    class StripRawPath:
+        def __init__(self, app: ASGIApp) -> None:
+            self.app = app
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope.get("type") == "http":
+                scope = dict(scope)
+                scope.pop("raw_path", None)
+            await self.app(scope, receive, send)
+
+    class ForceDecodedChatStripRaw:
+        """Simulate servers that decode /%63hat → path /chat without raw_path."""
+
+        def __init__(self, app: ASGIApp) -> None:
+            self.app = app
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope.get("type") == "http":
+                scope = dict(scope)
+                path = scope.get("path") or ""
+                raw = scope.get("raw_path")
+                if path in ("/%63hat",) or raw in (b"/%63hat", "/%63hat"):
+                    scope["path"] = "/chat"
+                scope.pop("raw_path", None)
+            await self.app(scope, receive, send)
+
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "missing-raw-live")
+
+    stripped = StripRawPath(web_server.app)
+    phone = TestClient(stripped, base_url="https://fly-app.fly.dev")
+    phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+
+    forced = ForceDecodedChatStripRaw(web_server.app)
+    phone_alias = TestClient(forced, base_url="https://fly-app.fly.dev")
+    phone_alias.get(f"/%63hat?handoff={ticket}", follow_redirects=False)
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone_alias)
+
+    # Ticket still valid once for exact /chat with present raw_path.
+    phone_ok = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    r_ok = phone_ok.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r_ok.status_code == 302, r_ok.text
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone_ok)
+
+    # Replay denied.
+    phone_replay = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone_replay.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone_replay)
 
 
 # ---------------------------------------------------------------------------
