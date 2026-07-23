@@ -580,11 +580,12 @@ class WorkflowEngine:
     def _get_session_info(self) -> dict:
         """Capture gateway session info for subscription routing.
 
-        NOTE: ContextVars from gateway.session_context are NOT available inside
+        ContextVars from gateway.session_context are NOT available inside
         engine.execute() — they're lost across the tool-handler → engine call
-        boundary. This method is a fallback; the tool handler should capture
-        session info and pass it via the session_info parameter.
+        boundary.  First try ContextVars (works in some contexts), then
+        check the module-level bridge written by the tool handler.
         """
+        # 1. Try ContextVars (works when called from gateway session directly)
         try:
             from gateway.session_context import get_session_env
             platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -602,6 +603,15 @@ class WorkflowEngine:
                 }
         except Exception as _exc:
             logger.debug("ContextVars session lookup failed: %s", _exc)
+        # 2. Check module-level bridge (written by tool handler)
+        try:
+            from plugins.workflow.tools import _get_captured_session
+            info = _get_captured_session()
+            if info:
+                return info
+        except Exception:
+            pass
+        # 3. Fallback: os.environ
         try:
             platform = os.environ.get("HERMES_SESSION_PLATFORM", "")
             chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "")

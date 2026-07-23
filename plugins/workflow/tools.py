@@ -76,6 +76,46 @@ def check_workflow_requirements() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Session info bridge — tool handler captures ContextVars, engine reads them
+# ---------------------------------------------------------------------------
+# ContextVars from gateway.session_context are available in the tool handler
+# scope but lost by the time engine.execute() runs.  The tool handler writes
+# session info here; the engine reads it.
+
+_SESSION_BRIDGE: dict = {}
+
+
+def _capture_session_for_engine() -> None:
+    """Capture current gateway session info into the module-level bridge.
+
+    Called from the tool handler where ContextVars are live.
+    """
+    global _SESSION_BRIDGE
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if platform and chat_id:
+            _SESSION_BRIDGE = {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+                "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
+                "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
+            }
+    except Exception:
+        pass
+
+
+def _get_captured_session() -> dict:
+    """Read the session info captured by the tool handler.
+
+    Called from the engine where ContextVars are NOT available.
+    """
+    return dict(_SESSION_BRIDGE) if _SESSION_BRIDGE else {}
+
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 def _engine():
@@ -228,21 +268,8 @@ def _handle_workflow_start_predefined(
 
     # Capture session info at tool-handler level where ContextVars are available.
     # The engine's execute() runs in a context where ContextVars are lost.
-    _captured_session = {}
-    try:
-        from gateway.session_context import get_session_env
-        _p = get_session_env("HERMES_SESSION_PLATFORM", "")
-        _c = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if _p and _c:
-            _captured_session = {
-                "platform": _p,
-                "chat_id": _c,
-                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
-                "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
-                "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
-            }
-    except Exception:
-        pass
+    # Store as module-level so the engine can read it directly.
+    _capture_session_for_engine()
 
     # Fire-and-forget: create all kanban cards and subscribe the final
     # layer for notifications.  The kanban dispatcher picks up ready
@@ -260,7 +287,7 @@ def _handle_workflow_start_predefined(
             board=board,
             fire_and_forget=True,
             attachments=attachments,
-            session_info=_captured_session or None,
+            session_info=_get_captured_session() or None,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))
