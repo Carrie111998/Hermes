@@ -2177,6 +2177,65 @@ class TestStaleFallbackCandidateSkip:
         return _AuxStreamTimeoutError(
             "Codex auxiliary Responses stream exceeded 120.0s total timeout")
 
+    def test_configured_fallback_uses_provider_id_for_request_shaping(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback = MagicMock()
+        fallback.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        fallback.chat.completions.create.return_value = _DummyResponse("gemini")
+
+        with patch(
+            "agent.auxiliary_client._build_call_kwargs",
+            return_value={"model": "gemini-3-flash", "messages": []},
+        ) as mock_build:
+            result = _call_fallback_candidate_sync(
+                fallback,
+                "gemini-3-flash",
+                "fallback_providers[0](gemini)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config={"effort": "high"},
+            )
+
+        assert result.choices[0].message.content == "gemini"
+        assert mock_build.call_args.args[0] == "gemini"
+
+    @pytest.mark.asyncio
+    async def test_async_configured_fallback_uses_provider_id_for_request_shaping(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        fallback = MagicMock()
+        fallback.base_url = "https://api.z.ai/api/paas/v4"
+        fallback.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("zai")
+        )
+
+        with patch(
+            "agent.auxiliary_client._build_call_kwargs",
+            return_value={"model": "glm-5.2", "messages": []},
+        ) as mock_build:
+            result = await _call_fallback_candidate_async(
+                fallback,
+                "glm-5.2",
+                "fallback_providers[1](zai)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config={"effort": "high"},
+            )
+
+        assert result.choices[0].message.content == "zai"
+        assert mock_build.call_args.args[0] == "zai"
+
     def test_stale_anthropic_fallback_refreshes_and_retries(self, monkeypatch):
         """401 from the fallback candidate → refresh its creds → retry succeeds."""
         primary_client = MagicMock()
@@ -2216,6 +2275,87 @@ class TestStaleFallbackCandidateSkip:
         mock_refresh.assert_called_once_with("anthropic")
         assert stale_fb.chat.completions.create.call_count == 1
         assert fresh_fb.chat.completions.create.call_count == 1
+
+    def test_refreshed_fallback_deployment_failure_is_skipped(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        stale_fb = MagicMock()
+        stale_fb.base_url = "https://api.anthropic.com"
+        stale_fb.chat.completions.create.side_effect = _AuxAuth401("expired")
+        refreshed_fb = MagicMock()
+        refreshed_fb.base_url = "https://api.anthropic.com"
+        refreshed_fb.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        label = "fallback_chain[0](anthropic)"
+
+        with patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(refreshed_fb, "claude-haiku-4-5-20251001"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = _call_fallback_candidate_sync(
+                stale_fb,
+                "claude-haiku-4-5-20251001",
+                label,
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with(label)
+
+    @pytest.mark.asyncio
+    async def test_async_refreshed_fallback_deployment_failure_is_skipped(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        stale_fb = MagicMock()
+        stale_fb.base_url = "https://api.anthropic.com"
+        stale_fb.chat.completions.create = AsyncMock(
+            side_effect=_AuxAuth401("expired")
+        )
+        refreshed_fb = MagicMock()
+        refreshed_fb.base_url = "https://api.anthropic.com"
+        refreshed_fb.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("HTTP 503: deployment unavailable")
+        )
+        label = "fallback_chain[0](anthropic)"
+
+        with patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(refreshed_fb, "claude-haiku-4-5-20251001"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = await _call_fallback_candidate_async(
+                stale_fb,
+                "claude-haiku-4-5-20251001",
+                label,
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with(label)
 
     def test_unrefreshable_stale_candidate_is_skipped_to_next(self, monkeypatch):
         """Refresh fails (expired setup token) → candidate quarantined, chain
@@ -2379,6 +2519,41 @@ class TestAuxiliaryFallbackLayering:
         )
         mock_main.assert_not_called()
 
+    def test_missing_nvidia_function_deployment_triggers_fallback(self):
+        """A retired NVIDIA NIM function id is a route-capability failure."""
+        primary_client = MagicMock()
+        deployment_error = Exception(
+            "Error code: 404 - {'detail': \"Function id 'dead-function' "
+            "version 'null': Specified function in account 'account' is not found\"}"
+        )
+        setattr(deployment_error, "status_code", 404)
+        primary_client.chat.completions.create.side_effect = deployment_error
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from healthy compression fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "qwen/qwen3.5-397b-a17b")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "qwen/qwen3.5-397b-a17b", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gemini-3.5-flash", "fallback_chain[0](google-gemini)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from healthy compression fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "nvidia",
+            reason="provider deployment unavailable",
+        )
+        mock_main.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_async_invalid_empty_choices_response_triggers_fallback(self, monkeypatch):
         """Async aux calls use the same malformed-response fallback path."""
@@ -2409,6 +2584,715 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "nvidia",
             reason="invalid provider response",
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_missing_nvidia_function_deployment_triggers_fallback(self):
+        """Async compression also escapes a retired NVIDIA NIM deployment."""
+        primary_client = MagicMock()
+        deployment_error = Exception(
+            "Error code: 404 - {'detail': \"Function id 'dead-function' "
+            "version 'null': Specified function in account 'account' is not found\"}"
+        )
+        setattr(deployment_error, "status_code", 404)
+        primary_client.chat.completions.create = AsyncMock(side_effect=deployment_error)
+
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async compression fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "qwen/qwen3.5-397b-a17b")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "qwen/qwen3.5-397b-a17b", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gemini-3.5-flash", "fallback_chain[0](google-gemini)")) as mock_chain, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_fallback_client, "gemini-3.5-flash")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async compression fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "nvidia",
+            reason="provider deployment unavailable",
+        )
+
+    def test_gemini_http_503_text_triggers_compression_fallback(self):
+        """Plain adapter RuntimeErrors must preserve HTTP 5xx fallback semantics."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): This model is currently experiencing high demand."
+        )
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from 503 fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("google-gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)")) as mock_chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from 503 fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "google-gemini",
+            reason="provider deployment unavailable",
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_gemini_http_503_text_triggers_compression_fallback(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(side_effect=RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): This model is currently experiencing high demand."
+        ))
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async 503 fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("google-gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)")) as mock_chain, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_fallback_client, "glm-5.2")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async 503 fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "google-gemini",
+            reason="provider deployment unavailable",
+        )
+
+    def test_auto_deployment_failure_quarantines_concrete_backend(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://integrate.api.nvidia.com/v1"
+        primary_client.chat.completions.create.side_effect = RuntimeError(
+            "NVIDIA HTTP 503: deployment unavailable"
+        )
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "healthy fallback"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "qwen/qwen3.5-397b-a17b"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "healthy fallback"
+        mock_mark.assert_called_once_with("nvidia")
+
+    def test_custom_deployment_failure_does_not_quarantine_all_custom_routes(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://custom-one.example/v1"
+        primary_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "healthy fallback"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "custom-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "custom:private-route",
+                "custom-model",
+                "https://custom-one.example/v1",
+                "custom-key",
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "healthy fallback"
+        mock_mark.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_custom_deployment_failure_does_not_quarantine_all_custom_routes(
+        self,
+    ):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://custom-one.example/v1"
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("HTTP 503: deployment unavailable")
+        )
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("healthy async fallback")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "custom-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "custom:private-route",
+                "custom-model",
+                "https://custom-one.example/v1",
+                "custom-key",
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "glm-5.2"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "healthy async fallback"
+        mock_mark.assert_not_called()
+
+    def test_model_only_configured_fallback_quarantines_shared_provider(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.anthropic.com/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-5"}
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "claude-sonnet-4-5",
+                "fallback_chain[0](anthropic)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with("anthropic")
+
+    def test_model_only_main_fallback_quarantines_shared_provider(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.anthropic.com/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        chain = [{"provider": "anthropic", "model": "claude-sonnet-4-5"}]
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"fallback_providers": chain},
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            return_value=chain,
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "claude-sonnet-4-5",
+                "fallback_providers[0](anthropic)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with("anthropic")
+
+    def test_unavailable_configured_fallback_quarantines_exact_entry(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        label = "fallback_chain[0](custom)"
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "custom-model",
+                        "base_url": "https://custom-one.example/v1",
+                    }
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "custom-model",
+                label,
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with(label)
+
+    def test_transient_fallback_503_retries_before_quarantine(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create.side_effect = [
+            RuntimeError("HTTP 503: temporary deployment outage"),
+            _DummyResponse("fallback recovered"),
+        ]
+
+        with patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=1,
+        ), patch(
+            "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE",
+            0,
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "custom-model",
+                "fallback_chain[0](custom)",
+                task="title_generation",
+                messages=[{"role": "user", "content": "title"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "fallback recovered"
+        assert fallback_client.chat.completions.create.call_count == 2
+        mock_mark.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_unavailable_configured_fallback_quarantines_exact_entry(
+        self,
+    ):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("HTTP 503: deployment unavailable")
+        )
+        label = "fallback_chain[0](custom)"
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "custom-model",
+                        "base_url": "https://custom-one.example/v1",
+                    }
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = await _call_fallback_candidate_async(
+                fallback_client,
+                "custom-model",
+                label,
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with(label)
+
+    @pytest.mark.asyncio
+    async def test_async_transient_fallback_503_retries_before_quarantine(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                RuntimeError("HTTP 503: temporary deployment outage"),
+                _DummyResponse("async fallback recovered"),
+            ]
+        )
+
+        with patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=1,
+        ), patch(
+            "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE",
+            0,
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = await _call_fallback_candidate_async(
+                fallback_client,
+                "custom-model",
+                "fallback_chain[0](custom)",
+                task="title_generation",
+                messages=[{"role": "user", "content": "title"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "async fallback recovered"
+        assert fallback_client.chat.completions.create.await_count == 2
+        mock_mark.assert_not_called()
+
+    def test_api_key_fallback_quarantines_only_concrete_provider(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://integrate.api.nvidia.com/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+
+        with patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "qwen/qwen3.5-397b-a17b",
+                "api-key",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with("nvidia")
+
+    def test_unknown_api_key_fallback_does_not_quarantine_bucket(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://unknown-provider.example/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+
+        with patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "unknown-model",
+                "api-key",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_not_called()
+
+    def test_unavailable_configured_fallback_continues_to_next_candidate(self):
+        deployment_error = RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): high demand"
+        )
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = deployment_error
+        unavailable_fallback = MagicMock()
+        unavailable_fallback.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        unavailable_fallback.chat.completions.create.side_effect = deployment_error
+        healthy_fallback = MagicMock()
+        healthy_fallback.chat.completions.create.return_value = _DummyResponse(
+            "second fallback served"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "primary-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nvidia", "primary-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=[
+                (
+                    unavailable_fallback,
+                    "gemini-3.5-flash",
+                    "fallback_chain[0](google-gemini)",
+                ),
+                (healthy_fallback, "glm-5.2", "fallback_chain[1](zai)"),
+            ],
+        ) as mock_chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "second fallback served"
+        assert mock_chain.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_unavailable_configured_fallback_continues_to_next_candidate(
+        self,
+    ):
+        deployment_error = RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): high demand"
+        )
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=deployment_error
+        )
+        unavailable_sync = MagicMock()
+        unavailable_async = MagicMock()
+        unavailable_async.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        unavailable_async.chat.completions.create = AsyncMock(
+            side_effect=deployment_error
+        )
+        healthy_sync = MagicMock()
+        healthy_async = MagicMock()
+        healthy_async.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async second fallback served")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "primary-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nvidia", "primary-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=[
+                (
+                    unavailable_sync,
+                    "gemini-3.5-flash",
+                    "fallback_chain[0](google-gemini)",
+                ),
+                (healthy_sync, "glm-5.2", "fallback_chain[1](zai)"),
+            ],
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._to_async_client",
+            side_effect=[
+                (unavailable_async, "gemini-3.5-flash"),
+                (healthy_async, "glm-5.2"),
+            ],
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "async second fallback served"
+        assert mock_chain.call_count == 2
+
+    @pytest.mark.parametrize("parameter", ["temperature", "max_tokens"])
+    def test_parameter_retry_503_reaches_fallback(self, parameter):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = [
+            RuntimeError(f"Unsupported parameter: {parameter}"),
+            RuntimeError("Gemini HTTP 503 (UNAVAILABLE): high demand"),
+        ]
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            f"{parameter} fallback served"
+        )
+        call_kwargs = {parameter: 100 if parameter == "max_tokens" else 0.2}
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gemini-3.5-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "google-gemini",
+                "gemini-3.5-flash",
+                None,
+                None,
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                **call_kwargs,
+            )
+
+        assert result.choices[0].message.content == f"{parameter} fallback served"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("parameter", ["temperature", "max_tokens"])
+    async def test_async_parameter_retry_503_reaches_fallback(self, parameter):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                RuntimeError(f"Unsupported parameter: {parameter}"),
+                RuntimeError("Gemini HTTP 503 (UNAVAILABLE): high demand"),
+            ]
+        )
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse(f"async {parameter} fallback served")
+        )
+        call_kwargs = {parameter: 100 if parameter == "max_tokens" else 0.2}
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gemini-3.5-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "google-gemini",
+                "gemini-3.5-flash",
+                None,
+                None,
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "glm-5.2"),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                **call_kwargs,
+            )
+
+        assert (
+            result.choices[0].message.content
+            == f"async {parameter} fallback served"
         )
 
     def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):
@@ -2675,7 +3559,10 @@ class TestTryMainAgentModelFallback:
         from agent.auxiliary_client import _try_main_agent_model_fallback
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
-             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=True):
+             patch(
+                 "agent.auxiliary_client._is_provider_unhealthy",
+                 side_effect=lambda label: label == "main-agent(openrouter)",
+             ):
             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is None
 
@@ -2738,8 +3625,8 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
 
 
 class TestTransientTransportRetry:
-    """call_llm retries ONCE on the same provider for a transient transport
-    blip before escalating to the fallback chain.
+    """Auxiliary calls retry the same provider within the configured budget
+    before escalating to the fallback chain.
 
     Salvaged from PR #16587 (@ARegalado1). The original fixed only the
     context-compression caller; this lives in call_llm so every auxiliary
@@ -2913,6 +3800,69 @@ class TestTransientTransportRetry:
             result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
         assert result == {"ok": True}
         assert client.chat.completions.create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_zero_retry_budget_falls_back_without_extra_attempt(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("Gemini HTTP 503")
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://api.openai.com/v1"
+        fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=0),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fallback, "fb-model", "openai"),
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(fallback, "fb-model"),
+            ),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"fallback": True}
+        assert primary.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_honors_multi_retry_budget(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=[
+                RuntimeError("Gemini HTTP 503"),
+                RuntimeError("Gemini HTTP 503"),
+                RuntimeError("Gemini HTTP 503"),
+                {"ok": True},
+            ]
+        )
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=3),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"ok": True}
+        assert primary.chat.completions.create.call_count == 4
 
 
 class TestAuxClientNoSdkRetries:
@@ -3894,7 +4844,11 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
 class TestAuxiliaryPoolRotationRetry:
-    def test_call_llm_rotates_explicit_codex_pool_on_429(self):
+    @pytest.mark.parametrize("resolved_api_mode", [None, "chat_completions"])
+    def test_call_llm_rotates_explicit_codex_pool_on_429(
+        self,
+        resolved_api_mode,
+    ):
         rate_err = Exception("usage limit reached")
         rate_err.status_code = 429
 
@@ -3923,7 +4877,16 @@ class TestAuxiliaryPoolRotationRetry:
         pool = _Pool()
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "openai-codex",
+                    "gpt-5.4",
+                    None,
+                    None,
+                    resolved_api_mode,
+                ),
+            ),
             patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
             patch("agent.auxiliary_client.load_pool", return_value=pool),
@@ -3943,8 +4906,12 @@ class TestAuxiliaryPoolRotationRetry:
         assert pool.rotate_calls[0]["status_code"] == 429
         mock_fallback.assert_not_called()
 
+    @pytest.mark.parametrize("resolved_api_mode", [None, "chat_completions"])
     @pytest.mark.asyncio
-    async def test_async_call_llm_rotates_explicit_codex_pool_on_429(self):
+    async def test_async_call_llm_rotates_explicit_codex_pool_on_429(
+        self,
+        resolved_api_mode,
+    ):
         rate_err = Exception("usage limit reached")
         rate_err.status_code = 429
 
@@ -3973,7 +4940,16 @@ class TestAuxiliaryPoolRotationRetry:
         pool = _Pool()
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "openai-codex",
+                    "gpt-5.4",
+                    None,
+                    None,
+                    resolved_api_mode,
+                ),
+            ),
             patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
             patch("agent.auxiliary_client.load_pool", return_value=pool),
@@ -5393,6 +6369,163 @@ class TestAuxUnhealthyCache:
         _mark_provider_unhealthy("codex")
         assert _is_provider_unhealthy("openai-codex") is True
 
+    def test_configured_chain_skips_exact_quarantined_entry(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        entries = [
+            {
+                "provider": "custom",
+                "model": "first",
+                "base_url": "https://custom-one.example/v1",
+                "api_key": "first-key",
+            },
+            {
+                "provider": "custom",
+                "model": "second",
+                "base_url": "https://custom-two.example/v1",
+                "api_key": "second-key",
+            },
+        ]
+        second_client = MagicMock()
+        _mark_provider_unhealthy("fallback_chain[0](custom)")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": entries},
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=[
+                (second_client, "second"),
+            ],
+        ), patch(
+            "agent.auxiliary_client._candidate_context_window",
+            return_value=1_048_576,
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "auto",
+            )
+
+        assert client is second_client
+        assert model == "second"
+        assert label == "fallback_chain[1](custom)"
+
+    def test_configured_override_is_not_suppressed_by_provider_health(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        fallback_client = MagicMock()
+        entry = {
+            "provider": "nvidia",
+            "model": "different-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "sibling-key",
+        }
+        _mark_provider_unhealthy("nvidia")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(fallback_client, "different-deployment"),
+        ), patch(
+            "agent.auxiliary_client._candidate_context_window",
+            return_value=1_048_576,
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is fallback_client
+        assert model == "different-deployment"
+        assert label == "fallback_chain[0](nvidia)"
+
+    def test_model_only_fallback_still_honors_provider_health(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        _mark_provider_unhealthy("openrouter")
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "openrouter", "model": "another-model"},
+                ],
+            },
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+        ) as resolve_entry:
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is None
+        assert model is None
+        assert label == ""
+        resolve_entry.assert_not_called()
+
+    def test_unset_env_key_fallback_still_honors_provider_health(
+        self,
+        monkeypatch,
+    ):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        monkeypatch.delenv("UNSET_OPENROUTER_FALLBACK_KEY", raising=False)
+        _mark_provider_unhealthy("openrouter")
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "openrouter",
+                        "model": "another-model",
+                        "key_env": "UNSET_OPENROUTER_FALLBACK_KEY",
+                    },
+                ],
+            },
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+        ) as resolve_entry:
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is None
+        assert model is None
+        assert label == ""
+        resolve_entry.assert_not_called()
+
+    def test_recoverable_provider_matches_full_registered_route(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://opencode.ai/zen/go/v1/"
+
+        assert _recoverable_pool_provider("auto", client) == "opencode-go"
+
+    def test_custom_route_never_recovers_through_a_builtin_pool(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+
+        assert _recoverable_pool_provider("custom", client) is None
+        assert _recoverable_pool_provider("custom:private-route", client) is None
+
     def test_resolve_auto_skips_unhealthy_step2(self):
         """_resolve_auto Step-2 chain skips unhealthy providers."""
         from agent.auxiliary_client import (
@@ -5744,6 +6877,37 @@ class TestCompressionFallbackContextFilter:
             "without screening by context window.")
         assert model == "huge-1m"
 
+    def test_main_chain_skips_exact_unhealthy_entry(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        second = MagicMock(name="second")
+        chain = [
+            self._make_chain_entry("google-gemini", "gemini-3.5-flash"),
+            self._make_chain_entry("zai", "glm-5.2"),
+        ]
+
+        monkeypatch.setattr(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            lambda cfg: chain,
+        )
+
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=[(second, "glm-5.2")],
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            side_effect=lambda label: label
+            == "fallback_providers[0](google-gemini)",
+        ):
+            client, model, label = _try_main_fallback_chain(
+                task="title_generation",
+                failed_provider="auto",
+            )
+
+        assert client is second
+        assert model == "glm-5.2"
+        assert label == "fallback_providers[1](zai)"
+
     # ── L4: unknown context passthrough ────────────────────────────────
 
     def test_configured_chain_passes_through_unknown_context(self, monkeypatch):
@@ -6017,3 +7181,288 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+class TestFallbackRouteScopingRegressions:
+    """Health and refresh state must follow the configured route."""
+
+    def test_main_chain_entry_override_ignores_shared_provider_health(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        entry = {
+            "provider": "nvidia",
+            "model": "different-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "sibling-key",
+        }
+        fallback_client = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            lambda _cfg: [entry],
+        )
+
+        with patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            side_effect=lambda label: label == "nvidia",
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(fallback_client, "different-deployment"),
+        ) as resolve_entry:
+            client, model, label = _try_main_fallback_chain(
+                task="compression",
+                failed_provider="auto",
+            )
+
+        assert client is fallback_client
+        assert model == "different-deployment"
+        assert label == "fallback_providers[0](nvidia)"
+        resolve_entry.assert_called_once_with(entry)
+
+    def test_entry_scoped_auth_refresh_rebuilds_exact_sync_route(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        entry = {
+            "provider": "nvidia",
+            "model": "custom-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "entry-key",
+            "api_mode": "chat_completions",
+        }
+        stale_client = MagicMock()
+        stale_client.base_url = entry["base_url"]
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("expired")
+        fresh_client = MagicMock()
+        fresh_client.base_url = entry["base_url"]
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ), patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fresh_client, entry["model"]),
+        ) as resolve_route, patch(
+            "agent.auxiliary_client._get_cached_client"
+        ) as cached_route:
+            result = _call_fallback_candidate_sync(
+                stale_client,
+                entry["model"],
+                "fallback_chain[0](nvidia)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "fresh"
+        resolve_route.assert_called_once_with(
+            "nvidia",
+            model="custom-deployment",
+            async_mode=False,
+            explicit_base_url="https://nim-sibling.example/v1",
+            explicit_api_key="entry-key",
+            api_mode="chat_completions",
+        )
+        cached_route.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_entry_scoped_auth_refresh_rebuilds_exact_async_route(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        entry = {
+            "provider": "nvidia",
+            "model": "custom-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "entry-key",
+        }
+        stale_client = MagicMock()
+        stale_client.base_url = entry["base_url"]
+        stale_client.chat.completions.create = AsyncMock(
+            side_effect=_AuxAuth401("expired")
+        )
+        fresh_client = MagicMock()
+        fresh_client.base_url = entry["base_url"]
+        fresh_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("fresh async")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ), patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fresh_client, entry["model"]),
+        ) as resolve_route, patch(
+            "agent.auxiliary_client._get_cached_client"
+        ) as cached_route:
+            result = await _call_fallback_candidate_async(
+                stale_client,
+                entry["model"],
+                "fallback_chain[0](nvidia)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "fresh async"
+        resolve_route.assert_called_once_with(
+            "nvidia",
+            model="custom-deployment",
+            async_mode=True,
+            explicit_base_url="https://nim-sibling.example/v1",
+            explicit_api_key="entry-key",
+            api_mode=None,
+        )
+        cached_route.assert_not_called()
+
+    def test_provider_label_with_base_override_is_not_shared_pool_route(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://nim-sibling.example/v1"
+
+        assert _recoverable_pool_provider(
+            "nvidia",
+            client,
+            route_is_explicit=True,
+        ) is None
+
+    def test_provider_owned_dynamic_route_keeps_pool_recovery(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+        assert _recoverable_pool_provider("zai", client) == "zai"
+
+    def test_configured_alias_health_skips_to_independent_candidate(self):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        second_client = MagicMock()
+        entries = [
+            {"provider": "google-gemini", "model": "gemini-3.5-flash"},
+            {"provider": "zai", "model": "glm-5.2"},
+        ]
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": entries},
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            side_effect=lambda label: label == "gemini",
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(second_client, "glm-5.2"),
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is second_client
+        assert model == "glm-5.2"
+        assert label == "fallback_chain[1](zai)"
+
+    def test_main_alias_skip_does_not_retry_failed_backend(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        second_client = MagicMock()
+        entries = [
+            {"provider": "google-gemini", "model": "gemini-3.5-flash"},
+            {"provider": "zai", "model": "glm-5.2"},
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            lambda _cfg: entries,
+        )
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(second_client, "glm-5.2"),
+        ) as resolve_entry, patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            return_value=False,
+        ):
+            client, model, label = _try_main_fallback_chain(
+                "compression",
+                "google-gemini",
+            )
+
+        assert client is second_client
+        assert model == "glm-5.2"
+        assert label == "fallback_providers[1](zai)"
+        resolve_entry.assert_called_once_with(entries[1])
+
+    def test_main_agent_alias_does_not_retry_failed_backend(self):
+        from agent.auxiliary_client import _try_main_agent_model_fallback
+
+        with patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value="gemini",
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="gemini-3.5-flash",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+        ) as resolve_client:
+            client, model, label = _try_main_agent_model_fallback(
+                "google-gemini",
+                "compression",
+            )
+
+        assert (client, model, label) == (None, None, "")
+        resolve_client.assert_not_called()
+
+    def test_model_only_alias_uses_canonical_provider_health_key(self):
+        from agent.auxiliary_client import _fallback_health_label
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "google-gemini", "model": "gemini-3.5-flash"}
+                ]
+            },
+        ):
+            assert _fallback_health_label(
+                "fallback_chain[0](google-gemini)",
+                MagicMock(),
+                "compression",
+            ) == "gemini"
+
+    def test_promoted_model_only_fallback_marks_canonical_provider(self):
+        from agent.auxiliary_client import _mark_recoverable_provider_unhealthy
+
+        client = MagicMock()
+        client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "google-gemini", "model": "gemini-3.5-flash"}
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mark_unhealthy:
+            health_key = _mark_recoverable_provider_unhealthy(
+                "fallback_chain[0](google-gemini)",
+                client,
+                task="compression",
+            )
+
+        assert health_key == "gemini"
+        mark_unhealthy.assert_called_once_with("gemini")
