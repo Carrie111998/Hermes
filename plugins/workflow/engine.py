@@ -512,7 +512,9 @@ class WorkflowEngine:
         from hermes_cli import kanban_db as kb
         conn = kb.connect(board=self.kanban_board)
         try:
-            print(f"   🔧 create_kanban_card: board={self.kanban_board}, title={title[:50]}, assignee={assignee}", file=sys.stderr, flush=True)
+            import datetime as _dt
+            with open("/tmp/workflow-create-card.log", "a") as _f:
+                _f.write(f"{_dt.datetime.now().isoformat()} board={self.kanban_board} title={title[:50]} assignee={assignee}\n")
             new_tid = kb.create_task(
                 conn,
                 title=title,

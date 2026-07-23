@@ -432,101 +432,74 @@ class WorkflowEngine:
                 task_with_context += f"\n\nContext: {json.dumps(context)}"
 
         title = f"[{node.id}] {node.agent}: {node.task[:60]}"
-        cmd = [
-            _hermes_binary(), "kanban", "create",
-            title,
-            "--tenant", self.kanban_board,
-            "--body", task_with_context,
-            "--assignee", node.agent,
-            "--goal",
-            "--priority", "2",
-        ]
-        if node.goal_max_turns is not None:
-            cmd.extend(["--goal-max-turns", str(node.goal_max_turns)])
-        # Pass --max-runtime so the heartbeat sweep uses the node's
-        # timeout as the threshold, not the 30-minute default.
-        if node.timeout_minutes is not None:
-            cmd.extend(["--max-runtime", str(node.timeout_minutes * 60)])
-        if node.model:
-            cmd.extend(["--model", node.model])
-        if node.triage:
-            cmd.append("--triage")
-        # Real agents start in their own persistent workspace so files
-        # they write (e.g. council artifacts) survive card completion.
-        # Synthetic/gate nodes have no agent and get the default scratch.
-        if not node.synthetic and node.agent:
-            # Cannot use Path.home() — it resolves to the profile's fake
-            # home dir when the engine runs inside a Hermes profile.
-            # HERMES_HOME always points to the real profile root
-            # (e.g. /home/ubuntu/.hermes/profiles/sherlock), so
-            # its parent is the profiles directory.
-            hermes_home = os.environ.get("HERMES_HOME")
-            if hermes_home:
-                profiles_root = Path(hermes_home).parent
-            else:
-                profiles_root = Path.home() / ".hermes" / "profiles"
-            agent_ws = profiles_root / node.agent / "workspace"
-            cmd.extend(["--workspace", f"dir:{agent_ws}"])
+        # Resolve {context_var} placeholders in the agent field.
+        assignee = node.agent
+        if assignee and "{" in assignee and context:
+            try:
+                assignee = assignee.format(**{
+                    k: v for k, v in context.items()
+                    if isinstance(v, (str, int, float))
+                })
+            except (KeyError, ValueError, TypeError):
+                pass
 
-        # When kanban_board is set (e.g. "council"), inject the env var
-        # so the CLI resolves to the right board file.
-        run_env = dict(os.environ)
-        if self.kanban_board:
-            run_env["HERMES_KANBAN_BOARD"] = self.kanban_board
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=run_env)
-        if result.returncode != 0:
-            raise RuntimeError(f"Kanban card creation failed: {result.stderr}")
-
-        # Card ID can come from either a "Created card <id>" line OR
-        # a JSON object (--json mode); try JSON first since it's structured.
-        out = result.stdout.strip()
+        # Use the kanban DB Python API directly — no subprocess.
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect(board=self.kanban_board)
         try:
-            card_obj = json.loads(out)
-            if "id" in card_obj:
-                return card_obj["id"]
-        except (json.JSONDecodeError, ValueError):
-            pass
-        match = re.match(r'Created\s+(t_\S+)', out)
-        if match:
-            return match.group(1)
-        # Fallback: try last token (fragile but works for legacy output)
-        card_id = out.split()[-1] if out else ""
-        return card_id
+            import datetime as _dt
+            with open("/tmp/workflow-create-card.log", "a") as _f:
+                _f.write(f"{_dt.datetime.now().isoformat()} tools.wfe board={self.kanban_board} title={title[:50]} assignee={assignee}\n")
+            new_tid = kb.create_task(
+                conn,
+                title=title,
+                body=task_with_context,
+                assignee=str(assignee),
+                parents=(),
+                tenant=self.kanban_board,
+                priority=2,
+                workspace_kind="scratch",
+                workspace_path=None,
+                project_id=None,
+                triage=node.triage if hasattr(node, 'triage') else False,
+                max_runtime_seconds=(
+                    int(node.timeout_minutes * 60)
+                    if node.timeout_minutes is not None else None
+                ),
+            )
+            return new_tid
+        finally:
+            conn.close()
 
     def get_card_status(self, card_id: str) -> dict:
         """Query a kanban card's current state.
 
-        The CLI returns ``{task: {..., status, body, ...}, latest_summary: ...}``.
-        Unwrap the ``task`` key so callers see ``status``, ``body``,
-        etc. at the top level — matching what ``get_card_body`` and
-        the monitor loop expect.  Also merge ``latest_summary`` (the
-        agent's completion summary) into the returned dict so
-        ``get_card_body`` can prefer it over the raw task body.
+        Uses the kanban DB Python API directly — no subprocess.
         """
-        import os as _os
-        _env = dict(_os.environ)
-        if self.kanban_board:
-            _env["HERMES_KANBAN_BOARD"] = self.kanban_board
-        result = subprocess.run(
-            [_hermes_binary(), "kanban", "show", card_id, "--json"],
-            capture_output=True, text=True, timeout=15,
-            env=_env,
-        )
-        if result.returncode != 0:
-            return {"status": "unknown", "error": result.stderr}
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect(board=self.kanban_board)
         try:
-            raw = json.loads(result.stdout)
-            # Unwrap the task envelope so status/body are at top level.
-            if "task" in raw and isinstance(raw["task"], dict):
-                card = dict(raw["task"])
-                # Merge the agent's completion summary so
-                # get_card_body can prefer it over the input prompt.
-                if "latest_summary" in raw and raw["latest_summary"]:
-                    card["latest_summary"] = raw["latest_summary"]
-                return card
-            return raw
-        except (json.JSONDecodeError, ValueError):
-            return {"status": "unknown"}
+            task = kb.get_task(conn, card_id)
+            if task is None:
+                return {"status": "unknown", "error": f"Card {card_id} not found"}
+            result = {
+                "status": task.status,
+                "body": task.body or "",
+                "assignee": task.assignee or "",
+                "title": task.title or "",
+            }
+            try:
+                events = conn.execute(
+                    "SELECT message FROM task_events WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+                    (card_id,)
+                ).fetchone()
+                if events and events[0]:
+                    result["latest_summary"] = events[0]
+            except Exception:
+                pass
+            return result
+        finally:
+            conn.close()
 
     def get_card_body(self, card_id: str) -> str:
         """Get the agent's output from a completed kanban card.
