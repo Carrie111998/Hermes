@@ -3560,10 +3560,11 @@ def _recoverable_pool_provider(
         return "kimi-coding"
     if base_url_host_matches(base, "api.x.ai"):
         return "xai-oauth"
-    # Match the selected client's base URL against registered providers even
-    # when ``resolved_provider`` is ``auto``. This is needed for route-health
-    # quarantine as well as credential-pool recovery: otherwise an auto-routed
-    # NVIDIA/OpenRouter outage can immediately select the same backend again.
+    # Match the selected client's full base route against registered providers
+    # even when ``resolved_provider`` is ``auto``. Host-only matching is unsafe:
+    # opencode-zen and opencode-go deliberately share opencode.ai but use
+    # different path roots. Prefer the longest normalized route so nested
+    # provider paths resolve to their exact owner.
     preferred_provider = ""
     if main_runtime:
         rt = _normalize_main_runtime(main_runtime)
@@ -3575,19 +3576,52 @@ def _recoverable_pool_provider(
         if preferred_provider in PROVIDER_REGISTRY:
             provider_ids.remove(preferred_provider)
             provider_ids.insert(0, preferred_provider)
+        normalized_base = _normalized_provider_route(base)
+        best_match: tuple[int, str] | None = None
         for provider_id in provider_ids:
             pconfig = PROVIDER_REGISTRY.get(provider_id)
-            provider_base = str(
-                getattr(pconfig, "inference_base_url", "") or ""
-            ).rstrip("/")
-            if (
-                provider_base
-                and base_url_host_matches(base, base_url_hostname(provider_base))
-            ):
-                return provider_id
+            candidates = [
+                str(getattr(pconfig, "inference_base_url", "") or ""),
+            ]
+            base_url_env_var = str(
+                getattr(pconfig, "base_url_env_var", "") or ""
+            ).strip()
+            if base_url_env_var:
+                candidates.append(str(os.environ.get(base_url_env_var) or ""))
+            for candidate in candidates:
+                normalized_candidate = _normalized_provider_route(candidate)
+                if not normalized_candidate or not normalized_base:
+                    continue
+                if (
+                    normalized_base == normalized_candidate
+                    or normalized_base.startswith(normalized_candidate + "/")
+                ):
+                    score = len(normalized_candidate)
+                    if best_match is None or score > best_match[0]:
+                        best_match = (score, provider_id)
+        if best_match is not None:
+            return best_match[1]
     except Exception:
         pass
     return None
+
+
+def _normalized_provider_route(value: str) -> str:
+    """Normalize an HTTP provider base URL without discarding its path."""
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except Exception:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunparse((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        parsed.path.rstrip("/"),
+        "",
+        "",
+        "",
+    ))
 
 
 def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
@@ -4192,8 +4226,18 @@ def _try_main_agent_model_fallback(
     if main_provider.lower() == skip:
         # The thing that failed IS the main model — nothing to fall back to.
         return None, None, ""
-    if _is_provider_unhealthy(main_provider):
-        _log_skip_unhealthy(main_provider, task)
+    label = f"main-agent({main_provider})"
+    unhealthy_label = (
+        label
+        if _is_provider_unhealthy(label)
+        else (
+            main_provider
+            if _is_provider_unhealthy(main_provider)
+            else ""
+        )
+    )
+    if unhealthy_label:
+        _log_skip_unhealthy(unhealthy_label, task)
         return None, None, ""
 
     try:
@@ -4206,7 +4250,6 @@ def _try_main_agent_model_fallback(
     if client is None:
         return None, None, ""
 
-    label = f"main-agent({main_provider})"
     logger.info(
         "Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
         task or "call", reason, failed_provider, label, resolved_model or main_model,
@@ -4326,21 +4369,29 @@ def _try_configured_fallback_chain(
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
-        if not fb_provider or fb_provider.lower() == skip:
+        if not fb_provider:
             continue
         fb_model = str(entry.get("model", "")).strip() or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
-        custom_route = (
-            fb_provider.lower() == "custom"
-            or fb_provider.lower().startswith("custom:")
+        entry_scoped = any(
+            str(entry.get(field) or "").strip()
+            for field in (
+                "model",
+                "base_url",
+                "api_key",
+                "key_env",
+                "api_key_env",
+            )
         )
+        if fb_provider.lower() == skip and not entry_scoped:
+            continue
         unhealthy_label = (
             label
             if _is_provider_unhealthy(label)
             else (
                 fb_provider
-                if not custom_route and _is_provider_unhealthy(fb_provider)
+                if not entry_scoped and _is_provider_unhealthy(fb_provider)
                 else ""
             )
         )

@@ -3285,7 +3285,10 @@ class TestTryMainAgentModelFallback:
         from agent.auxiliary_client import _try_main_agent_model_fallback
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
-             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=True):
+             patch(
+                 "agent.auxiliary_client._is_provider_unhealthy",
+                 side_effect=lambda label: label == "main-agent(openrouter)",
+             ):
             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is None
 
@@ -6109,6 +6112,48 @@ class TestAuxUnhealthyCache:
         assert client is second_client
         assert model == "second"
         assert label == "fallback_chain[1](custom)"
+
+    def test_configured_override_is_not_suppressed_by_provider_health(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        fallback_client = MagicMock()
+        entry = {
+            "provider": "nvidia",
+            "model": "different-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "sibling-key",
+        }
+        _mark_provider_unhealthy("nvidia")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(fallback_client, "different-deployment"),
+        ), patch(
+            "agent.auxiliary_client._candidate_context_window",
+            return_value=1_048_576,
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is fallback_client
+        assert model == "different-deployment"
+        assert label == "fallback_chain[0](nvidia)"
+
+    def test_recoverable_provider_matches_full_registered_route(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://opencode.ai/zen/go/v1/"
+
+        assert _recoverable_pool_provider("auto", client) == "opencode-go"
 
     def test_custom_route_never_recovers_through_a_builtin_pool(self):
         from agent.auxiliary_client import _recoverable_pool_provider
