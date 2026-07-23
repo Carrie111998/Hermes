@@ -278,7 +278,7 @@ def _handle_workflow_start_predefined(
         try:
             result = engine.execute(
                 workflow_name=workflow,
-                context=context or {},
+                context=_ctx,
                 start_node=node,
                 dry_run=True,
                 resume=resume,
@@ -293,10 +293,12 @@ def _handle_workflow_start_predefined(
             return _err(f"dry-run failed: {exc}")
         return _ok(result)
 
-    # Capture session info at tool-handler level where ContextVars are available.
-    # The engine's execute() runs in a context where ContextVars are lost.
-    # Store as module-level so the engine can read it directly.
+    # Capture session info and inject into context (which persists in state file)
     _capture_session_for_engine()
+    _sess = _get_captured_session()
+    _ctx = context or {}
+    if _sess:
+        _ctx["_session_info"] = _sess
 
     # Fire-and-forget: create all kanban cards and subscribe the final
     # layer for notifications.  The kanban dispatcher picks up ready
@@ -306,7 +308,7 @@ def _handle_workflow_start_predefined(
     try:
         result = engine.execute(
             workflow_name=workflow,
-            context=context or {},
+            context=_ctx,
             start_node=node,
             dry_run=False,
             resume=resume,

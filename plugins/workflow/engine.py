@@ -2258,7 +2258,12 @@ class WorkflowEngine:
         # can access them without threading through every method signature.
         self._current_attachments = attachments or []
         # Capture session info once — used for subscription routing and state persistence.
-        _session_info = session_info or self._get_session_info()
+        # Session info: parameter > context["_session_info"] > ContextVars/file fallback
+        _session_info = (
+            session_info
+            or (context or {}).get("_session_info")
+            or self._get_session_info()
+        )
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
