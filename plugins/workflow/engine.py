@@ -2616,6 +2616,15 @@ class WorkflowEngine:
         self._update_execution(workflow.run_id, status=final_status,
                               current_layer=layer_idx)
 
+        # Subscribe final-layer cards for notification.
+        # The notifier pushes terminal events back to the calling session.
+        if layers:
+            final_nids = layers[-1]
+            final_card_ids = [states[nid].kanban_card_id for nid in final_nids
+                              if states[nid].kanban_card_id]
+            if final_card_ids:
+                self._subscribe_final_cards(final_card_ids)
+
         self._clear_state(workflow_name, run_id=workflow.run_id)
 
         return results
