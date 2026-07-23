@@ -2687,3 +2687,54 @@ class TestToolHandlerArgsDict:
         result = handle_workflow_status({})
         data = json.loads(result)
         assert data["ok"] is True
+
+
+# ── Board resolution priority tests ─────────────────────────────
+
+class TestBoardResolution:
+    """Caller-passed board takes priority over YAML kanban_board field."""
+
+    def test_caller_board_wins_over_yaml(self, engine):
+        """When board= is passed, it overrides YAML kanban_board."""
+        from plugins.workflow.engine import Workflow, WorkflowNode
+        from unittest.mock import patch, MagicMock
+
+        wf = Workflow(name="test-board", kanban_board="yaml-board")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="Task A")
+
+        with patch.object(engine, 'load_workflow', return_value=wf):
+            with patch("hermes_cli.kanban_db.connect", return_value=MagicMock()) as mock_connect:
+                with patch("hermes_cli.kanban_db.create_task", return_value="t_test"):
+                    engine.execute("test-board", board="caller-board", fire_and_forget=True)
+
+        mock_connect.assert_called_with(board="caller-board")
+
+    def test_yaml_board_used_when_no_caller(self, engine):
+        """When no board= passed, YAML kanban_board is used."""
+        from plugins.workflow.engine import Workflow, WorkflowNode
+        from unittest.mock import patch, MagicMock
+
+        wf = Workflow(name="test-board", kanban_board="yaml-board")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="Task A")
+
+        with patch.object(engine, 'load_workflow', return_value=wf):
+            with patch("hermes_cli.kanban_db.connect", return_value=MagicMock()) as mock_connect:
+                with patch("hermes_cli.kanban_db.create_task", return_value="t_test"):
+                    engine.execute("test-board", fire_and_forget=True)
+
+        mock_connect.assert_called_with(board="yaml-board")
+
+    def test_auto_create_when_no_board(self, engine):
+        """When no board= and no YAML board, auto-creates wf_<name>."""
+        from plugins.workflow.engine import Workflow, WorkflowNode
+        from unittest.mock import patch, MagicMock
+
+        wf = Workflow(name="test-pipeline")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="Task A")
+
+        with patch.object(engine, 'load_workflow', return_value=wf):
+            with patch("hermes_cli.kanban_db.connect", return_value=MagicMock()) as mock_connect:
+                with patch("hermes_cli.kanban_db.create_task", return_value="t_test"):
+                    engine.execute("test-pipeline", fire_and_forget=True)
+
+        mock_connect.assert_called_with(board="wf_test-pipeline")
