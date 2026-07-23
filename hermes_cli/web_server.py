@@ -3800,11 +3800,14 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
 
     # Reap the process as soon as it exits so it doesn't linger as a zombie
     # if no client polls /api/actions/{name}/status after completion.
-    threading.Thread(
-        target=proc.wait,
-        name=f"reap-{name}",
-        daemon=True,
-    ).start()
+    # getattr guard: test doubles for Popen don't always stub wait().
+    reap = getattr(proc, "wait", None)
+    if callable(reap):
+        threading.Thread(
+            target=reap,
+            name=f"reap-{name}",
+            daemon=True,
+        ).start()
 
     return proc
 
