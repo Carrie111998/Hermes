@@ -1,17 +1,14 @@
 name: sillytavern
 version: 0.1.0
-description: "Hermes bridge for the pinned SillyTavern frontend and local chat-completions server."
-author: "Hermes Agent"
-kind: standalone
-platforms:
-  - linux
-  - macos
-  - windows
-provides_tools:
-  - sillytavern_capabilities
-  - sillytavern_status
-  - sillytavern_start
-  - sillytavern_stop
-  - sillytavern_generate
-provides_cli:
-  - sillytavern
+description: Manage a local SillyTavern server (start/stop/status) and query its CSRF-aware HTTP API.
+author: zapabob
+config:
+  install_dir:
+    type: string
+    default: "vendor/SillyTavern (repo submodule; override with SILLYTAVERN_DIR)"
+  port:
+    type: integer
+    default: 8000
+  host:
+    type: string
+    default: "127.0.0.1"
