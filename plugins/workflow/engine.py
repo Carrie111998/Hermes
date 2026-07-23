@@ -1635,12 +1635,40 @@ class WorkflowEngine:
     def validate(self, workflow_name: str) -> dict:
         """
         Validate a workflow without executing. Checks:
-        - YAML loads cleanly
+        - YAML loads cleanly (syntax + structure)
         - All dependency references resolve
         - No cycles in DAG
         - All agents referenced exist (best-effort)
+        - Required fields present on all nodes
         """
+        import yaml as _yaml
         result = {"valid": True, "issues": [], "layers": 0, "nodes": 0}
+
+        # Step 1: YAML syntax check (catches malformed YAML before load)
+        yaml_path = self.workflows_dir / f"{workflow_name}.yaml"
+        if not yaml_path.exists():
+            result["valid"] = False
+            result["issues"].append(f"Pipeline file not found: {yaml_path}")
+            return result
+
+        try:
+            raw_text = yaml_path.read_text()
+        except Exception as e:
+            result["valid"] = False
+            result["issues"].append(f"Cannot read YAML file: {e}")
+            return result
+
+        try:
+            raw = _yaml.safe_load(raw_text)
+        except _yaml.YAMLError as e:
+            result["valid"] = False
+            result["issues"].append(f"YAML syntax error: {e}")
+            return result
+
+        if not isinstance(raw, dict):
+            result["valid"] = False
+            result["issues"].append("YAML root must be a mapping (key: value)")
+            return result
 
         try:
             workflow = self.load_workflow(workflow_name)
@@ -2229,6 +2257,12 @@ class WorkflowEngine:
                             if card_id is None:
                                 results[nid] = "done"
                                 print(f"   ⊙ {nid} → in-process (scope: global)")
+                                continue
+                            if not card_id:
+                                state.status = "failed"
+                                state.error = "Card creation returned empty ID"
+                                results[nid] = "failed"
+                                print(f"   ✗ {nid} → failed: empty card ID")
                                 continue
                             state.kanban_card_id = card_id
                             if card_id and workflow.run_id:
