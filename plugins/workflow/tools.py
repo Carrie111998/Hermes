@@ -132,6 +132,7 @@ def handle_workflow_start(
     single_flight = args.get("single_flight", False)
     inputs = args.get("inputs")
     board = args.get("board", "")
+    attachments = args.get("attachments")
 
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
@@ -157,6 +158,7 @@ def handle_workflow_start(
         single_flight=single_flight,
         inputs=inputs,
         board=board,
+        attachments=attachments,
     )
 def _handle_workflow_start_predefined(
     workflow: str,
@@ -167,6 +169,7 @@ def _handle_workflow_start_predefined(
     single_flight: bool = False,
     inputs: Optional[Dict[str, Any]] = None,
     board: str = "",
+    attachments: Optional[list] = None,
 ) -> str:
     """Predefined mode: look up YAML in docs/fleet-pipelines/, validate,
     dispatch via engine.
@@ -214,6 +217,7 @@ def _handle_workflow_start_predefined(
                 resume=resume,
                 inputs=inputs,
                 board=board,
+                attachments=attachments,
             )
         except FileNotFoundError as exc:
             return _err(f"workflow not found: {workflow}", hint=str(exc))
@@ -237,6 +241,7 @@ def _handle_workflow_start_predefined(
             inputs=inputs,
             board=board,
             fire_and_forget=True,
+            attachments=attachments,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))
@@ -609,6 +614,15 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                     "uses the YAML 'kanban_board' field or auto-creates 'wf_<workflow_name>'."
                 ),
                 "default": "",
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of local file paths to attach to every kanban card "
+                    "created by this workflow run. Files are stored in the kanban "
+                    "attachment store and visible to agents that pick up the cards."
+                ),
             },
         },
         "required": ["workflow"],

@@ -532,6 +532,19 @@ class WorkflowEngine:
                     if node.timeout_minutes is not None else None
                 ),
             )
+            # Attach files if any were passed via the tool call.
+            for fpath in getattr(self, "_current_attachments", []):
+                try:
+                    from pathlib import Path as _P
+                    p = _P(fpath)
+                    if p.is_file():
+                        kb.store_attachment_bytes(
+                            conn, new_tid, p.name, p.read_bytes(),
+                            content_type=None,
+                            uploaded_by="workflow-engine",
+                        )
+                except Exception:
+                    pass  # don't fail card creation over an attachment
             return new_tid
         finally:
             conn.close()
@@ -2072,7 +2085,8 @@ class WorkflowEngine:
                 resume: bool = False, board: str = None,
                 inputs: dict = None,
                 fire_and_forget: bool = False,
-                run_id: Optional[str] = None) -> dict:
+                run_id: Optional[str] = None,
+                attachments: list = None) -> dict:
         """
         Run a workflow to completion. Supports revision loops via
         the LOOP:<target> convention in block reasons.
@@ -2200,6 +2214,9 @@ class WorkflowEngine:
             )
 
         # ── Fire-and-forget: create cards, detect loop zones, spawn supervisor ──
+        # Store attachments on the engine instance so create_kanban_card
+        # can access them without threading through every method signature.
+        self._current_attachments = attachments or []
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
