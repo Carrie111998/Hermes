@@ -70,6 +70,7 @@ from hermes_cli.config import (
     load_env,
     read_raw_config,
     save_config,
+    set_active_memory_providers,
     save_env_value,
     remove_env_value,
     custom_endpoint_key_env,
@@ -12501,7 +12502,7 @@ async def set_memory_provider(body: MemoryProviderSelect):
     cfg = load_config()
     if not isinstance(cfg.get("memory"), dict):
         cfg["memory"] = {}
-    cfg["memory"]["provider"] = provider
+    set_active_memory_providers(cfg, [provider] if provider else [])
     save_config(cfg)
     return {"ok": True, "active": provider}
 
