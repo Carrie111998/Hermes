@@ -325,7 +325,10 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
 
             # Get the failure report from the blocked card
             from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board", "fleet-workflow")
+            board = state.get("kanban_board")
+            if not board:
+                logger.error("kanban_board missing from state file — cannot process hook event")
+                return
             conn = kb.connect(board=board)
             try:
                 blocked_card = kb.get_task(conn, task_id)
@@ -374,7 +377,10 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             layer_nodes = layers[current_layer]
             # Check actual card status from kanban DB, not just state file
             from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board", "fleet-workflow")
+            board = state.get("kanban_board")
+            if not board:
+                logger.error("kanban_board missing from state file — cannot process hook event")
+                return
             conn = kb.connect(board=board)
             try:
                 all_done = True
@@ -443,7 +449,9 @@ def _subscribe_final_layer(state, completed_layer_idx, layers):
     # Create subscriptions
     try:
         from hermes_cli import kanban_db as kb
-        board = state.get("kanban_board", "fleet-workflow")
+        board = state.get("kanban_board")
+        if not board:
+            return
         conn = kb.connect(board=board)
         try:
             for cid in card_ids:
@@ -473,7 +481,9 @@ def _spawn_supervisor_for_next_layer(state, state_path):
         import sys
         workflow_name = state.get("workflow_name", "")
         run_id = state.get("run_id", "")
-        board = state.get("kanban_board", "fleet-workflow")
+        board = state.get("kanban_board")
+        if not board:
+            return
         current_layer = state.get("current_layer", 0)
         layers = state.get("layers", [])
 

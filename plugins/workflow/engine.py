@@ -1257,6 +1257,7 @@ class WorkflowEngine:
             self._record_node_completion(node_state)
         state = {
             "workflow_name": workflow_name,
+            "kanban_board": self.kanban_board,
             "current_layer": current_layer,
             "layers": layers,
             "context": context or {},
