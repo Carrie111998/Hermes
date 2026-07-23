@@ -913,11 +913,21 @@ def test_tgg_spreadsheet_job_numbers_extracts_xlsx_and_csv(tmp_path):
     ]
 
 
-def test_tgg_spreadsheet_tool_hands_numbers_to_existing_cross_check(tmp_path):
+def test_tgg_spreadsheet_tool_hands_numbers_to_existing_cross_check(
+    tmp_path, monkeypatch
+):
     import tools.pa_business_tools as pbt
+    import hermes_cli.config as hermes_config
 
     workbook = tmp_path / "jobs.xlsx"
     _xlsx(workbook, job_numbers=("AM/JOB/2607/0001", "AM/JOB/2607/0002"))
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {
+            "pa": {"media_retention": {"source_roots": [str(tmp_path)]}}
+        },
+    )
     result = json.loads(
         pbt._handle_tgg_spreadsheet_job_numbers({"path": str(workbook)})
     )
@@ -927,6 +937,62 @@ def test_tgg_spreadsheet_tool_hands_numbers_to_existing_cross_check(tmp_path):
         "AM/JOB/2607/0002",
     ]
     assert "tgg_case_query" in result["next"]
+
+
+def test_tgg_spreadsheet_tool_refuses_path_outside_configured_roots(
+    tmp_path, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+    import hermes_cli.config as hermes_config
+
+    workbook = tmp_path / "outside" / "jobs.xlsx"
+    workbook.parent.mkdir()
+    _xlsx(workbook, job_numbers=("AM/JOB/2607/0001",))
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {
+            "pa": {"media_retention": {"source_roots": [str(allowed)]}}
+        },
+    )
+
+    result = json.loads(
+        pbt._handle_tgg_spreadsheet_job_numbers({"path": str(workbook)})
+    )
+
+    assert result == {
+        "error": (
+            "INVALID_MEDIA_REF: spreadsheet is unavailable or outside "
+            "configured roots"
+        )
+    }
+    assert str(workbook) not in result["error"]
+
+
+def test_tgg_spreadsheet_gate_refuses_oversized_csv_without_full_read(
+    tmp_path, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+
+    csv_file = tmp_path / "huge.csv"
+    csv_file.write_text("Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8")
+    real_stat = Path.stat
+
+    class Oversized:
+        st_size = pbt._TGG_SPREADSHEET_MAX_FILE_BYTES + 1
+
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda self, *args, **kwargs: (
+            Oversized() if self == csv_file else real_stat(self, *args, **kwargs)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="SPREADSHEET_TOO_LARGE"):
+        pbt.validate_tgg_spreadsheet(csv_file, declared_mime="text/csv")
 
 
 @pytest.mark.parametrize("suffix", [".xlsm", ".xltm"])

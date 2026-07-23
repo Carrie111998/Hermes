@@ -113,6 +113,10 @@ class MediaRetentionError(ConsumerError):
     """Retryable failure before a claimed event reaches the model."""
 
 
+class PermanentMediaRefusal(ConsumerError):
+    """Terminal safety refusal that may reach the model as a refused attachment."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -526,10 +530,8 @@ class DurableInbox:
                     ) from exc
                 item = _bridge_item(decoded)
                 declared_document_mime = _declared_document_mime(decoded)
-                if declared_document_mime and item.get("mediaUrls"):
-                    item["mediaMimes"] = [
-                        declared_document_mime for _ in item["mediaUrls"]
-                    ]
+                if declared_document_mime and len(item.get("mediaUrls") or []) == 1:
+                    item["mediaMimes"] = [declared_document_mime]
                 message_id = str(item["messageId"])
                 staged.append((start, end, item))
                 last_message_id = message_id
@@ -1083,6 +1085,7 @@ class DurableInbox:
         *,
         retained: int | None = None,
         bypassed: bool = False,
+        refusal: str | None = None,
         error: str | None = None,
     ) -> None:
         now = _utc_now()
@@ -1101,9 +1104,15 @@ class DurableInbox:
             changed = conn.execute(
                 "UPDATE ingress_events SET retention_state=?,"
                 "retained_media_count=?,retention_attempts=retention_attempts+1,"
-                "retention_last_error=NULL,retention_updated_at=? "
+                "retention_last_error=?,retention_updated_at=? "
                 "WHERE seq=? AND retention_state IN ('pending','held')",
-                (state, max(0, int(retained or 0)), now, record.seq),
+                (
+                    state,
+                    max(0, int(retained or 0)),
+                    (refusal or "")[:2000] if refusal else None,
+                    now,
+                    record.seq,
+                ),
             ).rowcount
             if changed == 0:
                 row = conn.execute(
@@ -1408,13 +1417,21 @@ def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
     result: list[tuple[Any, str | None]] = []
     event_mime = item.get("mediaType") or item.get("mimeType")
     event_kind = str(event_mime or "").split("/", 1)[0].strip().lower()
-    if event_kind != "image":
-        return []
-    for value in values:
+    declared_mimes = item.get("mediaMimes") or []
+    if isinstance(declared_mimes, (str, bytes)):
+        declared_mimes = [declared_mimes]
+    for index, value in enumerate(values):
         mime = (
             value.get("mime") or value.get("mimeType") or value.get("contentType")
-            if isinstance(value, Mapping) else event_mime
+            if isinstance(value, Mapping)
+            else (
+                declared_mimes[index]
+                if index < len(declared_mimes)
+                else event_mime
+            )
         )
+        if not mime and event_kind == "image":
+            mime = event_mime
         declared = str(mime) if mime else None
         kind = str(declared or "").split("/", 1)[0].strip().lower()
         if kind != "image":
@@ -1457,7 +1474,7 @@ def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[Any, str]]:
         if not declared and index < len(declared_mimes):
             declared = str(declared_mimes[index] or "")
         if not declared:
-            raise MediaRetentionError(
+            raise PermanentMediaRefusal(
                 "PROVENANCE_DIVERGENCE: spreadsheet has no provider-declared MIME"
             )
         result.append((value, declared))
@@ -1531,13 +1548,14 @@ def _retain_record_media_impl(
             try:
                 validate_tgg_spreadsheet(source, declared_mime=declared_mime)
             except ValueError as exc:
-                raise MediaRetentionError(str(exc)) from exc
-        return {
-            "retained": 0,
-            "bytes": 0,
-            "operation": False,
-            "validated_spreadsheets": len(spreadsheets),
-        }
+                raise PermanentMediaRefusal(str(exc)) from exc
+        if not _event_media(item):
+            return {
+                "retained": 0,
+                "bytes": 0,
+                "operation": False,
+                "validated_spreadsheets": len(spreadsheets),
+            }
     media = _event_media(item)
     if not media:
         coarse_kind = str(
@@ -1650,6 +1668,16 @@ def ensure_record_media_retained(
         return durable
     try:
         result = retain_record_media(record, config_path=config_path)
+    except PermanentMediaRefusal as exc:
+        refusal = f"media-refused: {exc}"
+        inbox.record_retention(record, bypassed=True, refusal=refusal)
+        return {
+            "retained": 0,
+            "bytes": 0,
+            "operation": False,
+            "refused": True,
+            "reason": str(exc),
+        }
     except MediaRetentionError as exc:
         inbox.record_retention(record, error=f"media-retention-retry: {exc}")
         raise

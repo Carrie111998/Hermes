@@ -1928,7 +1928,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                                 declared_mime=mime,
                             )
                         except (OSError, ValueError) as exc:
-                            refused_documents.append(f"{Path(url).name}: {exc}")
+                            refusal_code = str(exc).split(":", 1)[0]
+                            refused_documents.append(refusal_code)
                             print(
                                 f"[{self.name}] Refused spreadsheet document: {exc}",
                                 flush=True,

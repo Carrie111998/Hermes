@@ -155,7 +155,46 @@ def test_spreadsheet_is_content_validated_then_bypasses_image_retention(tmp_path
     }
 
 
-def test_spreadsheet_without_declared_mime_is_held_before_model(tmp_path):
+def test_mixed_spreadsheet_and_image_still_retains_image(tmp_path, monkeypatch):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    image = capture / "evidence.png"
+    image.write_bytes(_png_bytes())
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    monkeypatch.setattr(
+        consumer,
+        "_converge_retained_media",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "data": {"ledgerChanged": False, "observationsChanged": False},
+        },
+    )
+    raw = _message("SHEET-IMAGE")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook), str(image)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "image/png",
+            ],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "SHEET-IMAGE", "test-group@g.us", 0, 1, raw
+    )
+
+    result = consumer.retain_record_media(record, config_path=config)
+
+    assert result["retained"] == 1
+    assert result["operation"] is True
+    assert len(list((tmp_path / "retained").glob("*.png"))) == 1
+
+
+def test_spreadsheet_without_declared_mime_is_permanently_refused(tmp_path):
     capture = tmp_path / "capture"
     capture.mkdir()
     workbook = capture / "jobs.xlsx"
@@ -173,8 +212,51 @@ def test_spreadsheet_without_declared_mime_is_held_before_model(tmp_path):
         1, "SHEET-NO-MIME", "test-group@g.us", 0, 1, raw
     )
 
-    with pytest.raises(consumer.MediaRetentionError, match="provider-declared MIME"):
+    with pytest.raises(
+        consumer.PermanentMediaRefusal, match="provider-declared MIME"
+    ):
         consumer.retain_record_media(record, config_path=config)
+
+
+def test_permanent_spreadsheet_refusal_is_durable_and_not_retried(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    executable = capture / "malware.xlsx"
+    executable.write_bytes(b"MZ" + b"\x00" * 100)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    source = tmp_path / "events.jsonl"
+    raw = _message("SHEET-REFUSED")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(executable)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ],
+        }
+    )
+    _write_jsonl(source, [raw])
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    consumer.initialize_cursor(source, cursor, position="start")
+    inbox.stage_from_source(source, cursor)
+    record = inbox.retention_candidates(limit=1)[0]
+
+    result = consumer.ensure_record_media_retained(
+        inbox, record, config_path=config
+    )
+
+    assert result["refused"] is True
+    assert inbox.retention_candidates(limit=1) == []
+    with inbox.connect() as conn:
+        row = conn.execute(
+            "SELECT retention_state,retention_attempts,retention_failures,"
+            "retention_last_error FROM ingress_events WHERE message_id=?",
+            ("SHEET-REFUSED",),
+        ).fetchone()
+    assert tuple(row[:3]) == ("bypassed", 1, 0)
+    assert "PROVENANCE_DIVERGENCE" in row["retention_last_error"]
 
 
 def test_media_retention_normalizes_source_read_oserror(tmp_path, monkeypatch):

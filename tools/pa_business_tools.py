@@ -1141,6 +1141,7 @@ _TGG_XLSX_MAIN_CONTENT_TYPE = (
 _TGG_SPREADSHEET_MACRO_MARKERS = ("macroenabled", "vbaproject", "macrosheet")
 _TGG_SPREADSHEET_MAX_ZIP_ENTRIES = 20_000
 _TGG_SPREADSHEET_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+_TGG_SPREADSHEET_MAX_FILE_BYTES = 64 * 1024 * 1024
 _TGG_SPREADSHEET_MAX_JOB_NUMBERS = 10_000
 _TGG_JOB_HEADER_NAMES = frozenset(
     {"job no", "job number", "job no.", "job number."}
@@ -1149,7 +1150,8 @@ _TGG_JOB_HEADER_NAMES = frozenset(
 
 def _sniff_tgg_csv(path: Path) -> bool:
     """Return whether a bounded prefix is plausibly comma-delimited text."""
-    sample = path.read_bytes()[: 128 * 1024]
+    with path.open("rb") as handle:
+        sample = handle.read(128 * 1024)
     if not sample or b"\x00" in sample:
         return False
     try:
@@ -1228,6 +1230,8 @@ def validate_tgg_spreadsheet(
     candidate = Path(path).expanduser().resolve(strict=True)
     if not candidate.is_file():
         raise ValueError("INVALID_MEDIA_REF: spreadsheet is not a regular file")
+    if candidate.stat().st_size > _TGG_SPREADSHEET_MAX_FILE_BYTES:
+        raise ValueError("SPREADSHEET_TOO_LARGE: file exceeds the media gate limit")
     suffix = candidate.suffix.lower()
     mime = str(declared_mime or "").split(";", 1)[0].strip().lower()
     if suffix not in _TGG_SPREADSHEET_EXTENSIONS:
@@ -1337,35 +1341,52 @@ def _extract_xlsx_job_numbers(path: Path) -> list[str]:
         shared = _xlsx_shared_strings(archive)
         for sheet_path in _xlsx_sheet_paths(archive):
             try:
-                sheet = ElementTree.fromstring(archive.read(sheet_path))
-            except (KeyError, ElementTree.ParseError) as exc:
+                sheet_stream = archive.open(sheet_path)
+            except KeyError as exc:
                 raise ValueError("INVALID_SPREADSHEET: malformed worksheet") from exc
             job_column = 0
-            for row in sheet.iter():
-                if row.tag.rsplit("}", 1)[-1] != "row":
-                    continue
-                values: dict[int, str] = {}
-                for cell in row:
-                    if cell.tag.rsplit("}", 1)[-1] != "c":
+            try:
+                for _event, row in ElementTree.iterparse(
+                    sheet_stream, events=("end",)
+                ):
+                    if row.tag.rsplit("}", 1)[-1] != "row":
                         continue
-                    column = _xlsx_column_index(str(cell.attrib.get("r") or ""))
-                    if column:
-                        values[column] = _xlsx_cell_text(cell, shared)
-                if not job_column:
-                    for column, value in values.items():
-                        normalized = " ".join(value.lower().split())
-                        if normalized in _TGG_JOB_HEADER_NAMES:
-                            job_column = column
-                            break
-                    continue
-                job_no = " ".join(values.get(job_column, "").upper().split())
-                if job_no and re.fullmatch(JOB_NO_RE, job_no) and job_no not in seen:
-                    seen.add(job_no)
-                    jobs.append(job_no)
-                    if len(jobs) > _TGG_SPREADSHEET_MAX_JOB_NUMBERS:
-                        raise ValueError(
-                            "SPREADSHEET_TOO_LARGE: too many unique job numbers"
+                    values: dict[int, str] = {}
+                    for cell in row:
+                        if cell.tag.rsplit("}", 1)[-1] != "c":
+                            continue
+                        column = _xlsx_column_index(
+                            str(cell.attrib.get("r") or "")
                         )
+                        if column:
+                            values[column] = _xlsx_cell_text(cell, shared)
+                    if not job_column:
+                        for column, value in values.items():
+                            normalized = " ".join(value.lower().split())
+                            if normalized in _TGG_JOB_HEADER_NAMES:
+                                job_column = column
+                                break
+                        row.clear()
+                        continue
+                    job_no = " ".join(
+                        values.get(job_column, "").upper().split()
+                    )
+                    if (
+                        job_no
+                        and re.fullmatch(JOB_NO_RE, job_no)
+                        and job_no not in seen
+                    ):
+                        seen.add(job_no)
+                        jobs.append(job_no)
+                        if len(jobs) > _TGG_SPREADSHEET_MAX_JOB_NUMBERS:
+                            raise ValueError(
+                                "SPREADSHEET_TOO_LARGE: too many unique job numbers"
+                            )
+                    row.clear()
+            except ElementTree.ParseError as exc:
+                raise ValueError("INVALID_SPREADSHEET: malformed worksheet") from exc
+            finally:
+                sheet_stream.close()
     return jobs
 
 
@@ -1420,7 +1441,35 @@ def _handle_tgg_spreadsheet_job_numbers(
         path = str(args.get("path") or "").strip()
         if not path:
             raise ValueError("path is required")
-        jobs = extract_tgg_spreadsheet_job_numbers(path)
+        try:
+            from hermes_cli.config import read_raw_config
+
+            config = read_raw_config()
+            pa = config.get("pa") if isinstance(config, Mapping) else None
+            retention = (
+                pa.get("media_retention") if isinstance(pa, Mapping) else None
+            )
+            roots = (
+                retention.get("source_roots")
+                if isinstance(retention, Mapping)
+                else None
+            )
+            if isinstance(roots, (str, bytes)):
+                roots = [roots]
+            candidate = Path(path).expanduser().resolve(strict=True)
+            allowed_roots = [
+                Path(str(root)).expanduser().resolve(strict=True)
+                for root in (roots or [])
+            ]
+            if not allowed_roots or not any(
+                candidate.is_relative_to(root) for root in allowed_roots
+            ):
+                raise ValueError
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise ValueError(
+                "INVALID_MEDIA_REF: spreadsheet is unavailable or outside configured roots"
+            ) from None
+        jobs = extract_tgg_spreadsheet_job_numbers(candidate)
         return tool_result(
             {
                 "ok": True,
