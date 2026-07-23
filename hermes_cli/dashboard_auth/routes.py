@@ -824,7 +824,11 @@ async def api_auth_ws_ticket(request: Request):
         session_is_restricted,
         session_scopes,
     )
-    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        TTL_SECONDS,
+        mint_ticket,
+        resume_event_channel,
+    )
 
     if session_is_restricted(sess):
         # Resume sessions may only mint tickets for chat-related WS paths.
@@ -836,15 +840,24 @@ async def api_auth_ws_ticket(request: Request):
             bound_profile=getattr(sess, "bound_profile", "") or "",
             allowed_endpoints=RESUME_WS_ENDPOINTS,
         )
+        event_channel = resume_event_channel(
+            user_id=sess.user_id,
+            session_id=getattr(sess, "bound_session_id", "") or "",
+            profile=getattr(sess, "bound_profile", "") or "",
+        )
     else:
         ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+        event_channel = ""
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,
         user_id=sess.user_id,
         ip=_client_ip(request),
     )
-    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+    response = {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+    if event_channel:
+        response["event_channel"] = event_channel
+    return response
 
 
 # ---------------------------------------------------------------------------

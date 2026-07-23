@@ -68,6 +68,11 @@ HANDOFF_TTL_SECONDS = 120
 #: even if a caller confuses the query param names.
 HANDOFF_TICKET_PREFIX = "hnd_"
 
+#: Server-derived channel name for the structured event bridge of a
+#: resume-scoped phone session. It is deterministic for the bound identity
+#: and process, not client-selected entropy.
+RESUME_EVENT_CHANNEL_PREFIX = "resume-"
+
 #: Lifetime of the browser session cookie minted when a handoff ticket is
 #: consumed. Longer than the ticket itself — the QR dies in 120 s, but the
 #: phone session should last a normal browsing window. No refresh token is
@@ -104,6 +109,24 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
+def resume_event_channel(*, user_id: str, session_id: str, profile: str) -> str:
+    """Derive the only structured-event channel for a resume ticket."""
+    payload = json.dumps(
+        {
+            "profile": str(profile or ""),
+            "session_id": str(session_id or ""),
+            "user_id": str(user_id or ""),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    with _lock:
+        key = _handoff_key_locked()
+    digest = hmac.new(key, payload, hashlib.sha256).digest()
+    encoded = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return f"{RESUME_EVENT_CHANNEL_PREFIX}{encoded}"
+
+
 def mint_ticket(
     *,
     user_id: str,
@@ -134,6 +157,13 @@ def mint_ticket(
         endpoints = None
     else:
         endpoints = sorted({str(e) for e in allowed_endpoints if e})
+    event_channel = ""
+    if endpoints is not None:
+        event_channel = resume_event_channel(
+            user_id=user_id,
+            session_id=str(bound_session_id or ""),
+            profile=str(bound_profile or ""),
+        )
     info = {
         "user_id": user_id,
         "provider": provider,
@@ -143,6 +173,7 @@ def mint_ticket(
         "bound_session_id": str(bound_session_id or ""),
         "bound_profile": str(bound_profile or ""),
         "allowed_endpoints": endpoints,
+        "event_channel": event_channel,
     }
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)

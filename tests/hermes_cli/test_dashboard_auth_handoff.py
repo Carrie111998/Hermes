@@ -393,7 +393,10 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
     phone = _resume_phone(gated_app, "ws-bound")
     r = phone.post("/api/auth/ws-ticket")
     assert r.status_code == 200, r.text
-    ticket = r.json()["ticket"]
+    ticket_response = r.json()
+    ticket = ticket_response["ticket"]
+    event_channel = ticket_response["event_channel"]
+    assert web_server._VALID_CHANNEL_RE.fullmatch(event_channel)
     with ws_tickets._lock:
         assert ticket in ws_tickets._tickets
         _exp, info = ws_tickets._tickets[ticket]
@@ -405,6 +408,7 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
     assert "/api/ws" not in allowed
     assert "/api/console" not in allowed
     assert info.get("bound_session_id") == "ws-bound"
+    assert info.get("event_channel") == event_channel
 
     class _FakeWS:
         def __init__(self, path, query=None):
@@ -419,8 +423,12 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
     for path in ("/api/pty", "/api/events"):
         r2 = phone.post("/api/auth/ws-ticket")
         assert r2.status_code == 200, r2.text
-        t = r2.json()["ticket"]
-        ws = _FakeWS(path, {"ticket": t})
+        ticket_response = r2.json()
+        t = ticket_response["ticket"]
+        query = {"ticket": t}
+        if path == "/api/events":
+            query["channel"] = ticket_response["event_channel"]
+        ws = _FakeWS(path, query)
         reason, cred = web_server._ws_auth_reason(ws)
         assert reason is None, (path, reason, cred)
         assert cred == "ticket"
@@ -428,6 +436,7 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
         assert getattr(ws.state, "ws_ticket_info", None) is not None
         assert ws.state.ws_ticket_info.get("bound_session_id") == "ws-bound"
         assert ws.state.ws_ticket_info.get("allowed_endpoints") is not None
+        assert getattr(ws.state, "ws_ticket_event_channel") == ticket_response["event_channel"]
 
     # Unbound admin sockets still denied.
     for path in ("/api/ws", "/api/console"):
@@ -438,6 +447,114 @@ def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
         reason, cred = web_server._ws_auth_reason(ws)
         assert reason == "ticket_endpoint_denied", (path, reason, cred)
         assert cred == "ticket"
+
+
+def test_resume_ws_ticket_binds_events_and_pty_sidecar_to_its_channel(gated_app, monkeypatch):
+    """A resume ticket cannot select another session's event bridge channel."""
+    import asyncio
+
+    phone_a = _resume_phone(gated_app, "event-session-a")
+    phone_b = _resume_phone(gated_app, "event-session-b")
+
+    def mint(phone):
+        response = phone.post("/api/auth/ws-ticket")
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    channel_a = mint(phone_a)["event_channel"]
+    channel_b = mint(phone_b)["event_channel"]
+    assert channel_a != channel_b
+
+    class _FakeWS:
+        def __init__(self, path, query):
+            self.query_params = query
+            self.headers = {}
+            self.client = type("C", (), {"host": "1.2.3.4"})()
+            self.app = web_server.app
+            self.url = type("U", (), {"path": path})()
+            self.state = type("S", (), {})()
+            self.closed = []
+
+        async def accept(self):
+            return None
+
+        async def close(self, **kwargs):
+            self.closed.append(kwargs)
+
+        async def send_text(self, _text):
+            return None
+
+    matching = mint(phone_a)
+    matching_ws = _FakeWS(
+        "/api/events",
+        {"ticket": matching["ticket"], "channel": channel_a},
+    )
+    reason, credential = web_server._ws_auth_reason(matching_ws)  # type: ignore[arg-type]
+    assert reason is None
+    assert credential == "ticket"
+    assert getattr(matching_ws.state, "ws_ticket_event_channel") == channel_a
+
+    foreign = mint(phone_a)
+    foreign_ws = _FakeWS(
+        "/api/events",
+        {"ticket": foreign["ticket"], "channel": channel_b},
+    )
+    reason, credential = web_server._ws_auth_reason(foreign_ws)  # type: ignore[arg-type]
+    assert reason == "ticket_event_channel_denied"
+    assert credential == "ticket"
+    assert not hasattr(foreign_ws.state, "ws_ticket_event_channel")
+
+    for invalid_channel in ("", "invalid channel"):
+        invalid = mint(phone_a)
+        invalid_ws = _FakeWS(
+            "/api/events",
+            {"ticket": invalid["ticket"], "channel": invalid_channel},
+        )
+        reason, credential = web_server._ws_auth_reason(invalid_ws)  # type: ignore[arg-type]
+        assert reason == "ticket_event_channel_denied"
+        assert credential == "ticket"
+
+    hostile_pty = mint(phone_a)
+    pty_ws = _FakeWS(
+        "/api/pty",
+        {"ticket": hostile_pty["ticket"], "channel": channel_b},
+    )
+    captured = {}
+
+    async def fake_resolve_chat_argv_async(**kwargs):
+        captured["sidecar_url"] = kwargs["sidecar_url"]
+        raise web_server.HTTPException(status_code=400, detail="stop after sidecar capture")
+
+    monkeypatch.setattr(web_server, "_ws_host_origin_reason", lambda _ws: None)
+    monkeypatch.setattr(web_server, "_ws_client_reason", lambda _ws: None)
+    monkeypatch.setattr(web_server, "_resolve_chat_argv_async", fake_resolve_chat_argv_async)
+    asyncio.run(web_server.pty_ws(pty_ws))  # type: ignore[arg-type]
+
+    assert f"channel={channel_a}" in captured["sidecar_url"]
+    assert f"channel={channel_b}" not in captured["sidecar_url"]
+
+
+def test_full_dashboard_ws_ticket_keeps_client_event_channel_unbound(gated_app):
+    """Full dashboard WS tickets retain the existing client-channel contract."""
+    _complete_stub_login(gated_app)
+    response = gated_app.post("/api/auth/ws-ticket")
+    assert response.status_code == 200, response.text
+    ticket_response = response.json()
+    assert "event_channel" not in ticket_response
+
+    class _FakeWS:
+        query_params = {"ticket": ticket_response["ticket"], "channel": "dashboard-client"}
+        headers = {}
+        client = type("C", (), {"host": "1.2.3.4"})()
+        app = web_server.app
+        url = type("U", (), {"path": "/api/events"})()
+        state = type("S", (), {})()
+
+    ws = _FakeWS()
+    reason, credential = web_server._ws_auth_reason(ws)  # type: ignore[arg-type]
+    assert reason is None
+    assert credential == "ticket"
+    assert not hasattr(ws.state, "ws_ticket_event_channel")
 
 
 def test_bound_pty_ticket_ignores_client_resume_and_profile(gated_app):

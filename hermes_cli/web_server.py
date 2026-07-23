@@ -14620,6 +14620,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             TicketInvalid,
             consume_internal_credential,
             consume_ticket,
+            resume_event_channel,
         )
 
         # Server-spawned children (PTY child → /api/ws, /api/pub) present the
@@ -14656,6 +14657,47 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                         path=path,
                     )
                     return "ticket_endpoint_denied", "ticket"
+                expected_channel = resume_event_channel(
+                    user_id=str(info.get("user_id") or ""),
+                    session_id=str(info.get("bound_session_id") or ""),
+                    profile=str(info.get("bound_profile") or ""),
+                )
+                actual_channel = info.get("event_channel")
+                if (
+                    not isinstance(actual_channel, str)
+                    or not _VALID_CHANNEL_RE.fullmatch(actual_channel)
+                    or not hmac.compare_digest(actual_channel, expected_channel)
+                ):
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_event_channel_invalid",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_event_channel_invalid", "ticket"
+                if path == "/api/events":
+                    requested_channel = ws.query_params.get("channel", "")
+                    if (
+                        not _VALID_CHANNEL_RE.fullmatch(requested_channel)
+                        or not hmac.compare_digest(requested_channel, expected_channel)
+                    ):
+                        audit_log(
+                            AuditEvent.WS_TICKET_REJECTED,
+                            reason="ticket_event_channel_denied",
+                            ip=(ws.client.host if ws.client else ""),
+                            path=path,
+                        )
+                        return "ticket_event_channel_denied", "ticket"
+                try:
+                    ws.state.ws_ticket_event_channel = expected_channel
+                except Exception:
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_event_channel_state_invalid",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_event_channel_state_invalid", "ticket"
             # Destination handlers (esp. /api/pty) force bound session/profile
             # from the ticket and ignore hostile client query params.
             try:
@@ -15659,7 +15701,9 @@ async def pty_ws(ws: WebSocket) -> None:
     # Preserve the explicit target for the attach registry before any active
     # session-file fallback below. A ticket-bound resume is explicit too.
     raw_resume = resume
-    channel = _channel_or_close_code(ws)
+    channel = getattr(getattr(ws, "state", None), "ws_ticket_event_channel", None)
+    if channel is None:
+        channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
     active_session_file: Optional[Path] = None
 
