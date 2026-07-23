@@ -3540,8 +3540,19 @@ def _tail_lines(path: Path, n: int) -> List[str]:
     return lines[-n:]
 
 
-def _gateway_subcommand(profile: Optional[str], verb: str) -> List[str]:
-    return _profile_cli_args(profile) + ["gateway", verb]
+def _gateway_subcommand(
+    profile: Optional[str],
+    verb: str,
+    *,
+    explicit_default: bool = False,
+) -> List[str]:
+    requested = (profile or "").strip()
+    profile_args = (
+        ["-p", "default"]
+        if explicit_default and requested.lower() == "default"
+        else _profile_cli_args(profile)
+    )
+    return profile_args + ["gateway", verb]
 
 
 def _gateway_display_command(profile: Optional[str], verb: str) -> str:
@@ -3604,7 +3615,11 @@ def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> Non
             )
 
 
-def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Popen, bool]:
+def _spawn_gateway_restart(
+    profile: Optional[str] = None,
+    *,
+    explicit_default: bool = False,
+) -> Tuple[subprocess.Popen, bool]:
     """Spawn ``hermes gateway restart``, reusing an in-flight restart.
 
     Multiple dashboard paths can request a restart in quick succession
@@ -3615,7 +3630,11 @@ def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Po
 
     Returns ``(proc, reused)``.
     """
-    subcommand = _gateway_subcommand(profile, "restart")
+    subcommand = _gateway_subcommand(
+        profile,
+        "restart",
+        explicit_default=explicit_default,
+    )
     existing = _ACTION_PROCS.get("gateway-restart")
     if existing is not None and existing.poll() is None:
         existing_command = _ACTION_COMMANDS.get("gateway-restart")
@@ -8495,7 +8514,10 @@ def _whatsapp_onboarding_payload(pairing_id: str, record: _WhatsAppOnboardingSes
 
 def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) -> dict[str, Any]:
     try:
-        proc, reused = _spawn_gateway_restart(profile)
+        proc, reused = _spawn_gateway_restart(
+            profile,
+            explicit_default=True,
+        )
     except Exception as exc:
         _log.exception("Failed to auto-restart gateway after WhatsApp onboarding")
         return {

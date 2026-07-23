@@ -206,6 +206,35 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
     assert "pairing" not in ws._whatsapp_onboarding_sessions
 
 
+def test_whatsapp_restart_forces_explicit_default_owner(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    captured = {}
+
+    class Proc:
+        pid = 12345
+
+    def spawn(profile=None, *, explicit_default=False):
+        captured["profile"] = profile
+        captured["explicit_default"] = explicit_default
+        return Proc(), False
+
+    monkeypatch.setattr(ws, "_spawn_gateway_restart", spawn)
+
+    result = ws._restart_gateway_after_whatsapp_onboarding("default")
+
+    assert result["restart_started"] is True
+    assert captured == {
+        "profile": "default",
+        "explicit_default": True,
+    }
+    assert ws._gateway_subcommand(
+        "default",
+        "restart",
+        explicit_default=True,
+    ) == ["-p", "default", "gateway", "restart"]
+
+
 def test_apply_whatsapp_onboarding_self_chat_defaults_to_linked_account(monkeypatch):
     from hermes_cli import web_server as ws
     from hermes_cli import whatsapp_setup

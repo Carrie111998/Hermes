@@ -31,8 +31,75 @@ def test_persist_whatsapp_enabled_updates_env_and_yaml(monkeypatch):
     setup.persist_whatsapp_enabled(False)
 
     assert writes == [
-        ("env", "WHATSAPP_ENABLED", "false"),
         ("yaml", "whatsapp", "enabled", False),
+        ("env", "WHATSAPP_ENABLED", "false"),
+    ]
+
+
+def test_enable_config_failure_never_writes_true_env(monkeypatch):
+    from hermes_cli import config
+    from hermes_cli import whatsapp_setup as setup
+
+    env_writes = []
+    monkeypatch.setattr(
+        config,
+        "save_env_value",
+        lambda key, value: env_writes.append((key, value)),
+    )
+    monkeypatch.setattr(
+        config,
+        "write_platform_config_field",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("config is read-only")
+        ),
+    )
+
+    try:
+        setup.persist_whatsapp_enabled(True)
+    except RuntimeError as exc:
+        assert "could not be persisted as enabled" in str(exc)
+    else:
+        raise AssertionError("expected activation persistence failure")
+
+    assert ("WHATSAPP_ENABLED", "true") not in env_writes
+
+
+def test_enable_env_failure_rolls_config_back_to_disabled(monkeypatch):
+    from hermes_cli import config
+    from hermes_cli import whatsapp_setup as setup
+
+    config_writes = []
+    env_writes = []
+
+    monkeypatch.setattr(
+        config,
+        "write_platform_config_field",
+        lambda platform, field, value: config_writes.append(
+            (platform, field, value)
+        ),
+    )
+
+    def save_env(key, value):
+        env_writes.append((key, value))
+        if value == "true":
+            raise PermissionError("env is read-only")
+
+    monkeypatch.setattr(config, "save_env_value", save_env)
+
+    try:
+        setup.persist_whatsapp_enabled(True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected activation persistence failure")
+
+    assert config_writes == [
+        ("whatsapp", "enabled", True),
+        ("whatsapp", "enabled", False),
+    ]
+    assert env_writes == [
+        ("WHATSAPP_ENABLED", "true"),
+        ("WHATSAPP_ENABLED", "false"),
     ]
 
 
@@ -187,6 +254,7 @@ def test_multiplexed_secondary_profile_resolves_to_default_owner(
     tmp_path,
 ):
     from gateway import status
+    from gateway import config as gateway_config
     from hermes_cli import profiles
     from hermes_cli import whatsapp_setup as setup
 
@@ -202,8 +270,43 @@ def test_multiplexed_secondary_profile_resolves_to_default_owner(
         "read_runtime_status",
         lambda path=None: {"served_profiles": ["default", "work"]},
     )
+    monkeypatch.setattr(
+        gateway_config,
+        "load_gateway_config",
+        lambda: type("Config", (), {"multiplex_profiles": True})(),
+    )
 
     assert setup.resolve_whatsapp_gateway_profile("work") == "default"
+
+
+def test_stale_served_profiles_do_not_override_live_nonmultiplex_config(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import config as gateway_config
+    from gateway import status
+    from hermes_cli import profiles
+    from hermes_cli import whatsapp_setup as setup
+
+    default_home = tmp_path / ".hermes"
+    monkeypatch.setattr(
+        profiles,
+        "get_profile_dir",
+        lambda name: default_home if name == "default" else default_home / "profiles" / name,
+    )
+    monkeypatch.setattr(status, "get_running_pid", lambda path=None: 123)
+    monkeypatch.setattr(
+        status,
+        "read_runtime_status",
+        lambda path=None: {"served_profiles": ["default", "work"]},
+    )
+    monkeypatch.setattr(
+        gateway_config,
+        "load_gateway_config",
+        lambda: type("Config", (), {"multiplex_profiles": False})(),
+    )
+
+    assert setup.resolve_whatsapp_gateway_profile("work") == "work"
 
 
 def test_restart_gateway_if_running_is_noop_when_stopped(monkeypatch):

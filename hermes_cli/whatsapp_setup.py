@@ -33,41 +33,63 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
     from hermes_cli import managed_scope
 
     value = "true" if enabled else "false"
-    save_env_value("WHATSAPP_ENABLED", value)
-    write_platform_config_field("whatsapp", "enabled", enabled)
+    try:
+        # Write config first. A config failure must never leave the stronger
+        # WHATSAPP_ENABLED env override enabled on its own.
+        write_platform_config_field("whatsapp", "enabled", enabled)
+        save_env_value("WHATSAPP_ENABLED", value)
 
-    env_value = str(load_env().get("WHATSAPP_ENABLED") or "").strip().lower()
-    raw_config = read_raw_config()
-    platforms = raw_config.get("platforms")
-    whatsapp = platforms.get("whatsapp") if isinstance(platforms, dict) else None
-    yaml_value = whatsapp.get("enabled") if isinstance(whatsapp, dict) else None
-    effective_config = load_config()
-    effective_platforms = effective_config.get("platforms")
-    effective_whatsapp = (
-        effective_platforms.get("whatsapp")
-        if isinstance(effective_platforms, dict)
-        else None
-    )
-    effective_yaml_value = (
-        effective_whatsapp.get("enabled")
-        if isinstance(effective_whatsapp, dict)
-        else None
-    )
-    effective_env_value = str(
-        managed_scope.load_managed_env().get("WHATSAPP_ENABLED", env_value)
-    ).strip().lower()
-    if (
-        env_value != value
-        or yaml_value is not enabled
-        or effective_env_value != value
-        or effective_yaml_value is not enabled
-    ):
+        env_value = str(load_env().get("WHATSAPP_ENABLED") or "").strip().lower()
+        raw_config = read_raw_config()
+        platforms = raw_config.get("platforms")
+        whatsapp = platforms.get("whatsapp") if isinstance(platforms, dict) else None
+        yaml_value = whatsapp.get("enabled") if isinstance(whatsapp, dict) else None
+        effective_config = load_config()
+        effective_platforms = effective_config.get("platforms")
+        effective_whatsapp = (
+            effective_platforms.get("whatsapp")
+            if isinstance(effective_platforms, dict)
+            else None
+        )
+        effective_yaml_value = (
+            effective_whatsapp.get("enabled")
+            if isinstance(effective_whatsapp, dict)
+            else None
+        )
+        effective_env_value = str(
+            managed_scope.load_managed_env().get("WHATSAPP_ENABLED", env_value)
+        ).strip().lower()
+        if (
+            env_value != value
+            or yaml_value is not enabled
+            or effective_env_value != value
+            or effective_yaml_value is not enabled
+        ):
+            raise RuntimeError("persisted WhatsApp state did not read back")
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        if enabled:
+            # Pairing preparation established disabled state before activation.
+            # Restore that invariant if either write or read-back fails.
+            try:
+                write_platform_config_field("whatsapp", "enabled", False)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"config rollback failed: {rollback_exc}")
+            try:
+                save_env_value("WHATSAPP_ENABLED", "false")
+            except Exception as rollback_exc:
+                rollback_errors.append(f"env rollback failed: {rollback_exc}")
         desired = "enabled" if enabled else "disabled"
+        rollback = (
+            f" Safety rollback also failed ({'; '.join(rollback_errors)})."
+            if rollback_errors
+            else ""
+        )
         raise RuntimeError(
             f"WhatsApp could not be persisted as {desired} in both .env and "
             "config.yaml. The setting may be managed or the files may be "
-            "read-only; pairing was stopped before touching the session."
-        )
+            f"read-only; pairing was stopped before touching the session.{rollback}"
+        ) from exc
 
 
 def _gateway_restart_command(profile: Optional[str]) -> list[str]:
@@ -128,18 +150,20 @@ def resolve_whatsapp_gateway_profile(profile: Optional[str]) -> Optional[str]:
         for name in runtime.get("served_profiles", [])
         if str(name).strip()
     }
-    if target in served:
-        return "default"
 
-    # Older running gateways may predate the served_profiles status field.
-    # Fall back to the effective default-profile config only when the default
-    # process is live, preserving the same ownership rule.
+    # Runtime status is updated in place and can retain an old served_profiles
+    # list. Revalidate the live owner's current multiplex setting before using
+    # that list; stale status must never redirect pairing to the wrong gateway.
     with _gateway_profile_scope("default"):
         from gateway.config import load_gateway_config
 
-        if load_gateway_config().multiplex_profiles:
-            return "default"
-    return target
+        multiplexing = bool(load_gateway_config().multiplex_profiles)
+    if not multiplexing:
+        return target
+    # A populated status list is live coverage evidence. Missing coverage means
+    # the named gateway remains the safer owner. Empty/missing lists may come
+    # from older multiplex gateways, so fall back to current config authority.
+    return "default" if not served or target in served else target
 
 
 def _gateway_pid_path(profile: Optional[str]):
