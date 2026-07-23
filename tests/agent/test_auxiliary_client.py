@@ -2546,6 +2546,220 @@ class TestAuxiliaryFallbackLayering:
             reason="provider deployment unavailable",
         )
 
+    def test_auto_deployment_failure_quarantines_concrete_backend(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://integrate.api.nvidia.com/v1"
+        primary_client.chat.completions.create.side_effect = RuntimeError(
+            "NVIDIA HTTP 503: deployment unavailable"
+        )
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "healthy fallback"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "qwen/qwen3.5-397b-a17b"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "healthy fallback"
+        mock_mark.assert_called_once_with("nvidia")
+
+    def test_unavailable_configured_fallback_continues_to_next_candidate(self):
+        deployment_error = RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): high demand"
+        )
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = deployment_error
+        unavailable_fallback = MagicMock()
+        unavailable_fallback.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        unavailable_fallback.chat.completions.create.side_effect = deployment_error
+        healthy_fallback = MagicMock()
+        healthy_fallback.chat.completions.create.return_value = _DummyResponse(
+            "second fallback served"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "primary-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nvidia", "primary-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=[
+                (
+                    unavailable_fallback,
+                    "gemini-3.5-flash",
+                    "fallback_chain[0](google-gemini)",
+                ),
+                (healthy_fallback, "glm-5.2", "fallback_chain[1](zai)"),
+            ],
+        ) as mock_chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "second fallback served"
+        assert mock_chain.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_unavailable_configured_fallback_continues_to_next_candidate(
+        self,
+    ):
+        deployment_error = RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): high demand"
+        )
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=deployment_error
+        )
+        unavailable_sync = MagicMock()
+        unavailable_async = MagicMock()
+        unavailable_async.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        unavailable_async.chat.completions.create = AsyncMock(
+            side_effect=deployment_error
+        )
+        healthy_sync = MagicMock()
+        healthy_async = MagicMock()
+        healthy_async.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async second fallback served")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "primary-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nvidia", "primary-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            side_effect=[
+                (
+                    unavailable_sync,
+                    "gemini-3.5-flash",
+                    "fallback_chain[0](google-gemini)",
+                ),
+                (healthy_sync, "glm-5.2", "fallback_chain[1](zai)"),
+            ],
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._to_async_client",
+            side_effect=[
+                (unavailable_async, "gemini-3.5-flash"),
+                (healthy_async, "glm-5.2"),
+            ],
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "async second fallback served"
+        assert mock_chain.call_count == 2
+
+    @pytest.mark.parametrize("parameter", ["temperature", "max_tokens"])
+    def test_parameter_retry_503_reaches_fallback(self, parameter):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = [
+            RuntimeError(f"Unsupported parameter: {parameter}"),
+            RuntimeError("Gemini HTTP 503 (UNAVAILABLE): high demand"),
+        ]
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            f"{parameter} fallback served"
+        )
+        call_kwargs = {parameter: 100 if parameter == "max_tokens" else 0.2}
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gemini-3.5-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "google-gemini",
+                "gemini-3.5-flash",
+                None,
+                None,
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                **call_kwargs,
+            )
+
+        assert result.choices[0].message.content == f"{parameter} fallback served"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("parameter", ["temperature", "max_tokens"])
+    async def test_async_parameter_retry_503_reaches_fallback(self, parameter):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                RuntimeError(f"Unsupported parameter: {parameter}"),
+                RuntimeError("Gemini HTTP 503 (UNAVAILABLE): high demand"),
+            ]
+        )
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse(f"async {parameter} fallback served")
+        )
+        call_kwargs = {parameter: 100 if parameter == "max_tokens" else 0.2}
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gemini-3.5-flash"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "google-gemini",
+                "gemini-3.5-flash",
+                None,
+                None,
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "glm-5.2"),
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                **call_kwargs,
+            )
+
+        assert (
+            result.choices[0].message.content
+            == f"async {parameter} fallback served"
+        )
+
     def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):
         """Auto aux call failures try per-task then top-level fallback before built-ins."""
         primary_client = MagicMock()
