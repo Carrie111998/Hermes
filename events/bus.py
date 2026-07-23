@@ -38,6 +38,15 @@ CREATE INDEX IF NOT EXISTS idx_events_source
 CREATE INDEX IF NOT EXISTS idx_events_correlation
     ON events (correlation_id)
     WHERE correlation_id IS NOT NULL;
+-- Every other index here is keyed on created_at, but the watchdog's daily
+-- escalation count filters `timestamp` AND `priority`, so none of them could
+-- seek and it degraded to a full SCAN of the whole table (594k VDBE steps on
+-- the 395 MB / 193k-row bus; 13.9 s cold). Leading with priority makes this a
+-- COVERING index for that predicate -- 4k steps -- because priority and
+-- timestamp are the only columns the query touches. high+critical is ~6% of
+-- rows, so the leading column stays selective.
+CREATE INDEX IF NOT EXISTS idx_events_priority_ts
+    ON events (priority, timestamp);
 
 CREATE TABLE IF NOT EXISTS subscriber_cursors (
     subscriber_id TEXT PRIMARY KEY,
