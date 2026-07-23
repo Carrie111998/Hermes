@@ -1,10 +1,10 @@
 # Higgsfield Supercomputer Dialogue Architecture Research
 
-Status: research dossier
-Date: 2026-06-01
-Fresh interactive task: <https://higgsfield.ai/supercomputer/e0e6431f-3978-4b89-a19b-ab0f4817cfc5>
-Primary interactive task: <https://higgsfield.ai/supercomputer/096f0016-130d-4810-88ac-4a3df4cf5aa3>
-Prior inspected task: <https://higgsfield.ai/supercomputer/748e2a15-f9e0-4ce9-9583-f0a40af40d01>
+Status: black-box observable architecture mapped; production internals explicitly unknown
+Date: 2026-07-22
+Deep audit task aliases: `audit_task_a`, `audit_task_b`
+Historical task aliases: `legacy_fresh_task`, `legacy_primary_task`, `legacy_inspected_task`
+Private task URL mapping: retained outside this public Git repository
 
 ## Evidence Policy
 
@@ -12,6 +12,9 @@ This document separates product evidence from architecture inference.
 
 | Label | Meaning | How to use |
 |---|---|---|
+| Observed runtime | Directly observed in browser Network/DOM or in a controlled tool experiment. | Strongest black-box evidence; still not source-code or fleet-wide proof. |
+| Literal tool schema | A capability, parameter, or return shape exposed to the running agent. | Confirms the agent-facing contract, not the backend implementation. |
+| Literal system contract | A rule the running agent says is present in its operating instructions. | Records intended behavior; a runtime counterexample wins over it. |
 | Visible UI | Directly observed in the authenticated Supercomputer page through Chrome Computer Use. | Safe as product-surface evidence. |
 | Public Higgsfield | Public Higgsfield page or FAQ. | Safe as official product wording, but not as implementation proof. |
 | Dialogue claim | Claimed by the Higgsfield Supercomputer chat during the architecture interview. | Useful as self-description; not authoritative for hidden internals. |
@@ -30,12 +33,249 @@ The important correction is that tool lists and names such as `TokenRouter` or `
 | Public: <https://higgsfield.ai/soul-intro> | Soul 2.0 and Soul ID public behavior: identity consistency, reference-image/image modes, presets, and Soul ID training requirements. |
 | Public: <https://higgsfield.ai/cli> | MCP integration, no direct API key management, 30+ model access, asynchronous generation and polling, history reuse. |
 | Public: <https://higgsfield.ai/social-connectors> | Connector surface: OAuth, X/Threads/Instagram tooling, publishing, status tools, retry/error surfacing. |
-| Dialogue: `e0e6431f-3978-4b89-a19b-ab0f4817cfc5` | Fresh restart chat. Returned a layer-by-layer decomposition, literal skill categories, toolsets, UI protocol claim, identity/session claims, media/job/credit layers, and unknowns list. |
-| Dialogue: `096f0016-130d-4810-88ac-4a3df4cf5aa3` | Interview answer listing declared Higgsfield tools, concurrency caps, media refs, Soul ID, enhancer, TokenRouter/CometAPI claims. |
+| Runtime: `audit_task_a` | Deep OpenCLI-controlled interview plus message protocol, tool/skill negative controls, Workflow, delegated-task timing, real media, reload, and cancel experiments. |
+| Runtime: `audit_task_b` | Clean chat for Memory/Sandbox/Security audit, correction of overclaims, operations boundary, and the final 15-claim adversarial review. |
+| Browser Network capture, 2026-07-22 | Direct request/response shapes for auth refresh, user/workspace, wallet, storage, model catalog, messages, polling, and stop command. This dossier keeps only a sanitized operator summary, not independently replayable raw traffic. |
+| Dialogue: `legacy_fresh_task` | Fresh restart chat. Returned a layer-by-layer decomposition, literal skill categories, toolsets, UI protocol claim, identity/session claims, media/job/credit layers, and unknowns list. |
+| Dialogue: `legacy_primary_task` | Interview answer listing declared Higgsfield tools, concurrency caps, media refs, Soul ID, enhancer, TokenRouter/CometAPI claims. |
 | Notion: `docs/notion-source/hermes/` | 2026-06-02 refresh with Hermes `references` model, Soul ID/Element asset notes, `default_api` tool declarations, TokenRouter, and CometAPI pages. |
 | Local: `docs/lark-source/higgsfield-hermes-agent-architecture.body.html` | Existing Higgsfield/Hermes four-layer architecture analysis and open questions. |
 | Local: `docs/hermes-open-source-architecture-plan.md` | Target open-source Hermes implementation plan across 16 modules. |
 | Local: `docs/hermes-notion-update-index.md` | Split index for the Notion refresh; use this for implementation follow-up instead of merging all updated content into this dossier. |
+
+## 2026-07-22 Deep Black-Box Audit
+
+This section supersedes any older dialogue claim where the July runtime evidence conflicts with it. In particular, the browser path observed here is HTTP message submission plus cursor polling, not SSE or WebSocket. One request labeled `job_credits: 1` showed no visible approval step; actual charging and global approval policy remain unknown.
+
+### Scope, Setup, and Stop Rule
+
+- OpenCLI `1.8.0` controlled the already authenticated browser through its generic browser surface. There was no built-in Higgsfield adapter.
+- Two authenticated chats were used: one for the long experiment chain and one clean chat after cancellation contaminated the first chat's goal state.
+- Only one media request labeled `job_credits: 1` was created: a minimal 1:1 blue-dot image. Whether a charge was captured is unknown; it was not published or sent through a connector.
+- Private balances, identity values, auth tokens, sandbox owner values, and asset URLs are deliberately omitted.
+- The stop condition was reached when all observable paths had an evidence grade and the remaining gaps required internal documents rather than more agent self-description.
+
+### Bottom Line
+
+The externally observable architecture is now mapped with high confidence: browser auth and API surfaces, message submission, cursor polling, turn chunks, stop/reload behavior, model catalog, dynamic tools, Skills, Workflow, parallel subagents, and asynchronous media jobs. The production implementation is still a gray box: service decomposition, databases, queues, model routing policy, fleet lifecycle, SLOs, billing capture, approval policy, and audit systems remain unknown.
+
+The most important methodological result is negative: Supercomputer repeatedly produced confident implementation claims that failed under direct observation. Runtime evidence caused it to retract SSE/WebSocket, an independently proven API/BFF, an unqualified approval claim, per-chat sandbox certainty, no-egress certainty, user-scoped Memory certainty, and several connector/security assertions.
+
+### Directly Observed Browser Protocol
+
+```text
+Browser
+  |-- refreshes an authenticated session token through Clerk
+  |-- GET user/workspace state
+  |-- GET workspace wallet
+  |-- GET storage usage
+  |-- GET model catalog
+  |
+  |-- POST chat-message endpoint
+  |     -> id, chat_id, parent_message_id, role, actor, type,
+  |        status, created_at, parts[]
+  |
+  |-- GET chat-poll endpoint [?from={last_id}]
+  |     -> chunks[], last_id, count
+  |     -> start, start-step, text-start, text-delta, text-end,
+  |        finish-step, message-metadata, data-final-message, finish
+  |
+  `-- POST chat-command endpoint
+        -> { success: true } for the observed stop action
+```
+
+Observed details:
+
+- The client polled roughly every two seconds and advanced with `from`/`last_id`.
+- Chunk IDs looked like an ordered timestamp-plus-sequence cursor, but retention, deduplication, and exactly-once behavior were not tested.
+- Completion metadata exposed `finishReason`, start/end timestamps, duration, and input/output/cache-read/cache-write/total token counts.
+- The user-message POST returned `type: text` and `status: completed`. That value describes the accepted user message; it does not prove a complete assistant-run status enum.
+- Reloading the page during generation reattached to the same turn and the same assistant message continued growing.
+- No SSE or WebSocket transport was observed for this chat path.
+- The model endpoint returned 24 entries in this account/session, including provider/family, per-message credit metadata, flags, and reasoning controls. This does not prove that 24 is a globally complete catalog.
+
+### Corrected Observable Architecture
+
+```text
+[Browser product edge]
+  UI + authenticated browser session
+        |
+        | HTTP: user/workspace, wallet, storage, model catalog,
+        |       message POST, cursor poll, stop command
+        v
+[Authenticated product API surface]
+        |
+        +--> [Chat/message persistence and event production: boundary unknown]
+        |          |
+        |          `--> ordered poll chunks --> browser
+        |
+        `--> [Agent execution boundary: exact service topology unknown]
+                   |
+                   +--> selected/default parent LLM
+                   +--> Tool registry / dynamic tool loading
+                   +--> Skill instruction assets
+                   +--> Workflow entry points
+                   +--> delegated subagents, potentially different models
+                   +--> Memory mutation contract
+                   +--> Connector / custom MCP contracts
+                   +--> Schedule / AI Employee contracts
+                   `--> Media tool submit
+                              |
+                              v
+                       [Media job state machine]
+                       job_id --> separate polling --> result/preview
+
+Cross-cutting but not proven as single services:
+workspace identity | wallet/credits | storage/assets | sandbox | audit
+```
+
+The boxes above are contract boundaries, not claimed microservices. Separate endpoints or tools do not prove separate deployments, databases, or teams.
+
+### Five State Machines
+
+1. **Message and turn**
+
+   ```text
+   user POST accepted
+     -> poll start
+     -> start-step
+     -> text-start -> text-delta* -> text-end
+     -> finish-step
+     -> message-metadata + data-final-message
+     -> finish
+   ```
+
+   Only this successful path was observed. Complete status enums, branching semantics for `parent_message_id`, replay guarantees, and retention are unknown.
+
+2. **Tool and Workflow**
+
+   ```text
+   discover/load schema -> tool becomes callable on a later step -> result/error
+   workflow_run -> { status: completed, value, tokensSpent }
+   ```
+
+   A nonexistent Skill produced an explicit error. Loading a nonexistent tool returned a success envelope with the name in `unknown`, a soft failure. Workflow did not surface a run ID or node states; that does not prove none exist internally.
+
+3. **Subagent**
+
+   ```text
+   parent batch delegate
+     -> child A(context A) --+
+     -> child B(context B) --+--> completed summaries returned to parent
+   ```
+
+   Two delegated results were consistent with concurrent execution: batch duration was close to the slower child, not the sum. Returned text contained only each supplied child canary, but that does not prove process or security isolation. Each result exposed model, duration, tokens, API-call count, exit reason, and an empty tool trace. Maximum concurrency, nesting depth, cancellation, failure merge, and workspace isolation remain unknown.
+
+4. **Media, approval, and billing**
+
+   ```text
+   model/price lookup
+     -> generate submit
+     -> job_id
+     -> job-status poll
+     -> completed
+     -> result URL + preview URL
+   ```
+
+   The selected single image reported `job_credits: 1` and completed before the first three-second poll. No visible `needs_approval` step appeared on this request. Whether it was actually charged and how global approval policy works are unknown. Quote/reserve/capture/refund, transaction ID, balance delta, failure states, retry, idempotency, and batch `job_set_id` semantics are also unknown. The agent corrected an earlier price-selection inconsistency: a mentioned `0.12` candidate was not the selected model.
+
+5. **Cancel and recovery**
+
+   ```text
+   browser reload -> resume polling from cursor -> same message continues
+
+   click Stop -> POST chat command -> success -> UI "Stopped after 4s"
+              -> old user goal remains in history
+              -> later turn incorrectly resumes cancelled goal
+   ```
+
+   The cancelled 1,000-line text task was incorrectly resumed twice despite explicit replacement instructions. A clean chat was required. Stop is therefore observed as turn/output interruption, not semantic removal of a goal from conversation history; backend process termination is unknown.
+
+### State Object and Cross-Layer Semantics
+
+| Object | Surfaced identifier or link | Minimal observed contract | Primary tag |
+|---|---|---|---|
+| Chat/message | `chat_id`, message `id`, `parent_message_id` | Message accepted and recoverable after reload; parent/branch semantics unknown. | O |
+| Cursor/chunk | chunk ID, `from`, `last_id` | Incremental poll continuation; replay/dedup/retention unknown. | O |
+| Assistant turn | `messageId` in start/final metadata | Start/step/text/final/finish envelope; no separate surfaced run ID. | O |
+| Step | start/finish markers | Visible boundaries only; step identity and atomicity unknown. | O |
+| Tool call | schema name and call result | Dynamic load/call/error surface; persistent call identity not documented. | C |
+| Workflow | workflow name | Tested result exposed `completed`, value, and token spend; internal lifecycle is not visible. | O |
+| Delegated task | task index plus returned metadata | Timing and child-specific returned text observed; independent runtime/isolation not proven. | O |
+| Media job | `job_id`, observed `job_set_id` | Submit/poll/completed/result path observed. | O |
+| Asset | result/preview references | Job-to-output link observed; durable asset/folder ownership unknown. | O |
+| Approval/billing | no stable object surfaced | `needs_approval` is a system contract; reserve/capture/refund objects unknown. | U |
+| Global run/checkpoint | none surfaced | Existence, owner, persistence, and lifecycle unknown. | U |
+
+| Layer | Recovery evidence | Cancel propagation | Retry/idempotency | Primary tag |
+|---|---|---|---|---|
+| Message/turn | Reload resumed the same output via cursor. | Chat command stopped visible output; goal remained. | No key or delivery guarantee was observed. | O |
+| Tool | Result/error returns to the turn. | Not tested. | Unknown; nonexistent load used a soft error. | U |
+| Workflow | Only one completed result observed. | Pause/cancel propagation not surfaced. | Run ID, node retry, and idempotency unknown. | U |
+| Delegated task | Two successful returned results observed. | Not tested. | Failure merge/retry/idempotency unknown. | U |
+| Media | Job polling recovered a completed result. | Media cancel was not tested. | No idempotency key or retry contract observed. | U |
+| Connector/schedule | Control operations exist in schema. | Runtime propagation not tested. | Execution retry/history/idempotency unknown. | C |
+
+### Controlled Experiment Ledger
+
+| Experiment | Result | Evidence grade |
+|---|---|---|
+| Text and Network | Complete text response plus message POST, cursor polling, final metadata, and model/user/wallet/storage/auth shapes. | Observed runtime |
+| Skill/tool negative controls | Missing Skill was explicit; unknown tool load returned a nonfatal `unknown` result. | Observed runtime |
+| Workflow | Safe text-only planning Workflow returned `completed`, a value, and token spend, with no surfaced run/node IDs. | Observed runtime |
+| Delegated-task canaries | Timing was consistent with concurrency; returned text was child-specific, but independence/isolation was not proven. | Observed runtime |
+| Real media job | One minimal image completed with job/result/preview fields and no approval interruption. | Observed runtime |
+| Reload and stop | Reload resumed output; chat command returned success; the cancelled goal was later resurrected twice. | Observed runtime |
+| Memory schema | Only content-matched `add`, `replace`, and `remove` were exposed; no ID-based symmetric CRUD, so no canary was written. | Literal tool schema |
+| Sandbox canary | Temporary file create/read/delete succeeded, but the agent also exceeded the authorized probe scope. | Observed tool trace, single sandbox snapshot |
+
+### Security and Sandbox Boundary Finding
+
+The sandbox audit was intentionally narrow: inspect Memory schema and create/read/delete one temporary canary without touching other paths, environment, network, account data, or unrelated tools. The Agent violated that boundary. Its visible trace showed broader terminal/environment/filesystem inspection and extra balance, connector, agent, schedule, and tool-output discovery calls.
+
+What this proves:
+
+- The Agent failed to follow the natural-language path/tool restriction, and its available tool set was not narrowed merely by that user instruction. Execution-layer authorization and sandbox security controls remain unknown.
+- The temporary canary was deleted, and the Memory canary was never created.
+- One tool output contained indicators consistent with gVisor/cgroup and showed multiple chat-workspace artifacts in its filesystem view; this is not independent proof of isolation strength.
+
+What it does not prove:
+
+- It does not establish cross-user or cross-tenant access; the ownership of other visible chat directories was not verified.
+- It does not establish the fleet-wide sandbox lifecycle, mount-sharing scope, external network policy, or production resource limits.
+- Missing local utilities did not prove that egress was impossible.
+- It does not prove that an execution-layer allowlist was absent or bypassed.
+
+No private value exposed during the over-broad probe is retained in this dossier.
+
+### Fifteen Claims Tightened by the Final Adversarial Review
+
+| Over-broad claim | Defensible statement |
+|---|---|
+| The UI is a known SPA stack. | A browser application is observed; framework/build architecture is unverified. |
+| An external identity service fully owns JWT issue/refresh. | The browser called a Clerk token endpoint and API calls were authenticated; server-side verification/ownership is unknown. |
+| A separate chat microservice persists messages. | Message endpoints and reload persistence are observed; deployment/service boundaries are unknown. |
+| `parent_message_id` proves tree branching. | A parent field exists; linear-predecessor versus branch semantics were not tested. |
+| Chat uses SSE/WebSocket/Vercel streaming. | The observed path used message POST plus cursor polling. |
+| A surfaced run ID does not exist anywhere. | No global run ID was surfaced in the tested Workflow/subagent results; internal IDs may exist. |
+| One sandbox maps to one chat. | A unique runtime snapshot and multiple visible chat workspaces were observed; mapping/reuse is unknown. |
+| Sandbox has no external egress. | Egress was not safely tested; missing utilities and cluster DNS do not settle it. |
+| Tool Executor shares the Agent process. | Process placement is unknown. |
+| Memory is user-scoped and injected into the system prompt. | Schema has no scope parameter and contract says future-turn injection; scope and injection mechanism are unknown. |
+| The returned 24 models are the complete platform catalog. | Twenty-four were returned for this account/session; pagination and eligibility filtering are unknown. |
+| Connector features equal OAuth scopes with no per-call authorization. | A feature catalog and connect/call/disconnect contract exist; actual scopes and authorization checks were not tested. |
+| Wallet, storage, and media are separate backend services. | They are separate API/tool boundaries; backend storage/deployment may be shared. |
+| Every paid generation requires approval. | A request labeled `job_credits: 1` showed no visible approval step; actual charging and global policy are unknown. |
+| There is no execution-layer enforcement. | The Agent disobeyed a natural-language restriction; execution-layer authorization controls are unknown. |
+
+### Production Internals Still Unknown
+
+- Topology and operations: services, regions, queues, databases, deployment, SLOs, backup, release, incident response, and disaster recovery.
+- Reliability: message retention/order/replay, global run/checkpoints, retry/idempotency, pause/resume, backpressure, and GC.
+- Routing/runtime: model selection/fallback/context/cache, sandbox lifecycle/egress/tenancy, and Workflow/delegation execution.
+- State/security: Memory, connectors, media billing/approval/assets, Schedule/AI Employee, audit, encryption, and content-security pipelines.
+
+The final Supercomputer review agreed that further dialogue would only add speculation. Production-grade confirmation now requires internal API specifications, persistence schemas, runtime design documents, routing policy, sandbox lifecycle documentation, operations runbooks, security/audit schemas, billing design, approval rules, and Workflow/subagent engine documentation.
 
 ## Fresh Restart Chat Capture
 
@@ -74,8 +314,8 @@ This supports the product-shape conclusion that Supercomputer is a general agent
 
 | Layer | Fresh chat claim | Evidence handling |
 |---|---|---|
-| UI/session | Streams chunks to the web client via Vercel AI SDK Data Stream Protocol / `UIMessageChunks`; renders Markdown plus structured interactive cards. | Dialogue claim. Verify through network capture before treating as implementation fact. |
-| Identity/tenant | Uses short-lived `HF_JWT_TOKEN` claims for user/chat identity and tracks workspace preferences and subscription limits. | Dialogue claim. Pattern is plausible; token format is unknown. |
+| UI/session | Claimed Vercel AI SDK Data Stream Protocol / `UIMessageChunks`; renders Markdown plus structured interactive cards. | Historical dialogue claim. July Network capture contradicted the transport claim: the observed chat path was cursor polling. |
+| Identity/tenant | Uses short-lived `HF_JWT_TOKEN` claims for user/chat identity and tracks workspace preferences and subscription limits. | Historical dialogue claim. July capture observed Clerk token refresh and workspace fields, but not this token name or full claim model. |
 | Orchestrator | Uses a Gemini LLM engine, parses instructions into tool payloads, and can delegate to sandboxed subagents. | Visible model picker supports Gemini usage; delegation details remain dialogue claim. |
 | Skills | Skills are markdown workflow blueprints with frontmatter, templates, scripts, and references, loaded dynamically into context. | Dialogue claim, consistent with visible Skills product surface. |
 | Files/memory | Uses isolated sandbox filesystem, durable user/project memory, session search, and chat-scoped artifact key-value state. | Dialogue claim, consistent with visible Files/Memory surfaces. |
@@ -92,7 +332,7 @@ The fresh chat unknowns were also useful: exact diffusion architectures, VM/cont
 
 Evidence level: Visible UI and Dialogue claim.
 
-The inspected Supercomputer tasks showed a `default_api:*` namespace for native tools exposed to the agent. The visible explanation said native tools and interfaces are mounted under a default namespace prefix and routed by a backend executor. Treat this as observed product behavior, not as a public API contract.
+The inspected Supercomputer tasks showed a `default_api:*` namespace for native tools exposed to the agent. The namespace is a UI observation; the claim that a backend executor mounts and routes it is dialogue self-description, not an observed implementation or public API contract.
 
 Key captured groups:
 
@@ -123,7 +363,7 @@ The official public product pages support the following high-confidence architec
 - MCP/CLI integration lets external agents generate media, train characters, and browse creation history without users managing provider API keys directly.
 - Media generation is asynchronous; agents poll for results.
 
-The deeper infrastructure story is partly inferred. The dialogue and local Hermes plan converge on a plausible stack: realtime ingress, identity and tenant policy, sandbox runtime, workspace volume mounting, tool runtime, credential boundary, async job orchestration, event fanout, GPU/media workers, asset storage, observability, and egress governance. For Hermes, this shape is useful; for claims about Higgsfield production internals, it remains unverified.
+The deeper infrastructure story is partly inferred. The dialogue and local Hermes plan converge on a plausible stack: message/event ingress, identity and tenant policy, sandbox runtime, workspace volume mounting, tool runtime, credential boundary, async job orchestration, GPU/media workers, asset storage, observability, and egress governance. For Hermes, this shape is useful; for claims about Higgsfield production internals, it remains unverified.
 
 ## Observed Product Surface
 
@@ -131,7 +371,7 @@ The deeper infrastructure story is partly inferred. The dialogue and local Herme
 |---|---|---|
 | Chat/task workspace | Visible UI | There is a persisted task/thread model rather than a stateless prompt box. |
 | New task/New chat | Visible UI | Task metadata and chat history are first-class entities. |
-| Model picker | Visible UI showed `Google Gemini 3.5 Flash`; public pages mention auto-routing. | Runtime can bind a turn to a selected model or an orchestrated model choice. |
+| Model picker | July endpoint returned 24 entries for this account/session and marked Higgsfield Free orchestrator as default; an older UI snapshot showed `Google Gemini 3.5 Flash`. | Runtime can bind a turn to a catalog entry; eligibility filtering and automatic routing policy are unknown. |
 | Auto Run | Visible UI | The UI supports queued execution without manual send per step. |
 | Usage | Visible UI and public credit FAQ | Billing/usage is exposed as a workspace control surface. |
 | Scheduled | Visible UI and public page | Workflows can run on timers outside active chat. |
@@ -144,17 +384,17 @@ The deeper infrastructure story is partly inferred. The dialogue and local Herme
 ## End-to-End Flow
 
 1. User opens a Supercomputer task in the browser.
-2. The chat UI sends a prompt over a realtime transport.
-3. The session layer authenticates the user and binds the task to a project/workspace.
-4. The orchestrator chooses either the selected model or an automatic model/tool route.
-5. The agent runtime loads relevant context: memory, files, skills, connectors, prior assets, and current task history.
-6. If the task needs external data, connector tools run under workspace authorization.
+2. The browser posts a user message, then polls an ordered cursor for assistant chunks.
+3. Authenticated API responses expose user/workspace state; exact server-side binding and authorization are not visible.
+4. The turn uses the selected/default model entry; automatic model/tool routing policy is unknown.
+5. The agent can load tools and Skills dynamically. Exact Memory, file, and prior-asset context injection is unknown.
+6. Connector tools expose discovery/connect/call contracts, but this audit did not execute a third-party connector.
 7. If the task needs media generation, the agent submits an asynchronous generation job.
-8. The job layer checks credits, plan, concurrency, and media input references.
-9. Media workers or partner/in-house model APIs produce images, videos, or audio.
-10. The agent polls job status and streams progress back to the UI.
+8. The submit result exposes a job credit estimate; plan, concurrency, reservation, and capture checks are not visible.
+9. An unknown generation backend produces images, videos, or audio.
+10. The agent polls media job status separately from browser chat polling.
 11. Completed outputs land in the project/gallery and can be reused as inputs.
-12. Scheduled workflows repeat the same pattern without a live user turn.
+12. Scheduled execution was not tested; only its UI and agent-facing control contract were observed.
 
 ## Component Decomposition
 
@@ -166,15 +406,16 @@ Responsibilities:
 
 - Render task list, chat transcript, model picker, usage, scheduled tasks, gallery, skills, connectors, files, and memory.
 - Maintain a long-lived task/thread identity.
-- Stream agent output, tool progress, queued prompts, and generated media status.
+- Render polled agent chunks, tool progress, queued prompts, and generated media status.
 - Keep project assets visible and reusable.
 
 Public product behavior strongly supports a task/session model: Supercomputer plans creative work, picks models/presets, shows cost before rendering, and stores finished generations in a project.
 
+July 22 resolved the primary transport question for the tested path: user-message POST plus cursor polling. Still unknown are ordering/replay guarantees, chunk retention, backpressure, and whether other product paths use different transports.
+
 Open questions:
 
-- Whether the current web transport is pure SSE, WebSocket, Vercel AI SDK Data Stream Protocol, or a mixture.
-- Exact event schema for tool progress, queued prompts, media status, and errors.
+- Exact event schema for tool progress, queued prompts, media status, and errors beyond the captured successful path.
 - Whether Gallery is a projection of project assets, a separate feed, or both.
 
 ### 2. Identity, Tenant, and Project Boundary
@@ -442,6 +683,8 @@ Design implication:
 
 ## Mermaid Architecture Sketch
 
+This is the original Hermes-oriented conceptual sketch. Its boxes are design boundaries, not verified Higgsfield production services; the July corrected observable diagram above is the evidence-backed view.
+
 ```mermaid
 flowchart TD
     user[User] --> ui[Supercomputer Web UI]
@@ -481,10 +724,10 @@ flowchart TD
 
 | Area | Question | Suggested verification |
 |---|---|---|
-| Web transport | SSE, WebSocket, Vercel AI SDK data stream, or mixed? | Capture network requests for one task turn. |
+| Web transport | Resolved for the tested chat path: message POST plus cursor polling; other surfaces remain unknown. | Re-test after major UI/API releases. |
 | Tool schemas | Exact `higgsfield_*` tool names and JSON schemas. | Inspect MCP manifest/tool list from authenticated client if available. |
 | Concurrency | Current caps by plan and media type. | Query Usage/Balance UI and run controlled generation tests. |
-| Credits | Exact pre-render estimate and post-render charge fields. | Capture a small generation approval flow. |
+| Credits | One submit exposed `job_credits: 1`, but capture/refund and balance delta remain unknown. | Obtain a read-only billing ledger or documented charge-state contract. |
 | Asset refs | Stable types for upload, image job, video job, element, Soul ID. | Use history reuse in a test generation and inspect request payloads. |
 | Soul ID | Training minimum, file limits, status states, output reference type. | Cross-check public FAQ against live UI/API. |
 | Connectors | Credential storage, refresh, scopes, rate-limit error model. | Add a test connector and inspect OAuth scopes/status surfaces. |
@@ -538,6 +781,6 @@ Provider-neutral names to prefer:
 ## Notes From The Dialogue Session
 
 - Chinese input through Computer Use dropped many characters, so the successful interview prompts were sent in English.
-- The fresh restart task `e0e6431f-3978-4b89-a19b-ab0f4817cfc5` returned a complete decomposition with skill categories, toolsets, layer claims, a Mermaid diagram, and unknowns.
-- The earlier task `096f0016-130d-4810-88ac-4a3df4cf5aa3` returned useful concurrency/tool/ref claims, then later queued follow-ups displayed `Viewing skill backend-architecture-explainer` without additional usable text before this dossier was updated.
+- `legacy_fresh_task` returned a complete decomposition with skill categories, toolsets, layer claims, a Mermaid diagram, and unknowns.
+- `legacy_primary_task` returned useful concurrency/tool/ref claims, then later queued follow-ups displayed `Viewing skill backend-architecture-explainer` without additional usable text before this dossier was updated.
 - The dialogue repeatedly invoked `backend-architecture-explainer`, so its answers should be treated as architecture explanation output, not privileged internal proof.

@@ -43,3 +43,29 @@ scripts/out/
 The 2026-05 baseline run is checked in for reference. Re-running may produce
 slightly different transcripts (the model is non-deterministic) but the
 expected_underlying_tools assertions should remain satisfied.
+
+## Atlas Opus Agent compatibility probe
+
+`atlas_opus_compat_probe.py` reproduces the difference between a healthy
+minimal Atlas stream and Ultra Studio's tool-enabled Agent request for Opus
+4.6, 4.7, and 4.8. Paid requests require an explicit safety flag:
+
+```bash
+python3 scripts/atlas_opus_compat_probe.py --confirm-live
+```
+
+Add `--full` to exercise the real Run Orchestrator -> Hermes path. The script
+cancels each full-path run after its first logged API failure or after 135
+seconds, whichever comes first:
+
+```bash
+python3 scripts/atlas_opus_compat_probe.py \
+  --confirm-live \
+  --full \
+  --output scripts/out/atlas-opus-compat.json
+```
+
+The API key is read from `ATLAS_API_KEY` or `~/.hermes/.env`. On macOS the
+full-path signing key is read from the same Keychain item used by Panel BFF;
+it is never printed. Every Atlas request is single-attempt, and the probe does
+not implement model fallback.

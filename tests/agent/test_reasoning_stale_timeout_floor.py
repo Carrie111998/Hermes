@@ -65,8 +65,8 @@ import pytest
     ("openai/o3-mini", 300.0),
     ("openai/o4-mini", 300.0),
     # Anthropic Claude 4.x thinking variants.
-    ("anthropic/claude-opus-4-6", 240.0),
-    ("anthropic/claude-opus-4-20250514", 240.0),
+    ("anthropic/claude-opus-4-6", 300.0),
+    ("anthropic/claude-opus-4-20250514", 300.0),
     ("anthropic/claude-sonnet-4.5", 180.0),
     ("anthropic/claude-sonnet-4.6", 180.0),
     # xAI Grok reasoning variants — explicit, not bare `grok`.
@@ -127,7 +127,7 @@ def test_longest_substring_wins_on_shared_prefix():
     # Even with deep aggregator prefix chains the model name resolves
     # correctly (start-of-slug anchor + rsplit('/') strip).
     assert get_reasoning_stale_timeout_floor("openrouter/openai/o3-mini") == 300.0
-    assert get_reasoning_stale_timeout_floor("openrouter/anthropic/claude-opus-4-6") == 240.0
+    assert get_reasoning_stale_timeout_floor("openrouter/anthropic/claude-opus-4-6") == 300.0
 
 
 
@@ -184,7 +184,7 @@ def test_reasoning_floor_applies_to_nemotron_3_ultra(monkeypatch, tmp_path):
 
 
 def test_reasoning_floor_applies_to_opus_4_thinking(monkeypatch, tmp_path):
-    """Anthropic Opus 4.x thinking gets the 240s floor without explicit config."""
+    """Anthropic Opus 4.x thinking gets the 300s floor without explicit config."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
     monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
@@ -202,7 +202,7 @@ def test_reasoning_floor_applies_to_opus_4_thinking(monkeypatch, tmp_path):
         model="claude-opus-4-6",
     )
     base, implicit = agent._resolved_api_call_stale_timeout_base()
-    assert base == 240.0
+    assert base == 300.0
     assert implicit is False
 
 
@@ -354,13 +354,13 @@ def test_stream_stale_timeout_floor_never_lowers_existing():
     )
     assert timeout == 600.0
 
-    # 60k tokens on Opus 4 -> context tier raises to 240s; floor keeps 240s.
+    # 60k tokens on Opus 4 -> context tier raises to 240s; the floor raises it to 300s.
     timeout = _resolve_stream_stale_timeout(
         model="anthropic/claude-opus-4-6",
         base_url="https://api.anthropic.com",
         est_tokens=60_000,
     )
-    assert timeout == 240.0
+    assert timeout == 300.0
 
 
 def test_stream_stale_timeout_unchanged_for_non_reasoning_models():

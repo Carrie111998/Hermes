@@ -146,6 +146,29 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_tool_result_resume_does_not_append_synthetic_user_turn():
+    agent = _FakeAgent()
+    agent._resume_from_tool_results = True
+    history = [
+        {"role": "user", "content": "make an image"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_media", "function": {"name": "media.generate_image", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_media", "name": "media.generate_image", "content": "{}"},
+    ]
+    ctx = _build(
+        agent,
+        user_message="",
+        conversation_history=history,
+    )
+    assert ctx.messages == history
+    assert ctx.current_turn_user_idx == -1
+    assert agent._user_turn_count == 1
+    assert sum(message["role"] == "user" for message in ctx.messages) == 1
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)

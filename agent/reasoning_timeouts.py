@@ -97,7 +97,7 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     # Anthropic Claude 4.x thinking variants.  Anchored at
     # ``claude-opus-4`` so non-thinking Claude 3.x or future
     # non-reasoning Claude variants don't match.
-    ("claude-opus-4", 240),
+    ("claude-opus-4", 300),
     ("claude-sonnet-4.5", 180),
     ("claude-sonnet-4.6", 180),
     # xAI Grok reasoning variants.  Explicit reasoning-only keys
@@ -195,7 +195,7 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     >>> get_reasoning_stale_timeout_floor("x-ai/grok-4-fast-reasoning")
     300.0
     >>> get_reasoning_stale_timeout_floor("anthropic/claude-opus-4-6")
-    240.0
+    300.0
     >>> get_reasoning_stale_timeout_floor("gpt-4o") is None
     True
     >>> get_reasoning_stale_timeout_floor("olmo-1") is None

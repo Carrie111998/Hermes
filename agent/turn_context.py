@@ -140,6 +140,8 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    resume_from_tool_results = bool(getattr(agent, "_resume_from_tool_results", False))
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -245,7 +247,7 @@ def build_turn_context(
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
-    _preview_text = summarize_user_message_for_log(user_message)
+    _preview_text = "<tool-results-resume>" if resume_from_tool_results else summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")
     logger.info(
@@ -272,8 +274,10 @@ def build_turn_context(
             if agent._memory_nudge_interval > 0 and agent._turns_since_memory == 0:
                 agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
 
-    # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    # A tool-result resume continues the existing user turn. It must not
+    # increment turn counters or append a synthetic user message.
+    if not resume_from_tool_results:
+        agent._user_turn_count += 1
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)
@@ -285,11 +289,14 @@ def build_turn_context(
         think_scrubber.reset()
 
     # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    original_user_message = "" if resume_from_tool_results else (
+        persist_user_message if persist_user_message is not None else user_message
+    )
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not resume_from_tool_results
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -297,13 +304,17 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
-    # Add user message.
-    user_msg = {"role": "user", "content": user_message}
-    messages.append(user_msg)
-    current_turn_user_idx = len(messages) - 1
-    agent._persist_user_message_idx = current_turn_user_idx
+    if resume_from_tool_results:
+        if not messages or messages[-1].get("role") != "tool":
+            raise ValueError("tool-result resume history must end with a tool message")
+        current_turn_user_idx = -1
+    else:
+        user_msg = {"role": "user", "content": user_message}
+        messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
+        agent._persist_user_message_idx = current_turn_user_idx
 
-    if not agent.quiet_mode:
+    if not resume_from_tool_results and not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)
         agent._safe_print(
             f"💬 Starting conversation: '{_print_preview[:60]}"
@@ -458,7 +469,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not resume_from_tool_results:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -467,7 +478,7 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not resume_from_tool_results:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
