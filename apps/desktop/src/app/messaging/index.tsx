@@ -80,7 +80,32 @@ const FIELD_COPY: Record<string, { advanced?: boolean }> = {
   QQBOT_HOME_CHANNEL: { advanced: true },
   QQBOT_HOME_CHANNEL_NAME: { advanced: true },
   WHATSAPP_ENABLED: { advanced: true },
-  WHATSAPP_MODE: { advanced: true }
+  WHATSAPP_MODE: { advanced: true },
+  // 国内平台高级字段
+  DINGTALK_WEBHOOK_URL: { advanced: true },
+  DINGTALK_ALLOWED_USERS: { advanced: true },
+  DINGTALK_HOME_CHANNEL: { advanced: true },
+  DINGTALK_HOME_CHANNEL_NAME: { advanced: true },
+  FEISHU_DOMAIN: { advanced: true },
+  FEISHU_ALLOWED_USERS: { advanced: true },
+  FEISHU_ALLOW_ALL_USERS: { advanced: true },
+  FEISHU_HOME_CHANNEL: { advanced: true },
+  FEISHU_HOME_CHANNEL_NAME: { advanced: true },
+  WECOM_ALLOWED_USERS: { advanced: true },
+  WECOM_HOME_CHANNEL: { advanced: true },
+  WECOM_HOME_CHANNEL_NAME: { advanced: true },
+  WECOM_WEBSOCKET_URL: { advanced: true },
+  WECOM_CALLBACK_HOST: { advanced: true },
+  WECOM_CALLBACK_PORT: { advanced: true },
+  QQ_ALLOWED_USERS: { advanced: true },
+  QQ_GROUP_ALLOWED_USERS: { advanced: true },
+  QQ_HOME_CHANNEL: { advanced: true },
+  QQ_HOME_CHANNEL_NAME: { advanced: true },
+  QQ_SANDBOX: { advanced: true },
+  QQ_MARKDOWN_SUPPORT: { advanced: true },
+  QQ_STT_API_KEY: { advanced: true },
+  QQ_STT_BASE_URL: { advanced: true },
+  QQ_STT_MODEL: { advanced: true }
 }
 
 function fieldCopy(field: MessagingEnvVarInfo, m: Translations['messaging']) {
