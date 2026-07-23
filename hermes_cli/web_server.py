@@ -3446,7 +3446,12 @@ def _dashboard_spawn_executable() -> str:
     return exe
 
 
-def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+def _spawn_hermes_action(
+    subcommand: List[str],
+    name: str,
+    *,
+    scrub_env_prefixes: Tuple[str, ...] = (),
+) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
     Uses the running interpreter's ``hermes_cli.main`` module so the action
@@ -3469,6 +3474,9 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     # drops it (gateway/run.py); mirror that here (#52470).
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
+    for key in list(action_env):
+        if any(key.startswith(prefix) for prefix in scrub_env_prefixes):
+            action_env.pop(key, None)
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
@@ -3549,7 +3557,7 @@ def _gateway_subcommand(
     requested = (profile or "").strip()
     profile_args = (
         ["-p", "default"]
-        if explicit_default and requested.lower() == "default"
+        if explicit_default and requested.lower() in {"", "current", "default"}
         else _profile_cli_args(profile)
     )
     return profile_args + ["gateway", verb]
@@ -3639,6 +3647,7 @@ def _spawn_gateway_restart(
     profile: Optional[str] = None,
     *,
     explicit_default: bool = False,
+    scrub_whatsapp_env: bool = False,
 ) -> Tuple[subprocess.Popen, bool]:
     """Spawn ``hermes gateway restart``, reusing an in-flight restart.
 
@@ -3670,7 +3679,14 @@ def _spawn_gateway_restart(
         ):
             return existing, True
         raise RuntimeError("gateway restart already in progress for another profile")
-    return _spawn_hermes_action(subcommand, "gateway-restart"), False
+    return (
+        _spawn_hermes_action(
+            subcommand,
+            "gateway-restart",
+            scrub_env_prefixes=("WHATSAPP_",) if scrub_whatsapp_env else (),
+        ),
+        False,
+    )
 
 
 def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict[str, Any]:
@@ -8360,7 +8376,10 @@ def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
                             record.account_id = account_id or None
                             record.account_name = account_name or None
                             record.account_phone = _whatsapp_phone_from_identifier(account_id)
-                        record.status = "connected"
+                        # The bridge keeps running briefly after this event to
+                        # flush credentials. Do not expose an applyable state
+                        # until proc.wait() below proves that pair-only exited.
+                        record.status = "finalizing"
                         record.error = None
                     elif event == "error":
                         record.status = "error"
@@ -8379,6 +8398,17 @@ def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
     with _whatsapp_onboarding_lock:
         record = _whatsapp_onboarding_sessions.get(pairing_id)
         if not record or record.proc is not proc:
+            return
+        if record.status == "finalizing":
+            if returncode == 0:
+                record.status = "connected"
+                record.error = None
+            else:
+                record.status = "error"
+                record.error = (
+                    f"WhatsApp pairing process exited with code {returncode} "
+                    "while finalizing credentials."
+                )
             return
         if record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             return
@@ -8501,13 +8531,15 @@ def _prune_whatsapp_onboarding_sessions() -> None:
     now = time.time()
     remove_ids: list[str] = []
     for pairing_id, record in _whatsapp_onboarding_sessions.items():
-        if (
-            record.proc is not None
-            and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
-            and record.proc.poll() is not None
-        ):
-            record.status = "error"
-            record.error = "WhatsApp pairing process exited before pairing completed."
+        if record.proc is not None and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+            returncode = record.proc.poll()
+            if returncode is not None:
+                if record.status == "finalizing" and returncode == 0:
+                    record.status = "connected"
+                    record.error = None
+                else:
+                    record.status = "error"
+                    record.error = "WhatsApp pairing process exited before pairing completed."
         if record.expires_at_ts <= now and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             _terminate_whatsapp_pairing(record.proc)
             record.status = "expired"
@@ -8546,6 +8578,11 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
         proc, reused = _spawn_gateway_restart(
             profile,
             explicit_default=True,
+            # save_env_value updates the dashboard process environment as well
+            # as the selected profile's .env. A restart may target a different
+            # multiplex owner, so let that child load its own profile-scoped
+            # WhatsApp values instead of inheriting the just-edited profile.
+            scrub_whatsapp_env=True,
         )
     except Exception as exc:
         _log.exception("Failed to auto-restart gateway after WhatsApp onboarding")
@@ -8660,6 +8697,11 @@ async def apply_whatsapp_onboarding(
             )
         if record.status != "connected":
             raise HTTPException(status_code=409, detail="WhatsApp setup is not connected yet.")
+        if record.proc is not None and record.proc.poll() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="WhatsApp setup is still finishing its credential flush.",
+            )
         mode = _normalize_whatsapp_onboarding_mode(body.mode or record.mode)
         allowed_users = _normalize_whatsapp_allowed_users(
             record.allowed_users if body.allowed_users is None else body.allowed_users

@@ -134,11 +134,13 @@ def _gateway_profile_scope(profile: Optional[str]):
 def resolve_whatsapp_gateway_profile(profile: Optional[str]) -> Optional[str]:
     """Return the gateway profile that owns ``profile``'s WhatsApp adapter."""
     requested = (profile or "").strip()
+    from hermes_cli import profiles
+
     if not requested or requested.lower() == "current":
-        return profile
+        active = profiles.get_active_profile_name()
+        requested = "default" if active in {"custom", "default"} else active
 
     from gateway.status import get_running_pid, read_runtime_status
-    from hermes_cli import profiles
 
     target = profiles.normalize_profile_name(requested)
     if target == "default":

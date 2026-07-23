@@ -283,6 +283,42 @@ def test_multiplexed_secondary_profile_resolves_to_default_owner(
     assert setup.resolve_whatsapp_gateway_profile("work") == "default"
 
 
+def test_current_named_profile_resolves_to_live_multiplex_owner(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import config as gateway_config
+    from gateway import status
+    from hermes_cli import profiles
+    from hermes_cli import whatsapp_setup as setup
+
+    default_home = tmp_path / ".hermes"
+    work_home = default_home / "profiles" / "work"
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "work")
+    monkeypatch.setattr(
+        profiles,
+        "get_profile_dir",
+        lambda name: default_home if name == "default" else work_home,
+    )
+    monkeypatch.setattr(
+        status,
+        "get_running_pid",
+        lambda path=None: 123 if path == default_home / "gateway.pid" else None,
+    )
+    monkeypatch.setattr(
+        status,
+        "read_runtime_status",
+        lambda path=None: {"served_profiles": ["default", "work"]},
+    )
+    monkeypatch.setattr(
+        gateway_config,
+        "load_gateway_config",
+        lambda: type("Config", (), {"multiplex_profiles": True})(),
+    )
+
+    assert setup.resolve_whatsapp_gateway_profile(None) == "default"
+
+
 def test_multiplex_owner_resolution_refuses_two_live_gateway_owners(
     monkeypatch,
     tmp_path,
