@@ -361,6 +361,9 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             _save_state_file(state_path, state)
             print(f"   ↩  LOOP #{current_loop + 1}: {implementer_nid} re-dispatched with failure report")
 
+            # Spawn supervisor to create the verify node's card for re-review
+            _spawn_supervisor_for_next_layer(state, state_path)
+
         elif status == "done":
             # Update this node's status in the state file
             states[node_id]["status"] = "done"
@@ -401,6 +404,9 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                     state["current_layer"] = current_layer + 1
                     _save_state_file(state_path, state)
                     print(f"   ✓ Layer {current_layer} complete — advancing to {current_layer + 1}")
+
+                    # Spawn supervisor to create next layer's cards
+                    _spawn_supervisor_for_next_layer(state, state_path)
             finally:
                 conn.close()
 
@@ -414,3 +420,47 @@ def _save_state_file(path, state):
     from datetime import datetime, timezone
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     Path(path).write_text(json.dumps(state, indent=2, default=str))
+
+
+def _spawn_supervisor_for_next_layer(state, state_path):
+    """Spawn the supervisor subprocess to create cards for the next layer.
+
+    Called by the kanban hook when a layer completes. The supervisor
+    creates cards for the next layer and returns — no monitoring loop.
+    """
+    try:
+        import subprocess
+        import sys
+        workflow_name = state.get("workflow_name", "")
+        run_id = state.get("run_id", "")
+        board = state.get("kanban_board", "adventours")
+        current_layer = state.get("current_layer", 0)
+        layers = state.get("layers", [])
+
+        if current_layer >= len(layers):
+            print(f"   ✓ All layers complete — workflow done")
+            return
+
+        # Spawn supervisor to create next layer's cards
+        cmd = [
+            sys.executable, "-m", "tools.workflow_engine",
+            "start", workflow_name,
+            "--resume",
+            "--board", board,
+            "--run-id", run_id,
+        ]
+        env = os.environ.copy()
+        env["HERMES_WORKFLOW_FILES"] = os.environ.get(
+            "HERMES_WORKFLOW_FILES",
+            str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines")),
+        )
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        print(f"   👤 supervisor spawned for layer {current_layer}")
+    except Exception as e:
+        print(f"   ⚠  Failed to spawn supervisor: {e}")
