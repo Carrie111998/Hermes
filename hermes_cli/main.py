@@ -2821,6 +2821,11 @@ def cmd_whatsapp(args):
             print("  Re-run and choose re-pair if the gateway reports logged out.")
             return
 
+    node = find_node_executable("node")
+    if not node:
+        print("\n✗ node not found on PATH — install Node.js first")
+        return
+
     # Pairing is a single-owner maintenance operation. Disable WhatsApp in
     # both persisted config stores and restart a running gateway before
     # touching the session directory. Failed/cancelled pairing stays disabled.
@@ -2867,7 +2872,7 @@ def cmd_whatsapp(args):
     try:
         pair_result = subprocess.run(
             [
-                find_node_executable("node") or "node",
+                node,
                 str(bridge_script),
                 "--pair-only",
                 "--pair-timeout-seconds",

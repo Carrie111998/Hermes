@@ -344,6 +344,7 @@ def test_whatsapp_restart_scrubs_profile_scoped_whatsapp_env(
     monkeypatch.setenv("WHATSAPP_ENABLED", "true")
     monkeypatch.setenv("WHATSAPP_MODE", "self-chat")
     monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "profile-user")
+    monkeypatch.setenv("WHATSAPP_CLOUD_ACCESS_TOKEN", "cloud-token")
 
     try:
         result = ws._restart_gateway_after_whatsapp_onboarding("default")
@@ -358,7 +359,10 @@ def test_whatsapp_restart_scrubs_profile_scoped_whatsapp_env(
         "gateway",
         "restart",
     ]
-    assert not any(key.startswith("WHATSAPP_") for key in captured["env"])
+    assert "WHATSAPP_ENABLED" not in captured["env"]
+    assert "WHATSAPP_MODE" not in captured["env"]
+    assert "WHATSAPP_ALLOWED_USERS" not in captured["env"]
+    assert captured["env"]["WHATSAPP_CLOUD_ACCESS_TOKEN"] == "cloud-token"
 
 
 def test_whatsapp_restart_reuses_equivalent_bare_default_restart(

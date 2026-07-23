@@ -136,6 +136,70 @@ def test_existing_pairing_skip_branch_does_not_claim_or_enable(isolated_home, mo
     assert "not re-verified" in buf.getvalue()
 
 
+def test_missing_node_is_rejected_before_pairing_disables_whatsapp(
+    isolated_home,
+    monkeypatch,
+):
+    """Node preflight must precede the single-owner persisted-state mutation."""
+    from hermes_cli import whatsapp_setup
+    from hermes_cli.main import cmd_whatsapp
+    from gateway.platforms import whatsapp_common
+    import hermes_constants
+
+    (isolated_home / ".env").write_text(
+        "WHATSAPP_MODE=bot\n"
+        "WHATSAPP_ALLOWED_USERS=15551234567\n"
+        "WHATSAPP_ENABLED=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        hermes_constants,
+        "find_node_executable",
+        lambda command: None if command == "node" else "/usr/bin/npm",
+    )
+    bridge_dir = isolated_home / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.js").write_text("// bridge", encoding="utf-8")
+    (bridge_dir / "node_modules").mkdir()
+    monkeypatch.setattr(
+        whatsapp_common,
+        "resolve_whatsapp_bridge_dir",
+        lambda: bridge_dir,
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: MagicMock(returncode=1, stderr=""),
+    )
+
+    original_exists = Path.exists
+
+    def stub_exists(self):
+        if self.name == "node_modules":
+            return True
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", stub_exists)
+    prepared = []
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **kwargs: prepared.append(kwargs),
+    )
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        cmd_whatsapp(MagicMock())
+
+    assert prepared == []
+    assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+    assert "node not found" in output.getvalue().lower()
+
+
 def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monkeypatch):
     """Fresh setup must pair into the same modern path used by the gateway."""
     from hermes_cli.main import cmd_whatsapp

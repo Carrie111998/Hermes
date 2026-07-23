@@ -13,12 +13,30 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
-from typing import Optional
+from typing import Mapping, Optional
 
 from hermes_cli._subprocess_compat import (
     windows_detach_flags_without_breakaway,
     windows_detach_popen_kwargs,
 )
+
+BAILEYS_WHATSAPP_ENV_PREFIXES = ("WHATSAPP_",)
+BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES = ("WHATSAPP_CLOUD_",)
+
+
+def scrub_baileys_whatsapp_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Drop inherited Baileys settings while preserving Cloud API settings."""
+    return {
+        key: value
+        for key, value in env.items()
+        if not (
+            any(key.startswith(prefix) for prefix in BAILEYS_WHATSAPP_ENV_PREFIXES)
+            and not any(
+                key.startswith(prefix)
+                for prefix in BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES
+            )
+        )
+    }
 
 
 def persist_whatsapp_enabled(enabled: bool) -> None:
@@ -261,7 +279,9 @@ def restart_gateway_if_running(
         if old_pid is None:
             return False
 
-        action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+        action_env = scrub_baileys_whatsapp_env(
+            {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+        )
         action_env.pop("_HERMES_GATEWAY", None)
         popen_kwargs = {
             "stdin": subprocess.DEVNULL,

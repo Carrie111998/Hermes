@@ -409,6 +409,9 @@ def test_restart_gateway_if_running_is_detached_profile_aware_and_scrubs_gateway
     pids = iter([123, 123, 456])
     monkeypatch.setattr(status, "get_running_pid", lambda pid_path=None: next(pids))
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_MODE", "self-chat")
+    monkeypatch.setenv("WHATSAPP_CLOUD_ACCESS_TOKEN", "cloud-token")
 
     class FakeProc:
         def poll(self):
@@ -433,6 +436,9 @@ def test_restart_gateway_if_running_is_detached_profile_aware_and_scrubs_gateway
         "restart",
     ]
     assert "_HERMES_GATEWAY" not in captured["kwargs"]["env"]
+    assert "WHATSAPP_ENABLED" not in captured["kwargs"]["env"]
+    assert "WHATSAPP_MODE" not in captured["kwargs"]["env"]
+    assert captured["kwargs"]["env"]["WHATSAPP_CLOUD_ACCESS_TOKEN"] == "cloud-token"
     assert captured["kwargs"]["env"]["HERMES_NONINTERACTIVE"] == "1"
     assert captured["kwargs"]["stdin"] is setup.subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] is setup.subprocess.DEVNULL

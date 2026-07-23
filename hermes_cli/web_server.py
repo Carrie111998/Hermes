@@ -3451,6 +3451,7 @@ def _spawn_hermes_action(
     name: str,
     *,
     scrub_env_prefixes: Tuple[str, ...] = (),
+    preserve_env_prefixes: Tuple[str, ...] = (),
 ) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
@@ -3475,7 +3476,10 @@ def _spawn_hermes_action(
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
     for key in list(action_env):
-        if any(key.startswith(prefix) for prefix in scrub_env_prefixes):
+        if (
+            any(key.startswith(prefix) for prefix in scrub_env_prefixes)
+            and not any(key.startswith(prefix) for prefix in preserve_env_prefixes)
+        ):
             action_env.pop(key, None)
 
     popen_kwargs: Dict[str, Any] = {
@@ -3681,7 +3685,15 @@ def _spawn_gateway_restart(
         raise RuntimeError("gateway restart already in progress for another profile")
     spawn_kwargs: Dict[str, Any] = {}
     if scrub_whatsapp_env:
-        spawn_kwargs["scrub_env_prefixes"] = ("WHATSAPP_",)
+        from hermes_cli.whatsapp_setup import (
+            BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES,
+            BAILEYS_WHATSAPP_ENV_PREFIXES,
+        )
+
+        spawn_kwargs["scrub_env_prefixes"] = BAILEYS_WHATSAPP_ENV_PREFIXES
+        spawn_kwargs["preserve_env_prefixes"] = (
+            BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES
+        )
     return (
         _spawn_hermes_action(
             subcommand,
