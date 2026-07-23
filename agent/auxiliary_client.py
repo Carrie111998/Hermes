@@ -3930,19 +3930,82 @@ def _fallback_label_provider(fb_label: str) -> str:
     return match.group(1) if match else str(fb_label or "")
 
 
-def _fallback_health_label(fb_label: str, fb_client: Any) -> str:
+def _fallback_entry_for_health(
+    task: Optional[str],
+    fb_label: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the configured entry represented by a stable fallback label."""
+    label = str(fb_label or "").strip()
+    task_match = re.match(r"fallback_chain\[(\d+)\]", label)
+    if task_match and task:
+        try:
+            chain = _get_auxiliary_task_config(task).get("fallback_chain")
+            entry = chain[int(task_match.group(1))] if isinstance(chain, list) else None
+            return entry if isinstance(entry, dict) else None
+        except Exception:
+            return None
+
+    main_match = re.match(r"fallback_providers\[(\d+)\]", label)
+    if main_match:
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.fallback_config import get_fallback_chain
+
+            chain = get_fallback_chain(load_config())
+            entry = chain[int(main_match.group(1))] if isinstance(chain, list) else None
+            return entry if isinstance(entry, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _fallback_health_label(
+    fb_label: str,
+    fb_client: Any,
+    task: Optional[str] = None,
+) -> str:
     """Return the narrowest safe health key for a fallback candidate.
 
-    Configured-chain labels identify one exact entry and must stay exact. The
-    built-in ``api-key`` label, however, represents a discovery bucket that can
-    contain several independent providers. Resolve that bucket to the concrete
-    selected backend; if the endpoint is unknown, leave it unquarantined rather
-    than suppressing every direct API-key provider.
+    A fallback entry with its own base URL or key is independently routed and
+    stays entry-scoped. A model-only entry shares its provider credentials and
+    endpoint with sibling entries, so a deployment/credential outage must mark
+    the provider-wide key. The built-in ``api-key`` label represents a discovery
+    bucket containing several independent providers; resolve it to the concrete
+    selected backend, or leave it unquarantined when the endpoint is unknown.
     """
     label = str(fb_label or "").strip()
-    if label != "api-key":
+    if label == "api-key":
+        return _recoverable_pool_provider("auto", fb_client) or ""
+
+    entry = _fallback_entry_for_health(task, label)
+    if entry is None:
+        # Labels can also come from built-in fallbacks rather than config. Keep
+        # unknown shapes exact instead of risking a provider-wide quarantine.
         return label
-    return _recoverable_pool_provider("auto", fb_client) or ""
+    entry_scoped = any(
+        str(entry.get(field) or "").strip()
+        for field in ("base_url", "api_key", "key_env", "api_key_env")
+    )
+    if entry_scoped:
+        return label
+    return _fallback_label_provider(label)
+
+
+def _mark_recoverable_provider_unhealthy(
+    resolved_provider: str,
+    client: Any,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Quarantine only a concrete shared provider inferred for this route."""
+    health_provider = _recoverable_pool_provider(
+        resolved_provider,
+        client,
+        main_runtime=main_runtime,
+    )
+    if health_provider:
+        _mark_provider_unhealthy(health_provider)
+    return health_provider
 
 
 def _call_fallback_with_transient_retry_sync(
@@ -4091,9 +4154,9 @@ def _call_fallback_candidate_sync(
         )
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
-            # Quarantine the exact configured entry, not its generic provider.
-            # Two `provider: custom` entries may point at independent endpoints.
-            health_label = _fallback_health_label(fb_label, fb_client)
+            # Independently routed entries stay exact; model-only entries share
+            # their provider route and therefore quarantine that provider.
+            health_label = _fallback_health_label(fb_label, fb_client, task)
             if health_label:
                 _mark_provider_unhealthy(health_label)
             logger.warning(
@@ -4127,7 +4190,11 @@ def _call_fallback_candidate_sync(
                     )
                 except Exception as retry_err:
                     if _is_provider_deployment_unavailable_error(retry_err):
-                        health_label = _fallback_health_label(fb_label, retry_client)
+                        health_label = _fallback_health_label(
+                            fb_label,
+                            retry_client,
+                            task,
+                        )
                         if health_label:
                             _mark_provider_unhealthy(health_label)
                         logger.warning(
@@ -4142,7 +4209,7 @@ def _call_fallback_candidate_sync(
         # the token is dead (expired setup token with no refresh token).
         # Quarantine the candidate so subsequent chain walks skip it, and
         # let the caller move on instead of aborting the whole task.
-        health_label = _fallback_health_label(fb_label, fb_client)
+        health_label = _fallback_health_label(fb_label, fb_client, task)
         if health_label:
             _mark_provider_unhealthy(health_label)
         logger.warning(
@@ -4193,7 +4260,7 @@ async def _call_fallback_candidate_async(
         )
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
-            health_label = _fallback_health_label(fb_label, fb_client)
+            health_label = _fallback_health_label(fb_label, fb_client, task)
             if health_label:
                 _mark_provider_unhealthy(health_label)
             logger.warning(
@@ -4228,7 +4295,11 @@ async def _call_fallback_candidate_async(
                     )
                 except Exception as retry_err:
                     if _is_provider_deployment_unavailable_error(retry_err):
-                        health_label = _fallback_health_label(fb_label, retry_client)
+                        health_label = _fallback_health_label(
+                            fb_label,
+                            retry_client,
+                            task,
+                        )
                         if health_label:
                             _mark_provider_unhealthy(health_label)
                         logger.warning(
@@ -4239,7 +4310,7 @@ async def _call_fallback_candidate_async(
                         return None
                     if not _is_auth_error(retry_err):
                         raise
-        health_label = _fallback_health_label(fb_label, fb_client)
+        health_label = _fallback_health_label(fb_label, fb_client, task)
         if health_label:
             _mark_provider_unhealthy(health_label)
         logger.warning(
@@ -7791,8 +7862,10 @@ def call_llm(
                 # "auto"; the client's base_url tells us which backend got the
                 # 402). Mark THAT label unhealthy so subsequent aux calls
                 # skip it instead of paying another doomed RTT.
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime) or resolved_provider
+                _mark_recoverable_provider_unhealthy(
+                    resolved_provider,
+                    client,
+                    main_runtime=main_runtime,
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
@@ -7800,13 +7873,10 @@ def call_llm(
                 reason = "model incompatible with route"
             elif _is_provider_deployment_unavailable_error(first_err):
                 reason = "provider deployment unavailable"
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(
-                        resolved_provider,
-                        client,
-                        main_runtime=main_runtime,
-                    )
-                    or resolved_provider
+                _mark_recoverable_provider_unhealthy(
+                    resolved_provider,
+                    client,
+                    main_runtime=main_runtime,
                 )
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
@@ -8346,8 +8416,10 @@ async def async_call_llm(
                 reason = "auth error"
             elif _is_payment_error(first_err):
                 reason = "payment error"
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                _mark_recoverable_provider_unhealthy(
+                    resolved_provider,
+                    client,
+                    main_runtime=main_runtime,
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
@@ -8355,13 +8427,10 @@ async def async_call_llm(
                 reason = "model incompatible with route"
             elif _is_provider_deployment_unavailable_error(first_err):
                 reason = "provider deployment unavailable"
-                _mark_provider_unhealthy(
-                    _recoverable_pool_provider(
-                        resolved_provider,
-                        client,
-                        main_runtime=main_runtime,
-                    )
-                    or resolved_provider
+                _mark_recoverable_provider_unhealthy(
+                    resolved_provider,
+                    client,
+                    main_runtime=main_runtime,
                 )
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"

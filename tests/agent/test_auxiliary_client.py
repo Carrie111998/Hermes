@@ -2719,6 +2719,169 @@ class TestAuxiliaryFallbackLayering:
         assert result.choices[0].message.content == "healthy fallback"
         mock_mark.assert_called_once_with("nvidia")
 
+    def test_custom_deployment_failure_does_not_quarantine_all_custom_routes(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://custom-one.example/v1"
+        primary_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "healthy fallback"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "custom-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "custom:private-route",
+                "custom-model",
+                "https://custom-one.example/v1",
+                "custom-key",
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "healthy fallback"
+        mock_mark.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_custom_deployment_failure_does_not_quarantine_all_custom_routes(
+        self,
+    ):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://custom-one.example/v1"
+        primary_client.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("HTTP 503: deployment unavailable")
+        )
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("healthy async fallback")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "custom-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "custom:private-route",
+                "custom-model",
+                "https://custom-one.example/v1",
+                "custom-key",
+                None,
+            ),
+        ), patch(
+            "agent.auxiliary_client._transient_retry_count", return_value=0
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain",
+            return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)"),
+        ), patch(
+            "agent.auxiliary_client._to_async_client",
+            return_value=(async_fallback_client, "glm-5.2"),
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "healthy async fallback"
+        mock_mark.assert_not_called()
+
+    def test_model_only_configured_fallback_quarantines_shared_provider(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.anthropic.com/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "anthropic", "model": "claude-sonnet-4-5"}
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "claude-sonnet-4-5",
+                "fallback_chain[0](anthropic)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with("anthropic")
+
+    def test_model_only_main_fallback_quarantines_shared_provider(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.anthropic.com/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        chain = [{"provider": "anthropic", "model": "claude-sonnet-4-5"}]
+
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"fallback_providers": chain},
+        ), patch(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            return_value=chain,
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "claude-sonnet-4-5",
+                "fallback_providers[0](anthropic)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with("anthropic")
+
     def test_unavailable_configured_fallback_quarantines_exact_entry(self):
         from agent.auxiliary_client import _call_fallback_candidate_sync
 
@@ -2730,6 +2893,17 @@ class TestAuxiliaryFallbackLayering:
         label = "fallback_chain[0](custom)"
 
         with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "custom-model",
+                        "base_url": "https://custom-one.example/v1",
+                    }
+                ]
+            },
+        ), patch(
             "agent.auxiliary_client._mark_provider_unhealthy"
         ) as mock_mark, patch(
             "agent.auxiliary_client._transient_retry_count",
@@ -2803,6 +2977,17 @@ class TestAuxiliaryFallbackLayering:
         label = "fallback_chain[0](custom)"
 
         with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "custom-model",
+                        "base_url": "https://custom-one.example/v1",
+                    }
+                ]
+            },
+        ), patch(
             "agent.auxiliary_client._mark_provider_unhealthy"
         ) as mock_mark, patch(
             "agent.auxiliary_client._transient_retry_count",
