@@ -868,6 +868,12 @@ class WorkflowEngine:
         node completes (see ``_monitor_layer``).
         """
         lookup: dict = {"context": dict(context or {})}
+        # Promote {inputs.<key>} to a top-level namespace so the
+        # template resolver can resolve e.g. {inputs.grill_artifact}
+        # directly without requiring {context.inputs.grill_artifact}.
+        ctx_dict = lookup["context"]
+        if "inputs" in ctx_dict and isinstance(ctx_dict["inputs"], dict):
+            lookup["inputs"] = ctx_dict["inputs"]
         run_id = workflow.run_id or "no-run-id"
 
         # Add {run_id} and {date} so YAML authors can reference them in
