@@ -97,16 +97,7 @@ def _err(message: str, **extra: Any) -> str:
     return json.dumps({"ok": False, "error": message, **extra}, indent=2, default=str)
 
 def handle_workflow_start(
-    workflow: str,
-    context: Optional[Dict[str, Any]] = None,
-    mode: str = "predefined",
-    node: Optional[str] = None,
-    dry_run: bool = False,
-    resume: bool = False,
-    scope: str = "project",
-    single_flight: bool = False,
-    inputs: Optional[Dict[str, Any]] = None,
-    board: str = "",
+    args: Dict[str, Any],
     **kwargs: Any,
 ) -> str:
     """Start a pipeline in the given mode.
@@ -131,6 +122,17 @@ def handle_workflow_start(
     See ``workflow_list`` for available pipelines, ``workflow_show`` to
     inspect structure, and ``workflow_status`` to check a running run.
     """
+    workflow = args.get("workflow", "")
+    context = args.get("context")
+    mode = args.get("mode", "predefined")
+    node = args.get("node")
+    dry_run = args.get("dry_run", False)
+    resume = args.get("resume", False)
+    scope = args.get("scope", "project")
+    single_flight = args.get("single_flight", False)
+    inputs = args.get("inputs")
+    board = args.get("board", "")
+
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
 
@@ -327,9 +329,11 @@ def _handle_workflow_start_dynamic(
     return _ok(result)
 
 
-def handle_workflow_view(workflow: str = "", **kwargs: Any) -> str:
+def handle_workflow_view(args: Dict[str, Any], **kwargs: Any) -> str:
     """Load a workflow template (predefined YAML or dynamic starter) for inspection."""
     from plugins.workflow.registry import _fleet_pipelines_dirs, _user_workflows_dir
+
+    workflow = args.get("workflow", "")
 
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
@@ -360,13 +364,15 @@ def handle_workflow_view(workflow: str = "", **kwargs: Any) -> str:
     return _err(f"workflow template not found: {workflow}")
 
 
-def handle_workflow_validate(workflow: str, **kwargs: Any) -> str:
+def handle_workflow_validate(args: Dict[str, Any], **kwargs: Any) -> str:
     """Structural validation only. Returns nodes/layers/cycle check without
     creating kanban cards. Safe to call before committing to a start."""
     try:
         engine = _engine()
     except Exception as exc:
         return _err(f"engine import failed: {exc}")
+
+    workflow = args.get("workflow", "")
 
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
@@ -382,7 +388,7 @@ def handle_workflow_validate(workflow: str, **kwargs: Any) -> str:
     return _ok(result)
 
 
-def handle_workflow_status(workflow: Optional[str] = None, **kwargs: Any) -> str:
+def handle_workflow_status(args: Dict[str, Any], **kwargs: Any) -> str:
     """Current state of a running pipeline (or all pipelines if workflow is
     omitted). Mirrors ``hermes kanban status`` for the kanban cards the
     engine owns."""
@@ -390,6 +396,8 @@ def handle_workflow_status(workflow: Optional[str] = None, **kwargs: Any) -> str
         engine = _engine()
     except Exception as exc:
         return _err(f"engine import failed: {exc}")
+
+    workflow = args.get("workflow") or None
 
     try:
         result = engine.status(workflow)
@@ -401,7 +409,7 @@ def handle_workflow_status(workflow: Optional[str] = None, **kwargs: Any) -> str
 
 
 def handle_workflow_list(
-    trigger: Optional[str] = None,
+    args: Dict[str, Any],
     **kwargs: Any,
 ) -> str:
     """List available workflow definitions from both the fleet pipelines
@@ -411,6 +419,7 @@ def handle_workflow_list(
     trigger keywords appear in the given string (case-insensitive).
     Without *trigger* every registered workflow is returned.
     """
+    trigger = args.get("trigger") or None
     from plugins.workflow.registry import list_workflows, match_workflow_trigger
 
     try:
@@ -438,13 +447,15 @@ def handle_workflow_list(
     })
 
 
-def handle_workflow_show(workflow: str, **kwargs: Any) -> str:
+def handle_workflow_show(args: Dict[str, Any], **kwargs: Any) -> str:
     """Show pipeline structure: layers, nodes, dependencies. Use before
     ``workflow_start`` to understand the DAG."""
     try:
         engine = _engine()
     except Exception as exc:
         return _err(f"engine import failed: {exc}")
+
+    workflow = args.get("workflow", "")
 
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
@@ -482,11 +493,7 @@ def handle_workflow_show(workflow: str, **kwargs: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def handle_workflow_dynamic_start(
-    workflow: str = "",
-    context: Optional[Dict[str, Any]] = None,
-    scope: str = "project",
-    single_flight: bool = False,
-    dry_run: bool = False,
+    args: Dict[str, Any],
     **kwargs: Any,
 ) -> str:
     """Deprecated: use ``handle_workflow_start`` with ``mode="dynamic"`` instead.
@@ -494,15 +501,8 @@ def handle_workflow_dynamic_start(
     This thin wrapper maintains backward compatibility for callers that
     still reference the old entry point.
     """
-    return handle_workflow_start(
-        workflow=workflow,
-        context=context,
-        mode="dynamic",
-        scope=scope,
-        single_flight=single_flight,
-        dry_run=dry_run,
-        **kwargs,
-    )
+    args["mode"] = "dynamic"
+    return handle_workflow_start(args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
