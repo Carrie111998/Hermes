@@ -3679,11 +3679,14 @@ def _spawn_gateway_restart(
         ):
             return existing, True
         raise RuntimeError("gateway restart already in progress for another profile")
+    spawn_kwargs: Dict[str, Any] = {}
+    if scrub_whatsapp_env:
+        spawn_kwargs["scrub_env_prefixes"] = ("WHATSAPP_",)
     return (
         _spawn_hermes_action(
             subcommand,
             "gateway-restart",
-            scrub_env_prefixes=("WHATSAPP_",) if scrub_whatsapp_env else (),
+            **spawn_kwargs,
         ),
         False,
     )
