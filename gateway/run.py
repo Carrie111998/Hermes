@@ -2171,6 +2171,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -2193,6 +2194,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
+        "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
@@ -2252,6 +2254,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "api_key": runtime.get("api_key"),
                     "base_url": runtime.get("base_url"),
                     "provider": runtime.get("provider"),
+                    "requested_provider": runtime.get("requested_provider"),
                     "api_mode": runtime.get("api_mode"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
@@ -4361,6 +4364,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "api_key": runtime_kwargs.get("api_key"),
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
+            "requested_provider": runtime_kwargs.get("requested_provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
@@ -4373,6 +4377,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "signature": (
                 model,
                 runtime["provider"],
+                runtime["requested_provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
                 runtime["command"],
@@ -6667,6 +6672,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # serviced (#53175). Offload to a worker thread under this timeout so the
     # loop is never blocked; mirrors the /new reset path's fix (#35994).
     _CLEANUP_TIMEOUT_S = 30.0
+
+    def _defer_agent_cleanup_until_future_done(
+        self,
+        future: asyncio.Future,
+        agent: Any,
+        *,
+        context: str,
+    ) -> None:
+        """Clean up ``agent`` only after its executor future has finished.
+
+        A timed-out executor call keeps running in its worker thread. Closing
+        the agent before that thread exits can tear down clients or providers
+        it is still using. Keep a strong task reference and wait for the real
+        future before invoking the normal bounded, off-loop cleanup path.
+        """
+
+        async def _cleanup_when_done() -> None:
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Loop shutdown can cancel this waiter while the executor still
+                # runs. Never turn that cancellation into premature cleanup.
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Deferred agent worker%s finished with an error: %s",
+                    f" ({context})" if context else "",
+                    exc,
+                )
+            await self._cleanup_agent_resources_off_loop(agent, context=context)
+
+        task = asyncio.create_task(_cleanup_when_done())
+        tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._deferred_agent_cleanup_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _cleanup_agent_resources_off_loop(
         self, agent: Any, *, context: str = ""
@@ -10791,6 +10834,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reply_to_is_own_message=event.reply_to_is_own_message,
                         auto_skill=event.auto_skill,
                         channel_prompt=event.channel_prompt,
+                        channel_context=event.channel_context,
                         internal=event.internal,
                         timestamp=event.timestamp,
                     )
@@ -10820,6 +10864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            channel_context=event.channel_context,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -10842,6 +10887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        channel_context=event.channel_context,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -12718,6 +12764,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
+            _hyg_timeout_seconds = 30.0
+            _hyg_failure_cooldown_seconds = 300.0
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -12761,6 +12809,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _parsed = int(_raw_hard_limit)
                                 if _parsed > 0:
                                     _hyg_hard_msg_limit = _parsed
+                            except (TypeError, ValueError):
+                                pass
+                        _raw_timeout = _comp_cfg.get("hygiene_timeout_seconds")
+                        if _raw_timeout is not None:
+                            try:
+                                _parsed = float(_raw_timeout)
+                                if _parsed > 0:
+                                    _hyg_timeout_seconds = _parsed
+                            except (TypeError, ValueError):
+                                pass
+                        _raw_cooldown = _comp_cfg.get("hygiene_failure_cooldown_seconds")
+                        if _raw_cooldown is not None:
+                            try:
+                                _parsed = float(_raw_cooldown)
+                                if _parsed >= 0:
+                                    _hyg_failure_cooldown_seconds = _parsed
                             except (TypeError, ValueError):
                                 pass
 
@@ -12874,6 +12938,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
+                    _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
+                    if _cooldowns is None:
+                        _cooldowns = {}
+                        self._hygiene_compression_failure_cooldowns = _cooldowns
+                    _cooldown_key = session_entry.session_id
+                    _cooldown_until = float(_cooldowns.get(_cooldown_key) or 0.0)
+                    if _cooldown_until > time.time():
+                        logger.info(
+                            "Session hygiene: skipping compression for %s; "
+                            "previous failure cooldown active for %.1fs",
+                            _cooldown_key,
+                            max(0.0, _cooldown_until - time.time()),
+                        )
+                        _needs_compress = False
+
+                if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
                         "(threshold: %s%% of %s = %s tokens)",
@@ -12886,6 +12966,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
                     try:
+                        from agent.conversation_compression import CompressionCommitFence
                         from run_agent import AIAgent
 
                         _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
@@ -12920,6 +13001,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
                                 )
+                                _hyg_cleanup_deferred = False
                                 try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
@@ -12947,13 +13029,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
                                     loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
+                                    _hyg_commit_fence = CompressionCommitFence()
+                                    _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
+                                            commit_fence=_hyg_commit_fence,
                                         ),
                                     )
+                                    try:
+                                        _compressed, _ = await asyncio.wait_for(
+                                            asyncio.shield(_hyg_future),
+                                            timeout=_hyg_timeout_seconds,
+                                        )
+                                    except asyncio.TimeoutError:
+                                        _cancelled = None
+                                        while _cancelled is None:
+                                            _cancelled = (
+                                                _hyg_commit_fence.try_cancel_before_commit()
+                                            )
+                                            if _cancelled is None:
+                                                await asyncio.sleep(0.001)
+                                        if not _cancelled:
+                                            # The worker crossed the commit boundary just
+                                            # before the timeout. The fence poll waited for
+                                            # that boundary to finish, so consume the
+                                            # completed result instead of treating a
+                                            # successful compaction as a timeout.
+                                            _compressed, _ = await _hyg_future
+                                        else:
+                                            self._defer_agent_cleanup_until_future_done(
+                                                _hyg_future,
+                                                _hyg_agent,
+                                                context="session hygiene timeout",
+                                            )
+                                            _hyg_cleanup_deferred = True
+                                            if _hyg_failure_cooldown_seconds >= 0:
+                                                self._hygiene_compression_failure_cooldowns[
+                                                    session_entry.session_id
+                                                ] = time.time() + _hyg_failure_cooldown_seconds
+                                            logger.warning(
+                                                "Session hygiene compression for session %s "
+                                                "timed out after %.1fs; continuing without "
+                                                "compression",
+                                                session_entry.session_id,
+                                                _hyg_timeout_seconds,
+                                            )
+                                            _timeout_msg = (
+                                                "⚠️ Context compression timed out "
+                                                f"after {_hyg_timeout_seconds:.1f}s. "
+                                                "No messages were dropped — continuing without "
+                                                "compression. Run /compress to retry, /reset for "
+                                                "a clean session, or check your "
+                                                "auxiliary.compression model configuration."
+                                            )
+                                            try:
+                                                _adapter = self._adapter_for_source(source)
+                                                if _adapter and source.chat_id:
+                                                    await _adapter.send(
+                                                        source.chat_id,
+                                                        _timeout_msg,
+                                                        metadata=_hyg_meta,
+                                                    )
+                                            except Exception as _werr:
+                                                logger.warning(
+                                                    "Failed to deliver compression-timeout "
+                                                    "warning to user: %s",
+                                                    _werr,
+                                                )
+                                            raise
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
@@ -13061,6 +13206,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # fresh.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
+                                        if _hyg_failure_cooldown_seconds >= 0:
+                                            self._hygiene_compression_failure_cooldowns[
+                                                session_entry.session_id
+                                            ] = time.time() + _hyg_failure_cooldown_seconds
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
@@ -13113,9 +13262,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # rebuilds its system prompt from current
                                     # SOUL.md, memory, and skills.
                                     self._evict_cached_agent(session_key)
-                                    await self._cleanup_agent_resources_off_loop(
-                                        _hyg_agent, context="session hygiene"
-                                    )
+                                    if not _hyg_cleanup_deferred:
+                                        await self._cleanup_agent_resources_off_loop(
+                                            _hyg_agent, context="session hygiene"
+                                        )
 
                     except Exception as e:
                         logger.warning(
@@ -14973,11 +15123,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event: MessageEvent,
         adapter,
     ) -> None:
-        """Extract MEDIA: tags and local file paths from a response and deliver them.
+        """Extract explicit MEDIA: tags from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
         that the normal _process_message_background path would have caught.
+
+        Unlike the non-streaming path in ``gateway/platforms/base.py`` (which
+        also auto-detects bare local paths via ``extract_local_files``), this
+        post-stream rescan is EXPLICIT-ONLY. The visible reply has already
+        been streamed verbatim, so a bare path string here was either (a)
+        already shown to the user as text, or (b) stale tool/inspected
+        content that was never part of the intended visible reply. Promoting
+        such paths into uploads after the fact sent files the model never
+        asked to deliver (#20834). Only ``MEDIA:`` directives — the explicit
+        attachment contract — trigger post-stream uploads.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
@@ -14993,16 +15153,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            # Chain the cleaned text through each extractor (extract_media →
-            # extract_images → extract_local_files) so MEDIA: tags and image URLs
-            # are removed before the bare-path auto-detect runs. Previously the
-            # cleaned text from extract_media was dropped (``_``) and
-            # extract_local_files scanned text that still contained MEDIA: tags,
-            # producing false-positive bare-path matches with the MEDIA: prefix
-            # glued on. This matches the chain order in gateway/platforms/base.py.
-            _, cleaned = adapter.extract_images(cleaned)
-            local_files, _ = adapter.extract_local_files(cleaned)
-            local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            # Strip image URLs from the cleaned text for parity with the
+            # non-streaming chain, but do NOT run extract_local_files here:
+            # post-stream delivery is explicit-only (#20834). Bare local paths
+            # in an already-streamed reply are text the user has seen (or
+            # stale inspected content), not an attachment request.
+            adapter.extract_images(cleaned)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -15023,14 +15179,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     image_paths.append(media_path)
                 else:
                     non_image_media.append((media_path, is_voice))
-
-            non_image_local: list = []
-            for file_path in local_files:
-                if (Path(file_path).suffix.lower() in _IMAGE_EXTS
-                        and not force_document_attachments):
-                    image_paths.append(file_path)
-                else:
-                    non_image_local.append(file_path)
 
             if image_paths:
                 try:
@@ -15066,24 +15214,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
-
-            for file_path in non_image_local:
-                try:
-                    ext = Path(file_path).suffix.lower()
-                    if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -16882,6 +17012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg = user_config if isinstance(user_config, dict) else load_config()
             resolved_provider = (provider or "").strip()
             resolved_model = (model or "").strip()
+            resolved_requested_provider = ""
 
             needs_session_runtime = not resolved_provider or not resolved_model
             has_session_identity = source is not None or session_key
@@ -16895,8 +17026,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not resolved_model and isinstance(turn_model, str):
                         resolved_model = turn_model.strip()
                     runtime_provider = runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None
+                    runtime_requested_provider = (
+                        runtime_kwargs.get("requested_provider")
+                        if isinstance(runtime_kwargs, dict)
+                        else None
+                    )
                     if not resolved_provider and isinstance(runtime_provider, str):
                         resolved_provider = runtime_provider.strip()
+                    if isinstance(runtime_requested_provider, str):
+                        resolved_requested_provider = runtime_requested_provider.strip()
                 except Exception as exc:
                     logger.debug(
                         "image_routing: session runtime resolution failed, falling back to config — %s",
@@ -16908,7 +17046,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not resolved_model:
                 resolved_model = _read_main_model()
 
-            return decide_image_input_mode(resolved_provider, resolved_model, cfg)
+            return decide_image_input_mode(
+                resolved_provider,
+                resolved_model,
+                cfg,
+                requested_provider=resolved_requested_provider,
+            )
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
@@ -17931,6 +18074,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _api_key_fingerprint,
                 runtime.get("base_url", ""),
                 runtime.get("provider", ""),
+                runtime.get("requested_provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
@@ -21044,6 +21188,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _status_adapter.pause_typing_for_chat(_status_chat_id)
                 except Exception:
                     pass
+
+                # Ordering barrier (#clarify-ordering): flush any buffered
+                # assistant prose (interim commentary / streamed deltas) to the
+                # platform BEFORE sending the poll.  The poll is delivered on a
+                # separate, agent-thread-blocking path; without this barrier it
+                # races ahead of prose still sitting in the stream consumer's
+                # queue, so the question renders ABOVE its own explanation.
+                # Best-effort + short timeout: never hang the agent thread if
+                # the consumer task isn't running.
+                try:
+                    _sc = stream_consumer_holder[0] if stream_consumer_holder else None
+                    _flush = getattr(_sc, "flush_pending_sync", None)
+                    if callable(_flush):
+                        _flush(timeout=3.0)
+                except Exception:
+                    logger.debug(
+                        "Stream-consumer flush before clarify prompt failed",
+                        exc_info=True,
+                    )
 
                 send_ok = False
                 fut = safe_schedule_threadsafe(

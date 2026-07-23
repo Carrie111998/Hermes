@@ -42,6 +42,7 @@ class _FakeAgent:
         self.session_id = "sess-1"
         self.model = "test/model"
         self.provider = "openrouter"
+        self.requested_provider = "openrouter"
         self.base_url = "https://openrouter.ai/api/v1"
         self.api_key = "sk-x"
         self.api_mode = "chat_completions"
@@ -273,6 +274,7 @@ def test_runtime_main_sync_happens_after_restore():
         agent.base_url = "https://api.anthropic.com"
         agent.api_key = "primary-key"
         agent.api_mode = "anthropic_messages"
+        agent.requested_provider = "anthropic"
 
     agent._restore_primary_runtime = restore_primary
     calls = []
@@ -289,6 +291,7 @@ def test_runtime_main_sync_happens_after_restore():
             "api_key": "primary-key",
             "api_mode": "anthropic_messages",
             "auth_mode": "",
+            "requested_provider": "anthropic",
         },
     )]
 
@@ -400,3 +403,53 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
+
+
+def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=4_000_000_000.0,
+    )
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_not_called()
+    agent._compress_context.assert_not_called()
+
+
+def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
+    db_path = tmp_path / "state.db"
+    _make_agent_with_cooldown(
+        db_path,
+        "sess-1",
+        cooldown_until=4_000_000_000.0,
+    )
+    agent = _make_agent_with_cooldown(db_path, "sess-2")
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called()
+
+
+def test_expired_cooldown_allows_preflight(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=1.0,
+    )
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called()
