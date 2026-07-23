@@ -5,6 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
+// Imported statically, not lazily inside renderMessaging(): vi.mock is hoisted
+// above imports either way, but a dynamic import inside the test body bills the
+// whole module graph's transform cost to whichever test runs first. Under full
+// -suite parallelism that graph took >30s to pull, timing out the first test
+// while every later test in the file reused the warm cache and passed.
+import { MessagingView } from './index'
+
 const getMessagingPlatforms = vi.fn()
 const updateMessagingPlatform = vi.fn()
 const openExternalLink = vi.fn()
@@ -52,7 +59,6 @@ afterEach(() => {
 })
 
 async function renderMessaging() {
-  const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(

@@ -8,6 +8,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as HermesApi from '@/hermes'
 import { queryClient } from '@/lib/query-client'
 
+// Imported statically, not lazily inside renderSkills(): vi.mock is hoisted
+// above imports either way, but a dynamic import inside the test body bills the
+// whole module graph's transform cost to whichever test runs first. Under full
+// -suite parallelism that graph took >30s to pull, timing out the first test
+// and leaving its half-mounted tree to poison the rest of the file.
+import { SkillsView } from './index'
+
 const getSkills = vi.fn()
 const getToolsets = vi.fn()
 const toggleSkill = vi.fn()
@@ -59,7 +66,6 @@ function toolset(overrides: Record<string, unknown> = {}) {
 }
 
 async function renderSkills() {
-  const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(

@@ -9,4 +9,7 @@ import { configure } from '@testing-library/react'
 // panels (radix menus, refetch chains) when the full suite runs under xdist
 // CPU contention in CI. Success still resolves the instant the node appears;
 // the wider deadline only absorbs a starved runner, killing timing flakes.
-configure({ asyncUtilTimeout: 5000 })
+// Must stay below the project testTimeout in vitest.config.ts, so an element
+// that never arrives is reported as a query failure naming the missing node
+// rather than as a bare "Test timed out".
+configure({ asyncUtilTimeout: 15_000 })

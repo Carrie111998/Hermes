@@ -8,3 +8,9 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Enforce LF for Node scripts too. A `#!` line followed by CRLF survives Vite's
+# shebang blanking (it only fires when the transformed code still starts with
+# `#`), so a Windows checkout makes every vitest import of such a module die
+# with "SyntaxError: Invalid or unexpected token".
+*.mjs       text eol=lf

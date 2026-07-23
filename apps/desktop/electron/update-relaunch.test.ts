@@ -57,7 +57,9 @@ test(
   // built with path.join and stays drive-less (\home\u\...), so the segment
   // prefix check can never match. The behavior is correct on Linux; skip the
   // faithless reproduction on win32.
-  { skip: process.platform === 'win32' && 'POSIX-absolute-path resolution differs on win32' },
+  // vitest types `skip` as a plain boolean and has no reason field, so the
+  // rationale stays in the comment above rather than in an inert string.
+  { skip: process.platform === 'win32' },
   () => {
     const exec = path.join(UNPACKED, 'hermes')
     assert.equal(resolveUnpackedRelease(exec, ROOT, 'linux'), UNPACKED)
