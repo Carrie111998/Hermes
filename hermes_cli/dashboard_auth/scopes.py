@@ -19,20 +19,21 @@ from urllib.parse import unquote
 from starlette.requests import Request
 
 # Scope names that must never appear on handoff tokens.
+# Canonical set — do not duplicate elsewhere (ws_tickets / middleware).
 FORBIDDEN_HANDOFF_SCOPES: frozenset[str] = frozenset(
     {"*", "superuser", "API_SERVER_KEY", "admin"}
 )
 
 RESUME_SCOPE = "resume"
 
+# Exact effective scopes for every handoff mint / verify / consume.
+EXACT_HANDOFF_SCOPES: tuple[str, ...] = (RESUME_SCOPE,)
+
 # WebSocket paths a resume session may mint tickets for (and connect to).
-RESUME_WS_ENDPOINTS: frozenset[str] = frozenset(
-    {
-        "/api/pty",
-        "/api/ws",
-        "/api/events",
-    }
-)
+# Empty until destination handlers enforce ticket-bound session/profile
+# (Oscar F-01). Prefer remove /api/pty + /api/ws (+ /api/events) rather
+# than allowlist endpoint names without bind.
+RESUME_WS_ENDPOINTS: frozenset[str] = frozenset()
 
 # Exact REST paths always allowed for resume (method checked separately).
 _RESUME_REST_EXACT: frozenset[tuple[str, str]] = frozenset(
@@ -73,18 +74,35 @@ def session_is_full_dashboard(sess: Any) -> bool:
     return not session_is_restricted(sess)
 
 
+def exact_handoff_scopes_or_none(
+    scopes: Iterable[str] | None,
+) -> Optional[tuple[str, ...]]:
+    """Canonical handoff scope validator (mint / verify / consume).
+
+    - Empty / missing → ``(\"resume\",)`` (restricted, never full dashboard).
+    - Exact ``resume`` only (dupes collapsed) → ``(\"resume\",)``.
+    - ``admin``, unknown, forbidden, or mixed extras → ``None`` (reject).
+    """
+    names = [str(s).strip() for s in (scopes or ()) if str(s).strip()]
+    if not names:
+        return EXACT_HANDOFF_SCOPES
+    uniq: list[str] = []
+    for n in names:
+        if n not in uniq:
+            uniq.append(n)
+    if uniq == [RESUME_SCOPE]:
+        return EXACT_HANDOFF_SCOPES
+    return None
+
+
 def sanitize_handoff_scopes(scopes: Iterable[str] | None) -> tuple[str, ...]:
-    """Return only the allowed resume scope; drop forbidden / unknown names."""
-    out: list[str] = []
-    for s in scopes or ():
-        name = str(s).strip()
-        if not name or name in FORBIDDEN_HANDOFF_SCOPES:
-            continue
-        if name == RESUME_SCOPE and RESUME_SCOPE not in out:
-            out.append(RESUME_SCOPE)
-    # Handoff always means resume-only. Empty after sanitize is still restricted
-    # if the caller intended scopes — mint path forces RESUME_SCOPE explicitly.
-    return tuple(out)
+    """Return exact ``(\"resume\",)`` or ``()`` when scopes are invalid.
+
+    Prefer :func:`exact_handoff_scopes_or_none` at security boundaries so
+    callers can distinguish reject from empty without ambiguity.
+    """
+    exact = exact_handoff_scopes_or_none(scopes)
+    return exact if exact is not None else ()
 
 
 def bound_session_id(sess: Any) -> str:
@@ -150,9 +168,8 @@ def resume_request_allowed(request: Request, sess: Any) -> bool:
     if not session_is_restricted(sess):
         return True
 
-    scopes = set(session_scopes(sess))
-    # Only resume is supported. Any other non-empty set without resume is deny.
-    if RESUME_SCOPE not in scopes:
+    # Exact resume only — admin / unknown / mixed extras get nothing.
+    if exact_handoff_scopes_or_none(session_scopes(sess)) is None:
         return False
 
     method = (request.method or "GET").upper()
@@ -193,18 +210,39 @@ def scope_denial_detail(request: Request, sess: Any) -> str:
 
 
 def is_handoff_consume_request(request: Request) -> bool:
-    """True only for the phone resume entry: GET …/chat (last path segment).
+    """True only for exact canonical GET ``/chat`` (plus validated prefix).
 
-    F-03: handoff tickets must not be consumed on ``/``, ``/api/*``, or POST.
+    F-02 / Oscar M2: no last-segment match. Reject trailing slash, nested
+    paths, API-shaped paths, doubled slashes, and non-canonical encodings.
+    Rejected attempts must not consume the ticket.
     """
     if (request.method or "GET").upper() != "GET":
         return False
-    path = request.url.path or "/"
-    # Drop trailing slash except root.
-    if path != "/" and path.endswith("/"):
-        path = path.rstrip("/")
-    parts = [p for p in path.split("/") if p]
-    return bool(parts) and parts[-1] == "chat"
+
+    from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
+    prefix = prefix_from_request(request) or ""
+    expected = f"{prefix}/chat" if prefix else "/chat"
+
+    path = request.url.path or ""
+    if path != expected:
+        return False
+
+    # ASGI raw_path is the on-the-wire bytes before decoding. When present,
+    # require the same exact canonical bytes so %2F / %63 tricks cannot mint.
+    raw = request.scope.get("raw_path")
+    if raw is not None:
+        try:
+            raw_s = (
+                raw.decode("ascii")
+                if isinstance(raw, (bytes, bytearray))
+                else str(raw)
+            )
+        except UnicodeDecodeError:
+            return False
+        if raw_s != expected:
+            return False
+    return True
 
 
 def handoff_redirect_location(info: dict, *, prefix: str = "") -> str:
@@ -289,11 +327,13 @@ def validate_handoff_target(
 
 
 __all__ = [
+    "EXACT_HANDOFF_SCOPES",
     "FORBIDDEN_HANDOFF_SCOPES",
     "RESUME_SCOPE",
     "RESUME_WS_ENDPOINTS",
     "bound_profile",
     "bound_session_id",
+    "exact_handoff_scopes_or_none",
     "handoff_redirect_location",
     "is_handoff_consume_request",
     "require_full_dashboard_session",

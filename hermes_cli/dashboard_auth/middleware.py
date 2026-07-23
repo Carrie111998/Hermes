@@ -594,16 +594,16 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
     import time
 
     from hermes_cli.dashboard_auth.scopes import (
+        exact_handoff_scopes_or_none,
         handoff_redirect_location,
         is_handoff_consume_request,
     )
     from hermes_cli.dashboard_auth.ws_tickets import (
-        HANDOFF_SCOPES,
         TicketInvalid,
         consume_handoff_ticket,
     )
 
-    # F-03: do not consume outside GET /chat (ticket stays usable).
+    # F-03 / M2: do not consume outside exact GET /chat (ticket stays usable).
     if not is_handoff_consume_request(request):
         return None
 
@@ -617,9 +617,8 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
         )
         return None
 
-    scopes = tuple(info.get("scopes") or HANDOFF_SCOPES)
-    forbidden = {"*", "superuser", "API_SERVER_KEY"}
-    if forbidden.intersection(scopes):
+    scopes = tuple(info.get("scopes") or ())
+    if exact_handoff_scopes_or_none(scopes) is None:
         audit_log(
             AuditEvent.HANDOFF_TICKET_REJECTED,
             reason="forbidden_scope",

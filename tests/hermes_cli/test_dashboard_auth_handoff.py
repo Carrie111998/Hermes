@@ -335,14 +335,19 @@ def _resume_phone(gated_app, session_id: str = "resume-bound") -> TestClient:
 
 
 def test_resume_cookie_denies_env_reveal(gated_app):
+    """M4: real sink is POST /api/env/reveal, not GET /api/env/{key}/reveal."""
     phone = _resume_phone(gated_app)
-    r = phone.get("/api/env/OPENAI_API_KEY/reveal")
+    r = phone.post("/api/env/reveal", json={"key": "OPENAI_API_KEY"})
     assert r.status_code in (401, 403), r.text
 
 
 def test_resume_cookie_denies_env_put(gated_app):
+    """M4: real sink is PUT /api/env, not PUT /api/env/{key}."""
     phone = _resume_phone(gated_app)
-    r = phone.put("/api/env/OPENAI_API_KEY", json={"value": "sk-evil"})
+    r = phone.put(
+        "/api/env",
+        json={"key": "OPENAI_API_KEY", "value": "sk-evil"},
+    )
     assert r.status_code in (401, 403), r.text
 
 
@@ -372,8 +377,17 @@ def test_resume_cookie_allows_bound_session_detail(gated_app):
     assert r.status_code not in (401, 403), r.text
 
 
-def test_resume_cookie_ws_ticket_is_scoped_not_generic(gated_app):
-    """Resume may mint a WS ticket, but it must carry allowed_endpoints."""
+def test_resume_cookie_ws_ticket_denies_unbound_ws_endpoints(gated_app):
+    """M1: resume WS tickets must not open /api/pty or /api/ws until bind exists.
+
+    allowed_endpoints is empty (or lacks pty/ws); every destination is denied.
+    """
+    from hermes_cli.dashboard_auth.scopes import RESUME_WS_ENDPOINTS
+
+    assert "/api/pty" not in RESUME_WS_ENDPOINTS
+    assert "/api/ws" not in RESUME_WS_ENDPOINTS
+    assert "/api/events" not in RESUME_WS_ENDPOINTS
+
     phone = _resume_phone(gated_app, "ws-bound")
     r = phone.post("/api/auth/ws-ticket")
     assert r.status_code == 200, r.text
@@ -384,8 +398,12 @@ def test_resume_cookie_ws_ticket_is_scoped_not_generic(gated_app):
     assert info.get("scopes") == ["resume"]
     allowed = info.get("allowed_endpoints")
     assert allowed is not None
-    assert "/api/ws" in allowed
+    assert "/api/pty" not in allowed
+    assert "/api/ws" not in allowed
     assert "/api/console" not in allowed
+    assert "/api/events" not in allowed
+    # Bind metadata is recorded for a future destination-bind slice.
+    assert info.get("bound_session_id") == "ws-bound"
 
     class _FakeWS:
         def __init__(self, path):
@@ -395,9 +413,16 @@ def test_resume_cookie_ws_ticket_is_scoped_not_generic(gated_app):
             self.app = web_server.app
             self.url = type("U", (), {"path": path})()
 
-    reason, cred = web_server._ws_auth_reason(_FakeWS("/api/console"))
-    assert reason == "ticket_endpoint_denied"
-    assert cred == "ticket"
+    for path in ("/api/pty", "/api/ws", "/api/console", "/api/events"):
+        # Fresh ticket per path (consume is single-use).
+        r2 = phone.post("/api/auth/ws-ticket")
+        assert r2.status_code == 200, r2.text
+        t = r2.json()["ticket"]
+        ws = _FakeWS(path)
+        ws.query_params = {"ticket": t}
+        reason, cred = web_server._ws_auth_reason(ws)
+        assert reason == "ticket_endpoint_denied", (path, reason, cred)
+        assert cred == "ticket"
 
 
 def test_resume_cookie_cannot_mint_handoff(gated_app):
@@ -433,7 +458,7 @@ def test_consume_ticket_wins_over_resume_query_mismatch(gated_app):
 
 
 # ---------------------------------------------------------------------------
-# F-03: consume placement — no cookie mint outside GET /chat
+# F-03 / M2: consume placement — exact GET /chat only
 # ---------------------------------------------------------------------------
 
 
@@ -469,3 +494,153 @@ def test_root_with_handoff_does_not_set_cookies(gated_app):
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     phone.get(f"/?handoff={ticket}", follow_redirects=False)
     assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+
+
+@pytest.mark.parametrize(
+    "hostile_path",
+    [
+        "/chat/",
+        "/chat//",
+        "/nested/chat",
+        "/api/config/chat",
+        "/api/chat",
+        "//chat",
+        "/CHAT",
+        "/chat/extra",
+    ],
+)
+def test_hostile_path_does_not_consume_handoff(gated_app, hostile_path):
+    """M2: non-canonical paths must not mint cookies or burn the ticket."""
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "place-hostile")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone.get(f"{hostile_path}?handoff={ticket}", follow_redirects=False)
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone), hostile_path
+
+    # Ticket remains valid for exact /chat once.
+    r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r2.status_code == 302, (hostile_path, r2.status_code, r2.text)
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+def test_encoded_path_variants_do_not_consume_handoff(gated_app):
+    """M2: encoded separators / letters must not satisfy exact /chat."""
+    from hermes_cli.dashboard_auth.scopes import is_handoff_consume_request
+    from starlette.requests import Request
+
+    def _req(path: str, raw: bytes | None = None) -> Request:
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "https",
+            "path": path,
+            "raw_path": raw if raw is not None else path.encode("ascii"),
+            "query_string": b"",
+            "headers": [],
+            "client": ("1.2.3.4", 1234),
+            "server": ("fly-app.fly.dev", 443),
+        }
+        return Request(scope)
+
+    # Decoded lookalikes that must fail when raw_path is non-canonical.
+    assert not is_handoff_consume_request(_req("/chat", raw=b"/%63hat"))
+    assert not is_handoff_consume_request(_req("/chat", raw=b"/chat%2F"))
+    assert not is_handoff_consume_request(
+        _req("/api/config/chat", raw=b"/api%2Fconfig%2Fchat")
+    )
+    assert not is_handoff_consume_request(_req("/chat/", raw=b"/chat/"))
+    assert not is_handoff_consume_request(_req("/nested/chat", raw=b"/nested/chat"))
+    # Canonical exact path is accepted.
+    assert is_handoff_consume_request(_req("/chat", raw=b"/chat"))
+
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "place-encoded")
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    # Live client: percent-encoded path segments that ASGI may decode.
+    for path in ("/%63hat", "/chat%2F", "/api%2Fconfig%2Fchat"):
+        phone2 = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+        phone2.get(f"{path}?handoff={ticket}", follow_redirects=False)
+        assert SESSION_AT_COOKIE not in _bare_cookie_names(phone2), path
+
+    r_ok = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r_ok.status_code == 302
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+# ---------------------------------------------------------------------------
+# M3: exact ('resume',) scopes only
+# ---------------------------------------------------------------------------
+
+
+def test_exact_handoff_scopes_reject_admin_and_extras():
+    from hermes_cli.dashboard_auth.scopes import (
+        EXACT_HANDOFF_SCOPES,
+        exact_handoff_scopes_or_none,
+        sanitize_handoff_scopes,
+    )
+
+    assert exact_handoff_scopes_or_none(None) == EXACT_HANDOFF_SCOPES
+    assert exact_handoff_scopes_or_none(()) == EXACT_HANDOFF_SCOPES
+    assert exact_handoff_scopes_or_none(("resume",)) == EXACT_HANDOFF_SCOPES
+    assert exact_handoff_scopes_or_none(("resume", "resume")) == EXACT_HANDOFF_SCOPES
+    assert exact_handoff_scopes_or_none(("admin",)) is None
+    assert exact_handoff_scopes_or_none(("resume", "admin")) is None
+    assert exact_handoff_scopes_or_none(("*",)) is None
+    assert exact_handoff_scopes_or_none(("unknown",)) is None
+    assert sanitize_handoff_scopes(("resume", "admin")) == ()
+    assert sanitize_handoff_scopes(("admin",)) == ()
+
+
+def test_verify_handoff_token_rejects_admin_scope(gated_app):
+    """M3: forged admin/mixed scope payloads must not yield a Session."""
+    payload_admin = {
+        "sub": "u1",
+        "email": "",
+        "name": "",
+        "org_id": "",
+        "provider": "stub",
+        "session_id": "s1",
+        "profile": "default",
+        "scopes": ["admin"],
+        "kind": "handoff",
+        "exp": 2_000_000_000,
+    }
+    payload_mixed = dict(payload_admin)
+    payload_mixed["scopes"] = ["resume", "admin"]
+    payload_ok = dict(payload_admin)
+    payload_ok["scopes"] = ["resume"]
+    payload_empty = dict(payload_admin)
+    payload_empty["scopes"] = []
+
+    tok_admin = ws_tickets._sign_handoff_session(payload_admin)
+    tok_mixed = ws_tickets._sign_handoff_session(payload_mixed)
+    tok_ok = ws_tickets._sign_handoff_session(payload_ok)
+    tok_empty = ws_tickets._sign_handoff_session(payload_empty)
+
+    assert ws_tickets.verify_handoff_session_token(tok_admin) is None
+    assert ws_tickets.verify_handoff_session_token(tok_mixed) is None
+    sess = ws_tickets.verify_handoff_session_token(tok_ok)
+    assert sess is not None
+    assert sess.scopes == ("resume",)
+    sess_empty = ws_tickets.verify_handoff_session_token(tok_empty)
+    assert sess_empty is not None
+    assert sess_empty.scopes == ("resume",)
+
+
+def test_consume_handoff_ticket_rejects_non_exact_scopes(gated_app):
+    """M3: ticket store payload with admin/mixed scopes fails closed."""
+    ticket = ws_tickets.mint_handoff_ticket(
+        session_id="s-scope",
+        user_id="u1",
+        provider="stub",
+    )
+    with ws_tickets._lock:
+        exp, info = ws_tickets._handoff_tickets[ticket]
+        evil = dict(info)
+        evil["scopes"] = ["resume", "admin"]
+        ws_tickets._handoff_tickets[ticket] = (exp, evil)
+    with pytest.raises(ws_tickets.TicketInvalid, match="forbidden handoff scope"):
+        ws_tickets.consume_handoff_ticket(ticket)

@@ -48,6 +48,10 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli.dashboard_auth.base import Session
+from hermes_cli.dashboard_auth.scopes import (
+    EXACT_HANDOFF_SCOPES,
+    exact_handoff_scopes_or_none,
+)
 
 #: Time-to-live for newly-minted WS tickets in seconds. 30 s is long enough
 #: that the SPA can call ``getWsTicket()`` and immediately open the WS,
@@ -71,11 +75,9 @@ HANDOFF_TICKET_PREFIX = "hnd_"
 HANDOFF_SESSION_TTL_SECONDS = 45 * 60  # F-04: shortened from 4h
 
 #: Least-privilege scope attached to every handoff-minted browser session.
-#: Explicitly excludes superuser / API_SERVER_KEY / wildcard power.
-HANDOFF_SCOPES: tuple[str, ...] = ("resume",)
-
-#: Scopes a handoff session must never carry.
-_FORBIDDEN_HANDOFF_SCOPES = frozenset({"*", "superuser", "API_SERVER_KEY"})
+#: Explicitly excludes superuser / API_SERVER_KEY / wildcard / admin power.
+#: Canonical value lives in scopes.EXACT_HANDOFF_SCOPES — single source.
+HANDOFF_SCOPES: tuple[str, ...] = EXACT_HANDOFF_SCOPES
 
 _lock = threading.Lock()
 _tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
@@ -219,9 +221,9 @@ def mint_handoff_ticket(
             "exp": session_exp,
         }
     )
-    # Hard invariant at mint time.
-    if _FORBIDDEN_HANDOFF_SCOPES.intersection(HANDOFF_SCOPES):
-        raise RuntimeError("handoff scopes must not include superuser power")
+    # Hard invariant at mint time — scopes constant must stay exact resume.
+    if exact_handoff_scopes_or_none(HANDOFF_SCOPES) != EXACT_HANDOFF_SCOPES:
+        raise RuntimeError("handoff scopes must be exactly ('resume',)")
 
     ticket = HANDOFF_TICKET_PREFIX + secrets.token_urlsafe(32)
     info: Dict[str, Any] = {
@@ -264,8 +266,8 @@ def consume_handoff_ticket(ticket: str) -> Dict[str, Any]:
             raise TicketInvalid("expired")
 
     scopes = tuple(info.get("scopes") or ())
-    if _FORBIDDEN_HANDOFF_SCOPES.intersection(scopes):
-        # Fail closed — never hand out a superuser-scoped handoff session.
+    if exact_handoff_scopes_or_none(scopes) is None:
+        # Fail closed — never hand out non-exact resume handoff sessions.
         raise TicketInvalid("forbidden handoff scope")
     return info
 
@@ -287,13 +289,10 @@ def verify_handoff_session_token(access_token: str) -> Optional[Session]:
     if exp <= int(time.time()):
         return None
     scopes = tuple(payload.get("scopes") or ())
-    if not scopes:
-        scopes = HANDOFF_SCOPES
-    if _FORBIDDEN_HANDOFF_SCOPES.intersection(scopes):
+    exact = exact_handoff_scopes_or_none(scopes)
+    if exact is None:
         return None
-    # Empty scopes after forbid filter must not become a full-dashboard session.
-    if not scopes:
-        return None
+    scopes = exact
     return Session(
         user_id=str(payload.get("sub") or ""),
         email=str(payload.get("email") or ""),
