@@ -8670,6 +8670,12 @@ async def apply_whatsapp_onboarding(
         gateway_profile = record.gateway_profile
 
     effective_profile = body.profile or profile or record_profile
+    requested_profile = (effective_profile or "").strip()
+    if requested_profile and requested_profile.lower() != "current":
+        # Ownership resolution probes gateway pid/state paths. Validate the
+        # profile before any of those paths are derived so an apply-body
+        # override cannot escape the profiles root.
+        _resolve_profile_dir(requested_profile)
     if gateway_profile is None or effective_profile != record_profile:
         from hermes_cli.whatsapp_setup import resolve_whatsapp_gateway_profile
 

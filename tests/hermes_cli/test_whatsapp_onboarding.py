@@ -163,6 +163,7 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
         yield
 
     monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_resolve_profile_dir", lambda _profile: None)
     monkeypatch.setattr(ws, "save_env_value", lambda key, value: saved.setdefault(key, value))
     monkeypatch.setattr(ws, "remove_env_value", lambda key: removed.append(key))
     monkeypatch.setattr(whatsapp_setup, "persist_whatsapp_enabled", lambda value: enabled.append(value))
@@ -204,6 +205,45 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
     assert enabled == [True]
     assert restarted == ["default"]
     assert "pairing" not in ws._whatsapp_onboarding_sessions
+
+
+def test_apply_whatsapp_onboarding_validates_profile_before_gateway_probe(monkeypatch):
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path="/tmp/session",
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+        profile="work",
+        status="connected",
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+    probes = []
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda profile: probes.append(profile) or "default",
+    )
+
+    try:
+        asyncio.run(
+            ws.apply_whatsapp_onboarding(
+                "pairing",
+                ws.WhatsAppOnboardingApply(profile="../escape"),
+            )
+        )
+    except ws.HTTPException as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("path-like profile must be rejected")
+
+    assert probes == []
+    assert "pairing" in ws._whatsapp_onboarding_sessions
 
 
 def test_whatsapp_restart_forces_explicit_default_owner(monkeypatch):
