@@ -581,24 +581,39 @@ class WorkflowEngine:
 
     def _get_session_info(self) -> dict:
         """Capture gateway session info for subscription routing."""
+        # Try ContextVars first (works when called from gateway session)
         try:
             from gateway.session_context import get_session_env
             platform = get_session_env("HERMES_SESSION_PLATFORM", "")
             chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-            if not platform or not chat_id:
-                return {}
-            return {
-                "platform": platform,
-                "chat_id": chat_id,
-                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
-                "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
-                "profile": (
-                    get_session_env("HERMES_SESSION_PROFILE", "")
-                    or os.environ.get("HERMES_PROFILE")
-                ),
-            }
+            if platform and chat_id:
+                return {
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+                    "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
+                    "profile": (
+                        get_session_env("HERMES_SESSION_PROFILE", "")
+                        or os.environ.get("HERMES_PROFILE")
+                    ),
+                }
         except Exception:
-            return {}
+            pass
+        # Fallback: os.environ (kanban tools also check this)
+        try:
+            platform = os.environ.get("HERMES_SESSION_PLATFORM", "")
+            chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "")
+            if platform and chat_id:
+                return {
+                    "platform": platform,
+                    "chat_id": chat_id,
+                    "thread_id": os.environ.get("HERMES_SESSION_THREAD_ID") or None,
+                    "user_id": os.environ.get("HERMES_SESSION_USER_ID") or None,
+                    "profile": os.environ.get("HERMES_SESSION_PROFILE") or os.environ.get("HERMES_PROFILE"),
+                }
+        except Exception:
+            pass
+        return {}
 
     def _subscribe_final_cards(self, card_ids: list[str],
                                 session_info: dict = None) -> None:
