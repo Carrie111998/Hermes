@@ -299,14 +299,37 @@ if ($FastRepack) {
     }
     Write-Ok "前端编译完成"
 
-    Write-Host "`n  [4b] 用新 dist 覆盖 app.asar..." -ForegroundColor DarkCyan
+    Write-Host "`n  [4b] 用新 dist 覆盖 app.asar...`n  （asar 需包含 dist + electron + assets + public + package.json）" -ForegroundColor DarkCyan
     $asarTool = Join-Path $desktopDir "node_modules\.bin\asar.CMD"
-    if (Test-Path $asarTool) {
-        & $asarTool pack (Join-Path $desktopDir "dist") (Join-Path $releaseDir "win-unpacked\resources\app.asar")
-        if ($LASTEXITCODE -ne 0) { Stop-Build "asar pack 失败" }
-        Write-Ok "app.asar 已更新"
+    # asar pack 必须打包整个 app 目录（dist + electron + assets + public + package.json），
+    # 不能只打包 dist。如果只打包 dist，electron main.cjs 入口会丢失，
+    # 导致安装后退化成 Electron 默认欢迎页（版本号画面）。
+    # 解决方案：创建临时 staging 目录 → pack → 验证。
+    $asarBin = Join-Path $repoRoot "node_modules\@electron\asar\bin\asar.js"
+    $asarResolved = if (Test-Path $asarTool) { $asarTool } elseif (Test-Path $asarBin) { "node `"$asarBin`"" } else { $null }
+    if ($asarResolved) {
+        $stagingDir = Join-Path $env:TEMP "qiji-asar-staging"
+        if (Test-Path $stagingDir) { Remove-Item -Recurse -Force $stagingDir }
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+        foreach ($sub in @("dist", "electron", "assets", "public", "package.json")) {
+            $src = Join-Path $desktopDir $sub
+            if (Test-Path $src) {
+                Copy-Item -Path $src -Destination $stagingDir -Recurse -Force
+            }
+        }
+        Push-Location $stagingDir
+        if ($asarResolved -eq $asarTool) {
+            & $asarResolved pack . (Join-Path $releaseDir "win-unpacked\resources\app.asar")
+        } else {
+            & node $asarBin pack . (Join-Path $releaseDir "win-unpacked\resources\app.asar")
+        }
+        $asarExit = $LASTEXITCODE
+        Pop-Location
+        Remove-Item -Recurse -Force $stagingDir -ErrorAction SilentlyContinue
+        if ($asarExit -ne 0) { Stop-Build "asar pack 失败" }
+        Write-Ok "app.asar 已更新（含完整 app 目录）"
     } else {
-        Stop-Build "asar 工具不可用（node_modules/.bin/asar.CMD 缺失）。FastRepack 无法更新 app.asar，前端改动不会生效。用完整编译（不带 -FastRepack）代替。"
+        Stop-Build "asar 工具不可用（node_modules/.bin/asar.CMD 和 @electron/asar 均缺失）。FastRepack 无法更新 app.asar，前端改动不会生效。用完整编译（不带 -FastRepack）代替。"
     }
 
     Write-Host "`n  [4c] 7z 压缩 + launcher3 拼接..." -ForegroundColor DarkCyan
