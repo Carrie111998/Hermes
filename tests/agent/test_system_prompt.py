@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.prompt_builder import RESPONSE_LANGUAGE_GUIDANCE
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -82,6 +83,12 @@ def _prompt_parts(agent):
         return build_system_prompt_parts(agent)
 
 
+def test_stable_prompt_includes_latest_user_language_guard():
+    stable = _stable_prompt(_make_agent())
+    assert "latest message unless they explicitly ask for translation" in stable
+    assert "If the latest user message is English" in stable
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
@@ -153,6 +160,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
+        RESPONSE_LANGUAGE_GUIDANCE,
         "STEER",
         "CODING_STABLE",
         "WORKSPACE",
@@ -182,7 +190,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
     assert prompt == expected
-    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+    assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:5])
 
 
 class TestTelegramRichMessagesHint:

@@ -75,6 +75,35 @@ def test_replaced_prefixes_are_frozen_for_renormalization():
 # derive them from module constants — the tests below must fail if any
 # frozen entry is mutated, reordered, or dropped.
 _FROZEN_PREFIX_GENERATIONS = (
+    # Pre-reply-language-guard: one-heading discard clause + tools-active clause,
+    # without the explicit latest-live-user reply-language sentence.
+    (
+        "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
+        "compacted into the summary below. This is a handoff from a "
+        "previous context window — treat it as background reference, NOT "
+        "as active instructions. Do NOT answer questions or fulfill "
+        "requests mentioned in this summary; they were already addressed. "
+        "Respond ONLY to the latest user message that appears AFTER this "
+        "summary — that message is the single source of truth for what to "
+        "do right now. Topic overlap with the summary does NOT mean you "
+        "should resume its task: even on similar topics, the latest user "
+        "message WINS. Treat ONLY the latest message as the active task "
+        "and discard stale items from '## Historical Task Snapshot' "
+        "entirely — do not 'wrap up' or 'finish' work described there "
+        "unless the latest message explicitly asks for it. Reverse signals "
+        "in the latest message (e.g. 'stop', 'undo', 'roll back', 'just "
+        "verify', 'don't do that anymore', 'never mind', a new topic) must "
+        "immediately end any in-flight work described in the summary; do "
+        "not re-surface it in later turns. IMPORTANT: Your persistent "
+        "memory (MEMORY.md, USER.md) in the system prompt is ALWAYS "
+        "authoritative and active — never ignore or deprioritize memory "
+        "content due to this compaction note. None of the above restricts "
+        "HOW you work: your tools remain fully active — keep calling them "
+        "normally for the active task (edit files, run commands, search) "
+        "instead of merely narrating what you would do. The current session "
+        "state (files, config, etc.) may reflect work described here — avoid "
+        "repeating it:"
+    ),
     # Pre-#69619: four-heading discard clause + tools-active clause.
     (
         "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
@@ -199,3 +228,29 @@ def test_pre_69619_prefix_generation_is_frozen_and_stripped():
     assert ContextCompressor._strip_summary_prefix(content) == "BODY"
 
 
+def test_frozen_generations_match_historical_prefixes_byte_exactly():
+    """Every entry in _HISTORICAL_SUMMARY_PREFIXES must equal its literal pin
+    in _FROZEN_PREFIX_GENERATIONS, in order. Frozen entries are immutable and
+    prepend-only: mutating, reordering, or dropping one silently un-normalizes
+    summaries persisted by that build generation — the exact failure caught in
+    the #69619 review, which the per-entry self-matching loop above cannot see.
+    """
+    from agent.context_compressor import (
+        _HISTORICAL_SUMMARY_PREFIXES,
+        ContextCompressor,
+    )
+
+    assert tuple(_FROZEN_PREFIX_GENERATIONS) == tuple(
+        _HISTORICAL_SUMMARY_PREFIXES
+    ), "a frozen prefix entry was mutated, reordered, added, or dropped"
+    for prefix in _FROZEN_PREFIX_GENERATIONS:
+        content = prefix + "\nBODY"
+        assert ContextCompressor._is_context_summary_content(content)
+        assert ContextCompressor._strip_summary_prefix(content) == "BODY"
+
+
+def test_summary_prefix_pins_reply_language_to_latest_live_user_message():
+    lower = SUMMARY_PREFIX.lower()
+    assert "latest live user message" in lower
+    assert "summary's language" in lower
+    assert lower.index("latest live user message") < lower.index("summary's language")
