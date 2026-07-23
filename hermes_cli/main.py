@@ -2824,11 +2824,21 @@ def cmd_whatsapp(args):
     # Pairing is a single-owner maintenance operation. Disable WhatsApp in
     # both persisted config stores and restart a running gateway before
     # touching the session directory. Failed/cancelled pairing stays disabled.
-    from hermes_cli.whatsapp_setup import prepare_whatsapp_pairing
+    from hermes_cli import profiles
+    from hermes_cli.whatsapp_setup import (
+        prepare_whatsapp_pairing,
+        resolve_whatsapp_gateway_profile,
+    )
 
     try:
-        gateway_restarted = prepare_whatsapp_pairing()
-    except RuntimeError as exc:
+        current_profile = profiles.get_active_profile_name()
+        pairing_profile = None if current_profile == "custom" else current_profile
+        gateway_profile = resolve_whatsapp_gateway_profile(pairing_profile)
+        gateway_restarted = prepare_whatsapp_pairing(
+            profile=pairing_profile,
+            gateway_profile=gateway_profile,
+        )
+    except Exception as exc:
         print(f"\n✗ Could not prepare WhatsApp pairing: {exc}")
         print("  WhatsApp remains disabled; fix the gateway restart and try again.")
         return
@@ -2882,13 +2892,24 @@ def cmd_whatsapp(args):
         and (session_dir / "creds.json").exists()
     )
     if pairing_succeeded:
-        from hermes_cli.whatsapp_setup import activate_whatsapp_after_pairing
+        from hermes_cli.whatsapp_setup import (
+            activate_whatsapp_after_pairing,
+            restart_gateway_if_running,
+        )
 
         try:
-            gateway_restarted = activate_whatsapp_after_pairing()
-        except RuntimeError as exc:
+            activate_whatsapp_after_pairing(restart_gateway=False)
+        except Exception as exc:
+            print(f"  ✗ WhatsApp paired, but could not be enabled: {exc}")
+            print("  The verified session was retained, but WhatsApp remains disabled.")
+            return
+        try:
+            gateway_restarted = restart_gateway_if_running(
+                profile=gateway_profile,
+            )
+        except Exception as exc:
             gateway_restarted = False
-            print(f"  ⚠ Paired, but gateway restart failed: {exc}")
+            print(f"  ⚠ Paired and enabled, but gateway restart failed: {exc}")
         print("✓ WhatsApp paired successfully!")
         if gateway_restarted:
             print("✓ Gateway restarted with the verified WhatsApp session")

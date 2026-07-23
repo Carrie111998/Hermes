@@ -148,20 +148,31 @@ def test_messaging_payload_includes_safe_whatsapp_setup(monkeypatch):
 
 
 def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
+    from contextlib import contextmanager
+
     from hermes_cli import web_server as ws
     from hermes_cli import whatsapp_setup
 
     saved = {}
     removed = []
     enabled = []
+    restarted = []
 
+    @contextmanager
+    def profile_scope(_profile):
+        yield
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
     monkeypatch.setattr(ws, "save_env_value", lambda key, value: saved.setdefault(key, value))
     monkeypatch.setattr(ws, "remove_env_value", lambda key: removed.append(key))
     monkeypatch.setattr(whatsapp_setup, "persist_whatsapp_enabled", lambda value: enabled.append(value))
     monkeypatch.setattr(
         ws,
         "_restart_gateway_after_whatsapp_onboarding",
-        lambda profile=None: {"restart_started": True, "restart_pid": 12345},
+        lambda profile=None: restarted.append(profile) or {
+            "restart_started": True,
+            "restart_pid": 12345,
+        },
     )
 
     record = ws._WhatsAppOnboardingSession(
@@ -171,6 +182,8 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
         session_path="/tmp/session",
         expires_at="2099-01-01T00:00:00Z",
         expires_at_ts=time.time() + 600,
+        profile="work",
+        gateway_profile="default",
         status="connected",
     )
     ws._whatsapp_onboarding_sessions.clear()
@@ -189,6 +202,7 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
     assert "WHATSAPP_ENABLED" not in saved
     assert "WHATSAPP_ALLOWED_USERS" not in removed
     assert enabled == [True]
+    assert restarted == ["default"]
     assert "pairing" not in ws._whatsapp_onboarding_sessions
 
 
@@ -429,6 +443,7 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
         yield
 
     monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: events.append(("ready", creds.exists())))
     monkeypatch.setattr(
         whatsapp_setup,
         "resolve_whatsapp_gateway_profile",
@@ -465,6 +480,7 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
     )
 
     assert events == [
+        ("ready", True),
         ("profile", "work"),
         (
             "quiesced",
@@ -474,6 +490,54 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
         ("paired", "pairing", session_dir, "bot", False),
     ]
     assert record.status == "preparing"
+    assert record.gateway_profile == "default"
+    ws._whatsapp_onboarding_sessions.clear()
+
+
+def test_prepare_pairing_keeps_credentials_when_bridge_preflight_fails(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    creds = session_dir / "creds.json"
+    creds.write_text('{"still":"valid"}', encoding="utf-8")
+    prepared = []
+    monkeypatch.setattr(
+        ws,
+        "_ensure_whatsapp_pairing_ready",
+        lambda: (_ for _ in ()).throw(RuntimeError("Node missing")),
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **kwargs: prepared.append(kwargs),
+    )
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    ws._prepare_and_run_whatsapp_pairing(
+        "pairing",
+        session_dir,
+        "bot",
+        "work",
+    )
+
+    assert creds.exists()
+    assert prepared == []
+    assert record.status == "error"
+    assert "Node missing" in (record.error or "")
     ws._whatsapp_onboarding_sessions.clear()
 
 

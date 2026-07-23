@@ -8079,6 +8079,7 @@ class _WhatsAppOnboardingSession:
     expires_at: str
     expires_at_ts: float
     profile: str | None = None
+    gateway_profile: str | None = None
     status: str = "starting"
     qr_payload: str | None = None
     account_id: str | None = None
@@ -8204,9 +8205,10 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
         )
 
 
-def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
+def _ensure_whatsapp_pairing_ready() -> None:
+    """Prove bridge, Node, and dependencies before session credentials move."""
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from hermes_constants import find_node_executable
 
     bridge_dir = resolve_whatsapp_bridge_dir()
     bridge_script = bridge_dir / "bridge.js"
@@ -8215,14 +8217,27 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             status_code=500,
             detail=f"WhatsApp bridge script was not found at {bridge_script}.",
         )
-    node = find_node_executable("node")
-    if not node:
+    if not find_node_executable("node"):
         raise HTTPException(
             status_code=500,
             detail="Node.js was not found. WhatsApp setup needs Node.js.",
         )
-
     _ensure_whatsapp_bridge_dependencies(bridge_dir)
+
+
+def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
+    from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    _ensure_whatsapp_pairing_ready()
+    bridge_dir = resolve_whatsapp_bridge_dir()
+    bridge_script = bridge_dir / "bridge.js"
+    node = find_node_executable("node")
+    if not node:
+        raise HTTPException(
+            status_code=500,
+            detail="Node.js became unavailable before WhatsApp setup could start.",
+        )
     session_path.mkdir(parents=True, exist_ok=True)
 
     env = with_hermes_node_path()
@@ -8332,7 +8347,6 @@ def _run_whatsapp_pairing(pairing_id: str, session_path: Path, mode: str) -> Non
         record = _whatsapp_onboarding_sessions.get(pairing_id)
         if not record or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             return
-        record.status = "installing"
 
     try:
         proc = _spawn_whatsapp_pairing_process(session_path, mode)
@@ -8369,7 +8383,20 @@ def _prepare_and_run_whatsapp_pairing(
             or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
         ):
             return
-        record.status = "preparing"
+        record.status = "installing"
+
+    try:
+        _ensure_whatsapp_pairing_ready()
+    except Exception as exc:
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                record
+                and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                record.status = "error"
+                record.error = f"Could not prepare the WhatsApp bridge: {exc}"
+        return
 
     try:
         from hermes_cli.whatsapp_setup import (
@@ -8377,7 +8404,23 @@ def _prepare_and_run_whatsapp_pairing(
             resolve_whatsapp_gateway_profile,
         )
 
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                not record
+                or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                return
+            record.status = "preparing"
         gateway_profile = resolve_whatsapp_gateway_profile(profile)
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                not record
+                or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                return
+            record.gateway_profile = gateway_profile
         with _config_profile_scope(profile):
             prepare_whatsapp_pairing(
                 profile=profile,
@@ -8573,8 +8616,13 @@ async def apply_whatsapp_onboarding(
         if mode == "self-chat" and not allowed_users:
             allowed_users = record.account_phone or record.account_id or ""
         record_profile = record.profile
+        gateway_profile = record.gateway_profile
 
     effective_profile = body.profile or profile or record_profile
+    if gateway_profile is None or effective_profile != record_profile:
+        from hermes_cli.whatsapp_setup import resolve_whatsapp_gateway_profile
+
+        gateway_profile = resolve_whatsapp_gateway_profile(effective_profile)
     try:
         with _config_profile_scope(effective_profile):
             save_env_value("WHATSAPP_MODE", mode)
@@ -8600,7 +8648,7 @@ async def apply_whatsapp_onboarding(
     with _whatsapp_onboarding_lock:
         _whatsapp_onboarding_sessions.pop(pairing_id, None)
 
-    restart_result = _restart_gateway_after_whatsapp_onboarding(effective_profile)
+    restart_result = _restart_gateway_after_whatsapp_onboarding(gateway_profile)
     return {
         "ok": True,
         "platform": "whatsapp",

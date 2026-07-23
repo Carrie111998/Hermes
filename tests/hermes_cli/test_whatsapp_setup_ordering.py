@@ -139,12 +139,31 @@ def test_existing_pairing_skip_branch_does_not_claim_or_enable(isolated_home, mo
 def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monkeypatch):
     """Fresh setup must pair into the same modern path used by the gateway."""
     from hermes_cli.main import cmd_whatsapp
+    from hermes_cli import profiles
+    from hermes_cli import whatsapp_setup
 
     monkeypatch.setenv("WHATSAPP_MODE", "bot")
     monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
     monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
     monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/npm")
+    gateway_events = []
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "work")
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda profile: gateway_events.append(("resolve", profile)) or "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **kwargs: gateway_events.append(("prepare", kwargs)) or False,
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "restart_gateway_if_running",
+        lambda **kwargs: gateway_events.append(("restart", kwargs)) or False,
+    )
 
     original_exists = Path.exists
 
@@ -175,6 +194,14 @@ def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monke
     assert not (isolated_home / "whatsapp" / "session").exists()
     assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
     assert "Start the gateway: hermes gateway start" in output.getvalue()
+    assert gateway_events == [
+        ("resolve", "work"),
+        (
+            "prepare",
+            {"profile": "work", "gateway_profile": "default"},
+        ),
+        ("restart", {"profile": "default"}),
+    ]
 
 
 def test_failed_pairing_forces_whatsapp_disabled(isolated_home, monkeypatch):
@@ -212,3 +239,58 @@ def test_failed_pairing_forces_whatsapp_disabled(isolated_home, monkeypatch):
     config_text = (isolated_home / "config.yaml").read_text(encoding="utf-8")
     assert "whatsapp:" in config_text
     assert "enabled: false" in config_text
+
+
+def test_success_is_not_claimed_when_enabled_state_cannot_be_persisted(
+    isolated_home,
+    monkeypatch,
+):
+    """A valid QR session is not a successful setup while config stays disabled."""
+    from hermes_cli.main import cmd_whatsapp
+    from hermes_cli import whatsapp_setup
+
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+
+    original_exists = Path.exists
+
+    def stub_exists(self):
+        if self.name == "node_modules":
+            return True
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", stub_exists)
+
+    def fake_run(args, *_a, **_kw):
+        if "--pair-only" in args:
+            session = Path(args[args.index("--session") + 1])
+            session.mkdir(parents=True, exist_ok=True)
+            (session / "creds.json").write_text("{}")
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "activate_whatsapp_after_pairing",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("managed setting")),
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "restart_gateway_if_running",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("restart called")),
+    )
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        cmd_whatsapp(MagicMock())
+
+    rendered = output.getvalue()
+    assert "could not be enabled" in rendered
+    assert "WhatsApp paired successfully" not in rendered
