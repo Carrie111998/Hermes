@@ -2088,14 +2088,14 @@ class WorkflowEngine:
         """
         workflow = self.load_workflow(workflow_name)
 
-        # Three-tier board resolution
-        if workflow.kanban_board:
-            # Tier 1: YAML declares a board
-            self.kanban_board = workflow.kanban_board
-        elif board:
-            # Tier 2: Caller passes a board at invocation
+        # Three-tier board resolution — caller-passed board wins
+        if board:
+            # Tier 1: Caller passes a board at invocation
             from hermes_cli.kanban_db import _normalize_board_slug
             self.kanban_board = _normalize_board_slug(board)
+        elif workflow.kanban_board:
+            # Tier 2: YAML declares a board
+            self.kanban_board = workflow.kanban_board
         else:
             # Tier 3: Auto-create wf_<workflow_name>
             auto_slug = f"wf_{workflow_name}"
