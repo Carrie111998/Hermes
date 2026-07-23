@@ -5,9 +5,16 @@ This module is mechanically split from gateway.platforms.api_server.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from gateway.api_server_shared import *
 from gateway.api_server_audit import log_api_decision, request_id_headers
 from gateway.principal_headers import parse_principal_scope_headers
+from gateway.runtime_provenance import (
+    RuntimeProvenance,
+    RuntimeProvenanceConfig,
+    collect_runtime_provenance,
+)
 
 
 _API_SERVER_CLI_INHERITED_TOOLSETS = frozenset({"video_gen"})
@@ -105,6 +112,8 @@ class APIServerCoreMixin:
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._max_concurrent_runs: int = self._resolve_max_concurrent_runs()
         self._inflight_agent_runs: int = 0
+        self._runtime_started_at = datetime.now(timezone.utc)
+        self._runtime_provenance: Optional[RuntimeProvenance] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -514,8 +523,23 @@ class APIServerCoreMixin:
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        if self._runtime_provenance is None:
+            self._runtime_provenance = collect_runtime_provenance(
+                RuntimeProvenanceConfig(
+                    listen_host=self._host,
+                    listen_port=self._port,
+                    cors_origins=self._cors_origins,
+                    model_name=self._model_name,
+                    max_concurrent_runs=self._max_concurrent_runs,
+                ),
+                startup_timestamp=self._runtime_started_at,
+            )
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                **self._runtime_provenance.to_dict(),
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":

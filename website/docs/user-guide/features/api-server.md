@@ -223,7 +223,17 @@ Use this endpoint when integrating dashboards, browser UIs, or control planes so
 
 ### GET /health
 
-Health check. Returns `{"status": "ok"}`. Also available at **GET /v1/health** for OpenAI-compatible clients that expect the `/v1/` prefix.
+Health check. It returns `status`, `platform`, and the Runtime's non-sensitive
+release provenance: service/release identity, version, Git commit, build and
+startup timestamps, Runtime artifact and public-config digests, session schema
+version, source state, and `provenance_complete`. `provenance_errors` lists
+missing build metadata explicitly; development/source installs must not claim
+complete release provenance.
+
+The same response is available at **GET /v1/health** for OpenAI-compatible
+clients and **GET /healthz** for the private Runtime Driver/control-plane path.
+The provenance config digest is allowlisted and never includes
+`API_SERVER_KEY` or provider credentials.
 
 ### GET /health/detailed
 
