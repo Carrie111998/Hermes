@@ -424,6 +424,17 @@ def _save_state_file(path, state):
     import json
     from datetime import datetime, timezone
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # Ensure session_info is always present — inject from tool handler's
+    # temp file if missing. The engine's ContextVar-based capture doesn't
+    # survive USR1 restarts, but the tool handler writes to /tmp.
+    if not state.get("session_info"):
+        try:
+            with open("/tmp/wfe-session.json") as _f:
+                _si = json.load(_f)
+            if _si and _si.get("platform"):
+                state["session_info"] = _si
+        except Exception:
+            pass
     Path(path).write_text(json.dumps(state, indent=2, default=str))
 
 
