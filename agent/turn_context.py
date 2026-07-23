@@ -32,10 +32,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import (
-    IDLE_COMPACTION_STATUS_TEMPLATE,
-    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    idle_compaction_status,
+    preflight_compression_status,
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
@@ -676,8 +676,8 @@ def build_turn_context(
                 _idle_status = automatic_compaction_status_message(
                     _compressor,
                     phase="idle",
-                    default_message=IDLE_COMPACTION_STATUS_TEMPLATE.format(
-                        idle_seconds=int(_idle_gap), tokens=_idle_tokens
+                    default_message=idle_compaction_status(
+                        int(_idle_gap), _idle_tokens
                     ),
                     approx_tokens=_idle_tokens,
                     idle_seconds=int(_idle_gap),
@@ -839,9 +839,8 @@ def build_turn_context(
             _preflight_status = automatic_compaction_status_message(
                 _compressor,
                 phase="preflight",
-                default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=_preflight_tokens,
-                    threshold=_compressor.threshold_tokens,
+                default_message=preflight_compression_status(
+                    _preflight_tokens, _compressor.threshold_tokens
                 ),
                 approx_tokens=_preflight_tokens,
                 threshold_tokens=_compressor.threshold_tokens,

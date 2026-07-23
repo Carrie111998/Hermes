@@ -122,6 +122,15 @@ gateway:
     aborted:               "⚠️ أُلغي الضغط ({error}). لم تُسقط أي رسائل — المحادثة كما هي. شغّل /compress للمحاولة مجددًا، أو /reset لجلسة نظيفة، أو راجع إعداد نموذج auxiliary.compression."
     aux_failed:            "ℹ️ فشل نموذج الضغط المُهيّأ `{model}` ({error}). تم التعافي باستخدام نموذجك الرئيسي — السياق سليم — لكن قد ترغب في مراجعة `auxiliary.compression.model` في config.yaml."
     failed:                "فشل الضغط: {error}"
+    status_compacting:     "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
+    status_compacted:      "✓ Context compaction complete — continuing turn..."
+    status_pre_api:        "📦 Pre-API compression: ~{tokens} tokens near the context/output limit. Compacting before the next model call."
+    status_preflight:      "📦 Preflight compression: ~{tokens} tokens >= {threshold} threshold. This may take a moment."
+    status_idle:           "💤 Resumed after {idle_seconds}s idle — compacting ~{tokens} tokens before continuing."
+    status_retry_too_large: "🗜️ Context too large (~{tokens} tokens) — compressing ({attempt}/{cap})..."
+    status_retry_messages: "🗜️ Compressed {before} → {after} messages, retrying..."
+    status_retry_tokens:   "🗜️ Compressed ~{before} → ~{after} tokens, retrying..."
+    status_retry_reduced:  "🗜️ Context reduced to {new_ctx} tokens (was {old_ctx}), retrying..."
 
   debug:
     upload_failed:         "✗ فشل رفع تقرير التصحيح: {error}"
