@@ -1406,6 +1406,14 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "answer", allow_expired=True)
 
 
+@method("clarify_form.respond")
+def _(rid, params: dict) -> dict:
+    # `answers` is a JSON string mapping each question id to its answer, since a
+    # clarify_form card collects several questions in one round-trip.
+    # allow_expired=True for the same reason as clarify.respond above.
+    return _respond(rid, params, "answers", allow_expired=True)
+
+
 @method("terminal.read.respond")
 def _(rid, params: dict) -> dict:
     # `text` is a JSON string of the serialized terminal buffer + line metadata.
