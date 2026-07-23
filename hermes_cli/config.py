@@ -981,6 +981,38 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
+def _split_dotted_key(dotted_key: str) -> list:
+    """Split a dotted config path into segments, honouring double-quoted spans.
+
+    A double-quoted span is taken literally, so a key segment that legitimately
+    contains a dot can be addressed.  Every real model id contains one
+    (``gpt-5.6-sol``, ``claude-sonnet-4.5``), which is what otherwise makes
+    ``platforms.api_server.extra.model_routes.<model-id>`` unreachable::
+
+        platforms.api_server.extra.model_routes."gpt-5.6-sol".model
+        -> ['platforms', 'api_server', 'extra', 'model_routes',
+            'gpt-5.6-sol', 'model']
+
+    Input without quotes tokenizes byte-for-byte identically to
+    ``dotted_key.split(".")``, so this is fully backward compatible.
+    """
+    parts: list = []
+    buf: list = []
+    in_quotes = False
+    for ch in dotted_key:
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "." and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if in_quotes:
+        raise ValueError(f"unterminated quote in config key {dotted_key!r}")
+    parts.append("".join(buf))
+    return parts
+
+
 def _set_nested(config, dotted_key: str, value):
     """Set a value at an arbitrarily nested dotted key path.
 
@@ -1003,7 +1035,7 @@ def _set_nested(config, dotted_key: str, value):
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
     """
-    parts = dotted_key.split(".")
+    parts = _split_dotted_key(dotted_key)
     current = config
     for part in parts[:-1]:
         if isinstance(current, list):
@@ -1065,7 +1097,7 @@ _MISSING = object()
 def _get_nested(config, dotted_key: str):
     """Return a dotted-path value from nested dict/list config data."""
     current = config
-    for part in dotted_key.split("."):
+    for part in _split_dotted_key(dotted_key):
         if isinstance(current, list):
             try:
                 current = current[int(part)]
@@ -1082,7 +1114,7 @@ def _get_nested(config, dotted_key: str):
 
 def _unset_nested(config, dotted_key: str) -> bool:
     """Remove a dotted-path value from nested dict/list config data."""
-    parts = dotted_key.split(".")
+    parts = _split_dotted_key(dotted_key)
     if not parts:
         return False
 
@@ -4592,7 +4624,7 @@ def _default_value_for_key(dotted_key: str):
     best-effort coercion used by ``config set``.
     """
     node = DEFAULT_CONFIG
-    for part in dotted_key.split("."):
+    for part in _split_dotted_key(dotted_key):
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
@@ -4698,7 +4730,7 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     if not key:
         return False, None
 
-    segments = key.split(".")
+    segments = _split_dotted_key(key)
     top = segments[0]
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
@@ -4783,6 +4815,14 @@ def set_config_value(key: str, value: str, force: bool = False):
             writes of keys the running version doesn't recognize yet. The CLI
             exposes this via ``hermes config set --force``.
     """
+    # Reject a malformed key (e.g. an unterminated quote) cleanly, before any
+    # validation or I/O runs — every dotted-key consumer below tokenizes too, so
+    # a late guard would only turn the same error into a traceback.
+    try:
+        _split_dotted_key(key)
+    except ValueError as e:
+        print(f"Invalid config key: {e}", file=sys.stderr)
+        sys.exit(1)
     if is_managed():
         managed_error("set configuration values")
         return
@@ -4921,6 +4961,11 @@ def set_config_value(key: str, value: str, force: bool = False):
 
 def get_config_value(key: str, *, as_json: bool = False):
     """Print a resolved configuration value."""
+    try:
+        _split_dotted_key(key)
+    except ValueError as e:
+        print(f"Invalid config key: {e}", file=sys.stderr)
+        sys.exit(1)
     if _is_env_config_key(key):
         env_value = get_env_value(key.upper())
         value = _MISSING if env_value is None else env_value
@@ -4936,6 +4981,11 @@ def get_config_value(key: str, *, as_json: bool = False):
 
 def unset_config_value(key: str):
     """Remove a user-set configuration or .env value."""
+    try:
+        _split_dotted_key(key)
+    except ValueError as e:
+        print(f"Invalid config key: {e}", file=sys.stderr)
+        sys.exit(1)
     if is_managed():
         managed_error("unset configuration values")
         return
