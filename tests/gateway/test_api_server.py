@@ -616,6 +616,37 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_unregisters_approval_surface_by_token(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        notify = MagicMock()
+        ownership_token = object()
+
+        with (
+            patch.object(adapter, "_create_agent", return_value=mock_agent),
+            patch(
+                "tools.tool_approval.register_tool_approval_notify",
+                return_value=ownership_token,
+            ) as register,
+            patch(
+                "tools.tool_approval.unregister_tool_approval_notify"
+            ) as unregister,
+            patch(
+                "tools.user_input.register_user_input_session",
+                return_value=None,
+            ),
+        ):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                approval_session_key="approval-session",
+                approval_notify=notify,
+            )
+
+        register.assert_called_once_with("approval-session", notify)
+        unregister.assert_called_once_with("approval-session", ownership_token)
+
 
 # ---------------------------------------------------------------------------
 # /health endpoint
@@ -2112,6 +2143,21 @@ class TestChatCompletionsEndpoint:
         )
         assert fake_agent.interrupt_calls == []
         assert fake_agent.completed_event["interaction"] == {"answered": "deny"}
+
+    @pytest.mark.asyncio
+    async def test_stream_connector_skipped_decision_rides_completed_event(self, adapter):
+        """A skip echoes so a reloaded card reads Skipped without ending the turn."""
+        import json as _json
+
+        fake_agent = await self._run_tool_complete_scenario(
+            adapter,
+            "mcp_connectors_GMAIL_CREATE_EMAIL_DRAFT",
+            _json.dumps({"status": "approval_skipped", "error": "skipped"}),
+            decision="skip",
+        )
+
+        assert fake_agent.interrupt_calls == []
+        assert fake_agent.completed_event["interaction"] == {"answered": "skip"}
 
     @pytest.mark.asyncio
     async def test_stream_connector_approval_error_does_not_end_turn(self, adapter):
