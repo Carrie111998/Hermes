@@ -1093,8 +1093,7 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
-        api_timer_start = time.perf_counter()
-        _api_time_accounted = 0.0
+        api_timer_start = time.monotonic()
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -1336,6 +1335,11 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                # ``api_call_count`` tracks tool-loop iterations and is
+                # incremented once per tool-loop iteration; provider retries
+                # must not inflate it. Each provider attempt is still timed
+                # independently below.
+                _api_attempt_started = time.monotonic()
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -1354,18 +1358,11 @@ def run_conversation(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
-                    # Failed calls and retry/backoff time are still API time.
-                    # Otherwise a 300s provider timeout appears as "other" in
-                    # the footer, which is precisely the lie this metric exists
-                    # to avoid. api_start_time spans the entire retry loop, so
-                    # add only the new delta after each attempt rather than
-                    # repeatedly adding the cumulative duration.
-                    api_duration = time.perf_counter() - api_timer_start
-                    agent._turn_api_time += max(
-                        0.0,
-                        api_duration - _api_time_accounted,
-                    )
-                    _api_time_accounted = api_duration
+                    # Time each provider attempt independently. Failed attempts
+                    # count once, while recovery work and retry backoff between
+                    # attempts remain outside the API-time metric.
+                    api_duration = time.monotonic() - _api_attempt_started
+                    agent._turn_api_time += max(0.0, api_duration)
 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -2987,7 +2984,7 @@ def run_conversation(
                     )
 
                 retry_count += 1
-                elapsed_time = time.perf_counter() - api_timer_start
+                elapsed_time = time.monotonic() - api_timer_start
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )

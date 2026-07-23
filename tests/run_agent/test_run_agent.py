@@ -5606,6 +5606,51 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "rate limited" in result["error"]
 
+    def test_api_timing_counts_failed_attempts_once_and_excludes_backoff(self, agent):
+        """API time is the sum of attempts, not the retry-loop wall clock."""
+        self._setup_agent(agent)
+        from agent import conversation_loop as _conv_loop
+
+        clock = {"now": 100.0, "wall": 1000.0}
+        mock_time = MagicMock()
+        mock_time.monotonic.side_effect = lambda: clock["now"]
+
+        def _wall_time():
+            clock["wall"] += 500.0
+            return clock["wall"]
+
+        mock_time.time.side_effect = _wall_time
+        mock_time.sleep = MagicMock()
+
+        def _failed_attempt(*_args, **_kwargs):
+            clock["now"] += 2.0
+            raise RuntimeError("rate limited")
+
+        def _backoff(*_args, **_kwargs):
+            # Simulate substantial time passing between attempts. It must not
+            # be charged to the provider API-time total.
+            clock["now"] += 50.0
+            return 0.0
+
+        agent.client.chat.completions.create.side_effect = _failed_attempt
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", mock_time),
+            patch.object(_conv_loop, "time", mock_time),
+            patch.object(_conv_loop, "jittered_backoff", _backoff),
+        ):
+            result = agent.run_conversation("hello")
+
+        attempts = agent.client.chat.completions.create.call_count
+        assert attempts > 1
+        # api_calls tracks tool-loop iterations; provider retries do not
+        # inflate it (the per-attempt accounting lives in api_time).
+        assert result["api_calls"] == 1
+        assert result["api_time"] == pytest.approx(attempts * 2.0)
+        assert result["api_time"] < 50.0
+
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.
 
