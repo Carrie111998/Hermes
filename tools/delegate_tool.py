@@ -2436,6 +2436,8 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    logical_dispatch_key: Optional[str] = None,
+    logical_input_digest: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2553,6 +2555,35 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Optional Kanban→delegation logical identity.  The bridge is deliberately
+    # disabled by default and the direct source APIs remain available for
+    # disposable-store workflows.  When enabled, reserve after all validation
+    # but before transcript IDs, child sessions, or execution identities exist.
+    _logical_bridge = None
+    if is_truthy_value(cfg.get("workflow_bridge_enabled", False)):
+        if bool(logical_dispatch_key) != bool(logical_input_digest):
+            return tool_error(
+                "logical_dispatch_key and logical_input_digest must be provided together."
+            )
+        if logical_dispatch_key and logical_input_digest:
+            from tools.async_delegation import reserve_logical_delegation
+
+            _logical_bridge = reserve_logical_delegation(
+                logical_key=logical_dispatch_key,
+                input_digest=logical_input_digest,
+                goal=task_list[0]["goal"] if len(task_list) == 1 else json.dumps(
+                    [task["goal"] for task in task_list], ensure_ascii=False
+                ),
+                context=context,
+                toolsets=None,
+                role=top_role,
+                model=creds["model"],
+                session_key="",
+                parent_session_id=getattr(parent_agent, "session_id", None),
+            )
+            if _logical_bridge.get("status") != "reserved":
+                return json.dumps(_logical_bridge, ensure_ascii=False)
 
     overall_start = time.monotonic()
     results = []
@@ -2962,7 +2993,22 @@ def delegate_task(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
             )
+            if _logical_bridge:
+                from tools.async_delegation import (
+                    claim_logical_delegation_launch,
+                    commit_logical_delegation_result,
+                )
+                if not claim_logical_delegation_launch(
+                    logical_dispatch_key, logical_input_digest
+                ):
+                    return json.dumps(
+                        {"status": "quarantined", "error": "logical launch claim failed"}
+                    )
             _sync_result = _execute_and_aggregate()
+            if _logical_bridge:
+                commit_logical_delegation_result(
+                    logical_dispatch_key, logical_input_digest, _sync_result
+                )
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
@@ -3026,7 +3072,13 @@ def delegate_task(
                     pass
 
         def _batch_runner():
-            return _execute_and_aggregate()
+            combined = _execute_and_aggregate()
+            if _logical_bridge:
+                from tools.async_delegation import commit_logical_delegation_result
+                commit_logical_delegation_result(
+                    logical_dispatch_key, logical_input_digest, combined
+                )
+            return combined
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -3039,6 +3091,14 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        if _logical_bridge:
+            from tools.async_delegation import claim_logical_delegation_launch
+            if not claim_logical_delegation_launch(
+                logical_dispatch_key, logical_input_digest
+            ):
+                return json.dumps(
+                    {"status": "quarantined", "error": "logical launch claim failed"}
+                )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3056,7 +3116,9 @@ def delegate_task(
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
+            delegation_id=(
+                _logical_bridge["delegation_id"] if _logical_bridge else live_deleg_id
+            ),
         )
 
         if dispatch.get("status") == "dispatched":
@@ -3099,6 +3161,15 @@ def delegate_task(
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
+        if _logical_bridge:
+            from tools.async_delegation import _quarantine_logical
+            return json.dumps(
+                _quarantine_logical(
+                    logical_dispatch_key,
+                    "async submit rejected after logical launch claim",
+                ),
+                ensure_ascii=False,
+            )
         _cap_result = _execute_and_aggregate()
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
@@ -3111,6 +3182,22 @@ def delegate_task(
         return json.dumps(_cap_result, ensure_ascii=False)
 
     # ----- Synchronous path -----
+    if _logical_bridge:
+        from tools.async_delegation import (
+            claim_logical_delegation_launch,
+            commit_logical_delegation_result,
+        )
+        if not claim_logical_delegation_launch(
+            logical_dispatch_key, logical_input_digest
+        ):
+            return json.dumps(
+                {"status": "quarantined", "error": "logical launch claim failed"}
+            )
+        _sync_result = _execute_and_aggregate()
+        commit_logical_delegation_result(
+            logical_dispatch_key, logical_input_digest, _sync_result
+        )
+        return json.dumps(_sync_result, ensure_ascii=False)
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
 
 

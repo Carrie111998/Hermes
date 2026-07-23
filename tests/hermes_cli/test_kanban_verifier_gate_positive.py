@@ -374,4 +374,54 @@ def test_successor_completion_revalidates_captured_verifier_receipt_version(conn
         expected_claim_token="successor",
         authority_mode=kb.CompletionAuthority.WORKER,
     )
-    assert kb.get_task(conn, successor).status != "done"
+    final_successor = kb.get_task(conn, successor)
+    assert final_successor is not None
+    assert final_successor.status != "done"
+
+
+def test_predeployment_workflow_run_without_snapshot_fails_closed(conn):
+    verifier = kb.create_task(conn, title="legacy verifier", assignee="gauge")
+    conn.execute("UPDATE tasks SET status = 'done', result = 'PASS' WHERE id = ?", (verifier,))
+    successor = kb.create_task(conn, title="legacy successor", parents=[verifier])
+    for task, step in ((verifier, "verify"), (successor, "integrate")):
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? WHERE id = ?",
+            (WORKFLOW + "-legacy", step, task),
+        )
+    # Simulate a run that was already active when the additive table appeared.
+    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (successor,))
+    conn.commit()
+    assert kb.claim_task(conn, successor, claimer="legacy-successor") is None
+
+    # A pre-deployment run can exist with no snapshot row. Construct that exact
+    # legacy state and prove terminal completion does not receive compatibility
+    # authority merely because the additive row is absent.
+    now = 1_700_000_000
+    conn.execute(
+        """
+        INSERT INTO task_runs (task_id, profile, status, claim_lock, started_at)
+        VALUES (?, 'circuit', 'running', 'legacy-claim', ?)
+        """,
+        (successor, now),
+    )
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        UPDATE tasks SET status = 'running', current_run_id = ?, claim_lock = 'legacy-claim'
+        WHERE id = ?
+        """,
+        (run_id, successor),
+    )
+    conn.commit()
+
+    assert not kb.complete_task(
+        conn,
+        successor,
+        result="must fail closed",
+        expected_run_id=run_id,
+        expected_claim_token="legacy-claim",
+        authority_mode=kb.CompletionAuthority.WORKER,
+    )
+    final_successor = kb.get_task(conn, successor)
+    assert final_successor is not None
+    assert final_successor.status != "done"

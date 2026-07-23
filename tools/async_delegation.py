@@ -37,6 +37,7 @@ logic stays in one place.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import sqlite3
 import threading
@@ -131,6 +132,37 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS logical_delegations (
+            logical_key TEXT PRIMARY KEY,
+            input_digest TEXT NOT NULL,
+            delegation_id TEXT NOT NULL UNIQUE,
+            execution_id TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            context_json TEXT,
+            toolsets_json TEXT,
+            role TEXT NOT NULL,
+            model TEXT,
+            session_key TEXT NOT NULL,
+            parent_session_id TEXT,
+            reserved_at REAL NOT NULL,
+            started_at REAL,
+            completed_at REAL,
+            updated_at REAL NOT NULL,
+            terminal_status TEXT,
+            result_json TEXT,
+            result_digest TEXT,
+            receipt_id TEXT,
+            kanban_db_path TEXT,
+            task_id TEXT,
+            continuation_id TEXT,
+            source_acknowledged_at REAL,
+            source_ack_count INTEGER NOT NULL DEFAULT 0,
+            quarantine_reason TEXT,
+            observed_digest TEXT
+        )"""
+    )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
     for name, sql_type in (
         ("owner_pid", "INTEGER"),
@@ -207,36 +239,31 @@ def _prune_durable_records() -> None:
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
+            """DELETE FROM async_delegations
+               WHERE delivery_state='delivered'
+                 AND state NOT IN ('running','finalizing','unknown')
+                 AND updated_at < ?""",
             (cutoff,),
         )
-        terminal_count = conn.execute(
+        # Count caps may retire only positively delivered ordinary records.
+        # Pending/unknown records are evidence, not cache: pressure must be
+        # handled by logical-dispatch backpressure rather than deletion.
+        total_terminal_count = conn.execute(
             "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
         ).fetchone()[0]
-        excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
+        # The total history cap may retire delivered rows to make room, but it
+        # never spills over into pending/unknown evidence when delivered rows
+        # are insufficient.
+        excess = max(0, total_terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
-                   )""",
-                (excess,),
-            )
-        pending_count = conn.execute(
-            """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
-        ).fetchone()[0]
-        overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
-        if overflow:
-            conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       AND delivery_state='delivered'
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
-                (overflow,),
+                (excess,),
             )
 
 
@@ -510,6 +537,519 @@ def active_count() -> int:
 
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
+
+
+_LOGICAL_TERMINAL_STATUSES = {
+    "PASS", "REWORK", "REPLAN", "BLOCKED", "FALLBACK_REQUIRED", "FAILED"
+}
+_LOGICAL_PROTECTED_STATES = {
+    "reserved", "running", "terminal_unattached", "terminal_pending_receipt",
+    "receipted_unacknowledged", "quarantined", "unknown",
+}
+
+
+class LogicalDispatchBridgeFault(RuntimeError):
+    """Deterministic test seam raised only after a named durable boundary."""
+
+
+def canonical_json_digest(value: Any) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+_LOGICAL_COLUMNS = (
+    "logical_key", "input_digest", "delegation_id", "execution_id", "state",
+    "goal", "context_json", "toolsets_json", "role", "model", "session_key",
+    "parent_session_id", "reserved_at", "started_at", "completed_at",
+    "updated_at", "terminal_status", "result_json", "result_digest",
+    "receipt_id", "kanban_db_path", "task_id", "continuation_id",
+    "source_acknowledged_at", "source_ack_count", "quarantine_reason",
+    "observed_digest",
+)
+
+
+def _logical_record(row) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    record: Dict[str, Any] = dict(zip(_LOGICAL_COLUMNS, row))
+    context_json = record.pop("context_json")
+    toolsets_json = record.pop("toolsets_json")
+    result_json = record.pop("result_json")
+    record["context"] = json.loads(context_json) if context_json else None
+    record["toolsets"] = json.loads(toolsets_json) if toolsets_json else None
+    record["result"] = json.loads(result_json) if result_json else None
+    return record
+
+
+def _select_logical(conn: sqlite3.Connection, logical_key: str):
+    return conn.execute(
+        f"SELECT {', '.join(_LOGICAL_COLUMNS)} FROM logical_delegations WHERE logical_key=?",
+        (logical_key,),
+    ).fetchone()
+
+
+def get_logical_delegation(logical_key: str) -> Optional[Dict[str, Any]]:
+    """Read committed logical-dispatch evidence from source state.db."""
+    with _DB_LOCK, _connect() as conn:
+        return _logical_record(_select_logical(conn, logical_key))
+
+
+def _quarantine_logical(
+    logical_key: str, reason: str, observed_digest: Optional[str] = None
+) -> Dict[str, Any]:
+    with _DB_LOCK, _connect() as conn:
+        return _quarantine_logical_in_conn(
+            conn, logical_key, reason, observed_digest
+        )
+
+
+def _quarantine_logical_in_conn(
+    conn: sqlite3.Connection,
+    logical_key: str,
+    reason: str,
+    observed_digest: Optional[str] = None,
+) -> Dict[str, Any]:
+    conn.execute(
+        """UPDATE logical_delegations
+           SET state='quarantined', quarantine_reason=?, observed_digest=?, updated_at=?
+           WHERE logical_key=?""",
+        (reason, observed_digest, time.time(), logical_key),
+    )
+    record = _logical_record(_select_logical(conn, logical_key)) or {}
+    return {
+        **record, "status": "quarantined", "reason": reason,
+        "expected_digest": record.get("input_digest"),
+        "observed_digest": observed_digest,
+    }
+
+
+def reserve_logical_delegation(
+    *, logical_key: str, input_digest: str, goal: str,
+    context: Optional[str], toolsets: Optional[List[str]], role: str,
+    model: Optional[str], session_key: str = "",
+    parent_session_id: Optional[str] = None,
+    max_pending_records: int = _MAX_DURABLE_PENDING,
+) -> Dict[str, Any]:
+    """Reserve K→D identity without launching; used at delegate_task's seam."""
+    logical_key = str(logical_key or "").strip()
+    input_digest = str(input_digest or "").strip()
+    if not logical_key or not input_digest:
+        return {"status": "rejected", "error": "logical_key and input_digest are required"}
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = _logical_record(_select_logical(conn, logical_key))
+        if existing is not None:
+            if existing["input_digest"] != input_digest:
+                conn.execute(
+                    """UPDATE logical_delegations SET state='quarantined',
+                       quarantine_reason='input digest conflict', observed_digest=?, updated_at=?
+                       WHERE logical_key=?""",
+                    (input_digest, now, logical_key),
+                )
+                return {
+                    **existing, "state": "quarantined", "status": "quarantined",
+                    "expected_digest": existing["input_digest"],
+                    "observed_digest": input_digest,
+                }
+            return {**existing, "status": "replayed"}
+        protected = conn.execute(
+            "SELECT COUNT(*) FROM logical_delegations WHERE state != 'acknowledged'"
+        ).fetchone()[0]
+        if protected >= max_pending_records:
+            return {"status": "backpressure", "state": "backpressure", "protected": protected}
+        delegation_id = _new_delegation_id()
+        execution_id = "exec_" + uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO logical_delegations
+               (logical_key, input_digest, delegation_id, execution_id, state,
+                goal, context_json, toolsets_json, role, model, session_key,
+                parent_session_id, reserved_at, updated_at)
+               VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                logical_key, input_digest, delegation_id, execution_id, goal,
+                json.dumps(context) if context is not None else None,
+                json.dumps(list(toolsets)) if toolsets else None,
+                role, model, session_key, parent_session_id, now, now,
+            ),
+        )
+        return {
+            "status": "reserved", "state": "reserved", "logical_key": logical_key,
+            "input_digest": input_digest, "delegation_id": delegation_id,
+            "execution_id": execution_id,
+        }
+
+
+def claim_logical_delegation_launch(logical_key: str, input_digest: str) -> bool:
+    """CAS a pre-transcript reservation immediately before executor launch."""
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE logical_delegations SET state='running', started_at=?, updated_at=?
+               WHERE logical_key=? AND input_digest=? AND state='reserved'""",
+            (now, now, logical_key, input_digest),
+        )
+        return cur.rowcount == 1
+
+
+def commit_logical_delegation_result(
+    logical_key: str, input_digest: str, result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Commit canonical terminal evidence for an integrated delegate runner."""
+    terminal_status = str(result.get("status") or "FAILED").upper()
+    if terminal_status == "COMPLETED":
+        terminal_status = "PASS"
+    if terminal_status not in _LOGICAL_TERMINAL_STATUSES:
+        terminal_status = "FAILED"
+    digest = canonical_json_digest(result)
+    payload = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE logical_delegations SET state='terminal_unattached',
+               terminal_status=?, result_json=?, result_digest=?, completed_at=?, updated_at=?
+               WHERE logical_key=? AND input_digest=? AND state='running'""",
+            (terminal_status, payload, digest, now, now, logical_key, input_digest),
+        )
+        if cur.rowcount != 1:
+            return _quarantine_logical_in_conn(
+                conn, logical_key, "terminal commit identity/state mismatch"
+            )
+    return get_logical_delegation(logical_key) or {}
+
+
+def dispatch_logical_delegation(
+    *,
+    logical_key: str,
+    input_digest: str,
+    goal: str,
+    context: Optional[str],
+    toolsets: Optional[List[str]],
+    role: str,
+    model: Optional[str],
+    session_key: str,
+    parent_session_id: Optional[str],
+    runner: Callable[[], Dict[str, Any]],
+    origin_ui_session_id: str = "",
+    interrupt_fn: Optional[Callable[[], None]] = None,
+    max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    max_pending_records: int = _MAX_DURABLE_PENDING,
+) -> Dict[str, Any]:
+    """Reserve one logical identity durably, then launch exactly one runner."""
+    logical_key = str(logical_key or "").strip()
+    input_digest = str(input_digest or "").strip()
+    if not logical_key or not input_digest:
+        return {"status": "rejected", "error": "logical_key and input_digest are required"}
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = _logical_record(_select_logical(conn, logical_key))
+        if existing is not None:
+            if existing["input_digest"] != input_digest:
+                conn.execute(
+                    """UPDATE logical_delegations SET state='quarantined',
+                       quarantine_reason='input digest conflict', observed_digest=?, updated_at=?
+                       WHERE logical_key=?""",
+                    (input_digest, now, logical_key),
+                )
+                existing.update(
+                    state="quarantined", observed_digest=input_digest,
+                    quarantine_reason="input digest conflict",
+                )
+                return {
+                    **existing, "status": "quarantined",
+                    "expected_digest": existing["input_digest"],
+                    "observed_digest": input_digest,
+                }
+            return {**existing, "status": "replayed"}
+        protected = conn.execute(
+            "SELECT COUNT(*) FROM logical_delegations WHERE state != 'acknowledged'"
+        ).fetchone()[0]
+        if protected >= max_pending_records:
+            return {
+                "status": "backpressure", "state": "backpressure",
+                "protected": protected,
+                "error": "logical delegation protected-state capacity reached",
+            }
+        delegation_id = _new_delegation_id()
+        execution_id = "exec_" + uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO logical_delegations
+               (logical_key, input_digest, delegation_id, execution_id, state,
+                goal, context_json, toolsets_json, role, model, session_key,
+                parent_session_id, reserved_at, updated_at)
+               VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                logical_key, input_digest, delegation_id, execution_id, goal,
+                json.dumps(context) if context is not None else None,
+                json.dumps(list(toolsets)) if toolsets else None,
+                role, model, session_key, parent_session_id, now, now,
+            ),
+        )
+
+    record: Dict[str, Any] = {
+        "delegation_id": delegation_id, "execution_id": execution_id,
+        "logical_key": logical_key, "goal": goal, "context": context,
+        "toolsets": list(toolsets) if toolsets else None, "role": role,
+        "model": model, "session_key": session_key,
+        "origin_ui_session_id": origin_ui_session_id,
+        "parent_session_id": parent_session_id, "status": "running",
+        "dispatched_at": now, "completed_at": None, "interrupt_fn": interrupt_fn,
+    }
+    with _records_lock:
+        running = sum(
+            1 for r in _records.values()
+            if r.get("status") in {"running", "finalizing"}
+        )
+        if running >= max_async_children:
+            return _quarantine_logical(
+                logical_key, "async execution capacity changed after reservation"
+            )
+        _records[delegation_id] = record
+    started = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            """UPDATE logical_delegations SET state='running', started_at=?, updated_at=?
+               WHERE logical_key=? AND state='reserved'""",
+            (started, started, logical_key),
+        )
+
+    def _worker() -> None:
+        try:
+            result = runner() or {}
+            if not isinstance(result, dict):
+                raise TypeError("logical delegation runner must return a dict")
+            terminal_status = str(result.get("status") or "FAILED").upper()
+            if terminal_status not in _LOGICAL_TERMINAL_STATUSES:
+                terminal_status = "FAILED"
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "status": "FAILED", "summary": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            terminal_status = "FAILED"
+        completed = time.time()
+        try:
+            result_digest = canonical_json_digest(result)
+        except (TypeError, ValueError) as exc:
+            result = {
+                "status": "FAILED", "summary": None,
+                "error": f"uncanonicalizable result: {exc}",
+            }
+            terminal_status = "FAILED"
+            result_digest = canonical_json_digest(result)
+        result_json = json.dumps(
+            result, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        with _DB_LOCK, _connect() as conn:
+            conn.execute(
+                """UPDATE logical_delegations SET state='terminal_unattached',
+                   terminal_status=?, result_json=?, result_digest=?, completed_at=?, updated_at=?
+                   WHERE logical_key=? AND state != 'quarantined'""",
+                (
+                    terminal_status, result_json, result_digest,
+                    completed, completed, logical_key,
+                ),
+            )
+        with _records_lock:
+            current = _records.get(delegation_id)
+            if current is not None:
+                current["status"] = terminal_status
+                current["completed_at"] = completed
+            _prune_completed_locked()
+
+    try:
+        _get_executor(max_async_children).submit(propagate_context_to_thread(_worker))
+    except Exception as exc:  # pragma: no cover
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        return _quarantine_logical(
+            logical_key, f"executor submission outcome unknown: {exc}"
+        )
+    return {
+        "status": "dispatched", "state": "reserved",
+        "logical_key": logical_key, "delegation_id": delegation_id,
+        "execution_id": execution_id,
+    }
+
+
+def acknowledge_logical_dispatch(
+    *, logical_key: str, fault_after: Optional[str] = None
+) -> Dict[str, Any]:
+    """Commit exactly one source acknowledgement after a proven receipt."""
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        record = _logical_record(_select_logical(conn, logical_key))
+        if record is None:
+            return {"status": "missing", "logical_key": logical_key}
+        if record["state"] == "quarantined":
+            return {**record, "status": "quarantined"}
+        if not record["receipt_id"] or not record["result_digest"]:
+            return _quarantine_logical_in_conn(
+                conn, logical_key,
+                "source acknowledgement lacks committed receipt proof",
+            )
+        if record["state"] == "acknowledged":
+            return {**record, "status": "replayed"}
+        if record["state"] != "receipted_unacknowledged":
+            return _quarantine_logical_in_conn(
+                conn, logical_key,
+                f"invalid acknowledgement state {record['state']}",
+            )
+        conn.execute(
+            """UPDATE logical_delegations
+               SET state='acknowledged', source_acknowledged_at=?,
+                   source_ack_count=1, updated_at=?
+               WHERE logical_key=? AND state='receipted_unacknowledged'
+                 AND source_ack_count=0 AND receipt_id=? AND result_digest=?""",
+            (
+                now, now, logical_key, record["receipt_id"],
+                record["result_digest"],
+            ),
+        )
+    if fault_after == "source_ack_commit":
+        raise LogicalDispatchBridgeFault("fault after source_ack_commit")
+    return {**(get_logical_delegation(logical_key) or {}), "status": "acknowledged"}
+
+
+def attach_logical_dispatch_receipt(
+    *,
+    logical_key: str,
+    kanban_db_path,
+    task_id: str,
+    acknowledge_source: bool = True,
+    prepare_only: bool = False,
+    fault_after: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Bridge committed source evidence to one atomic Kanban receipt unit."""
+    record = get_logical_delegation(logical_key)
+    if record is None:
+        return {"status": "missing", "logical_key": logical_key}
+    if record["state"] == "quarantined":
+        return {**record, "status": "quarantined"}
+    if record.get("task_id") and record["task_id"] != task_id:
+        return _quarantine_logical(logical_key, "Kanban target task conflict")
+    if not record.get("result") or not record.get("result_digest"):
+        return _quarantine_logical(logical_key, "source terminal result is not committed")
+    allowed = {
+        "terminal_unattached", "terminal_pending_receipt",
+        "receipted_unacknowledged", "acknowledged",
+    }
+    if record["state"] not in allowed:
+        return {
+            **record, "status": "not_terminal",
+            "error": f"logical dispatch is in {record['state']}",
+        }
+    if prepare_only:
+        if record["state"] == "terminal_unattached":
+            now = time.time()
+            with _DB_LOCK, _connect() as conn:
+                conn.execute(
+                    """UPDATE logical_delegations
+                       SET state='terminal_pending_receipt', kanban_db_path=?,
+                           task_id=?, updated_at=?
+                       WHERE logical_key=? AND state='terminal_unattached'""",
+                    (str(kanban_db_path), task_id, now, logical_key),
+                )
+        return {
+            **(get_logical_delegation(logical_key) or record),
+            "status": "prepared",
+        }
+
+    if record["state"] in {"terminal_unattached", "terminal_pending_receipt"}:
+        now = time.time()
+        with _DB_LOCK, _connect() as conn:
+            conn.execute(
+                """UPDATE logical_delegations
+                   SET state='terminal_pending_receipt', kanban_db_path=?,
+                       task_id=?, updated_at=?
+                   WHERE logical_key=? AND state IN
+                       ('terminal_unattached','terminal_pending_receipt')""",
+                (str(kanban_db_path), task_id, now, logical_key),
+            )
+
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing(kanban_db_path) as conn:
+        receipt = kb.record_delegation_receipt(
+            conn,
+            logical_key=logical_key,
+            input_digest=record["input_digest"],
+            delegation_id=record["delegation_id"],
+            execution_id=record["execution_id"],
+            result_digest=record["result_digest"],
+            terminal_status=record["terminal_status"],
+            result=record["result"],
+            task_id=task_id,
+        )
+    if receipt["status"] == "conflict":
+        return _quarantine_logical(
+            logical_key, f"Kanban receipt conflict: {receipt.get('reason', 'unknown')}"
+        )
+    if fault_after == "kanban_commit":
+        raise LogicalDispatchBridgeFault("fault after kanban_commit")
+
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            """UPDATE logical_delegations
+               SET state=CASE WHEN state='acknowledged' THEN state
+                              ELSE 'receipted_unacknowledged' END,
+                   receipt_id=?, continuation_id=?, kanban_db_path=?, task_id=?,
+                   updated_at=?
+               WHERE logical_key=? AND delegation_id=? AND execution_id=?
+                 AND result_digest=? AND state != 'quarantined'""",
+            (
+                receipt["receipt_id"], receipt["continuation_id"],
+                str(kanban_db_path), task_id, now, logical_key,
+                record["delegation_id"], record["execution_id"],
+                record["result_digest"],
+            ),
+        )
+    if acknowledge_source:
+        return acknowledge_logical_dispatch(logical_key=logical_key)
+    return {
+        **(get_logical_delegation(logical_key) or {}),
+        "status": receipt["status"],
+    }
+
+
+def prune_logical_delegations(
+    *, retention_seconds: float, max_records: int, max_pending_records: int
+) -> Dict[str, Any]:
+    """Delete only old acknowledged rows; protected evidence backpressures."""
+    cutoff = time.time() - max(0.0, float(retention_seconds))
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        protected = conn.execute(
+            "SELECT COUNT(*) FROM logical_delegations WHERE state != 'acknowledged'"
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM logical_delegations").fetchone()[0]
+        eligible = conn.execute(
+            """SELECT logical_key FROM logical_delegations
+               WHERE state='acknowledged' AND source_acknowledged_at <= ?
+               ORDER BY source_acknowledged_at ASC""",
+            (cutoff,),
+        ).fetchall()
+        excess = max(0, total - max(0, int(max_records)))
+        delete_keys = [row[0] for row in eligible[:excess]]
+        if delete_keys:
+            conn.executemany(
+                "DELETE FROM logical_delegations WHERE logical_key=? AND state='acknowledged'",
+                [(key,) for key in delete_keys],
+            )
+        status = (
+            "backpressure"
+            if protected > max_pending_records or protected > max_records
+            else "ok"
+        )
+        return {
+            "status": status, "deleted": len(delete_keys),
+            "protected": protected, "total": total - len(delete_keys),
+        }
 
 
 def _prune_completed_locked() -> None:

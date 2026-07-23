@@ -1247,6 +1247,48 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Generic immutable acceptance evidence for any durable delegation terminal
+-- outcome.  Kept separate from PASS/workflow-specific receipt tables.
+CREATE TABLE IF NOT EXISTS delegation_receipts (
+    receipt_id       TEXT PRIMARY KEY,
+    logical_key      TEXT NOT NULL UNIQUE,
+    input_digest     TEXT NOT NULL,
+    delegation_id    TEXT NOT NULL,
+    execution_id     TEXT NOT NULL,
+    result_digest    TEXT NOT NULL,
+    terminal_status  TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    task_id          TEXT NOT NULL,
+    continuation_id  TEXT NOT NULL UNIQUE,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delegation_continuations (
+    continuation_id  TEXT PRIMARY KEY,
+    logical_key      TEXT NOT NULL UNIQUE,
+    receipt_id       TEXT NOT NULL UNIQUE,
+    task_id          TEXT NOT NULL,
+    state            TEXT NOT NULL CHECK (state = 'accepted'),
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS delegation_receipts_immutable_update
+BEFORE UPDATE ON delegation_receipts BEGIN
+    SELECT RAISE(ABORT, 'delegation receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS delegation_receipts_immutable_delete
+BEFORE DELETE ON delegation_receipts BEGIN
+    SELECT RAISE(ABORT, 'delegation receipt is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS delegation_continuations_immutable_update
+BEFORE UPDATE ON delegation_continuations BEGIN
+    SELECT RAISE(ABORT, 'delegation continuation is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS delegation_continuations_immutable_delete
+BEFORE DELETE ON delegation_continuations BEGIN
+    SELECT RAISE(ABORT, 'delegation continuation is immutable');
+END;
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -2812,6 +2854,96 @@ def write_txn(conn: sqlite3.Connection):
         _check_file_length_invariant(conn)
 
 
+def record_delegation_receipt(
+    conn: sqlite3.Connection,
+    *,
+    logical_key: str,
+    input_digest: str,
+    delegation_id: str,
+    execution_id: str,
+    result_digest: str,
+    terminal_status: str,
+    result: dict[str, Any],
+    task_id: str,
+) -> dict[str, Any]:
+    """Create or validate one receipt/event/continuation atomic unit."""
+    key_bytes = logical_key.encode("utf-8")
+    receipt_id = "dr_" + hashlib.sha256(b"receipt\0" + key_bytes).hexdigest()[:24]
+    continuation_id = "dc_" + hashlib.sha256(b"continuation\0" + key_bytes).hexdigest()[:24]
+    result_json = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    expected = (
+        receipt_id, logical_key, input_digest, delegation_id, execution_id,
+        result_digest, terminal_status, result_json, task_id, continuation_id,
+    )
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            return {"status": "conflict", "reason": "target task does not exist"}
+        row = conn.execute(
+            """SELECT receipt_id, logical_key, input_digest, delegation_id,
+                      execution_id, result_digest, terminal_status, result_json,
+                      task_id, continuation_id
+               FROM delegation_receipts WHERE logical_key=?""",
+            (logical_key,),
+        ).fetchone()
+        if row is not None:
+            if tuple(row) != expected:
+                return {"status": "conflict", "reason": "immutable receipt identity mismatch"}
+            continuation = conn.execute(
+                """SELECT continuation_id, logical_key, receipt_id, task_id, state
+                   FROM delegation_continuations WHERE logical_key=?""",
+                (logical_key,),
+            ).fetchone()
+            events = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='delegation_receipted'",
+                (task_id,),
+            ).fetchall()
+            matching_events = sum(
+                json.loads(payload or "{}").get("logical_key") == logical_key
+                for (payload,) in events
+            )
+            if tuple(continuation or ()) != (
+                continuation_id, logical_key, receipt_id, task_id, "accepted"
+            ) or matching_events != 1:
+                return {"status": "conflict", "reason": "partial receipt atomic unit"}
+            return {
+                "status": "replayed", "receipt_id": receipt_id,
+                "continuation_id": continuation_id,
+            }
+
+        now = int(time.time())
+        conn.execute(
+            """INSERT INTO delegation_receipts
+               (receipt_id, logical_key, input_digest, delegation_id,
+                execution_id, result_digest, terminal_status, result_json,
+                task_id, continuation_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*expected, now),
+        )
+        payload = json.dumps(
+            {
+                "logical_key": logical_key, "receipt_id": receipt_id,
+                "delegation_id": delegation_id, "execution_id": execution_id,
+                "result_digest": result_digest, "continuation_id": continuation_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'delegation_receipted', ?, ?)",
+            (task_id, payload, now),
+        )
+        conn.execute(
+            """INSERT INTO delegation_continuations
+               (continuation_id, logical_key, receipt_id, task_id, state, created_at)
+               VALUES (?, ?, ?, ?, 'accepted', ?)""",
+            (continuation_id, logical_key, receipt_id, task_id, now),
+        )
+        return {
+            "status": "committed", "receipt_id": receipt_id,
+            "continuation_id": continuation_id,
+        }
+
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
@@ -4090,10 +4222,19 @@ def _captured_prerequisites_are_current(
         "WHERE run_id = ? AND task_id = ?",
         (run_id, task_id),
     ).fetchone()
-    # Compatibility for attempts that predate the additive migration. New
-    # claims always capture a row; old in-flight attempts keep their old rules.
     if captured is None:
-        return True
+        # Additive rollout compatibility is safe only for ordinary legacy DAG
+        # runs. A pre-existing workflow run with predecessors has no frozen
+        # version baseline and therefore must fail closed at terminal time.
+        workflow = conn.execute(
+            "SELECT workflow_template_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        has_parents = conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,),
+        ).fetchone()
+        return not bool(
+            workflow and workflow["workflow_template_id"] and has_parents
+        )
     current_json = _canonical_json(_prerequisite_snapshot(conn, task_id))
     return (
         captured["snapshot_json"] == current_json
