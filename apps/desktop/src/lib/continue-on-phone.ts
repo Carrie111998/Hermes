@@ -88,6 +88,7 @@ export async function resolveContinueOnPhoneUrl(
 
   // Validate base URL shape before minting (no credentials, HTTPS only).
   const probeUrl = buildDashboardSessionUrl(publicUrl, sessionId, profile)
+
   if (!probeUrl) {
     return { ok: false, reason: 'insecure-url' }
   }
@@ -105,9 +106,11 @@ export async function resolveContinueOnPhoneUrl(
   }
 
   let ticket: string
+
   try {
     const minted = await dependencies.mintHandoffTicket(sessionId, profile)
     ticket = (minted.ticket || '').trim()
+
     if (!ticket) {
       return { ok: false, reason: 'handoff-failed' }
     }
@@ -116,6 +119,7 @@ export async function resolveContinueOnPhoneUrl(
   }
 
   const url = buildDashboardSessionUrl(publicUrl, sessionId, profile, ticket)
+
   if (!url) {
     return { ok: false, reason: 'insecure-url' }
   }
