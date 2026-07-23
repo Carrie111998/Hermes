@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import zipfile
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -38,6 +39,22 @@ def _write_jsonl(path: Path, values: list[dict]) -> None:
 
 def _png_bytes(payload: bytes = b"fixture") -> bytes:
     return b"\x89PNG\r\n\x1a\n" + payload
+
+
+def _xlsx(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Override PartName="/xl/workbook.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.'
+                'spreadsheetml.sheet.main+xml"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr("xl/workbook.xml", "<workbook/>")
 
 
 def _retention_config(tmp_path: Path, source_root: Path, media_root: Path) -> Path:
@@ -106,6 +123,57 @@ def test_media_retention_refuses_source_path_escape(tmp_path, monkeypatch):
     )
     record = consumer.InboxRecord(1, "ESCAPE", "test-group@g.us", 0, 1, raw)
     with pytest.raises(consumer.MediaRetentionError, match="escapes configured roots"):
+        consumer.retain_record_media(record, config_path=config)
+
+
+def test_spreadsheet_is_content_validated_then_bypasses_image_retention(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    raw = _message("SHEET-1")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook)],
+            "mediaMimes": [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "SHEET-1", "test-group@g.us", 0, 1, raw
+    )
+
+    assert consumer.retain_record_media(record, config_path=config) == {
+        "retained": 0,
+        "bytes": 0,
+        "operation": False,
+        "validated_spreadsheets": 1,
+    }
+
+
+def test_spreadsheet_without_declared_mime_is_held_before_model(tmp_path):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    workbook = capture / "jobs.xlsx"
+    _xlsx(workbook)
+    config = _retention_config(tmp_path, capture, tmp_path / "retained")
+    raw = _message("SHEET-NO-MIME")
+    raw.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": [str(workbook)],
+        }
+    )
+    record = consumer.InboxRecord(
+        1, "SHEET-NO-MIME", "test-group@g.us", 0, 1, raw
+    )
+
+    with pytest.raises(consumer.MediaRetentionError, match="provider-declared MIME"):
         consumer.retain_record_media(record, config_path=config)
 
 
@@ -686,6 +754,46 @@ def test_stage_is_durable_before_cursor_and_idempotent(tmp_path):
     assert inbox.stage_from_source(source, cursor_path, max_records=10) == 2
     assert inbox.counts() == {"pending": 2}
     assert consumer.SourceCursor.from_path(cursor_path).offset == source.stat().st_size
+
+
+def test_stage_preserves_provider_document_mime_for_spreadsheet_gate(tmp_path):
+    source = tmp_path / "events.jsonl"
+    cursor = tmp_path / "cursor.json"
+    inbox = consumer.DurableInbox(tmp_path / "inbox.db")
+    normalized = _message("xlsx-provider-mime")
+    normalized.update(
+        {
+            "hasMedia": True,
+            "mediaType": "document",
+            "mediaUrls": ["/capture/jobs.xlsx"],
+        }
+    )
+    wrapped = {
+        "normalized": normalized,
+        "raw": {
+            "message": {
+                "documentWithCaptionMessage": {
+                    "message": {
+                        "documentMessage": {
+                            "mimetype": (
+                                "application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    }
+    _write_jsonl(source, [wrapped])
+    consumer.initialize_cursor(source, cursor, position="start")
+
+    assert inbox.stage_from_source(source, cursor) == 1
+    record = inbox.pending(limit=1)[0]
+    assert record.raw["mediaMimes"] == [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ]
+    assert inbox.retention_candidates(limit=1)[0].message_id == "xlsx-provider-mime"
 
 
 def test_inbox_v1_migration_classifies_existing_retention_queue(tmp_path):

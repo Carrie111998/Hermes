@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -779,6 +780,7 @@ def test_pa_business_toolset_is_registered_without_all_tools():
         "tgg_case_lookup",
         "tgg_case_photos",
         "tgg_case_query",
+        "tgg_spreadsheet_job_numbers",
         "tgg_case_search",
         "tgg_message_history_search",
         "message_history_search",
@@ -801,6 +803,191 @@ def test_pa_business_toolset_is_registered_without_all_tools():
 def _jpeg(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\xff\xd8\xff\xe0fixture")
+
+
+def _xlsx(
+    path: Path,
+    *,
+    macro_enabled: bool = False,
+    job_numbers: tuple[str, ...] = (),
+) -> None:
+    workbook_type = (
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
+        if macro_enabled
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                f'<Override PartName="/xl/workbook.xml" ContentType="{workbook_type}"/>'
+                "</Types>"
+            ),
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            (
+                '<workbook xmlns="http://schemas.openxmlformats.org/'
+                'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/'
+                'officeDocument/2006/relationships"><sheets><sheet name="Sheet1" '
+                'sheetId="1" r:id="rId1"/></sheets></workbook>'
+            ),
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            (
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/'
+                '2006/relationships"><Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                'relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                "</Relationships>"
+            ),
+        )
+        rows = [
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>Job No.</t></is></c>'
+            '<c r="B1" t="inlineStr"><is><t>Status</t></is></c></row>'
+        ]
+        rows.extend(
+            f'<row r="{index}"><c r="A{index}" t="inlineStr"><is><t>{job}</t>'
+            f'</is></c><c r="B{index}" t="inlineStr"><is><t>Open</t></is></c></row>'
+            for index, job in enumerate(job_numbers, start=2)
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            (
+                '<worksheet xmlns="http://schemas.openxmlformats.org/'
+                'spreadsheetml/2006/main"><sheetData>'
+                + "".join(rows)
+                + "</sheetData></worksheet>"
+            ),
+        )
+        if macro_enabled:
+            archive.writestr("xl/vbaProject.bin", b"macro")
+
+
+def test_tgg_spreadsheet_gate_accepts_xlsx_and_csv_by_content(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "jobs.xlsx"
+    _xlsx(workbook)
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8")
+
+    assert pbt.validate_tgg_spreadsheet(
+        workbook,
+        declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ).endswith("spreadsheetml.sheet")
+    assert pbt.validate_tgg_spreadsheet(
+        csv_file, declared_mime="text/csv"
+    ) == "text/csv"
+
+
+def test_tgg_spreadsheet_job_numbers_extracts_xlsx_and_csv(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "jobs.xlsx"
+    _xlsx(
+        workbook,
+        job_numbers=(
+            "AM/JOB/2607/0001",
+            "AM/JOB/2607/0002",
+            "AM/JOB/2607/0001",
+        ),
+    )
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text(
+        "Address,Job Number,Status\n"
+        "One,AM/JOB/2607/0003,Open\n"
+        "Two,not-a-job,Open\n",
+        encoding="utf-8",
+    )
+
+    assert pbt.extract_tgg_spreadsheet_job_numbers(workbook) == [
+        "AM/JOB/2607/0001",
+        "AM/JOB/2607/0002",
+    ]
+    assert pbt.extract_tgg_spreadsheet_job_numbers(csv_file) == [
+        "AM/JOB/2607/0003"
+    ]
+
+
+def test_tgg_spreadsheet_tool_hands_numbers_to_existing_cross_check(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "jobs.xlsx"
+    _xlsx(workbook, job_numbers=("AM/JOB/2607/0001", "AM/JOB/2607/0002"))
+    result = json.loads(
+        pbt._handle_tgg_spreadsheet_job_numbers({"path": str(workbook)})
+    )
+
+    assert result["jobNumbers"] == [
+        "AM/JOB/2607/0001",
+        "AM/JOB/2607/0002",
+    ]
+    assert "tgg_case_query" in result["next"]
+
+
+@pytest.mark.parametrize("suffix", [".xlsm", ".xltm"])
+def test_tgg_spreadsheet_gate_refuses_macro_enabled_extensions(tmp_path, suffix):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / f"jobs{suffix}"
+    _xlsx(workbook, macro_enabled=True)
+    with pytest.raises(ValueError, match="UNSUPPORTED_MEDIA_TYPE"):
+        pbt.validate_tgg_spreadsheet(
+            workbook,
+            declared_mime="application/vnd.ms-excel.sheet.macroenabled.12",
+        )
+
+
+def test_tgg_spreadsheet_gate_refuses_macro_payload_renamed_xlsx(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    workbook = tmp_path / "renamed.xlsx"
+    _xlsx(workbook, macro_enabled=True)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_spreadsheet(
+            workbook,
+            declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def test_tgg_spreadsheet_gate_refuses_executable_renamed_xlsx(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    executable = tmp_path / "malware.xlsx"
+    executable.write_bytes(b"MZ" + b"\x00" * 100)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_spreadsheet(
+            executable,
+            declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def test_tgg_spreadsheet_gate_refuses_mime_bytes_mismatch(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    csv_file = tmp_path / "jobs.csv"
+    csv_file.write_text("Job No.,Status\nAM/JOB/2607/0001,Open\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt.validate_tgg_spreadsheet(
+            csv_file,
+            declared_mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def test_tgg_case_photo_provenance_gate_is_unchanged(tmp_path):
+    import tools.pa_business_tools as pbt
+
+    photo = tmp_path / "photo.jpg"
+    _jpeg(photo)
+    with pytest.raises(ValueError, match="PROVENANCE_DIVERGENCE"):
+        pbt._resolve_case_photo(
+            {"ref": "/media/photo.jpg", "mimeType": "image/png"},
+            tmp_path,
+        )
 
 
 def test_tgg_case_photos_resolves_opaque_refs_under_configured_root(

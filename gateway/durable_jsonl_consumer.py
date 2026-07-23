@@ -261,6 +261,26 @@ def _bridge_item(value: Any) -> dict[str, Any]:
     raise ConsumerError("durable JSONL record has no bridge messageId/chatId item")
 
 
+def _declared_document_mime(value: Any) -> str:
+    """Recover the provider-declared document MIME before normalizing the event."""
+    if not isinstance(value, Mapping):
+        return ""
+    document = value.get("documentMessage")
+    if isinstance(document, Mapping):
+        return str(
+            document.get("mimetype")
+            or document.get("mimeType")
+            or document.get("contentType")
+            or ""
+        ).split(";", 1)[0].strip().lower()
+    for nested in value.values():
+        if isinstance(nested, Mapping):
+            mime = _declared_document_mime(nested)
+            if mime:
+                return mime
+    return ""
+
+
 @dataclass(frozen=True)
 class InboxRecord:
     seq: int
@@ -272,22 +292,40 @@ class InboxRecord:
 
 
 def _initial_retention_state(item: Mapping[str, Any]) -> str:
-    """Classify obvious non-images without doing any retention I/O."""
+    """Classify media that needs content validation before model ingress."""
     coarse = str(item.get("mediaType") or item.get("mimeType") or "")
     if coarse.split("/", 1)[0].strip().lower() == "image":
         return "pending"
     values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
+    declared_mimes = item.get("mediaMimes") or []
+    if isinstance(declared_mimes, (str, bytes)):
+        declared_mimes = [declared_mimes]
     if isinstance(values, Mapping):
         values = [values]
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-        for value in values:
-            if not isinstance(value, Mapping):
-                continue
-            mime = str(
-                value.get("mime") or value.get("mimeType")
-                or value.get("contentType") or ""
-            )
+        for index, value in enumerate(values):
+            mime = ""
+            if isinstance(value, Mapping):
+                mime = str(
+                    value.get("mime") or value.get("mimeType")
+                    or value.get("contentType") or ""
+                )
+            elif index < len(declared_mimes):
+                mime = str(declared_mimes[index] or "")
             if mime.split("/", 1)[0].strip().lower() == "image":
+                return "pending"
+            suffix = Path(
+                str(
+                    value.get("path")
+                    or value.get("filePath")
+                    or value.get("localPath")
+                    or value.get("url")
+                    or ""
+                )
+                if isinstance(value, Mapping)
+                else str(value or "")
+            ).suffix.lower()
+            if suffix in {".xlsx", ".csv", ".xlsm", ".xltm"}:
                 return "pending"
     return "bypassed"
 
@@ -487,6 +525,11 @@ class DurableInbox:
                         f"invalid JSONL at byte {start}: {exc.msg}"
                     ) from exc
                 item = _bridge_item(decoded)
+                declared_document_mime = _declared_document_mime(decoded)
+                if declared_document_mime and item.get("mediaUrls"):
+                    item["mediaMimes"] = [
+                        declared_document_mime for _ in item["mediaUrls"]
+                    ]
                 message_id = str(item["messageId"])
                 staged.append((start, end, item))
                 last_message_id = message_id
@@ -1380,6 +1423,47 @@ def _event_media(item: Mapping[str, Any]) -> list[tuple[Any, str | None]]:
     return result
 
 
+def _event_spreadsheets(item: Mapping[str, Any]) -> list[tuple[Any, str]]:
+    """Return spreadsheet-like documents with their provider-declared MIME."""
+    values = item.get("mediaUrls") or item.get("media") or item.get("mediaPaths") or []
+    if isinstance(values, (str, bytes, Mapping)):
+        values = [values]
+    if not isinstance(values, Sequence):
+        raise MediaRetentionError("event media collection is not a list")
+    declared_mimes = item.get("mediaMimes") or []
+    if isinstance(declared_mimes, (str, bytes)):
+        declared_mimes = [declared_mimes]
+    result: list[tuple[Any, str]] = []
+    for index, value in enumerate(values):
+        raw_path = (
+            value.get("path")
+            or value.get("filePath")
+            or value.get("localPath")
+            or value.get("url")
+            if isinstance(value, Mapping)
+            else value
+        )
+        suffix = Path(str(raw_path or "")).suffix.lower()
+        if suffix not in {".xlsx", ".csv", ".xlsm", ".xltm"}:
+            continue
+        declared = ""
+        if isinstance(value, Mapping):
+            declared = str(
+                value.get("mime")
+                or value.get("mimeType")
+                or value.get("contentType")
+                or ""
+            )
+        if not declared and index < len(declared_mimes):
+            declared = str(declared_mimes[index] or "")
+        if not declared:
+            raise MediaRetentionError(
+                "PROVENANCE_DIVERGENCE: spreadsheet has no provider-declared MIME"
+            )
+        result.append((value, declared))
+    return result
+
+
 def _converge_retained_media(
     config_path: Path, *, operation: str, payload: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1438,6 +1522,22 @@ def _retain_record_media_impl(
     if config is None:
         return {"retained": 0, "bytes": 0, "operation": False}
     item = _bridge_item(record.raw)
+    spreadsheets = _event_spreadsheets(item)
+    if spreadsheets:
+        from tools.pa_business_tools import validate_tgg_spreadsheet
+
+        for raw_path, declared_mime in spreadsheets:
+            source = _contained_existing_file(raw_path, config["source_roots"])
+            try:
+                validate_tgg_spreadsheet(source, declared_mime=declared_mime)
+            except ValueError as exc:
+                raise MediaRetentionError(str(exc)) from exc
+        return {
+            "retained": 0,
+            "bytes": 0,
+            "operation": False,
+            "validated_spreadsheets": len(spreadsheets),
+        }
     media = _event_media(item)
     if not media:
         coarse_kind = str(
