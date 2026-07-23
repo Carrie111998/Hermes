@@ -273,7 +273,11 @@ def sillytavern_stop(args, **kwargs) -> str:
             if f":{DEFAULT_PORT}" in line and "LISTENING" in line
         }
         for pid in pids:
-            subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
+            subprocess.run(
+                ["taskkill", "/PID", pid, "/F"],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+            )
         return json.dumps({"ok": True, "killed_pids": sorted(pids)})
     except Exception as exc:
         return json.dumps({"ok": False, "error": str(exc)})

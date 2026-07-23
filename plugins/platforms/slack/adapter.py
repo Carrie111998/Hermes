@@ -2649,7 +2649,10 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             import httpx as _httpx
             from urllib.parse import unquote as _unquote
-            from tools.url_safety import is_safe_url as _is_safe_url
+            from tools.url_safety import (
+                is_safe_url as _is_safe_url,
+                redirect_target_from_response as _redirect_target_from_response,
+            )
         except Exception:
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return

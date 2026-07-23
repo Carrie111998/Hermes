@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins" / "sillytavern"
@@ -48,113 +50,59 @@ def test_register_exposes_sillytavern_to_agents():
     module.register(context)
 
     assert {tool["name"] for tool in context.tools} == {
-        "sillytavern_capabilities",
         "sillytavern_status",
         "sillytavern_start",
         "sillytavern_stop",
-        "sillytavern_generate",
+        "sillytavern_version",
+        "sillytavern_configure",
     }
-    assert {tool["toolset"] for tool in context.tools} == {"sillytavern"}
-    assert "sillytavern" in context.cli_commands
+    assert all(callable(tool["handler"]) for tool in context.tools)
+    assert all(callable(tool["check_fn"]) for tool in context.tools)
 
 
-def test_start_requires_configuration_and_acknowledgement(monkeypatch):
+def test_status_reports_install_state(monkeypatch, tmp_path):
+    module = load_plugin()
+    monkeypatch.setattr(module, "_get_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(module, "_is_up", lambda timeout=3.0: False)
+    payload = json.loads(module.sillytavern_status({}, task_id=None))
+    assert payload["installed"] is False
+    assert payload["running"] is False
+    assert payload["install_dir"] == str(tmp_path)
+
+
+def test_configure_returns_structured_result(monkeypatch):
     module = load_plugin()
     monkeypatch.setattr(
-        module.core,
-        "_load_entry",
-        lambda: {"allow_process_control": False},
+        module,
+        "_configure",
+        lambda: {"written_secrets": ["openai_api_key"], "local_llama": True},
     )
-    payload = module.core.start_server({"acknowledge_side_effects": True})
-    assert payload["success"] is False
-    assert "allow_process_control" in payload["error"]
-
-    monkeypatch.setattr(
-        module.core,
-        "_load_entry",
-        lambda: {"allow_process_control": True},
-    )
-    payload = module.core.start_server({})
-    assert payload["success"] is False
-    assert "acknowledge_side_effects" in payload["error"]
+    payload = json.loads(module.sillytavern_configure({}, task_id=None))
+    assert payload["ok"] is True
+    assert payload["written_secrets"] == ["openai_api_key"]
+    assert payload["local_llama"] is True
 
 
-def test_generate_normalizes_prompt_and_provider_response(monkeypatch):
+def test_stop_taskkill_sets_stdin(monkeypatch):
     module = load_plugin()
+    module._STATE.clear()
     monkeypatch.setattr(
-        module.core,
-        "_load_entry",
-        lambda: {
-            "allow_network": True,
-            "model": "test-model",
-            "chat_completion_source": "openai",
-        },
+        module.subprocess,
+        "check_output",
+        lambda *args, **kwargs: (
+            "  TCP    0.0.0.0:8000    0.0.0.0:0    LISTENING    4242\n"
+        ),
     )
-    monkeypatch.setattr(
-        module.core,
-        "status_payload",
-        lambda _values: {"healthy": True, "base_url": "http://127.0.0.1:8000"},
-    )
-    responses = iter(
-        [
-            {"ok": True, "status_code": 200, "data": {"token": "csrf-test"}},
-            {
-                "ok": True,
-                "status_code": 200,
-                "data": {
-                    "model": "test-model",
-                    "choices": [
-                        {
-                            "message": {"content": "hello from SillyTavern"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {"total_tokens": 3},
-                },
-            },
-        ]
-    )
-    monkeypatch.setattr(module.core, "_http_json", lambda *args, **kwargs: next(responses))
+    captured = {}
 
-    payload = module.core.generate(
-        {"prompt": "hello", "acknowledge_side_effects": True}
-    )
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["stdin"] = kwargs.get("stdin")
+        return MagicMock(returncode=0)
 
-    assert payload == {
-        "success": True,
-        "status": "completed",
-        "reply": "hello from SillyTavern",
-        "model": "test-model",
-        "finish_reason": "stop",
-        "usage": {"total_tokens": 3},
-        "request_source": "openai",
-    }
-
-
-def test_generate_rejects_invalid_message_role():
-    module = load_plugin()
-    payload = module.core.generate(
-        {
-            "messages": [{"role": "tool", "content": "not allowed"}],
-            "acknowledge_side_effects": True,
-        }
-    )
-    assert payload["success"] is False
-    assert "role" in payload["error"]
-
-
-def test_stop_refuses_unmanaged_process(monkeypatch, tmp_path):
-    module = load_plugin()
-    state = tmp_path / "server.json"
-    state.write_text(
-        json.dumps({"pid": 1234, "data_root": str(tmp_path / "data")}),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(module.core, "state_file", lambda: state)
-    monkeypatch.setattr(module.core, "_pid_exists", lambda _pid: True)
-    monkeypatch.setattr(module.core, "_process_matches", lambda *_args: False)
-
-    payload = module.core.stop_server({"acknowledge_side_effects": True})
-
-    assert payload["success"] is False
-    assert "unmanaged" in payload["error"]
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    payload = json.loads(module.sillytavern_stop({}, task_id=None))
+    assert payload["ok"] is True
+    assert "4242" in payload["killed_pids"]
+    assert captured["cmd"] == ["taskkill", "/PID", "4242", "/F"]
+    assert captured["stdin"] is subprocess.DEVNULL
