@@ -1044,6 +1044,39 @@ def test_resolve_does_not_treat_json_braces_as_templates(engine):
     assert out == "List: {1, 2, 3} and empty: {} and ref: Q"
 
 
+def test_resolve_inputs_namespace(engine):
+    """{inputs.key} resolves via lookup['inputs'] namespace.
+
+    Inputs are merged into context["inputs"] by execute(), and the
+    lookup builder promotes them to a top-level 'inputs' namespace
+    so {inputs.grill_artifact} resolves correctly.
+    """
+    lookup = {
+        "context": {"inputs": {"grill_artifact": "/tmp/art.json", "n": 42}},
+    }
+    # The lookup builder should have promoted inputs to top-level
+    # when called via _build_template_lookup, but _resolve_template
+    # itself just needs the key to exist in the lookup.
+    lookup["inputs"] = lookup["context"]["inputs"]
+    out = engine._resolve_template(
+        "File: {inputs.grill_artifact}, Count: {inputs.n}", lookup,
+    )
+    assert out == "File: /tmp/art.json, Count: 42"
+
+
+def test_build_template_lookup_promotes_inputs(engine):
+    """_build_template_lookup promotes context.inputs to top-level lookup key."""
+    wf = Workflow(name="test", description="t", nodes={
+        "a": WorkflowNode(id="a", task="do {inputs.x}", agent="dev", depends_on=[]),
+    })
+    states = {"a": NodeState(node_id="a")}
+    layers = [["a"]]
+    lookup = engine._build_template_lookup(wf, states, layers,
+                                           context={"inputs": {"x": "VAL"}})
+    assert "inputs" in lookup
+    assert lookup["inputs"]["x"] == "VAL"
+
+
 # ── _build_task_body tests ───────────────────────────────────────
 
 def test_build_task_body_appends_context_footer_after_substitution(engine):
