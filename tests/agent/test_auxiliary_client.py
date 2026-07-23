@@ -4844,7 +4844,11 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
 class TestAuxiliaryPoolRotationRetry:
-    def test_call_llm_rotates_explicit_codex_pool_on_429(self):
+    @pytest.mark.parametrize("resolved_api_mode", [None, "chat_completions"])
+    def test_call_llm_rotates_explicit_codex_pool_on_429(
+        self,
+        resolved_api_mode,
+    ):
         rate_err = Exception("usage limit reached")
         rate_err.status_code = 429
 
@@ -4873,7 +4877,16 @@ class TestAuxiliaryPoolRotationRetry:
         pool = _Pool()
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "openai-codex",
+                    "gpt-5.4",
+                    None,
+                    None,
+                    resolved_api_mode,
+                ),
+            ),
             patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
             patch("agent.auxiliary_client.load_pool", return_value=pool),
@@ -4893,8 +4906,12 @@ class TestAuxiliaryPoolRotationRetry:
         assert pool.rotate_calls[0]["status_code"] == 429
         mock_fallback.assert_not_called()
 
+    @pytest.mark.parametrize("resolved_api_mode", [None, "chat_completions"])
     @pytest.mark.asyncio
-    async def test_async_call_llm_rotates_explicit_codex_pool_on_429(self):
+    async def test_async_call_llm_rotates_explicit_codex_pool_on_429(
+        self,
+        resolved_api_mode,
+    ):
         rate_err = Exception("usage limit reached")
         rate_err.status_code = 429
 
@@ -4923,7 +4940,16 @@ class TestAuxiliaryPoolRotationRetry:
         pool = _Pool()
 
         with (
-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "openai-codex",
+                    "gpt-5.4",
+                    None,
+                    None,
+                    resolved_api_mode,
+                ),
+            ),
             patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
             patch("agent.auxiliary_client.load_pool", return_value=pool),
@@ -6433,6 +6459,41 @@ class TestAuxUnhealthyCache:
             return_value={
                 "fallback_chain": [
                     {"provider": "openrouter", "model": "another-model"},
+                ],
+            },
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+        ) as resolve_entry:
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is None
+        assert model is None
+        assert label == ""
+        resolve_entry.assert_not_called()
+
+    def test_unset_env_key_fallback_still_honors_provider_health(
+        self,
+        monkeypatch,
+    ):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        monkeypatch.delenv("UNSET_OPENROUTER_FALLBACK_KEY", raising=False)
+        _mark_provider_unhealthy("openrouter")
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "openrouter",
+                        "model": "another-model",
+                        "key_env": "UNSET_OPENROUTER_FALLBACK_KEY",
+                    },
                 ],
             },
         ), patch(

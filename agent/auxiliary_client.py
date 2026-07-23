@@ -3530,6 +3530,14 @@ def _pool_error_context(exc: Exception) -> Dict[str, Any]:
     return payload
 
 
+def _route_has_explicit_endpoint_or_key(
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> bool:
+    """Return whether an auxiliary route overrides provider-owned routing."""
+    return bool(str(base_url or "").strip() or str(api_key or "").strip())
+
+
 def _recoverable_pool_provider(
     resolved_provider: str,
     client: Any,
@@ -3966,6 +3974,25 @@ def _fallback_entry_for_health(
     return None
 
 
+def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
+    """Resolve inline or env-backed API key from a fallback-chain entry."""
+    explicit = str(entry.get("api_key") or "").strip()
+    if explicit:
+        return explicit
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        return os.getenv(key_env, "").strip() or None
+    return None
+
+
+def _fallback_entry_has_explicit_route(entry: Dict[str, Any]) -> bool:
+    """Return whether a fallback resolves outside its provider-owned route."""
+    return _route_has_explicit_endpoint_or_key(
+        str(entry.get("base_url") or "").strip() or None,
+        _fallback_entry_api_key(entry),
+    )
+
+
 def _fallback_health_label(
     fb_label: str,
     fb_client: Any,
@@ -3989,10 +4016,7 @@ def _fallback_health_label(
         # Labels can also come from built-in fallbacks rather than config. Keep
         # unknown shapes exact instead of risking a provider-wide quarantine.
         return label
-    entry_scoped = any(
-        str(entry.get(field) or "").strip()
-        for field in ("base_url", "api_key", "key_env", "api_key_env")
-    )
+    entry_scoped = _fallback_entry_has_explicit_route(entry)
     if entry_scoped:
         return label
     return _normalize_aux_provider(_fallback_label_provider(label))
@@ -4574,15 +4598,7 @@ def _try_configured_fallback_chain(
         fb_norm = _normalize_aux_provider(fb_provider)
 
         label = f"fallback_chain[{i}]({fb_provider})"
-        entry_scoped = any(
-            str(entry.get(field) or "").strip()
-            for field in (
-                "base_url",
-                "api_key",
-                "key_env",
-                "api_key_env",
-            )
-        )
+        entry_scoped = _fallback_entry_has_explicit_route(entry)
         if fb_norm == skip and not entry_scoped:
             continue
         unhealthy_label = (
@@ -4654,17 +4670,6 @@ def _try_configured_fallback_for_unavailable_client(
         explicit,
         reason="provider unavailable",
     )
-
-
-def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
-    """Resolve inline or env-backed API key from a fallback-chain entry."""
-    explicit = str(entry.get("api_key") or "").strip()
-    if explicit:
-        return explicit
-    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
-    if key_env:
-        return os.getenv(key_env, "").strip() or None
-    return None
 
 
 def _resolve_fallback_entry(
@@ -4762,10 +4767,7 @@ def _try_main_fallback_chain(
             _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
-        entry_scoped = any(
-            str(entry.get(field) or "").strip()
-            for field in ("base_url", "api_key", "key_env", "api_key_env")
-        )
+        entry_scoped = _fallback_entry_has_explicit_route(entry)
         if not entry_scoped and _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
@@ -7806,8 +7808,9 @@ def call_llm(
             resolved_provider,
             client,
             main_runtime=main_runtime,
-            route_is_explicit=bool(
-                resolved_base_url or resolved_api_key or resolved_api_mode
+            route_is_explicit=_route_has_explicit_endpoint_or_key(
+                resolved_base_url,
+                resolved_api_key,
             ),
         )
         # Capture the exact API key used so mark_exhausted_and_rotate can find
@@ -7935,8 +7938,9 @@ def call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
-                    route_is_explicit=bool(
-                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    route_is_explicit=_route_has_explicit_endpoint_or_key(
+                        resolved_base_url,
+                        resolved_api_key,
                     ),
                 )
             elif _is_rate_limit_error(first_err):
@@ -7950,8 +7954,9 @@ def call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
-                    route_is_explicit=bool(
-                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    route_is_explicit=_route_has_explicit_endpoint_or_key(
+                        resolved_base_url,
+                        resolved_api_key,
                     ),
                 )
             elif _is_invalid_aux_response_error(first_err):
@@ -8417,8 +8422,9 @@ async def async_call_llm(
             resolved_provider,
             client,
             main_runtime=main_runtime,
-            route_is_explicit=bool(
-                resolved_base_url or resolved_api_key or resolved_api_mode
+            route_is_explicit=_route_has_explicit_endpoint_or_key(
+                resolved_base_url,
+                resolved_api_key,
             ),
         )
         _client_api_key = str(getattr(client, "api_key", "") or "")
@@ -8504,8 +8510,9 @@ async def async_call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
-                    route_is_explicit=bool(
-                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    route_is_explicit=_route_has_explicit_endpoint_or_key(
+                        resolved_base_url,
+                        resolved_api_key,
                     ),
                 )
             elif _is_rate_limit_error(first_err):
@@ -8519,8 +8526,9 @@ async def async_call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
-                    route_is_explicit=bool(
-                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    route_is_explicit=_route_has_explicit_endpoint_or_key(
+                        resolved_base_url,
+                        resolved_api_key,
                     ),
                 )
             elif _is_invalid_aux_response_error(first_err):
