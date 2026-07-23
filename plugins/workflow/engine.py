@@ -755,37 +755,34 @@ class WorkflowEngine:
     def get_card_status(self, card_id: str) -> dict:
         """Query a kanban card's current state.
 
-        The CLI returns ``{task: {..., status, body, ...}, latest_summary: ...}``.
-        Unwrap the ``task`` key so callers see ``status``, ``body``,
-        etc. at the top level — matching what ``get_card_body`` and
-        the monitor loop expect.  Also merge ``latest_summary`` (the
-        agent's completion summary) into the returned dict so
-        ``get_card_body`` can prefer it over the raw task body.
+        Uses the kanban DB Python API directly — no subprocess.
+        Returns a dict with status, body, latest_summary, etc.
         """
-        import os as _os
-        _env = dict(_os.environ)
-        if self.kanban_board:
-            _env["HERMES_KANBAN_BOARD"] = self.kanban_board
-        result = subprocess.run(
-            [_hermes_binary(), "kanban", "show", card_id, "--json"],
-            capture_output=True, text=True, timeout=15,
-            env=_env,
-        )
-        if result.returncode != 0:
-            return {"status": "unknown", "error": result.stderr}
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect(board=self.kanban_board)
         try:
-            raw = json.loads(result.stdout)
-            # Unwrap the task envelope so status/body are at top level.
-            if "task" in raw and isinstance(raw["task"], dict):
-                card = dict(raw["task"])
-                # Merge the agent's completion summary so
-                # get_card_body can prefer it over the input prompt.
-                if "latest_summary" in raw and raw["latest_summary"]:
-                    card["latest_summary"] = raw["latest_summary"]
-                return card
-            return raw
-        except (json.JSONDecodeError, ValueError):
-            return {"status": "unknown"}
+            task = kb.get_task(conn, card_id)
+            if task is None:
+                return {"status": "unknown", "error": f"Card {card_id} not found"}
+            result = {
+                "status": task.status,
+                "body": task.body or "",
+                "assignee": task.assignee or "",
+                "title": task.title or "",
+            }
+            # Get the latest summary from task_events if available
+            try:
+                events = conn.execute(
+                    "SELECT message FROM task_events WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+                    (card_id,)
+                ).fetchone()
+                if events and events[0]:
+                    result["latest_summary"] = events[0]
+            except Exception:
+                pass
+            return result
+        finally:
+            conn.close()
 
     def get_card_body(self, card_id: str) -> str:
         """Get the agent's output from a completed kanban card.
