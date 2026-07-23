@@ -40,6 +40,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
 import contextlib
 import contextvars
 import hashlib
@@ -3895,6 +3896,21 @@ def _fallback_label_provider(fb_label: str) -> str:
     return match.group(1) if match else str(fb_label or "")
 
 
+def _fallback_health_label(fb_label: str, fb_client: Any) -> str:
+    """Return the narrowest safe health key for a fallback candidate.
+
+    Configured-chain labels identify one exact entry and must stay exact. The
+    built-in ``api-key`` label, however, represents a discovery bucket that can
+    contain several independent providers. Resolve that bucket to the concrete
+    selected backend; if the endpoint is unknown, leave it unquarantined rather
+    than suppressing every direct API-key provider.
+    """
+    label = str(fb_label or "").strip()
+    if label != "api-key":
+        return label
+    return _recoverable_pool_provider("auto", fb_client) or ""
+
+
 def _call_fallback_candidate_sync(
     fb_client: Any,
     fb_model: Optional[str],
@@ -3952,7 +3968,9 @@ def _call_fallback_candidate_sync(
         if _is_provider_deployment_unavailable_error(fb_err):
             # Quarantine the exact configured entry, not its generic provider.
             # Two `provider: custom` entries may point at independent endpoints.
-            _mark_provider_unhealthy(fb_label)
+            health_label = _fallback_health_label(fb_label, fb_client)
+            if health_label:
+                _mark_provider_unhealthy(health_label)
             logger.warning(
                 "Auxiliary %s: fallback candidate %s is unavailable (%s) — "
                 "skipping to next fallback",
@@ -3979,13 +3997,25 @@ def _call_fallback_candidate_sync(
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
                 except Exception as retry_err:
+                    if _is_provider_deployment_unavailable_error(retry_err):
+                        health_label = _fallback_health_label(fb_label, retry_client)
+                        if health_label:
+                            _mark_provider_unhealthy(health_label)
+                        logger.warning(
+                            "Auxiliary %s: refreshed fallback candidate %s is "
+                            "unavailable (%s) — skipping to next fallback",
+                            task or "call", fb_label, retry_err,
+                        )
+                        return None
                     if not _is_auth_error(retry_err):
                         raise
         # Refresh unavailable or the refreshed credential still 401s —
         # the token is dead (expired setup token with no refresh token).
         # Quarantine the candidate so subsequent chain walks skip it, and
         # let the caller move on instead of aborting the whole task.
-        _mark_provider_unhealthy(fb_label)
+        health_label = _fallback_health_label(fb_label, fb_client)
+        if health_label:
+            _mark_provider_unhealthy(health_label)
         logger.warning(
             "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
@@ -4029,7 +4059,9 @@ async def _call_fallback_candidate_async(
             await fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
-            _mark_provider_unhealthy(fb_label)
+            health_label = _fallback_health_label(fb_label, fb_client)
+            if health_label:
+                _mark_provider_unhealthy(health_label)
             logger.warning(
                 "Auxiliary %s (async): fallback candidate %s is unavailable "
                 "(%s) — skipping to next fallback",
@@ -4057,9 +4089,21 @@ async def _call_fallback_candidate_async(
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
                 except Exception as retry_err:
+                    if _is_provider_deployment_unavailable_error(retry_err):
+                        health_label = _fallback_health_label(fb_label, retry_client)
+                        if health_label:
+                            _mark_provider_unhealthy(health_label)
+                        logger.warning(
+                            "Auxiliary %s (async): refreshed fallback candidate "
+                            "%s is unavailable (%s) — skipping to next fallback",
+                            task or "call", fb_label, retry_err,
+                        )
+                        return None
                     if not _is_auth_error(retry_err):
                         raise
-        _mark_provider_unhealthy(fb_label)
+        health_label = _fallback_health_label(fb_label, fb_client)
+        if health_label:
+            _mark_provider_unhealthy(health_label)
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
@@ -4432,6 +4476,10 @@ def _try_main_fallback_chain(
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
             continue
+        if _is_provider_unhealthy(label):
+            _log_skip_unhealthy(label, task)
+            tried.append(f"{label} (unhealthy)")
+            continue
         if _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
@@ -4461,7 +4509,7 @@ def _try_main_fallback_chain(
                 task or "call", reason, failed_provider or "auto", label,
                 resolved_model or fb_model,
             )
-            return fb_client, resolved_model or fb_model, fb_provider
+            return fb_client, resolved_model or fb_model, label
         tried.append(label)
 
     if tried:
@@ -7849,9 +7897,9 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
-        # Retry ONCE on the same provider for a transient transport blip
-        # before the except-chain escalates to fallback — see call_llm()
-        # for the rationale. (PR #16587)
+        # Retry on the same provider for a transient transport blip before the
+        # except-chain escalates to fallback — see call_llm() for the rationale.
+        # The async path honors the same configured retry budget as sync.
         try:
             return _validate_llm_response(
                 await client.chat.completions.create(**kwargs), task,
@@ -7869,13 +7917,29 @@ async def async_call_llm(
                     transient_err,
                 )
                 raise
-            logger.info(
-                "Auxiliary %s (async): transient transport error; retrying "
-                "once on the same provider before fallback: %s",
-                task or "call", transient_err,
-            )
-            return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task)
+            max_transient_retries = _transient_retry_count()
+            last_transient = transient_err
+            for attempt in range(1, max_transient_retries + 1):
+                backoff = min(
+                    _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)),
+                    8.0,
+                )
+                logger.info(
+                    "Auxiliary %s (async): transient transport error "
+                    "(attempt %d/%d); retrying same provider after %.1fs "
+                    "before fallback: %s",
+                    task or "call", attempt, max_transient_retries, backoff,
+                    last_transient,
+                )
+                await asyncio.sleep(backoff)
+                try:
+                    return _validate_llm_response(
+                        await client.chat.completions.create(**kwargs), task)
+                except Exception as retry_transient:
+                    if not _is_transient_transport_error(retry_transient):
+                        raise
+                    last_transient = retry_transient
+            raise last_transient
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
