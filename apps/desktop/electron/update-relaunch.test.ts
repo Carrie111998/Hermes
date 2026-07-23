@@ -37,8 +37,12 @@ import {
   unpackedDirName
 } from './update-relaunch'
 
+// These fixtures describe a Linux install (#45205 is Linux-only product code),
+// so they are built with path.posix explicitly — host path.join would emit
+// backslashes on a Windows runner and the POSIX-flavored production code under
+// test would never match them.
 const ROOT = '/home/u/.hermes/hermes-agent'
-const UNPACKED = path.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked')
+const UNPACKED = path.posix.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked')
 
 // ---------------------------------------------------------------------------
 // 1) The execPath split — the heart of the GUI/backend skew guard.
@@ -49,24 +53,12 @@ test('unpackedDirName maps platform to the electron-builder dir', () => {
   assert.equal(unpackedDirName('win32'), 'win-unpacked')
 })
 
-test(
-  'resolveUnpackedRelease returns the dir for a binary UNDER release/<plat>-unpacked',
-  // This is Linux-only product code (#45205). resolveUnpackedRelease uses
-  // path.resolve() on an absolute POSIX execPath, which on a Windows host
-  // prepends the current drive (C:\home\u\...) while the expected UNPACKED is
-  // built with path.join and stays drive-less (\home\u\...), so the segment
-  // prefix check can never match. The behavior is correct on Linux; skip the
-  // faithless reproduction on win32.
-  // vitest types `skip` as a plain boolean and has no reason field, so the
-  // rationale stays in the comment above rather than in an inert string.
-  { skip: process.platform === 'win32' },
-  () => {
-    const exec = path.join(UNPACKED, 'hermes')
-    assert.equal(resolveUnpackedRelease(exec, ROOT, 'linux'), UNPACKED)
-    // The unpacked dir itself also counts.
-    assert.equal(resolveUnpackedRelease(UNPACKED, ROOT, 'linux'), UNPACKED)
-  }
-)
+test('resolveUnpackedRelease returns the dir for a binary UNDER release/<plat>-unpacked', () => {
+  const exec = path.posix.join(UNPACKED, 'hermes')
+  assert.equal(resolveUnpackedRelease(exec, ROOT, 'linux'), UNPACKED)
+  // The unpacked dir itself also counts.
+  assert.equal(resolveUnpackedRelease(UNPACKED, ROOT, 'linux'), UNPACKED)
+})
 
 test('resolveUnpackedRelease is null for AppImage / .deb / .rpm / dev / unresolved paths', () => {
   // AppImage mount
@@ -81,12 +73,12 @@ test('resolveUnpackedRelease is null for AppImage / .deb / .rpm / dev / unresolv
   )
   // empty / missing
   assert.equal(resolveUnpackedRelease('', ROOT, 'linux'), null)
-  assert.equal(resolveUnpackedRelease(path.join(UNPACKED, 'hermes'), '', 'linux'), null)
+  assert.equal(resolveUnpackedRelease(path.posix.join(UNPACKED, 'hermes'), '', 'linux'), null)
 })
 
 test('resolveUnpackedRelease is not fooled by a sibling prefix dir', () => {
   // `.../release/linux-unpacked-evil` must NOT match `.../release/linux-unpacked`.
-  const sneaky = path.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked-evil', 'hermes')
+  const sneaky = path.posix.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked-evil', 'hermes')
   assert.equal(resolveUnpackedRelease(sneaky, ROOT, 'linux'), null)
 })
 
