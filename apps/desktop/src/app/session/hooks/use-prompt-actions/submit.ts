@@ -507,6 +507,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             sessionId = resumed.session_id
 
             if (targetIsCurrentView()) {
+              setActiveSessionId(sessionId)
               activeSessionIdRef.current = sessionId
             }
           }
@@ -649,7 +650,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
           const { sessionId: usedSessionId } = await withSessionNotFoundResume(
-            sessionId,
+            liveSessionId,
             recoverStoredSessionId,
             liveId =>
               withSessionBusyRetry(() => {
@@ -716,6 +717,13 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         return true
       } catch (err) {
+        // A failure can arrive after a recovered submit was dispatched and the
+        // user selected another conversation. Clean the abandoned optimistic
+        // turn in its own cache without touching the new foreground session.
+        if (sessionDriftReason()) {
+          return abortForSessionSwitch(sessionId)
+        }
+
         releaseBusy()
 
         // A queued drain that raced a not-yet-settled turn gets a transient

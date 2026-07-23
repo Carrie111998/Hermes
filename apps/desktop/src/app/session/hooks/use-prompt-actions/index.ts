@@ -737,6 +737,15 @@ export function usePromptActions({
         return false
       }
 
+      const invocationStoredSessionId = selectedStoredSessionIdRef.current
+      const invocationRouteToken = getRouteToken()
+      const invocationSelectionGeneration = getSelectionGeneration()
+
+      const redirectContextDrifted = (): boolean =>
+        selectedStoredSessionIdRef.current !== invocationStoredSessionId ||
+        getRouteToken() !== invocationRouteToken ||
+        getSelectionGeneration() !== invocationSelectionGeneration
+
       // Accepted whether the live turn was redirected in place or queued for
       // the next turn (the build window, before the agent is wired) — either
       // way the correction reaches the model, so record it once as a real user
@@ -795,8 +804,9 @@ export function usePromptActions({
         // A stale runtime id after reconnect 404s ("session not found"): the
         // shared resolver resumes the stored session and retries once, so a
         // correction right after a reconnect isn't lost to the race.
-        const { result } = await withSessionNotFoundResume(sessionId, selectedStoredSessionIdRef.current, send, {
+        const { result } = await withSessionNotFoundResume(sessionId, invocationStoredSessionId, send, {
           requestGateway,
+          driftReason: () => (redirectContextDrifted() ? 'redirect context changed' : null),
           onRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -810,7 +820,15 @@ export function usePromptActions({
 
       return false
     },
-    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      appendSessionTextMessage,
+      getRouteToken,
+      getSelectionGeneration,
+      requestGateway,
+      selectedStoredSessionIdRef,
+      updateSessionState
+    ]
   )
 
   const reloadFromMessage = useCallback(

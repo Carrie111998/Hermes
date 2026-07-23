@@ -56,6 +56,7 @@ import {
   $messagingSessions,
   $resumeExhaustedSessionId,
   $resumeFailedSessionId,
+  $selectedSessionGeneration,
   $selectedStoredSessionId,
   $sessions,
   sessionMatchesStoredId,
@@ -199,7 +200,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   }
 
   const getRouteToken = useCallback(() => routeTokenRef.current, [])
-  const getSelectionGeneration = useCallback(() => selectionGenerationRef.current, [])
+
+  const getSelectionGeneration = useCallback(
+    () => selectionGenerationRef.current + $selectedSessionGeneration.get(),
+    []
+  )
 
   const getRoutedStoredSessionId = useCallback(() => routedSessionIdRef.current, [])
 
