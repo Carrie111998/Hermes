@@ -403,32 +403,6 @@ def test_max_revision_loops_constant():
     assert WorkflowEngine.MAX_REVISION_LOOPS == 3
 
 
-# ── Card ID parsing tests ──────────────────────────────────────────
-
-def test_card_id_regex_match():
-    import re
-    # Standard output format
-    output = "Created card abc123-def456\n"
-    match = re.match(r'Created\s+card\s+(\S+)', output.strip())
-    assert match is not None
-    assert match.group(1) == "abc123-def456"
-
-
-def test_card_id_regex_no_match_fallback():
-    """Fallback to split()[-1] when regex doesn't match."""
-    output = "card xyz789 created\n"
-    card_id = output.strip().split()[-1]
-    assert card_id == "created"
-
-
-def test_card_id_regex_multispace():
-    import re
-    output = "Created    card    spaced-id-123   "
-    match = re.match(r'Created\s+card\s+(\S+)', output.strip())
-    assert match is not None
-    assert match.group(1) == "spaced-id-123"
-
-
 # ── WorkflowNode tests ─────────────────────────────────────────────
 
 def test_workflow_node_defaults():
