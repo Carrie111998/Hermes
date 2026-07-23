@@ -362,19 +362,47 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             print(f"   ↩  LOOP #{current_loop + 1}: {implementer_nid} re-dispatched with failure report")
 
         elif status == "done":
+            # Update this node's status in the state file
+            states[node_id]["status"] = "done"
+            from datetime import datetime, timezone
+            states[node_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+            _save_state_file(state_path, state)
+
             # Check if all nodes in the current layer are done
             current_layer = state.get("current_layer", 0)
             if current_layer >= len(layers):
                 return
             layer_nodes = layers[current_layer]
-            all_done = all(
-                states.get(nid, {}).get("status") == "done"
-                for nid in layer_nodes
-            )
-            if all_done and node_id in layer_nodes:
-                state["current_layer"] = current_layer + 1
-                _save_state_file(state_path, state)
-                print(f"   ✓ Layer {current_layer} complete — advancing to {current_layer + 1}")
+            # Check actual card status from kanban DB, not just state file
+            from hermes_cli import kanban_db as kb
+            board = state.get("kanban_board", "adventours")
+            conn = kb.connect(board=board)
+            try:
+                all_done = True
+                for nid in layer_nodes:
+                    ns = states.get(nid, {})
+                    card_id = ns.get("kanban_card_id")
+                    if not card_id:
+                        all_done = False
+                        continue
+                    card = kb.get_task(conn, card_id)
+                    if not card or card.status != "done":
+                        all_done = False
+                        break
+                if all_done and node_id in layer_nodes:
+                    # Update all node statuses in state file from kanban DB
+                    for nid in layer_nodes:
+                        ns = states.get(nid, {})
+                        card_id = ns.get("kanban_card_id")
+                        if card_id:
+                            card = kb.get_task(conn, card_id)
+                            if card:
+                                ns["status"] = card.status
+                    state["current_layer"] = current_layer + 1
+                    _save_state_file(state_path, state)
+                    print(f"   ✓ Layer {current_layer} complete — advancing to {current_layer + 1}")
+            finally:
+                conn.close()
 
     except Exception as e:
         print(f"   ⚠  Workflow event handler error: {e}")
