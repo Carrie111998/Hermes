@@ -82,37 +82,45 @@ def check_workflow_requirements() -> bool:
 # scope but lost by the time engine.execute() runs.  The tool handler writes
 # session info here; the engine reads it.
 
-_SESSION_BRIDGE: dict = {}
 
 
 def _capture_session_for_engine() -> None:
-    """Capture current gateway session info into the module-level bridge.
+    """Capture current gateway session info into a temp file for the engine.
 
     Called from the tool handler where ContextVars are live.
+    The engine reads this file because ContextVars are lost across
+    the tool-handler → engine call boundary.
     """
-    global _SESSION_BRIDGE
     try:
         from gateway.session_context import get_session_env
+        import json as _json
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if platform and chat_id:
-            _SESSION_BRIDGE = {
+            data = {
                 "platform": platform,
                 "chat_id": chat_id,
                 "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
                 "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
                 "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
             }
+            with open("/tmp/wfe-session.json", "w") as f:
+                _json.dump(data, f)
     except Exception:
         pass
 
 
 def _get_captured_session() -> dict:
-    """Read the session info captured by the tool handler.
+    """Read the session info captured by the tool handler from temp file.
 
     Called from the engine where ContextVars are NOT available.
     """
-    return dict(_SESSION_BRIDGE) if _SESSION_BRIDGE else {}
+    try:
+        import json as _json
+        with open("/tmp/wfe-session.json") as f:
+            return _json.load(f)
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
