@@ -509,6 +509,8 @@ class WorkflowEngine:
         from hermes_cli import kanban_db as kb
         conn = kb.connect(board=self.kanban_board)
         try:
+            import sys as _sys
+            print(f"   🔧 create_kanban_card: board={self.kanban_board}, title={title[:50]}, assignee={assignee}", file=_sys.stderr)
             new_tid = kb.create_task(
                 conn,
                 title=title,
