@@ -68,7 +68,7 @@ HANDOFF_TICKET_PREFIX = "hnd_"
 #: consumed. Longer than the ticket itself — the QR dies in 120 s, but the
 #: phone session should last a normal browsing window. No refresh token is
 #: issued for handoff sessions, so this is a hard upper bound.
-HANDOFF_SESSION_TTL_SECONDS = 4 * 60 * 60
+HANDOFF_SESSION_TTL_SECONDS = 45 * 60  # F-04: shortened from 4h
 
 #: Least-privilege scope attached to every handoff-minted browser session.
 #: Explicitly excludes superuser / API_SERVER_KEY / wildcard power.
@@ -102,12 +102,24 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(
+    *,
+    user_id: str,
+    provider: str,
+    scopes: tuple[str, ...] | list[str] | None = None,
+    bound_session_id: str = "",
+    bound_profile: str = "",
+    allowed_endpoints: tuple[str, ...] | list[str] | frozenset[str] | None = None,
+) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
     seed). Stash returns the ``info`` dict to the caller on consume so the
     WS handler can carry the identity forward into its session log.
+
+    Full-dashboard sessions omit ``scopes`` / ``allowed_endpoints``
+    (unrestricted WS paths). Resume sessions pass both so consume can
+    default-deny admin WS endpoints.
     """
     ticket = secrets.token_urlsafe(32)
     # Defence in depth: never mint a WS ticket that collides with the
@@ -115,11 +127,20 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
     # cheap to guard).
     while ticket.startswith(HANDOFF_TICKET_PREFIX):
         ticket = secrets.token_urlsafe(32)
+    scope_list = [str(s) for s in (scopes or ()) if s]
+    if allowed_endpoints is None:
+        endpoints = None
+    else:
+        endpoints = sorted({str(e) for e in allowed_endpoints if e})
     info = {
         "user_id": user_id,
         "provider": provider,
         "minted_at": int(time.time()),
         "kind": "ws",
+        "scopes": scope_list,
+        "bound_session_id": str(bound_session_id or ""),
+        "bound_profile": str(bound_profile or ""),
+        "allowed_endpoints": endpoints,
     }
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
@@ -270,6 +291,9 @@ def verify_handoff_session_token(access_token: str) -> Optional[Session]:
         scopes = HANDOFF_SCOPES
     if _FORBIDDEN_HANDOFF_SCOPES.intersection(scopes):
         return None
+    # Empty scopes after forbid filter must not become a full-dashboard session.
+    if not scopes:
+        return None
     return Session(
         user_id=str(payload.get("sub") or ""),
         email=str(payload.get("email") or ""),
@@ -280,6 +304,8 @@ def verify_handoff_session_token(access_token: str) -> Optional[Session]:
         access_token=access_token,
         refresh_token="",  # handoff sessions never get a refresh token
         scopes=scopes,
+        bound_session_id=str(payload.get("session_id") or ""),
+        bound_profile=str(payload.get("profile") or ""),
     )
 
 

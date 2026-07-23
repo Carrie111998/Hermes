@@ -420,10 +420,20 @@ def _require_token(request: Request) -> None:
     if getattr(request.app.state, "auth_required", False):
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
-        # authenticated. Belt-and-braces: confirm the session is present.
-        if getattr(request.state, "session", None) is not None:
-            return
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # authenticated. Belt-and-braces: confirm the session is present and
+        # is full-dashboard (resume-scoped cookies must not pass admin
+        # endpoints that call _require_token).
+        sess = getattr(request.state, "session", None)
+        if sess is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        from hermes_cli.dashboard_auth.scopes import session_is_restricted
+
+        if session_is_restricted(sess):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient scope for this operation",
+            )
+        return
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -14634,7 +14644,18 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            allowed = info.get("allowed_endpoints")
+            if allowed is not None:
+                path = ws.url.path or ""
+                if path not in set(allowed):
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_endpoint_denied",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_endpoint_denied", "ticket"
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(

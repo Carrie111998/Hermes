@@ -1,9 +1,14 @@
 """Handoff ticket mint + gated middleware consume (QR phone-path server core).
 
-Covers the security invariants for Approach D (single-use handoff ticket →
-cookie session), without the public-SPA / tunnel surface (slice 2).
+Covers Approach D security invariants + Oscar F-01..F-04 scoped authz:
+single-use handoff ticket → resume-scoped cookie session, default-deny API
+gate, session/profile bind, consume only on GET /chat, shortened session TTL.
+Without the public-SPA / tunnel surface (slice 2).
 """
 from __future__ import annotations
+
+import os
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,15 +18,22 @@ from hermes_cli.dashboard_auth import clear_providers, register_provider
 from hermes_cli.dashboard_auth import ws_tickets
 from hermes_cli.dashboard_auth.base import Session, TokenPrincipal
 from hermes_cli.dashboard_auth.cookies import SESSION_AT_COOKIE, SESSION_RT_COOKIE
-from hermes_cli.dashboard_auth.ws_tickets import _reset_for_tests
+from hermes_cli.dashboard_auth.ws_tickets import (
+    HANDOFF_SESSION_TTL_SECONDS,
+    _reset_for_tests,
+)
+from hermes_state import SessionDB
 from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
 
 
 @pytest.fixture
-def gated_app():
+def gated_app(tmp_path, monkeypatch):
     clear_providers()
     register_provider(StubAuthProvider())
     _reset_for_tests()
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
@@ -37,6 +49,15 @@ def gated_app():
     web_server.app.state.auth_required = prev_required
 
 
+def _seed_session(session_id: str) -> str:
+    home = Path(os.environ["HERMES_HOME"])
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        return db.create_session(session_id, source="cli")
+    finally:
+        db.close()
+
+
 def _complete_stub_login(client) -> None:
     r1 = client.get("/auth/login?provider=stub", follow_redirects=False)
     assert r1.status_code == 302
@@ -48,18 +69,36 @@ def _complete_stub_login(client) -> None:
     assert r2.status_code == 302
 
 
-def _set_cookie_names(response) -> set[str]:
-    """Names present in Set-Cookie headers (prefix-stripped bare names)."""
+def _bare_cookie_names(client_or_response) -> set[str]:
     names = set()
-    # Starlette TestClient exposes set-cookie via response.cookies (jar)
-    # and headers. Use both for resilience.
-    for k in response.cookies.keys():
+    cookies = getattr(client_or_response, "cookies", None) or {}
+    for k in cookies.keys():
         bare = k
         for pfx in ("__Host-", "__Secure-"):
             if bare.startswith(pfx):
                 bare = bare[len(pfx) :]
         names.add(bare)
     return names
+
+
+def _mint(client, session_id: str, profile: str = "") -> str:
+    _seed_session(session_id)
+    body = {"session_id": session_id}
+    if profile:
+        body["profile"] = profile
+    r = client.post("/api/auth/handoff-ticket", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()["ticket"]
+
+
+def _phone_consume(ticket: str, *, extra_qs: str = "") -> TestClient:
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    qs = f"handoff={ticket}"
+    if extra_qs:
+        qs = f"{qs}&{extra_qs}"
+    r = phone.get(f"/chat?{qs}", follow_redirects=False)
+    assert r.status_code == 302, r.text
+    return phone
 
 
 # ---------------------------------------------------------------------------
@@ -72,11 +111,14 @@ def test_mint_handoff_requires_auth(gated_app):
         "/api/auth/handoff-ticket",
         json={"session_id": "sess-abc", "profile": "default"},
     )
-    assert r.status_code == 401, f"unauth mint must be rejected, got {r.status_code}: {r.text}"
+    assert r.status_code == 401, (
+        f"unauth mint must be rejected, got {r.status_code}: {r.text}"
+    )
 
 
 def test_mint_handoff_succeeds_when_authenticated(gated_app):
     _complete_stub_login(gated_app)
+    _seed_session("sess-abc")
     r = gated_app.post(
         "/api/auth/handoff-ticket",
         json={"session_id": "sess-abc", "profile": "default"},
@@ -98,41 +140,50 @@ def test_mint_handoff_requires_session_id(gated_app):
     assert r.status_code == 400
 
 
+def test_mint_handoff_rejects_unknown_session(gated_app):
+    _complete_stub_login(gated_app)
+    r = gated_app.post(
+        "/api/auth/handoff-ticket",
+        json={"session_id": "does-not-exist"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_mint_handoff_rejects_unknown_profile(gated_app):
+    _complete_stub_login(gated_app)
+    _seed_session("sess-p")
+    r = gated_app.post(
+        "/api/auth/handoff-ticket",
+        json={"session_id": "sess-p", "profile": "nope-profile-xyz"},
+    )
+    assert r.status_code in (400, 404), r.text
+
+
 # ---------------------------------------------------------------------------
-# Consume path: cookie set + 302 strip
+# Consume path: cookie set + 302 strip (F-03 GET /chat)
 # ---------------------------------------------------------------------------
 
 
 def test_consume_valid_handoff_sets_cookie_and_302_strips_param(gated_app):
     _complete_stub_login(gated_app)
-    mint = gated_app.post(
-        "/api/auth/handoff-ticket",
-        json={"session_id": "chat-42", "profile": "work"},
-    )
-    assert mint.status_code == 200
-    ticket = mint.json()["ticket"]
+    ticket = _mint(gated_app, "chat-42", profile="default")
 
     # Fresh client = no cookies (phone scan).
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     r = phone.get(
-        f"/chat?resume=chat-42&profile=work&handoff={ticket}",
+        f"/chat?resume=chat-42&profile=default&handoff={ticket}",
         follow_redirects=False,
     )
     assert r.status_code == 302, r.text
     loc = r.headers.get("location", "")
     assert "handoff=" not in loc, f"handoff must be stripped from redirect: {loc}"
-    assert "resume=chat-42" in loc or "resume=chat-42" in loc.replace("%3D", "=")
-    # Cookie jar should now hold a session AT.
-    cookie_names = set(phone.cookies.keys())
-    bare = {
-        n[len("__Host-") :] if n.startswith("__Host-") else
-        n[len("__Secure-") :] if n.startswith("__Secure-") else n
-        for n in cookie_names
-    }
-    assert SESSION_AT_COOKIE in bare, f"expected AT cookie, got {cookie_names}"
+    assert "resume=chat-42" in loc
+    assert "profile=default" in loc
+    bare = _bare_cookie_names(phone)
+    assert SESSION_AT_COOKIE in bare, f"expected AT cookie, got {bare}"
     # No refresh token for handoff sessions.
     assert SESSION_RT_COOKIE not in bare, (
-        f"handoff must not set refresh cookie, got {cookie_names}"
+        f"handoff must not set refresh cookie, got {bare}"
     )
 
     # Follow-up request with the cookie authenticates (no handoff param).
@@ -145,14 +196,12 @@ def test_consume_valid_handoff_sets_cookie_and_302_strips_param(gated_app):
     assert "*" not in scopes
     assert "superuser" not in scopes
     assert "API_SERVER_KEY" not in scopes
+    assert data.get("bound_session_id") == "chat-42"
 
 
 def test_replay_consumed_handoff_fails_closed(gated_app):
     _complete_stub_login(gated_app)
-    ticket = gated_app.post(
-        "/api/auth/handoff-ticket",
-        json={"session_id": "chat-1"},
-    ).json()["ticket"]
+    ticket = _mint(gated_app, "chat-1")
 
     phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
     first = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
@@ -166,12 +215,7 @@ def test_replay_consumed_handoff_fails_closed(gated_app):
     loc = second.headers.get("location", "")
     assert "/login" in loc or "/auth/login" in loc, loc
     # No session cookie granted.
-    bare = {
-        n[len("__Host-") :] if n.startswith("__Host-") else
-        n[len("__Secure-") :] if n.startswith("__Secure-") else n
-        for n in attacker.cookies.keys()
-    }
-    assert SESSION_AT_COOKIE not in bare
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(attacker)
 
 
 def test_expired_handoff_fails_closed(gated_app, monkeypatch):
@@ -179,10 +223,7 @@ def test_expired_handoff_fails_closed(gated_app, monkeypatch):
     clock = {"now": 2_000_000.0}
     monkeypatch.setattr(ws_tickets.time, "time", lambda: clock["now"])
 
-    ticket = gated_app.post(
-        "/api/auth/handoff-ticket",
-        json={"session_id": "chat-exp"},
-    ).json()["ticket"]
+    ticket = _mint(gated_app, "chat-exp")
 
     clock["now"] += ws_tickets.HANDOFF_TTL_SECONDS + 5
 
@@ -191,12 +232,7 @@ def test_expired_handoff_fails_closed(gated_app, monkeypatch):
     assert r.status_code == 302
     loc = r.headers.get("location", "")
     assert "/login" in loc or "/auth/login" in loc, loc
-    bare = {
-        n[len("__Host-") :] if n.startswith("__Host-") else
-        n[len("__Secure-") :] if n.startswith("__Secure-") else n
-        for n in phone.cookies.keys()
-    }
-    assert SESSION_AT_COOKIE not in bare
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +243,7 @@ def test_expired_handoff_fails_closed(gated_app, monkeypatch):
 def test_handoff_ticket_rejected_on_ws_auth_path(gated_app):
     """A handoff ticket must not authenticate a WS ``?ticket=`` upgrade."""
     _complete_stub_login(gated_app)
-    ticket = gated_app.post(
-        "/api/auth/handoff-ticket",
-        json={"session_id": "chat-ws"},
-    ).json()["ticket"]
+    ticket = _mint(gated_app, "chat-ws")
 
     # Drive the same helper the WS endpoints use.
     class _FakeWS:
@@ -240,12 +273,7 @@ def test_ws_ticket_rejected_on_handoff_path(gated_app):
     assert r.status_code == 302
     loc = r.headers.get("location", "")
     assert "/login" in loc or "/auth/login" in loc, loc
-    bare = {
-        n[len("__Host-") :] if n.startswith("__Host-") else
-        n[len("__Secure-") :] if n.startswith("__Secure-") else n
-        for n in phone.cookies.keys()
-    }
-    assert SESSION_AT_COOKIE not in bare
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
 
 
 # ---------------------------------------------------------------------------
@@ -255,13 +283,9 @@ def test_ws_ticket_rejected_on_handoff_path(gated_app):
 
 def test_handoff_minted_session_is_not_superuser(gated_app):
     _complete_stub_login(gated_app)
-    ticket = gated_app.post(
-        "/api/auth/handoff-ticket",
-        json={"session_id": "chat-scope"},
-    ).json()["ticket"]
+    ticket = _mint(gated_app, "chat-scope")
 
-    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
-    phone.get(f"/?handoff={ticket}", follow_redirects=False)
+    phone = _phone_consume(ticket)
 
     me = phone.get("/api/auth/me")
     assert me.status_code == 200, me.text
@@ -273,7 +297,6 @@ def test_handoff_minted_session_is_not_superuser(gated_app):
     assert "API_SERVER_KEY" not in scopes
 
     # Cookie path yields a Session, never a TokenPrincipal with wildcard scope.
-    # Prove via the access token the cookie carries.
     at = None
     for name, value in phone.cookies.items():
         bare = name
@@ -289,5 +312,160 @@ def test_handoff_minted_session_is_not_superuser(gated_app):
     assert not isinstance(session, TokenPrincipal)
     assert session.scopes == ("resume",)
     assert session.refresh_token == ""
+    assert session.bound_session_id == "chat-scope"
     forbidden = {"*", "superuser", "API_SERVER_KEY"}
     assert not forbidden.intersection(session.scopes)
+
+
+def test_handoff_session_ttl_is_short():
+    """F-04: session TTL is 30–60 minutes (45m)."""
+    assert 30 * 60 <= HANDOFF_SESSION_TTL_SECONDS <= 60 * 60
+    assert HANDOFF_SESSION_TTL_SECONDS == 45 * 60
+
+
+# ---------------------------------------------------------------------------
+# F-01: resume cookie default-deny (Oscar probes)
+# ---------------------------------------------------------------------------
+
+
+def _resume_phone(gated_app, session_id: str = "resume-bound") -> TestClient:
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, session_id)
+    return _phone_consume(ticket)
+
+
+def test_resume_cookie_denies_env_reveal(gated_app):
+    phone = _resume_phone(gated_app)
+    r = phone.get("/api/env/OPENAI_API_KEY/reveal")
+    assert r.status_code in (401, 403), r.text
+
+
+def test_resume_cookie_denies_env_put(gated_app):
+    phone = _resume_phone(gated_app)
+    r = phone.put("/api/env/OPENAI_API_KEY", json={"value": "sk-evil"})
+    assert r.status_code in (401, 403), r.text
+
+
+def test_resume_cookie_denies_config_get(gated_app):
+    phone = _resume_phone(gated_app)
+    r = phone.get("/api/config")
+    assert r.status_code in (401, 403), r.text
+
+
+def test_resume_cookie_denies_sessions_list(gated_app):
+    phone = _resume_phone(gated_app)
+    r = phone.get("/api/sessions")
+    assert r.status_code in (401, 403), r.text
+
+
+def test_resume_cookie_denies_unbound_session_detail(gated_app):
+    phone = _resume_phone(gated_app, "bound-only")
+    _seed_session("other-session")
+    r = phone.get("/api/sessions/other-session")
+    assert r.status_code in (401, 403), r.text
+
+
+def test_resume_cookie_allows_bound_session_detail(gated_app):
+    phone = _resume_phone(gated_app, "bound-only")
+    r = phone.get("/api/sessions/bound-only")
+    # Must not be authz-denied; route may 200 or 404 depending on profile wiring.
+    assert r.status_code not in (401, 403), r.text
+
+
+def test_resume_cookie_ws_ticket_is_scoped_not_generic(gated_app):
+    """Resume may mint a WS ticket, but it must carry allowed_endpoints."""
+    phone = _resume_phone(gated_app, "ws-bound")
+    r = phone.post("/api/auth/ws-ticket")
+    assert r.status_code == 200, r.text
+    ticket = r.json()["ticket"]
+    with ws_tickets._lock:
+        assert ticket in ws_tickets._tickets
+        _exp, info = ws_tickets._tickets[ticket]
+    assert info.get("scopes") == ["resume"]
+    allowed = info.get("allowed_endpoints")
+    assert allowed is not None
+    assert "/api/ws" in allowed
+    assert "/api/console" not in allowed
+
+    class _FakeWS:
+        def __init__(self, path):
+            self.query_params = {"ticket": ticket}
+            self.headers = {}
+            self.client = type("C", (), {"host": "1.2.3.4"})()
+            self.app = web_server.app
+            self.url = type("U", (), {"path": path})()
+
+    reason, cred = web_server._ws_auth_reason(_FakeWS("/api/console"))
+    assert reason == "ticket_endpoint_denied"
+    assert cred == "ticket"
+
+
+def test_resume_cookie_cannot_mint_handoff(gated_app):
+    phone = _resume_phone(gated_app, "no-remint")
+    r = phone.post(
+        "/api/auth/handoff-ticket",
+        json={"session_id": "no-remint"},
+    )
+    assert r.status_code in (401, 403), r.text
+
+
+# ---------------------------------------------------------------------------
+# F-02: ticket-bound redirect wins over client query
+# ---------------------------------------------------------------------------
+
+
+def test_consume_ticket_wins_over_resume_query_mismatch(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "real-session", profile="default")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    r = phone.get(
+        f"/chat?handoff={ticket}&resume=attacker-session&profile=evil",
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    loc = r.headers.get("location", "")
+    assert "resume=real-session" in loc
+    assert "attacker-session" not in loc
+    assert "profile=default" in loc
+    assert "evil" not in loc
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+# ---------------------------------------------------------------------------
+# F-03: consume placement — no cookie mint outside GET /chat
+# ---------------------------------------------------------------------------
+
+
+def test_api_config_with_handoff_does_not_set_cookies(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "place-api")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone.get(f"/api/config?handoff={ticket}", follow_redirects=False)
+    # Must not mint cookies; ticket still live for /chat.
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r2.status_code == 302
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+def test_post_with_handoff_does_not_set_cookies(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "place-post")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone.post(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+    r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r2.status_code == 302
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+def test_root_with_handoff_does_not_set_cookies(gated_app):
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "place-root")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone.get(f"/?handoff={ticket}", follow_redirects=False)
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)

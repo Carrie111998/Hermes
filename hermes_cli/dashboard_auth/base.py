@@ -16,8 +16,13 @@ class Session:
     provider-specific.
 
     ``scopes`` is optional and defaults to empty (unscoped interactive
-    browser session). Handoff-minted sessions set ``scopes=("resume",)`` and
-    never carry superuser / ``*`` / ``API_SERVER_KEY``.
+    browser session = full dashboard). Handoff-minted sessions set
+    ``scopes=("resume",)`` and never carry superuser / ``*`` /
+    ``API_SERVER_KEY``. Non-empty scopes are default-deny; see
+    ``dashboard_auth.scopes``.
+
+    ``bound_session_id`` / ``bound_profile`` bind a resume session to one
+    chat row (and optional profile home). Empty for full-dashboard sessions.
     """
 
     user_id: str
@@ -29,6 +34,9 @@ class Session:
     access_token: str
     refresh_token: str
     scopes: tuple[str, ...] = ()
+    # Handoff/resume binding — empty for full-dashboard sessions.
+    bound_session_id: str = ""
+    bound_profile: str = ""
 
 
 @dataclass(frozen=True)

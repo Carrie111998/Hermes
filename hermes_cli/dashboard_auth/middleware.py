@@ -369,6 +369,9 @@ async def gated_auth_middleware(
             )
         if bearer_session is not None:
             request.state.session = bearer_session
+            scope_block = _scope_denial_response(request, bearer_session)
+            if scope_block is not None:
+                return scope_block
             return await call_next(request)
         # A bearer was presented but didn't verify (expired/invalid/unknown).
         # Return the structured 401 so the desktop knows to refresh or
@@ -488,6 +491,9 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
+            scope_block = _scope_denial_response(request, new_session)
+            if scope_block is not None:
+                return scope_block
             response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
@@ -535,6 +541,9 @@ async def gated_auth_middleware(
         return response
 
     request.state.session = session
+    scope_block = _scope_denial_response(request, session)
+    if scope_block is not None:
+        return scope_block
     response = await call_next(request)
     if not provider_hint and session.provider:
         from hermes_cli.dashboard_auth.cookies import detect_https
@@ -549,25 +558,33 @@ async def gated_auth_middleware(
     return response
 
 
-def _strip_handoff_query(request: Request) -> str:
-    """Same path + query with ``handoff`` removed (ticket never stays in URL)."""
-    from urllib.parse import urlencode
+def _scope_denial_response(request: Request, session) -> Response | None:
+    """If session is resume-scoped and path is outside allowlist, return 403."""
+    from hermes_cli.dashboard_auth.scopes import (
+        resume_request_allowed,
+        scope_denial_detail,
+        session_is_restricted,
+    )
 
-    pairs = [
-        (k, v)
-        for k, v in request.query_params.multi_items()
-        if k != "handoff"
-    ]
-    query = urlencode(pairs)
-    path = request.url.path or "/"
-    return f"{path}?{query}" if query else path
+    if session is None or not session_is_restricted(session):
+        return None
+    if resume_request_allowed(request, session):
+        return None
+    return JSONResponse(
+        {"detail": scope_denial_detail(request, session)},
+        status_code=403,
+    )
 
 
 def _handoff_consume_response(request: Request, handoff: str) -> Response | None:
     """Consume a single-use handoff ticket and mint resume-scoped cookies.
 
-    On success returns a 302 to the same path with ``handoff`` stripped and
-    Set-Cookie headers for a least-privilege browser session
+    F-03: only GET …/chat may consume. Other paths ignore the param (return
+    None → normal unauth) without burning the ticket.
+
+    On success returns a 302 to ``/chat?resume=&profile=`` built from the
+    **ticket-bound** session_id/profile only (F-02 ticket wins) plus
+    Set-Cookie for a least-privilege browser session
     (``scopes=("resume",)``, no refresh token, never superuser).
 
     On invalid/expired/replay returns ``None`` so the caller falls through
@@ -576,11 +593,19 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
     """
     import time
 
+    from hermes_cli.dashboard_auth.scopes import (
+        handoff_redirect_location,
+        is_handoff_consume_request,
+    )
     from hermes_cli.dashboard_auth.ws_tickets import (
         HANDOFF_SCOPES,
         TicketInvalid,
         consume_handoff_ticket,
     )
+
+    # F-03: do not consume outside GET /chat (ticket stays usable).
+    if not is_handoff_consume_request(request):
+        return None
 
     try:
         info = consume_handoff_ticket(handoff)
@@ -613,7 +638,11 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
 
     expires_at = int(info.get("access_token_expires_at") or 0)
     expires_in = max(60, expires_at - int(time.time())) if expires_at else 60
-    location = _strip_handoff_query(request)
+    # F-02: redirect from ticket-bound targets only (ignore client query).
+    location = handoff_redirect_location(
+        info,
+        prefix=prefix_from_request(request) or "",
+    )
     resp = RedirectResponse(url=location, status_code=302)
     # Never issue a refresh token via handoff — resume-scoped AT only.
     set_session_cookies(
