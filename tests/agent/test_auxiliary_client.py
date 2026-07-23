@@ -2579,6 +2579,69 @@ class TestAuxiliaryFallbackLayering:
         assert result.choices[0].message.content == "healthy fallback"
         mock_mark.assert_called_once_with("nvidia")
 
+    def test_unavailable_configured_fallback_quarantines_exact_entry(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create.side_effect = RuntimeError(
+            "HTTP 503: deployment unavailable"
+        )
+        label = "fallback_chain[0](custom)"
+
+        with patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "custom-model",
+                label,
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with(label)
+
+    @pytest.mark.asyncio
+    async def test_async_unavailable_configured_fallback_quarantines_exact_entry(
+        self,
+    ):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("HTTP 503: deployment unavailable")
+        )
+        label = "fallback_chain[0](custom)"
+
+        with patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = await _call_fallback_candidate_async(
+                fallback_client,
+                "custom-model",
+                label,
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result is None
+        mock_mark.assert_called_once_with(label)
+
     def test_unavailable_configured_fallback_continues_to_next_candidate(self):
         deployment_error = RuntimeError(
             "Gemini HTTP 503 (UNAVAILABLE): high demand"
@@ -5741,6 +5804,59 @@ class TestAuxUnhealthyCache:
         )
         _mark_provider_unhealthy("codex")
         assert _is_provider_unhealthy("openai-codex") is True
+
+    def test_configured_chain_skips_exact_quarantined_entry(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        entries = [
+            {
+                "provider": "custom",
+                "model": "first",
+                "base_url": "https://custom-one.example/v1",
+                "api_key": "first-key",
+            },
+            {
+                "provider": "custom",
+                "model": "second",
+                "base_url": "https://custom-two.example/v1",
+                "api_key": "second-key",
+            },
+        ]
+        second_client = MagicMock()
+        _mark_provider_unhealthy("fallback_chain[0](custom)")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": entries},
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=[
+                (second_client, "second"),
+            ],
+        ), patch(
+            "agent.auxiliary_client._candidate_context_window",
+            return_value=1_048_576,
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "auto",
+            )
+
+        assert client is second_client
+        assert model == "second"
+        assert label == "fallback_chain[1](custom)"
+
+    def test_custom_route_never_recovers_through_a_builtin_pool(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+
+        assert _recoverable_pool_provider("custom", client) is None
+        assert _recoverable_pool_provider("custom:private-route", client) is None
 
     def test_resolve_auto_skips_unhealthy_step2(self):
         """_resolve_auto Step-2 chain skips unhealthy providers."""

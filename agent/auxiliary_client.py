@@ -3535,6 +3535,12 @@ def _recoverable_pool_provider(
     main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Infer which provider pool can recover the current auxiliary client."""
+    route_label = str(resolved_provider or "").strip().lower()
+    if route_label == "custom" or route_label.startswith("custom:"):
+        # An explicit custom route owns its own endpoint/key. Even when its
+        # base URL happens to share a hostname with a built-in provider, it
+        # must never rotate or exhaust that unrelated provider's pool.
+        return None
     normalized = _normalize_aux_provider(resolved_provider)
     if normalized not in {"", "auto", "custom"}:
         return normalized
@@ -3883,14 +3889,10 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     return None
 
 
-def _fallback_candidate_provider(fb_label: str, fb_client: Any) -> str:
-    """Resolve a fallback label/client pair to its concrete provider."""
+def _fallback_label_provider(fb_label: str) -> str:
+    """Extract the declared provider from a configured fallback label."""
     match = re.search(r"\(([^()]+)\)$", str(fb_label or ""))
-    label_provider = match.group(1) if match else str(fb_label or "")
-    return (
-        _recoverable_pool_provider(label_provider, fb_client)
-        or _normalize_aux_provider(label_provider)
-    )
+    return match.group(1) if match else str(fb_label or "")
 
 
 def _call_fallback_candidate_sync(
@@ -3948,8 +3950,9 @@ def _call_fallback_candidate_sync(
             fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
-            fb_provider = _fallback_candidate_provider(fb_label, fb_client)
-            _mark_provider_unhealthy(fb_provider)
+            # Quarantine the exact configured entry, not its generic provider.
+            # Two `provider: custom` entries may point at independent endpoints.
+            _mark_provider_unhealthy(fb_label)
             logger.warning(
                 "Auxiliary %s: fallback candidate %s is unavailable (%s) — "
                 "skipping to next fallback",
@@ -3958,7 +3961,10 @@ def _call_fallback_candidate_sync(
             return None
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
+        fb_provider = _auth_refresh_provider_for_route(
+            _fallback_label_provider(fb_label),
+            fb_base,
+        )
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
             if retry_client is not None:
@@ -3979,7 +3985,7 @@ def _call_fallback_candidate_sync(
         # the token is dead (expired setup token with no refresh token).
         # Quarantine the candidate so subsequent chain walks skip it, and
         # let the caller move on instead of aborting the whole task.
-        _mark_provider_unhealthy(fb_provider or fb_label)
+        _mark_provider_unhealthy(fb_label)
         logger.warning(
             "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
@@ -4023,8 +4029,7 @@ async def _call_fallback_candidate_async(
             await fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
-            fb_provider = _fallback_candidate_provider(fb_label, fb_client)
-            _mark_provider_unhealthy(fb_provider)
+            _mark_provider_unhealthy(fb_label)
             logger.warning(
                 "Auxiliary %s (async): fallback candidate %s is unavailable "
                 "(%s) — skipping to next fallback",
@@ -4033,7 +4038,10 @@ async def _call_fallback_candidate_async(
             return None
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
+        fb_provider = _auth_refresh_provider_for_route(
+            _fallback_label_provider(fb_label),
+            fb_base,
+        )
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(
                 fb_provider, fb_model, async_mode=True)
@@ -4051,7 +4059,7 @@ async def _call_fallback_candidate_async(
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
-        _mark_provider_unhealthy(fb_provider or fb_label)
+        _mark_provider_unhealthy(fb_label)
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
@@ -4277,8 +4285,21 @@ def _try_configured_fallback_chain(
         fb_model = str(entry.get("model", "")).strip() or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
-        if _is_provider_unhealthy(fb_provider):
-            _log_skip_unhealthy(fb_provider, task)
+        custom_route = (
+            fb_provider.lower() == "custom"
+            or fb_provider.lower().startswith("custom:")
+        )
+        unhealthy_label = (
+            label
+            if _is_provider_unhealthy(label)
+            else (
+                fb_provider
+                if not custom_route and _is_provider_unhealthy(fb_provider)
+                else ""
+            )
+        )
+        if unhealthy_label:
+            _log_skip_unhealthy(unhealthy_label, task)
             tried.append(f"{label} (unhealthy)")
             continue
 
