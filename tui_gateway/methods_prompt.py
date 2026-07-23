@@ -875,6 +875,7 @@ def _(rid, params: dict) -> dict:
                 "resolved": resolve_gateway_approval(
                     session["session_key"],
                     params.get("choice", "deny"),
+                    reason=params.get("reason"),
                     resolve_all=params.get("all", False),
                 )
             },
