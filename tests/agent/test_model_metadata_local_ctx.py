@@ -438,6 +438,58 @@ class TestFetchEndpointModelMetadataLmStudio:
         assert result["publisher/model-a"]["context_length"] == 65536
 
 
+class TestFetchEndpointModelMetadataStreaming:
+    """Cloud endpoint probes should inspect status before reading the body."""
+
+    @pytest.mark.parametrize("status_code", (401, 403))
+    def test_auth_error_stops_candidate_waterfall(self, status_code):
+        from agent.model_metadata import fetch_endpoint_model_metadata
+
+        response = MagicMock()
+        response.status_code = status_code
+        response.raise_for_status.side_effect = RuntimeError(status_code)
+
+        with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
+             patch("agent.model_metadata.requests.get", return_value=response) as mock_get:
+            result = fetch_endpoint_model_metadata(
+                "https://provider.example/v1",
+                force_refresh=True,
+            )
+
+        assert result == {}
+        mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs["stream"] is True
+        response.json.assert_not_called()
+        response.close.assert_called_once()
+
+    def test_not_found_falls_through_to_alternate_candidate(self):
+        from agent.model_metadata import fetch_endpoint_model_metadata
+
+        not_found = MagicMock()
+        not_found.status_code = 404
+        not_found.raise_for_status.side_effect = RuntimeError(404)
+        success = MagicMock()
+        success.status_code = 200
+        success.json.return_value = {"data": []}
+
+        with patch("agent.model_metadata.is_local_endpoint", return_value=False), \
+             patch(
+                 "agent.model_metadata.requests.get",
+                 side_effect=(not_found, success),
+             ) as mock_get:
+            result = fetch_endpoint_model_metadata(
+                "https://provider.example/v1",
+                force_refresh=True,
+            )
+
+        assert result == {}
+        assert mock_get.call_count == 2
+        not_found.json.assert_not_called()
+        not_found.close.assert_called_once()
+        success.json.assert_called_once()
+        success.close.assert_called_once()
+
+
 class TestQueryLocalContextLengthNetworkError:
     """_query_local_context_length handles network failures gracefully."""
 

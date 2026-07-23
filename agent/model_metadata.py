@@ -1147,10 +1147,21 @@ def fetch_endpoint_model_metadata(
 
     for candidate in candidates:
         url = candidate.rstrip("/") + "/models"
+        stop_after_error = False
         try:
-            response = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify())
-            response.raise_for_status()
-            payload = response.json()
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=(5, 10),
+                verify=_resolve_requests_verify(),
+                stream=True,
+            )
+            try:
+                stop_after_error = response.status_code in (401, 403)
+                response.raise_for_status()
+                payload = response.json()
+            finally:
+                response.close()
             cache: Dict[str, Dict[str, Any]] = {}
             for model in payload.get("data", []):
                 if not isinstance(model, dict):
@@ -1198,6 +1209,8 @@ def fetch_endpoint_model_metadata(
             return cache
         except Exception as exc:
             last_error = exc
+            if stop_after_error:
+                break
 
     if last_error:
         logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
