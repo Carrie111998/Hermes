@@ -3543,9 +3543,39 @@ def _recoverable_pool_provider(
         # must never rotate or exhaust that unrelated provider's pool.
         return None
     normalized = _normalize_aux_provider(resolved_provider)
-    if normalized not in {"", "auto", "custom"}:
-        return normalized
     base = str(getattr(client, "base_url", "") or "")
+    normalized_base = _normalized_provider_route(base)
+
+    # A concrete provider label is not enough to prove pool ownership. A
+    # configured route may reuse that label while supplying its own endpoint
+    # or key. Only associate it with the shared pool when the selected
+    # client's route matches the provider registry's canonical route.
+    if normalized not in {"", "auto", "custom"}:
+        if not normalized_base:
+            return normalized
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+
+            pconfig = PROVIDER_REGISTRY.get(normalized)
+            candidates = [
+                str(getattr(pconfig, "inference_base_url", "") or ""),
+            ]
+            base_url_env_var = str(
+                getattr(pconfig, "base_url_env_var", "") or ""
+            ).strip()
+            if base_url_env_var:
+                candidates.append(str(os.environ.get(base_url_env_var) or ""))
+            for candidate in candidates:
+                normalized_candidate = _normalized_provider_route(candidate)
+                if normalized_candidate and (
+                    normalized_base == normalized_candidate
+                    or normalized_base.startswith(normalized_candidate + "/")
+                ):
+                    return normalized
+        except Exception:
+            pass
+        return None
+
     if base_url_host_matches(base, "chatgpt.com"):
         return "openai-codex"
     if base_url_host_matches(base, "openrouter.ai"):
@@ -3576,7 +3606,6 @@ def _recoverable_pool_provider(
         if preferred_provider in PROVIDER_REGISTRY:
             provider_ids.remove(preferred_provider)
             provider_ids.insert(0, preferred_provider)
-        normalized_base = _normalized_provider_route(base)
         best_match: tuple[int, str] | None = None
         for provider_id in provider_ids:
             pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -3988,7 +4017,7 @@ def _fallback_health_label(
     )
     if entry_scoped:
         return label
-    return _fallback_label_provider(label)
+    return _normalize_aux_provider(_fallback_label_provider(label))
 
 
 def _mark_recoverable_provider_unhealthy(
@@ -3996,13 +4025,18 @@ def _mark_recoverable_provider_unhealthy(
     client: Any,
     *,
     main_runtime: Optional[Dict[str, Any]] = None,
+    task: Optional[str] = None,
 ) -> Optional[str]:
     """Quarantine only a concrete shared provider inferred for this route."""
-    health_provider = _recoverable_pool_provider(
-        resolved_provider,
-        client,
-        main_runtime=main_runtime,
-    )
+    route_label = str(resolved_provider or "").strip()
+    if re.match(r"fallback_(?:chain|providers)\[\d+\]", route_label):
+        health_provider = _fallback_health_label(route_label, client, task)
+    else:
+        health_provider = _recoverable_pool_provider(
+            resolved_provider,
+            client,
+            main_runtime=main_runtime,
+        )
     if health_provider:
         _mark_provider_unhealthy(health_provider)
     return health_provider
@@ -4172,7 +4206,12 @@ def _call_fallback_candidate_sync(
             fb_base,
         )
         if refresh_provider not in {"auto", "", None} and _refresh_provider_credentials(refresh_provider):
-            retry_client, retry_model = _get_cached_client(refresh_provider, fb_model)
+            retry_client, retry_model = _resolve_refreshed_fallback_candidate(
+                fb_label,
+                task,
+                refresh_provider,
+                fb_model,
+            )
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
                     refresh_provider, retry_model or fb_model, messages,
@@ -4276,8 +4315,13 @@ async def _call_fallback_candidate_async(
             fb_base,
         )
         if refresh_provider not in {"auto", "", None} and _refresh_provider_credentials(refresh_provider):
-            retry_client, retry_model = _get_cached_client(
-                refresh_provider, fb_model, async_mode=True)
+            retry_client, retry_model = _resolve_refreshed_fallback_candidate(
+                fb_label,
+                task,
+                refresh_provider,
+                fb_model,
+                async_mode=True,
+            )
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
                     refresh_provider, retry_model or fb_model, messages,
@@ -4640,7 +4684,11 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(
+    entry: Dict[str, Any],
+    *,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
@@ -4652,10 +4700,36 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     return resolve_provider_client(
         provider,
         model=model,
+        async_mode=async_mode,
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
     )
+
+
+def _resolve_refreshed_fallback_candidate(
+    fb_label: str,
+    task: Optional[str],
+    refresh_provider: str,
+    fb_model: Optional[str],
+    *,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Rebuild a refreshed fallback without losing entry-scoped routing."""
+    entry = _fallback_entry_for_health(task, fb_label)
+    entry_scoped = isinstance(entry, dict) and any(
+        str(entry.get(field) or "").strip()
+        for field in ("base_url", "api_key", "key_env", "api_key_env", "api_mode", "transport")
+    )
+    if entry_scoped:
+        return _resolve_fallback_entry(entry, async_mode=async_mode)
+    if async_mode:
+        return _get_cached_client(
+            refresh_provider,
+            fb_model,
+            async_mode=True,
+        )
+    return _get_cached_client(refresh_provider, fb_model)
 
 
 def _try_main_fallback_chain(
@@ -4696,7 +4770,7 @@ def _try_main_fallback_chain(
         fb_model = str(entry.get("model") or "").strip()
         if not fb_provider or not fb_model:
             continue
-        fb_norm = fb_provider.lower()
+        fb_norm = _normalize_aux_provider(fb_provider)
         label = f"fallback_providers[{i}]({fb_provider})"
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
@@ -4705,7 +4779,11 @@ def _try_main_fallback_chain(
             _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
-        if _is_provider_unhealthy(fb_norm):
+        entry_scoped = any(
+            str(entry.get(field) or "").strip()
+            for field in ("base_url", "api_key", "key_env", "api_key_env")
+        )
+        if not entry_scoped and _is_provider_unhealthy(fb_norm):
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
             continue
@@ -7866,6 +7944,7 @@ def call_llm(
                     resolved_provider,
                     client,
                     main_runtime=main_runtime,
+                    task=task,
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
@@ -7877,6 +7956,7 @@ def call_llm(
                     resolved_provider,
                     client,
                     main_runtime=main_runtime,
+                    task=task,
                 )
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
@@ -8420,6 +8500,7 @@ async def async_call_llm(
                     resolved_provider,
                     client,
                     main_runtime=main_runtime,
+                    task=task,
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
@@ -8431,6 +8512,7 @@ async def async_call_llm(
                     resolved_provider,
                     client,
                     main_runtime=main_runtime,
+                    task=task,
                 )
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"

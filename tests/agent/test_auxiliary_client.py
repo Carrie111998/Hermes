@@ -7120,3 +7120,200 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+class TestFallbackRouteScopingRegressions:
+    """Health and refresh state must follow the configured route."""
+
+    def test_main_chain_entry_override_ignores_shared_provider_health(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        entry = {
+            "provider": "nvidia",
+            "model": "different-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "sibling-key",
+        }
+        fallback_client = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            lambda _cfg: [entry],
+        )
+
+        with patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            side_effect=lambda label: label == "nvidia",
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(fallback_client, "different-deployment"),
+        ) as resolve_entry:
+            client, model, label = _try_main_fallback_chain(
+                task="compression",
+                failed_provider="auto",
+            )
+
+        assert client is fallback_client
+        assert model == "different-deployment"
+        assert label == "fallback_providers[0](nvidia)"
+        resolve_entry.assert_called_once_with(entry)
+
+    def test_entry_scoped_auth_refresh_rebuilds_exact_sync_route(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        entry = {
+            "provider": "nvidia",
+            "model": "custom-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "entry-key",
+            "api_mode": "chat_completions",
+        }
+        stale_client = MagicMock()
+        stale_client.base_url = entry["base_url"]
+        stale_client.chat.completions.create.side_effect = _AuxAuth401("expired")
+        fresh_client = MagicMock()
+        fresh_client.base_url = entry["base_url"]
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh")
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ), patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fresh_client, entry["model"]),
+        ) as resolve_route, patch(
+            "agent.auxiliary_client._get_cached_client"
+        ) as cached_route:
+            result = _call_fallback_candidate_sync(
+                stale_client,
+                entry["model"],
+                "fallback_chain[0](nvidia)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "fresh"
+        resolve_route.assert_called_once_with(
+            "nvidia",
+            model="custom-deployment",
+            async_mode=False,
+            explicit_base_url="https://nim-sibling.example/v1",
+            explicit_api_key="entry-key",
+            api_mode="chat_completions",
+        )
+        cached_route.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_entry_scoped_auth_refresh_rebuilds_exact_async_route(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        entry = {
+            "provider": "nvidia",
+            "model": "custom-deployment",
+            "base_url": "https://nim-sibling.example/v1",
+            "api_key": "entry-key",
+        }
+        stale_client = MagicMock()
+        stale_client.base_url = entry["base_url"]
+        stale_client.chat.completions.create = AsyncMock(
+            side_effect=_AuxAuth401("expired")
+        )
+        fresh_client = MagicMock()
+        fresh_client.base_url = entry["base_url"]
+        fresh_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("fresh async")
+        )
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": [entry]},
+        ), patch(
+            "agent.auxiliary_client._refresh_provider_credentials",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fresh_client, entry["model"]),
+        ) as resolve_route, patch(
+            "agent.auxiliary_client._get_cached_client"
+        ) as cached_route:
+            result = await _call_fallback_candidate_async(
+                stale_client,
+                entry["model"],
+                "fallback_chain[0](nvidia)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "fresh async"
+        resolve_route.assert_called_once_with(
+            "nvidia",
+            model="custom-deployment",
+            async_mode=True,
+            explicit_base_url="https://nim-sibling.example/v1",
+            explicit_api_key="entry-key",
+            api_mode=None,
+        )
+        cached_route.assert_not_called()
+
+    def test_provider_label_with_base_override_is_not_shared_pool_route(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://nim-sibling.example/v1"
+
+        assert _recoverable_pool_provider("nvidia", client) is None
+
+    def test_model_only_alias_uses_canonical_provider_health_key(self):
+        from agent.auxiliary_client import _fallback_health_label
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "google-gemini", "model": "gemini-3.5-flash"}
+                ]
+            },
+        ):
+            assert _fallback_health_label(
+                "fallback_chain[0](google-gemini)",
+                MagicMock(),
+                "compression",
+            ) == "gemini"
+
+    def test_promoted_model_only_fallback_marks_canonical_provider(self):
+        from agent.auxiliary_client import _mark_recoverable_provider_unhealthy
+
+        client = MagicMock()
+        client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "google-gemini", "model": "gemini-3.5-flash"}
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mark_unhealthy:
+            health_key = _mark_recoverable_provider_unhealthy(
+                "fallback_chain[0](google-gemini)",
+                client,
+                task="compression",
+            )
+
+        assert health_key == "gemini"
+        mark_unhealthy.assert_called_once_with("gemini")
