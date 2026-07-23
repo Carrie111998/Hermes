@@ -28,10 +28,11 @@ through the board.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -151,11 +152,144 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+@dataclass(frozen=True)
+class _CompletionContext:
+    """One parsed authority decision for a completion attempt."""
+
+    authority_mode: Literal["worker", "orchestrator"]
+    task_id: Optional[str] = None
+    run_id: Optional[int] = None
+    claim_token: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _parse_completion_context(task_id: str) -> _CompletionContext:
+    """Parse worker scope and identity once, failing closed on ambiguity.
+
+    Either the canonical marker or the compatibility task marker declares a
+    worker context.  A declared worker must have one exact task scope and one
+    unambiguous run/claim identity before completion can reach the database.
+    Raw alias values are compared and validated without normalization.
+    """
+    canonical_marker_present = "KANBAN_WORKER" in os.environ
+    task_marker_present = "HERMES_KANBAN_TASK" in os.environ
+    if not canonical_marker_present and not task_marker_present:
+        return _CompletionContext(authority_mode="orchestrator")
+
+    if canonical_marker_present and os.environ["KANBAN_WORKER"] != "1":
+        return _CompletionContext(
+            authority_mode="worker",
+            error="worker completion requires KANBAN_WORKER=1",
+        )
+
+    scoped_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if (
+        not scoped_task_id
+        or scoped_task_id != scoped_task_id.strip()
+    ):
+        return _CompletionContext(
+            authority_mode="worker",
+            error=(
+                "worker completion requires a non-empty, stripped "
+                "HERMES_KANBAN_TASK scope"
+            ),
+        )
+    if scoped_task_id != task_id:
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            error=(
+                f"worker is scoped to task {scoped_task_id}; refusing to mutate "
+                f"{task_id}. Use kanban_comment to hand off information to other "
+                f"tasks, or kanban_create to spawn follow-up work."
+            ),
+        )
+
+    canonical_run_present = "KANBAN_TASK_RUN_ID" in os.environ
+    legacy_run_present = "HERMES_KANBAN_RUN_ID" in os.environ
+    if (
+        canonical_run_present
+        and legacy_run_present
+        and os.environ["KANBAN_TASK_RUN_ID"]
+        != os.environ["HERMES_KANBAN_RUN_ID"]
+    ):
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            error="worker completion run id aliases conflict",
+        )
+    raw_run_id = (
+        os.environ["KANBAN_TASK_RUN_ID"]
+        if canonical_run_present
+        else os.environ.get("HERMES_KANBAN_RUN_ID")
+    )
+    if not raw_run_id or not raw_run_id.isascii() or not raw_run_id.isdecimal():
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            error="worker completion requires a valid current run id",
+        )
+    run_id = int(raw_run_id)
+    if run_id <= 0 or run_id > 0x7FFF_FFFF_FFFF_FFFF:
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            error="worker completion requires a positive current run id",
+        )
+
+    canonical_claim_present = "KANBAN_CLAIM_TOKEN" in os.environ
+    legacy_claim_present = "HERMES_KANBAN_CLAIM_LOCK" in os.environ
+    if (
+        canonical_claim_present
+        and legacy_claim_present
+        and os.environ["KANBAN_CLAIM_TOKEN"]
+        != os.environ["HERMES_KANBAN_CLAIM_LOCK"]
+    ):
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            run_id=run_id,
+            error="worker completion claim token aliases conflict",
+        )
+    claim_token = (
+        os.environ["KANBAN_CLAIM_TOKEN"]
+        if canonical_claim_present
+        else os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    )
+    if not claim_token:
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            run_id=run_id,
+            error="worker completion requires a non-empty current claim token",
+        )
+    if (
+        claim_token != claim_token.strip()
+        or not claim_token.isprintable()
+        or len(claim_token.encode("utf-8")) > 512
+    ):
+        return _CompletionContext(
+            authority_mode="worker",
+            task_id=scoped_task_id,
+            run_id=run_id,
+            error=(
+                "worker completion requires a valid claim token: no surrounding "
+                "whitespace or control characters, maximum 512 UTF-8 bytes"
+            ),
+        )
+    return _CompletionContext(
+        authority_mode="worker",
+        task_id=scoped_task_id,
+        run_id=run_id,
+        claim_token=claim_token,
+    )
+
+
 def _stamp_worker_session_metadata(
-    task_id: str, metadata: Optional[dict]
+    context: _CompletionContext, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if context.authority_mode != "worker":
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
@@ -546,9 +680,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
-    ownership_err = _enforce_worker_task_ownership(tid)
-    if ownership_err:
-        return ownership_err
+    context = _parse_completion_context(tid)
+    if context.error:
+        return tool_error(context.error)
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -625,7 +759,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
-    metadata = _stamp_worker_session_metadata(tid, metadata)
+    metadata = _stamp_worker_session_metadata(context, metadata)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -671,7 +805,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=context.run_id,
+                    expected_claim_token=context.claim_token,
+                    authority_mode=kb.CompletionAuthority(context.authority_mode),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

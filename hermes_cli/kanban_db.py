@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -4596,6 +4597,14 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class CompletionAuthority(str, Enum):
+    """Explicit authority used for a terminal task completion."""
+
+    WORKER = "worker"
+    ORCHESTRATOR = "orchestrator"
+    LEGACY = "legacy"
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4605,6 +4614,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_token: Optional[str] = None,
+    authority_mode: CompletionAuthority = CompletionAuthority.LEGACY,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4628,6 +4639,11 @@ def complete_task(
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
 
+    ``authority_mode`` explicitly distinguishes worker, orchestrator, and
+    backwards-compatible direct-kernel completion. Worker authority requires
+    the exact current run and claim on both the task and active run row. Legacy
+    callers that pass ``expected_claim_token`` retain the worker-style guard.
+
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
     Any suspected phantom references are recorded as a
@@ -4635,31 +4651,89 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
-
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
-    # completion still needs an auditable event, so we emit it in a
-    # tiny dedicated txn, then raise. The caller is responsible for
-    # surfacing HallucinatedCardsError to the worker; this function
-    # never mutates task state on a phantom-card rejection.
-    if created_cards:
-        verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
+    authority_mode = CompletionAuthority(authority_mode)
+    worker_authority = (
+        authority_mode is CompletionAuthority.WORKER
+        or (
+            authority_mode is CompletionAuthority.LEGACY
+            and expected_claim_token is not None
         )
-        if phantom_cards:
+    )
+
+    # A worker must prove exact task/run/task-claim/run-row-claim authority
+    # under BEGIN IMMEDIATE before its phantom-card rejection audit can write.
+    # The later terminal UPDATE retains the same predicate as a final CAS.
+    if created_cards:
+        hallucination_error: Optional[HallucinatedCardsError] = None
+        if worker_authority:
             with write_txn(conn):
-                _append_event(
-                    conn, task_id, "completion_blocked_hallucination",
-                    {
-                        "phantom_cards": phantom_cards,
-                        "verified_cards": verified_cards,
-                        "summary_preview": (
-                            (summary or result or "").strip().splitlines()[0][:200]
-                            if (summary or result)
-                            else None
-                        ),
-                    },
+                if expected_run_id is None or int(expected_run_id) <= 0:
+                    return False
+                current_authority = conn.execute(
+                    """
+                    SELECT 1
+                      FROM tasks
+                     WHERE id = ?
+                       AND status = 'running'
+                       AND current_run_id = ?
+                       AND claim_lock = ?
+                       AND EXISTS (
+                           SELECT 1
+                             FROM task_runs AS active_run
+                            WHERE active_run.id = tasks.current_run_id
+                              AND active_run.task_id = tasks.id
+                              AND active_run.status = 'running'
+                              AND active_run.ended_at IS NULL
+                              AND active_run.claim_lock = ?
+                       )
+                    """,
+                    (
+                        task_id, int(expected_run_id),
+                        expected_claim_token, expected_claim_token,
+                    ),
+                ).fetchone()
+                if current_authority is None:
+                    return False
+                verified_cards, phantom_cards = _verify_created_cards(
+                    conn, task_id, created_cards
                 )
-            raise HallucinatedCardsError(phantom_cards, task_id)
+                if phantom_cards:
+                    _append_event(
+                        conn, task_id, "completion_blocked_hallucination",
+                        {
+                            "phantom_cards": phantom_cards,
+                            "verified_cards": verified_cards,
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                    hallucination_error = HallucinatedCardsError(
+                        phantom_cards, task_id
+                    )
+            if hallucination_error is not None:
+                raise hallucination_error
+        else:
+            verified_cards, phantom_cards = _verify_created_cards(
+                conn, task_id, created_cards
+            )
+            if phantom_cards:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_blocked_hallucination",
+                        {
+                            "phantom_cards": phantom_cards,
+                            "verified_cards": verified_cards,
+                            "summary_preview": (
+                                (summary or result or "").strip().splitlines()[0][:200]
+                                if (summary or result)
+                                else None
+                            ),
+                        },
+                    )
+                raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
 
@@ -4667,7 +4741,40 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
-        if expected_run_id is None:
+        if worker_authority:
+            if expected_run_id is None or int(expected_run_id) <= 0:
+                return False
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                   AND claim_lock = ?
+                   AND EXISTS (
+                       SELECT 1
+                         FROM task_runs AS active_run
+                        WHERE active_run.id = tasks.current_run_id
+                          AND active_run.task_id = tasks.id
+                          AND active_run.status = 'running'
+                          AND active_run.ended_at IS NULL
+                          AND active_run.claim_lock = ?
+                   )
+                """,
+                (
+                    result, now, task_id, int(expected_run_id),
+                    expected_claim_token, expected_claim_token,
+                ),
+            )
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4742,6 +4849,7 @@ def complete_task(
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "authority_mode": authority_mode.value,
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
