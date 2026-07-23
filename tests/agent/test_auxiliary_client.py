@@ -2379,6 +2379,41 @@ class TestAuxiliaryFallbackLayering:
         )
         mock_main.assert_not_called()
 
+    def test_missing_nvidia_function_deployment_triggers_fallback(self):
+        """A retired NVIDIA NIM function id is a route-capability failure."""
+        primary_client = MagicMock()
+        deployment_error = Exception(
+            "Error code: 404 - {'detail': \"Function id 'dead-function' "
+            "version 'null': Specified function in account 'account' is not found\"}"
+        )
+        setattr(deployment_error, "status_code", 404)
+        primary_client.chat.completions.create.side_effect = deployment_error
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from healthy compression fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "qwen/qwen3.5-397b-a17b")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "qwen/qwen3.5-397b-a17b", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gemini-3.5-flash", "fallback_chain[0](google-gemini)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from healthy compression fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "nvidia",
+            reason="provider deployment unavailable",
+        )
+        mock_main.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_async_invalid_empty_choices_response_triggers_fallback(self, monkeypatch):
         """Async aux calls use the same malformed-response fallback path."""
@@ -2409,6 +2444,106 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "nvidia",
             reason="invalid provider response",
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_missing_nvidia_function_deployment_triggers_fallback(self):
+        """Async compression also escapes a retired NVIDIA NIM deployment."""
+        primary_client = MagicMock()
+        deployment_error = Exception(
+            "Error code: 404 - {'detail': \"Function id 'dead-function' "
+            "version 'null': Specified function in account 'account' is not found\"}"
+        )
+        setattr(deployment_error, "status_code", 404)
+        primary_client.chat.completions.create = AsyncMock(side_effect=deployment_error)
+
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async compression fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "qwen/qwen3.5-397b-a17b")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("nvidia", "qwen/qwen3.5-397b-a17b", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "gemini-3.5-flash", "fallback_chain[0](google-gemini)")) as mock_chain, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_fallback_client, "gemini-3.5-flash")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async compression fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "nvidia",
+            reason="provider deployment unavailable",
+        )
+
+    def test_gemini_http_503_text_triggers_compression_fallback(self):
+        """Plain adapter RuntimeErrors must preserve HTTP 5xx fallback semantics."""
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): This model is currently experiencing high demand."
+        )
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from 503 fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("google-gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)")) as mock_chain:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from 503 fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "google-gemini",
+            reason="provider deployment unavailable",
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_gemini_http_503_text_triggers_compression_fallback(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(side_effect=RuntimeError(
+            "Gemini HTTP 503 (UNAVAILABLE): This model is currently experiencing high demand."
+        ))
+        fallback_client = MagicMock()
+        async_fallback_client = MagicMock()
+        async_fallback_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async 503 fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("google-gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback_client, "glm-5.2", "fallback_chain[0](zai)")) as mock_chain, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_fallback_client, "glm-5.2")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async 503 fallback"
+        mock_chain.assert_called_once_with(
+            "compression",
+            "google-gemini",
+            reason="provider deployment unavailable",
         )
 
     def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):

@@ -3179,6 +3179,27 @@ def _is_connection_error(exc: Exception) -> bool:
     return False
 
 
+def _http_status_code(exc: Exception) -> Optional[int]:
+    """Extract an HTTP status from SDK exceptions and plain adapter errors.
+
+    Native OpenAI-compatible exceptions expose ``status_code`` (sometimes on
+    ``response``), but subprocess/native adapters commonly preserve it only in
+    text such as ``Gemini HTTP 503`` or ``Error code: 404``.  Keeping this in one
+    helper prevents retry and fallback gates from silently disagreeing.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if isinstance(status, int):
+        return status
+    match = re.search(
+        r"\b(?:http|status|error\s+code)\s*[:=]?\s*([1-5]\d{2})\b",
+        str(exc),
+        re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
 def _is_transient_transport_error(exc: Exception) -> bool:
     """Return True for a one-off transport blip worth retrying ON the
     same provider before any provider/model fallback.
@@ -3192,9 +3213,7 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     """
     if _is_connection_error(exc):
         return True
-    status = getattr(exc, "status_code", None) or getattr(
-        getattr(exc, "response", None), "status_code", None
-    )
+    status = _http_status_code(exc)
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
@@ -3379,6 +3398,32 @@ def _is_model_incompatible_error(exc: Exception) -> bool:
         "does not support this model",
         "unsupported model",
     ))
+
+
+def _is_provider_deployment_unavailable_error(exc: Exception) -> bool:
+    """Detect a configured provider route whose backing deployment vanished.
+
+    NVIDIA NIM can keep accepting a model slug while returning HTTP 404 because
+    the account-scoped function deployment behind it was retired. The client
+    resolves and authenticates, so this is a hard route-capability failure and
+    auxiliary tasks must continue through their configured fallback chain.
+
+    Any 5xx is a temporary deployment outage after bounded same-provider
+    retries. Keep 404 deliberately narrow: a generic 404 may be a caller or
+    configuration mistake and must not silently bypass an explicitly selected
+    provider.
+    """
+    status = _http_status_code(exc)
+    if isinstance(status, int) and 500 <= status < 600:
+        return True
+    if status != 404:
+        return False
+    err_lower = str(exc).lower()
+    return (
+        "function id" in err_lower
+        and "specified function" in err_lower
+        and "not found" in err_lower
+    )
 
 
 def _is_invalid_aux_response_error(exc: Exception) -> bool:
@@ -7432,6 +7477,7 @@ def call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_provider_deployment_unavailable_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
@@ -7455,6 +7501,7 @@ def call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_provider_deployment_unavailable_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
@@ -7473,6 +7520,8 @@ def call_llm(
                 reason = "rate limit"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
+            elif _is_provider_deployment_unavailable_error(first_err):
+                reason = "provider deployment unavailable"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
             else:
@@ -7962,6 +8011,7 @@ async def async_call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_provider_deployment_unavailable_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
@@ -7977,6 +8027,7 @@ async def async_call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_provider_deployment_unavailable_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
@@ -7991,6 +8042,8 @@ async def async_call_llm(
                 reason = "rate limit"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
+            elif _is_provider_deployment_unavailable_error(first_err):
+                reason = "provider deployment unavailable"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
             else:
