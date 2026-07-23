@@ -295,6 +295,14 @@ class CLICommandsMixin:
         agent_running = getattr(self, "_agent_running", False)
         _cprint(f"  Agent: {'running' if agent_running else 'idle'}")
 
+    def _handle_jobs_command(self, cmd_original: str) -> None:
+        """Handle read-only ``/jobs`` reports in the classic CLI."""
+        from cli import _cprint
+        from hermes_cli.job_diagnostics import run_jobs_slash
+
+        for line in run_jobs_slash(cmd_original).splitlines():
+            _cprint(line)
+
     def _handle_journey_command(self, cmd_original: str) -> None:
         """Handle /journey — the learning timeline (see `hermes journey`).
 

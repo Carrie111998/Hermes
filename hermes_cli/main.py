@@ -299,6 +299,7 @@ from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.jobs import build_jobs_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -10998,6 +10999,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "mcp",
         "sessions",
         "insights",
+        "jobs",
         "version",
         "update",
         "uninstall",
@@ -12188,7 +12190,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "hooks", "import", "insights", "jobs",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -12625,6 +12627,13 @@ def cmd_insights(args):
         db.close()
     except Exception as e:
         print(f"Error generating insights: {e}")
+
+
+def cmd_jobs(args):
+    """Read-only long-job diagnostics and safe-resume inspection."""
+    from hermes_cli.job_diagnostics import jobs_command
+
+    return jobs_command(args)
 
 
 def cmd_skills(args):
@@ -13711,6 +13720,11 @@ def main():
     # insights command  (parser built in hermes_cli/subcommands/insights.py)
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
+
+    # =========================================================================
+    # jobs command  (read-only long-job diagnostics)
+    # =========================================================================
+    build_jobs_parser(subparsers, cmd_jobs=cmd_jobs)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)

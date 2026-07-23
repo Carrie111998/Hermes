@@ -234,6 +234,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
+    CommandDef(
+        "jobs",
+        "Inspect long-job timing, blockers, and safe resume state",
+        "Info",
+        args_hint="[status|show|why-slow|parallel|resume-plan]",
+        subcommands=("status", "show", "why-slow", "parallel", "resume-plan"),
+    ),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
                cli_only=True, aliases=("gateway",)),
     CommandDef("platform", "Pause, resume, or list a failing gateway platform", "Info",
@@ -557,6 +564,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "new",
     "stop",
     "status",
+    "jobs",
     "resume",
     "sessions",
     "model",
@@ -1163,7 +1171,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - jobs: local diagnostics remain reachable via /hermes jobs without
+#     displacing an existing native command from Slack's fixed 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "jobs"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

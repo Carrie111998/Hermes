@@ -3045,6 +3045,14 @@ class AIAgent:
         """
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
+        tracker = getattr(self, "_job_diagnostics_tracker", None)
+        if tracker is not None:
+            try:
+                tracker.activity(desc)
+            except Exception:
+                # Diagnostics are local observability only; they must never
+                # interrupt the agent loop.
+                pass
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -3055,6 +3063,56 @@ class AIAgent:
                 # covers import-time failures (kanban_tools unavailable,
                 # etc.) on niche deployment surfaces.
                 pass
+
+    def _record_job_span(
+        self,
+        category: str,
+        started_at: float,
+        ended_at: float,
+        *,
+        label: str = "",
+        meaningful_output: str | None = None,
+    ) -> None:
+        """Best-effort structured timing for the active diagnostics lane."""
+        tracker = getattr(self, "_job_diagnostics_tracker", None)
+        if tracker is None:
+            return
+        try:
+            tracker.record_span(
+                category,
+                started_at,
+                ended_at,
+                label=label,
+                meaningful_output=meaningful_output,
+            )
+        except Exception:
+            pass
+
+    def _record_job_tool_timing(
+        self,
+        tool_name: str,
+        args: dict,
+        started_at: float,
+        ended_at: float,
+        *,
+        failed: bool = False,
+        detail: str = "",
+    ) -> None:
+        """Best-effort timing/classification for one completed tool call."""
+        tracker = getattr(self, "_job_diagnostics_tracker", None)
+        if tracker is None:
+            return
+        try:
+            tracker.record_tool(
+                tool_name,
+                args,
+                started_at,
+                ended_at,
+                failed=failed,
+                detail=detail,
+            )
+        except Exception:
+            pass
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -3259,7 +3317,7 @@ class AIAgent:
         when it was killed, and by the periodic "still working" notifications.
         """
         elapsed = time.time() - self._last_activity_ts
-        return {
+        summary = {
             "last_activity_ts": self._last_activity_ts,
             "last_activity_desc": self._last_activity_desc,
             "seconds_since_activity": round(elapsed, 1),
@@ -3269,6 +3327,27 @@ class AIAgent:
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
         }
+        tracker = getattr(self, "_job_diagnostics_tracker", None)
+        if tracker is not None:
+            try:
+                lane = tracker.lane_snapshot()
+                summary.update(
+                    {
+                        "job_id": tracker.job_id,
+                        "lane_id": tracker.lane_id,
+                        "lane_status": lane.get("status"),
+                        "lane_blocker": lane.get("blocker"),
+                        "last_meaningful_output_at": lane.get(
+                            "last_meaningful_output_at"
+                        ),
+                        "last_meaningful_output": lane.get(
+                            "last_meaningful_output"
+                        ),
+                    }
+                )
+            except Exception:
+                pass
+        return summary
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
@@ -5551,11 +5630,21 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        return compress_context(
-            self, messages, system_message,
-            approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
-            force=force,
-        )
+        _started_at = time.time()
+        try:
+            return compress_context(
+                self, messages, system_message,
+                approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+                force=force,
+            )
+        finally:
+            self._record_job_span(
+                "compression",
+                _started_at,
+                time.time(),
+                label="context compression",
+                meaningful_output="context compression completed",
+            )
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""

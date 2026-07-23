@@ -715,6 +715,30 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
+            _timing_result = results[index]
+            _timing_failed = bool(
+                _timing_result is None or _timing_result[4]
+            )
+            _timing_detail = (
+                str(_timing_result[2])[:500]
+                if _timing_result is not None
+                else f"{function_name} ended without a result"
+            )
+            _record_job_tool_timing = getattr(
+                agent, "_record_job_tool_timing", None
+            )
+            if callable(_record_job_tool_timing):
+                try:
+                    _record_job_tool_timing(
+                        function_name,
+                        function_args,
+                        start,
+                        time.time(),
+                        failed=_timing_failed,
+                        detail=_timing_detail,
+                    )
+                except Exception:
+                    pass
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
             # starts with a clean slate.  This MUST be in a finally block
@@ -1685,6 +1709,27 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        if not _execution_blocked:
+            _record_job_tool_timing = getattr(
+                agent, "_record_job_tool_timing", None
+            )
+            if callable(_record_job_tool_timing):
+                try:
+                    _record_job_tool_timing(
+                        function_name,
+                        function_args,
+                        tool_start_time,
+                        tool_start_time + tool_duration,
+                        failed=_is_error_result,
+                        detail=(
+                            _multimodal_text_summary(function_result)[:500]
+                            if _is_error_result
+                            else ""
+                        ),
+                    )
+                except Exception:
+                    pass
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")

@@ -597,6 +597,19 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Profile-scoped, local-only job diagnostics. This adapter is fail-open:
+    # an unavailable/malformed diagnostics store must never block a turn.
+    try:
+        from hermes_cli.job_diagnostics import start_agent_job_tracker
+
+        agent._job_diagnostics_tracker = start_agent_job_tracker(
+            agent,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+        )
+    except Exception:
+        agent._job_diagnostics_tracker = None
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -622,13 +635,31 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        _codex_result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        _tracker = getattr(agent, "_job_diagnostics_tracker", None)
+        if _tracker is not None:
+            try:
+                _tracker.finish(
+                    failed=bool(_codex_result.get("failed")),
+                    interrupted=False,
+                    summary="codex app-server turn completed",
+                    exit_reason=(
+                        "codex_app_server_failed"
+                        if _codex_result.get("failed")
+                        else "completed"
+                    ),
+                )
+            except Exception:
+                pass
+            finally:
+                agent._job_diagnostics_tracker = None
+        return _codex_result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -4075,6 +4106,19 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+
+            _record_job_span = getattr(agent, "_record_job_span", None)
+            if callable(_record_job_span):
+                try:
+                    _record_job_span(
+                        "model_wait",
+                        api_start_time,
+                        api_start_time + api_duration,
+                        label=f"{agent.provider or 'provider'} API call",
+                        meaningful_output="model response received",
+                    )
+                except Exception:
+                    pass
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -5151,7 +5195,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    _result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -5166,6 +5210,24 @@ def run_conversation(
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
     )
+    _tracker = getattr(agent, "_job_diagnostics_tracker", None)
+    if _tracker is not None:
+        try:
+            _tracker.finish(
+                failed=bool(failed or _result.get("failed")),
+                interrupted=interrupted,
+                summary=(
+                    "agent turn interrupted"
+                    if interrupted
+                    else "agent turn completed"
+                ),
+                exit_reason=_turn_exit_reason,
+            )
+        except Exception:
+            pass
+        finally:
+            agent._job_diagnostics_tracker = None
+    return _result
 
 
 

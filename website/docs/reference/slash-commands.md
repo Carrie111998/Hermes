@@ -115,6 +115,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/credits` | Show your Nous credit balance and a top-up handoff link. |
 | `/billing` | CLI terminal-billing flow for Nous — view balance, buy credits, and manage auto-reload / monthly limits. |
 | `/insights` | Show usage insights and analytics (last 30 days) |
+| `/jobs [status\|show\|why-slow\|parallel\|resume-plan]` | Read-only long-job diagnostics for CLI and messaging. Shows active/blocked/idle lanes, timing, provider/worktree use, safe parallel recommendations, and fail-closed resume plans. See [Long-job diagnostics](/user-guide/features/job-diagnostics). |
 | `/platforms` (alias: `/gateway`) | Show gateway/messaging platform status (CLI-only summary view). |
 | `/paste` | Attach a clipboard image |
 | `/copy [number]` | Copy the last assistant response to clipboard (or the Nth-from-last with a number). CLI-only. |

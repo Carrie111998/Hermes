@@ -1087,7 +1087,20 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
-    
+
+    # Profile-scoped, local-only long-job diagnostics. Runtime records are
+    # written under $HERMES_HOME/jobs/diagnostics; operator report commands
+    # remain read-only and never launch, retry, stop, or resume work.
+    "job_diagnostics": {
+        "enabled": True,
+        "idle_after_seconds": 300,
+        "stale_after_seconds": 900,
+        "meaningful_output_warning_seconds": 600,
+        # Suppress unchanged heartbeat text until this much time has passed.
+        # State transitions always emit immediately.
+        "heartbeat_repeat_seconds": 540,
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",

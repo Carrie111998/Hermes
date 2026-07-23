@@ -462,6 +462,17 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_jobs_command(self, event: MessageEvent) -> str:
+        """Handle local, read-only long-job diagnostics."""
+        import asyncio
+
+        from hermes_cli.job_diagnostics import run_jobs_slash
+
+        output = await asyncio.to_thread(run_jobs_slash, event.text or "/jobs")
+        if len(output) > 3800:
+            output = output[:3790].rstrip() + "\n…(truncated)"
+        return output
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

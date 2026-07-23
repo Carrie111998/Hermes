@@ -9410,6 +9410,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
+        if canonical == "jobs":
+            return await self._handle_jobs_command(event)
+
         if canonical == "platform":
             return await self._handle_platform_command(event)
 
@@ -18567,6 +18570,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
+        _job_diag_cfg = user_config.get("job_diagnostics", {})
+        if not isinstance(_job_diag_cfg, dict):
+            _job_diag_cfg = {}
+        try:
+            from hermes_cli.job_diagnostics import HeartbeatReporter
+
+            _heartbeat_reporter = HeartbeatReporter(
+                interval_seconds=_NOTIFY_INTERVAL or 180,
+                meaningful_output_warning_seconds=float(
+                    _job_diag_cfg.get(
+                        "meaningful_output_warning_seconds",
+                        600,
+                    )
+                ),
+                idle_after_seconds=float(
+                    _job_diag_cfg.get("idle_after_seconds", 300)
+                ),
+                repeat_after_seconds=float(
+                    _job_diag_cfg.get("heartbeat_repeat_seconds", 540)
+                ),
+            )
+        except Exception:
+            _heartbeat_reporter = None
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -18603,6 +18629,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # who want it can opt in per platform.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
+                _activity_snapshot = {}
                 _want_iteration_detail = bool(
                     resolve_display_setting(
                         user_config,
@@ -18614,6 +18641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
+                        _activity_snapshot = _a
                         _parts = []
                         if _want_iteration_detail:
                             _parts.append(
@@ -18626,7 +18654,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                if _heartbeat_reporter is not None:
+                    _heartbeat_update = _heartbeat_reporter.evaluate(
+                        started_at=_notify_start,
+                        current_step=_status_detail.lstrip(" —"),
+                        last_activity_at=_activity_snapshot.get(
+                            "last_activity_ts",
+                            _notify_start,
+                        ),
+                        last_meaningful_output_at=_activity_snapshot.get(
+                            "last_meaningful_output_at",
+                            _notify_start,
+                        ),
+                        persisted_status=_activity_snapshot.get(
+                            "lane_status",
+                            "working",
+                        ),
+                        blocker=_activity_snapshot.get("lane_blocker"),
+                        process_alive=True,
+                    )
+                    if _heartbeat_update is None:
+                        continue
+                    _heartbeat_text = _heartbeat_update.text
+                else:
+                    _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
