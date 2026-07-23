@@ -39,10 +39,17 @@ $releaseDir = Join-Path $desktopDir "release"
 $vendorDir = Join-Path $desktopDir "build\vendor"
 
 # WSL 路径（用于调用 wsl.exe 跑 grep/前端编译）
-$repoRootWin = $repoRoot -replace '\\', '/'
-$drive = $repoRootWin.Substring(0, 1).ToLower()
-$pathRest = $repoRootWin.Substring(2)
-$wslRepoRoot = "/mnt/$drive$pathRest"
+if ($repoRoot -match '^\\\\wsl\.localhost\\([^\\]+)\\(.*)$') {
+    # UNC path \\wsl.localhost\<distro>\<path> → /<path>
+    $wslRepoRoot = '/' + ($matches[2] -replace '\\', '/')
+} elseif ($repoRoot -match '^\\\\wsl$\\([^\\]+)\\(.*)$') {
+    $wslRepoRoot = '/' + ($matches[2] -replace '\\', '/')
+} else {
+    $repoRootWin = $repoRoot -replace '\\', '/'
+    $drive = $repoRootWin.Substring(0, 1).ToLower()
+    $pathRest = $repoRootWin.Substring(2)
+    $wslRepoRoot = "/mnt/$drive$pathRest"
+}
 
 # ============================================================
 # 辅助函数
