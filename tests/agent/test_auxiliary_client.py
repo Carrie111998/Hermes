@@ -2731,7 +2731,10 @@ class TestAuxiliaryFallbackLayering:
 
         with patch(
             "agent.auxiliary_client._mark_provider_unhealthy"
-        ) as mock_mark:
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
             result = _call_fallback_candidate_sync(
                 fallback_client,
                 "custom-model",
@@ -2749,6 +2752,43 @@ class TestAuxiliaryFallbackLayering:
         assert result is None
         mock_mark.assert_called_once_with(label)
 
+    def test_transient_fallback_503_retries_before_quarantine(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create.side_effect = [
+            RuntimeError("HTTP 503: temporary deployment outage"),
+            _DummyResponse("fallback recovered"),
+        ]
+
+        with patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=1,
+        ), patch(
+            "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE",
+            0,
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = _call_fallback_candidate_sync(
+                fallback_client,
+                "custom-model",
+                "fallback_chain[0](custom)",
+                task="title_generation",
+                messages=[{"role": "user", "content": "title"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "fallback recovered"
+        assert fallback_client.chat.completions.create.call_count == 2
+        mock_mark.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_async_unavailable_configured_fallback_quarantines_exact_entry(
         self,
@@ -2764,7 +2804,10 @@ class TestAuxiliaryFallbackLayering:
 
         with patch(
             "agent.auxiliary_client._mark_provider_unhealthy"
-        ) as mock_mark:
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
             result = await _call_fallback_candidate_async(
                 fallback_client,
                 "custom-model",
@@ -2782,6 +2825,46 @@ class TestAuxiliaryFallbackLayering:
         assert result is None
         mock_mark.assert_called_once_with(label)
 
+    @pytest.mark.asyncio
+    async def test_async_transient_fallback_503_retries_before_quarantine(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://custom-one.example/v1"
+        fallback_client.chat.completions.create = AsyncMock(
+            side_effect=[
+                RuntimeError("HTTP 503: temporary deployment outage"),
+                _DummyResponse("async fallback recovered"),
+            ]
+        )
+
+        with patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=1,
+        ), patch(
+            "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE",
+            0,
+        ), patch(
+            "agent.auxiliary_client._mark_provider_unhealthy"
+        ) as mock_mark:
+            result = await _call_fallback_candidate_async(
+                fallback_client,
+                "custom-model",
+                "fallback_chain[0](custom)",
+                task="title_generation",
+                messages=[{"role": "user", "content": "title"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+
+        assert result.choices[0].message.content == "async fallback recovered"
+        assert fallback_client.chat.completions.create.await_count == 2
+        mock_mark.assert_not_called()
+
     def test_api_key_fallback_quarantines_only_concrete_provider(self):
         from agent.auxiliary_client import _call_fallback_candidate_sync
 
@@ -2793,7 +2876,10 @@ class TestAuxiliaryFallbackLayering:
 
         with patch(
             "agent.auxiliary_client._mark_provider_unhealthy"
-        ) as mock_mark:
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
             result = _call_fallback_candidate_sync(
                 fallback_client,
                 "qwen/qwen3.5-397b-a17b",
@@ -2822,7 +2908,10 @@ class TestAuxiliaryFallbackLayering:
 
         with patch(
             "agent.auxiliary_client._mark_provider_unhealthy"
-        ) as mock_mark:
+        ) as mock_mark, patch(
+            "agent.auxiliary_client._transient_retry_count",
+            return_value=0,
+        ):
             result = _call_fallback_candidate_sync(
                 fallback_client,
                 "unknown-model",
@@ -6146,6 +6235,33 @@ class TestAuxUnhealthyCache:
         assert client is fallback_client
         assert model == "different-deployment"
         assert label == "fallback_chain[0](nvidia)"
+
+    def test_model_only_fallback_still_honors_provider_health(self):
+        from agent.auxiliary_client import (
+            _mark_provider_unhealthy,
+            _try_configured_fallback_chain,
+        )
+
+        _mark_provider_unhealthy("openrouter")
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {"provider": "openrouter", "model": "another-model"},
+                ],
+            },
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+        ) as resolve_entry:
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is None
+        assert model is None
+        assert label == ""
+        resolve_entry.assert_not_called()
 
     def test_recoverable_provider_matches_full_registered_route(self):
         from agent.auxiliary_client import _recoverable_pool_provider

@@ -3945,6 +3945,92 @@ def _fallback_health_label(fb_label: str, fb_client: Any) -> str:
     return _recoverable_pool_provider("auto", fb_client) or ""
 
 
+def _call_fallback_with_transient_retry_sync(
+    fb_client: Any,
+    fb_kwargs: dict,
+    task: Optional[str],
+    fb_label: str,
+) -> Any:
+    """Call a fallback with the same bounded transient budget as the primary."""
+    try:
+        return _validate_llm_response(
+            fb_client.chat.completions.create(**fb_kwargs), task)
+    except Exception as transient_err:
+        if not _is_transient_transport_error(transient_err):
+            raise
+        if task == "compression" and _is_timeout_error(transient_err):
+            raise
+        max_retries = _transient_retry_count()
+        last_transient = transient_err
+        for attempt in range(1, max_retries + 1):
+            backoff = min(
+                _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)),
+                8.0,
+            )
+            logger.info(
+                "Auxiliary %s: fallback candidate %s hit a transient error "
+                "(attempt %d/%d); retrying after %.1fs: %s",
+                task or "call",
+                fb_label,
+                attempt,
+                max_retries,
+                backoff,
+                last_transient,
+            )
+            time.sleep(backoff)
+            try:
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+            except Exception as retry_err:
+                if not _is_transient_transport_error(retry_err):
+                    raise
+                last_transient = retry_err
+        raise last_transient
+
+
+async def _call_fallback_with_transient_retry_async(
+    fb_client: Any,
+    fb_kwargs: dict,
+    task: Optional[str],
+    fb_label: str,
+) -> Any:
+    """Async mirror of :func:`_call_fallback_with_transient_retry_sync`."""
+    try:
+        return _validate_llm_response(
+            await fb_client.chat.completions.create(**fb_kwargs), task)
+    except Exception as transient_err:
+        if not _is_transient_transport_error(transient_err):
+            raise
+        if task == "compression" and _is_timeout_error(transient_err):
+            raise
+        max_retries = _transient_retry_count()
+        last_transient = transient_err
+        for attempt in range(1, max_retries + 1):
+            backoff = min(
+                _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)),
+                8.0,
+            )
+            logger.info(
+                "Auxiliary %s (async): fallback candidate %s hit a transient "
+                "error (attempt %d/%d); retrying after %.1fs: %s",
+                task or "call",
+                fb_label,
+                attempt,
+                max_retries,
+                backoff,
+                last_transient,
+            )
+            await asyncio.sleep(backoff)
+            try:
+                return _validate_llm_response(
+                    await fb_client.chat.completions.create(**fb_kwargs), task)
+            except Exception as retry_err:
+                if not _is_transient_transport_error(retry_err):
+                    raise
+                last_transient = retry_err
+        raise last_transient
+
+
 def _call_fallback_candidate_sync(
     fb_client: Any,
     fb_model: Optional[str],
@@ -3997,8 +4083,12 @@ def _call_fallback_candidate_sync(
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base)
     try:
-        return _validate_llm_response(
-            fb_client.chat.completions.create(**fb_kwargs), task)
+        return _call_fallback_with_transient_retry_sync(
+            fb_client,
+            fb_kwargs,
+            task,
+            fb_label,
+        )
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
             # Quarantine the exact configured entry, not its generic provider.
@@ -4029,8 +4119,12 @@ def _call_fallback_candidate_sync(
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
                 try:
-                    return _validate_llm_response(
-                        retry_client.chat.completions.create(**retry_kwargs), task)
+                    return _call_fallback_with_transient_retry_sync(
+                        retry_client,
+                        retry_kwargs,
+                        task,
+                        fb_label,
+                    )
                 except Exception as retry_err:
                     if _is_provider_deployment_unavailable_error(retry_err):
                         health_label = _fallback_health_label(fb_label, retry_client)
@@ -4091,8 +4185,12 @@ async def _call_fallback_candidate_async(
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=fb_base)
     try:
-        return _validate_llm_response(
-            await fb_client.chat.completions.create(**fb_kwargs), task)
+        return await _call_fallback_with_transient_retry_async(
+            fb_client,
+            fb_kwargs,
+            task,
+            fb_label,
+        )
     except Exception as fb_err:
         if _is_provider_deployment_unavailable_error(fb_err):
             health_label = _fallback_health_label(fb_label, fb_client)
@@ -4122,8 +4220,12 @@ async def _call_fallback_candidate_async(
                     reasoning_config=reasoning_config,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
                 try:
-                    return _validate_llm_response(
-                        await retry_client.chat.completions.create(**retry_kwargs), task)
+                    return await _call_fallback_with_transient_retry_async(
+                        retry_client,
+                        retry_kwargs,
+                        task,
+                        fb_label,
+                    )
                 except Exception as retry_err:
                     if _is_provider_deployment_unavailable_error(retry_err):
                         health_label = _fallback_health_label(fb_label, retry_client)
@@ -4377,7 +4479,6 @@ def _try_configured_fallback_chain(
         entry_scoped = any(
             str(entry.get(field) or "").strip()
             for field in (
-                "model",
                 "base_url",
                 "api_key",
                 "key_env",
