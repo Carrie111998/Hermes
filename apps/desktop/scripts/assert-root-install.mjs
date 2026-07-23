@@ -190,10 +190,10 @@ function main() {
   }
 }
 
-// Unlike the other scripts here this module is also *imported* (by vitest's
-// globalSetup and by its own test), so guard argv[1] — isMain() throws without
-// it, e.g. under `node --input-type=module -e`.
-if (process.argv[1] && isMain(import.meta.url)) {
+// Unlike the other scripts here, this module is also *imported* — by vitest's
+// globalSetup and by its own test — so isMain() has to stay false in contexts
+// with no entry script. utils.mjs handles that.
+if (isMain(import.meta.url)) {
   main()
 }
 
