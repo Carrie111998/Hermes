@@ -17,7 +17,7 @@ import assert from 'node:assert/strict'
 import os from 'os'
 import path from 'path'
 
-import { test } from 'vitest'
+import { afterEach, test } from 'vitest'
 
 import {
   isPidAlive,
@@ -27,8 +27,20 @@ import {
   writeUpdateMarker
 } from './update-marker'
 
+const tempDirs: string[] = []
+
+// Registered as a hook rather than a per-test try/finally so the dirs are
+// reclaimed even when a test throws or the runner aborts it mid-assertion.
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    fs.rmSync(dir, { force: true, recursive: true, maxRetries: 3 })
+  }
+})
+
 function tmpHome(tag) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-marker-${tag}-`))
+
+  tempDirs.push(dir)
 
   return dir
 }

@@ -382,6 +382,15 @@ markers = [
 # Windows. The thread watchdog works on both platforms.
 addopts = "-m 'not integration' --timeout=30 --timeout-method=thread"
 
+# Reclaim tmp_path dirs for passing tests instead of pytest's "all" default.
+# Per-file isolation (scripts/run_tests_parallel.py) spawns one pytest process
+# per test file, and each one lands its own pytest-<N> root under
+# %TEMP%/pytest-of-<user>. pytest only garbage-collects a numbered root once its
+# lock is ~3 days stale, so with "all" the per-test dirs from every passing test
+# in every file survive that window — 2.3 GB / 36,954 files as of 2026-07-22.
+# "failed" keeps exactly the dirs worth post-mortem debugging and drops the rest.
+tmp_path_retention_policy = "failed"
+
 [tool.ty.environment]
 python-version = "3.13"
 

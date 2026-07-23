@@ -23,10 +23,12 @@ _PNG_BYTES = base64.b64decode(
 
 class TestResolveMediaToDataUrls(unittest.TestCase):
     def _write_png(self, tmpdir_name="hermes_media_test"):
+        import shutil
         import tempfile
         from pathlib import Path
 
         d = Path(tempfile.mkdtemp(prefix=tmpdir_name))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         p = d / "shot.png"
         p.write_bytes(_PNG_BYTES)
         return p
@@ -94,10 +96,12 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         the traversal can't be laundered through an innocuous-looking
         image-suffixed symlink name."""
         import os
+        import shutil
         import tempfile
         from pathlib import Path
 
         d = Path(tempfile.mkdtemp(prefix="hermes_media_test_symlink"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         link = d / "shot.png"
         try:
             os.symlink("/etc/hosts", link)

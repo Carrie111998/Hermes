@@ -32,8 +32,15 @@ def kanban_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def conn(kanban_home):
-    with kb.connect() as c:
-        yield c
+    # `with <sqlite3.Connection>` commits/rolls back but does NOT close, so the
+    # handle outlived the test and kept the tmp_path DB locked on Windows —
+    # which silently defeats pytest's best-effort tmp_path reclaim.
+    c = kb.connect()
+    try:
+        with c:
+            yield c
+    finally:
+        c.close()
 
 
 def _stuck_todo(conn, *, parents_done=True, n_parents=1):

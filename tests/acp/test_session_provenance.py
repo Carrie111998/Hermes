@@ -15,8 +15,14 @@ from hermes_state import SessionDB
 
 @pytest.fixture()
 def db(tmp_path):
+    # Close on teardown: an open sqlite handle keeps state.db locked on Windows,
+    # and pytest's tmp_path reclaim is a best-effort rmtree(ignore_errors=True),
+    # so the whole tmp dir silently survives the run and accumulates in %TEMP%.
     d = SessionDB(db_path=tmp_path / "state.db")
-    yield d
+    try:
+        yield d
+    finally:
+        d.close()
 
 
 def _mk(db, sid, parent=None):
