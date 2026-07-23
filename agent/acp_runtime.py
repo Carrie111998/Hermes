@@ -382,20 +382,18 @@ def run_acp_client_turn(
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
-    # Background review fork — same cadence + signature as the default path.
+    # ACP runtime manages its own context; review fork inherits session_id
+    # and collides on the (hermes_session_id, provider) binding in
+    # SQLiteACPSessionMapper. Skip to avoid binding collision.
     if (
         turn.final_text
         and not turn.interrupted
         and (should_review_memory or should_review_skills)
     ):
-        try:
-            agent._spawn_background_review(
-                messages_snapshot=list(messages),
-                review_memory=should_review_memory,
-                review_skills=should_review_skills,
-            )
-        except Exception:
-            logger.debug("background review spawn raised", exc_info=True)
+        logger.debug(
+            "background review skipped in ACP client mode "
+            "(session binding collision)"
+        )
 
     return {
         "final_response": turn.final_text,
