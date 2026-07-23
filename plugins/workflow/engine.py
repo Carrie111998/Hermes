@@ -1303,6 +1303,11 @@ class WorkflowEngine:
         # final-layer cards even when the supervisor runs as a subprocess.
         if session_info:
             state["session_info"] = session_info
+        else:
+            # Preserve session_info from previously loaded state (supervisor resume)
+            existing = self._load_state(workflow_name, run_id)
+            if existing and existing.get("session_info"):
+                state["session_info"] = existing["session_info"]
         with open(self._state_path(workflow_name, run_id), "w") as f:
             json.dump(state, f, indent=2)
         # Retention: prune state files beyond STATE_RETENTION_PER_WORKFLOW
