@@ -1926,6 +1926,7 @@ from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.worker_task_dispatcher import GatewayWorkerTaskDispatcherMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -3057,7 +3058,12 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    GatewayWorkerTaskDispatcherMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -8112,6 +8118,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+
+        # Start created worker-bridge tasks without requiring an explicit
+        # `hermes worker tasks start` command.
+        self._spawn_supervised(
+            self._worker_task_dispatcher_watcher,
+            "worker_task_dispatcher_watcher",
+        )
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:

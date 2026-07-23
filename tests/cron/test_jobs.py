@@ -18,6 +18,7 @@ from cron.jobs import (
     resume_job,
     remove_job,
     mark_job_run,
+    defer_job,
     advance_next_run,
     claim_dispatch,
     heartbeat_run_claim,
@@ -250,6 +251,20 @@ class TestJobCRUD:
         fetched = get_job(job["id"])
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
+
+    def test_defer_job_records_delay_without_error(self, tmp_cron_dir):
+        job = create_job(prompt="Needs local router", schedule="every 1h")
+        before = datetime.now().astimezone()
+
+        next_run_at = defer_job(job["id"], 120, "9Router unavailable")
+
+        delayed = get_job(job["id"])
+        assert next_run_at is not None
+        assert datetime.fromisoformat(next_run_at) >= before + timedelta(seconds=119)
+        assert delayed["last_status"] == "delayed"
+        assert delayed["last_error"] is None
+        assert delayed["last_defer_reason"] == "9Router unavailable"
+        assert delayed["health_gate_failures"] == 1
 
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")

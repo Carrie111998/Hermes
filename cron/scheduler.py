@@ -47,6 +47,65 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+_LITELLM_CRON_PROVIDER = "custom:litellm"
+_LITELLM_HEALTH_URL = "http://127.0.0.1:4000/health/liveliness"
+_NINE_ROUTER_HEALTH_URL = "http://127.0.0.1:20128/v1/models"
+_HEALTH_GATE_BASE_DELAY_SECONDS = 120
+_HEALTH_GATE_MAX_BACKOFF_STEP = 4
+
+
+def _job_uses_litellm(job: dict) -> bool:
+    """Return whether this job resolves through the local LiteLLM provider."""
+    requested = str(job.get("provider") or "").strip().lower()
+    return requested == _LITELLM_CRON_PROVIDER
+
+
+def _probe_http_health(url: str, timeout_seconds: float = 2.0) -> tuple[bool, str]:
+    """Perform a small unauthenticated local health probe."""
+    from urllib.request import Request, urlopen
+
+    try:
+        request = Request(url, headers={"Accept": "application/json"})
+        with urlopen(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", response.getcode())
+            if 200 <= int(status) < 300:
+                return True, ""
+            return False, f"HTTP {status}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _litellm_dependencies_healthy(job: dict) -> tuple[bool, str]:
+    """Probe LiteLLM and its 9Router backend for LLM-backed cron jobs."""
+    if not _job_uses_litellm(job):
+        return True, ""
+    for name, url in (
+        ("LiteLLM", _LITELLM_HEALTH_URL),
+        ("9Router", _NINE_ROUTER_HEALTH_URL),
+    ):
+        healthy, detail = _probe_http_health(url)
+        if not healthy:
+            return False, f"{name} unavailable at {url} ({detail})"
+    return True, ""
+
+
+def _defer_for_litellm_health(job: dict) -> bool:
+    """Persist dependency backoff and return True when dispatch must stop."""
+    healthy, reason = _litellm_dependencies_healthy(job)
+    if healthy:
+        return False
+    failures = max(0, int(job.get("health_gate_failures") or 0))
+    backoff_step = min(failures, _HEALTH_GATE_MAX_BACKOFF_STEP)
+    delay_seconds = _HEALTH_GATE_BASE_DELAY_SECONDS * (2 ** backoff_step)
+    next_run_at = defer_job(job["id"], delay_seconds, reason)
+    if next_run_at is None:
+        return False
+    logger.warning(
+        "Job '%s' delayed by dependency health gate for %ds (retry at %s): %s",
+        job.get("name", job["id"]), delay_seconds, next_run_at, reason,
+    )
+    return True
+
 
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
@@ -277,7 +336,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import defer_job, get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -3723,6 +3782,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    # A backend outage is a delayed run, not an inference failure. Gate before
+    # creating an execution, consuming a one-shot claim, or constructing an
+    # agent so a transient post-boot race remains fully retryable.
+    if _defer_for_litellm_health(job):
+        if job.get("execution_id"):
+            finish_execution(job["execution_id"], success=True)
+        return True
+
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]

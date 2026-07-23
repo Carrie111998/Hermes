@@ -1531,6 +1531,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
+                job.pop("last_defer_reason", None)
+                job.pop("health_gate_failures", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -1605,6 +1607,34 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def defer_job(job_id: str, delay_seconds: float, reason: str) -> Optional[str]:
+    """Delay a due job without recording a failed execution.
+
+    Dependency health gates call this before dispatch claims and agent work.
+    Persisting a future ``next_run_at`` with a distinct ``delayed`` status
+    lets the ticker retry a transient outage without burning the scheduled run.
+    """
+    delay_seconds = max(1.0, float(delay_seconds))
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            next_run_at = (_hermes_now() + timedelta(seconds=delay_seconds)).isoformat()
+            job["next_run_at"] = next_run_at
+            job["last_status"] = "delayed"
+            job["last_error"] = None
+            job["last_defer_reason"] = str(reason)
+            job["health_gate_failures"] = int(job.get("health_gate_failures") or 0) + 1
+            job["state"] = "scheduled"
+            job["fire_claim"] = None
+            job["run_claim"] = None
+            save_jobs(jobs)
+            return next_run_at
+    logger.warning("defer_job: job_id %s not found, skipping save", job_id)
+    return None
 
 
 def claim_dispatch(job_id: str) -> bool:

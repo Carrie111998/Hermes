@@ -13,6 +13,93 @@ extracted helper directly.
 import cron.scheduler as s
 
 
+def test_litellm_health_gate_probes_proxy_then_router(monkeypatch):
+    calls = []
+
+    def probe(url, timeout_seconds=2.0):
+        calls.append(url)
+        return (len(calls) == 1, "connection refused")
+
+    monkeypatch.setattr(s, "_probe_http_health", probe)
+
+    healthy, reason = s._litellm_dependencies_healthy(
+        {"id": "health", "provider": "custom:litellm"}
+    )
+
+    assert healthy is False
+    assert calls == [s._LITELLM_HEALTH_URL, s._NINE_ROUTER_HEALTH_URL]
+    assert "9Router unavailable" in reason
+
+
+def test_run_one_job_delays_when_nine_router_is_down(monkeypatch):
+    deferred = []
+    finished = []
+    monkeypatch.setattr(
+        s,
+        "_litellm_dependencies_healthy",
+        lambda job: (False, "9Router unavailable (connection refused)"),
+    )
+    monkeypatch.setattr(
+        s,
+        "defer_job",
+        lambda jid, seconds, reason: deferred.append((jid, seconds, reason))
+        or "2026-07-22T18:02:00-05:00",
+    )
+    monkeypatch.setattr(
+        s,
+        "create_execution",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("execution must not be created while dependency is down")
+        ),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    ok = s.run_one_job(
+        {
+            "id": "delayed-job",
+            "name": "Delayed",
+            "provider": "custom:litellm",
+            "execution_id": "claimed-execution",
+        }
+    )
+
+    assert ok is True
+    assert deferred == [
+        ("delayed-job", 120, "9Router unavailable (connection refused)")
+    ]
+    assert finished == [("claimed-execution", {"success": True})]
+
+
+def test_litellm_health_gate_uses_capped_exponential_backoff(monkeypatch):
+    delays = []
+    monkeypatch.setattr(
+        s,
+        "_litellm_dependencies_healthy",
+        lambda job: (False, "9Router unavailable"),
+    )
+    monkeypatch.setattr(
+        s,
+        "defer_job",
+        lambda jid, seconds, reason: delays.append(seconds)
+        or "2026-07-22T18:02:00-05:00",
+    )
+
+    for failures in (0, 1, 2, 3, 4, 5):
+        assert s._defer_for_litellm_health(
+            {
+                "id": f"backoff-{failures}",
+                "provider": "custom:litellm",
+                "health_gate_failures": failures,
+            }
+        )
+
+    assert delays == [120, 240, 480, 960, 1920, 1920]
+
+
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
                     error=None, silent_marker_in=None):
     """Patch the job pipeline primitives and record the call order."""
