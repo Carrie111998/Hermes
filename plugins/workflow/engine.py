@@ -579,22 +579,61 @@ class WorkflowEngine:
             initial_status=initial_status,
         )
 
-    def _subscribe_final_cards(self, card_ids: list[str]) -> None:
+    def _get_session_info(self) -> dict:
+        """Capture gateway session info for subscription routing."""
+        try:
+            from gateway.session_context import get_session_env
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            if not platform or not chat_id:
+                return {}
+            return {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+                "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
+                "profile": (
+                    get_session_env("HERMES_SESSION_PROFILE", "")
+                    or os.environ.get("HERMES_PROFILE")
+                ),
+            }
+        except Exception:
+            return {}
+
+    def _subscribe_final_cards(self, card_ids: list[str],
+                                session_info: dict = None) -> None:
         """Subscribe the originating session to final-layer cards."""
         if not card_ids:
             return
         try:
             from hermes_cli import kanban_db as _kb
-            from gateway.session_context import get_session_env
-            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            # Try ContextVars first (works when called from gateway session)
+            platform = ""
+            chat_id = ""
+            thread_id = None
+            user_id = None
+            notifier_profile = None
+            try:
+                from gateway.session_context import get_session_env
+                platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+                chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+                if platform and chat_id:
+                    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+                    user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                    notifier_profile = (
+                        get_session_env("HERMES_SESSION_PROFILE", "")
+                        or os.environ.get("HERMES_PROFILE")
+                    )
+            except Exception:
+                pass
+            # Fall back to session_info from state file (for supervisor subprocess)
+            if not platform and session_info:
+                platform = session_info.get("platform", "")
+                chat_id = session_info.get("chat_id", "")
+                thread_id = session_info.get("thread_id")
+                user_id = session_info.get("user_id")
+                notifier_profile = session_info.get("profile")
             if platform and chat_id:
-                thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-                user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-                notifier_profile = (
-                    get_session_env("HERMES_SESSION_PROFILE", "")
-                    or os.environ.get("HERMES_PROFILE")
-                )
                 with _kb.connect(board=self.kanban_board) as _conn:
                     for cid in card_ids:
                         _kb.add_notify_sub(
@@ -1255,7 +1294,7 @@ class WorkflowEngine:
     def _save_state(self, workflow_name: str, states: dict, results: dict,
                     current_layer: int, layers: list[list[str]],
                     run_id: str = None, context: dict = None,
-                    attachments: list = None):
+                    attachments: list = None, session_info: dict = None):
         """Persist engine state for crash recovery."""
         # Telemetry: capture duration_seconds + error_count for any node
         # that has reached a terminal status but hasn't been recorded yet.
@@ -1291,6 +1330,10 @@ class WorkflowEngine:
             "results": results,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Persist session info so hooks can create subscriptions for
+        # final-layer cards even when the supervisor runs as a subprocess.
+        if session_info:
+            state["session_info"] = session_info
         with open(self._state_path(workflow_name, run_id), "w") as f:
             json.dump(state, f, indent=2)
         # Retention: prune state files beyond STATE_RETENTION_PER_WORKFLOW
@@ -2291,7 +2334,8 @@ class WorkflowEngine:
             # The calling agent gets an immediate response.
             self._save_state(workflow_name, states, results, 0, layers,
                             run_id=workflow.run_id, context=context,
-                            attachments=attachments)
+                            attachments=attachments,
+                            session_info=self._get_session_info())
             self._spawn_supervisor(workflow_name, workflow.run_id)
             return results
 

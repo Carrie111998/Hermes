@@ -402,6 +402,9 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                     _save_state_file(state_path, state)
                     print(f"   ✓ Layer {current_layer} complete — advancing to {current_layer + 1}")
 
+                    # Subscribe final-layer cards for notification
+                    _subscribe_final_layer(state, current_layer, layers)
+
                     # Spawn supervisor to create next layer's cards
                     _spawn_supervisor_for_next_layer(state, state_path)
             finally:
@@ -417,6 +420,47 @@ def _save_state_file(path, state):
     from datetime import datetime, timezone
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     Path(path).write_text(json.dumps(state, indent=2, default=str))
+
+
+def _subscribe_final_layer(state, completed_layer_idx, layers):
+    """Subscribe final-layer cards for notification when the last layer completes."""
+    # Only subscribe when the completed layer is the last one
+    if completed_layer_idx + 1 < len(layers):
+        return
+    session_info = state.get("session_info", {})
+    if not session_info.get("platform") or not session_info.get("chat_id"):
+        return
+    # Find card IDs for the final layer
+    final_layer = layers[-1]
+    states = state.get("states", {})
+    card_ids = []
+    for nid in final_layer:
+        ns = states.get(nid, {})
+        card_id = ns.get("kanban_card_id")
+        if card_id:
+            card_ids.append(card_id)
+    if not card_ids:
+        return
+    # Create subscriptions
+    try:
+        from hermes_cli import kanban_db as kb
+        board = state.get("kanban_board", "adventours")
+        conn = kb.connect(board=board)
+        try:
+            for cid in card_ids:
+                kb.add_notify_sub(
+                    conn, task_id=cid,
+                    platform=session_info["platform"],
+                    chat_id=session_info["chat_id"],
+                    thread_id=session_info.get("thread_id"),
+                    user_id=session_info.get("user_id"),
+                    notifier_profile=session_info.get("profile"),
+                )
+            print(f"   📬 Subscribed {len(card_ids)} final-layer card(s) to session")
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   ⚠  Failed to subscribe final-layer cards: {e}")
 
 
 def _spawn_supervisor_for_next_layer(state, state_path):
