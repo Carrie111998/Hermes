@@ -2282,6 +2282,8 @@ class WorkflowEngine:
         # Store attachments on the engine instance so create_kanban_card
         # can access them without threading through every method signature.
         self._current_attachments = attachments or []
+        # Capture session info once — used for subscription routing and state persistence.
+        _session_info = self._get_session_info()
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
@@ -2335,10 +2337,11 @@ class WorkflowEngine:
 
                 # Subscribe final-layer cards
                 if last_layer_card_ids:
-                    self._subscribe_final_cards(last_layer_card_ids)
+                    self._subscribe_final_cards(last_layer_card_ids, session_info=_session_info)
 
                 self._save_state(workflow_name, states, results, len(layers) - 1, layers,
-                                run_id=workflow.run_id, context=context)
+                                run_id=workflow.run_id, context=context,
+                                session_info=_session_info)
                 self._update_execution(workflow.run_id, status="completed",
                                       current_layer=len(layers) - 1)
                 return results
@@ -2350,7 +2353,7 @@ class WorkflowEngine:
             self._save_state(workflow_name, states, results, 0, layers,
                             run_id=workflow.run_id, context=context,
                             attachments=attachments,
-                            session_info=self._get_session_info())
+                            session_info=_session_info)
             self._spawn_supervisor(workflow_name, workflow.run_id)
             return results
 
