@@ -10,6 +10,7 @@ export interface PositionedNavItem {
  * contributed row; unresolved anchors fall back to the end in registry order. */
 export function mergePositionedNav<T extends PositionedNavItem>(core: readonly T[], contributed: readonly T[]): T[] {
   const merged = [...core]
+
   let pending = contributed.filter(item => {
     if (!item.override) {
       return true
