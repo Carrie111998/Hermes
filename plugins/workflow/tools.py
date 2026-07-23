@@ -94,6 +94,7 @@ def _capture_session_for_engine() -> None:
     try:
         from gateway.session_context import get_session_env
         import json as _json
+        from pathlib import Path
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if platform and chat_id:
@@ -104,8 +105,16 @@ def _capture_session_for_engine() -> None:
                 "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
                 "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
             }
-            with open("/tmp/wfe-session.json", "w") as f:
-                _json.dump(data, f)
+            # Write to both /tmp and the engine state dir for reliability
+            for path in ["/tmp/wfe-session.json",
+                         Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session.json"]:
+                try:
+                    path = Path(path)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(path, "w") as f:
+                        _json.dump(data, f)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -117,8 +126,18 @@ def _get_captured_session() -> dict:
     """
     try:
         import json as _json
-        with open("/tmp/wfe-session.json") as f:
-            return _json.load(f)
+        from pathlib import Path
+        # Try /tmp first, then engine state dir
+        for path in ["/tmp/wfe-session.json",
+                     Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session.json"]:
+            try:
+                with open(path) as f:
+                    data = _json.load(f)
+                if data and data.get("platform"):
+                    return data
+            except Exception:
+                continue
+        return {}
     except Exception:
         return {}
 

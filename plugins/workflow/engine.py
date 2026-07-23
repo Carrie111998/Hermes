@@ -606,10 +606,16 @@ class WorkflowEngine:
         # 2. Check temp file written by tool handler
         try:
             import json as _json
-            with open("/tmp/wfe-session.json") as _f:
-                info = _json.load(_f)
-            if info and info.get("platform"):
-                return info
+            from pathlib import Path as _P
+            for _p in ["/tmp/wfe-session.json",
+                       _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state" / "_session.json"]:
+                try:
+                    with open(_p) as _f:
+                        info = _json.load(_f)
+                    if info and info.get("platform"):
+                        return info
+                except Exception:
+                    continue
         except Exception:
             pass
         # 3. Fallback: os.environ
