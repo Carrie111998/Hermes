@@ -30,10 +30,13 @@ RESUME_SCOPE = "resume"
 EXACT_HANDOFF_SCOPES: tuple[str, ...] = (RESUME_SCOPE,)
 
 # WebSocket paths a resume session may mint tickets for (and connect to).
-# Empty until destination handlers enforce ticket-bound session/profile
-# (Oscar F-01). Prefer remove /api/pty + /api/ws (+ /api/events) rather
-# than allowlist endpoint names without bind.
-RESUME_WS_ENDPOINTS: frozenset[str] = frozenset()
+# Slice 2 opens chat PTY + events only. Admin WS (/api/ws JSON-RPC gateway,
+# /api/console) stays closed. Destination bind is enforced at /api/pty
+# (ticket bound_session_id / bound_profile win over client query params).
+RESUME_WS_ENDPOINTS: frozenset[str] = frozenset({
+    "/api/pty",
+    "/api/events",
+})
 
 # Exact REST paths always allowed for resume (method checked separately).
 _RESUME_REST_EXACT: frozenset[tuple[str, str]] = frozenset(

@@ -377,16 +377,18 @@ def test_resume_cookie_allows_bound_session_detail(gated_app):
     assert r.status_code not in (401, 403), r.text
 
 
-def test_resume_cookie_ws_ticket_denies_unbound_ws_endpoints(gated_app):
-    """M1: resume WS tickets must not open /api/pty or /api/ws until bind exists.
+def test_resume_cookie_ws_ticket_allows_bound_pty_denies_unbound_ws(gated_app):
+    """Slice 2: resume WS tickets open bound /api/pty (+ events); not /api/ws.
 
-    allowed_endpoints is empty (or lacks pty/ws); every destination is denied.
+    Ticket bind metadata is recorded; destination allow-list is non-empty for
+    chat-needed endpoints only. Unbound admin sockets stay denied.
     """
     from hermes_cli.dashboard_auth.scopes import RESUME_WS_ENDPOINTS
 
-    assert "/api/pty" not in RESUME_WS_ENDPOINTS
+    assert "/api/pty" in RESUME_WS_ENDPOINTS
+    assert "/api/events" in RESUME_WS_ENDPOINTS
     assert "/api/ws" not in RESUME_WS_ENDPOINTS
-    assert "/api/events" not in RESUME_WS_ENDPOINTS
+    assert "/api/console" not in RESUME_WS_ENDPOINTS
 
     phone = _resume_phone(gated_app, "ws-bound")
     r = phone.post("/api/auth/ws-ticket")
@@ -398,31 +400,91 @@ def test_resume_cookie_ws_ticket_denies_unbound_ws_endpoints(gated_app):
     assert info.get("scopes") == ["resume"]
     allowed = info.get("allowed_endpoints")
     assert allowed is not None
-    assert "/api/pty" not in allowed
+    assert "/api/pty" in allowed
+    assert "/api/events" in allowed
     assert "/api/ws" not in allowed
     assert "/api/console" not in allowed
-    assert "/api/events" not in allowed
-    # Bind metadata is recorded for a future destination-bind slice.
     assert info.get("bound_session_id") == "ws-bound"
 
     class _FakeWS:
-        def __init__(self, path):
-            self.query_params = {"ticket": ticket}
+        def __init__(self, path, query=None):
+            self.query_params = query or {"ticket": ticket}
             self.headers = {}
             self.client = type("C", (), {"host": "1.2.3.4"})()
             self.app = web_server.app
             self.url = type("U", (), {"path": path})()
+            self.state = type("S", (), {})()
 
-    for path in ("/api/pty", "/api/ws", "/api/console", "/api/events"):
-        # Fresh ticket per path (consume is single-use).
+    # Allowed destinations: consume succeeds with ticket credential.
+    for path in ("/api/pty", "/api/events"):
         r2 = phone.post("/api/auth/ws-ticket")
         assert r2.status_code == 200, r2.text
         t = r2.json()["ticket"]
-        ws = _FakeWS(path)
-        ws.query_params = {"ticket": t}
+        ws = _FakeWS(path, {"ticket": t})
+        reason, cred = web_server._ws_auth_reason(ws)
+        assert reason is None, (path, reason, cred)
+        assert cred == "ticket"
+        # Bound ticket metadata stashed for PTY handler bind enforcement.
+        assert getattr(ws.state, "ws_ticket_info", None) is not None
+        assert ws.state.ws_ticket_info.get("bound_session_id") == "ws-bound"
+        assert ws.state.ws_ticket_info.get("allowed_endpoints") is not None
+
+    # Unbound admin sockets still denied.
+    for path in ("/api/ws", "/api/console"):
+        r2 = phone.post("/api/auth/ws-ticket")
+        assert r2.status_code == 200, r2.text
+        t = r2.json()["ticket"]
+        ws = _FakeWS(path, {"ticket": t})
         reason, cred = web_server._ws_auth_reason(ws)
         assert reason == "ticket_endpoint_denied", (path, reason, cred)
         assert cred == "ticket"
+
+
+def test_bound_pty_ticket_ignores_client_resume_and_profile(gated_app):
+    """Hostile phone path: client resume/profile/fresh cannot pivot bind.
+
+    Auth accepts /api/pty for a resume-scoped ticket; bind metadata on the
+    ticket wins over query params. (Full PTY accept is not driven here — the
+    starlette TestClient WS path is flaky; we assert the bind stash the
+    handler reads.)
+    """
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "real-session", profile="default")
+    phone = _phone_consume(ticket)
+    r = phone.post("/api/auth/ws-ticket")
+    assert r.status_code == 200, r.text
+    t = r.json()["ticket"]
+    with ws_tickets._lock:
+        _exp, info = ws_tickets._tickets[t]
+    assert info.get("bound_session_id") == "real-session"
+    # default profile is canonicalised; empty or "default" both ok for bind.
+    assert (info.get("bound_profile") or "") in ("", "default")
+
+    class _FakeWS:
+        def __init__(self):
+            self.query_params = {
+                "ticket": t,
+                "resume": "attacker-session",
+                "profile": "evil",
+                "fresh": "1",
+            }
+            self.headers = {}
+            self.client = type("C", (), {"host": "1.2.3.4"})()
+            self.app = web_server.app
+            self.url = type("U", (), {"path": "/api/pty"})()
+            self.state = type("S", (), {})()
+
+    ws = _FakeWS()
+    reason, cred = web_server._ws_auth_reason(ws)
+    assert reason is None, (reason, cred)
+    assert cred == "ticket"
+    ti = ws.state.ws_ticket_info
+    assert ti.get("bound_session_id") == "real-session"
+    assert (ti.get("bound_profile") or "") in ("", "default")
+
+    # Handler helper, not a copied test implementation: ticket bind must
+    # override hostile query params and disable a new-session request.
+    assert web_server._pty_resume_params(ws) == ("real-session", "default", False)
 
 
 def test_resume_cookie_cannot_mint_handoff(gated_app):

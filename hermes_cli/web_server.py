@@ -14656,6 +14656,12 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                         path=path,
                     )
                     return "ticket_endpoint_denied", "ticket"
+            # Destination handlers (esp. /api/pty) force bound session/profile
+            # from the ticket and ignore hostile client query params.
+            try:
+                ws.state.ws_ticket_info = info
+            except Exception:
+                pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -15570,6 +15576,32 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
+def _pty_resume_params(ws: Any) -> tuple[Optional[str], Optional[str], bool]:
+    """Return PTY resume parameters, forcing a resume-ticket's immutable bind.
+
+    A resume-scoped WS ticket may reach ``/api/pty`` only after auth stashes
+    its ticket info on ``ws.state``. In that case the bound session/profile
+    win over all client query params and ``fresh`` is disabled. Full desk
+    tickets retain the normal client-selected behaviour.
+    """
+    resume = ws.query_params.get("resume") or None
+    profile = ws.query_params.get("profile") or None
+    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    if isinstance(ticket_info, dict) and ticket_info.get("allowed_endpoints") is not None:
+        return (
+            str(ticket_info.get("bound_session_id") or "").strip() or None,
+            str(ticket_info.get("bound_profile") or "").strip() or None,
+            False,
+        )
+    return resume, profile, force_fresh
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -15623,18 +15655,21 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # --- spawn PTY ------------------------------------------------------
-    raw_resume = ws.query_params.get("resume") or None
-    resume = raw_resume
-    profile = ws.query_params.get("profile") or None
+    resume, profile, force_fresh = _pty_resume_params(ws)
+    # Preserve the explicit target for the attach registry before any active
+    # session-file fallback below. A ticket-bound resume is explicit too.
+    raw_resume = resume
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
-    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
     active_session_file: Optional[Path] = None
+
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    if isinstance(ticket_info, dict) and ticket_info.get("allowed_endpoints") is not None:
+        _log.info(
+            "pty ticket bind session=%r profile=%r (client query ignored)",
+            resume,
+            profile,
+        )
 
     if channel:
         active_session_file = _active_session_file_for_channel(ws.app, channel)

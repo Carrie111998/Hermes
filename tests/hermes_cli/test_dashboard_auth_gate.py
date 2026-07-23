@@ -15,6 +15,16 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def restore_dashboard_app_state():
+    """Keep start_server state probes from leaking into later auth modules."""
+    state = web_server.app.state._state
+    before = dict(state)
+    yield
+    state.clear()
+    state.update(before)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with

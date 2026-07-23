@@ -861,22 +861,40 @@ class _HandoffTicketBody(BaseModel):
 async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
     """Mint a single-use phone-handoff ticket for a chat session.
 
-    Cookie-authenticated desk session only. Unauthenticated callers are
-    rejected by the gate (and defensively here). The ticket binds
-    ``session_id`` + optional ``profile`` and, on consume via
+    Full desk session only (cookie / native bearer). On loopback binds
+    (``auth_required`` False) Hermes Desktop authenticates with the legacy
+    session token and has no OAuth cookie — mint as a synthetic local-desk
+    identity so Continue-on-phone can issue QR handoff tickets. The ticket
+    binds ``session_id`` + optional ``profile`` and, on consume via
     ``?handoff=``, mints a resume-scoped browser session cookie — never
     ``API_SERVER_KEY`` / superuser / ``*`` scope.
     """
-    sess = getattr(request.state, "session", None)
-    if sess is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    import time as _time
 
-    # F-01: resume sessions cannot mint new handoffs (full desk only).
+    from hermes_cli.dashboard_auth.base import Session as _Session
     from hermes_cli.dashboard_auth.scopes import (
         require_full_dashboard_session,
         validate_handoff_target,
     )
 
+    sess = getattr(request.state, "session", None)
+    if sess is None and not getattr(request.app.state, "auth_required", False):
+        # Local desk trust boundary (loopback + session token already checked).
+        sess = _Session(
+            user_id="local-desk",
+            email="",
+            display_name="Local desk",
+            org_id="",
+            provider="loopback",
+            expires_at=int(_time.time()) + 3600,
+            access_token="",
+            refresh_token="",
+            scopes=(),
+        )
+    if sess is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # F-01: resume sessions cannot mint new handoffs (full desk only).
     require_full_dashboard_session(sess)
 
     session_id = (body.session_id or "").strip()
