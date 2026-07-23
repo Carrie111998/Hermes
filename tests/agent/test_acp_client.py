@@ -475,6 +475,7 @@ class TestRespond:
         sent = fake.drain_stdin()
         assert len(sent) == 1
         msg = sent[0]
+        assert msg["jsonrpc"] == "2.0"
         assert msg["id"] == 42
         assert msg["result"] == {"action": "accept"}
         assert "error" not in msg
@@ -488,6 +489,7 @@ class TestRespond:
         sent = fake.drain_stdin()
         assert len(sent) == 1
         msg = sent[0]
+        assert msg["jsonrpc"] == "2.0"
         assert msg["id"] == 7
         assert msg["error"]["code"] == -32601
         assert msg["error"]["message"] == "not found"
@@ -509,9 +511,74 @@ class TestNotify:
         sent = fake.drain_stdin()
         assert len(sent) == 1
         msg = sent[0]
+        assert msg["jsonrpc"] == "2.0"
         assert "id" not in msg
         assert msg["method"] == "session/cancel"
         assert msg["params"]["sessionId"] == "abc"
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: JSON-RPC 2.0 envelope on every outbound message
+# ---------------------------------------------------------------------------
+
+
+class TestJsonRpcEnvelope:
+    """Every outbound wire message must carry "jsonrpc": "2.0".
+
+    ACP SDK >= 1.3.0 rejects responses lacking the field with -32600
+    "Invalid request" (surfacing as "Tool permission request failed"), so the
+    envelope is enforced at the _send() chokepoint for all four outbound paths.
+    """
+
+    def test_request_carries_envelope(self):
+        client, fake = make_client_with_fake_proc()
+
+        def push_response():
+            time.sleep(0.05)
+            fake.push_stdout({"id": 1, "result": {}})
+
+        t = threading.Thread(target=push_response, daemon=True)
+        t.start()
+        client.request("test/method", {"k": "v"}, timeout=2.0)
+        t.join(timeout=1.0)
+        sent = fake.drain_stdin()
+        assert len(sent) == 1
+        assert sent[0]["jsonrpc"] == "2.0"
+        client.close()
+
+    def test_notify_carries_envelope(self):
+        client, fake = make_client_with_fake_proc()
+        client.notify("session/cancel", {})
+        time.sleep(0.05)
+        sent = fake.drain_stdin()
+        assert sent[0]["jsonrpc"] == "2.0"
+        client.close()
+
+    def test_respond_carries_envelope(self):
+        client, fake = make_client_with_fake_proc()
+        client.respond(1, {"outcome": {"outcome": "selected", "optionId": "allow"}})
+        time.sleep(0.05)
+        sent = fake.drain_stdin()
+        assert sent[0]["jsonrpc"] == "2.0"
+        client.close()
+
+    def test_respond_error_carries_envelope(self):
+        client, fake = make_client_with_fake_proc()
+        client.respond_error(1, code=-32601, message="nope")
+        time.sleep(0.05)
+        sent = fake.drain_stdin()
+        assert sent[0]["jsonrpc"] == "2.0"
+        client.close()
+
+    def test_send_setdefault_does_not_overwrite_explicit_envelope(self):
+        """A caller-supplied jsonrpc field must survive _send()."""
+        client, fake = make_client_with_fake_proc()
+        client._send({"jsonrpc": "9.9", "id": 1, "result": {}})
+        time.sleep(0.05)
+        sent = fake.drain_stdin()
+        assert len(sent) == 1
+        assert sent[0]["jsonrpc"] == "9.9"
         client.close()
 
 

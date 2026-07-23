@@ -316,6 +316,12 @@ class ACPClient:
             raise RuntimeError("ACP client is closed")
         if self._proc.stdin is None:
             raise RuntimeError("ACP agent stdin not available")
+        # JSON-RPC 2.0 requires every wire message to carry "jsonrpc": "2.0".
+        # Applied at this single chokepoint so request/respond/respond_error/
+        # notify all emit a spec-compliant envelope; setdefault never overwrites
+        # an explicit value. ACP SDK >= 1.3.0 rejects responses lacking the
+        # field with -32600 "Invalid request".
+        obj.setdefault("jsonrpc", "2.0")
         # _send_lock serialises writes from multiple threads. Unlike Codex
         # (where session/prompt returns immediately), ACP session/prompt blocks
         # for the whole turn, so callers wrap it in a background thread while
