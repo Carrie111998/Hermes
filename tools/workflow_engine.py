@@ -1153,7 +1153,7 @@ class WorkflowEngine:
     def execute(self, workflow_name: str, context: dict = None,
                 start_node: str = None, dry_run: bool = False,
                 resume: bool = False, board: str = None,
-                inputs: dict = None) -> dict:
+                inputs: dict = None, run_id: str = None) -> dict:
         """
         Run a workflow to completion. Supports revision loops via
         the LOOP:<target> convention in block reasons.
@@ -1194,8 +1194,11 @@ class WorkflowEngine:
         # Generate a run ID for this invocation. Available as {run_id}
         # in template substitution so YAML authors can create unique
         # artifact filenames per run.
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        workflow.run_id = f"{workflow_name}-{ts}"
+        if run_id:
+            workflow.run_id = run_id
+        else:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            workflow.run_id = f"{workflow_name}-{ts}"
 
         layers = self.topological_sort(workflow)
 
