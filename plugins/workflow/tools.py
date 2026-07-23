@@ -226,6 +226,24 @@ def _handle_workflow_start_predefined(
             return _err(f"dry-run failed: {exc}")
         return _ok(result)
 
+    # Capture session info at tool-handler level where ContextVars are available.
+    # The engine's execute() runs in a context where ContextVars are lost.
+    _captured_session = {}
+    try:
+        from gateway.session_context import get_session_env
+        _p = get_session_env("HERMES_SESSION_PLATFORM", "")
+        _c = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if _p and _c:
+            _captured_session = {
+                "platform": _p,
+                "chat_id": _c,
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
+                "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
+                "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
+            }
+    except Exception:
+        pass
+
     # Fire-and-forget: create all kanban cards and subscribe the final
     # layer for notifications.  The kanban dispatcher picks up ready
     # cards and spawns workers; the gateway notifier pushes terminal
@@ -242,6 +260,7 @@ def _handle_workflow_start_predefined(
             board=board,
             fire_and_forget=True,
             attachments=attachments,
+            session_info=_captured_session or None,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))

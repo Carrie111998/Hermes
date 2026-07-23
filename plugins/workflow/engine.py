@@ -578,8 +578,13 @@ class WorkflowEngine:
         )
 
     def _get_session_info(self) -> dict:
-        """Capture gateway session info for subscription routing."""
-        # Try ContextVars first (works when called from gateway session)
+        """Capture gateway session info for subscription routing.
+
+        NOTE: ContextVars from gateway.session_context are NOT available inside
+        engine.execute() — they're lost across the tool-handler → engine call
+        boundary. This method is a fallback; the tool handler should capture
+        session info and pass it via the session_info parameter.
+        """
         try:
             from gateway.session_context import get_session_env
             platform = get_session_env("HERMES_SESSION_PLATFORM", "")
@@ -597,7 +602,6 @@ class WorkflowEngine:
                 }
         except Exception as _exc:
             logger.debug("ContextVars session lookup failed: %s", _exc)
-        # Fallback: os.environ (kanban tools also check this)
         try:
             platform = os.environ.get("HERMES_SESSION_PLATFORM", "")
             chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "")
@@ -2084,7 +2088,8 @@ class WorkflowEngine:
                 inputs: dict = None,
                 fire_and_forget: bool = False,
                 run_id: Optional[str] = None,
-                attachments: list = None) -> dict:
+                attachments: list = None,
+                session_info: dict = None) -> dict:
         """
         Run a workflow to completion. Supports revision loops via
         the LOOP:<target> convention in block reasons.
@@ -2221,7 +2226,7 @@ class WorkflowEngine:
         # can access them without threading through every method signature.
         self._current_attachments = attachments or []
         # Capture session info once — used for subscription routing and state persistence.
-        _session_info = self._get_session_info()
+        _session_info = session_info or self._get_session_info()
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
