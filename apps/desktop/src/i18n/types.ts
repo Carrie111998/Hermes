@@ -494,6 +494,13 @@ export interface Translations {
       searchKeys: string
       noKeysMatch: string
       loading: string
+      customEndpoint: string
+      customEndpointDesc: string
+      customEndpointEdit: string
+      customEndpointSet: string
+      customEndpointModel: string
+      customEndpointNotConfigured: string
+      customEndpointConfigure: string
     }
     sessions: {
       loading: string

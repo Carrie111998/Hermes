@@ -805,7 +805,14 @@ export const zh: Translations = {
       noProviderKeys: '没有可用的提供方 API 密钥。',
       searchKeys: '搜索提供方…',
       noKeysMatch: '没有匹配的提供方。',
-      loading: '正在加载提供方...'
+      loading: '正在加载提供方...',
+      customEndpoint: '自定义端点',
+      customEndpointDesc: '兼容 OpenAI 的自定义端点（中转站、vLLM、Ollama 等）。',
+      customEndpointEdit: '编辑端点',
+      customEndpointSet: '端点地址',
+      customEndpointModel: '模型',
+      customEndpointNotConfigured: '未配置自定义端点。',
+      customEndpointConfigure: '配置自定义端点'
     },
     sessions: {
       loading: '正在加载已归档会话…',
@@ -1171,7 +1178,28 @@ export const zh: Translations = {
       QQ_MARKDOWN_SUPPORT: { label: 'QQ Markdown 支持', help: '为 true 时启用 Markdown 消息支持（高级）。' },
       QQ_STT_API_KEY: { label: 'QQ 语音转文字 API Key', help: 'QQ 语音转文字服务的 API Key（高级）。' },
       QQ_STT_BASE_URL: { label: 'QQ 语音转文字服务地址', help: 'QQ 语音转文字服务的 API 地址（高级）。' },
-      QQ_STT_MODEL: { label: 'QQ 语音转文字模型', help: 'QQ 语音转文字使用的模型名称（高级）。' }
+      QQ_STT_MODEL: { label: 'QQ 语音转文字模型', help: 'QQ 语音转文字使用的模型名称（高级）。' },
+      // ---- 邮件 ----
+      EMAIL_ADDRESS: { label: '邮箱地址', help: '用于收发邮件的邮箱地址。', placeholder: 'your@email.com' },
+      EMAIL_PASSWORD: { label: '邮箱密码', help: '邮箱密码或应用专用密码（Gmail/Workspace 请使用应用专用密码）。', placeholder: '粘贴密码' },
+      EMAIL_IMAP_HOST: { label: 'IMAP 服务器', help: 'IMAP 收信服务器地址（如 imap.gmail.com）。', placeholder: 'imap.gmail.com' },
+      EMAIL_SMTP_HOST: { label: 'SMTP 服务器', help: 'SMTP 发信服务器地址（如 smtp.gmail.com）。', placeholder: 'smtp.gmail.com' },
+      // ---- 短信（Twilio）----
+      TWILIO_ACCOUNT_SID: { label: 'Twilio Account SID', help: 'Twilio 控制台中的 Account SID。' },
+      TWILIO_AUTH_TOKEN: { label: 'Twilio Auth Token', help: 'Twilio 控制台中的 Auth Token。', placeholder: '粘贴 Auth Token' },
+      // ---- Home Assistant ----
+      HASS_URL: { label: 'Home Assistant URL', help: 'Home Assistant 地址（如 https://homeassistant.local:8123）。' },
+      HASS_TOKEN: { label: 'Home Assistant 访问令牌', help: '在 Home Assistant 个人资料 → 安全中创建的长期访问令牌。', placeholder: '粘贴访问令牌' },
+      // ---- 微信（iLink Bot）----
+      WEIXIN_ACCOUNT_ID: { label: 'iLink Bot 账号 ID', help: '通过 `qiji gateway setup` 扫码登录获取的 iLink Bot 账号 ID。' },
+      WEIXIN_TOKEN: { label: 'iLink Bot Token', help: '通过扫码登录获取的 iLink Bot Token。', placeholder: '粘贴 Token' },
+      WEIXIN_BASE_URL: { label: 'iLink API 地址', help: '扫码登录保存的 iLink API 地址（默认 https://ilinkai.weixin.qq.com）。' },
+      // ---- WhatsApp 高级 ----
+      WHATSAPP_DM_POLICY: { label: 'WhatsApp 私信策略', help: '控制 WhatsApp 私信的授权方式（高级）。' },
+      // ---- Webhook ----
+      WEBHOOK_ENABLED: { label: '启用 Webhook', help: '启用后 奇计 监听 HTTP POST 请求。' },
+      WEBHOOK_PORT: { label: 'Webhook 端口', help: 'Webhook 服务器监听的端口。' },
+      WEBHOOK_SECRET: { label: 'Webhook 密钥', help: '用于验证传入请求签名的密钥。', placeholder: '粘贴密钥' }
     },
     platformIntro: {
       telegram:

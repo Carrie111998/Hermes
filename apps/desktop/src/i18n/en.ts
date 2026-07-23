@@ -615,7 +615,14 @@ export const en: Translations = {
       noProviderKeys: 'No provider API keys available.',
       searchKeys: 'Search providers…',
       noKeysMatch: 'No providers match your search.',
-      loading: 'Loading providers...'
+      loading: 'Loading providers...',
+      customEndpoint: 'Custom endpoint',
+      customEndpointDesc: 'OpenAI-compatible custom endpoint (relay, vLLM, Ollama, etc.).',
+      customEndpointEdit: 'Edit endpoint',
+      customEndpointSet: 'Endpoint URL',
+      customEndpointModel: 'Model',
+      customEndpointNotConfigured: 'No custom endpoint configured.',
+      customEndpointConfigure: 'Configure custom endpoint'
     },
     sessions: {
       loading: 'Loading archived sessions…',

@@ -13,12 +13,12 @@ import {
 } from '@/components/desktop-onboarding-overlay'
 import { Button } from '@/components/ui/button'
 import { SearchField } from '@/components/ui/search-field'
-import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
+import { disconnectOAuthProvider, getGlobalModelInfo, getHermesConfigRecord, listOAuthProviders } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $desktopOnboarding, startManualProviderOAuth } from '@/store/onboarding'
+import { $desktopOnboarding, startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 
 import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
@@ -300,6 +300,95 @@ function NoProviderKeys() {
   )
 }
 
+// Shows the current custom endpoint config (provider=custom) and lets the user
+// edit it. Always visible in the Accounts view so the entry point doesn't
+// disappear after initial configuration.
+function CustomEndpointCard() {
+  const { t } = useI18n()
+  const p = t.settings.providers
+  const [modelInfo, setModelInfo] = useState<{ baseUrl: null | string; model: null | string; provider: null | string } | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    void (async () => {
+      try {
+        const info = await getGlobalModelInfo()
+
+        if (cancelled) {
+          return
+        }
+
+        // The /api/model/info response doesn't include base_url; read the
+        // config record to get it for display.
+        let baseUrl: null | string = null
+
+        try {
+          const cfg = await getHermesConfigRecord()
+          const modelCfg = (cfg as Record<string, unknown>)?.model
+
+          if (modelCfg && typeof modelCfg === 'object') {
+            baseUrl = String((modelCfg as Record<string, unknown>).base_url ?? '') || null
+          }
+        } catch {
+          /* config read is best-effort */
+        }
+
+        if (!cancelled) {
+          setModelInfo({ baseUrl, model: info.model || null, provider: info.provider || null })
+        }
+      } catch {
+        if (!cancelled) {
+          setModelInfo({ baseUrl: null, model: null, provider: null })
+        }
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [])
+
+  const isCustom = modelInfo?.provider?.toLowerCase() === 'custom'
+  const baseUrl = modelInfo?.baseUrl
+  const model = modelInfo?.model
+
+  return (
+    <section className="mb-2 grid gap-2 rounded-[8px] border border-(--ui-stroke-tertiary) bg-background/60 p-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <SettingsCategoryHeading icon={KeyRound} title={p.customEndpoint} />
+        <Button
+          onClick={() => startManualLocalEndpoint()}
+          size="inline"
+          type="button"
+          variant="textStrong"
+        >
+          {isCustom ? p.customEndpointEdit : p.customEndpointConfigure}
+        </Button>
+      </div>
+      <p className="-mt-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
+        {p.customEndpointDesc}
+      </p>
+      {isCustom && baseUrl ? (
+        <div className="grid gap-0.5 text-[length:var(--conversation-caption-font-size)]">
+          <div className="flex items-center gap-2">
+            <span className="text-muted-foreground">{p.customEndpointSet}:</span>
+            <span className="truncate font-mono">{baseUrl}</span>
+          </div>
+          {model && (
+            <div className="flex items-center gap-2">
+              <span className="text-muted-foreground">{p.customEndpointModel}:</span>
+              <span className="font-mono">{model}</span>
+            </div>
+          )}
+        </div>
+      ) : (
+        <p className="text-[length:var(--conversation-caption-font-size)] text-muted-foreground/70">
+          {p.customEndpointNotConfigured}
+        </p>
+      )}
+    </section>
+  )
+}
+
 export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSettingsProps) {
   const { t } = useI18n()
   const { rowProps, vars } = useEnvCredentials()
@@ -456,6 +545,7 @@ export function ProvidersSettings({ onClose, onViewChange, view }: ProvidersSett
         onWantApiKey={() => onViewChange('keys')}
         providers={oauthProviders}
       />
+      <CustomEndpointCard />
     </SettingsContent>
   )
 }

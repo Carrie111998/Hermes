@@ -1,3 +1,13 @@
+// On Windows the console defaults to the system OEM codepage (typically GBK /
+// CP936 on Chinese locale). Node writes UTF-8, so Chinese strings in error
+// messages and log output appear as mojibake (锟斤拷). Switch the console to
+// UTF-8 (CP65001) as early as possible. This is a no-op on macOS/Linux.
+if (process.platform === 'win32') {
+  try {
+    require('node:child_process').execFileSync('chcp', ['65001'], { stdio: 'ignore', shell: true })
+  } catch { /* non-fatal — console may not exist in some contexts */ }
+}
+
 const {
   app,
   BrowserWindow,
