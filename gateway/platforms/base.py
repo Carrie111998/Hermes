@@ -3571,6 +3571,47 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    async def send_suggested_actions(
+        self,
+        chat_id: str,
+        message: str,
+        actions: list,
+        set_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a message with tappable follow-up actions (non-blocking).
+
+        Unlike :meth:`send_clarify`, this does NOT block the agent — the
+        actions are optional next moves the user may tap now, later, or never.
+        Tapping an action starts a fresh agent turn seeded with that action's
+        payload.
+
+        Adapters with native button UIs (Telegram, Discord) SHOULD override
+        this to render inline buttons whose callback data is
+        ``sa:<set_id>:<index>`` and whose tap handler resolves the payload via
+        ``tools.suggested_actions_gateway.resolve(set_id, index)`` and injects
+        it as a new user message.
+
+        The default implementation degrades to a numbered text list that works
+        on every platform: it appends the actions to the message body so the
+        user can reply with a number or the action's own text. The gateway
+        does not intercept these replies (the turn is already over); they
+        simply arrive as the next user message, which is the intended UX for a
+        plain-text platform.
+        """
+        lines = [message, ""]
+        for i, action in enumerate(actions, start=1):
+            label = action.get("label") if isinstance(action, dict) else str(action)
+            lines.append(f"  {i}. {label}")
+        lines.append("")
+        lines.append("Reply with a number or tell me what you'd like to do.")
+        return await self.send(
+            chat_id=chat_id,
+            content="\n".join(lines),
+            metadata=metadata,
+        )
+
     async def send_private_notice(
         self,
         chat_id: str,

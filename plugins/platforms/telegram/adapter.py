@@ -834,6 +834,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Suggested-actions button state: set_id → routing dict
+        # ({session_key, chat_id, thread_id}) for the non-blocking
+        # suggest_actions tool; see GatewayRunner suggest_actions_callback wiring.
+        self._suggested_action_state: Dict[str, Dict[str, Any]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -5515,6 +5519,77 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_suggested_actions(
+        self,
+        chat_id: str,
+        message: str,
+        actions: list,
+        set_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a message with one inline button per suggested action.
+
+        Non-blocking: buttons carry ``sa:<set_id>:<index>``. Tapping one is
+        handled in :meth:`_handle_callback_query`, which resolves the payload
+        via ``tools.suggested_actions_gateway.resolve`` and injects it as a
+        fresh user turn. The agent does NOT wait on this send.
+
+        Button labels use the action's own text (truncated for mobile); the
+        payload is not round-tripped through callback_data (Telegram caps it at
+        64 bytes) but recovered server-side from the registered set.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            text = _html.escape(message)
+            thread_id = self._metadata_thread_id(metadata)
+
+            rows = []
+            for idx, action in enumerate(actions):
+                label = action.get("label") if isinstance(action, dict) else str(action)
+                # Telegram truncates long button labels; keep them tidy.
+                short = (label or f"Option {idx + 1}")[:48]
+                rows.append([
+                    InlineKeyboardButton(
+                        short,
+                        callback_data=f"sa:{set_id}:{idx}",
+                    )
+                ])
+
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": InlineKeyboardMarkup(rows),
+                **self._link_preview_kwargs(),
+            }
+
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            # Remember the session for this set so the tap handler can route
+            # the injected turn back to the right session/thread.
+            self._suggested_action_state[set_id] = {
+                "session_key": session_key,
+                "chat_id": str(chat_id),
+                "thread_id": str(thread_id) if thread_id else None,
+            }
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_suggested_actions failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -6199,6 +6274,18 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Suggested-actions callbacks (sa:<set_id>:<index>) ---
+        if data.startswith("sa:"):
+            await self._handle_suggested_action_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -6677,6 +6764,125 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.edit_message_text(text=appended, reply_markup=None)
         except Exception:
             pass
+
+    async def _handle_suggested_action_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Dispatch a suggested-action tap (sa:<set_id>:<index>).
+
+        Resolves the tapped action's payload from the module-level registry and
+        injects it as a fresh user turn via ``handle_message`` — the same entry
+        point a typed message uses. This is non-blocking: no agent thread was
+        waiting on it. The payload becomes the text of a synthetic
+        ``MessageEvent`` routed to the same chat/thread the buttons were sent
+        to.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid action data.")
+            return
+        set_id, index_token = parts[1], parts[2]
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this action.")
+            return
+
+        try:
+            index = int(index_token)
+        except (ValueError, TypeError):
+            await query.answer(text="Invalid action index.")
+            return
+
+        # Resolve the payload from the gateway registry.
+        payload = None
+        label = None
+        try:
+            from tools.suggested_actions_gateway import get_set, resolve
+            payload = resolve(set_id, index)
+            entry = get_set(set_id)
+            if entry is not None:
+                label = entry.label_for(index)
+        except Exception as exc:
+            logger.warning("[%s] suggested-action resolve failed: %s", self.name, exc)
+
+        if payload is None:
+            await query.answer(text="This action has expired.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        user_display = getattr(query.from_user, "first_name", "User")
+        await query.answer(text=f"✓ {(label or payload)[:60]}")
+
+        # Acknowledge on the original message and strip the keyboard so the
+        # same action isn't fired twice.
+        try:
+            original_text = (query.message.text or "") if query.message else ""
+            appended = f"{original_text}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(label or payload)}"
+            await query.edit_message_text(
+                text=appended,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+        # Route the injected turn back to the chat/thread the buttons were
+        # sent to. Prefer the stored routing; fall back to the callback's own
+        # chat context.
+        routing = self._suggested_action_state.get(set_id, {})
+        chat_id = routing.get("chat_id") or (
+            str(query_chat_id) if query_chat_id is not None else None
+        )
+        thread_id = routing.get("thread_id") or (
+            str(query_thread_id) if query_thread_id is not None else None
+        )
+        if not chat_id:
+            logger.warning("[%s] suggested-action tap has no chat_id to route to", self.name)
+            return
+
+        normalized_chat_type = str(query_chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "group"
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=None,
+            chat_type=normalized_chat_type,
+            user_id=caller_id or chat_id,
+            user_name=str(query_user_name).strip() if query_user_name else None,
+            thread_id=thread_id,
+            message_id=None,
+        )
+
+        event = MessageEvent(
+            text=str(payload),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=None,
+        )
+        try:
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.error("[%s] suggested-action injection failed: %s", self.name, exc, exc_info=True)
 
     def _missing_media_path_error(self, label: str, path: str) -> str:
         """Build an actionable file-not-found error for gateway MEDIA delivery.

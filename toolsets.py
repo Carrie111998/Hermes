@@ -234,8 +234,8 @@ TOOLSETS = {
     },
     
     "clarify": {
-        "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
-        "tools": ["clarify"],
+        "description": "Ask the user clarifying questions (multiple-choice or open-ended), or attach tappable follow-up actions",
+        "tools": ["clarify", "suggest_actions"],
         "includes": []
     },
     
