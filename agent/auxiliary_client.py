@@ -3534,6 +3534,8 @@ def _recoverable_pool_provider(
     resolved_provider: str,
     client: Any,
     main_runtime: Optional[Dict[str, Any]] = None,
+    *,
+    route_is_explicit: bool = False,
 ) -> Optional[str]:
     """Infer which provider pool can recover the current auxiliary client."""
     route_label = str(resolved_provider or "").strip().lower()
@@ -3546,35 +3548,11 @@ def _recoverable_pool_provider(
     base = str(getattr(client, "base_url", "") or "")
     normalized_base = _normalized_provider_route(base)
 
-    # A concrete provider label is not enough to prove pool ownership. A
-    # configured route may reuse that label while supplying its own endpoint
-    # or key. Only associate it with the shared pool when the selected
-    # client's route matches the provider registry's canonical route.
+    # Concrete provider clients can legitimately select provider-owned dynamic
+    # routes (for example Z.AI global/China/coding endpoints). Preserve their
+    # pool association unless the task supplied an explicit route/key override.
     if normalized not in {"", "auto", "custom"}:
-        if not normalized_base:
-            return normalized
-        try:
-            from hermes_cli.auth import PROVIDER_REGISTRY
-
-            pconfig = PROVIDER_REGISTRY.get(normalized)
-            candidates = [
-                str(getattr(pconfig, "inference_base_url", "") or ""),
-            ]
-            base_url_env_var = str(
-                getattr(pconfig, "base_url_env_var", "") or ""
-            ).strip()
-            if base_url_env_var:
-                candidates.append(str(os.environ.get(base_url_env_var) or ""))
-            for candidate in candidates:
-                normalized_candidate = _normalized_provider_route(candidate)
-                if normalized_candidate and (
-                    normalized_base == normalized_candidate
-                    or normalized_base.startswith(normalized_candidate + "/")
-                ):
-                    return normalized
-        except Exception:
-            pass
-        return None
+        return None if route_is_explicit else normalized
 
     if base_url_host_matches(base, "chatgpt.com"):
         return "openai-codex"
@@ -4026,6 +4004,7 @@ def _mark_recoverable_provider_unhealthy(
     *,
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
+    route_is_explicit: bool = False,
 ) -> Optional[str]:
     """Quarantine only a concrete shared provider inferred for this route."""
     route_label = str(resolved_provider or "").strip()
@@ -4036,6 +4015,7 @@ def _mark_recoverable_provider_unhealthy(
             resolved_provider,
             client,
             main_runtime=main_runtime,
+            route_is_explicit=route_is_explicit,
         )
     if health_provider:
         _mark_provider_unhealthy(health_provider)
@@ -4379,13 +4359,14 @@ def _try_payment_fallback(
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
     # Normalise the failed provider label for matching.
-    skip = failed_provider.lower().strip()
+    skip = _normalize_aux_provider(failed_provider)
     # Also skip Step-1 main-provider path if it maps to the same backend.
     # (e.g. main_provider="openrouter" → skip "openrouter" in chain)
     main_provider = _read_main_provider()
     skip_labels = {skip}
-    if main_provider and main_provider.lower() in skip:
-        skip_labels.add(main_provider.lower())
+    main_norm = _normalize_aux_provider(main_provider)
+    if main_norm and main_norm == skip:
+        skip_labels.add(main_norm)
     # Map common resolved_provider values back to chain labels.
     _alias_to_label = {"openrouter": "openrouter", "nous": "nous",
                        "openai-codex": "openai-codex", "codex": "openai-codex",
@@ -4436,11 +4417,12 @@ def _try_main_agent_model_fallback(
     """
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
-    if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
+    main_norm = _normalize_aux_provider(main_provider)
+    if not main_provider or not main_model or main_norm in {"auto", ""}:
         return None, None, ""
 
-    skip = (failed_provider or "").lower().strip()
-    if main_provider.lower() == skip:
+    skip = _normalize_aux_provider(failed_provider)
+    if main_norm == skip:
         # The thing that failed IS the main model — nothing to fall back to.
         return None, None, ""
     label = f"main-agent({main_provider})"
@@ -4448,8 +4430,8 @@ def _try_main_agent_model_fallback(
         label
         if _is_provider_unhealthy(label)
         else (
-            main_provider
-            if _is_provider_unhealthy(main_provider)
+            main_norm
+            if _is_provider_unhealthy(main_norm)
             else ""
         )
     )
@@ -4578,7 +4560,7 @@ def _try_configured_fallback_chain(
     if not chain or not isinstance(chain, list):
         return None, None, ""
 
-    skip = failed_provider.lower().strip()
+    skip = _normalize_aux_provider(failed_provider)
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -4589,6 +4571,7 @@ def _try_configured_fallback_chain(
         if not fb_provider:
             continue
         fb_model = str(entry.get("model", "")).strip() or None
+        fb_norm = _normalize_aux_provider(fb_provider)
 
         label = f"fallback_chain[{i}]({fb_provider})"
         entry_scoped = any(
@@ -4600,14 +4583,14 @@ def _try_configured_fallback_chain(
                 "api_key_env",
             )
         )
-        if fb_provider.lower() == skip and not entry_scoped:
+        if fb_norm == skip and not entry_scoped:
             continue
         unhealthy_label = (
             label
             if _is_provider_unhealthy(label)
             else (
-                fb_provider
-                if not entry_scoped and _is_provider_unhealthy(fb_provider)
+                fb_norm
+                if not entry_scoped and _is_provider_unhealthy(fb_norm)
                 else ""
             )
         )
@@ -4757,8 +4740,8 @@ def _try_main_fallback_chain(
     if not chain:
         return None, None, ""
 
-    failed_norm = (failed_provider or "").strip().lower()
-    main_norm = (_read_main_provider() or "").strip().lower()
+    failed_norm = _normalize_aux_provider(failed_provider)
+    main_norm = _normalize_aux_provider(_read_main_provider())
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
@@ -7819,7 +7802,14 @@ def call_llm(
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
-        pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
+        pool_provider = _recoverable_pool_provider(
+            resolved_provider,
+            client,
+            main_runtime=main_runtime,
+            route_is_explicit=bool(
+                resolved_base_url or resolved_api_key or resolved_api_mode
+            ),
+        )
         # Capture the exact API key used so mark_exhausted_and_rotate can find
         # the correct pool entry even when another process rotated the pool
         # between this call and recovery (which leaves current()=None and makes
@@ -7945,6 +7935,9 @@ def call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
+                    route_is_explicit=bool(
+                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    ),
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
@@ -7957,6 +7950,9 @@ def call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
+                    route_is_explicit=bool(
+                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    ),
                 )
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
@@ -8417,7 +8413,14 @@ async def async_call_llm(
                 )
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
-        pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
+        pool_provider = _recoverable_pool_provider(
+            resolved_provider,
+            client,
+            main_runtime=main_runtime,
+            route_is_explicit=bool(
+                resolved_base_url or resolved_api_key or resolved_api_mode
+            ),
+        )
         _client_api_key = str(getattr(client, "api_key", "") or "")
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
@@ -8501,6 +8504,9 @@ async def async_call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
+                    route_is_explicit=bool(
+                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    ),
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
@@ -8513,6 +8519,9 @@ async def async_call_llm(
                     client,
                     main_runtime=main_runtime,
                     task=task,
+                    route_is_explicit=bool(
+                        resolved_base_url or resolved_api_key or resolved_api_mode
+                    ),
                 )
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"

@@ -7275,7 +7275,95 @@ class TestFallbackRouteScopingRegressions:
         client = MagicMock()
         client.base_url = "https://nim-sibling.example/v1"
 
-        assert _recoverable_pool_provider("nvidia", client) is None
+        assert _recoverable_pool_provider(
+            "nvidia",
+            client,
+            route_is_explicit=True,
+        ) is None
+
+    def test_provider_owned_dynamic_route_keeps_pool_recovery(self):
+        from agent.auxiliary_client import _recoverable_pool_provider
+
+        client = MagicMock()
+        client.base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+
+        assert _recoverable_pool_provider("zai", client) == "zai"
+
+    def test_configured_alias_health_skips_to_independent_candidate(self):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        second_client = MagicMock()
+        entries = [
+            {"provider": "google-gemini", "model": "gemini-3.5-flash"},
+            {"provider": "zai", "model": "glm-5.2"},
+        ]
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": entries},
+        ), patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            side_effect=lambda label: label == "gemini",
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(second_client, "glm-5.2"),
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "nvidia",
+            )
+
+        assert client is second_client
+        assert model == "glm-5.2"
+        assert label == "fallback_chain[1](zai)"
+
+    def test_main_alias_skip_does_not_retry_failed_backend(self, monkeypatch):
+        from agent.auxiliary_client import _try_main_fallback_chain
+
+        second_client = MagicMock()
+        entries = [
+            {"provider": "google-gemini", "model": "gemini-3.5-flash"},
+            {"provider": "zai", "model": "glm-5.2"},
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.fallback_config.get_fallback_chain",
+            lambda _cfg: entries,
+        )
+        with patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            return_value=(second_client, "glm-5.2"),
+        ) as resolve_entry, patch(
+            "agent.auxiliary_client._is_provider_unhealthy",
+            return_value=False,
+        ):
+            client, model, label = _try_main_fallback_chain(
+                "compression",
+                "google-gemini",
+            )
+
+        assert client is second_client
+        assert model == "glm-5.2"
+        assert label == "fallback_providers[1](zai)"
+        resolve_entry.assert_called_once_with(entries[1])
+
+    def test_main_agent_alias_does_not_retry_failed_backend(self):
+        from agent.auxiliary_client import _try_main_agent_model_fallback
+
+        with patch(
+            "agent.auxiliary_client._read_main_provider",
+            return_value="gemini",
+        ), patch(
+            "agent.auxiliary_client._read_main_model",
+            return_value="gemini-3.5-flash",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+        ) as resolve_client:
+            client, model, label = _try_main_agent_model_fallback(
+                "google-gemini",
+                "compression",
+            )
+
+        assert (client, model, label) == (None, None, "")
+        resolve_client.assert_not_called()
 
     def test_model_only_alias_uses_canonical_provider_health_key(self):
         from agent.auxiliary_client import _fallback_health_label
