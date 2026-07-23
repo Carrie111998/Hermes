@@ -3955,8 +3955,9 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     fb_base = str(getattr(fb_client, "base_url", "") or "")
+    fb_provider = _fallback_label_provider(fb_label)
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
+        fb_provider, fb_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
@@ -3979,15 +3980,15 @@ def _call_fallback_candidate_sync(
             return None
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(
-            _fallback_label_provider(fb_label),
+        refresh_provider = _auth_refresh_provider_for_route(
+            fb_provider,
             fb_base,
         )
-        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
-            retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
+        if refresh_provider not in {"auto", "", None} and _refresh_provider_credentials(refresh_provider):
+            retry_client, retry_model = _get_cached_client(refresh_provider, fb_model)
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
-                    fb_provider, retry_model or fb_model, messages,
+                    refresh_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
@@ -4048,8 +4049,9 @@ async def _call_fallback_candidate_async(
         )
         effective_timeout = fb_timeout
     fb_base = str(getattr(fb_client, "base_url", "") or "")
+    fb_provider = _fallback_label_provider(fb_label)
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
+        fb_provider, fb_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
@@ -4070,16 +4072,16 @@ async def _call_fallback_candidate_async(
             return None
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(
-            _fallback_label_provider(fb_label),
+        refresh_provider = _auth_refresh_provider_for_route(
+            fb_provider,
             fb_base,
         )
-        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
+        if refresh_provider not in {"auto", "", None} and _refresh_provider_credentials(refresh_provider):
             retry_client, retry_model = _get_cached_client(
-                fb_provider, fb_model, async_mode=True)
+                refresh_provider, fb_model, async_mode=True)
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
-                    fb_provider, retry_model or fb_model, messages,
+                    refresh_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,

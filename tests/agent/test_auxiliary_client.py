@@ -2177,6 +2177,65 @@ class TestStaleFallbackCandidateSkip:
         return _AuxStreamTimeoutError(
             "Codex auxiliary Responses stream exceeded 120.0s total timeout")
 
+    def test_configured_fallback_uses_provider_id_for_request_shaping(self):
+        from agent.auxiliary_client import _call_fallback_candidate_sync
+
+        fallback = MagicMock()
+        fallback.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        fallback.chat.completions.create.return_value = _DummyResponse("gemini")
+
+        with patch(
+            "agent.auxiliary_client._build_call_kwargs",
+            return_value={"model": "gemini-3-flash", "messages": []},
+        ) as mock_build:
+            result = _call_fallback_candidate_sync(
+                fallback,
+                "gemini-3-flash",
+                "fallback_providers[0](gemini)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config={"effort": "high"},
+            )
+
+        assert result.choices[0].message.content == "gemini"
+        assert mock_build.call_args.args[0] == "gemini"
+
+    @pytest.mark.asyncio
+    async def test_async_configured_fallback_uses_provider_id_for_request_shaping(self):
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        fallback = MagicMock()
+        fallback.base_url = "https://api.z.ai/api/paas/v4"
+        fallback.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("zai")
+        )
+
+        with patch(
+            "agent.auxiliary_client._build_call_kwargs",
+            return_value={"model": "glm-5.2", "messages": []},
+        ) as mock_build:
+            result = await _call_fallback_candidate_async(
+                fallback,
+                "glm-5.2",
+                "fallback_providers[1](zai)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30,
+                effective_extra_body={},
+                reasoning_config={"effort": "high"},
+            )
+
+        assert result.choices[0].message.content == "zai"
+        assert mock_build.call_args.args[0] == "zai"
+
     def test_stale_anthropic_fallback_refreshes_and_retries(self, monkeypatch):
         """401 from the fallback candidate → refresh its creds → retry succeeds."""
         primary_client = MagicMock()
