@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import gc
 import logging
 import os
 import re
@@ -1037,3 +1038,31 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Collect cycle-held sqlite connections before fixture finalizers run.
+
+    ``sqlite3.Connection`` keeps its prepared-statement cache in a reference
+    cycle, so a connection a test opened and dropped is NOT freed by plain
+    refcounting — it waits for a cyclic-GC pass. Until it is freed, its
+    ``__del__`` has not closed the file, and on Windows the open handle blocks
+    deletion of the directory holding the DB.
+
+    ``tmp_path`` reclaims its directory with a best-effort
+    ``rmtree(ignore_errors=True)``, so that failure is silent: the test passes
+    and the tree survives in %TEMP% (30.4 GB / ~191K dirs by 2026-07-22).
+    Because collection is timing-dependent, only *some* tests stranded a dir,
+    which is why the leak looked erratic.
+
+    ``tryfirst`` puts this ahead of pytest's own teardown, which is what
+    finalizes fixtures — so the connections are closed while ``tmp_path``'s
+    finalizer can still act on them. Deliberately NOT a fixture: an autouse
+    fixture is set up before ``tmp_path`` and therefore torn down *after* it,
+    and one depending on ``tmp_path`` would force a temp dir for every test.
+
+    Purely a lifetime nudge — it never changes when anything commits, closes,
+    or rolls back, so it cannot alter test semantics.
+    """
+    gc.collect()
