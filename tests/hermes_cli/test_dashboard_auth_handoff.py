@@ -529,7 +529,7 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
     from hermes_cli.dashboard_auth.scopes import is_handoff_consume_request
     from starlette.requests import Request
 
-    def _req(path: str, raw: bytes | None = None) -> Request:
+    def _req(path: str, raw: bytes | None = None, headers: list | None = None) -> Request:
         scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
@@ -539,7 +539,7 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
             "path": path,
             "raw_path": raw if raw is not None else path.encode("ascii"),
             "query_string": b"",
-            "headers": [],
+            "headers": headers or [],
             "client": ("1.2.3.4", 1234),
             "server": ("fly-app.fly.dev", 443),
         }
@@ -555,6 +555,28 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
     assert not is_handoff_consume_request(_req("/nested/chat", raw=b"/nested/chat"))
     # Canonical exact path is accepted.
     assert is_handoff_consume_request(_req("/chat", raw=b"/chat"))
+    # F-01: client X-Forwarded-Prefix must not redefine consume path.
+    assert is_handoff_consume_request(
+        _req(
+            "/chat",
+            raw=b"/chat",
+            headers=[(b"x-forwarded-prefix", b"/hermes")],
+        )
+    )
+    assert not is_handoff_consume_request(
+        _req(
+            "/nested/chat",
+            raw=b"/nested/chat",
+            headers=[(b"x-forwarded-prefix", b"/nested")],
+        )
+    )
+    assert not is_handoff_consume_request(
+        _req(
+            "/hermes/chat",
+            raw=b"/hermes/chat",
+            headers=[(b"x-forwarded-prefix", b"/hermes")],
+        )
+    )
 
     _complete_stub_login(gated_app)
     ticket = _mint(gated_app, "place-encoded")
@@ -567,6 +589,74 @@ def test_encoded_path_variants_do_not_consume_handoff(gated_app):
 
     r_ok = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
     assert r_ok.status_code == 302
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+# ---------------------------------------------------------------------------
+# F-01 / slice 1.3: X-Forwarded-Prefix is not consume authz
+# ---------------------------------------------------------------------------
+
+
+def test_bare_chat_with_forwarded_prefix_consumes_and_redirects(gated_app):
+    """Legitimate proxy shape: ASGI path /chat + X-Forwarded-Prefix: /hermes."""
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "pfx-hermes")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    r = phone.get(
+        f"/chat?handoff={ticket}",
+        headers={"X-Forwarded-Prefix": "/hermes"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    loc = r.headers.get("location", "")
+    assert loc.startswith("/hermes/chat?")
+    assert "resume=pfx-hermes" in loc
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+    # Single-use: replay with same prefix must not mint again.
+    phone2 = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone2.get(
+        f"/chat?handoff={ticket}",
+        headers={"X-Forwarded-Prefix": "/hermes"},
+        follow_redirects=False,
+    )
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone2)
+
+
+def test_nested_chat_with_matching_forwarded_prefix_does_not_consume(gated_app):
+    """F-01: /nested/chat + X-Forwarded-Prefix: /nested must not consume."""
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "pfx-nested")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone.get(
+        f"/nested/chat?handoff={ticket}",
+        headers={"X-Forwarded-Prefix": "/nested"},
+        follow_redirects=False,
+    )
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+
+    r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r2.status_code == 302
+    assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
+
+
+def test_api_config_chat_with_matching_forwarded_prefix_does_not_consume(gated_app):
+    """F-01: /api/config/chat + X-Forwarded-Prefix: /api/config must not consume."""
+    _complete_stub_login(gated_app)
+    ticket = _mint(gated_app, "pfx-api-config")
+
+    phone = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    phone.get(
+        f"/api/config/chat?handoff={ticket}",
+        headers={"X-Forwarded-Prefix": "/api/config"},
+        follow_redirects=False,
+    )
+    assert SESSION_AT_COOKIE not in _bare_cookie_names(phone)
+
+    r2 = phone.get(f"/chat?handoff={ticket}", follow_redirects=False)
+    assert r2.status_code == 302
     assert SESSION_AT_COOKIE in _bare_cookie_names(phone)
 
 

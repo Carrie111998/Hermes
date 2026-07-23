@@ -210,38 +210,34 @@ def scope_denial_detail(request: Request, sess: Any) -> str:
 
 
 def is_handoff_consume_request(request: Request) -> bool:
-    """True only for exact canonical GET ``/chat`` (plus validated prefix).
+    """True only for exact canonical GET ``/chat`` at the ASGI boundary.
 
-    F-02 / Oscar M2: no last-segment match. Reject trailing slash, nested
-    paths, API-shaped paths, doubled slashes, and non-canonical encodings.
-    Rejected attempts must not consume the ticket.
+    F-02 / Oscar M2 / F-01 (slice 1.3): no last-segment match and no
+    client-controlled ``X-Forwarded-Prefix`` in the authorisation decision.
+    Reject trailing slash, nested paths, API-shaped paths, doubled slashes,
+    and non-canonical encodings. Rejected attempts must not consume the
+    ticket.
+
+    After a successful consume, callers may still use a normalised prefix for
+    external redirect Location and cookie Path only.
     """
     if (request.method or "GET").upper() != "GET":
         return False
 
-    from hermes_cli.dashboard_auth.prefix import prefix_from_request
-
-    prefix = prefix_from_request(request) or ""
-    expected = f"{prefix}/chat" if prefix else "/chat"
-
     path = request.url.path or ""
-    if path != expected:
+    if path != "/chat":
         return False
 
     # ASGI raw_path is the on-the-wire bytes before decoding. When present,
-    # require the same exact canonical bytes so %2F / %63 tricks cannot mint.
+    # require exact b"/chat" so %2F / %63 / prefix tricks cannot mint.
     raw = request.scope.get("raw_path")
     if raw is not None:
-        try:
-            raw_s = (
-                raw.decode("ascii")
-                if isinstance(raw, (bytes, bytearray))
-                else str(raw)
-            )
-        except UnicodeDecodeError:
-            return False
-        if raw_s != expected:
-            return False
+        if isinstance(raw, (bytes, bytearray)):
+            if bytes(raw) != b"/chat":
+                return False
+        else:
+            if str(raw) != "/chat":
+                return False
     return True
 
 

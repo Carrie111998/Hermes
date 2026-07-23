@@ -603,7 +603,9 @@ def _handoff_consume_response(request: Request, handoff: str) -> Response | None
         consume_handoff_ticket,
     )
 
-    # F-03 / M2: do not consume outside exact GET /chat (ticket stays usable).
+    # F-03 / M2 / F-01: exact ASGI GET /chat only (no client prefix authz).
+    # Ticket stays usable on rejected placement. Prefix is used only below
+    # for redirect Location + cookie Path after a successful consume.
     if not is_handoff_consume_request(request):
         return None
 
