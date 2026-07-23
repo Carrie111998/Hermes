@@ -920,17 +920,13 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+clean\b.*--forc[a-z]*\b', "git clean with force long flag (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
-    # `git checkout -- <path>` treats every following argument as a pathspec
-    # and restores its working-tree content from the index, discarding
-    # unstaged changes. The required path token keeps a bare `git checkout --`
-    # (which errors without changing anything) out of the approval flow.
-    (r'\bgit\s+checkout\s+--\s+[^\s;|&]+', "git checkout -- (discards working-tree changes)"),
+
     # `git restore` defaults to restoring the working tree. A direct path,
     # including `.` for the whole tree, is therefore destructive; `--staged`
     # alone changes only the index and must remain safe. The worktree flags
     # explicitly select the destructive mode even when used with other flags.
     (r'\bgit\s+restore\b[^;|&\n]*(?:\s--worktree\b|\s-W\b)', "git restore working tree (discards uncommitted changes)"),
-    (r'\bgit\s+restore\b(?![^;|&\n]*\s--staged\b)[^;|&\n]*?\s(?!-)[^\s;|&]+', "git restore path (discards working-tree changes)"),
+    (r'\bgit\s+restore\b(?![^;|&\n]*\s(?:--staged|-S)\b)[^;|&\n]*?\s(?!-)[^\s;|&]+', "git restore path (discards working-tree changes)"),
     # `-D` is shorthand for `-d --force`; the long-flag spellings
     # (`--delete`, `--force`) are different tokens entirely, so they slip
     # past the `-D\b` pattern above even though `git branch -d --force`
@@ -951,13 +947,7 @@ DANGEROUS_PATTERNS = [
     # -- src/` both overwrite local modifications. Does NOT flag branch
     # switches like `git checkout main` (no `--` separator).
     (r'\bgit\s+checkout\b[^;|&\n]*\s--\s+\S', "git checkout -- <path> (discards uncommitted changes)"),
-    # git restore --worktree / -W discards uncommitted worktree changes.
-    # `git restore --worktree .` and `git restore -W file.txt` both overwrite.
-    # Also gate bare `git restore .` (implicit worktree restore), including a
-    # `--source` form which writes the named source into the worktree. Do NOT
-    # gate `git restore --staged .` which only unstages.
-    (r'\bgit\s+restore\b[^;|&\n]*(?:--worktree\b|-W\b)', "git restore --worktree (discards uncommitted changes)"),
-    (r'\bgit\s+restore\b(?![^;|&\n]*(?:--staged\b|-S\b))(?=[^;|&\n]*\s+(?!-)\S)', "git restore <path> (discards uncommitted changes)"),
+
     # git stash clear / drop destroy stashed work. `stash clear` removes ALL
     # stashes; `stash drop` removes a specific one (or the top if no index).
     (r'\bgit\s+stash\s+clear\b', "git stash clear (destroys all stashes)"),
