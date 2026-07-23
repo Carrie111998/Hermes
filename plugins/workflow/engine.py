@@ -492,12 +492,24 @@ class WorkflowEngine:
                 task_with_context += f"\n\nContext: {json.dumps(context)}"
 
         title = f"[{node.id}] {node.agent}: {node.task[:60]}"
+        # Resolve {context_var} placeholders in the agent field.
+        # This lets workflows accept agent profile names at runtime
+        # via context (e.g., agent: "{target_agent}").
+        assignee = node.agent
+        if assignee and "{" in assignee and context:
+            try:
+                assignee = assignee.format(**{
+                    k: v for k, v in context.items()
+                    if isinstance(v, (str, int, float))
+                })
+            except (KeyError, ValueError, TypeError):
+                pass
         cmd = [
             _hermes_binary(), "kanban", "create",
             title,
             "--tenant", self.kanban_board,
             "--body", task_with_context,
-            "--assignee", node.agent,
+            "--assignee", assignee,
             "--goal",
             "--priority", "2",
         ]
