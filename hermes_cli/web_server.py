@@ -1083,6 +1083,7 @@ class WhatsAppOnboardingStart(BaseModel):
     mode: Optional[str] = "bot"
     allowed_users: Optional[str] = ""
     profile: Optional[str] = None
+    replace_existing: bool = False
 
 
 class WhatsAppOnboardingApply(BaseModel):
@@ -8232,6 +8233,8 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             str(bridge_script),
             "--pair-only",
             "--pair-json",
+            "--pair-timeout-seconds",
+            str(_WHATSAPP_ONBOARDING_TTL_SECONDS),
             "--session",
             str(session_path),
         ],
@@ -8313,7 +8316,7 @@ def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
         record = _whatsapp_onboarding_sessions.get(pairing_id)
         if not record or record.proc is not proc:
             return
-        if record.status in {"connected", "cancelled", "expired"}:
+        if record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             return
         record.status = "error"
         record.error = (
@@ -8428,7 +8431,7 @@ async def start_whatsapp_onboarding(
         session_path = _whatsapp_session_path()
         expires_at_ts = time.time() + _WHATSAPP_ONBOARDING_TTL_SECONDS
         expires_at = _utc_iso_from_ts(expires_at_ts)
-        if (session_path / "creds.json").exists():
+        if (session_path / "creds.json").exists() and not body.replace_existing:
             pairing_id = secrets.token_urlsafe(16)
             account_id, account_name, account_phone = _whatsapp_linked_account_from_session(session_path)
             record = _WhatsAppOnboardingSession(
@@ -8449,6 +8452,28 @@ async def start_whatsapp_onboarding(
                 _supersede_whatsapp_onboarding_sessions(session_path)
                 _whatsapp_onboarding_sessions[pairing_id] = record
             return _whatsapp_onboarding_payload(pairing_id, record)
+
+        # Stop any older pair-only process before quiescing the gateway or
+        # deleting credentials. Two pairers are just as unsafe as a pairer and
+        # gateway sharing the Baileys session.
+        with _whatsapp_onboarding_lock:
+            _prune_whatsapp_onboarding_sessions()
+            _supersede_whatsapp_onboarding_sessions(session_path)
+
+        # Pairing must have exclusive ownership of the Baileys session.  Keep
+        # the gateway alive for other platforms, but restart it with WhatsApp
+        # disabled before clearing credentials or launching pair-only.
+        from hermes_cli.whatsapp_setup import prepare_whatsapp_pairing
+
+        try:
+            prepare_whatsapp_pairing()
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Could not quiesce WhatsApp before pairing: {exc}",
+            ) from exc
+        shutil.rmtree(session_path, ignore_errors=True)
+        session_path.mkdir(parents=True, exist_ok=True)
 
     pairing_id = secrets.token_urlsafe(16)
     record = _WhatsAppOnboardingSession(
@@ -8521,8 +8546,9 @@ async def apply_whatsapp_onboarding(
                 save_env_value("WHATSAPP_ALLOWED_USERS", allowed_users)
             # Blank means "keep the existing allowlist"; explicit clearing
             # still lives in the normal config editor where the field is visible.
-            save_env_value("WHATSAPP_ENABLED", "true")
-            _write_platform_enabled("whatsapp", True)
+            from hermes_cli.whatsapp_setup import persist_whatsapp_enabled
+
+            persist_whatsapp_enabled(True)
     except HTTPException:
         raise
     except ValueError as exc:

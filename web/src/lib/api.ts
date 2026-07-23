@@ -868,6 +868,7 @@ export const api = {
   startWhatsAppOnboarding: (body: {
     mode?: "bot" | "self-chat";
     allowed_users?: string;
+    replace_existing?: boolean;
   }) =>
     fetchJSON<WhatsAppOnboardingStartResponse>(
       "/api/messaging/whatsapp/onboarding/start",

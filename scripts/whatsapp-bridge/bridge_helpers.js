@@ -13,6 +13,11 @@ export const MIME_MAP = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 
+export function resolvePairTimeoutSeconds(rawValue, fallbackSeconds = 600) {
+  const parsed = Number(String(rawValue ?? '').trim());
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallbackSeconds;
+}
+
 export function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');

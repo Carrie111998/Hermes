@@ -21,7 +21,17 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolvePairTimeoutSeconds,
 } from './bridge_helpers.js';
+
+// -- bounded pairing lifecycle -------------------------------------------
+{
+  assert.equal(resolvePairTimeoutSeconds('15'), 15);
+  assert.equal(resolvePairTimeoutSeconds('0'), 600);
+  assert.equal(resolvePairTimeoutSeconds('not-a-number'), 600);
+  assert.equal(resolvePairTimeoutSeconds('15seconds'), 600);
+  console.log('  ✓ pair-only timeout parsing is bounded and deterministic');
+}
 
 // -- quoted outbound text -------------------------------------------------
 {

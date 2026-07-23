@@ -84,12 +84,8 @@ def test_aborted_setup_does_not_enable_whatsapp(isolated_home, monkeypatch):
     )
 
 
-def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatch):
-    """User runs ``hermes whatsapp`` with an existing paired session and
-    chooses "no, keep my session" at the re-pair prompt.  The env var
-    should be (re-)written to true so the gateway picks WhatsApp back up,
-    even if the var was lost since the original pairing.
-    """
+def test_existing_pairing_skip_branch_does_not_claim_or_enable(isolated_home, monkeypatch):
+    """A retained creds file is not proof that WhatsApp accepts the session."""
     from hermes_cli.main import cmd_whatsapp
 
     # Pre-create a paired session WITHOUT WHATSAPP_ENABLED in .env.
@@ -136,8 +132,8 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
     with redirect_stdout(buf):
         cmd_whatsapp(MagicMock())
 
-    # The skip-rebar branch should have set the env var on its way out.
-    assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+    assert _env_value(isolated_home, "WHATSAPP_ENABLED") is None
+    assert "not re-verified" in buf.getvalue()
 
 
 def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monkeypatch):
@@ -176,3 +172,41 @@ def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monke
 
     assert paired_session == isolated_home / "platforms" / "whatsapp" / "session"
     assert not (isolated_home / "whatsapp" / "session").exists()
+    assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+
+
+def test_failed_pairing_forces_whatsapp_disabled(isolated_home, monkeypatch):
+    """A failed pair-only process must not preserve stale enabled state."""
+    from hermes_cli.main import cmd_whatsapp
+
+    (isolated_home / ".env").write_text(
+        "WHATSAPP_MODE=bot\n"
+        "WHATSAPP_ALLOWED_USERS=15551234567\n"
+        "WHATSAPP_ENABLED=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+
+    original_exists = Path.exists
+
+    def stub_exists(self):
+        if self.name == "node_modules":
+            return True
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", stub_exists)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_a, **_kw: MagicMock(returncode=64, stderr=""),
+    )
+
+    with redirect_stdout(io.StringIO()):
+        cmd_whatsapp(MagicMock())
+
+    assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "false"
+    config_text = (isolated_home / "config.yaml").read_text(encoding="utf-8")
+    assert "whatsapp:" in config_text
+    assert "enabled: false" in config_text

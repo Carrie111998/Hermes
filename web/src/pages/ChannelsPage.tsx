@@ -757,6 +757,9 @@ function WhatsAppOnboardingPanel({
       const res = await api.startWhatsAppOnboarding({
         mode,
         allowed_users: allowedUsers,
+        // This control explicitly starts a new QR link. Never let a stale
+        // creds.json masquerade as a connected WhatsApp session.
+        replace_existing: true,
       });
       setSetup(res);
       if (res.qr_payload) {
