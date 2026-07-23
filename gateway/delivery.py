@@ -457,6 +457,30 @@ class DeliveryRouter:
             return env.strip().lower() in ("1", "true", "yes", "on")
         return bool(getattr(self.config, "filter_silence_narration", True))
 
+    async def _apply_delivery_guards(
+        self, target: "DeliveryTarget", content: str
+    ) -> Optional[str]:
+        """Run the outbound content through the shared output-guard pipeline.
+
+        Returns the (possibly rewritten) content, or ``None`` if a guard
+        dropped the message. Falls back to the legacy silence-only check if
+        the pipeline can't be imported, so delivery never breaks on a bad
+        import.
+        """
+        try:
+            from gateway.output_guards import apply_output_guards, GuardContext
+            ctx = GuardContext(
+                platform=target.platform.value,
+                chat_id=target.chat_id,
+                is_final_response=False,
+            )
+            return await apply_output_guards(content, ctx)
+        except Exception:
+            logger.debug("output-guard pipeline failed in delivery; using legacy check", exc_info=True)
+            if _is_silence_narration(content):
+                return None
+            return content
+
     async def _deliver_to_platform(
         self,
         target: DeliveryTarget,
@@ -522,26 +546,41 @@ class DeliveryRouter:
                 )
                 content = content[:visible] + footer
         
-        # Substrate-level anti-loop guard: drop hallucinated "silence narration"
-        # (*(silent)*, 🔇, a bare ".", etc.) before it ever reaches the adapter.
-        # In bot-to-bot channels these tokens mirror back and forth until a
-        # model crashes with "no content after all retries". Behavioral prompt
-        # rules drift across providers; this single chokepoint covers every
-        # platform adapter regardless of which persona's prompt failed.
-        # Local/file delivery (_deliver_local) is a separate path and is never
+        # Substrate-level outbound guard pipeline. Historically this chokepoint
+        # only dropped hallucinated "silence narration" (*(silent)*, 🔇, a bare
+        # "."). It now threads cron output through the composable guard chain
+        # (gateway.output_guards) so secret redaction, provider-error rewriting,
+        # opt-in em-dash stripping, and opt-in link verification all apply to
+        # scheduled deliveries too — the same rules the agent's live replies
+        # get. The silence drop is one guard in that chain. The legacy
+        # single-check path is kept as a fallback so a pipeline import/runtime
+        # error can never block a delivery. Local/file delivery
+        # (_deliver_local) is a separate path and is intentionally never
         # filtered — saved silence has no loop risk.
-        if self._filter_silence_narration_enabled() and _is_silence_narration(content):
-            logger.warning(
-                "Dropped silence-narration outbound to %s (chat=%s): %r",
-                target.platform.value,
-                target.chat_id,
-                content[:40],
-            )
-            return {
-                "success": True,
-                "filtered": "silence_narration",
-                "delivered": False,
-            }
+        if self._filter_silence_narration_enabled():
+            guarded = await self._apply_delivery_guards(target, content)
+            if guarded is None:
+                # Preserve the specific "silence_narration" telemetry label
+                # when that was the cause (backward-compatible contract);
+                # other guard drops report the generic "output_guard".
+                filtered_reason = (
+                    "silence_narration"
+                    if _is_silence_narration(content)
+                    else "output_guard"
+                )
+                logger.warning(
+                    "Dropped outbound to %s (chat=%s) by output guard [%s]: %r",
+                    target.platform.value,
+                    target.chat_id,
+                    filtered_reason,
+                    content[:40],
+                )
+                return {
+                    "success": True,
+                    "filtered": filtered_reason,
+                    "delivered": False,
+                }
+            content = guarded
 
         send_metadata = dict(metadata or {})
         if transport.is_relay:

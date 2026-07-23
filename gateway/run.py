@@ -543,6 +543,19 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     bodies, request IDs, leaked credentials, or policy text. Only programmatic
     surfaces in ``_GATEWAY_RAW_TEXT_PLATFORMS`` (CLI/TUI ``local`` diagnostics,
     API JSON, webhook payloads) keep the raw text unchanged.
+
+    The sanitizing itself runs through the composable output-guard pipeline
+    (``gateway.output_guards``), which reproduces this behaviour as ordered
+    guards (secret redaction, then provider-error rewriting) and lets opt-in
+    guards (em-dash stripping, link verification) drop in via
+    ``gateway.guards.*`` config without touching this call site.
+
+    Only the synchronous guards run here (this helper is called from both sync
+    and async contexts); async guards such as link verification are applied on
+    the delivery path. A pipeline "drop" is rare for a final response, so we
+    fall back to the original text rather than sending an empty reply, and any
+    pipeline failure falls back to the inline legacy path so a bug in the guard
+    layer can never mute the agent.
     """
     if not text:
         return text
@@ -554,10 +567,20 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 
-    redacted = _redact_gateway_user_facing_secrets(str(text))
-    if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
-    return redacted
+    try:
+        from gateway.output_guards import apply_output_guards_sync, GuardContext
+        ctx = GuardContext(
+            platform=_gateway_platform_value(platform),
+            is_final_response=True,
+        )
+        result = apply_output_guards_sync(str(text), ctx)
+        return result if result is not None else text
+    except Exception:
+        logger.debug("output-guard pipeline failed; using legacy sanitize", exc_info=True)
+        redacted = _redact_gateway_user_facing_secrets(str(text))
+        if _looks_like_gateway_provider_error(redacted):
+            return _gateway_provider_error_reply(redacted)
+        return redacted
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -22127,6 +22150,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # tool_progress mode. Mattermost needs an explicit per-platform
             # opt-in so global scratch-text display does not leak into threads.
             agent.thinking_progress = _thinking_enabled
+
+            def _suggest_actions_callback_sync(message: str, actions) -> dict:
+                """Non-blocking: register the action set, render buttons, return.
+
+                Mirrors ``_clarify_callback_sync`` for the wiring (schedules the
+                adapter send on the event loop) but does NOT wait for a
+                response — the agent's turn ends after this. A later tap is
+                handled by the adapter's ``sa:`` callback, which injects a
+                fresh user turn.
+                """
+                from tools import suggested_actions_gateway as _sa_mod
+                import uuid as _uuid
+
+                if not _status_adapter:
+                    return {"delivered": False}
+
+                # Adapters without a native buttons UI still get a text
+                # fallback via the base send_suggested_actions default.
+                sender = getattr(_status_adapter, "send_suggested_actions", None)
+                if not callable(sender):
+                    return {"delivered": False, "reason": "adapter has no send_suggested_actions"}
+
+                set_id = _uuid.uuid4().hex[:10]
+                _sa_mod.register(
+                    set_id=set_id,
+                    session_key=session_key or "",
+                    message=message,
+                    actions=list(actions) if actions else [],
+                )
+
+                fut = safe_schedule_threadsafe(
+                    sender(
+                        chat_id=_status_chat_id,
+                        message=message,
+                        actions=list(actions) if actions else [],
+                        set_id=set_id,
+                        session_key=session_key or "",
+                        metadata=_status_thread_metadata,
+                    ),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="Suggested-actions send failed to schedule",
+                )
+                if fut is None:
+                    _sa_mod.clear_session(session_key or "")
+                    return {"delivered": False}
+                try:
+                    result = fut.result(timeout=15)
+                    delivered = bool(getattr(result, "success", False))
+                except Exception as exc:
+                    logger.warning("Suggested-actions send failed: %s", exc)
+                    delivered = False
+                if not delivered:
+                    _sa_mod.clear_session(session_key or "")
+                return {"delivered": delivered}
+
+            agent.suggest_actions_callback = _suggest_actions_callback_sync
+
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
@@ -22490,6 +22571,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     from tools.clarify_gateway import clear_session as _clear_clarify_session
                     _clear_clarify_session(_approval_session_key)
+                except Exception:
+                    pass
+                # Suggested-action sets are non-blocking (no threads hang on
+                # them) but should still be reclaimed at run end so they don't
+                # accumulate across sessions. Idempotent.
+                try:
+                    from tools.suggested_actions_gateway import clear_session as _clear_sa_session
+                    _clear_sa_session(_approval_session_key)
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
