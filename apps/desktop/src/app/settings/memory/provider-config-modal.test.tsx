@@ -3,6 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MemoryProviderConfig, MemoryProviderField } from '@/types/hermes'
 
+// Imported statically, not lazily inside renderModal(): vi.mock is hoisted
+// above imports either way, but a dynamic import inside the test body bills the
+// whole module graph's transform cost to whichever test runs first. Under
+// full-suite parallelism that is enough to time the first test out while every
+// later test in the file reuses the warm cache and passes.
+import { ProviderConfigModal } from './provider-config-modal'
+
 const saveMemoryProviderConfig = vi.fn()
 
 vi.mock('@/hermes', () => ({
@@ -66,7 +73,6 @@ afterEach(() => {
 })
 
 async function renderModal(open = true) {
-  const { ProviderConfigModal } = await import('./provider-config-modal')
   const onOpenChange = vi.fn()
   const onSaved = vi.fn().mockResolvedValue(undefined)
 

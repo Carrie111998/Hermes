@@ -7,6 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ToolsetConfig } from '@/types/hermes'
 
+// Imported statically, not lazily inside each test: vi.mock is hoisted above
+// imports either way, but a dynamic import inside the test body bills the whole
+// module graph's transform cost to whichever test runs first. Under full-suite
+// parallelism that is enough to time the first test out while every later test
+// in the file reuses the warm cache and passes.
+import { ToolsetConfigPanel } from './toolset-config-panel'
+
 // EnvVarField navigates to Settings → Keys via useNavigate, so every render
 // needs a router context. The navigate spy asserts the deep-link target.
 const navigateSpy = vi.fn()
@@ -168,7 +175,6 @@ describe('ToolsetConfigPanel', () => {
       })
     )
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     expect(await screen.findByText('OpenAI TTS Model')).toBeTruthy()
@@ -184,7 +190,6 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('renders no inline voice fields for rows without tts_provider (older backend)', async () => {
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     await screen.findByText('Microsoft Edge TTS')
@@ -193,7 +198,6 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('lists providers from the config endpoint', async () => {
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     expect(await screen.findByText('Microsoft Edge TTS')).toBeTruthy()
@@ -202,7 +206,6 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('selects a provider when clicked', async () => {
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     const elevenlabs = await screen.findByRole('button', { name: /ElevenLabs/ })
@@ -242,7 +245,6 @@ describe('ToolsetConfigPanel', () => {
       default: 'z-image-turbo'
     })
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="image_gen" />)
 
     // Both catalog rows render with their picker metadata.
@@ -256,7 +258,6 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('does not fetch model catalogs for toolsets without them', async () => {
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     await screen.findByText('Microsoft Edge TTS')
@@ -264,7 +265,6 @@ describe('ToolsetConfigPanel', () => {
   })
 
   it('saves an API key for a provider env var', async () => {
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     // Select the keyed provider so its env vars render.
@@ -323,7 +323,6 @@ describe('ToolsetConfigPanel', () => {
       })
     )
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
     // The active provider's env-var field only renders when it's the expanded
@@ -370,7 +369,6 @@ describe('ToolsetConfigPanel', () => {
         running: false
       })
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
     fireEvent.click(await screen.findByRole('button', { name: /Run setup/ }))
@@ -404,7 +402,6 @@ describe('ToolsetConfigPanel', () => {
     // Spawn failed server-side — must NOT proceed to poll a non-existent action.
     runToolsetPostSetup.mockResolvedValue({ ok: false, pid: 0, name: 'tools-post-setup' })
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
     fireEvent.click(await screen.findByRole('button', { name: /Run setup/ }))
@@ -443,7 +440,6 @@ describe('ToolsetConfigPanel', () => {
       running: false
     })
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
     fireEvent.click(await screen.findByRole('button', { name: /Run setup/ }))
@@ -481,7 +477,6 @@ describe('ToolsetConfigPanel', () => {
       })
     )
 
-    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
     // Installed confirmation replaces the contradictory install prompt…
@@ -535,7 +530,6 @@ describe('ToolsetConfigPanel', () => {
         })
       )
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       await screen.findByText('Microsoft Edge TTS')
@@ -571,7 +565,6 @@ describe('ToolsetConfigPanel', () => {
         })
       )
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       await screen.findByText('ElevenLabs')
@@ -585,7 +578,6 @@ describe('ToolsetConfigPanel', () => {
       // Older backend (no `status` field): keyless rows keep the legacy
       // Ready pill, keyed-and-unset rows keep no pill. Narrow compat path —
       // desktop and backend update on separate clocks.
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       await screen.findByText('Microsoft Edge TTS')
@@ -622,7 +614,6 @@ describe('ToolsetConfigPanel', () => {
         })
       )
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       expect(await screen.findByText('ELEVENLABS_API_KEY')).toBeTruthy()
@@ -665,7 +656,6 @@ describe('ToolsetConfigPanel', () => {
         })
       )
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       await screen.findByText('Local Browser')
@@ -702,7 +692,6 @@ describe('ToolsetConfigPanel', () => {
         running: false
       })
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       fireEvent.click(await screen.findByRole('button', { name: /Re-run setup/ }))
@@ -730,7 +719,6 @@ describe('ToolsetConfigPanel', () => {
         })
       )
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       await screen.findByText('Local Browser')
@@ -778,7 +766,6 @@ describe('ToolsetConfigPanel', () => {
         feature: 'browser'
       })
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       fireEvent.click(await screen.findByRole('button', { name: /Nous Subscription/ }))
@@ -821,7 +808,6 @@ describe('ToolsetConfigPanel', () => {
       const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
 
       try {
-        const { ToolsetConfigPanel } = await import('./toolset-config-panel')
         render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
         fireEvent.click(await screen.findByRole('button', { name: /Nous Subscription/ }))
@@ -863,7 +849,6 @@ describe('ToolsetConfigPanel', () => {
         provider: 'Nous Subscription (Browser Use cloud)'
       })
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="browser" />)
 
       fireEvent.click(await screen.findByRole('button', { name: /Nous Subscription/ }))
@@ -901,7 +886,6 @@ describe('ToolsetConfigPanel', () => {
         })
       )
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       const trigger = await screen.findByRole('button', { name: /Actions for ELEVENLABS_API_KEY/ })
@@ -914,7 +898,6 @@ describe('ToolsetConfigPanel', () => {
     it('hides "Manage in API Keys" while the key is unset', async () => {
       // Default config(): ElevenLabs key is not set. An unset key is managed
       // right here via Set — no point bouncing the user to another page.
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       // Expand the keyed provider so its env row renders.
@@ -968,7 +951,6 @@ describe('ToolsetConfigPanel', () => {
     it('shows the resolved per-capability backends as badges', async () => {
       getToolsetConfig.mockResolvedValue(webConfig())
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="web" />)
 
       expect(await screen.findByText('Search: searxng')).toBeTruthy()
@@ -982,7 +964,6 @@ describe('ToolsetConfigPanel', () => {
       getToolsetConfig.mockResolvedValue(webConfig())
       selectToolsetProvider.mockResolvedValue({ ok: true, name: 'web', provider: 'SearXNG', capability: 'search' })
 
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="web" />)
 
       // Active/expanded provider is search-only SearXNG.
@@ -1001,7 +982,6 @@ describe('ToolsetConfigPanel', () => {
     })
 
     it('does not render capability chrome for non-web toolsets', async () => {
-      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
       render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
 
       await screen.findByText('Microsoft Edge TTS')

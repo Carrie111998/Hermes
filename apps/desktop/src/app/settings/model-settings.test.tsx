@@ -3,6 +3,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+// Imported statically, not lazily inside renderModelSettings(): vi.mock is
+// hoisted above imports either way, but a dynamic import inside the test body
+// bills the whole module graph's transform cost to whichever test runs first.
+// Under full-suite parallelism that is enough to time the first test out while
+// every later test in the file reuses the warm cache and passes.
+import { ModelSettings } from './model-settings'
+
 // Radix Select calls scrollIntoView on its items when the content opens; jsdom
 // doesn't implement it (nor hasPointerCapture / releasePointerCapture), so stub
 // them to let the dropdown open in tests.
@@ -85,7 +92,6 @@ afterEach(() => {
 })
 
 async function renderModelSettings() {
-  const { ModelSettings } = await import('./model-settings')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   return render(

@@ -2,6 +2,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+// Imported statically, not lazily inside the render helpers: vi.mock is hoisted
+// above imports either way, but a dynamic import inside the test body bills the
+// whole module graph's transform cost to whichever test runs first. Under
+// full-suite parallelism that is enough to time the first test out while every
+// later test in the file reuses the warm cache and passes.
+import { FallbackModelsField } from './fallback-models-field'
+
 // Radix Select calls scrollIntoView / pointer-capture APIs jsdom lacks.
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
@@ -31,7 +38,6 @@ afterEach(() => {
 })
 
 async function renderField(value: unknown, onChange = vi.fn()) {
-  const { FallbackModelsField } = await import('./fallback-models-field')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   render(
@@ -44,7 +50,6 @@ async function renderField(value: unknown, onChange = vi.fn()) {
 }
 
 async function renderFieldWithRerender(value: unknown, onChange = vi.fn()) {
-  const { FallbackModelsField } = await import('./fallback-models-field')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   const view = render(

@@ -3,6 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MemoryProviderConfig } from '@/types/hermes'
 
+// Imported statically, not lazily inside renderPanel(): vi.mock is hoisted
+// above imports either way, but a dynamic import inside the test body bills the
+// whole module graph's transform cost to whichever test runs first. Under
+// full-suite parallelism that is enough to time the first test out while every
+// later test in the file reuses the warm cache and passes.
+import { ProviderConfigPanel } from './provider-config-panel'
+
 const getMemoryProviderConfig = vi.fn()
 const saveMemoryProviderConfig = vi.fn()
 
@@ -109,7 +116,6 @@ afterEach(() => {
 })
 
 async function renderPanel(provider = 'honcho') {
-  const { ProviderConfigPanel } = await import('./provider-config-panel')
 
   return render(<ProviderConfigPanel provider={provider} />)
 }

@@ -1,15 +1,31 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
+
+// Imported statically, not lazily inside renderProvidersSettings()/the tests:
+// vi.mock is hoisted above imports either way, but a dynamic import inside the
+// test body bills the whole module graph's transform cost to whichever test
+// runs first. Under full-suite parallelism that is enough to time the first
+// test out while every later test in the file reuses the warm cache and passes.
+import { ProvidersSettings } from './providers-settings'
 
 const listOAuthProviders = vi.fn()
 const disconnectOAuthProvider = vi.fn()
 const getEnvVars = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
-const onboarding = atom({ manual: false })
+
+// The onboarding mock hands back the atom itself rather than a function that
+// closes over it, so the factory reads `onboarding` the moment it runs — and
+// vi.mock factories are hoisted above the static ProvidersSettings import,
+// which is what pulls @/store/onboarding. A plain `const` here is still in its
+// TDZ at that point; vi.hoisted is the only scope that runs early enough.
+const { onboarding } = await vi.hoisted(async () => {
+  const { atom } = await import('nanostores')
+
+  return { onboarding: atom({ manual: false }) }
+})
 
 vi.mock('@/hermes', () => ({
   disconnectOAuthProvider: (providerId: string) => disconnectOAuthProvider(providerId),
@@ -74,7 +90,6 @@ afterEach(() => {
 })
 
 async function renderProvidersSettings() {
-  const { ProvidersSettings } = await import('./providers-settings')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="accounts" />)
@@ -141,7 +156,6 @@ describe('ProvidersSettings', () => {
     })
     listOAuthProviders.mockResolvedValue({ providers: [] })
 
-    const { ProvidersSettings } = await import('./providers-settings')
     await act(async () => {
       render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="keys" />)
     })
@@ -160,7 +174,6 @@ describe('ProvidersSettings', () => {
     })
     listOAuthProviders.mockResolvedValue({ providers: [] })
 
-    const { ProvidersSettings } = await import('./providers-settings')
     render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="keys" />)
 
     // Equal priority → alphabetical tiebreak: Acme, Middle, Zebra.
@@ -193,7 +206,6 @@ describe('ProvidersSettings', () => {
     getEnvVars.mockResolvedValue({})
     listOAuthProviders.mockResolvedValue({ providers: [] })
 
-    const { ProvidersSettings } = await import('./providers-settings')
     render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="keys" />)
 
     const row = await screen.findByText('Local / custom endpoint')
