@@ -603,11 +603,12 @@ class WorkflowEngine:
                 }
         except Exception as _exc:
             logger.debug("ContextVars session lookup failed: %s", _exc)
-        # 2. Check module-level bridge (written by tool handler)
+        # 2. Check temp file written by tool handler
         try:
-            from plugins.workflow.tools import _get_captured_session
-            info = _get_captured_session()
-            if info:
+            import json as _json
+            with open("/tmp/wfe-session.json") as _f:
+                info = _json.load(_f)
+            if info and info.get("platform"):
                 return info
         except Exception:
             pass
