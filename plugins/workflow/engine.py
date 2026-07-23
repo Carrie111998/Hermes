@@ -34,9 +34,12 @@ import subprocess
 import sys
 import os
 import re
+import logging
 from pathlib import Path
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+
+logger = logging.getLogger("plugins.workflow.engine")
 from typing import Optional
 
 
@@ -509,8 +512,8 @@ class WorkflowEngine:
         from hermes_cli import kanban_db as kb
         conn = kb.connect(board=self.kanban_board)
         try:
-            import sys as _sys
-            print(f"   🔧 create_kanban_card: board={self.kanban_board}, title={title[:50]}, assignee={assignee}", file=_sys.stderr)
+            logger.debug("create_kanban_card: board=%s, title=%s, assignee=%s",
+                         self.kanban_board, title[:50], assignee)
             new_tid = kb.create_task(
                 conn,
                 title=title,
