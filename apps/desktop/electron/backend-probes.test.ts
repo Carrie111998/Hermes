@@ -26,8 +26,14 @@ function scriptedExec(failures) {
       const err: Error & { code?: string; status?: number } = new Error(
         failure.message || failure.code || 'probe failure'
       )
-      if (failure.code) err.code = failure.code
-      if (failure.status != null) err.status = failure.status
+      if (failure.code) {
+        err.code = failure.code
+      }
+
+      if (failure.status != null) {
+        err.status = failure.status
+      }
+
       throw err
     }
   }

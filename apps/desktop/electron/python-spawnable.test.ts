@@ -36,7 +36,10 @@ function fakeFs(table) {
       if (!entry || !entry.lstat) {
         throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' })
       }
-      if (entry.lstat instanceof Error) throw entry.lstat
+      if (entry.lstat instanceof Error) {
+        throw entry.lstat
+      }
+
       return entry.lstat
     },
     statSync(p) {
@@ -44,7 +47,10 @@ function fakeFs(table) {
       if (!entry || !entry.stat) {
         throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' })
       }
-      if (entry.stat instanceof Error) throw entry.stat
+      if (entry.stat instanceof Error) {
+        throw entry.stat
+      }
+
       return entry.stat
     }
   }
