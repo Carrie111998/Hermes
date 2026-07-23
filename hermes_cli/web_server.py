@@ -8066,6 +8066,7 @@ def _write_platform_enabled(platform_id: str, enabled: bool) -> None:
 
 
 _WHATSAPP_ONBOARDING_TTL_SECONDS = 600
+_WHATSAPP_PAIRING_TIMEOUT_SECONDS = _WHATSAPP_ONBOARDING_TTL_SECONDS - 30
 _WHATSAPP_ONBOARDING_TERMINAL_STATUSES = {"connected", "error", "expired", "cancelled"}
 
 
@@ -8234,7 +8235,7 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             "--pair-only",
             "--pair-json",
             "--pair-timeout-seconds",
-            str(_WHATSAPP_ONBOARDING_TTL_SECONDS),
+            str(_WHATSAPP_PAIRING_TIMEOUT_SECONDS),
             "--session",
             str(session_path),
         ],
@@ -8371,10 +8372,17 @@ def _prepare_and_run_whatsapp_pairing(
         record.status = "preparing"
 
     try:
-        with _config_profile_scope(profile):
-            from hermes_cli.whatsapp_setup import prepare_whatsapp_pairing
+        from hermes_cli.whatsapp_setup import (
+            prepare_whatsapp_pairing,
+            resolve_whatsapp_gateway_profile,
+        )
 
-            prepare_whatsapp_pairing(profile=profile)
+        gateway_profile = resolve_whatsapp_gateway_profile(profile)
+        with _config_profile_scope(profile):
+            prepare_whatsapp_pairing(
+                profile=profile,
+                gateway_profile=gateway_profile,
+            )
             with _whatsapp_onboarding_lock:
                 record = _whatsapp_onboarding_sessions.get(pairing_id)
                 if (

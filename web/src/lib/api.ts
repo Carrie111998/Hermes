@@ -1900,6 +1900,7 @@ export interface TelegramOnboardingApplyResponse {
 export interface WhatsAppOnboardingStartResponse {
   pairing_id: string;
   status:
+    | "preparing"
     | "starting"
     | "installing"
     | "waiting"

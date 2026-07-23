@@ -431,6 +431,11 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
     monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
     monkeypatch.setattr(
         whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda profile: "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
         "prepare_whatsapp_pairing",
         lambda **kwargs: events.append(("quiesced", kwargs, creds.exists())),
     )
@@ -461,7 +466,11 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
 
     assert events == [
         ("profile", "work"),
-        ("quiesced", {"profile": "work"}, True),
+        (
+            "quiesced",
+            {"profile": "work", "gateway_profile": "default"},
+            True,
+        ),
         ("paired", "pairing", session_dir, "bot", False),
     ]
     assert record.status == "preparing"
@@ -498,7 +507,7 @@ def test_spawn_whatsapp_pairing_process_uses_json_mode(monkeypatch, tmp_path):
     assert "--pair-json" in captured["args"]
     assert "--pair-timeout-seconds" in captured["args"]
     timeout_index = captured["args"].index("--pair-timeout-seconds")
-    assert captured["args"][timeout_index + 1] == "600"
+    assert captured["args"][timeout_index + 1] == "570"
     assert str(session_dir) in captured["args"]
     assert captured["kwargs"]["env"]["WHATSAPP_MODE"] == "bot"
     assert captured["kwargs"]["env"]["WHATSAPP_DM_POLICY"] == "pairing"

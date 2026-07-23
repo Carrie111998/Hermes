@@ -12,6 +12,21 @@ def test_persist_whatsapp_enabled_updates_env_and_yaml(monkeypatch):
         "write_platform_config_field",
         lambda platform, field, value: writes.append(("yaml", platform, field, value)),
     )
+    monkeypatch.setattr(
+        config,
+        "load_env",
+        lambda: {"WHATSAPP_ENABLED": "false"},
+    )
+    monkeypatch.setattr(
+        config,
+        "read_raw_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": False}}},
+    )
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": False}}},
+    )
 
     setup.persist_whatsapp_enabled(False)
 
@@ -19,6 +34,46 @@ def test_persist_whatsapp_enabled_updates_env_and_yaml(monkeypatch):
         ("env", "WHATSAPP_ENABLED", "false"),
         ("yaml", "whatsapp", "enabled", False),
     ]
+
+
+def test_persist_whatsapp_enabled_refuses_unapplied_managed_write(monkeypatch):
+    from hermes_cli import config
+    from hermes_cli import managed_scope
+    from hermes_cli import whatsapp_setup as setup
+
+    monkeypatch.setattr(config, "save_env_value", lambda key, value: None)
+    monkeypatch.setattr(
+        config,
+        "write_platform_config_field",
+        lambda platform, field, value: None,
+    )
+    monkeypatch.setattr(
+        config,
+        "load_env",
+        lambda: {"WHATSAPP_ENABLED": "false"},
+    )
+    monkeypatch.setattr(
+        config,
+        "read_raw_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": False}}},
+    )
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        managed_scope,
+        "load_managed_env",
+        lambda: {"WHATSAPP_ENABLED": "true"},
+    )
+
+    try:
+        setup.persist_whatsapp_enabled(False)
+    except RuntimeError as exc:
+        assert "pairing was stopped before touching the session" in str(exc)
+    else:
+        raise AssertionError("expected managed write refusal")
 
 
 def test_prepare_disables_before_gateway_restart(monkeypatch):
@@ -34,6 +89,121 @@ def test_prepare_disables_before_gateway_restart(monkeypatch):
 
     assert setup.prepare_whatsapp_pairing() is True
     assert events == [("enabled", False), ("restart", {"profile": None})]
+
+
+def test_prepare_system_gateway_preflight_runs_before_disable(monkeypatch):
+    from hermes_cli import whatsapp_setup as setup
+
+    events = []
+    monkeypatch.setattr(
+        setup,
+        "_preflight_gateway_restart",
+        lambda profile: (_ for _ in ()).throw(RuntimeError("requires root")),
+    )
+    monkeypatch.setattr(
+        setup,
+        "persist_whatsapp_enabled",
+        lambda enabled: events.append(("enabled", enabled)),
+    )
+
+    try:
+        setup.prepare_whatsapp_pairing(profile="default")
+    except RuntimeError as exc:
+        assert "requires root" in str(exc)
+    else:
+        raise AssertionError("expected system-service preflight failure")
+    assert events == []
+
+
+def test_system_service_without_root_is_rejected_before_config_write(
+    monkeypatch,
+):
+    from gateway import status
+    from hermes_cli import whatsapp_setup as setup
+
+    monkeypatch.setattr(setup.sys, "platform", "linux")
+    monkeypatch.setattr(status, "get_running_pid", lambda path=None: None)
+    monkeypatch.setattr(setup, "_active_system_gateway_pid", lambda: 123)
+    monkeypatch.setattr(setup.os, "geteuid", lambda: 501)
+    writes = []
+    monkeypatch.setattr(
+        setup,
+        "persist_whatsapp_enabled",
+        lambda enabled: writes.append(enabled),
+    )
+
+    try:
+        setup.prepare_whatsapp_pairing(profile="default")
+    except RuntimeError as exc:
+        assert "sudo hermes gateway stop --system" in str(exc)
+    else:
+        raise AssertionError("expected system-scope authority failure")
+    assert writes == []
+
+
+def test_root_system_service_restart_uses_system_scope(monkeypatch):
+    from gateway import status
+    from hermes_cli import whatsapp_setup as setup
+
+    captured = {}
+    monkeypatch.setattr(status, "get_running_pid", lambda path=None: 123)
+    monkeypatch.setattr(
+        setup,
+        "_raise_if_system_gateway_requires_root",
+        lambda old_pid: 123,
+    )
+    monkeypatch.setattr(setup, "_active_system_gateway_pid", lambda: 456)
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        return FakeProc()
+
+    monkeypatch.setattr(setup.subprocess, "Popen", fake_popen)
+
+    assert setup.restart_gateway_if_running(profile="default") is True
+    assert captured["args"][-3:] == ["gateway", "restart", "--system"]
+
+
+def test_default_profile_restart_command_is_explicit():
+    from hermes_cli import whatsapp_setup as setup
+
+    assert setup._gateway_restart_command("default") == [
+        setup.sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "-p",
+        "default",
+        "gateway",
+        "restart",
+    ]
+
+
+def test_multiplexed_secondary_profile_resolves_to_default_owner(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import status
+    from hermes_cli import profiles
+    from hermes_cli import whatsapp_setup as setup
+
+    default_home = tmp_path / ".hermes"
+    monkeypatch.setattr(
+        profiles,
+        "get_profile_dir",
+        lambda name: default_home if name == "default" else default_home / "profiles" / name,
+    )
+    monkeypatch.setattr(status, "get_running_pid", lambda path=None: 123)
+    monkeypatch.setattr(
+        status,
+        "read_runtime_status",
+        lambda path=None: {"served_profiles": ["default", "work"]},
+    )
+
+    assert setup.resolve_whatsapp_gateway_profile("work") == "default"
 
 
 def test_restart_gateway_if_running_is_noop_when_stopped(monkeypatch):
