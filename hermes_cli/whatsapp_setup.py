@@ -14,7 +14,10 @@ import sys
 import time
 from typing import Optional
 
-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+from hermes_cli._subprocess_compat import (
+    windows_detach_flags_without_breakaway,
+    windows_detach_popen_kwargs,
+)
 
 
 def persist_whatsapp_enabled(enabled: bool) -> None:
@@ -52,25 +55,52 @@ def restart_gateway_if_running(
     """Restart the selected-profile gateway without tying it to this process."""
     from gateway.status import get_running_pid
 
-    old_pid = get_running_pid()
+    requested = (profile or "").strip()
+    pid_path = None
+    if requested and requested.lower() != "current":
+        from hermes_cli import profiles
+
+        pid_path = profiles.get_profile_dir(requested) / "gateway.pid"
+
+    old_pid = get_running_pid(pid_path)
     if old_pid is None:
         return False
 
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
-    proc = subprocess.Popen(
-        _gateway_restart_command(profile),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=action_env,
-        close_fds=True,
-        **windows_detach_popen_kwargs(),
-    )
+    popen_kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": action_env,
+        "close_fds": True,
+    }
+    try:
+        proc = subprocess.Popen(
+            _gateway_restart_command(profile),
+            **popen_kwargs,
+            **windows_detach_popen_kwargs(),
+        )
+    except OSError as exc:
+        if sys.platform != "win32":
+            raise RuntimeError(
+                f"Could not start the gateway restart for WhatsApp pairing: {exc}"
+            ) from exc
+        try:
+            proc = subprocess.Popen(
+                _gateway_restart_command(profile),
+                **popen_kwargs,
+                creationflags=windows_detach_flags_without_breakaway(),
+            )
+        except OSError as fallback_exc:
+            raise RuntimeError(
+                "Could not start the gateway restart for WhatsApp pairing "
+                f"without Windows job breakaway: {fallback_exc}"
+            ) from fallback_exc
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        current_pid = get_running_pid()
+        current_pid = get_running_pid(pid_path)
         if current_pid is not None and current_pid != old_pid:
             return True
         returncode = proc.poll()

@@ -167,12 +167,14 @@ def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monke
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    with redirect_stdout(io.StringIO()):
+    output = io.StringIO()
+    with redirect_stdout(output):
         cmd_whatsapp(MagicMock())
 
     assert paired_session == isolated_home / "platforms" / "whatsapp" / "session"
     assert not (isolated_home / "whatsapp" / "session").exists()
     assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+    assert "Start the gateway: hermes gateway start" in output.getvalue()
 
 
 def test_failed_pairing_forces_whatsapp_disabled(isolated_home, monkeypatch):

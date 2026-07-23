@@ -2895,14 +2895,20 @@ def cmd_whatsapp(args):
         print()
         if wa_mode == "bot":
             print("  Next steps:")
-            print("    1. Confirm the gateway: hermes gateway status")
+            if gateway_restarted:
+                print("    1. Confirm the gateway: hermes gateway status")
+            else:
+                print("    1. Start the gateway: hermes gateway start")
             print("    2. Send a message to the bot's WhatsApp number")
             print("    3. The agent will reply automatically")
             print()
             print("  Tip: Agent responses are prefixed with '⚕ Hermes Agent'")
         else:
             print("  Next steps:")
-            print("    1. Confirm the gateway: hermes gateway status")
+            if gateway_restarted:
+                print("    1. Confirm the gateway: hermes gateway status")
+            else:
+                print("    1. Start the gateway: hermes gateway start")
             print("    2. Open WhatsApp → Message Yourself")
             print("    3. Type a message — the agent will reply")
             print()

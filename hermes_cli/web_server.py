@@ -8354,6 +8354,50 @@ def _run_whatsapp_pairing(pairing_id: str, session_path: Path, mode: str) -> Non
     _watch_whatsapp_pairing(pairing_id, proc)
 
 
+def _prepare_and_run_whatsapp_pairing(
+    pairing_id: str,
+    session_path: Path,
+    mode: str,
+    profile: Optional[str],
+) -> None:
+    """Quiesce the selected gateway, then launch the pollable pair-only flow."""
+    with _whatsapp_onboarding_lock:
+        record = _whatsapp_onboarding_sessions.get(pairing_id)
+        if (
+            not record
+            or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+        ):
+            return
+        record.status = "preparing"
+
+    try:
+        with _config_profile_scope(profile):
+            from hermes_cli.whatsapp_setup import prepare_whatsapp_pairing
+
+            prepare_whatsapp_pairing(profile=profile)
+            with _whatsapp_onboarding_lock:
+                record = _whatsapp_onboarding_sessions.get(pairing_id)
+                if (
+                    not record
+                    or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+                ):
+                    return
+            shutil.rmtree(session_path, ignore_errors=True)
+            session_path.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                record
+                and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                record.status = "error"
+                record.error = f"Could not quiesce WhatsApp before pairing: {exc}"
+        return
+
+    _run_whatsapp_pairing(pairing_id, session_path, mode)
+
+
 def _prune_whatsapp_onboarding_sessions() -> None:
     now = time.time()
     remove_ids: list[str] = []
@@ -8460,21 +8504,6 @@ async def start_whatsapp_onboarding(
             _prune_whatsapp_onboarding_sessions()
             _supersede_whatsapp_onboarding_sessions(session_path)
 
-        # Pairing must have exclusive ownership of the Baileys session.  Keep
-        # the gateway alive for other platforms, but restart it with WhatsApp
-        # disabled before clearing credentials or launching pair-only.
-        from hermes_cli.whatsapp_setup import prepare_whatsapp_pairing
-
-        try:
-            prepare_whatsapp_pairing(profile=effective_profile)
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Could not quiesce WhatsApp before pairing: {exc}",
-            ) from exc
-        shutil.rmtree(session_path, ignore_errors=True)
-        session_path.mkdir(parents=True, exist_ok=True)
-
     pairing_id = secrets.token_urlsafe(16)
     record = _WhatsAppOnboardingSession(
         proc=None,
@@ -8492,8 +8521,8 @@ async def start_whatsapp_onboarding(
         _whatsapp_onboarding_sessions[pairing_id] = record
 
     threading.Thread(
-        target=_run_whatsapp_pairing,
-        args=(pairing_id, session_path, mode),
+        target=_prepare_and_run_whatsapp_pairing,
+        args=(pairing_id, session_path, mode, effective_profile),
         daemon=True,
     ).start()
 
