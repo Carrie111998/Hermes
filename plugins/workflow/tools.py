@@ -50,13 +50,13 @@ def check_workflow_requirements() -> bool:
         logger.debug("workflow_engine import failed: %s", exc)
         return False
 
-    # Check HERMES_FLEET_PIPELINES env var first, then $HERMES_HOME/workflows/,
+    # Check HERMES_WORKFLOW_FILES env var first, then $HERMES_HOME/workflows/,
     # then fall back to the repo-relative path.
     workflows_dir = None
     try:
         from pathlib import Path
         import os
-        env_path = os.environ.get("HERMES_FLEET_PIPELINES")
+        env_path = os.environ.get("HERMES_WORKFLOW_FILES")
         if env_path:
             workflows_dir = Path(env_path)
         else:

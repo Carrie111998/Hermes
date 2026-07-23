@@ -70,13 +70,13 @@ _DESCRIPTIONS: Dict[str, str] = {
 def _fleet_pipelines_dirs() -> list[Path]:
     """Resolve all ``docs/fleet-pipelines/`` directories.
 
-    Uses ``HERMES_FLEET_PIPELINES`` env var if set, then falls back to
+    Uses ``HERMES_WORKFLOW_FILES`` env var if set, then falls back to
     scanning profile workspaces for docs repos.
     """
     dirs: list[Path] = []
 
-    # Primary: HERMES_FLEET_PIPELINES env var
-    env_path = os.environ.get("HERMES_FLEET_PIPELINES", "")
+    # Primary: HERMES_WORKFLOW_FILES env var
+    env_path = os.environ.get("HERMES_WORKFLOW_FILES", "")
     if env_path:
         p = Path(env_path).expanduser()
         if p.is_dir():

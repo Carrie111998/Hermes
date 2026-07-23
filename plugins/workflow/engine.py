@@ -234,7 +234,7 @@ class WorkflowEngine:
     def __init__(self, workflows_dir: str = None):
         if workflows_dir is None:
             workflows_dir = os.environ.get(
-                "HERMES_FLEET_PIPELINES",
+                "HERMES_WORKFLOW_FILES",
                 ""
             )
             if not workflows_dir:

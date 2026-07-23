@@ -42,7 +42,7 @@ The workflow engine is a **plugin** that registers `workflow_start` and related 
       - hermes-cli
       - workflow
   ```
-- `HERMES_FLEET_PIPELINES` must point to the directory containing pipeline YAMLs
+- `HERMES_WORKFLOW_FILES` must point to the directory containing pipeline YAMLs
 - The gateway must be running (it runs the kanban dispatcher and notifier)
 
 ## How to Run
@@ -207,7 +207,7 @@ Variables resolve from:
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `workflow_start` returns error "workflow not found" | Pipeline YAML missing or `HERMES_FLEET_PIPELINES` not set | Check `workflow_list()` shows it; verify env var |
+| `workflow_start` returns error "workflow not found" | Pipeline YAML missing or `HERMES_WORKFLOW_FILES` not set | Check `workflow_list()` shows it; verify env var |
 | Cards created but no notification arrives | Session info not injected (CLI/cron path) | Ensure you're calling from a gateway session |
 | Node stuck "running" but worker completed | Kanban dispatcher polls the wrong board | Verify card is on the expected board |
 | Template substitution failure | Context dict missing a key referenced in YAML | Ensure ALL `{placeholders}` in YAML are in the context dict |
