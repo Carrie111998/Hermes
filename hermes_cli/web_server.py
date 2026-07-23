@@ -3555,6 +3555,26 @@ def _gateway_subcommand(
     return profile_args + ["gateway", verb]
 
 
+def _gateway_restart_target_home(profile: Optional[str]) -> Path:
+    """Resolve the semantic HERMES_HOME owned by a restart request."""
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        from hermes_constants import get_process_hermes_home
+
+        return get_process_hermes_home().expanduser().resolve()
+
+    from hermes_cli import profiles as profiles_mod
+
+    return profiles_mod.get_profile_dir(requested).expanduser().resolve()
+
+
+def _gateway_restart_target_from_command(command: Tuple[str, ...]) -> Path:
+    """Recover a recorded restart's semantic target from its CLI argv."""
+    if len(command) >= 2 and command[0] in {"-p", "--profile"}:
+        return _gateway_restart_target_home(command[1])
+    return _gateway_restart_target_home(None)
+
+
 def _gateway_display_command(profile: Optional[str], verb: str) -> str:
     return " ".join(["hermes", *_gateway_subcommand(profile, verb)])
 
@@ -3638,7 +3658,16 @@ def _spawn_gateway_restart(
     existing = _ACTION_PROCS.get("gateway-restart")
     if existing is not None and existing.poll() is None:
         existing_command = _ACTION_COMMANDS.get("gateway-restart")
-        if existing_command is None or existing_command == tuple(subcommand):
+        same_target = (
+            existing_command is not None
+            and _gateway_restart_target_from_command(existing_command)
+            == _gateway_restart_target_home(profile)
+        )
+        if (
+            existing_command is None
+            or existing_command == tuple(subcommand)
+            or same_target
+        ):
             return existing, True
         raise RuntimeError("gateway restart already in progress for another profile")
     return _spawn_hermes_action(subcommand, "gateway-restart"), False

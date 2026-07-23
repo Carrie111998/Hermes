@@ -94,11 +94,15 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
 
 def _gateway_restart_command(profile: Optional[str]) -> list[str]:
     requested = (profile or "").strip()
-    profile_args: list[str] = []
-    if requested and requested.lower() != "current":
-        from hermes_cli import profiles
+    from hermes_cli import profiles
 
-        profile_args = ["-p", profiles.normalize_profile_name(requested)]
+    if not requested or requested.lower() == "current":
+        active = profiles.get_active_profile_name()
+        # A custom HERMES_HOME is the deployment's default/root profile. An
+        # explicit selector prevents the detached child from following a
+        # sticky active_profile file away from that inherited HERMES_HOME.
+        requested = "default" if active in {"custom", "default"} else active
+    profile_args = ["-p", profiles.normalize_profile_name(requested)]
     return [
         sys.executable,
         "-m",
@@ -141,7 +145,19 @@ def resolve_whatsapp_gateway_profile(profile: Optional[str]) -> Optional[str]:
         return "default"
 
     default_home = profiles.get_profile_dir("default")
-    if get_running_pid(default_home / "gateway.pid") is None:
+    target_home = profiles.get_profile_dir(target)
+    target_pid = get_running_pid(target_home / "gateway.pid")
+    default_pid = get_running_pid(default_home / "gateway.pid")
+    if (
+        target_pid is not None
+        and default_pid is not None
+        and target_pid != default_pid
+    ):
+        raise RuntimeError(
+            f"WhatsApp pairing cannot choose one session owner while both default "
+            f"and '{target}' gateways are running. Stop one gateway, then retry."
+        )
+    if default_pid is None:
         return target
 
     runtime = read_runtime_status(default_home / "gateway_state.json") or {}

@@ -264,7 +264,11 @@ def test_multiplexed_secondary_profile_resolves_to_default_owner(
         "get_profile_dir",
         lambda name: default_home if name == "default" else default_home / "profiles" / name,
     )
-    monkeypatch.setattr(status, "get_running_pid", lambda path=None: 123)
+    monkeypatch.setattr(
+        status,
+        "get_running_pid",
+        lambda path=None: 123 if path == default_home / "gateway.pid" else None,
+    )
     monkeypatch.setattr(
         status,
         "read_runtime_status",
@@ -277,6 +281,46 @@ def test_multiplexed_secondary_profile_resolves_to_default_owner(
     )
 
     assert setup.resolve_whatsapp_gateway_profile("work") == "default"
+
+
+def test_multiplex_owner_resolution_refuses_two_live_gateway_owners(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import status
+    from hermes_cli import profiles
+    from hermes_cli import whatsapp_setup as setup
+
+    default_home = tmp_path / ".hermes"
+    work_home = default_home / "profiles" / "work"
+    monkeypatch.setattr(
+        profiles,
+        "get_profile_dir",
+        lambda name: default_home if name == "default" else work_home,
+    )
+
+    def running_pid(path=None):
+        if path == work_home / "gateway.pid":
+            return 222
+        if path == default_home / "gateway.pid":
+            return 111
+        return None
+
+    monkeypatch.setattr(status, "get_running_pid", running_pid)
+    monkeypatch.setattr(
+        status,
+        "read_runtime_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must fail before assigning multiplex ownership")
+        ),
+    )
+
+    try:
+        setup.resolve_whatsapp_gateway_profile("work")
+    except RuntimeError as exc:
+        assert "both default and 'work' gateways are running" in str(exc)
+    else:
+        raise AssertionError("expected conflicting live gateway owners to be refused")
 
 
 def test_stale_served_profiles_do_not_override_live_nonmultiplex_config(
@@ -357,6 +401,42 @@ def test_restart_gateway_if_running_is_detached_profile_aware_and_scrubs_gateway
     assert captured["kwargs"]["stdin"] is setup.subprocess.DEVNULL
     assert captured["kwargs"]["stdout"] is setup.subprocess.DEVNULL
     assert captured["kwargs"]["stderr"] is setup.subprocess.DEVNULL
+
+
+def test_restart_gateway_preserves_custom_home_against_sticky_active_profile(
+    monkeypatch,
+    tmp_path,
+):
+    from gateway import status
+    from hermes_cli import whatsapp_setup as setup
+
+    custom_home = tmp_path / "custom-hermes"
+    custom_home.mkdir()
+    (custom_home / "active_profile").write_text("work\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+    pids = iter([123, 456])
+    monkeypatch.setattr(status, "get_running_pid", lambda pid_path=None: next(pids))
+    captured = {}
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr(setup.subprocess, "Popen", fake_popen)
+
+    assert setup.restart_gateway_if_running(profile=None) is True
+    assert captured["args"][-4:] == [
+        "-p",
+        "default",
+        "gateway",
+        "restart",
+    ]
+    assert captured["env"]["HERMES_HOME"] == str(custom_home)
 
 
 def test_restart_gateway_checks_the_requested_profile_pid(monkeypatch, tmp_path):

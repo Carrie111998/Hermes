@@ -235,6 +235,48 @@ def test_whatsapp_restart_forces_explicit_default_owner(monkeypatch):
     ) == ["-p", "default", "gateway", "restart"]
 
 
+def test_whatsapp_restart_reuses_equivalent_bare_default_restart(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+
+    custom_home = tmp_path / "custom-hermes"
+    custom_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+
+    class Proc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    existing = Proc()
+    ws._ACTION_PROCS.clear()
+    ws._ACTION_COMMANDS.clear()
+    ws._ACTION_PROCS["gateway-restart"] = existing
+    ws._ACTION_COMMANDS["gateway-restart"] = ("gateway", "restart")
+    monkeypatch.setattr(
+        ws,
+        "_spawn_hermes_action",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("equivalent default restart must be reused")
+        ),
+    )
+
+    try:
+        proc, reused = ws._spawn_gateway_restart(
+            "default",
+            explicit_default=True,
+        )
+    finally:
+        ws._ACTION_PROCS.clear()
+        ws._ACTION_COMMANDS.clear()
+
+    assert proc is existing
+    assert reused is True
+
+
 def test_apply_whatsapp_onboarding_self_chat_defaults_to_linked_account(monkeypatch):
     from hermes_cli import web_server as ws
     from hermes_cli import whatsapp_setup
