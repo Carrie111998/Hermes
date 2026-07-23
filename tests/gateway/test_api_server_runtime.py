@@ -17,6 +17,7 @@ from gateway.api_server_audit import request_audit_middleware
 from gateway.api_server_runtime import (
     APIServerRuntimeMixin,
     RuntimeBridgeSession,
+    _failed_tool_result_projection,
     _pin_run_model,
     _resume_runtime_history,
     _runtime_attachment_parts,
@@ -1048,6 +1049,120 @@ async def test_runtime_checkpoint_filters_local_activity_sibling_call():
     assert (await queue.get())["type"] == "tool_request"
     assert session.submit_result({"call_id": "call_compile", "ok": True, "result": {"compiled": {}}})
     assert json.loads(await call) == {"compiled": {}}
+
+
+@pytest.mark.asyncio
+async def test_runtime_bridge_preserves_safe_failed_result_with_typed_error():
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_failed_projection",
+        asyncio.get_running_loop(),
+        queue,
+        [{"name": "platform.prompt_compile", "input_schema": {"type": "object"}}],
+        10_000,
+        "agent_failed_projection",
+    )
+    session.agent_ref[0] = SimpleNamespace(
+        _runtime_checkpoint_message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_failed_projection",
+                "function": {"name": "platform.prompt_compile", "arguments": "{}"},
+            }],
+        },
+    )
+    call = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        "platform.prompt_compile",
+        {},
+        "call_failed_projection",
+    ))
+    assert (await queue.get())["type"] == "checkpoint"
+    assert (await queue.get())["type"] == "tool_request"
+    assert session.submit_result({
+        "call_id": "call_failed_projection",
+        "ok": False,
+        "result": {
+            "allowed": {
+                "aspect_ratios": ["16:9"],
+                "durations": [5],
+            },
+        },
+        "error": {
+            "code": "unsupported_aspect_ratio",
+            "message": "aspect ratio is not supported by model",
+            "retryable": False,
+        },
+    })
+    assert json.loads(await call) == {
+        "result": {
+            "allowed": {
+                "aspect_ratios": ["16:9"],
+                "durations": [5],
+            },
+        },
+        "error": {
+            "code": "unsupported_aspect_ratio",
+            "message": "aspect ratio is not supported by model",
+            "retryable": False,
+        },
+    }
+
+
+@pytest.mark.parametrize("transport", [
+    {
+        "ok": False,
+        "error": {
+            "code": "unsupported_aspect_ratio",
+            "message": "unsupported",
+            "retryable": False,
+            "private_upstream_detail": "must-not-cross",
+        },
+    },
+    {
+        "ok": False,
+        "result": {"allowed": {"credential": "must-not-cross"}},
+        "error": {
+            "code": "unsupported_aspect_ratio",
+            "message": "unsupported",
+            "retryable": False,
+        },
+    },
+    {
+        "ok": False,
+        "result": {"allowed": {"durations": [{"secret": "must-not-cross"}]}},
+        "error": {
+            "code": "unsupported_duration",
+            "message": "unsupported",
+            "retryable": False,
+        },
+    },
+    {
+        "ok": False,
+        "error": {
+            "code": "unsupported_aspect_ratio",
+            "message": "unsupported",
+        },
+    },
+    {
+        "error": {
+            "code": "unsupported_aspect_ratio",
+            "message": "unsupported",
+            "retryable": False,
+        },
+    },
+])
+def test_failed_tool_result_projection_fails_closed(transport):
+    projected = _failed_tool_result_projection(transport)
+    assert projected == {
+        "error": {
+            "code": "invalid_tool_result",
+            "message": "tool failed with an invalid result envelope",
+            "retryable": False,
+        },
+    }
+    assert "must-not-cross" not in json.dumps(projected)
 
 
 @pytest.mark.asyncio

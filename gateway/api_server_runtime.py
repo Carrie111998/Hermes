@@ -27,6 +27,17 @@ _SESSIONS_LOCK = threading.RLock()
 _REGISTERED_MANAGERS: set[int] = set()
 _LOCAL_ACTIVITY_TOOLS = {"skill_view", "video_analyze"}
 _MAX_ARGUMENT_CORRECTIONS = 1
+_FAILED_ALLOWED_STRING_FIELDS = {"media_type", "model", "provider"}
+_FAILED_ALLOWED_STRING_LIST_FIELDS = {"aspect_ratios", "resolutions"}
+_FAILED_ALLOWED_INTEGER_LIST_FIELDS = {"durations"}
+_FAILED_ALLOWED_INTEGER_FIELDS = {"max_prompt_chars", "max_reference_images"}
+_FAILED_ALLOWED_FIELDS = (
+    _FAILED_ALLOWED_STRING_FIELDS
+    | _FAILED_ALLOWED_STRING_LIST_FIELDS
+    | _FAILED_ALLOWED_INTEGER_LIST_FIELDS
+    | _FAILED_ALLOWED_INTEGER_FIELDS
+)
+_FAILED_ERROR_FIELDS = {"code", "message", "retryable"}
 _TERMINAL_PLATFORM_ERROR_CODES = {
     "auth_rejected",
     "configuration_error",
@@ -220,6 +231,81 @@ def _activity_failure_message(result: Any) -> str:
     if not isinstance(message, str) or not message.strip():
         return "runtime activity failed"
     return message.strip()[:240]
+
+
+def _invalid_failed_tool_result() -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "invalid_tool_result",
+            "message": "tool failed with an invalid result envelope",
+            "retryable": False,
+        },
+    }
+
+
+def _failed_allowed_value_is_safe(key: str, value: Any) -> bool:
+    if key in _FAILED_ALLOWED_STRING_FIELDS:
+        return isinstance(value, str) and bool(value.strip()) and len(value) <= 512
+    if key in _FAILED_ALLOWED_INTEGER_FIELDS:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    if not isinstance(value, list) or len(value) > 64:
+        return False
+    if key in _FAILED_ALLOWED_STRING_LIST_FIELDS:
+        return all(
+            isinstance(item, str) and bool(item.strip()) and len(item) <= 128
+            for item in value
+        )
+    return all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0
+        for item in value
+    )
+
+
+def _failed_tool_result_projection(transport: Any) -> dict[str, Any]:
+    """Project a failed platform result without exposing arbitrary fields."""
+    if (
+        not isinstance(transport, dict)
+        or transport.get("ok") is not False
+        or set(transport) - {"call_id", "ok", "result", "error"}
+    ):
+        return _invalid_failed_tool_result()
+    error = transport.get("error")
+    if not isinstance(error, dict) or set(error) != _FAILED_ERROR_FIELDS:
+        return _invalid_failed_tool_result()
+    code = error.get("code")
+    message = error.get("message")
+    retryable = error.get("retryable")
+    if (
+        not isinstance(code, str)
+        or not code.strip()
+        or len(code) > 128
+        or not isinstance(message, str)
+        or not message.strip()
+        or len(message) > 2_000
+        or not isinstance(retryable, bool)
+    ):
+        return _invalid_failed_tool_result()
+    projection: dict[str, Any] = {
+        "error": {
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+        },
+    }
+    if "result" not in transport:
+        return projection
+    result = transport.get("result")
+    if not isinstance(result, dict) or set(result) != {"allowed"}:
+        return _invalid_failed_tool_result()
+    allowed = result.get("allowed")
+    if (
+        not isinstance(allowed, dict)
+        or set(allowed) - _FAILED_ALLOWED_FIELDS
+        or any(not _failed_allowed_value_is_safe(key, value) for key, value in allowed.items())
+    ):
+        return _invalid_failed_tool_result()
+    projection["result"] = {"allowed": dict(allowed)}
+    return projection
 
 
 def _skill_scope_error(name: str) -> str:
@@ -866,11 +952,8 @@ class RuntimeBridgeSession:
             with self.lock:
                 self.argument_correction_failures.pop(name, None)
             return json.dumps(result.get("result"), ensure_ascii=False, separators=(",", ":"))
-        error = result.get("error") if isinstance(result.get("error"), dict) else {
-            "code": "invalid_tool_result",
-            "message": "tool failed",
-            "retryable": False,
-        }
+        failure = _failed_tool_result_projection(result)
+        error = failure["error"]
         code = str(error.get("code") or "invalid_tool_result")
         if code == "invalid_tool_arguments":
             with self.lock:
@@ -913,7 +996,7 @@ class RuntimeBridgeSession:
             if code in _TERMINAL_PLATFORM_ERROR_CODES:
                 message = str(error.get("message") or f"{name} failed with {code}")
                 self._halt_tool_loop(name, args, "terminal_platform_error", message, 1)
-        return json.dumps({"error": error}, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(failure, ensure_ascii=False, separators=(",", ":"))
 
     def submit_result(self, result: dict[str, Any]) -> bool:
         call_id = str(result.get("call_id") or "")
