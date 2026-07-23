@@ -898,6 +898,13 @@ DANGEROUS_PATTERNS = [
     # awk -i inplace targeting Hermes security files. Mirrors the sed/perl/ruby
     # patterns above and pairs the file_tools write_file/patch deny.
     (rf'\bawk\b.*(?:^|\s)-i\s+inplace\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (awk)"),
+    # patch command with an explicit target path argument. Unlike `patch -p1 <
+    # repo.patch` (which derives targets from diff headers), specifying the path
+    # directly mutates that file — gate the same sensitive paths that sed/perl/
+    # ruby/awk in-place edit patterns cover. Pairs the file_tools patch deny.
+    (rf'\bpatch\b[^|<;]*\s{_SYSTEM_CONFIG_PATH}[^\s"\']*', "patch targeting system config path"),
+    (rf'\bpatch\b[^|<;]*\s["\']?(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "patch targeting sensitive credential/SSH/shell-rc path"),
+    (rf'\bpatch\b[^|<;]*\s["\']?(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "patch targeting Hermes config/env path"),
     # Interpreter heredocs are handled by _execution_flag_findings() alongside
     # inline-exec flags; keep only shell heredocs regex-based here.
     # Shell execution via heredoc — `bash <<'EOF' ... EOF` runs arbitrary
