@@ -35,6 +35,10 @@ const electronNative: TestProjectConfiguration = {
 
 export default defineConfig({
   test: {
+    // Runs once for the whole run (both projects) and before any test file is
+    // loaded, so lockfile drift is reported as drift instead of as 32 tests
+    // failing on a missing export. See vitest.globalSetup.mjs.
+    globalSetup: ['./vitest.globalSetup.mjs'],
     projects: [reactUi, electronNative]
   }
 })
