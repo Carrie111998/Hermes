@@ -1271,18 +1271,13 @@ def test_create_kanban_card_resolves_templates_when_workflow_provided(
     # Capture the body that create_kanban_card would post
     captured = {}
 
-    class FakeResult:
-        returncode = 0
-        stdout = '{"id": "t_fake_card_123"}'
-        stderr = ""
+    def fake_create_task(conn, *, title, body, assignee, **kwargs):
+        captured["body"] = body
+        captured["assignee"] = assignee
+        captured["tenant"] = kwargs.get("tenant")
+        return "t_fake_card_123"
 
-    def fake_run(cmd, capture_output=True, text=True, timeout=30, **kwargs):
-        # Find the --body arg in the command list
-        idx = cmd.index("--body") + 1
-        captured["body"] = cmd[idx]
-        return FakeResult()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("hermes_cli.kanban_db.create_task", fake_create_task)
 
     probe_node = council_pipeline.nodes["probe-sherlock"]
     probe_node.task = "All positions: {phase1.all}\nContext Q: {context.q}"
@@ -1320,17 +1315,11 @@ def test_create_kanban_card_legacy_path_unchanged(
     """
     captured = {}
 
-    class FakeResult:
-        returncode = 0
-        stdout = '{"id": "t_legacy"}'
-        stderr = ""
+    def fake_create_task(conn, *, title, body, assignee, **kwargs):
+        captured["body"] = body
+        return "t_legacy"
 
-    def fake_run(cmd, capture_output=True, text=True, timeout=30, **kwargs):
-        idx = cmd.index("--body") + 1
-        captured["body"] = cmd[idx]
-        return FakeResult()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("hermes_cli.kanban_db.create_task", fake_create_task)
 
     node = WorkflowNode(id="x", agent="a", task="Do {phase1.foo}")
     # Note: no workflow= passed → legacy path
@@ -1376,12 +1365,10 @@ def test_dispatch_node_scope_project_delegates_to_create_kanban_card(
         engine, council_pipeline, monkeypatch):
     """scope: project (default) routes through create_kanban_card as before."""
 
-    class FakeResult:
-        returncode = 0
-        stdout = '{"id": "t_project_card"}'
-        stderr = ""
+    def fake_create_task(conn, *, title, body, assignee, **kwargs):
+        return "t_project_card"
 
-    monkeypatch.setattr("subprocess.run", lambda *a, **kw: FakeResult())
+    monkeypatch.setattr("hermes_cli.kanban_db.create_task", fake_create_task)
 
     node = council_pipeline.nodes["position-edison"]
     state = NodeState(node_id=node.id)

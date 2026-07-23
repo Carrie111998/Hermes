@@ -504,68 +504,31 @@ class WorkflowEngine:
                 })
             except (KeyError, ValueError, TypeError):
                 pass
-        cmd = [
-            _hermes_binary(), "kanban", "create",
-            title,
-            "--tenant", self.kanban_board,
-            "--body", task_with_context,
-            "--assignee", assignee,
-            "--goal",
-            "--priority", "2",
-        ]
-        if node.goal_max_turns is not None:
-            cmd.extend(["--goal-max-turns", str(node.goal_max_turns)])
-        # Pass --max-runtime so the heartbeat sweep uses the node's
-        # timeout as the threshold, not the 30-minute default.
-        if node.timeout_minutes is not None:
-            cmd.extend(["--max-runtime", str(node.timeout_minutes * 60)])
-        if node.model:
-            cmd.extend(["--model", node.model])
-        if node.triage:
-            cmd.append("--triage")
-        if initial_status != "ready":
-            cmd.extend(["--initial-status", initial_status])
-        # Real agents start in their own persistent workspace so files
-        # they write (e.g. council artifacts) survive card completion.
-        # Synthetic/gate nodes have no agent and get the default scratch.
-        if not node.synthetic and node.agent:
-            # Cannot use Path.home() — it resolves to the profile's fake
-            # home dir when the engine runs inside a Hermes profile.
-            # HERMES_HOME always points to the real profile root
-            # (e.g. /home/ubuntu/.hermes/profiles/sherlock), so
-            # its parent is the profiles directory.
-            hermes_home = os.environ.get("HERMES_HOME")
-            if hermes_home:
-                profiles_root = Path(hermes_home).parent
-            else:
-                profiles_root = Path.home() / ".hermes" / "profiles"
-            agent_ws = profiles_root / node.agent / "workspace"
-            cmd.extend(["--workspace", f"dir:{agent_ws}"])
 
-        # When kanban_board is set (e.g. "council"), inject the env var
-        # so the CLI resolves to the right board file.
-        run_env = dict(os.environ)
-        if self.kanban_board:
-            run_env["HERMES_KANBAN_BOARD"] = self.kanban_board
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=run_env)
-        if result.returncode != 0:
-            raise RuntimeError(f"Kanban card creation failed: {result.stderr}")
-
-        # Card ID can come from either a "Created card <id>" line OR
-        # a JSON object (--json mode); try JSON first since it's structured.
-        out = result.stdout.strip()
+        # Use the kanban DB Python API directly — no subprocess.
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect(board=self.kanban_board)
         try:
-            card_obj = json.loads(out)
-            if "id" in card_obj:
-                return card_obj["id"]
-        except (json.JSONDecodeError, ValueError):
-            pass
-        match = re.match(r'Created\s+(t_\S+)', out)
-        if match:
-            return match.group(1)
-        # Fallback: try last token (fragile but works for legacy output)
-        card_id = out.split()[-1] if out else ""
-        return card_id
+            new_tid = kb.create_task(
+                conn,
+                title=title,
+                body=task_with_context,
+                assignee=str(assignee),
+                parents=(),
+                tenant=self.kanban_board,
+                priority=2,
+                workspace_kind="scratch",
+                workspace_path=None,
+                project_id=None,
+                triage=node.triage if hasattr(node, 'triage') else False,
+                max_runtime_seconds=(
+                    int(node.timeout_minutes * 60)
+                    if node.timeout_minutes is not None else None
+                ),
+            )
+            return new_tid
+        finally:
+            conn.close()
 
     def dispatch_node(self, state: NodeState, node: WorkflowNode, context: dict,
                        workflow: "Workflow", states: dict, layers: list,
