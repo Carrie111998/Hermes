@@ -198,6 +198,13 @@ def test_system_service_without_root_is_rejected_before_config_write(
         "persist_whatsapp_enabled",
         lambda enabled: writes.append(enabled),
     )
+    monkeypatch.setattr(
+        setup,
+        "restart_gateway_if_running",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("duplicate owners must fail during preflight")
+        ),
+    )
 
     try:
         setup.prepare_whatsapp_pairing(profile="default")
@@ -205,6 +212,33 @@ def test_system_service_without_root_is_rejected_before_config_write(
         assert "sudo hermes gateway stop --system" in str(exc)
     else:
         raise AssertionError("expected system-scope authority failure")
+    assert writes == []
+
+
+def test_duplicate_user_and_system_gateways_are_rejected_before_config_write(
+    monkeypatch,
+):
+    from gateway import status
+    from hermes_cli import whatsapp_setup as setup
+
+    monkeypatch.setattr(setup.sys, "platform", "linux")
+    monkeypatch.setattr(status, "get_running_pid", lambda path=None: 111)
+    monkeypatch.setattr(setup, "_active_system_gateway_pid", lambda: 222)
+    monkeypatch.setattr(setup.os, "geteuid", lambda: 0)
+    writes = []
+    monkeypatch.setattr(
+        setup,
+        "persist_whatsapp_enabled",
+        lambda enabled: writes.append(enabled),
+    )
+
+    try:
+        setup.prepare_whatsapp_pairing(profile="default")
+    except RuntimeError as exc:
+        assert "both a profile gateway and the system gateway" in str(exc)
+        assert "sudo hermes gateway stop --system" in str(exc)
+    else:
+        raise AssertionError("expected duplicate gateway-owner failure")
     assert writes == []
 
 

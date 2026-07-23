@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 
@@ -259,10 +260,12 @@ def test_whatsapp_restart_forces_explicit_default_owner(monkeypatch):
         *,
         explicit_default=False,
         scrub_whatsapp_env=False,
+        require_fresh=False,
     ):
         captured["profile"] = profile
         captured["explicit_default"] = explicit_default
         captured["scrub_whatsapp_env"] = scrub_whatsapp_env
+        captured["require_fresh"] = require_fresh
         return Proc(), False
 
     monkeypatch.setattr(ws, "_spawn_gateway_restart", spawn)
@@ -274,6 +277,7 @@ def test_whatsapp_restart_forces_explicit_default_owner(monkeypatch):
         "profile": "default",
         "explicit_default": True,
         "scrub_whatsapp_env": True,
+        "require_fresh": True,
     }
     assert ws._gateway_subcommand(
         "default",
@@ -295,10 +299,12 @@ def test_whatsapp_restart_forces_implicit_default_owner(monkeypatch):
         *,
         explicit_default=False,
         scrub_whatsapp_env=False,
+        require_fresh=False,
     ):
         captured["profile"] = profile
         captured["explicit_default"] = explicit_default
         captured["scrub_whatsapp_env"] = scrub_whatsapp_env
+        captured["require_fresh"] = require_fresh
         return Proc(), False
 
     monkeypatch.setattr(ws, "_spawn_gateway_restart", spawn)
@@ -310,6 +316,7 @@ def test_whatsapp_restart_forces_implicit_default_owner(monkeypatch):
         "profile": None,
         "explicit_default": True,
         "scrub_whatsapp_env": True,
+        "require_fresh": True,
     }
     assert ws._gateway_subcommand(
         None,
@@ -405,6 +412,58 @@ def test_whatsapp_restart_reuses_equivalent_bare_default_restart(
 
     assert proc is existing
     assert reused is True
+
+
+def test_whatsapp_apply_waits_for_inflight_restart_then_starts_fresh(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+
+    custom_home = tmp_path / "custom-hermes"
+    custom_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+    spawned = []
+
+    class ExistingProc:
+        pid = 11111
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+
+    class FreshProc:
+        pid = 22222
+
+        def poll(self):
+            return None
+
+    existing = ExistingProc()
+    fresh = FreshProc()
+    ws._ACTION_PROCS.clear()
+    ws._ACTION_COMMANDS.clear()
+    ws._ACTION_PROCS["gateway-restart"] = existing
+    ws._ACTION_COMMANDS["gateway-restart"] = ("gateway", "restart")
+    monkeypatch.setattr(
+        ws,
+        "_spawn_hermes_action",
+        lambda subcommand, name, **kwargs: (
+            spawned.append((subcommand, name, kwargs)) or fresh
+        ),
+    )
+
+    try:
+        result = ws._restart_gateway_after_whatsapp_onboarding("default")
+    finally:
+        ws._ACTION_PROCS.clear()
+        ws._ACTION_COMMANDS.clear()
+
+    assert result["restart_started"] is True
+    assert result["restart_pid"] == 22222
+    assert existing.polls >= 2
+    assert len(spawned) == 1
+    assert spawned[0][0] == ["-p", "default", "gateway", "restart"]
 
 
 def test_apply_whatsapp_onboarding_self_chat_defaults_to_linked_account(monkeypatch):
@@ -739,6 +798,86 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
     assert record.status == "preparing"
     assert record.gateway_profile == "default"
     ws._whatsapp_onboarding_sessions.clear()
+
+
+def test_session_replacement_is_atomic_with_whatsapp_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    from contextlib import contextmanager
+
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "creds.json").write_text('{"still":"valid"}', encoding="utf-8")
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
+    cancel_started = threading.Event()
+    original_rmtree = ws.shutil.rmtree
+
+    @contextmanager
+    def profile_scope(_profile):
+        yield
+
+    def blocking_rmtree(path, *, ignore_errors):
+        delete_entered.set()
+        assert allow_delete.wait(timeout=2)
+        original_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: None)
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda _profile: "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(ws.shutil, "rmtree", blocking_rmtree)
+    monkeypatch.setattr(ws, "_run_whatsapp_pairing", lambda *_args: None)
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    worker = threading.Thread(
+        target=ws._prepare_and_run_whatsapp_pairing,
+        args=("pairing", session_dir, "bot", "work"),
+    )
+    worker.start()
+    assert delete_entered.wait(timeout=2)
+    def cancel():
+        cancel_started.set()
+        asyncio.run(ws.cancel_whatsapp_onboarding("pairing"))
+
+    canceller = threading.Thread(target=cancel)
+    canceller.start()
+    assert cancel_started.wait(timeout=2)
+    time.sleep(0.05)
+    try:
+        assert canceller.is_alive(), (
+            "cancellation interleaved after the active-session check and before "
+            "credential replacement completed"
+        )
+    finally:
+        allow_delete.set()
+        worker.join(timeout=2)
+        canceller.join(timeout=2)
+        ws._whatsapp_onboarding_sessions.clear()
+
+    assert not worker.is_alive()
+    assert not canceller.is_alive()
 
 
 def test_prepare_pairing_keeps_credentials_when_bridge_preflight_fails(

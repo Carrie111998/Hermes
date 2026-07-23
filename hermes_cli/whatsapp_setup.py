@@ -233,9 +233,16 @@ def _active_system_gateway_pid() -> Optional[int]:
 def _system_gateway_pid_if_owned(old_pid: Optional[int]) -> Optional[int]:
     """Return the active system-service PID when it owns ``old_pid``."""
     system_pid = _active_system_gateway_pid()
-    if system_pid is not None and old_pid in {None, system_pid}:
-        return system_pid
-    return None
+    if system_pid is None:
+        return None
+    if old_pid not in {None, system_pid}:
+        raise RuntimeError(
+            "WhatsApp pairing cannot choose one session owner while both a "
+            "profile gateway and the system gateway are running. Stop one "
+            "gateway first (for the system service: "
+            "`sudo hermes gateway stop --system`), then retry."
+        )
+    return system_pid
 
 
 def _raise_if_system_gateway_requires_root(old_pid: Optional[int]) -> Optional[int]:

@@ -3411,6 +3411,7 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 # report liveness and exit code without shelling out to ``ps``.
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
 _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
+_GATEWAY_RESTART_LOCK = threading.Lock()
 
 # ``name`` → completed synthetic action result for actions the server handled
 # without spawning a subprocess (for example, unsupported Docker updates).
@@ -3652,56 +3653,77 @@ def _spawn_gateway_restart(
     *,
     explicit_default: bool = False,
     scrub_whatsapp_env: bool = False,
+    require_fresh: bool = False,
+    fresh_wait_timeout: float = 120.0,
 ) -> Tuple[subprocess.Popen, bool]:
-    """Spawn ``hermes gateway restart``, reusing an in-flight restart.
+    """Spawn ``hermes gateway restart``, normally reusing an in-flight restart.
 
     Multiple dashboard paths can request a restart in quick succession
     (restart button double-click, or a stale cached frontend firing its own
     restart after the server already auto-restarted post-onboarding). Two
     concurrent ``hermes gateway restart`` children race each other on the
-    manual kill-and-start path, so reuse the live one instead.
+    manual kill-and-start path, so reuse the live one instead. When
+    ``require_fresh`` is true, wait for a compatible in-flight restart to
+    finish and then start a new one. This is required after a config activation:
+    an older child may already have read the pre-activation configuration.
 
     Returns ``(proc, reused)``.
     """
-    subcommand = _gateway_subcommand(
-        profile,
-        "restart",
-        explicit_default=explicit_default,
-    )
-    existing = _ACTION_PROCS.get("gateway-restart")
-    if existing is not None and existing.poll() is None:
-        existing_command = _ACTION_COMMANDS.get("gateway-restart")
-        same_target = (
-            existing_command is not None
-            and _gateway_restart_target_from_command(existing_command)
-            == _gateway_restart_target_home(profile)
+    with _GATEWAY_RESTART_LOCK:
+        subcommand = _gateway_subcommand(
+            profile,
+            "restart",
+            explicit_default=explicit_default,
         )
-        if (
-            existing_command is None
-            or existing_command == tuple(subcommand)
-            or same_target
-        ):
-            return existing, True
-        raise RuntimeError("gateway restart already in progress for another profile")
-    spawn_kwargs: Dict[str, Any] = {}
-    if scrub_whatsapp_env:
-        from hermes_cli.whatsapp_setup import (
-            BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES,
-            BAILEYS_WHATSAPP_ENV_PREFIXES,
-        )
+        existing = _ACTION_PROCS.get("gateway-restart")
+        if existing is not None and existing.poll() is None:
+            existing_command = _ACTION_COMMANDS.get("gateway-restart")
+            same_target = (
+                existing_command is not None
+                and _gateway_restart_target_from_command(existing_command)
+                == _gateway_restart_target_home(profile)
+            )
+            compatible = (
+                existing_command is None
+                or existing_command == tuple(subcommand)
+                or same_target
+            )
+            if not compatible:
+                raise RuntimeError(
+                    "gateway restart already in progress for another profile"
+                )
+            if not require_fresh:
+                return existing, True
 
-        spawn_kwargs["scrub_env_prefixes"] = BAILEYS_WHATSAPP_ENV_PREFIXES
-        spawn_kwargs["preserve_env_prefixes"] = (
-            BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES
+            deadline = time.monotonic() + max(0.0, fresh_wait_timeout)
+            while existing.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "the pre-activation gateway restart is still in progress; "
+                        "a fresh post-activation restart could not be started"
+                    )
+                time.sleep(min(0.1, remaining))
+
+        spawn_kwargs: Dict[str, Any] = {}
+        if scrub_whatsapp_env:
+            from hermes_cli.whatsapp_setup import (
+                BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES,
+                BAILEYS_WHATSAPP_ENV_PREFIXES,
+            )
+
+            spawn_kwargs["scrub_env_prefixes"] = BAILEYS_WHATSAPP_ENV_PREFIXES
+            spawn_kwargs["preserve_env_prefixes"] = (
+                BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES
+            )
+        return (
+            _spawn_hermes_action(
+                subcommand,
+                "gateway-restart",
+                **spawn_kwargs,
+            ),
+            False,
         )
-    return (
-        _spawn_hermes_action(
-            subcommand,
-            "gateway-restart",
-            **spawn_kwargs,
-        ),
-        False,
-    )
 
 
 def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict[str, Any]:
@@ -8526,8 +8548,12 @@ def _prepare_and_run_whatsapp_pairing(
                     or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
                 ):
                     return
-            shutil.rmtree(session_path, ignore_errors=True)
-            session_path.mkdir(parents=True, exist_ok=True)
+                # The final active-session check and credential replacement are
+                # one cancellation-critical section. A cancel that wins this
+                # lock preserves the existing credentials; it cannot interleave
+                # after the check and before deletion.
+                shutil.rmtree(session_path, ignore_errors=True)
+                session_path.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         with _whatsapp_onboarding_lock:
             record = _whatsapp_onboarding_sessions.get(pairing_id)
@@ -8598,6 +8624,10 @@ def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) ->
             # multiplex owner, so let that child load its own profile-scoped
             # WhatsApp values instead of inheriting the just-edited profile.
             scrub_whatsapp_env=True,
+            # An earlier restart may already have read disabled WhatsApp state.
+            # Applying verified credentials therefore requires a new child
+            # that starts only after activation was persisted.
+            require_fresh=True,
         )
     except Exception as exc:
         _log.exception("Failed to auto-restart gateway after WhatsApp onboarding")
