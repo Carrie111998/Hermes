@@ -414,6 +414,43 @@ class EventBus:
                 logger.warning("WAL checkpoint(%s) failed: %s", mode, e)
                 return None
 
+    def analyze(self, analysis_limit: int = 400) -> bool:
+        """Refresh query-planner statistics. Returns True on success.
+
+        Without a sqlite_stat1 table SQLite plans from hard-coded guesses. The
+        live bus ran without one until 2026-07-23, which is part of why the
+        watchdog's escalation count degraded to a full SCAN (R61).
+
+        ``analysis_limit`` caps how many index entries ANALYZE samples per
+        index, which is what makes this cheap enough to run on a schedule: on
+        the 395 MB / 193k-row bus a full ANALYZE takes ~4.7s and blocks
+        writers, while analysis_limit=400 takes ~0.010s — 470x less — and
+        still tracked table growth correctly across a +40k-row insert. The
+        resulting row estimates are approximate by design (SQLite documents
+        this trade-off); every plan that matters here was verified to stay
+        SEARCH under them.
+
+        NB ``PRAGMA optimize`` is the usual recommendation for this job but was
+        measured NOT to refresh at all here — it left stats untouched across a
+        15% row increase — so this deliberately runs ANALYZE outright.
+
+        Statistics are only read when a connection loads its schema, so
+        existing long-lived connections keep planning from whatever they
+        already cached until they reconnect.
+        """
+        with self._lock:
+            try:
+                conn = self._get_conn()
+                # Must precede ANALYZE on the SAME connection: analysis_limit
+                # is a connection-scoped setting the next ANALYZE reads.
+                conn.execute(f"PRAGMA analysis_limit={int(analysis_limit)}")
+                conn.execute("ANALYZE")
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logger.warning("EventBus ANALYZE failed: %s", e)
+                return False
+
     def close(self) -> None:
         """Close the thread-local SQLite connection."""
         conn = getattr(self._local, "conn", None)

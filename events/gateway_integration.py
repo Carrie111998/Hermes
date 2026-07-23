@@ -802,6 +802,17 @@ def _subscriber_poll_loop() -> None:
                     _bus.cleanup(retention_days=30)
                 except Exception:
                     logger.exception("Event cleanup failed")
+                # Refresh planner statistics AFTER the prune, so they describe
+                # the table that callers will actually query. Separate try so a
+                # failed cleanup still gets fresh stats and vice versa. Cheap
+                # by construction (~0.010s via analysis_limit) — see
+                # EventBus.analyze; nothing else re-analyzes this DB, so
+                # without this the stats taken on 2026-07-23 would drift
+                # further out of date the more the bus grows.
+                try:
+                    _bus.analyze()
+                except Exception:
+                    logger.exception("Event bus ANALYZE failed")
                 last_cleanup = now
 
             # WAL checkpoint every 60 seconds
