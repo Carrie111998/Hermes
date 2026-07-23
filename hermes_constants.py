@@ -916,9 +916,9 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     * ``profile``: use ``{HERMES_HOME}/home`` when it exists, preserving the
       older strict per-profile tool-config isolation.
     """
-    env = env or {}
+    env_lookup = env or {}
     profile_home = _profile_home_path(env)
-    mode = str(env.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto")).strip().lower() or "auto"
+    mode = str(env_lookup.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto")).strip().lower() or "auto"
     if mode in {"isolated", "profile_home", "profile-home"}:
         mode = "profile"
     if mode in {"host", "user", "real_home", "real-home"}:
@@ -928,7 +928,7 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
         return profile_home
 
     real_home = get_real_home(env)
-    current_home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
+    current_home = str(env_lookup.get("HOME") or os.getenv("HOME", "")).strip()
     if mode == "real":
         return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
 

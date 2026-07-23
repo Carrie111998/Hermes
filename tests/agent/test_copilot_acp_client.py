@@ -219,6 +219,27 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
     assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] == str(real_home)
 
 
+def test_run_prompt_does_not_inherit_stale_hermes_real_home(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes"
+    (hermes_home / "home").mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+
+    monkeypatch.setenv("HERMES_REAL_HOME", "/stale/parent/home")
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] != "/stale/parent/home"
+    assert captured["kwargs"]["env"]["HERMES_REAL_HOME"] == str(real_home)
+
+
 def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
