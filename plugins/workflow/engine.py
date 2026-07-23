@@ -513,8 +513,6 @@ class WorkflowEngine:
         conn = kb.connect(board=self.kanban_board)
         try:
             import datetime as _dt
-            with open("/tmp/workflow-create-card.log", "a") as _f:
-                _f.write(f"{_dt.datetime.now().isoformat()} board={self.kanban_board} title={title[:50]} assignee={assignee}\n")
             new_tid = kb.create_task(
                 conn,
                 title=title,
@@ -622,40 +620,19 @@ class WorkflowEngine:
             return
         try:
             from hermes_cli import kanban_db as _kb
-            # Try ContextVars first (works when called from gateway session)
-            platform = ""
-            chat_id = ""
-            thread_id = None
-            user_id = None
-            notifier_profile = None
-            try:
-                from gateway.session_context import get_session_env
-                platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-                chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-                if platform and chat_id:
-                    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-                    user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-                    notifier_profile = (
-                        get_session_env("HERMES_SESSION_PROFILE", "")
-                        or os.environ.get("HERMES_PROFILE")
-                    )
-            except Exception:
-                pass
-            # Fall back to session_info from state file (for supervisor subprocess)
-            if not platform and session_info:
-                platform = session_info.get("platform", "")
-                chat_id = session_info.get("chat_id", "")
-                thread_id = session_info.get("thread_id")
-                user_id = session_info.get("user_id")
-                notifier_profile = session_info.get("profile")
+            # Merge live ContextVars with persisted session_info from state file.
+            info = {**self._get_session_info(), **(session_info or {})}
+            platform = info.get("platform", "")
+            chat_id = info.get("chat_id", "")
             if platform and chat_id:
                 with _kb.connect(board=self.kanban_board) as _conn:
                     for cid in card_ids:
                         _kb.add_notify_sub(
                             _conn, task_id=cid,
                             platform=platform, chat_id=chat_id,
-                            thread_id=thread_id, user_id=user_id,
-                            notifier_profile=notifier_profile,
+                            thread_id=info.get("thread_id"),
+                            user_id=info.get("user_id"),
+                            notifier_profile=info.get("profile"),
                         )
                 print(f"   🔔 subscribed {len(card_ids)} final card(s) for notifications")
         except Exception:
@@ -705,7 +682,7 @@ class WorkflowEngine:
     # Tracks which (state-id, status) pairs have already had telemetry
     # recorded, so repeated _save_state calls don't double-count
     # error_count or recompute duration. Reset per engine instance.
-    _telemetry_recorded: "set[tuple[int, str]]" = None  # lazy-init in __init__
+    _telemetry_recorded: "set[tuple[str, str]]" = None  # lazy-init in __init__
 
     def _record_node_completion(self, state: NodeState) -> None:
         """Capture telemetry when a node enters a terminal status.
@@ -720,7 +697,7 @@ class WorkflowEngine:
             return
         if self._telemetry_recorded is None:
             self._telemetry_recorded = set()
-        dedup_key = (id(state), state.status)
+        dedup_key = (state.node_id, state.status)
         if dedup_key in self._telemetry_recorded:
             return
         self._telemetry_recorded.add(dedup_key)
@@ -1043,9 +1020,8 @@ class WorkflowEngine:
             "namespace_node_counts": {k: [pk for pk in v.keys() if pk != "all"] for k, v in by_phase.items()},
             "top_level_lookup_keys": [k for k in lookup.keys() if k not in ("context",)],
         }
-        import sys as _sys
         # Use a well-known prefix so log grepping is reliable
-        print(f"\n📋 WFE:DIAG {json.dumps(diag, default=str)}", file=_sys.stderr)
+        print(f"\n📋 WFE:DIAG {json.dumps(diag, default=str)}", file=sys.stderr)
 
         return lookup
 
@@ -1094,8 +1070,7 @@ class WorkflowEngine:
                     "top_level_keys": top_keys,
                     "known_namespaces": sorted(k for k in lookup.keys() if isinstance(lookup.get(k), dict) and k != "context"),
                 }
-                import sys as _sys
-                print(f"   📋 WFE:DIAG {json.dumps(diag, default=str)}", file=_sys.stderr)
+                print(f"   📋 WFE:DIAG {json.dumps(diag, default=str)}", file=sys.stderr)
                 print(
                     f"   ⚠  Unresolved template {{{ns}.{field}}} "
                     f"— leaving literal"
@@ -1150,7 +1125,6 @@ class WorkflowEngine:
             else:
                 unresolved_formatted.append(f"{{{bare}}}")
         if unresolved_formatted:
-            import sys as _sys
             diag = {
                 "run_id": lookup.get("run_id", "unknown"),
                 "event": "post_resolution",
@@ -1159,7 +1133,7 @@ class WorkflowEngine:
                 "unresolved_count": len(unresolved_formatted),
                 "unresolved_refs": unresolved_formatted,
             }
-            print(f"   📋 WFE:DIAG {json.dumps(diag, default=str)}", file=_sys.stderr)
+            print(f"   📋 WFE:DIAG {json.dumps(diag, default=str)}", file=sys.stderr)
 
         if context:
             # Preserve the pre-B2 footer. It contains braces (JSON
@@ -1264,42 +1238,6 @@ class WorkflowEngine:
         except Exception:
             pass
 
-    def _update_node_card_status(self, card_id: str, status: str) -> None:
-        """Update a node card's status (called from kanban hooks)."""
-        try:
-            import sqlite3
-            with sqlite3.connect(str(self._exec_db_path)) as conn:
-                conn.execute(
-                    "UPDATE workflow_node_cards SET status = ? WHERE card_id = ?",
-                    (status, card_id)
-                )
-                # Check if all cards for this run are terminal
-                row = conn.execute(
-                    "SELECT run_id FROM workflow_node_cards WHERE card_id = ?",
-                    (card_id,)
-                ).fetchone()
-                if row:
-                    run_id = row[0]
-                    total = conn.execute(
-                        "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ?",
-                        (run_id,)
-                    ).fetchone()[0]
-                    done = conn.execute(
-                        "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ? AND status IN ('done','failed')",
-                        (run_id,)
-                    ).fetchone()[0]
-                    if done >= total:
-                        final = "failed" if conn.execute(
-                            "SELECT COUNT(*) FROM workflow_node_cards WHERE run_id = ? AND status = 'failed'",
-                            (run_id,)
-                        ).fetchone()[0] > 0 else "completed"
-                        from datetime import datetime, timezone
-                        conn.execute(
-                            "UPDATE workflow_executions SET status = ?, finished_at = ? WHERE run_id = ?",
-                            (final, datetime.now(timezone.utc).isoformat(), run_id)
-                        )
-        except Exception:
-            pass
 
     def _state_path(self, workflow_name: str, run_id: str = None) -> Path:
         if run_id:
@@ -1429,14 +1367,12 @@ class WorkflowEngine:
             if not raw_path:
                 continue
 
-            # Resolve {run_id} and {date} in the path using the template lookup
+            # Resolve {run_id} and {date} in the path
             resolved = raw_path
-            if lookup:
-                resolved = resolved.replace("{run_id}", lookup.get("run_id", "run"))
-                resolved = resolved.replace("{date}", lookup.get("date", "unknown"))
-            else:
-                resolved = resolved.replace("{run_id}", state.node_id.split("_")[0]
-                                            if "_" in state.node_id else "run")
+            run_id = state.node_id.split("_")[0] if "_" in state.node_id else "run"
+            from datetime import date as _date
+            resolved = resolved.replace("{run_id}", run_id)
+            resolved = resolved.replace("{date}", _date.today().isoformat())
 
             full_path = agent_ws / resolved
             if not full_path.exists():
@@ -1686,7 +1622,6 @@ class WorkflowEngine:
         - All agents referenced exist (best-effort)
         - Required fields present on all nodes
         """
-        import yaml as _yaml
         result = {"valid": True, "issues": [], "layers": 0, "nodes": 0}
 
         # Step 1: YAML syntax check (catches malformed YAML before load)
@@ -1704,8 +1639,8 @@ class WorkflowEngine:
             return result
 
         try:
-            raw = _yaml.safe_load(raw_text)
-        except _yaml.YAMLError as e:
+            raw = yaml.safe_load(raw_text)
+        except yaml.YAMLError as e:
             result["valid"] = False
             result["issues"].append(f"YAML syntax error: {e}")
             return result
@@ -2049,14 +1984,16 @@ class WorkflowEngine:
             if _peek() == ("KEYWORD", "in"):
                 _consume()
                 # Expect '['
-                assert _peek() == ("BRACKET", "["), "Expected '[' after 'in'"
+                if _peek() != ("BRACKET", "["):
+                    raise ValueError("Expected '[' after 'in'")
                 _consume()
                 items = []
                 while _peek() and _peek() != ("BRACKET", "]"):
                     items.append(_parse_atom())
                     if _peek() == ("COMMA", ","):
                         _consume()
-                assert _peek() == ("BRACKET", "]"), "Expected ']' to close list"
+                if _peek() != ("BRACKET", "]"):
+                    raise ValueError("Expected ']' to close list")
                 _consume()
                 return left in items
             return left
@@ -2099,7 +2036,8 @@ class WorkflowEngine:
             if pk[0] == "BRACKET" and pk[1] == "(":
                 _consume()
                 val = _parse_or()
-                assert _peek() == ("BRACKET", ")"), "Expected ')' in when: expression"
+                if _peek() != ("BRACKET", ")"):
+                    raise ValueError("Expected ')' in when: expression")
                 _consume()
                 return val
             raise ValueError(f"Unexpected token in when: expression: {pk}")
@@ -2130,11 +2068,10 @@ class WorkflowEngine:
         except Exception as exc:
             # Fail open — evaluation error defaults to skip to avoid
             # dispatching a node whose condition couldn't be checked.
-            import sys as _sys
             print(
                 f"   ⚠  when: evaluation error for "
                 f"'{when_expr}': {exc} — skipping node",
-                file=_sys.stderr,
+                file=sys.stderr,
             )
             return False
 
@@ -2759,7 +2696,7 @@ class WorkflowEngine:
                         try:
                             card_id = self.dispatch_node(
                                 state, node, context,
-                                workflow=workflow, states=states, layers=layers,
+                                workflow=workflow, states=states, layers=[layer],
                             )
                             if card_id is None:
                                 results[nid] = "done"

@@ -2446,7 +2446,7 @@ class TestNodeCardDB:
     def test_update_node_card_status(self, engine):
         """_update_node_card_status changes status for a card."""
         engine._record_node_card("t_upd", "run-002", "node-b")
-        engine._update_node_card_status("t_upd", "done")
+        from plugins.workflow import _update_node_card_db as _upd; _upd("t_upd", "done")
         import sqlite3
         with sqlite3.connect(str(engine._exec_db_path)) as conn:
             row = conn.execute(
@@ -2460,8 +2460,8 @@ class TestNodeCardDB:
         engine._record_node_card("t_x", "run-003", "node-x")
         engine._record_node_card("t_y", "run-003", "node-y")
         # Mark both as done
-        engine._update_node_card_status("t_x", "done")
-        engine._update_node_card_status("t_y", "done")
+        from plugins.workflow import _update_node_card_db as _upd; _upd("t_x", "done")
+        from plugins.workflow import _update_node_card_db as _upd; _upd("t_y", "done")
         import sqlite3
         with sqlite3.connect(str(engine._exec_db_path)) as conn:
             row = conn.execute(
@@ -2476,8 +2476,8 @@ class TestNodeCardDB:
         engine._record_execution("test-wf", "run-004", "board-b", 1)
         engine._record_node_card("t_p", "run-004", "node-p")
         engine._record_node_card("t_q", "run-004", "node-q")
-        engine._update_node_card_status("t_p", "done")
-        engine._update_node_card_status("t_q", "failed")
+        from plugins.workflow import _update_node_card_db as _upd; _upd("t_p", "done")
+        from plugins.workflow import _update_node_card_db as _upd; _upd("t_q", "failed")
         import sqlite3
         with sqlite3.connect(str(engine._exec_db_path)) as conn:
             row = conn.execute(

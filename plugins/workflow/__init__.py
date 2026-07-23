@@ -204,7 +204,7 @@ def _find_state_for_card(task_id: str):
     # State files live in .engine-state/ under the workflow files directory
     wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
     if not wf_dir:
-        wf_dir = str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines"))
+        wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
     state_dir = Path(wf_dir) / ".engine-state"
     if not state_dir.exists():
         return None
@@ -229,7 +229,7 @@ def _find_verify_nodes(workflow_name: str):
     """
     wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
     if not wf_dir:
-        wf_dir = str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines"))
+        wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
     wf_files = Path(wf_dir)
     import yaml
     wf_path = wf_files / f"{workflow_name}.yaml"
@@ -293,7 +293,7 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             # Find the implementer's card (the node this verify depends on)
             wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
             if not wf_dir:
-                wf_dir = str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines"))
+                wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
             wf_files = Path(wf_dir)
             import yaml
             wf_path = wf_files / f"{workflow_name}.yaml"
@@ -322,7 +322,7 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
 
             # Get the failure report from the blocked card
             from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board", "adventours")
+            board = state.get("kanban_board", "fleet-workflow")
             conn = kb.connect(board=board)
             try:
                 blocked_card = kb.get_task(conn, task_id)
@@ -375,7 +375,7 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             layer_nodes = layers[current_layer]
             # Check actual card status from kanban DB, not just state file
             from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board", "adventours")
+            board = state.get("kanban_board", "fleet-workflow")
             conn = kb.connect(board=board)
             try:
                 all_done = True
@@ -444,7 +444,7 @@ def _subscribe_final_layer(state, completed_layer_idx, layers):
     # Create subscriptions
     try:
         from hermes_cli import kanban_db as kb
-        board = state.get("kanban_board", "adventours")
+        board = state.get("kanban_board", "fleet-workflow")
         conn = kb.connect(board=board)
         try:
             for cid in card_ids:
@@ -474,7 +474,7 @@ def _spawn_supervisor_for_next_layer(state, state_path):
         import sys
         workflow_name = state.get("workflow_name", "")
         run_id = state.get("run_id", "")
-        board = state.get("kanban_board", "adventours")
+        board = state.get("kanban_board", "fleet-workflow")
         current_layer = state.get("current_layer", 0)
         layers = state.get("layers", [])
 
@@ -493,7 +493,7 @@ def _spawn_supervisor_for_next_layer(state, state_path):
         env = os.environ.copy()
         env["HERMES_WORKFLOW_FILES"] = os.environ.get(
             "HERMES_WORKFLOW_FILES",
-            str(Path("/home/ubuntu/.hermes/workspace/docs/fleet-pipelines")),
+            str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines"),
         )
         subprocess.Popen(
             cmd,
