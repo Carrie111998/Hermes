@@ -361,9 +361,6 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             _save_state_file(state_path, state)
             print(f"   ↩  LOOP #{current_loop + 1}: {implementer_nid} re-dispatched with failure report")
 
-            # Spawn supervisor to create the verify node's card for re-review
-            _spawn_supervisor_for_next_layer(state, state_path)
-
         elif status == "done":
             # Update this node's status in the state file
             states[node_id]["status"] = "done"
