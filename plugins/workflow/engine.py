@@ -1254,7 +1254,8 @@ class WorkflowEngine:
 
     def _save_state(self, workflow_name: str, states: dict, results: dict,
                     current_layer: int, layers: list[list[str]],
-                    run_id: str = None, context: dict = None):
+                    run_id: str = None, context: dict = None,
+                    attachments: list = None):
         """Persist engine state for crash recovery."""
         # Telemetry: capture duration_seconds + error_count for any node
         # that has reached a terminal status but hasn't been recorded yet.
@@ -1267,6 +1268,7 @@ class WorkflowEngine:
             "current_layer": current_layer,
             "layers": layers,
             "context": context or {},
+            "attachments": attachments or [],
             "states": {nid: {
                 "node_id": s.node_id,
                 "status": s.status,
@@ -2162,6 +2164,11 @@ class WorkflowEngine:
                 # substitution when creating downstream cards.
                 if context is None and "context" in saved:
                     context = saved["context"]
+                # Restore attachments from saved state so the supervisor
+                # subprocess can attach files to first-layer cards.
+                if not attachments and "attachments" in saved:
+                    attachments = saved["attachments"]
+                    self._current_attachments = attachments
                 states = {
                     nid: NodeState(
                         node_id=s["node_id"],
@@ -2283,7 +2290,8 @@ class WorkflowEngine:
             # monitoring loop, creating cards as it goes and handling LOOPs.
             # The calling agent gets an immediate response.
             self._save_state(workflow_name, states, results, 0, layers,
-                            run_id=workflow.run_id, context=context)
+                            run_id=workflow.run_id, context=context,
+                            attachments=attachments)
             self._spawn_supervisor(workflow_name, workflow.run_id)
             return results
 
