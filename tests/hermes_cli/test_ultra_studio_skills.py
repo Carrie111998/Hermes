@@ -6,6 +6,7 @@ from hermes_cli.ultra_studio_skills import (
     DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST,
     DEFAULT_VIDEO_AGENT_SKILL_ALLOWLIST,
     VIDEO_AGENT_CORE_SKILL_ALLOWLIST,
+    VIDEO_AGENT_DEPENDENCY_SKILL_ALLOWLIST,
     VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST,
     VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST,
     apply_ultra_studio_allowlist,
@@ -85,9 +86,32 @@ def test_apply_ultra_studio_allowlist_is_side_effect_free():
 
 def test_default_allowlist_names_are_present():
     assert set(DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST) == {
+        "ai-influencer-flow",
+        "amazon-product-listing",
+        "audio-generation",
+        "brand-analyzer",
+        "cartoon-flow",
+        "cinematic-flow",
+        "classicMD-flow",
+        "highMD-flow",
         "infographic-md-flow",
+        "image-generation",
         "media-qa",
+        "montage",
+        "podcast-flow",
+        "product-analyzer",
+        "product-photoshoot",
+        "productMD-flow",
         "prompt-repair",
+        "script-writer",
+        "tv-ad",
+        "typographyMD-flow",
+        "ugc-flow",
+        "ugc-product-flow",
+        "ugc-try-on-flow",
+        "ugc-tutorial-flow",
+        "ugc-unboxing-flow",
+        "video-generation",
         "gpt-image-2-director",
         "marketing-studio-director",
         "higgsfield-content-factory",
@@ -100,7 +124,34 @@ def test_video_agent_allowlist_separates_core_from_specific_workflows():
         "media-qa",
         "prompt-repair",
     }
-    assert VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST == ("infographic-md-flow",)
+    assert set(VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST) == {
+        "ai-influencer-flow",
+        "amazon-product-listing",
+        "cartoon-flow",
+        "cinematic-flow",
+        "classicMD-flow",
+        "highMD-flow",
+        "infographic-md-flow",
+        "podcast-flow",
+        "product-photoshoot",
+        "productMD-flow",
+        "tv-ad",
+        "typographyMD-flow",
+        "ugc-flow",
+        "ugc-product-flow",
+        "ugc-try-on-flow",
+        "ugc-tutorial-flow",
+        "ugc-unboxing-flow",
+    }
+    assert VIDEO_AGENT_DEPENDENCY_SKILL_ALLOWLIST == (
+        "audio-generation",
+        "brand-analyzer",
+        "image-generation",
+        "montage",
+        "product-analyzer",
+        "script-writer",
+        "video-generation",
+    )
     assert VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST == (
         "gpt-image-2-director",
         "marketing-studio-director",
@@ -138,7 +189,7 @@ def test_ultra_allowlist_hides_unrelated_skills_from_discovery(tmp_path, monkeyp
 
     visible = {skill["name"] for skill in _st._find_all_skills()}
 
-    assert visible == set(DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST)
+    assert visible == set(installed) & set(DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST)
 
 
 def test_apply_skill_allowlist_disables_everything_outside_allowlist(monkeypatch):

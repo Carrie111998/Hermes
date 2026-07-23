@@ -13,7 +13,33 @@ VIDEO_AGENT_CORE_SKILL_ALLOWLIST: tuple[str, ...] = (
 )
 
 VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST: tuple[str, ...] = (
+    "ai-influencer-flow",
+    "amazon-product-listing",
+    "cartoon-flow",
+    "cinematic-flow",
+    "classicMD-flow",
+    "highMD-flow",
     "infographic-md-flow",
+    "podcast-flow",
+    "product-photoshoot",
+    "productMD-flow",
+    "tv-ad",
+    "typographyMD-flow",
+    "ugc-flow",
+    "ugc-product-flow",
+    "ugc-try-on-flow",
+    "ugc-tutorial-flow",
+    "ugc-unboxing-flow",
+)
+
+VIDEO_AGENT_DEPENDENCY_SKILL_ALLOWLIST: tuple[str, ...] = (
+    "audio-generation",
+    "brand-analyzer",
+    "image-generation",
+    "montage",
+    "product-analyzer",
+    "script-writer",
+    "video-generation",
 )
 
 VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST: tuple[str, ...] = (
@@ -25,6 +51,7 @@ VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST: tuple[str, ...] = (
 DEFAULT_VIDEO_AGENT_SKILL_ALLOWLIST: tuple[str, ...] = (
     *VIDEO_AGENT_CORE_SKILL_ALLOWLIST,
     *VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST,
+    *VIDEO_AGENT_DEPENDENCY_SKILL_ALLOWLIST,
     *VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST,
 )
 
