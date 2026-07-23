@@ -11,9 +11,12 @@ See ``plugins/workflow/analyst.py`` for the auxiliary module.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict
+
+logger = logging.getLogger("plugins.workflow")
 
 # ---------------------------------------------------------------------------
 # Plugin config loader
@@ -62,8 +65,8 @@ def load_config() -> Dict[str, Any]:
             try:
                 import yaml
                 user_config = yaml.safe_load(path.read_text()) or {}
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Failed to read user config %s: %s", path, _exc)
             break
 
     _CONFIG = {**_DEFAULTS, **user_config}
@@ -327,14 +330,8 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
             try:
                 blocked_card = kb.get_task(conn, task_id)
                 failure_report = blocked_card.body if blocked_card else (reason or "Unknown failure")
-            except Exception:
-                failure_report = reason or "Unknown failure"
-            finally:
-                conn.close()
 
-            # Enrich the implementer's card with the failure report
-            conn = kb.connect(board=board)
-            try:
+                # Enrich the implementer's card with the failure report
                 card = kb.get_task(conn, impl_card_id)
                 if card:
                     original_body = card.body or ""
@@ -350,6 +347,8 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                         (enriched_body, impl_card_id),
                     )
                     conn.commit()
+            except Exception:
+                failure_report = reason or "Unknown failure"
             finally:
                 conn.close()
 

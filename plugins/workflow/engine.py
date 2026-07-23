@@ -595,8 +595,8 @@ class WorkflowEngine:
                         or os.environ.get("HERMES_PROFILE")
                     ),
                 }
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("ContextVars session lookup failed: %s", _exc)
         # Fallback: os.environ (kanban tools also check this)
         try:
             platform = os.environ.get("HERMES_SESSION_PLATFORM", "")
@@ -609,8 +609,8 @@ class WorkflowEngine:
                     "user_id": os.environ.get("HERMES_SESSION_USER_ID") or None,
                     "profile": os.environ.get("HERMES_SESSION_PROFILE") or os.environ.get("HERMES_PROFILE"),
                 }
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("os.environ session lookup failed: %s", _exc)
         return {}
 
     def _subscribe_final_cards(self, card_ids: list[str],
@@ -828,8 +828,8 @@ class WorkflowEngine:
                 ).fetchone()
                 if events and events[0]:
                     result["latest_summary"] = events[0]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Failed to load card summary events: %s", _exc)
             return result
         finally:
             conn.close()
@@ -1192,8 +1192,8 @@ class WorkflowEngine:
                     (run_id, workflow_name, board,
                      datetime.now(timezone.utc).isoformat(), total_layers)
                 )
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("Failed to record execution to job log DB: %s", _exc)
 
     def _update_execution(self, run_id: str, status: str = None,
                           current_layer: int = None, error: str = None) -> None:
@@ -1223,8 +1223,8 @@ class WorkflowEngine:
                     f"UPDATE workflow_executions SET {', '.join(updates)} WHERE run_id = ?",
                     params
                 )
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("Failed to record node card to job log DB: %s", _exc)
 
     def _record_node_card(self, card_id: str, run_id: str, node_id: str) -> None:
         """Record a card→run→node mapping in the job log DB."""
@@ -1235,8 +1235,8 @@ class WorkflowEngine:
                     "INSERT OR IGNORE INTO workflow_node_cards (card_id, run_id, node_id, status) VALUES (?, ?, ?, 'pending')",
                     (card_id, run_id, node_id)
                 )
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.warning("Failed to record node card to job log DB: %s", _exc)
 
 
     def _state_path(self, workflow_name: str, run_id: str = None) -> Path:
