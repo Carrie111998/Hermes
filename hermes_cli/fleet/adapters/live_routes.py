@@ -41,6 +41,9 @@ _AGY_MODEL_LABELS = {
 _AGY_RECEIPT_RE = re.compile(
     r'Propagating selected model override to backend: label="([^"\r\n]+)"\s*$'
 )
+_AGY_SUBSCRIPTION_ENDPOINT = (
+    "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+)
 
 
 def _agy_log_path(run_id: str) -> Path:
@@ -102,6 +105,55 @@ def _inspect_agy_receipt(
         check["status"] = "matched"
         check["receipt_count"] = len(labels)
     return check
+
+
+def _apply_agy_subscription_route_markers(
+    text: str, check: dict[str, object]
+) -> dict[str, object]:
+    """Fail-closed consumer subscription markers shared by doctor and parents."""
+
+    if "authMethod=consumer" not in text:
+        check["status"] = "subscription_auth_missing"
+        return check
+    if _AGY_SUBSCRIPTION_ENDPOINT not in text:
+        check["status"] = "subscription_endpoint_missing"
+        return check
+    if "GOOGLE_API_KEY" in text or "GEMINI_API_KEY" in text:
+        check["status"] = "api_key_route_present"
+        return check
+    check.update(
+        {
+            "auth_method": "consumer",
+            "endpoint_kind": "antigravity_cloud_code",
+            "served_model_id": check.get("canonical_model_id"),
+            "served_model_label": check.get("expected_display_label"),
+            "fallback_enabled": False,
+        }
+    )
+    return check
+
+
+def inspect_agy_subscription_receipt(
+    log_path: Path,
+    *,
+    canonical_model_id: str,
+    expected_display_label: str,
+) -> dict[str, object]:
+    """Canonical label + consumer-subscription route receipt (secret-free)."""
+
+    check = _inspect_agy_receipt(
+        log_path,
+        canonical_model_id=canonical_model_id,
+        expected_display_label=expected_display_label,
+    )
+    if check.get("status") != "matched":
+        return check
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError:
+        check["status"] = "unreadable_log"
+        return check
+    return _apply_agy_subscription_route_markers(text, check)
 
 
 def _finalize_agy_log(

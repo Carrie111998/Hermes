@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,9 +20,28 @@ from hermes_cli.fleet.types import (
 
 
 NOW = datetime(2026, 7, 24, tzinfo=timezone.utc)
+DISPLAY_MODEL_LABEL = "Gemini 3.1 Pro (High)"
+_LIVE_RECEIPT_MATCH = (
+    "Starting new conversation\n"
+    "Created conversation 11111111-1111-1111-1111-111111111111\n"
+    "authMethod=consumer\n"
+    "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent\n"
+    "I0724 11:02:16.509256 40296 model_config_manager.go:272] "
+    f'Propagating selected model override to backend: label="{DISPLAY_MODEL_LABEL}"\n'
+)
 
 
-def _doctor(*, overage_state: str | None = None) -> FleetQualificationDoctor:
+def _probe_process(log_text: str = _LIVE_RECEIPT_MATCH):
+    def process(argv, **_kwargs):
+        log_path = Path(argv[argv.index("--log-file") + 1])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(log_text, encoding="utf-8")
+        return type("Completed", (), {"returncode": 0, "stdout": "pong", "stderr": ""})()
+
+    return process
+
+
+def _doctor(tmp_path, *, overage_state: str | None = None) -> FleetQualificationDoctor:
     def command(argv):
         if argv[1] == "--version":
             return 0, "agy 1.1.6", ""
@@ -38,14 +57,16 @@ def _doctor(*, overage_state: str | None = None) -> FleetQualificationDoctor:
     return FleetQualificationDoctor(
         which=lambda _: "C:/tools/agy.exe",
         command=command,
+        run_process=_probe_process(),
         environment={},
         now=lambda: NOW,
+        proof_cache_dir=tmp_path / "fleet" / "evidence" / "agy",
         **kwargs,
     )
 
 
-def test_agy_qualification_exposes_implemented_parent_session_contract():
-    qualification = _doctor().qualify((profile_map()["antigravity"],))[
+def test_agy_qualification_exposes_implemented_parent_session_contract(tmp_path):
+    qualification = _doctor(tmp_path).qualify((profile_map()["antigravity"],))[
         "antigravity"
     ]
 
@@ -58,8 +79,8 @@ def test_agy_qualification_exposes_implemented_parent_session_contract():
     assert "served-model receipt" in qualification.detail
 
 
-def test_explicit_antigravity_overage_on_still_blocks_the_safe_default():
-    qualification = _doctor(overage_state="on").qualify(
+def test_explicit_antigravity_overage_on_still_blocks_the_safe_default(tmp_path):
+    qualification = _doctor(tmp_path, overage_state="on").qualify(
         (profile_map()["antigravity"],)
     )["antigravity"]
 
@@ -67,9 +88,9 @@ def test_explicit_antigravity_overage_on_still_blocks_the_safe_default():
     assert qualification.overage_disabled is False
 
 
-def test_antigravity_parent_admission_accepts_proven_external_driver():
+def test_antigravity_parent_admission_accepts_proven_external_driver(tmp_path):
     profile = profile_map()["antigravity"]
-    qualification = _doctor().qualify((profile,))["antigravity"]
+    qualification = _doctor(tmp_path).qualify((profile,))["antigravity"]
     evaluation = evaluate_lane(
         LaneInputs(
             profile=profile,
@@ -149,9 +170,11 @@ def test_live_service_uses_explicit_bridge_overage_for_antigravity_parent_catalo
                     if argv[1] == "--version"
                     else (0, "gemini-3.1-pro-high", "")
                 ),
+                run_process=_probe_process(),
                 environment={},
                 billing_status=kwargs.get("billing_status"),
                 now=lambda: NOW,
+                proof_cache_dir=tmp_path / "fleet" / "evidence" / "agy",
             )
 
     monkeypatch.setattr(

@@ -15,7 +15,7 @@ from hermes_cli.fleet.adapters.base import safe_child_environment
 from hermes_cli.fleet.adapters.live_routes import (
     _agy_log_path,
     _finalize_agy_log,
-    _inspect_agy_receipt,
+    inspect_agy_subscription_receipt,
 )
 from hermes_cli.fleet.inspection import build_fleet_service
 from hermes_cli.fleet.state import FleetStore
@@ -44,7 +44,7 @@ def _parent_receipt(
     *,
     expected_conversation_id: str | None,
 ) -> dict[str, object]:
-    check = _inspect_agy_receipt(
+    check = inspect_agy_subscription_receipt(
         log_path,
         canonical_model_id=_MODEL_ID,
         expected_display_label=_MODEL_LABEL,
@@ -60,19 +60,8 @@ def _parent_receipt(
         check["status"] = "log_too_large"
         return check
     text = raw.decode("utf-8", errors="strict")
-    if "authMethod=consumer" not in text:
-        check["status"] = "subscription_auth_missing"
-        return check
-    if (
-        "daily-cloudcode-pa.googleapis.com/"
-        "v1internal:streamGenerateContent" not in text
-    ):
-        check["status"] = "subscription_endpoint_missing"
-        return check
-    if "GOOGLE_API_KEY" in text or "GEMINI_API_KEY" in text:
-        check["status"] = "api_key_route_present"
-        return check
-
+    # Subscription markers already validated by the shared inspector; keep the
+    # conversation continuity checks below as parent-session-specific proof.
     if expected_conversation_id:
         quoted = re.escape(expected_conversation_id)
         if not re.search(
