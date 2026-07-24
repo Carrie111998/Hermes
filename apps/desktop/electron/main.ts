@@ -37,6 +37,12 @@ import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
+import {
+  BACKGROUND_PROTOCOL,
+  BackgroundImageRegistry,
+  resolveBackgroundImages,
+  resolveBackgroundProtocolTarget
+} from './background-images'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -917,6 +923,7 @@ app.setAboutPanelOptions({
 // handler removes the size cap and gives the <video> element seekable,
 // range-aware playback. Must be registered before the app is ready.
 const MEDIA_PROTOCOL = 'hermes-media'
+const backgroundImageRegistry = new BackgroundImageRegistry()
 
 // Only audio/video may be streamed. Without this the handler would read any
 // non-blocklisted local file (no size cap) for any `fetch(hermes-media://…)`.
@@ -937,6 +944,15 @@ const STREAMABLE_MEDIA_EXTS = new Set([
 protocol.registerSchemesAsPrivileged([
   {
     scheme: MEDIA_PROTOCOL,
+    privileges: {
+      secure: true,
+      standard: true,
+      stream: true,
+      supportFetchAPI: true
+    }
+  },
+  {
+    scheme: BACKGROUND_PROTOCOL,
     privileges: {
       secure: true,
       standard: true,
@@ -968,6 +984,23 @@ function registerMediaProtocol() {
     // content-type and honors Range requests so seeking works. Forward the
     // renderer's headers (notably Range) and skip custom-protocol re-entry.
     return electronNet.fetch(pathToFileURL(resolvedPath).toString(), {
+      bypassCustomProtocolHandlers: true,
+      headers: request.headers
+    })
+  })
+}
+
+function registerBackgroundProtocol() {
+  protocol.handle(BACKGROUND_PROTOCOL, async request => {
+    const target = await resolveBackgroundProtocolTarget(request.url, backgroundImageRegistry)
+
+    if (!target.filePath) {
+      const message = target.status === 415 ? 'Background image unavailable' : 'Background image not found'
+
+      return new Response(message, { status: target.status })
+    }
+
+    return electronNet.fetch(pathToFileURL(target.filePath).toString(), {
       bypassCustomProtocolHandlers: true,
       headers: request.headers
     })
@@ -9637,6 +9670,16 @@ ipcMain.handle('hermes:selectPaths', async (_event, options: any = {}) => {
   return result.filePaths
 })
 
+ipcMain.handle('hermes:background:resolve', async (_event, request) =>
+  resolveBackgroundImages(
+    {
+      kind: request?.kind,
+      sourcePath: typeof request?.sourcePath === 'string' ? request.sourcePath : ''
+    },
+    backgroundImageRegistry
+  )
+)
+
 ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   clipboard.writeText(String(text || ''))
 
@@ -10770,6 +10813,7 @@ app.whenReady().then(() => {
 
   installMediaPermissions()
   registerMediaProtocol()
+  registerBackgroundProtocol()
   installEmbedReferer()
   registerDeepLinkProtocol()
   ensureWslWindowsFonts()
