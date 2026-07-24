@@ -1310,18 +1310,16 @@ class WorkflowEngine:
         if session_info:
             state["session_info"] = session_info
         else:
-            # Preserve session_info from the most recent state file that has it.
-            # The supervisor subprocess gets a new run_id, so we can't look up
-            # by run_id alone — scan recent state files instead.
+            # Preserve session_info from the existing state file.
+            # The supervisor subprocess writes to the same file, so we
+            # read the existing file before overwriting to carry forward
+            # session_info that the tool handler injected.
             try:
-                for sf in sorted(self.STATE_DIR.glob(f"{workflow_name}_*_state.json"),
-                                 key=lambda p: p.stat().st_mtime, reverse=True):
-                    if sf.name == f"{workflow_name}_{run_id}_state.json" if run_id else False:
-                        continue  # skip the file we're about to write
-                    existing = json.loads(sf.read_text())
+                existing_path = self._state_path(workflow_name, run_id)
+                if existing_path.exists():
+                    existing = json.loads(existing_path.read_text())
                     if existing.get("session_info"):
                         state["session_info"] = existing["session_info"]
-                        break
             except Exception:
                 pass
         with open(self._state_path(workflow_name, run_id), "w") as f:
