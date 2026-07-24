@@ -45,11 +45,24 @@ export function ModelPill({
   const viewProvider = useStore(view.$provider)
   const currentModel = model.model || viewModel
   const currentProvider = model.provider || viewProvider
+  const modelDisplayLabel = useStore(view.$modelDisplayLabel)
+  const viewModelSource = useStore(view.$modelSource)
+  const fleetAdapterKind = useStore(view.$fleetAdapterKind)
   const fastMode = useStore(view.$fast)
   const reasoningEffort = useStore(view.$reasoningEffort)
   const modelSource = useStore($currentModelSource)
   const runtimeId = useStore(view.$runtimeId)
   const [open, setOpen] = useState(false)
+
+  const fleetAutoDraft = view.kind === 'primary' && !runtimeId && modelSource === 'fleet_auto'
+
+  const committedFleetRoute = Boolean(runtimeId && viewModelSource === 'fleet_auto' && modelDisplayLabel.trim())
+
+  const fleetBadge = committedFleetRoute
+    ? fleetAdapterKind === 'external_cli'
+      ? 'external CLI'
+      : 'Fleet'
+    : ''
 
   // The composer pick is sticky: a manual selection is pinned and every NEW
   // chat uses it instead of the Settings → Model default — silently, which has
@@ -67,7 +80,19 @@ export function ModelPill({
     <ChevronDown className="size-3.5 shrink-0 opacity-70" />
   ) : (
     <>
-      {currentModel.trim() ? (
+      {fleetAutoDraft ? (
+        <span className="truncate">Auto · Fleet on send</span>
+      ) : committedFleetRoute ? (
+        <>
+          <span className="truncate">{modelDisplayLabel}</span>
+          <span
+            className="shrink-0 rounded-sm bg-primary/10 px-1 text-[0.6rem] text-primary"
+            data-testid="fleet-route-badge"
+          >
+            {fleetBadge}
+          </span>
+        </>
+      ) : currentModel.trim() ? (
         <span className="truncate">{formatModelStatusLabel(currentModel, { fastMode, reasoningEffort })}</span>
       ) : (
         <GlyphSpinner className="opacity-50" spinner="braille" />
@@ -93,7 +118,11 @@ export function ModelPill({
       )
     : PILL
 
-  const baseTitle = currentProvider
+  const baseTitle = fleetAutoDraft
+    ? 'Fleet Auto will select a qualified parent when this session is created'
+    : committedFleetRoute
+      ? modelDisplayLabel
+      : currentProvider
     ? copy.modelTitle(currentProvider, currentModel || copy.modelNone)
     : copy.switchModel
 

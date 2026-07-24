@@ -146,6 +146,18 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
+      const liveModelSource = touchesPrimary
+        ? getCurrentModelSource()
+        : ($sessionStates.get()[liveSessionId!]?.modelSource ?? '')
+
+      if (liveSessionId && liveModelSource === 'fleet_auto') {
+        const message = copy.fleetPinnedModelSwitchBlocked
+
+        notifyError(new Error(message), message)
+
+        return false
+      }
+
       const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
 
       const prevProvider = touchesPrimary
@@ -217,7 +229,13 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         return false
       }
     },
-    [copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
+    [
+      copy.fleetPinnedModelSwitchBlocked,
+      copy.modelSwitchFailed,
+      queryClient,
+      requestGateway,
+      updateModelOptionsCache
+    ]
   )
 
   return { refreshCurrentModel, selectModel, updateModelOptionsCache }

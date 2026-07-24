@@ -731,6 +731,13 @@ export interface Translations {
         attentionDetail: string
         fallbackSummary: string
         lanesTitle: string
+        parentLanesTitle: string
+        workerLanesTitle: string
+        parent: string
+        worker: string
+        parentAuto: string
+        parentAutoDescription: string
+        parentAutoFailed: string
         laneNames: Record<string, string>
         enabled: string
         disabled: string
@@ -2297,6 +2304,7 @@ export interface Translations {
     cwdStagedTitle: string
     cwdStagedMessage: string
     modelSwitchFailed: string
+    fleetPinnedModelSwitchBlocked: string
     sessionExported: string
     sessionExportFailed: string
     imageSaved: string

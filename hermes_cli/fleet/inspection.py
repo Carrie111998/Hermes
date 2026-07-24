@@ -32,6 +32,12 @@ from .types import (
 
 SCHEMA_VERSION = 1
 DEFAULT_CAPABILITIES = frozenset({"workspace_write", "shell"})
+_MODEL_LABELS = {
+    "claude-opus-4-8": "Claude Opus 4.8",
+    "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+    "gpt-5.6-sol": "GPT-5.6 Sol",
+    "grok-4.5": "Grok 4.5",
+}
 
 
 def build_fleet_service(
@@ -113,6 +119,10 @@ def serialize_evaluation(
         "adapter_kind": item.profile.adapter_kind.value,
         "provider_id": item.profile.provider_id,
         "model_id": item.selected_model,
+        "model_label": _MODEL_LABELS.get(
+            item.selected_model or "",
+            item.selected_model,
+        ),
         "effort": item.selected_effort,
         "qualification_evidence_id": item.qualification_evidence_id,
         "qualification_detail": item.qualification_detail,

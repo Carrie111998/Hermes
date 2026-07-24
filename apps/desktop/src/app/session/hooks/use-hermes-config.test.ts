@@ -8,6 +8,7 @@ import {
   $currentCwd,
   $currentFastMode,
   $currentReasoningEffort,
+  getCurrentModelSource,
   markComposerSelectionManual,
   setCurrentCwd,
   setCurrentFastMode,
@@ -58,6 +59,30 @@ describe('useHermesConfig refreshHermesConfig', () => {
     })
 
     expect($currentCwd.get()).toBe('/Users/example/repo/.worktrees/feature')
+  })
+
+  it('arms Fleet Auto for a fresh draft from the profile setting', async () => {
+    setCurrentModelSource('default')
+    mockConfig({ fleet: { parent_desktop_enabled: true } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+
+    expect(getCurrentModelSource()).toBe('fleet_auto')
+  })
+
+  it('keeps an explicit manual draft choice ahead of Fleet Auto', async () => {
+    setCurrentModelSource('manual')
+    mockConfig({ fleet: { parent_desktop_enabled: true } })
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    await act(async () => {
+      await result.current.refreshHermesConfig()
+    })
+
+    expect(getCurrentModelSource()).toBe('manual')
   })
 
   it('does not let terminal.cwd replace an active session workspace', async () => {

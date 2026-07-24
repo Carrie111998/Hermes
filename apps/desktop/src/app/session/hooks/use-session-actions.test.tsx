@@ -25,6 +25,7 @@ import {
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentProvider,
   setCurrentReasoningEffort,
   setMessages,
@@ -439,6 +440,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentModel.set('')
     $currentProvider.set('')
     $currentReasoningEffort.set('')
+    setCurrentModelSource('')
     setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
   })
@@ -478,6 +480,25 @@ describe('createBackendSessionForSend profile routing', () => {
     const params = await createWith(() => {})
 
     expect(params).toMatchObject({ source: 'desktop' })
+  })
+
+  it('sends Fleet Auto intent without leaking the stale manual model controls', async () => {
+    const params = await createWith(() => {
+      setCurrentModel('paid/provider-model')
+      setCurrentProvider('paid-provider')
+      setCurrentReasoningEffort('ultra')
+      setCurrentFastMode(true)
+      setCurrentModelSource('fleet_auto')
+    })
+
+    expect(params).toMatchObject({
+      fast: false,
+      model_source: 'fleet_auto',
+      source: 'desktop'
+    })
+    expect(params).not.toHaveProperty('model')
+    expect(params).not.toHaveProperty('provider')
+    expect(params).not.toHaveProperty('reasoning_effort')
   })
 
   it('passes the current workspace cwd into session.create', async () => {

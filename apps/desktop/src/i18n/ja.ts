@@ -904,6 +904,14 @@ export const ja = defineLocale({
         fallbackSummary:
           '完全に新しい容量情報を持つレーンはありませんが、設定済みのローテーションフォールバックにより、少なくとも 1 つの有効なレーンを選択できます。',
         lanesTitle: 'サブスクリプションレーン',
+        parentLanesTitle: 'Desktop 親レーン',
+        workerLanesTitle: 'タスクワーカーレーン',
+        parent: '親',
+        worker: 'ワーカー',
+        parentAuto: '新しい Desktop セッションで Fleet Auto を使用',
+        parentAutoDescription:
+          'セッション作成時に認定済みのサブスクリプション親を選択して固定します。手動のモデル選択が常に優先されます。',
+        parentAutoFailed: 'Fleet Auto を更新できませんでした',
         laneNames: {
           chatgpt_codex: 'ChatGPT / Codex',
           claude_code: 'Claude Code',
@@ -2686,6 +2694,7 @@ export const ja = defineLocale({
     cwdStagedMessage:
       'このアクティブなセッションへの cwd の変更を適用するにはデスクトップバックエンドを再起動してください。',
     modelSwitchFailed: 'モデルの切り替えに失敗しました',
+    fleetPinnedModelSwitchBlocked: 'Fleet 固定モデルを変更するには新しいセッションを開始してください',
     sessionExported: 'セッションをエクスポートしました',
     sessionExportFailed: 'セッションをエクスポートできませんでした',
     imageSaved: '画像を保存しました',

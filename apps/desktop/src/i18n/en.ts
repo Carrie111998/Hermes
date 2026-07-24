@@ -857,6 +857,14 @@ export const en: Translations = {
         fallbackSummary:
           'No lane has fully fresh capacity evidence, so deterministic rotation is active for eligible lanes.',
         lanesTitle: 'Subscription lanes',
+        parentLanesTitle: 'Desktop parent lanes',
+        workerLanesTitle: 'Task worker lanes',
+        parent: 'Parent',
+        worker: 'Worker',
+        parentAuto: 'Fleet Auto for new Desktop sessions',
+        parentAutoDescription:
+          'Choose and pin a qualified subscription parent at session creation. Manual model picks still take precedence.',
+        parentAutoFailed: 'Could not update Fleet Auto',
         laneNames: {
           chatgpt_codex: 'ChatGPT / Codex',
           claude_code: 'Claude Code',
@@ -2739,6 +2747,7 @@ export const en: Translations = {
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',
     modelSwitchFailed: 'Model switch failed',
+    fleetPinnedModelSwitchBlocked: 'Start a new session to change a Fleet-pinned model',
     sessionExported: 'Session exported',
     sessionExportFailed: 'Could not export session',
     imageSaved: 'Image saved',

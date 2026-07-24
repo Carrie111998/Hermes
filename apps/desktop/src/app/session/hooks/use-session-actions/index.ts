@@ -31,6 +31,7 @@ import {
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  getCurrentModelSource,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
   sessionPinId,
@@ -164,8 +165,11 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
     model: $currentModel.get().trim(),
-    provider: $currentProvider.get().trim()
+    provider: $currentProvider.get().trim(),
+    source: getCurrentModelSource()
   }
+
+  const fleetAuto = selection.source === 'fleet_auto'
 
   const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
   await ensureGatewayProfile(profile)
@@ -173,13 +177,14 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
   return {
     cols: 96,
     source: 'desktop',
+    model_source: fleetAuto ? 'fleet_auto' : selection.source === 'manual' ? 'manual' : 'default',
     ...(cwd && { cwd }),
     ...(profile ? { profile } : {}),
-    ...(selection.model
+    ...(!fleetAuto && selection.model
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
-    ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
-    fast: selection.fast
+    ...(!fleetAuto && selection.effort ? { reasoning_effort: selection.effort } : {}),
+    fast: fleetAuto ? false : selection.fast
   }
 }
 

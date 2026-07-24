@@ -172,7 +172,11 @@ export interface ClientSessionState {
   branch: string
   cwd: string
   model: string
+  modelDisplayLabel?: string
+  modelSource?: string
   provider: string
+  fleetAdapterKind?: string
+  fleetLaneId?: string
   reasoningEffort: string
   serviceTier: string
   fast: boolean

@@ -1,17 +1,29 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
-import { getFleetStatus } from '@/hermes'
+import {
+  getFleetStatus,
+  getHermesConfigRecordForProfile,
+  saveHermesConfigForProfile
+} from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Activity, GitBranch, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import type { FleetLaneEvaluation, FleetStatusResponse } from '@/types/hermes'
+import { setFleetAutoComposerEnabled } from '@/store/session'
+import type {
+  FleetLaneEvaluation,
+  FleetRoutePurpose,
+  FleetStatusResponse,
+  HermesConfigRecord
+} from '@/types/hermes'
 
-import { Pill, SettingsContent, SettingsSection } from './primitives'
+import { Pill, SettingsContent, SettingsSection, ToggleRow } from './primitives'
 
 const FLEET_SCHEMA_VERSION = 1
 
@@ -61,16 +73,26 @@ function Detail({ label, mono = false, value }: { label: string; mono?: boolean;
   )
 }
 
-function LaneRow({ evaluation }: { evaluation: FleetLaneEvaluation }) {
+function LaneRow({
+  evaluation,
+  purpose
+}: {
+  evaluation: FleetLaneEvaluation
+  purpose: FleetRoutePurpose
+}) {
   const { t } = useI18n()
   const copy = t.settings.providers.fleet
   const state = laneState(evaluation)
   const capacity = evaluation.capacity
   const laneName = copy.laneNames[evaluation.lane_id] ?? evaluation.lane_id
   const adapter = evaluation.adapter_kind === 'native_provider' ? copy.nativeProvider : copy.externalCli
+  const purposeLabel = purpose === 'desktop_parent' ? copy.parent : copy.worker
 
   return (
-    <article aria-label={laneName} className="border-t border-(--ui-stroke-tertiary) py-5 first:border-t-0 first:pt-1">
+    <article
+      aria-label={`${laneName} · ${purposeLabel}`}
+      className="border-t border-(--ui-stroke-tertiary) py-5 first:border-t-0 first:pt-1"
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="text-[length:var(--conversation-text-font-size)] font-medium text-foreground">{laneName}</h3>
@@ -80,6 +102,7 @@ function LaneRow({ evaluation }: { evaluation: FleetLaneEvaluation }) {
           <Pill tone={evaluation.enabled ? 'primary' : 'muted'}>
             {evaluation.enabled ? copy.enabled : copy.disabled}
           </Pill>
+          <Pill>{purposeLabel}</Pill>
           <Pill tone={state === 'selectable' ? 'primary' : state === 'fallback' ? 'warn' : 'muted'}>
             {state === 'selectable' ? copy.selectable : state === 'fallback' ? copy.rotationFallback : copy.blocked}
           </Pill>
@@ -94,7 +117,7 @@ function LaneRow({ evaluation }: { evaluation: FleetLaneEvaluation }) {
 
       <dl className="mt-4 grid gap-x-5 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
         <Detail label={copy.provider} mono value={evaluation.provider_id || copy.unavailable} />
-        <Detail label={copy.model} mono value={evaluation.model_id || copy.unavailable} />
+        <Detail label={copy.model} mono value={evaluation.model_label || evaluation.model_id || copy.unavailable} />
         <Detail label={copy.effort} mono value={evaluation.effort || copy.unavailable} />
         <Detail label={copy.adapter} mono value={`${adapter} · ${evaluation.adapter_kind}`} />
         <Detail label={copy.remaining} value={capacity ? `${capacity.effective_remaining_pct}%` : copy.unavailable} />
@@ -163,6 +186,7 @@ export function FleetRouterSettings() {
   const { t } = useI18n()
   const copy = t.settings.providers.fleet
   const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const [savingAuto, setSavingAuto] = useState(false)
 
   const query = useQuery({
     queryFn: () => getFleetStatus(activeProfile),
@@ -212,7 +236,47 @@ export function FleetRouterSettings() {
   }
 
   const payload = query.data
+  const workerStatus = payload.purposes?.task_worker
+  const parentStatus = payload.purposes?.desktop_parent
+  const workerEvaluations = workerStatus?.evaluations ?? payload.evaluations
+  const parentEvaluations = parentStatus?.evaluations ?? []
+  const parentEnabled = parentStatus?.enabled ?? false
   const fallbackCount = payload.evaluations.filter(item => item.fallback_eligible).length
+
+  const setParentAuto = async (enabled: boolean) => {
+    const profile = activeProfile
+    setSavingAuto(true)
+
+    try {
+      const current = await getHermesConfigRecordForProfile(profile)
+
+      const currentFleet =
+        current.fleet && typeof current.fleet === 'object'
+          ? (current.fleet as Record<string, unknown>)
+          : {}
+
+      const next: HermesConfigRecord = {
+        ...current,
+        fleet: {
+          ...currentFleet,
+          ...(enabled ? { enabled: true } : {}),
+          parent_desktop_enabled: enabled
+        }
+      }
+
+      await saveHermesConfigForProfile(next, profile)
+
+      if (normalizeProfileKey($activeGatewayProfile.get()) === profile) {
+        setFleetAutoComposerEnabled(enabled)
+      }
+
+      await query.refetch()
+    } catch (error) {
+      notifyError(error, copy.parentAutoFailed)
+    } finally {
+      setSavingAuto(false)
+    }
+  }
 
   const summary = !payload.enabled
     ? copy.fleetDisabledDetail
@@ -255,12 +319,31 @@ export function FleetRouterSettings() {
         <p className="mt-3 max-w-3xl text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-secondary)">
           {summary}
         </p>
+        <div className="mt-4 border-t border-(--ui-stroke-tertiary)">
+          <ToggleRow
+            checked={parentEnabled}
+            description={copy.parentAutoDescription}
+            disabled={savingAuto}
+            label={copy.parentAuto}
+            onChange={enabled => void setParentAuto(enabled)}
+          />
+        </div>
       </SettingsSection>
 
-      <SettingsSection icon={Activity} meta={String(payload.evaluations.length)} title={copy.lanesTitle}>
+      {parentEvaluations.length > 0 && (
+        <SettingsSection icon={Activity} meta={String(parentEvaluations.length)} title={copy.parentLanesTitle}>
+          <div>
+            {parentEvaluations.map(evaluation => (
+              <LaneRow evaluation={evaluation} key={`parent:${evaluation.lane_id}`} purpose="desktop_parent" />
+            ))}
+          </div>
+        </SettingsSection>
+      )}
+
+      <SettingsSection icon={Activity} meta={String(workerEvaluations.length)} title={copy.workerLanesTitle}>
         <div>
-          {payload.evaluations.map(evaluation => (
-            <LaneRow evaluation={evaluation} key={evaluation.lane_id} />
+          {workerEvaluations.map(evaluation => (
+            <LaneRow evaluation={evaluation} key={`worker:${evaluation.lane_id}`} purpose="task_worker" />
           ))}
         </div>
       </SettingsSection>

@@ -8,7 +8,11 @@ import {
   $busy,
   $currentCwd,
   $currentFastMode,
+  $currentFleetAdapterKind,
+  $currentFleetLaneId,
   $currentModel,
+  $currentModelDisplayLabel,
+  $currentModelSource,
   $currentProvider,
   $currentReasoningEffort,
   $lastVisibleMessageIsUser,
@@ -39,7 +43,11 @@ export interface SessionView {
   $lastVisibleIsUser: ReadableAtom<boolean>
   $cwd: ReadableAtom<string>
   $model: ReadableAtom<string>
+  $modelDisplayLabel: ReadableAtom<string>
+  $modelSource: ReadableAtom<string>
   $provider: ReadableAtom<string>
+  $fleetAdapterKind: ReadableAtom<string>
+  $fleetLaneId: ReadableAtom<string>
   $fast: ReadableAtom<boolean>
   $reasoningEffort: ReadableAtom<string>
 }
@@ -54,7 +62,11 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $messages,
   $messagesEmpty,
   $model: $currentModel,
+  $modelDisplayLabel: $currentModelDisplayLabel,
+  $modelSource: $currentModelSource,
   $provider: $currentProvider,
+  $fleetAdapterKind: $currentFleetAdapterKind,
+  $fleetLaneId: $currentFleetLaneId,
   $reasoningEffort: $currentReasoningEffort,
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId

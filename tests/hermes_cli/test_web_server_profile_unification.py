@@ -706,10 +706,15 @@ class TestProfileScopedFleetStatus:
             config = SimpleNamespace(
                 default_reservation_pct=Decimal("5.000"),
                 enabled=True,
+                parent_desktop_enabled=True,
             )
 
             def inspect(self, task):
                 seen["task"] = task
+                return evaluations
+
+            def inspect_parent(self, task):
+                seen["parent_task"] = task
                 return evaluations
 
         def fake_build_fleet_service():
@@ -730,6 +735,7 @@ class TestProfileScopedFleetStatus:
         assert response.status_code == 200
         assert seen["home"] == isolated_profiles["worker_beta"]
         assert seen["task"].task_id == "read-only-doctor"
+        assert seen["parent_task"] is seen["task"]
         payload = response.json()
         assert payload["schema_version"] == 1
         assert payload["command"] == "doctor"
@@ -746,8 +752,12 @@ class TestProfileScopedFleetStatus:
         assert codex["enabled"] is True
         assert codex["selectable"] is True
         assert codex["fallback_eligible"] is False
+        assert codex["model_label"] == "GPT-5.6 Sol"
         assert codex["capacity"]["effective_remaining_pct"] == "75.000"
         assert codex["qualification_detail"] == "qualified chatgpt_codex"
+        assert payload["purposes"]["task_worker"]["eligible"] is True
+        assert payload["purposes"]["desktop_parent"]["enabled"] is True
+        assert payload["purposes"]["desktop_parent"]["eligible"] is True
 
     def test_unknown_profile_returns_404(self, client, isolated_profiles):
         response = client.get(
