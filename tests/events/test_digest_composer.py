@@ -216,10 +216,31 @@ class TestRowidWatermark:
         composer = self._composer(bus, tmp_path)
         bus.emit(EventType.JOB_DISCOVERED, "scout", {})
         composer.compose()
+        # The persisted watermark is the head snapshotted BEFORE the second
+        # compose's own DIGEST_GENERATED emit — capture it here so the compare
+        # is deterministic (head after compose() would include that emit).
+        head_before_second = bus.head_rowid()
         d2 = composer.compose()
         assert "No activity" in d2
         state = load_state(digest_state_path(), default={})
-        assert state["last_digest_rowid"] == bus.head_rowid()
+        assert state["last_digest_rowid"] == head_before_second
+
+    def test_watermark_is_preread_snapshot_not_post_emit(self, bus, tmp_path, monkeypatch):
+        """The persisted watermark must be the head snapshotted BEFORE the read
+        (and before compose's own DIGEST_GENERATED emit), so an event landing
+        during delivery is picked up next run rather than skipped forever."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from events.paths import digest_state_path
+        from events.state import load_state
+        composer = self._composer(bus, tmp_path)
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})  # rowid 1
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})  # rowid 2
+        composer.compose()  # reads through=2, then emits DIGEST_GENERATED (rowid 3)
+        state = load_state(digest_state_path(), default={})
+        assert state["last_digest_rowid"] == 2, (
+            "must persist the pre-read head (2), not a head recomputed after the "
+            "DIGEST_GENERATED emit (3) — else the audit event and any event "
+            "emitted during delivery are dropped from the next window")
 
     def test_first_run_seeds_floor_from_last_digest_at(self, bus, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

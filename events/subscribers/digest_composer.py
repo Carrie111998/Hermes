@@ -65,6 +65,18 @@ class DigestComposer(BaseSubscriber):
         events = self.bus.query_rowid_range(after, through)
         now_iso = datetime.now(timezone.utc).isoformat()
 
+        # Persist the pre-read snapshot as the watermark now — BEFORE delivery
+        # and BEFORE the DIGEST_GENERATED emit below. Persisting `through`
+        # (not a head recomputed later) keeps the next window gap-free: any
+        # event emitted during delivery, and this method's own audit emit, has
+        # rowid > through and is picked up next run rather than skipped forever.
+        self._last_digest_rowid = through
+        self._last_digest_at = now_iso
+        save_state(
+            digest_state_path(),
+            {"last_digest_at": now_iso, "last_digest_rowid": through},
+        )
+
         snapshot = self._load_notifier_snapshot()
 
         if not events:
@@ -85,14 +97,6 @@ class DigestComposer(BaseSubscriber):
             event_type=EventType.DIGEST_GENERATED,
             source="digest-composer",
             payload={"period": self._get_period_label(), "event_count": len(events)},
-        )
-
-        # Persist watermark and timestamp after emit so watermark includes the digest event
-        self._last_digest_rowid = self.bus.head_rowid()
-        self._last_digest_at = now_iso
-        save_state(
-            digest_state_path(),
-            {"last_digest_at": now_iso, "last_digest_rowid": self._last_digest_rowid},
         )
 
         return digest
