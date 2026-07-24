@@ -418,6 +418,25 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
     except Exception as e:
         print(f"   ⚠  Workflow event handler error: {e}")
 
+    # Always check if final-layer cards need subscribing — the hook above
+    # may return early if current_layer is already advanced past the end,
+    # but the final-layer cards still need a subscription for notification.
+    try:
+        result2 = _find_state_for_card(task_id)
+        if result2 is not None:
+            state2, _ = result2
+            layers2 = state2.get("layers", [])
+            if layers2:
+                final_layer_nids = layers2[-1]
+                all_final_done = all(
+                    state2.get("states", {}).get(nid, {}).get("status") == "done"
+                    for nid in final_layer_nids
+                )
+                if all_final_done and state2.get("session_info"):
+                    _subscribe_final_layer(state2, len(layers2) - 1, layers2)
+    except Exception:
+        pass
+
 
 def _save_state_file(path, state):
     """Persist the workflow state file."""
