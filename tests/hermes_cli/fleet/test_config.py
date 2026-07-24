@@ -14,6 +14,7 @@ def test_defaults_are_disabled_conservative_and_documented_in_main_config():
     config = parse_fleet_config({})
 
     assert config.enabled is False
+    assert config.parent_desktop_enabled is False
     assert config.bridge_usage_file.as_posix() == "C:/HermesBridge/usage-weekly.json"
     assert config.switch_delta_pct == Decimal("20.000")
     assert config.minimum_confidence is Confidence.HIGH
@@ -23,15 +24,25 @@ def test_defaults_are_disabled_conservative_and_documented_in_main_config():
     assert config.lanes["chatgpt_codex"].enabled is True
     assert config.lanes["claude_code"].enabled is False
     assert DEFAULT_CONFIG["fleet"]["enabled"] is False
+    assert DEFAULT_CONFIG["fleet"]["parent_desktop_enabled"] is False
     assert DEFAULT_CONFIG["fleet"]["rotation_without_fresh_capacity"] is False
 
 
-def test_stale_capacity_rotation_is_explicitly_opt_in():
+def test_deprecated_stale_capacity_flag_is_accepted_but_ignored():
     config = parse_fleet_config(
         {"fleet": {"rotation_without_fresh_capacity": True}}
     )
 
-    assert config.rotation_without_fresh_capacity is True
+    assert config.rotation_without_fresh_capacity is False
+
+
+def test_parent_desktop_admission_has_an_explicit_default_off_gate():
+    config = parse_fleet_config(
+        {"fleet": {"enabled": True, "parent_desktop_enabled": True}}
+    )
+
+    assert config.enabled is True
+    assert config.parent_desktop_enabled is True
 
 
 def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():
@@ -48,19 +59,28 @@ def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():
     assert profiles[0].provider_id == "openai-codex"
     assert profiles[0].supported_efforts[-2:] == ("max", "ultra")
     assert profiles[0].selected_effort == "max"
+    assert profiles[0].supports_task_worker
+    assert profiles[0].supports_parent_session
     assert profiles[1].adapter_kind is AdapterKind.EXTERNAL_CLI
     assert profiles[1].executable == "claude"
     assert profiles[1].supported_efforts == ("low", "medium", "high", "max")
     assert profiles[1].selected_effort == "high"
+    assert profiles[1].supports_task_worker
+    assert not profiles[1].supports_parent_session
     assert profiles[2].provider_id == "xai-oauth"
     assert profiles[2].supported_efforts[-2:] == ("max", "ultra")
     assert profiles[2].selected_effort == "max"
+    assert profiles[2].supports_parent_session
     assert profiles[3].implemented
     assert profiles[3].executable == "agy"
     assert profiles[3].ordered_models == ("gemini-3.1-pro-high",)
     assert profiles[3].supported_efforts == ("low", "medium", "high")
     assert profiles[3].selected_effort == "medium"
+    assert profiles[3].supports_task_worker
+    assert not profiles[3].supports_parent_session
     assert not profiles[4].implemented
+    assert not profiles[4].supports_task_worker
+    assert not profiles[4].supports_parent_session
 
 
 @pytest.mark.parametrize(

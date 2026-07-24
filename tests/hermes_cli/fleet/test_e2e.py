@@ -28,6 +28,8 @@ from hermes_cli.fleet.types import (
     Freshness,
     LaneInputs,
     LaneProfile,
+    MeasurementKind,
+    OverageState,
     Qualification,
     ReasonCode,
     TaskSpec,
@@ -67,9 +69,11 @@ def _qualification(profile: LaneProfile) -> Qualification:
         capabilities=profile.capabilities,
         evidence_id="qualification:e2e",
         detail=(
-            "policy evidence: subscription OAuth route; "
-            "overage_disabled is policy, not provider billing telemetry"
+            "observed subscription OAuth route with billing isolation"
         ),
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
     )
 
 
@@ -89,6 +93,9 @@ def _snapshot(lane_id: str = "chatgpt_codex") -> CapacitySnapshot:
         confidence=Confidence.HIGH,
         schema_version="1",
         overage_disabled=True,
+        comparability_group="subscription-weekly",
+        quota_window_id="2026-W30",
+        measurement_kind=MeasurementKind.MEASURED,
     )
 
 
@@ -127,6 +134,9 @@ def _bridge(path: Path) -> None:
                         "remaining_pct": "90.000",
                         "confidence": "high",
                         "overage_disabled": True,
+                        "comparability_group": "subscription-weekly",
+                        "quota_window_id": "2026-W30",
+                        "measurement_kind": "measured",
                     }
                 },
             },

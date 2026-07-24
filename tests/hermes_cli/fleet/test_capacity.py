@@ -8,7 +8,12 @@ from decimal import Decimal
 import pytest
 
 from hermes_cli.fleet.capacity import BridgeUsageAdapter
-from hermes_cli.fleet.types import Confidence, Freshness, ReasonCode
+from hermes_cli.fleet.types import (
+    Confidence,
+    Freshness,
+    MeasurementKind,
+    ReasonCode,
+)
 
 
 NOW = datetime(2026, 7, 24, 0, 0, tzinfo=timezone.utc)
@@ -20,6 +25,9 @@ def _payload(**lane_overrides: object) -> dict[str, object]:
         "remaining_pct": "75.000",
         "confidence": "high",
         "overage_disabled": True,
+        "comparability_group": "subscription-weekly",
+        "quota_window_id": "2026-W30",
+        "measurement_kind": "measured",
     }
     lane.update(lane_overrides)
     return {
@@ -51,6 +59,9 @@ def test_bridge_normalizes_attributable_per_lane_capacity_without_writing(tmp_pa
     assert result.snapshot.reserved_pct == Decimal("5.000")
     assert result.snapshot.effective_remaining_pct == Decimal("70.000")
     assert result.snapshot.freshness is Freshness.FRESH
+    assert result.snapshot.comparability_group == "subscription-weekly"
+    assert result.snapshot.quota_window_id == "2026-W30"
+    assert result.snapshot.measurement_kind is MeasurementKind.MEASURED
     assert result.snapshot.source_id.endswith(f"#{before}")
     assert result.snapshot.read_at == NOW
     assert result.snapshot.expires_at.isoformat() == "2026-07-24T01:30:00+00:00"
@@ -119,6 +130,23 @@ def test_bridge_marks_expired_samples_stale_with_provenance(tmp_path):
     assert result.snapshot is not None
     assert result.snapshot.freshness is Freshness.STALE
     assert result.reason is ReasonCode.CAPACITY_STALE
+
+
+def test_bridge_preserves_usage_without_synthesizing_comparability(tmp_path):
+    path = tmp_path / "usage-weekly.json"
+    payload = _payload()
+    lane = payload["lanes"]["chatgpt_codex"]  # type: ignore[index]
+    lane.pop("comparability_group")
+    lane.pop("quota_window_id")
+    lane.pop("measurement_kind")
+    _write(path, payload)
+
+    result = BridgeUsageAdapter(path).read("chatgpt_codex", now=NOW)
+
+    assert result.snapshot is not None
+    assert result.snapshot.comparability_group is None
+    assert result.snapshot.quota_window_id is None
+    assert result.snapshot.measurement_kind is MeasurementKind.UNKNOWN
 
 
 def test_bridge_rejects_future_duplicate_and_oversized_documents(tmp_path):
@@ -197,6 +225,9 @@ def test_bridge_reads_live_plans_schema_with_deterministic_labels_and_row_times(
     assert claude.used_pct == Decimal("40.500")
     assert claude.captured_at.isoformat() == "2026-07-23T23:30:00+00:00"
     assert codex.overage_disabled is None
+    assert codex.comparability_group is None
+    assert codex.quota_window_id is None
+    assert codex.measurement_kind is MeasurementKind.UNKNOWN
 
 
 @pytest.mark.parametrize(

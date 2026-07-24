@@ -9,7 +9,14 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from .types import CapacityRead, CapacitySnapshot, Confidence, Freshness, ReasonCode
+from .types import (
+    CapacityRead,
+    CapacitySnapshot,
+    Confidence,
+    Freshness,
+    MeasurementKind,
+    ReasonCode,
+)
 
 
 _QUANTUM = Decimal("0.001")
@@ -77,6 +84,14 @@ def _plan_lane(label: object) -> str | None:
         label.strip().lower().replace("-", " ").replace("·", " ").split()
     )
     return _PLAN_LABELS.get(normalized)
+
+
+def _optional_identifier(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value.strip()
 
 
 class BridgeUsageAdapter:
@@ -153,6 +168,15 @@ class BridgeUsageAdapter:
             if abs((used + remaining) - _TOTAL) > _QUANTUM:
                 raise ValueError("used and remaining percentages disagree")
             confidence = Confidence(lane.get("confidence"))
+            comparability_group = _optional_identifier(
+                lane.get("comparability_group"), "comparability_group"
+            )
+            quota_window_id = _optional_identifier(
+                lane.get("quota_window_id"), "quota_window_id"
+            )
+            measurement_kind = MeasurementKind(
+                lane.get("measurement_kind", MeasurementKind.UNKNOWN.value)
+            )
             overage_disabled = lane.get("overage_disabled")
             if not isinstance(overage_disabled, bool):
                 raise ValueError("overage_disabled must be explicit")
@@ -178,6 +202,9 @@ class BridgeUsageAdapter:
                 confidence=confidence,
                 schema_version="1",
                 overage_disabled=overage_disabled,
+                comparability_group=comparability_group,
+                quota_window_id=quota_window_id,
+                measurement_kind=measurement_kind,
             )
             reason = (
                 None if freshness is Freshness.FRESH else ReasonCode.CAPACITY_STALE
@@ -249,6 +276,17 @@ class BridgeUsageAdapter:
                 confidence=confidence,
                 schema_version="plans-1",
                 overage_disabled=None,
+                comparability_group=_optional_identifier(
+                    matched.get("comparability_group"), "comparability_group"
+                ),
+                quota_window_id=_optional_identifier(
+                    matched.get("quota_window_id"), "quota_window_id"
+                ),
+                measurement_kind=MeasurementKind(
+                    matched.get(
+                        "measurement_kind", MeasurementKind.UNKNOWN.value
+                    )
+                ),
             )
             return CapacityRead(
                 snapshot,

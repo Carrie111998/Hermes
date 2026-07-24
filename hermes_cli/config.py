@@ -944,10 +944,11 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
-    # Subscription-aware fleet routing is an opt-in CLI + skill edge feature.
-    # It never changes the provider/model of an existing Hermes conversation.
+    # Subscription-aware fleet routing is opt-in. Parent Desktop admission is
+    # separately gated and happens only before a new agent is constructed.
     "fleet": {
         "enabled": False,
+        "parent_desktop_enabled": False,
         "bridge_usage_file": "C:/HermesBridge/usage-weekly.json",
         "switch_delta_pct": 20.0,
         "minimum_confidence": "high",

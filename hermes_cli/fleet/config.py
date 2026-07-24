@@ -21,6 +21,7 @@ DEFERRED_LANES = frozenset({"kimi"})
 
 DEFAULT_FLEET_CONFIG: dict[str, Any] = {
     "enabled": False,
+    "parent_desktop_enabled": False,
     "bridge_usage_file": "C:/HermesBridge/usage-weekly.json",
     "switch_delta_pct": 20.0,
     "minimum_confidence": "high",
@@ -83,6 +84,7 @@ class LaneConfig:
 @dataclass(frozen=True)
 class FleetConfig:
     enabled: bool
+    parent_desktop_enabled: bool
     bridge_usage_file: Path
     switch_delta_pct: Decimal
     minimum_confidence: Confidence
@@ -145,6 +147,10 @@ def parse_fleet_config(config: Mapping[str, Any] | None) -> FleetConfig:
         raise FleetConfigError(f"unknown fleet option: {sorted(unknown)[0]}")
 
     enabled = _bool(root.get("enabled", False), "fleet.enabled")
+    parent_desktop_enabled = _bool(
+        root.get("parent_desktop_enabled", False),
+        "fleet.parent_desktop_enabled",
+    )
     bridge = root.get(
         "bridge_usage_file", DEFAULT_FLEET_CONFIG["bridge_usage_file"]
     )
@@ -215,10 +221,13 @@ def parse_fleet_config(config: Mapping[str, Any] | None) -> FleetConfig:
 
     return FleetConfig(
         enabled=enabled,
+        parent_desktop_enabled=parent_desktop_enabled,
         bridge_usage_file=Path(bridge),
         switch_delta_pct=switch,
         minimum_confidence=Confidence.HIGH,
-        rotation_without_fresh_capacity=rotation_without_fresh_capacity,
+        # Accepted for one compatibility release, but intentionally ignored.
+        # Missing/stale usage now always falls back to deterministic rotation.
+        rotation_without_fresh_capacity=False,
         lease_ttl_seconds=ttl,
         execution_timeout_seconds=timeout,
         default_reservation_pct=reservation,

@@ -15,6 +15,7 @@ from hermes_cli.fleet.types import (
     AdapterKind,
     AdapterResult,
     LaneProfile,
+    OverageState,
     Qualification,
     ReasonCode,
     TaskSpec,
@@ -51,6 +52,9 @@ def _qualification(profile: LaneProfile) -> Qualification:
         fast_off_supported=True,
         capabilities=profile.capabilities,
         evidence_id=f"qualification:{profile.lane_id}",
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
     )
 
 
@@ -61,6 +65,9 @@ def _bridge(path: Path, capacities: dict[str, str]) -> None:
             "remaining_pct": remaining,
             "confidence": "high",
             "overage_disabled": True,
+            "comparability_group": "subscription-weekly",
+            "quota_window_id": "2026-W30",
+            "measurement_kind": "measured",
         }
         for lane_id, remaining in capacities.items()
     }
@@ -187,11 +194,11 @@ def test_continuation_keeps_pin_when_capacity_reverses(tmp_path):
     ].count("ROUTE_SELECTED") == 1
 
 
-def test_pinned_lane_failure_does_not_migrate_or_start_another_adapter(tmp_path):
-    service, adapter, bridge = _service(tmp_path)
+def test_pinned_lane_unavailable_does_not_migrate_or_start_another_adapter(tmp_path):
+    service, adapter, _ = _service(tmp_path)
     first = service.run(_task(), prompt="first")
     assert first.ok
-    _bridge(bridge, {"claude_code": "100"})
+    service.qualifications.pop("chatgpt_codex")
 
     continued = service.run(_task(), prompt="continue")
 
@@ -248,7 +255,7 @@ def test_rate_limit_result_sets_cooldown_and_releases_lease(tmp_path):
     assert service.store.active_reserved_pct("chatgpt_codex", now=NOW) == 0
 
 
-def test_stale_fallback_rate_limit_keeps_cooldown_and_audit_contract(tmp_path):
+def test_stale_rotation_rate_limit_keeps_cooldown_and_audit_contract(tmp_path):
     bridge = tmp_path / "usage.json"
     bridge.write_text(
         json.dumps(
@@ -302,7 +309,8 @@ def test_stale_fallback_rate_limit_keeps_cooldown_and_audit_contract(tmp_path):
     result = service.run(_task(), prompt="bounded task")
 
     assert not result.ok
-    assert result.evaluations[0].fallback_eligible
+    assert result.evaluations[0].eligible
+    assert ReasonCode.USAGE_STALE in result.evaluations[0].reasons
     assert service.store.cooldown("grok", now=NOW) == (
         NOW + timedelta(seconds=120),
         "PROVIDER_RATE_LIMIT",
@@ -312,7 +320,7 @@ def test_stale_fallback_rate_limit_keeps_cooldown_and_audit_contract(tmp_path):
         for event in service.store.audit(task_id="task-1")
         if event["event_type"] == "ROUTE_SELECTED"
     )
-    assert route["reason_code"] == ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY.value
+    assert route["reason_code"] == ReasonCode.ROTATION.value
     assert route["decision"]["selection_reason"] == route["reason_code"]
     assert route["decision"]["capacity_source"] is None
 

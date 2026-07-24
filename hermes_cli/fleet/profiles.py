@@ -24,6 +24,7 @@ def ordered_profiles() -> tuple[LaneProfile, ...]:
             allowed_auth_kinds=frozenset({"oauth_subscription"}),
             fast_mode_supported=False,
             fast_off_verifiable=True,
+            supports_parent_session=True,
         ),
         LaneProfile(
             lane_id="claude_code",
@@ -37,6 +38,7 @@ def ordered_profiles() -> tuple[LaneProfile, ...]:
             executable="claude",
             fast_mode_supported=False,
             fast_off_verifiable=True,
+            supports_parent_session=False,
         ),
         LaneProfile(
             lane_id="grok",
@@ -51,6 +53,7 @@ def ordered_profiles() -> tuple[LaneProfile, ...]:
             allowed_auth_kinds=frozenset({"oauth_subscription"}),
             fast_mode_supported=False,
             fast_off_verifiable=True,
+            supports_parent_session=True,
         ),
         LaneProfile(
             lane_id="antigravity",
@@ -64,6 +67,7 @@ def ordered_profiles() -> tuple[LaneProfile, ...]:
             executable="agy",
             implemented=True,
             fast_off_verifiable=True,
+            supports_parent_session=False,
         ),
         LaneProfile(
             lane_id="kimi",
@@ -76,6 +80,8 @@ def ordered_profiles() -> tuple[LaneProfile, ...]:
             allowed_auth_kinds=frozenset({"cli_subscription"}),
             implemented=False,
             fast_off_verifiable=False,
+            supports_task_worker=False,
+            supports_parent_session=False,
         ),
     )
 

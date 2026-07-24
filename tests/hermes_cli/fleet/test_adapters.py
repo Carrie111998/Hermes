@@ -15,6 +15,7 @@ from hermes_cli.fleet.types import (
     AdapterKind,
     AdapterRequest,
     LaneProfile,
+    OverageState,
     Qualification,
     ReasonCode,
 )
@@ -57,6 +58,9 @@ def _qualification(
         executable=profile.executable,
         version="1.0.0",
         evidence_id="qualification:test",
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
     )
 
 

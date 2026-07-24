@@ -16,8 +16,11 @@ from hermes_cli.fleet.types import (
     Freshness,
     LaneInputs,
     LaneProfile,
+    MeasurementKind,
+    OverageState,
     Qualification,
     ReasonCode,
+    RoutePurpose,
     TaskSpec,
 )
 
@@ -58,6 +61,9 @@ def _qualification(profile: LaneProfile) -> Qualification:
         fast_off_supported=True,
         capabilities=profile.capabilities,
         evidence_id=f"qualification:{profile.lane_id}",
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
     )
 
 
@@ -79,6 +85,9 @@ def _capacity(lane_id: str, remaining: str = "60.000") -> CapacityRead:
             confidence=Confidence.HIGH,
             schema_version="1",
             overage_disabled=True,
+            comparability_group="subscription-weekly",
+            quota_window_id="2026-W30",
+            measurement_kind=MeasurementKind.MEASURED,
         ),
         None,
     )
@@ -184,37 +193,6 @@ def _inputs(profile: LaneProfile | None = None, remaining: str = "60.000"):
             ReasonCode.RESERVE_FLOOR,
         ),
         (
-            lambda i: replace(
-                i, capacity=CapacityRead(None, ReasonCode.CAPACITY_MISSING)
-            ),
-            ReasonCode.CAPACITY_MISSING,
-        ),
-        (
-            lambda i: replace(
-                i,
-                capacity=replace(
-                    i.capacity,
-                    snapshot=replace(
-                        i.capacity.snapshot, freshness=Freshness.STALE  # type: ignore[arg-type]
-                    ),
-                    reason=ReasonCode.CAPACITY_STALE,
-                ),
-            ),
-            ReasonCode.CAPACITY_STALE,
-        ),
-        (
-            lambda i: replace(
-                i,
-                capacity=replace(
-                    i.capacity,
-                    snapshot=replace(
-                        i.capacity.snapshot, confidence=Confidence.LOW  # type: ignore[arg-type]
-                    ),
-                ),
-            ),
-            ReasonCode.CAPACITY_CONFIDENCE_LOW,
-        ),
-        (
             lambda i: replace(i, cooldown_until=NOW + timedelta(minutes=1)),
             ReasonCode.LANE_COOLDOWN,
         ),
@@ -234,6 +212,88 @@ def test_model_policy_uses_strongest_model_second_highest_effort_and_fast_off():
     assert evaluation.reasons == (ReasonCode.MET,)
     assert evaluation.selected_model == "m1"
     assert evaluation.selected_effort == "high"
+
+
+def test_desktop_parent_excludes_external_worker_without_parent_session_support():
+    profile = replace(
+        _profile("antigravity"),
+        adapter_kind=AdapterKind.EXTERNAL_CLI,
+        supports_parent_session=False,
+    )
+
+    evaluation = evaluate_lane(
+        _inputs(profile),
+        TASK,
+        now=NOW,
+        purpose=RoutePurpose.DESKTOP_PARENT,
+    )
+
+    assert not evaluation.eligible
+    assert ReasonCode.PARENT_SESSION_UNSUPPORTED in evaluation.reasons
+
+
+@pytest.mark.parametrize(
+    ("lane_id", "provider_id"),
+    [
+        ("chatgpt_codex", "openai-codex"),
+        ("grok", "xai-oauth"),
+    ],
+)
+def test_native_parent_requires_exact_subscription_qualification(
+    lane_id, provider_id
+):
+    profile = replace(
+        _profile(lane_id),
+        provider_id=provider_id,
+        supports_parent_session=True,
+    )
+    inputs = _inputs(profile)
+
+    qualified = evaluate_lane(
+        inputs,
+        TASK,
+        now=NOW,
+        purpose=RoutePurpose.DESKTOP_PARENT,
+    )
+    unproven = evaluate_lane(
+        replace(
+            inputs,
+            qualification=replace(
+                inputs.qualification,  # type: ignore[arg-type]
+                subscription_only_proven=False,
+            ),
+        ),
+        TASK,
+        now=NOW,
+        purpose=RoutePurpose.DESKTOP_PARENT,
+    )
+
+    assert qualified.eligible
+    assert not unproven.eligible
+    assert ReasonCode.SUBSCRIPTION_NOT_PROVEN in unproven.reasons
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"subscription_only_proven": False}, ReasonCode.SUBSCRIPTION_NOT_PROVEN),
+        ({"paid_fallback_absent": False}, ReasonCode.PAID_FALLBACK_PRESENT),
+        ({"overage_state": OverageState.UNKNOWN}, ReasonCode.OVERAGE_STATUS_UNKNOWN_OR_ON),
+        ({"overage_state": OverageState.ON}, ReasonCode.OVERAGE_STATUS_UNKNOWN_OR_ON),
+    ],
+)
+def test_billing_safety_requires_observed_evidence_not_policy_text(changes, reason):
+    inputs = _inputs()
+    qualification = replace(inputs.qualification, **changes)  # type: ignore[arg-type]
+
+    evaluation = evaluate_lane(
+        replace(inputs, qualification=qualification),
+        TASK,
+        now=NOW,
+    )
+
+    assert not evaluation.eligible
+    assert reason in evaluation.reasons
 
 
 @pytest.mark.parametrize(
@@ -257,6 +317,33 @@ def test_exact_twenty_point_switch_boundary(delta, expected_lane, switched):
 
     assert decision.lane_id == expected_lane
     assert decision.switch_applied is switched
+    assert decision.reason is (
+        ReasonCode.BALANCE_THRESHOLD if switched else ReasonCode.ROTATION
+    )
+
+
+def test_non_comparable_usage_never_overrides_deterministic_rotation():
+    priority = _inputs(_profile("chatgpt_codex", 0), "60.000")
+    alternative = _inputs(_profile("grok", 1), "100.000")
+    alternative = replace(
+        alternative,
+        capacity=replace(
+            alternative.capacity,
+            snapshot=replace(
+                alternative.capacity.snapshot,  # type: ignore[arg-type]
+                comparability_group="different-plan",
+            ),
+        ),
+    )
+    evaluations = tuple(
+        evaluate_lane(item, TASK, now=NOW) for item in (priority, alternative)
+    )
+
+    decision = select_lane(evaluations, rotation_index=0)
+
+    assert decision.lane_id == "chatgpt_codex"
+    assert decision.reason is ReasonCode.ROTATION
+    assert ReasonCode.USAGE_NOT_COMPARABLE in decision.evaluations[1].reasons
 
 
 def test_exact_top_capacity_ties_rotate_in_fixed_order_without_hidden_mutation():
@@ -278,13 +365,12 @@ def test_exact_top_capacity_ties_rotate_in_fixed_order_without_hidden_mutation()
     assert second.lane_id == "claude_code"
 
 
-def test_live_capacity_shape_rotates_fallbacks_without_stale_override():
+def test_stale_capacity_rotates_without_preempting_or_blocking():
     candidates = (
         _inputs(_profile("chatgpt_codex", 0), "84.000"),
         _inputs(_profile("claude_code", 1), "11.000"),
         replace(
             _inputs(_profile("grok", 2), "99.000"),
-            rotation_without_fresh_capacity=True,
             capacity=replace(
                 _capacity("grok", "99.000"),
                 snapshot=replace(
@@ -297,7 +383,6 @@ def test_live_capacity_shape_rotates_fallbacks_without_stale_override():
         ),
         replace(
             _inputs(_profile("antigravity", 3), "100.000"),
-            rotation_without_fresh_capacity=True,
             capacity=replace(
                 _capacity("antigravity", "100.000"),
                 snapshot=replace(
@@ -314,11 +399,11 @@ def test_live_capacity_shape_rotates_fallbacks_without_stale_override():
     )
 
     claude, grok, agy = evaluations[1:]
-    assert not claude.eligible and not claude.fallback_eligible
+    assert not claude.eligible
     assert ReasonCode.RESERVE_FLOOR in claude.reasons
-    assert not grok.eligible and grok.fallback_eligible
-    assert not agy.eligible and agy.fallback_eligible
-    assert ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY in grok.reasons
+    assert grok.eligible and not grok.fallback_eligible
+    assert agy.eligible and not agy.fallback_eligible
+    assert ReasonCode.USAGE_STALE in grok.reasons
     assert ReasonCode.MET not in grok.reasons
 
     first = select_lane(evaluations, rotation_index=0)
@@ -327,15 +412,14 @@ def test_live_capacity_shape_rotates_fallbacks_without_stale_override():
 
     assert (first.lane_id, first.rotation_index) == ("chatgpt_codex", 1)
     assert (grok_turn.lane_id, grok_turn.rotation_index) == ("grok", 2)
-    assert grok_turn.reason is ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY
+    assert grok_turn.reason is ReasonCode.ROTATION
     assert (agy_turn.lane_id, agy_turn.rotation_index) == ("antigravity", 0)
-    assert agy_turn.reason is ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY
+    assert agy_turn.reason is ReasonCode.ROTATION
 
 
-def test_stale_fallback_capacity_never_participates_in_reserve_arithmetic():
+def test_stale_capacity_never_participates_in_reserve_arithmetic():
     stale = replace(
         _inputs(_profile("grok", 0), "1.000"),
-        rotation_without_fresh_capacity=True,
         capacity=replace(
             _capacity("grok", "1.000"),
             snapshot=replace(
@@ -349,8 +433,33 @@ def test_stale_fallback_capacity_never_participates_in_reserve_arithmetic():
 
     evaluation = evaluate_lane(stale, TASK, now=NOW)
 
-    assert evaluation.fallback_eligible
+    assert evaluation.eligible
     assert ReasonCode.RESERVE_FLOOR not in evaluation.reasons
+    assert ReasonCode.USAGE_STALE in evaluation.reasons
+
+
+def test_missing_capacity_uses_rotation_instead_of_no_route():
+    missing = replace(
+        _inputs(_profile("chatgpt_codex", 0)),
+        capacity=CapacityRead(None, ReasonCode.CAPACITY_MISSING),
+    )
+    evaluation = evaluate_lane(missing, TASK, now=NOW)
+
+    decision = select_lane((evaluation,), rotation_index=0)
+
+    assert evaluation.eligible
+    assert ReasonCode.CAPACITY_MISSING in evaluation.reasons
+    assert decision.lane_id == "chatgpt_codex"
+    assert decision.reason is ReasonCode.ROTATION
+
+
+def test_explicit_exhaustion_still_blocks_the_lane():
+    exhausted = _inputs(_profile("chatgpt_codex", 0), "0.000")
+
+    evaluation = evaluate_lane(exhausted, TASK, now=NOW)
+
+    assert not evaluation.eligible
+    assert ReasonCode.CAPACITY_EXHAUSTED in evaluation.reasons
 
 
 def test_no_eligible_lane_returns_complete_evaluations():

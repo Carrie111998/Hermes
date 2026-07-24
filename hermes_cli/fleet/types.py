@@ -17,13 +17,19 @@ from typing import Any, FrozenSet, Mapping, Sequence
 
 class ReasonCode(str, Enum):
     MET = "MET"
+    ROTATION = "ROTATION"
+    BALANCE_THRESHOLD = "BALANCE_THRESHOLD"
     LANE_DISABLED = "LANE_DISABLED"
+    PURPOSE_UNSUPPORTED = "PURPOSE_UNSUPPORTED"
+    PARENT_SESSION_UNSUPPORTED = "PARENT_SESSION_UNSUPPORTED"
     ADAPTER_UNIMPLEMENTED = "ADAPTER_UNIMPLEMENTED"
     PLATFORM_UNSUPPORTED = "PLATFORM_UNSUPPORTED"
     ADAPTER_NOT_FOUND = "ADAPTER_NOT_FOUND"
     AUTH_MISSING = "AUTH_MISSING"
     AUTH_KIND_FORBIDDEN = "AUTH_KIND_FORBIDDEN"
     AUTH_SOURCE_UNKNOWN = "AUTH_SOURCE_UNKNOWN"
+    SUBSCRIPTION_NOT_PROVEN = "SUBSCRIPTION_NOT_PROVEN"
+    PAID_FALLBACK_PRESENT = "PAID_FALLBACK_PRESENT"
     OVERAGE_STATUS_UNKNOWN_OR_ON = "OVERAGE_STATUS_UNKNOWN_OR_ON"
     QUALIFICATION_FAILED = "QUALIFICATION_FAILED"
     QUALIFICATION_STALE = "QUALIFICATION_STALE"
@@ -35,6 +41,9 @@ class ReasonCode(str, Enum):
     CAPACITY_INVALID = "CAPACITY_INVALID"
     CAPACITY_STALE = "CAPACITY_STALE"
     CAPACITY_CONFIDENCE_LOW = "CAPACITY_CONFIDENCE_LOW"
+    CAPACITY_EXHAUSTED = "CAPACITY_EXHAUSTED"
+    USAGE_STALE = "USAGE_STALE"
+    USAGE_NOT_COMPARABLE = "USAGE_NOT_COMPARABLE"
     ROTATION_WITHOUT_FRESH_CAPACITY = "ROTATION_WITHOUT_FRESH_CAPACITY"
     LANE_COOLDOWN = "LANE_COOLDOWN"
     NO_ELIGIBLE_LANE = "NO_ELIGIBLE_LANE"
@@ -57,6 +66,11 @@ class AdapterKind(str, Enum):
     EXTERNAL_CLI = "external_cli"
 
 
+class RoutePurpose(str, Enum):
+    TASK_WORKER = "task_worker"
+    DESKTOP_PARENT = "desktop_parent"
+
+
 class Freshness(str, Enum):
     FRESH = "fresh"
     STALE = "stale"
@@ -67,6 +81,18 @@ class Confidence(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+
+
+class MeasurementKind(str, Enum):
+    MEASURED = "measured"
+    ESTIMATED = "estimated"
+    UNKNOWN = "unknown"
+
+
+class OverageState(str, Enum):
+    OFF = "off"
+    ON = "on"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -85,6 +111,9 @@ class CapacitySnapshot:
     confidence: Confidence
     schema_version: str
     overage_disabled: bool | None
+    comparability_group: str | None = None
+    quota_window_id: str | None = None
+    measurement_kind: MeasurementKind = MeasurementKind.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -118,6 +147,8 @@ class LaneProfile:
     fast_mode_supported: bool = False
     fast_off_verifiable: bool = True
     executable: str | None = None
+    supports_task_worker: bool = True
+    supports_parent_session: bool = False
 
     @property
     def selected_model(self) -> str | None:
@@ -146,6 +177,9 @@ class Qualification:
     version: str | None = None
     evidence_id: str = ""
     detail: str = ""
+    subscription_only_proven: bool = False
+    paid_fallback_absent: bool = False
+    overage_state: OverageState = OverageState.UNKNOWN
 
 
 @dataclass(frozen=True)

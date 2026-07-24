@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -10,7 +11,10 @@ from .types import (
     Freshness,
     LaneEvaluation,
     LaneInputs,
+    MeasurementKind,
+    OverageState,
     ReasonCode,
+    RoutePurpose,
     RouteDecision,
     TaskSpec,
 )
@@ -30,6 +34,7 @@ def evaluate_lane(
     *,
     now: datetime | None = None,
     minimum_confidence: Confidence = Confidence.HIGH,
+    purpose: RoutePurpose = RoutePurpose.TASK_WORKER,
 ) -> LaneEvaluation:
     """Evaluate every gate without short-circuiting the reason matrix."""
 
@@ -37,11 +42,18 @@ def evaluate_lane(
     profile = inputs.profile
     qualification = inputs.qualification
     reasons: list[ReasonCode] = []
-    capacity_reasons: list[ReasonCode] = []
+    usage_reasons: list[ReasonCode] = []
 
     # 1. Basic eligibility.
     if not inputs.enabled:
         reasons.append(ReasonCode.LANE_DISABLED)
+    if purpose is RoutePurpose.TASK_WORKER and not profile.supports_task_worker:
+        reasons.append(ReasonCode.PURPOSE_UNSUPPORTED)
+    if (
+        purpose is RoutePurpose.DESKTOP_PARENT
+        and not profile.supports_parent_session
+    ):
+        reasons.append(ReasonCode.PARENT_SESSION_UNSUPPORTED)
     if not profile.implemented:
         reasons.append(ReasonCode.ADAPTER_UNIMPLEMENTED)
     if not profile.platform_supported:
@@ -57,7 +69,14 @@ def evaluate_lane(
             reasons.append(ReasonCode.AUTH_KIND_FORBIDDEN)
         if not qualification.auth_source:
             reasons.append(ReasonCode.AUTH_SOURCE_UNKNOWN)
-        if qualification.overage_disabled is not True:
+        if not qualification.subscription_only_proven:
+            reasons.append(ReasonCode.SUBSCRIPTION_NOT_PROVEN)
+        if not qualification.paid_fallback_absent:
+            reasons.append(ReasonCode.PAID_FALLBACK_PRESENT)
+        if (
+            qualification.overage_disabled is not True
+            or qualification.overage_state is not OverageState.OFF
+        ):
             reasons.append(ReasonCode.OVERAGE_STATUS_UNKNOWN_OR_ON)
 
     # 3. Qualification and model policy.
@@ -108,10 +127,16 @@ def evaluate_lane(
         and snapshot.freshness is Freshness.FRESH
         and _CONFIDENCE_RANK[snapshot.confidence]
         >= _CONFIDENCE_RANK[minimum_confidence]
+        and snapshot.measurement_kind is MeasurementKind.MEASURED
     )
 
     # 6. Protected reserve. Untrusted percentages never enter arithmetic.
     if trustworthy_capacity:
+        if (
+            snapshot.remaining_pct <= Decimal("0")  # type: ignore[union-attr]
+            or snapshot.effective_remaining_pct <= Decimal("0")  # type: ignore[union-attr]
+        ):
+            reasons.append(ReasonCode.CAPACITY_EXHAUSTED)
         after_reservation = (
             snapshot.remaining_pct  # type: ignore[union-attr]
             - inputs.active_reserved_pct
@@ -120,52 +145,47 @@ def evaluate_lane(
         if after_reservation < inputs.reserve_floor_pct:
             reasons.append(ReasonCode.RESERVE_FLOOR)
 
-    # 7. Capacity evidence.
+    # 7. Capacity evidence is advisory unless it directly proves exhaustion or
+    # a reserve-floor breach. Unknown/stale/non-comparable usage rotates.
     if snapshot is None:
-        capacity_reasons.append(
+        usage_reasons.append(
             inputs.capacity.reason or ReasonCode.CAPACITY_MISSING
         )
     else:
         if snapshot.freshness is not Freshness.FRESH:
-            capacity_reasons.append(
-                inputs.capacity.reason or ReasonCode.CAPACITY_STALE
-            )
+            usage_reasons.append(ReasonCode.USAGE_STALE)
         if _CONFIDENCE_RANK[snapshot.confidence] < _CONFIDENCE_RANK[minimum_confidence]:
-            capacity_reasons.append(ReasonCode.CAPACITY_CONFIDENCE_LOW)
+            usage_reasons.append(ReasonCode.USAGE_STALE)
+        if (
+            snapshot.measurement_kind is not MeasurementKind.MEASURED
+            or not snapshot.comparability_group
+            or not snapshot.quota_window_id
+        ):
+            usage_reasons.append(ReasonCode.USAGE_NOT_COMPARABLE)
 
     # 8. Cooldown.
     if inputs.cooldown_until is not None and inputs.cooldown_until > at:
         reasons.append(ReasonCode.LANE_COOLDOWN)
 
-    stale_or_missing = (
-        snapshot is None
-        and (inputs.capacity.reason or ReasonCode.CAPACITY_MISSING)
-        is ReasonCode.CAPACITY_MISSING
-    ) or (
-        snapshot is not None and snapshot.freshness is Freshness.STALE
-    )
-    fallback_eligible = (
-        inputs.rotation_without_fresh_capacity
-        and stale_or_missing
-        and not reasons
-    )
-    if fallback_eligible:
-        reasons.append(ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY)
-    reasons.extend(capacity_reasons)
-
     # Preserve deterministic ordering while avoiding duplicate codes caused by
     # related auth/capacity evidence.
-    unique_reasons = tuple(dict.fromkeys(reasons))
-    eligible = not unique_reasons
+    hard_reasons = tuple(dict.fromkeys(reasons))
+    advisory_reasons = tuple(dict.fromkeys(usage_reasons))
+    eligible = not hard_reasons
+    evaluation_reasons = (
+        advisory_reasons
+        if eligible and advisory_reasons
+        else ((ReasonCode.MET,) if eligible else hard_reasons + advisory_reasons)
+    )
     return LaneEvaluation(
         lane_id=profile.lane_id,
         profile=profile,
         capacity=snapshot,
         eligible=eligible,
-        reasons=(ReasonCode.MET,) if eligible else unique_reasons,
+        reasons=evaluation_reasons,
         selected_model=selected_model,
         selected_effort=selected_effort,
-        fallback_eligible=fallback_eligible,
+        fallback_eligible=False,
         qualification_evidence_id=(
             qualification.evidence_id if qualification is not None else ""
         ),
@@ -184,11 +204,7 @@ def select_lane(
     """Select a lane deterministically without mutating rotation state."""
 
     ordered = tuple(sorted(evaluations, key=lambda item: item.profile.order))
-    pool = tuple(
-        item
-        for item in ordered
-        if item.eligible or item.fallback_eligible
-    )
+    pool = tuple(item for item in ordered if item.eligible)
     if not pool:
         return RouteDecision(
             lane_id=None,
@@ -200,11 +216,24 @@ def select_lane(
     chosen_pos = rotation_index % len(pool)
     cyclic = pool[chosen_pos]
     chosen = cyclic
-    if cyclic.eligible and cyclic.capacity is not None:
-        fresh = tuple(item for item in pool if item.eligible)
+    annotated: dict[str, LaneEvaluation] = {}
+    comparable = tuple(
+        item for item in pool if _capacity_is_comparable(cyclic, item)
+    )
+    for item in pool:
+        if (
+            item.capacity is not None
+            and cyclic.capacity is not None
+            and item is not cyclic
+            and item not in comparable
+        ):
+            annotated[item.lane_id] = _with_reason(
+                item, ReasonCode.USAGE_NOT_COMPARABLE
+            )
+    if comparable and cyclic in comparable and cyclic.capacity is not None:
         best_remaining = max(
             item.capacity.effective_remaining_pct  # type: ignore[union-attr]
-            for item in fresh
+            for item in comparable
         )
         difference = (
             best_remaining - cyclic.capacity.effective_remaining_pct
@@ -212,19 +241,54 @@ def select_lane(
         if difference >= switch_delta:
             chosen = next(
                 item
-                for item in fresh
+                for item in comparable
                 if item.capacity is not None
                 and item.capacity.effective_remaining_pct == best_remaining
             )
 
+    decision_evaluations = tuple(
+        annotated.get(item.lane_id, item) for item in ordered
+    )
     return RouteDecision(
         lane_id=chosen.lane_id,
         reason=(
-            ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY
-            if chosen.fallback_eligible
-            else ReasonCode.MET
+            ReasonCode.BALANCE_THRESHOLD
+            if chosen is not cyclic
+            else ReasonCode.ROTATION
         ),
-        evaluations=ordered,
+        evaluations=decision_evaluations,
         rotation_index=(chosen_pos + 1) % len(pool),
         switch_applied=chosen is not cyclic,
     )
+
+
+def _capacity_is_comparable(
+    cyclic: LaneEvaluation,
+    candidate: LaneEvaluation,
+) -> bool:
+    left = cyclic.capacity
+    right = candidate.capacity
+    return bool(
+        left is not None
+        and right is not None
+        and left.freshness is Freshness.FRESH
+        and right.freshness is Freshness.FRESH
+        and left.confidence is Confidence.HIGH
+        and right.confidence is Confidence.HIGH
+        and left.measurement_kind is MeasurementKind.MEASURED
+        and right.measurement_kind is MeasurementKind.MEASURED
+        and left.comparability_group
+        and left.comparability_group == right.comparability_group
+        and left.quota_window_id
+        and left.quota_window_id == right.quota_window_id
+    )
+
+
+def _with_reason(
+    evaluation: LaneEvaluation,
+    reason: ReasonCode,
+) -> LaneEvaluation:
+    if reason in evaluation.reasons:
+        return evaluation
+    reasons = tuple(code for code in evaluation.reasons if code is not ReasonCode.MET)
+    return replace(evaluation, reasons=reasons + (reason,))

@@ -18,6 +18,8 @@ from hermes_cli.fleet.types import (
     Freshness,
     LaneInputs,
     LaneProfile,
+    MeasurementKind,
+    OverageState,
     Qualification,
     ReasonCode,
     TaskSpec,
@@ -57,6 +59,9 @@ def _candidate(
         fast_off_supported=True,
         capabilities=profile.capabilities,
         evidence_id=f"qualification:{lane_id}",
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
     )
     rem = Decimal(remaining).quantize(Decimal("0.001"))
     capacity = CapacitySnapshot(
@@ -74,6 +79,9 @@ def _candidate(
         confidence=Confidence.HIGH,
         schema_version="1",
         overage_disabled=True,
+        comparability_group="subscription-weekly",
+        quota_window_id="2026-W30",
+        measurement_kind=MeasurementKind.MEASURED,
     )
     return LaneInputs(
         profile=profile,

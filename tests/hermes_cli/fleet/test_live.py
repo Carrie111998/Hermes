@@ -17,7 +17,7 @@ from hermes_cli.fleet.adapters.live_routes import (
 from hermes_cli.fleet.adapters.native_provider import NativeProviderAdapter
 from hermes_cli.fleet.live import FleetQualificationDoctor
 from hermes_cli.fleet.profiles import profile_map
-from hermes_cli.fleet.types import TaskSpec
+from hermes_cli.fleet.types import OverageState, TaskSpec
 from hermes_cli.subcommands.fleet import _default_service
 
 
@@ -66,7 +66,10 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
     )
     assert qualifications["chatgpt_codex"].models == ("gpt-5.6-sol",)
     assert qualifications["chatgpt_codex"].efforts[-2:] == ("max", "ultra")
-    assert qualifications["chatgpt_codex"].overage_disabled is True
+    assert qualifications["chatgpt_codex"].subscription_only_proven is True
+    assert qualifications["chatgpt_codex"].paid_fallback_absent is True
+    assert qualifications["chatgpt_codex"].overage_disabled is False
+    assert qualifications["chatgpt_codex"].overage_state is OverageState.UNKNOWN
     assert qualifications["grok"].models == ("grok-4.5",)
     assert qualifications["grok"].efforts[-2:] == ("max", "ultra")
     assert qualifications["claude_code"].models == ("claude-opus-4-8",)
@@ -214,6 +217,7 @@ def test_default_service_qualifies_and_executes_each_live_lane(
         which=lambda _: sys.executable,
         command=command,
         environment={},
+        billing_status=lambda _: {"overage_state": "off"},
         now=lambda: NOW,
     )
 

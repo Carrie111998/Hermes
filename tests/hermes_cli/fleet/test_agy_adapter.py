@@ -11,7 +11,12 @@ import pytest
 
 from hermes_cli.fleet.adapters.live_routes import AntigravityAdapter
 from hermes_cli.fleet.profiles import profile_map
-from hermes_cli.fleet.types import AdapterRequest, Qualification, ReasonCode
+from hermes_cli.fleet.types import (
+    AdapterRequest,
+    OverageState,
+    Qualification,
+    ReasonCode,
+)
 
 
 NOW = datetime(2026, 7, 24, tzinfo=timezone.utc)
@@ -54,6 +59,9 @@ def _qualification(request: AdapterRequest) -> Qualification:
         executable=executable,
         version="agy 1.2.3",
         evidence_id="qualification:agy",
+        subscription_only_proven=True,
+        paid_fallback_absent=True,
+        overage_state=OverageState.OFF,
     )
 
 

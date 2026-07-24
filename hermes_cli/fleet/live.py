@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .types import AdapterKind, LaneProfile, Qualification
+from .types import AdapterKind, LaneProfile, OverageState, Qualification
 
 
 _FORBIDDEN_ENV = {
@@ -47,6 +47,7 @@ class FleetQualificationDoctor:
         which: Callable[[str], str | None] = shutil.which,
         command: Callable[[Sequence[str]], tuple[int, str, str]] = _command,
         environment: Mapping[str, str] | None = None,
+        billing_status: Callable[[str], Mapping[str, object]] | None = None,
         now: Callable[[], datetime] | None = None,
         platform_name: str | None = None,
     ) -> None:
@@ -58,6 +59,7 @@ class FleetQualificationDoctor:
         self.which = which
         self.command = command
         self.environment = dict(os.environ if environment is None else environment)
+        self.billing_status = billing_status
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.platform_name = os.name if platform_name is None else platform_name
 
@@ -218,28 +220,39 @@ class FleetQualificationDoctor:
                 policy_detail = (
                     "policy evidence: authenticated first-party Claude subscription "
                     "route and forbidden billable API-key env absent; "
-                    "overage_disabled is policy, not provider billing telemetry"
+                    "provider overage state requires separate billing telemetry"
                 )
             elif profile.lane_id == "antigravity":
                 policy_detail = (
                     "policy evidence: agy executable/version plus exact model "
                     "qualification from `agy models` and forbidden billable API-key "
                     "env absent; requested model is not provider-reported served-model "
-                    "proof; overage_disabled is policy, not provider billing telemetry"
+                    "proof; provider overage state requires separate billing telemetry"
                 )
             else:
                 policy_detail = (
                     f"policy evidence: {profile.provider_id} subscription OAuth "
                     "route and forbidden billable API-key env absent; "
-                    "overage_disabled is policy, not provider billing telemetry"
+                    "provider overage state requires separate billing telemetry"
                 )
+            billing = (
+                dict(self.billing_status(profile.lane_id))
+                if self.billing_status is not None
+                else {}
+            )
+            try:
+                overage_state = OverageState(
+                    str(billing.get("overage_state", OverageState.UNKNOWN.value))
+                )
+            except ValueError:
+                overage_state = OverageState.UNKNOWN
             result[profile.lane_id] = Qualification(
                 qualified=True,
                 captured_at=at,
                 expires_at=at + timedelta(minutes=5),
                 auth_kind=auth_kind,
                 auth_source=auth_source,
-                overage_disabled=True,
+                overage_disabled=overage_state is OverageState.OFF,
                 provider_id=profile.provider_id,
                 models=models,
                 efforts=profile.supported_efforts,
@@ -249,5 +262,8 @@ class FleetQualificationDoctor:
                 version=version,
                 evidence_id=f"live-doctor:{profile.lane_id}:{at.isoformat()}",
                 detail=policy_detail,
+                subscription_only_proven=True,
+                paid_fallback_absent=True,
+                overage_state=overage_state,
             )
         return result
