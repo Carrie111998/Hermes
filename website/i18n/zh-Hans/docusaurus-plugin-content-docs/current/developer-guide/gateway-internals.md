@@ -92,7 +92,7 @@ agent:main:{platform}:{chat_type}:{chat_id}
 Gateway 使用多层授权检查，按顺序评估：
 
 1. **平台级全量放行标志**（如 `TELEGRAM_ALLOW_ALL_USERS`）— 若设置，该平台所有用户均被授权
-2. **平台白名单**（如 `TELEGRAM_ALLOWED_USERS`）— 逗号分隔的用户 ID
+2. **平台白名单**——来自 `config.yaml`（`platforms.<name>.extra.allow_from`）或对应环境变量（如 `TELEGRAM_ALLOWED_USERS`）
 3. **DM 配对** — 已认证用户可通过配对码为新用户授权
 4. **全局放行标志**（`GATEWAY_ALLOW_ALL_USERS`）— 若设置，所有平台的所有用户均被授权
 5. **默认：拒绝** — 未授权用户被拒绝
