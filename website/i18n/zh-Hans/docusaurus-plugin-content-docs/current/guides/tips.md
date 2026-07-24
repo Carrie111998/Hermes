@@ -218,15 +218,18 @@ Hermes 在执行每条命令前都会与一份精心维护的危险模式列表�
 
 ### 为消息 Bot 使用白名单
 
-永远不要在拥有终端访问权限的 bot 上设置 `GATEWAY_ALLOW_ALL_USERS=true`。始终使用平台专属白名单（`TELEGRAM_ALLOWED_USERS`、`DISCORD_ALLOWED_USERS`）或 DM 配对来控制谁可以与你的 agent 交互。
+永远不要在拥有终端访问权限的 bot 上设置 `GATEWAY_ALLOW_ALL_USERS=true`。始终使用平台专属白名单或 DM 配对来控制谁可以与你的 agent 交互。
 
-```bash
-# Recommended: explicit allowlists per platform
-TELEGRAM_ALLOWED_USERS=123456789,987654321
-DISCORD_ALLOWED_USERS=123456789012345678
-
-# Or use cross-platform allowlist
-GATEWAY_ALLOWED_USERS=123456789,987654321
+```yaml
+# 推荐：在 config.yaml 中为每个平台配置显式白名单
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_from: "123456789,987654321"
+    discord:
+      extra:
+        allow_from: "123456789012345678"
 ```
 
 ---

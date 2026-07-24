@@ -29,7 +29,8 @@ import type {
   SessionInfo,
   SlashCatalog,
   SudoReq,
-  Usage
+  Usage,
+  WelcomeBannerConfig
 } from '../types.js'
 
 export interface StateSetter<T> {
