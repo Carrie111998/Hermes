@@ -3116,7 +3116,7 @@ class AIAgent:
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
-        On failure, store ``{path: {error_preview, tool}}`` entries.  On
+        On failure, store ``{path: {error_preview, tool, kind}}`` entries.  On
         success, remove any prior failure entries for the same paths (the
         model recovered within the turn).  Silently no-ops if the per-turn
         state dict hasn't been initialised yet (e.g. a tool dispatched
@@ -3137,6 +3137,20 @@ class AIAgent:
                 changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
         if is_error and not landed:
             preview = _extract_error_preview(result)
+            # A rejected call with missing conditional arguments never reached
+            # the filesystem. Keep it in per-turn state so a later successful
+            # call can supersede it, but don't present it as an attempted edit
+            # that the model may have falsely claimed succeeded (#70719).
+            kind = (
+                "args_missing"
+                if preview.strip().lower()
+                in {
+                    "path required",
+                    "old_string and new_string required",
+                    "patch content required",
+                }
+                else "apply_failed"
+            )
             for path in targets:
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
@@ -3145,6 +3159,7 @@ class AIAgent:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "kind": kind,
                     }
         else:
             for path in targets:
@@ -3220,6 +3235,17 @@ class AIAgent:
         bare-path media extractor can never auto-attach a protected file
         (e.g. ``~/.hermes/config.yaml``) to a messaging channel (#35584).
         """
+        # Tool-call formation errors (for example a replace patch missing
+        # ``old_string``) never attempted a write. Their tool result remains
+        # available to the agent, but the overclaim footer is reserved for
+        # failures that actually attempted a mutation (#70719).  Missing
+        # ``kind`` preserves the pre-classification behavior for callers that
+        # construct this data directly.
+        failed = {
+            path: info
+            for path, info in failed.items()
+            if info.get("kind", "apply_failed") != "args_missing"
+        }
         if not failed:
             return ""
         lines = [
