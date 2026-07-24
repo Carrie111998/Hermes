@@ -315,7 +315,17 @@ function resolveWindowsPowerShell() {
 function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, hermesHome } = {}) {
   return new Promise((resolve, reject) => {
     const ps = process.platform === 'win32' ? resolveWindowsPowerShell() : 'pwsh'
-    const fullArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, ...args]
+    // Prepend a UTF-8 setup so Chinese output from install.ps1 doesn't arrive
+    // as GBK and get mojibake'd by the 'utf8' stream decoder below.
+    // Using -Command with proper quoting instead of -File so we can set
+    // [Console]::OutputEncoding before the script runs.
+    const quotedScript = "'" + scriptPath.replace(/'/g, "''") + "'"
+    const quotedArgs = args.map(a => "'" + String(a).replace(/'/g, "''") + "'").join(' ')
+    const fullArgs = [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass',
+      '-Command',
+      "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; & " + quotedScript + (quotedArgs ? ' ' + quotedArgs : '')
+    ]
 
     const child = spawn(ps, fullArgs, hiddenWindowsChildOptions({
       stdio: ['ignore', 'pipe', 'pipe'],
