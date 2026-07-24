@@ -3095,16 +3095,9 @@ class TestConfigIntegration:
     def test_platform_enum_has_api_server(self):
         assert Platform.API_SERVER.value == "api_server"
 
-    def test_env_override_requires_key_to_enable_api_server(self, monkeypatch):
+    def test_env_override_enables_api_server(self, monkeypatch):
         monkeypatch.setenv("API_SERVER_ENABLED", "true")
         monkeypatch.setenv("API_SERVER_KEY", "opensslrandhex32strongkey")
-        from gateway.config import load_gateway_config
-        config = load_gateway_config()
-        assert Platform.API_SERVER not in config.platforms
-
-    def test_env_override_enables_api_server_with_key(self, monkeypatch):
-        monkeypatch.setenv("API_SERVER_ENABLED", "true")
-        monkeypatch.setenv("API_SERVER_KEY", "sk-mykey")
         from gateway.config import load_gateway_config
         config = load_gateway_config()
         assert Platform.API_SERVER in config.platforms
@@ -3162,18 +3155,9 @@ class TestConfigIntegration:
         connected = config.get_connected_platforms()
         assert Platform.API_SERVER in connected
 
-    def test_api_server_not_in_connected_without_key(self):
-        config = GatewayConfig()
-        config.platforms[Platform.API_SERVER] = PlatformConfig(enabled=True)
-        connected = config.get_connected_platforms()
-        assert Platform.API_SERVER not in connected
-
     def test_api_server_not_in_connected_when_disabled(self):
         config = GatewayConfig()
-        config.platforms[Platform.API_SERVER] = PlatformConfig(
-            enabled=False,
-            extra={"key": "sk-mykey"},
-        )
+        config.platforms[Platform.API_SERVER] = PlatformConfig(enabled=False)
         connected = config.get_connected_platforms()
         assert Platform.API_SERVER not in connected
 

@@ -6079,6 +6079,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "`/platform resume api_server`.",
                 retryable=False,
             )
+            # Close any ResponseStore opened during __init__ so a rejected key
+            # cannot leak SQLite connections across reconnect attempts.
+            self._close_response_store()
             return False
 
         try:

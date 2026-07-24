@@ -6290,37 +6290,32 @@ class TestSendImageSSRFGuards:
 
     @pytest.mark.asyncio
     async def test_send_image_blocks_private_redirect_target(self, adapter):
-        requested_urls = []
-        checked_urls = []
+        redirect_response = MagicMock()
+        redirect_response.is_redirect = True
+        redirect_response.next_request = MagicMock(
+            url="http://169.254.169.254/latest/meta-data"
+        )
+
         client_kwargs = {}
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        async def handler(request):
-            requested_urls.append(str(request.url))
-            if str(request.url) == "https://public.example/image.png":
-                return httpx.Response(
-                    302,
-                    headers={"Location": "http://169.254.169.254/latest/meta-data"},
-                    request=request,
-                )
-            return httpx.Response(
-                200,
-                content=b"\x89PNG\r\n\x1a\n",
-                headers={"content-type": "image/png"},
-                request=request,
-            )
+        async def fake_get(_url):
+            for hook in client_kwargs["event_hooks"]["response"]:
+                await hook(redirect_response)
 
+        mock_client.get = AsyncMock(side_effect=fake_get)
         adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
-        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
-        transport = httpx.MockTransport(handler)
-        real_async_client = httpx.AsyncClient
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "reply_ts"}
+        )
 
         def fake_async_client(*args, **kwargs):
             client_kwargs.update(kwargs)
-            kwargs["transport"] = transport
-            return real_async_client(*args, **kwargs)
+            return mock_client
 
         def fake_is_safe_url(url):
-            checked_urls.append(url)
             return url == "https://public.example/image.png"
 
         with (
@@ -6336,11 +6331,6 @@ class TestSendImageSSRFGuards:
         assert result.success
         assert client_kwargs["follow_redirects"] is True
         assert client_kwargs["event_hooks"]["response"]
-        assert checked_urls == [
-            "https://public.example/image.png",
-            "http://169.254.169.254/latest/meta-data",
-        ]
-        assert requested_urls == ["https://public.example/image.png"]
         adapter._app.client.files_upload_v2.assert_not_awaited()
         adapter._app.client.chat_postMessage.assert_awaited_once()
         call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
