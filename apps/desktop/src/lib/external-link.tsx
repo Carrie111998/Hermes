@@ -1,7 +1,11 @@
 import type { ComponentProps, ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 
+import { Button } from '@/components/ui/button'
+import { Tip } from '@/components/ui/tooltip'
+import { useI18n } from '@/i18n'
 import { ArrowUpRight } from '@/lib/icons'
+import { openPreviewUrl } from '@/store/preview'
 
 import { resolveBrandIcon } from './brand-icon'
 import { cn } from './utils'
@@ -204,7 +208,11 @@ export function openExternalLink(href: string): void {
 interface ExternalLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {
   href: string
   children?: ReactNode
+  /** Label for the preview-pane button's tab (falls back to the link text). */
+  previewLabel?: string
   showExternalIcon?: boolean
+  /** Render the "open in preview pane" button as a sibling of the anchor. */
+  showPreviewButton?: boolean
 }
 
 export function ExternalLinkIcon({ className }: { className?: string }) {
@@ -227,17 +235,49 @@ export function LinkBrandIcon({ className, href }: { className?: string; href: s
   ) : null
 }
 
+// "Open in preview pane" button. Rendered as a SIBLING of the anchor, never
+// inside it — nesting an interactive control in a link is invalid HTML, traps
+// keyboard users inside the link, and makes both controls fire on one click.
+// http(s) only: file paths travel through the file-card path, and non-web
+// schemes are rejected by openPreviewUrl anyway, so a dead button never shows.
+function PreviewPaneButton({ href, label }: { href: string; label?: string }) {
+  const { t } = useI18n()
+
+  if (!/^https?:\/\//i.test(href)) {
+    return null
+  }
+
+  return (
+    <Tip label={t.preview.openInPane}>
+      <Button
+        aria-label={t.preview.openInPane}
+        className="ml-1 inline-flex size-[0.78em] align-[-0.08em] p-0"
+        onClick={event => {
+          event.preventDefault()
+          event.stopPropagation()
+          void openPreviewUrl(href, label)
+        }}
+        size="icon-xs"
+        variant="ghost"
+      >
+        <span aria-hidden className="text-[1.15em] leading-none">🖥️</span>
+      </Button>
+    </Tip>
+  )
+}
+
 export function ExternalLink({
   children,
   className,
   href,
   onClick,
+  previewLabel,
   showExternalIcon = false,
+  showPreviewButton = false,
   ...rest
 }: ExternalLinkProps) {
   const target = normalizeExternalUrl(href)
-
-  return (
+  const link = (
     <a
       className={cn('ref', className)}
       href={target}
@@ -260,24 +300,55 @@ export function ExternalLink({
       {showExternalIcon && <ExternalLinkIcon />}
     </a>
   )
+
+  if (!showPreviewButton) {
+    return link
+  }
+
+  return (
+    <span className="inline-flex items-center">
+      {link}
+      <PreviewPaneButton
+        href={target}
+        label={previewLabel ?? (typeof children === 'string' ? children : undefined)}
+      />
+    </span>
+  )
 }
 
 interface PrettyLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {
   href: string
   label?: string
   fallbackLabel?: string
+  /** Render the "open in preview pane" button next to the link (chat markdown
+   *  links opt in so the 🖥 button shows for ordinary URLs). */
+  showPreviewButton?: boolean
 }
 
 // Title resolution is a fallback, not an override. Both props carry authored
 // text — chat markdown passes `fallbackLabel` — so either one skips the fetch.
-export function PrettyLink({ className, fallbackLabel, href, label, ...rest }: PrettyLinkProps) {
+export function PrettyLink({
+  className,
+  fallbackLabel,
+  href,
+  label,
+  showPreviewButton = false,
+  ...rest
+}: PrettyLinkProps) {
   const target = useMemo(() => normalizeExternalUrl(href), [href])
   const authoredLabel = label?.trim() || fallbackLabel?.trim()
   const fetched = useLinkTitle(authoredLabel ? null : target)
   const display = authoredLabel || fetched || urlSlugTitleLabel(target)
 
   return (
-    <ExternalLink className={cn('wrap-break-word', className)} href={target} title={target} {...rest}>
+    <ExternalLink
+      className={cn('wrap-break-word', className)}
+      href={target}
+      previewLabel={display}
+      showPreviewButton={showPreviewButton}
+      title={target}
+      {...rest}
+    >
       <LinkBrandIcon href={target} />
       {display}
     </ExternalLink>

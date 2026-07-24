@@ -2167,7 +2167,10 @@ export interface Translations {
     opening: string
     hide: string
     openPreview: string
+    openExternally: string
+    openFile: (label: string) => string
     openInBrowser: string
+    openInPane: string
     linkHint: string
     sourceLineTitle: string
     source: string

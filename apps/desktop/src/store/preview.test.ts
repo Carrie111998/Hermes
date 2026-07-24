@@ -13,6 +13,7 @@ import {
   closeRightRail,
   closeRightRailTab,
   openPreview,
+  openPreviewUrl,
   previewTabId,
   type PreviewTarget,
   progressPreviewServerRestart
@@ -132,5 +133,58 @@ describe('preview store', () => {
     openPreview({ ...fileTarget('/work/shot.png'), dataUrl: 'data:image/png;base64,AAAA', previewKind: 'image' })
 
     expect(window.localStorage.getItem('hermes.desktop.previewTabs.v2') ?? '').not.toContain('base64')
+  })
+
+  describe('openPreviewUrl', () => {
+    it('opens a URL in the preview pane with an explicit label', async () => {
+      await openPreviewUrl('https://example.com', 'Example')
+
+      expect($previewTarget.get()).toEqual({
+        kind: 'url',
+        label: 'Example',
+        source: 'https://example.com',
+        url: 'https://example.com'
+      })
+      expect($paneOpen(PREVIEW_PANE_ID).get()).toBe(true)
+      expect($rightRailActiveTabId.get()).toBe('url:https://example.com')
+    })
+
+    it('derives the label from the URL when none is given', async () => {
+      await openPreviewUrl('https://example.com/page')
+
+      expect($previewTarget.get()?.label).toBe('page')
+      expect($previewTarget.get()?.url).toBe('https://example.com/page')
+    })
+
+    it('accepts http URLs and localhost', async () => {
+      await openPreviewUrl('http://localhost:5173')
+
+      expect($previewTarget.get()).toEqual({
+        kind: 'url',
+        label: 'localhost:5173',
+        source: 'http://localhost:5173',
+        url: 'http://localhost:5173'
+      })
+    })
+
+    it('rejects non-web schemes and empty URLs without touching the rail', async () => {
+      const before = $previewTarget.get()
+
+      expect(await openPreviewUrl('javascript:alert(1)')).toBeNull()
+      expect(await openPreviewUrl('data:text/html,<script>alert(1)</script>')).toBeNull()
+      expect(await openPreviewUrl('file:///etc/passwd')).toBeNull()
+      expect(await openPreviewUrl('')).toBeNull()
+
+      expect($previewTarget.get()).toBe(before)
+      expect($previewTabs.get()).toHaveLength(0)
+    })
+
+    it('re-fronts an existing tab for the same URL instead of duplicating it', async () => {
+      await openPreviewUrl('https://example.com', 'First')
+      await openPreviewUrl('https://example.com', 'Second')
+
+      expect($previewTabs.get()).toHaveLength(1)
+      expect($previewTarget.get()?.label).toBe('Second')
+    })
   })
 })
