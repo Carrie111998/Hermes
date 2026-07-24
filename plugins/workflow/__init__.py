@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger("plugins.workflow")
-_COMPLETIONS_DIR = Path.home() / ".hermes" / "workflows" / "completions"
+# Completions directory: alongside workflow files
+_wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+if not _wf_dir:
+    _wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
+_COMPLETIONS_DIR = Path(_wf_dir) / "completions"
 
 # ---------------------------------------------------------------------------
 # Plugin config loader
