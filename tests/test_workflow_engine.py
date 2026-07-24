@@ -10,7 +10,11 @@ import pytest
 import tempfile
 import json
 from pathlib import Path
+import re
+import os
+import re
 from datetime import datetime, timezone
+import yaml
 
 # Import the engine module (must be run from hermes-agent repo root)
 from plugins.workflow.engine import (
@@ -1393,9 +1397,8 @@ def test_dispatch_node_scope_project_delegates_to_create_kanban_card(
 
 def test_load_workflow_parses_scope_field(tmp_path):
     """YAML scope: global is loaded into Workflow.scope."""
-    import yaml as _yaml
     wf_path = tmp_path / "heartbeat.yaml"
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "heartbeat",
         "scope": "global",
         "nodes": {
@@ -1413,9 +1416,8 @@ def test_load_workflow_parses_scope_field(tmp_path):
 
 def test_load_workflow_scope_defaults_to_project(tmp_path):
     """Workflows without explicit scope default to 'project'."""
-    import yaml as _yaml
     wf_path = tmp_path / "normal.yaml"
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "normal",
         "nodes": {
             "x": {"agent": "sherlock", "task": "do x"},
@@ -1433,10 +1435,9 @@ def test_load_workflow_scope_defaults_to_project(tmp_path):
 
 def test_validate_flags_non_terminal_without_fallback(tmp_path):
     """Non-terminal node relying on default fallback_on_timeout surfaces an issue."""
-    import yaml as _yaml
     wf_path = tmp_path / "wf.yaml"
     # a depends on b — b is non-terminal. b does NOT declare fallback_on_timeout.
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "wf",
         "nodes": {
             "a": {"agent": "sherlock", "task": "do a", "depends_on": ["b"]},
@@ -1453,9 +1454,8 @@ def test_validate_flags_non_terminal_without_fallback(tmp_path):
 
 def test_validate_does_not_flag_terminal_nodes(tmp_path):
     """Terminal nodes (no downstream) don't need explicit fallback_on_timeout."""
-    import yaml as _yaml
     wf_path = tmp_path / "wf.yaml"
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "wf",
         "nodes": {
             "leaf": {"agent": "sherlock", "task": "final node"},  # terminal
@@ -1469,9 +1469,8 @@ def test_validate_does_not_flag_terminal_nodes(tmp_path):
 
 def test_validate_does_not_flag_when_explicit(tmp_path):
     """Non-terminal node with explicit fallback_on_timeout is clean."""
-    import yaml as _yaml
     wf_path = tmp_path / "wf.yaml"
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "wf",
         "nodes": {
             "a": {"agent": "sherlock", "task": "do a", "depends_on": ["b"]},
@@ -1490,9 +1489,8 @@ def test_validate_does_not_flag_when_explicit(tmp_path):
 
 def test_validate_skips_synthetic_nodes(tmp_path):
     """Synthetic gates don't need fallback_on_timeout even if downstream."""
-    import yaml as _yaml
     wf_path = tmp_path / "wf.yaml"
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "wf",
         "nodes": {
             "a": {"agent": "sherlock", "task": "do a", "depends_on": ["gate"]},
@@ -1516,9 +1514,8 @@ def test_workflow_single_flight_default_false():
 
 def test_load_workflow_parses_single_flight_field(tmp_path):
     """YAML single_flight: true is loaded into Workflow.single_flight."""
-    import yaml as _yaml
     wf_path = tmp_path / "wf.yaml"
-    wf_path.write_text(_yaml.safe_dump({
+    wf_path.write_text(yaml.safe_dump({
         "name": "wf",
         "single_flight": True,
         "nodes": {
@@ -1541,11 +1538,10 @@ def test_has_active_run_returns_false_when_no_state_files(tmp_path):
 
 def test_has_active_run_returns_false_when_all_nodes_terminal(tmp_path):
     """State file exists but all nodes are done → not active."""
-    import json as _json
     state_dir = tmp_path / ".engine-state"
     state_dir.mkdir()
     state_file = state_dir / "wf_abc123_state.json"
-    state_file.write_text(_json.dumps({
+    state_file.write_text(json.dumps({
         "workflow_name": "wf",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "states": {
@@ -1560,11 +1556,10 @@ def test_has_active_run_returns_false_when_all_nodes_terminal(tmp_path):
 
 def test_has_active_run_returns_true_when_node_running(tmp_path):
     """State file with a running node → active."""
-    import json as _json
     state_dir = tmp_path / ".engine-state"
     state_dir.mkdir()
     state_file = state_dir / "wf_xyz_state.json"
-    state_file.write_text(_json.dumps({
+    state_file.write_text(json.dumps({
         "workflow_name": "wf",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "states": {
@@ -1579,7 +1574,6 @@ def test_has_active_run_returns_true_when_node_running(tmp_path):
 
 def test_has_active_run_ignores_stale_state_files(tmp_path):
     """State files older than ACTIVE_RUN_STALE_SECONDS are ignored."""
-    import json as _json
     from datetime import timedelta as _td
     state_dir = tmp_path / ".engine-state"
     state_dir.mkdir()
@@ -1588,7 +1582,7 @@ def test_has_active_run_ignores_stale_state_files(tmp_path):
     old_time = (
         datetime.now(timezone.utc) - _td(seconds=2 * 3600)
     ).isoformat()
-    state_file.write_text(_json.dumps({
+    state_file.write_text(json.dumps({
         "workflow_name": "wf",
         "updated_at": old_time,
         "states": {
@@ -1699,8 +1693,7 @@ def test_prune_old_runs_keeps_most_recent(tmp_path):
         p = state_dir / f"wf_run{i:03d}_state.json"
         p.write_text("{}")
         # Force mtime difference
-        import os as _os
-        _os.utime(p, (1000 + i, 1000 + i))
+        os.utime(p, (1000 + i, 1000 + i))
         paths.append(p)
     pruned = engine._prune_old_runs(keep=20)
     assert pruned == 5
@@ -1714,13 +1707,12 @@ def test_prune_old_runs_groups_by_workflow(tmp_path):
     state_dir.mkdir()
     engine = WorkflowEngine(workflows_dir=tmp_path)
     engine.STATE_DIR = state_dir
-    import os as _os
     # 15 files for "wf_a" and 15 for "wf_b"
     for wf_name in ("wf_a", "wf_b"):
         for i in range(15):
             p = state_dir / f"{wf_name}_run{i:03d}_state.json"
             p.write_text("{}")
-            _os.utime(p, (1000 + i, 1000 + i))
+            os.utime(p, (1000 + i, 1000 + i))
     pruned = engine._prune_old_runs(keep=10)
     assert pruned == 10  # 5 from each workflow
     assert len(list(state_dir.glob("wf_a_*"))) == 10

@@ -67,6 +67,15 @@ def _clean_state():
 # ── dynamic.py — create action ───────────────────────────────────────────────
 
 
+# ── Shared test constants ───────────────────────────────────────────
+MOCK_WF_CONFIG = {
+    "max_nodes_per_workflow": 256,
+    "max_extensions_per_workflow": 10,
+    "max_nodes_per_extension": 3,
+    "auto_approve_extensions": False,
+}
+
+
 class TestCreateWorkflow:
     """Tests for action='create'."""
 
