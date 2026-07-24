@@ -4967,6 +4967,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             context_length = getattr(compressor, "context_length", 0) or 0
             if context_length < 0:
                 context_length = 0
+
+            # --- Live context gauge (smooth, no jump) ---
+            # `last_prompt_tokens` is only updated when a real API call returns
+            # usage (turn boundary) — so during a long streamed reply, while
+            # tools run, or across the compression-transition turn, it is STALE.
+            # The status bar repaints every ~0.25s but feeds on that stale
+            # number, so the gauge appears frozen at e.g. 40% then snaps to
+            # 50%+ (or 100%) only when a big request finally reports usage.
+            # While a turn is in flight we instead estimate the live window
+            # occupancy from the message list (mirrors tui_gateway's own
+            # live-usage estimate) and take the max of the two, so the bar
+            # climbs smoothly as messages accumulate instead of jumping.
+            if getattr(self, "_prompt_start_time", None) is not None:
+                try:
+                    from agent.model_metadata import estimate_request_tokens_rough
+
+                    _msgs = getattr(agent, "messages", None)
+                    if _msgs:
+                        _sys = getattr(agent, "_cached_system_prompt", "") or ""
+                        _tools = getattr(agent, "tools", None) or None
+                        _live = estimate_request_tokens_rough(
+                            _msgs, system_prompt=_sys, tools=_tools
+                        )
+                        if _live and _live > context_tokens:
+                            context_tokens = _live
+                except Exception:
+                    pass
+
             snapshot["context_tokens"] = context_tokens
             snapshot["context_length"] = context_length or None
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
@@ -6152,7 +6180,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         self._stream_buf += text
 
-        # Emit complete lines, keep partial remainder in buffer
+        # --- Incremental-streaming patch (smooth token paint) ---
+        # Original behaviour only emitted on "\n" plus a force-flush that
+        # waited until the buffer reached terminal width (>=40 chars).
+        # With bursty upstreams (e.g. hy3:free) that width gate produced
+        # visible "chunk jumps". We keep the word-aware wrap AND table
+        # buffering (both correct), but flush partial lines the moment
+        # they arrive instead of waiting for the width threshold. Tokens
+        # hence paint as smoothly as the upstream delivers them.
         _tc = getattr(self, "_stream_text_ansi", "")
 
         def _emit_one(printed_line: str) -> None:
@@ -6164,23 +6199,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._in_stream_table = False
             if not buf:
                 return
-            # Strip cell-level markdown (`code`, **bold**, ~~strike~~) FIRST
-            # so the realigner pads to the final visible cell width, not
-            # the marker-decorated source width.  Otherwise a body row
-            # like `` | Bold | `**bold**` | `` lands narrower than its
-            # header column once the markers are removed.
             joined = "\n".join(buf)
             if self.final_response_markdown == "strip":
                 joined = _strip_markdown_syntax(joined)
             block = realign_markdown_tables(joined, _terminal_width_for_streaming())
             for ln in block.split("\n"):
-                _emit_one(ln)
+                # Tables paint as a whole block (not per-char) so the
+                # realigned columns are not disturbed by typewriter timing.
+                _cprint(f"{_STREAM_PAD}{_tc}{ln}{_RST}" if _tc else f"{_STREAM_PAD}{ln}")
 
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
 
             # Hold table-shaped lines in a side-buffer so we can re-pad
-            # the whole block once it ends.  Streaming line-by-line, we
+            # the whole block once it ends. Streaming line-by-line, we
             # cannot re-align mid-table without reflowing already-printed
             # rows; the cost is that the user sees the table appear in a
             # single batch when the block closes instead of row-by-row.
@@ -6200,15 +6232,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 line = _strip_markdown_syntax(line)
             _emit_one(line)
 
-        # Force-flush long partial lines so a response that opens with a
-        # long paragraph paints as tokens arrive instead of staying blank
-        # until the first newline (TTFT perception fix — the reasoning box
-        # has done this at 80 chars since day one; the response box never
-        # did). Wrap at the terminal's visible width so we only ever emit
-        # text that would have line-broken at that point anyway; the
-        # remainder stays buffered as the logical line's continuation.
-        # Table-shaped partials are exempt — they need the whole block for
-        # realignment (see the table side-buffer above).
+        # Smooth-flush partial line: emit as soon as anything is buffered
+        # (no width threshold), word-aware so words never tear at the wrap
+        # point. Table-shaped partials are exempt — they need the whole
+        # block for realignment (see the table side-buffer above).
         if (
             self._stream_buf
             and not self._in_stream_table
@@ -6226,6 +6253,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self.final_response_markdown == "strip":
                     chunk = _strip_markdown_syntax(chunk)
                 _emit_one(chunk)
+            # Emit the trailing sub-width partial immediately (smoothness
+            # fix): only the unbreakable tail with no space in the first
+            # wrap_w chars stays buffered until the next word boundary.
+            if self._stream_buf:
+                head = self._stream_buf.rfind(" ", 0, wrap_w)
+                if head > 0:
+                    chunk, self._stream_buf = (
+                        self._stream_buf[:head],
+                        self._stream_buf[head:].lstrip(" "),
+                    )
+                    if self.final_response_markdown == "strip":
+                        chunk = _strip_markdown_syntax(chunk)
+                    _emit_one(chunk)
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""

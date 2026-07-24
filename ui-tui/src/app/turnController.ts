@@ -17,7 +17,7 @@ import {
   sameToolTrailGroup,
   toolTrailLabel
 } from '../lib/text.js'
-import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
+import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem, Usage } from '../types.js'
 
 import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
@@ -132,6 +132,22 @@ class TurnController {
   private reasoningTimer: Timer = null
   private streamTimer: Timer = null
   private streamDelay = STREAM_IDLE_BATCH_MS
+  // Streaming watchdog: if the backend goes silent for longer than this
+  // without emitting any further stream event, assume the turn stalled
+  // (upstream drop, compression deadlock, gateway hiccup) and release the
+  // busy lock so the UI is never permanently frozen waiting for a
+  // message.complete that will never arrive. Any new stream event resets it.
+  private streamWatchdogTimer: Timer = null
+  private static readonly STREAM_STALL_TIMEOUT_MS = 45000
+  // Baseline context_used (tokens) captured at turn start — the authoritative
+  // server value from the previous turn. Live streaming projections add the
+  // estimated tokens of the in-flight reply on top of this so the bottom
+  // context meter ticks up during streaming instead of only at turn end.
+  private usageBaselineTokens = 0
+  // Cached context window size (tokens), seeded from message.start's usage
+  // payload (backend now ships context_max up front) or from the prior turn's
+  // authoritative usage. publishLiveUsage() uses this to compute a live %.
+  private contextMaxTokens = 0
   private toolProgressTimer: Timer = null
 
   // ── Credits notice machinery (Strategy B) ───────────────────────────
@@ -264,12 +280,74 @@ class TurnController {
     }
   }
 
+  // ── Streaming watchdog ────────────────────────────────────────────────
+  // Any inbound stream event (text delta, interim, tool, progress) calls
+  // armStreamWatchdog() to (re)start the stall timer. If STREAM_STALL_TIMEOUT_MS
+  // elapses with no further event while the session is still busy, the turn has
+  // silently stalled — release the busy lock and surface a recoverable notice
+  // instead of freezing the UI forever (the classic "send another message to
+  // wake it up" desktop hang). Normal turns disarm() on idle()/interrupt.
+  private armStreamWatchdog() {
+    this.streamWatchdogTimer = clear(this.streamWatchdogTimer)
+    this.streamWatchdogTimer = setTimeout(() => {
+      if (!getUiState().busy) {
+        return
+      }
+      // Stalled: force-release. idle() also disarms, so this is terminal.
+      this.disarmStreamWatchdog()
+      this.idle()
+      this.pushActivity(
+        '响应中断：未收到服务端结束信号（可能是上游断流或压缩卡住），已自动释放，可继续发送消息。',
+        'error'
+      )
+    }, TurnController.STREAM_STALL_TIMEOUT_MS)
+  }
+
+  private disarmStreamWatchdog() {
+    this.streamWatchdogTimer = clear(this.streamWatchdogTimer)
+  }
+
+  // Project a live context-usage estimate during streaming. The backend only
+  // ships an authoritative `usage` payload at message.complete, so without
+  // this the bottom context meter jumps once per turn instead of ticking up
+  // as the reply streams. We add the rough token cost of the in-flight reply
+  // (accumulated in bufRef) on top of the previous turn's authoritative
+  // baseline. The server value overwrites this projection at turn end, so any
+  // approximation drift self-corrects.
+  private publishLiveUsage() {
+    // Prefer the cached window size (seeded at message.start), falling back to
+    // whatever ui.usage currently holds. This keeps the projection alive even
+    // if ui.usage gets reset to ZERO mid-stream.
+    const max = this.contextMaxTokens || getUiState().usage?.context_max || 0
+    if (max <= 0) {
+      return
+    }
+    const repliedTokens = estimateTokensRough(this.bufRef)
+    const used = Math.max(0, this.usageBaselineTokens + repliedTokens)
+    const pct = Math.min(100, Math.round((used / max) * 100))
+    const cur = getUiState().usage
+    // Only patch when the projection actually moved, to avoid redundant
+    // Ink re-renders on every tiny delta.
+    if (cur && cur.context_used === used && cur.context_percent === pct) {
+      return
+    }
+    patchUiState({
+      usage: {
+        ...cur,
+        context_max: max,
+        context_used: used,
+        context_percent: pct
+      }
+    })
+  }
+
   endReasoningPhase() {
     this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
     patchTurnState({ reasoningActive: false, reasoningStreaming: false })
   }
 
   idle() {
+    this.disarmStreamWatchdog()
     this.endReasoningPhase()
     this.activeTools = []
     this.streamTimer = clear(this.streamTimer)
@@ -509,6 +587,7 @@ class TurnController {
   }
 
   pushActivity(text: string, tone: ActivityItem['tone'] = 'info', replaceLabel?: string) {
+    this.armStreamWatchdog()
     patchTurnState(state => {
       const base = replaceLabel
         ? state.activity.filter(item => !sameToolTrailGroup(replaceLabel, item.text))
@@ -673,6 +752,7 @@ class TurnController {
 
     this.pruneTransient()
     this.endReasoningPhase()
+    this.armStreamWatchdog()
 
     // Always accumulate the raw text delta.  The pre-#16391 path replaced
     // the entire buffer with `rendered` (an *incremental* Rich ANSI
@@ -680,6 +760,8 @@ class TurnController {
     // — visible as overlapping coloured text and lost prose under
     // `display.final_response_markdown: render`.
     this.bufRef += text
+
+    this.publishLiveUsage()
 
     if (getUiState().streaming) {
       this.scheduleStreaming()
@@ -691,6 +773,7 @@ class TurnController {
       return
     }
 
+    this.armStreamWatchdog()
     const authoritativeText = text.trimStart()
 
     if (!authoritativeText) {
@@ -703,6 +786,8 @@ class TurnController {
     if (this.bufRef.trimStart() !== authoritativeText) {
       this.bufRef = authoritativeText
     }
+
+    this.publishLiveUsage()
 
     // Flush the current streaming buffer into a sealed segment — this is the
     // TUI equivalent of the desktop's finalizeInterimAssistantMessage. The
@@ -977,7 +1062,7 @@ class TurnController {
     patchTurnState({ streaming: boundedLiveRenderText(visible) })
   }
 
-  startMessage() {
+  startMessage(payload?: { usage?: Partial<Usage> }) {
     this.endReasoningPhase()
     this.clearReasoning()
     this.activeTools = []
@@ -1002,6 +1087,27 @@ class TurnController {
     }
 
     patchUiState({ busy: true })
+    // Seed the context window from message.start's usage payload (the backend
+    // now ships context_max up front so the bottom bar can render and tick
+    // during streaming, not only at message.complete). Fall back to the prior
+    // turn's authoritative usage if the payload lacks it.
+    const seedMax =
+      typeof payload?.usage?.context_max === 'number' && payload!.usage!.context_max! > 0
+        ? payload!.usage!.context_max!
+        : getUiState().usage?.context_max ?? 0
+    this.contextMaxTokens = seedMax
+    if (seedMax > 0) {
+      patchUiState((s) => ({
+        ...s,
+        usage: {
+          ...s.usage,
+          context_max: seedMax,
+        },
+      }))
+    }
+    // Capture the previous turn's authoritative context_used as the baseline
+    // for this turn's live projection (see publishLiveUsage).
+    this.usageBaselineTokens = getUiState().usage?.context_used ?? 0
     patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
   }
 

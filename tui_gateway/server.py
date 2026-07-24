@@ -10778,6 +10778,19 @@ def _run_prompt_submit(
         except Exception:
             pass
     _emit("message.start", sid)
+    # Seed the live context window so the desktop/TUI bottom bar can render
+    # (and project a real-time %) from the very first streamed token, instead
+    # of waiting for message.complete (which only fires at turn end). The
+    # frontend's publishLiveUsage() computes context_used during streaming; it
+    # needs context_max up front or the bar stays hidden on a fresh session.
+    _comp = getattr(agent, "context_compressor", None)
+    _ctx_max = int(getattr(_comp, "context_length", 0) or 0)
+    if _ctx_max > 0:
+        _emit(
+            "message.start",
+            sid,
+            {"usage": {"context_max": _ctx_max, "context_used": 0, "context_percent": 0}},
+        )
 
     def run():
         approval_token = None

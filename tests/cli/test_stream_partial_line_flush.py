@@ -61,14 +61,15 @@ class TestPartialLineForceFlush:
         for w in words:
             assert w in plain, f"lost {w} at a wrap boundary"
 
-    def test_short_partial_stays_buffered(self, cli_stub):
+    def test_short_partial_emits_immediately(self, cli_stub):
         cli, emitted = cli_stub
         cli._stream_delta("short line, no newline")
-        # Under wrap width: the box header may open, but the text itself
-        # stays buffered until a newline or the width threshold.
+        # Smooth-stream contract: tokens paint as they arrive. The first
+        # word-boundary flushes immediately (no waiting for a newline or
+        # the width threshold); only the unbreakable tail stays buffered.
         plain = _strip_ansi("\n".join(emitted))
-        assert "short line" not in plain
-        assert cli._stream_buf == "short line, no newline"
+        assert "short" in plain
+        assert cli._stream_buf != ""  # remainder held until next word boundary
 
     def test_table_rows_not_force_flushed(self, cli_stub):
         cli, emitted = cli_stub

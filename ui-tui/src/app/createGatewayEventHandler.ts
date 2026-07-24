@@ -758,7 +758,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'message.start':
         resetAgentsNudgeTurnState()
-        turnController.startMessage()
+        turnController.startMessage(ev.payload)
 
         return
       case 'status.update': {
