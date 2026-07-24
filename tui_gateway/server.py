@@ -12000,8 +12000,8 @@ def _run_prompt_submit(
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
             # and hang the headless gateway. Re-wire here so the prompt routes to
-            # the sudo.request overlay. (secret capture is a module global, so
-            # re-running is a harmless no-op.)
+            # the sudo.request overlay. Secret capture is context-local, so
+            # re-running binds this turn to the correct session.
             _wire_callbacks(sid)
             # Skip the config-model sync while a /model --once override is
             # active: the once-model is intentionally not pinned as a session

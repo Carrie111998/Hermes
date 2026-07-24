@@ -69,6 +69,7 @@ Usage:
 import json
 import logging
 import time
+from contextvars import ContextVar, Token
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -173,7 +174,9 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona"}
 )
-_secret_capture_callback = None
+_secret_capture_callback: ContextVar[Any] = ContextVar(
+    "skills_secret_capture_callback", default=None
+)
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -241,9 +244,23 @@ _INJECTION_PATTERNS: list = [
 ]
 
 
+def bind_secret_capture_callback(callback) -> Token:
+    """Bind secret prompting and return a token for scoped restoration."""
+    return _secret_capture_callback.set(callback)
+
+
 def set_secret_capture_callback(callback) -> None:
-    global _secret_capture_callback
-    _secret_capture_callback = callback
+    """Bind secret prompting to the current session/task context."""
+    bind_secret_capture_callback(callback)
+
+
+def reset_secret_capture_callback(token: Token) -> None:
+    """Restore the callback binding that preceded *token*."""
+    _secret_capture_callback.reset(token)
+
+
+def _get_secret_capture_callback():
+    return _secret_capture_callback.get()
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -427,7 +444,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    secret_capture_callback = _get_secret_capture_callback()
+    if secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -445,7 +463,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,

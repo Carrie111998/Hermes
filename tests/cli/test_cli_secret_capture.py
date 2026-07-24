@@ -142,6 +142,9 @@ def test_cli_chat_registers_secret_capture_callback():
             cli_obj.chat("hello")
 
     try:
-        assert skills_tool_module._secret_capture_callback == cli_obj._secret_capture_callback
+        assert (
+            skills_tool_module._get_secret_capture_callback()
+            == cli_obj._secret_capture_callback
+        )
     finally:
         set_secret_capture_callback(None)

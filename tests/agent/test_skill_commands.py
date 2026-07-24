@@ -1,6 +1,7 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,15 @@ from agent.skill_commands import (
     resolve_skill_command_key,
     scan_skill_commands,
 )
+
+
+@contextmanager
+def _secret_capture(callback):
+    token = skills_tool_module.bind_secret_capture_callback(callback)
+    try:
+        yield
+    finally:
+        skills_tool_module.reset_secret_capture_callback(token)
 
 
 def _make_skill(
@@ -627,14 +637,9 @@ Generate some audio.
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(fake_secret_callback), patch(
+            "tools.skills_tool.SKILLS_DIR", tmp_path
+        ):
             _make_skill(
                 tmp_path,
                 "test-skill",
@@ -662,14 +667,9 @@ Generate some audio.
                 "gateway flow should not try secure in-band secret capture"
             )
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fail_if_called,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(fail_if_called), patch(
+            "tools.skills_tool.SKILLS_DIR", tmp_path
+        ):
             from gateway.session_context import clear_session_vars, set_session_vars
 
             tokens = set_session_vars(platform="telegram")
@@ -694,14 +694,7 @@ Generate some audio.
     def test_preserves_remaining_remote_setup_warning(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            None,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(None), patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
                 tmp_path,
                 "test-skill",

@@ -1,12 +1,22 @@
 """Test that skill_view registers required env vars in the passthrough registry."""
 
 import json
-from unittest.mock import patch
+from contextlib import contextmanager
 
 import pytest
 
 import tools.env_passthrough as _ep_mod
+import tools.skills_tool as skills_tool_module
 from tools.env_passthrough import clear_env_passthrough, is_env_passthrough
+
+
+@contextmanager
+def _secret_capture(callback):
+    token = skills_tool_module.bind_secret_capture_callback(callback)
+    try:
+        yield
+    finally:
+        skills_tool_module.reset_secret_capture_callback(token)
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +64,7 @@ class TestSkillViewRegistersPassthrough:
         monkeypatch.setenv("TENOR_API_KEY", "test-value-123")
 
         # Patch the secret capture callback to not prompt
-        with patch("tools.skills_tool._secret_capture_callback", None):
+        with _secret_capture(None):
             from tools.skills_tool import skill_view
 
             result = json.loads(skill_view(name="test-skill"))
@@ -81,7 +91,7 @@ class TestSkillViewRegistersPassthrough:
         save_env_value("TENOR_API_KEY", "persisted-value-123")
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
+        with _secret_capture(None):
             from tools.skills_tool import skill_view
 
             result = json.loads(skill_view(name="test-skill"))
@@ -108,7 +118,7 @@ class TestSkillViewRegistersPassthrough:
         )
         monkeypatch.delenv("NONEXISTENT_SKILL_KEY_XYZ", raising=False)
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
+        with _secret_capture(None):
             from tools.skills_tool import skill_view
 
             result = json.loads(skill_view(name="test-skill"))
@@ -123,7 +133,7 @@ class TestSkillViewRegistersPassthrough:
             "tools.skills_tool.SKILLS_DIR", tmp_path
         )
 
-        with patch("tools.skills_tool._secret_capture_callback", None):
+        with _secret_capture(None):
             from tools.skills_tool import skill_view
 
             result = json.loads(skill_view(name="simple-skill"))
