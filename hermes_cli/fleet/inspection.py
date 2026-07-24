@@ -24,6 +24,7 @@ from .types import (
     CapacitySnapshot,
     LaneEvaluation,
     ReasonCode,
+    RoutePurpose,
     RouteDecision,
     TaskSpec,
 )
@@ -85,10 +86,17 @@ def serialize_capacity(
         "reserved_pct": str(snapshot.reserved_pct),
         "effective_remaining_pct": str(snapshot.effective_remaining_pct),
         "overage_disabled": snapshot.overage_disabled,
+        "comparability_group": snapshot.comparability_group,
+        "quota_window_id": snapshot.quota_window_id,
+        "measurement_kind": snapshot.measurement_kind.value,
     }
 
 
-def serialize_evaluation(item: LaneEvaluation) -> dict[str, Any]:
+def serialize_evaluation(
+    item: LaneEvaluation,
+    *,
+    purpose: RoutePurpose = RoutePurpose.TASK_WORKER,
+) -> dict[str, Any]:
     """Serialize one authoritative lane evaluation for every UI surface."""
 
     enabled = ReasonCode.LANE_DISABLED not in item.reasons
@@ -98,6 +106,9 @@ def serialize_evaluation(item: LaneEvaluation) -> dict[str, Any]:
         "eligible": item.eligible,
         "selectable": item.eligible or item.fallback_eligible,
         "fallback_eligible": item.fallback_eligible,
+        "route_purpose": purpose.value,
+        "supports_task_worker": item.profile.supports_task_worker,
+        "supports_parent_session": item.profile.supports_parent_session,
         "reasons": [reason.value for reason in item.reasons],
         "adapter_kind": item.profile.adapter_kind.value,
         "provider_id": item.profile.provider_id,
@@ -110,10 +121,13 @@ def serialize_evaluation(item: LaneEvaluation) -> dict[str, Any]:
 
 
 def serialize_evaluations(
-    items: Sequence[LaneEvaluation], *, lane: str | None = None
+    items: Sequence[LaneEvaluation],
+    *,
+    lane: str | None = None,
+    purpose: RoutePurpose = RoutePurpose.TASK_WORKER,
 ) -> list[dict[str, Any]]:
     return [
-        serialize_evaluation(item)
+        serialize_evaluation(item, purpose=purpose)
         for item in items
         if lane is None or item.lane_id == lane
     ]
@@ -147,16 +161,26 @@ def build_inspection_payload(
     if command not in {"doctor", "status"}:
         raise ValueError(f"unsupported inspection command: {command}")
 
-    evaluations = service.inspect(
-        inspection_task(
-            command,
-            reservation_pct=service.config.default_reservation_pct,
-        )
+    task = inspection_task(
+        command,
+        reservation_pct=service.config.default_reservation_pct,
     )
+    evaluations = service.inspect(task)
+    parent_evaluations = service.inspect_parent(task)
     visible = tuple(
         item for item in evaluations if lane is None or item.lane_id == lane
     )
+    visible_parent = tuple(
+        item
+        for item in parent_evaluations
+        if lane is None or item.lane_id == lane
+    )
     has_route = any(item.eligible for item in visible)
+    has_parent_route = (
+        service.config.enabled
+        and service.config.parent_desktop_enabled
+        and any(item.eligible for item in visible_parent)
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "command": command,
@@ -166,4 +190,24 @@ def build_inspection_payload(
             ReasonCode.MET.value if has_route else ReasonCode.NO_ELIGIBLE_LANE.value
         ),
         "evaluations": serialize_evaluations(visible),
+        "purposes": {
+            RoutePurpose.TASK_WORKER.value: {
+                "route_purpose": RoutePurpose.TASK_WORKER.value,
+                "enabled": service.config.enabled,
+                "eligible": has_route,
+                "evaluations": serialize_evaluations(
+                    visible,
+                    purpose=RoutePurpose.TASK_WORKER,
+                ),
+            },
+            RoutePurpose.DESKTOP_PARENT.value: {
+                "route_purpose": RoutePurpose.DESKTOP_PARENT.value,
+                "enabled": service.config.parent_desktop_enabled,
+                "eligible": has_parent_route,
+                "evaluations": serialize_evaluations(
+                    visible_parent,
+                    purpose=RoutePurpose.DESKTOP_PARENT,
+                ),
+            },
+        },
     }

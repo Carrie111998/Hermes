@@ -234,6 +234,24 @@ class TaskPin:
 
 
 @dataclass(frozen=True)
+class ParentPin:
+    profile_id: str
+    lineage_root_id: str
+    session_id: str
+    purpose: RoutePurpose
+    lane_id: str
+    adapter_kind: AdapterKind
+    provider_id: str
+    model_id: str
+    effort: str
+    fast_mode: bool
+    qualification_evidence_hash: str
+    route_identity: str
+    selection_reason: ReasonCode
+    status: str
+
+
+@dataclass(frozen=True)
 class LeaseHandle:
     task_id: str
     lane_id: str
@@ -241,6 +259,32 @@ class LeaseHandle:
     generation: int
     reserved_pct: Decimal
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class ParentLeaseHandle:
+    profile_id: str
+    lineage_root_id: str
+    lane_id: str
+    owner_uuid: str
+    generation: int
+    reserved_pct: Decimal
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class ParentAdmission:
+    reason: ReasonCode
+    pin: ParentPin | None
+    evaluations: tuple[LaneEvaluation, ...] = ()
+
+
+@dataclass(frozen=True)
+class ParentTurnAcquisition:
+    reason: ReasonCode
+    pin: ParentPin | None
+    lease: ParentLeaseHandle | None
+    evaluations: tuple[LaneEvaluation, ...] = ()
 
 
 @dataclass(frozen=True)

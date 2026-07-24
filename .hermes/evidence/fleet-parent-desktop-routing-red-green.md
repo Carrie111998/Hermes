@@ -80,3 +80,72 @@ Commands:
 The compatibility fixes added explicit observed proof to fixtures instead of
 defaulting or synthesizing it in production. The live doctor now reports
 overage as unknown unless a separate billing-status source proves it off.
+
+## Phase 2 — atomic parent pins and turn leases
+
+### RED: state reader
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet/test_state.py -q`
+
+Expected RED:
+
+- 7 tests passed and 1 failed because `FleetStore.read_parent_pin` did not
+  exist.
+
+### RED: service preview
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet/test_service.py -q`
+
+Expected RED:
+
+- 8 tests passed and 1 failed because `FleetService.preview_parent` did not
+  exist.
+
+### RED: parent admission contract
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet/test_parent_admission.py -q`
+
+Expected RED:
+
+- Collection failed because the immutable `ParentPin` and
+  `ParentLeaseHandle` contracts did not exist.
+- The new file covers atomic admission, idempotence, 32-way concurrency,
+  lineage persistence, lease generation safety, fail-closed unavailable pins,
+  secret-free audit, and transaction rollback.
+
+### RED: purpose-separated inspection
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet/test_parent_admission.py -q`
+
+Expected RED after the state path was GREEN:
+
+- 8 tests passed and 1 failed because inspection had no `purposes` payload and
+  therefore could not distinguish worker eligibility from parent eligibility.
+
+### GREEN: parent pin state, service, and inspection
+
+Commands:
+
+- `bash scripts/run_tests.sh tests/hermes_cli/fleet/test_parent_admission.py tests/hermes_cli/fleet/test_cli.py -q`
+  - GREEN: 2 files, 17 tests passed.
+- `bash scripts/run_tests.sh tests/hermes_cli/fleet -q`
+  - GREEN: 11 files, 141 tests passed.
+
+The parent admission transaction now persists one immutable lineage pin,
+advances a purpose-specific rotation cursor once, and writes a secret-free
+audit event atomically. Parent turn leases are owner/generation safe, expired
+leases release reserved capacity without deleting the pin, and an unavailable
+pinned lane fails closed without evaluating an alternate route.
+
+The Windows parallel runner emitted a post-result `UnicodeEncodeError` while
+printing its checkmark through cp1252. The process exit code was zero and the
+authoritative test summaries above reported zero failed tests; production and
+test files were not changed to mask the runner-only display issue.

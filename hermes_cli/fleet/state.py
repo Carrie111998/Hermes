@@ -18,7 +18,12 @@ from .types import (
     CapacityRead,
     LaneInputs,
     LeaseHandle,
+    ParentAdmission,
+    ParentLeaseHandle,
+    ParentPin,
+    ParentTurnAcquisition,
     ReasonCode,
+    RoutePurpose,
     TaskPin,
     TaskSpec,
 )
@@ -49,6 +54,40 @@ CREATE TABLE IF NOT EXISTS leases(
   heartbeat_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   released_at TEXT
+);
+CREATE TABLE IF NOT EXISTS parent_sessions(
+  profile_id TEXT NOT NULL,
+  lineage_root_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  route_purpose TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  adapter_kind TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  effort TEXT NOT NULL,
+  fast_mode INTEGER NOT NULL,
+  qualification_evidence_hash TEXT NOT NULL,
+  route_identity TEXT NOT NULL,
+  selection_reason TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(profile_id, lineage_root_id)
+);
+CREATE TABLE IF NOT EXISTS parent_leases(
+  profile_id TEXT NOT NULL,
+  lineage_root_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  owner_uuid TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  reserved_pct TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  released_at TEXT,
+  PRIMARY KEY(profile_id, lineage_root_id),
+  FOREIGN KEY(profile_id, lineage_root_id)
+    REFERENCES parent_sessions(profile_id, lineage_root_id)
 );
 CREATE TABLE IF NOT EXISTS lane_state(
   lane_id TEXT PRIMARY KEY,
@@ -148,6 +187,51 @@ class FleetStore:
             expires_at=_datetime(row["expires_at"]),
         )
 
+    @staticmethod
+    def _parent_pin(row: sqlite3.Row) -> ParentPin:
+        return ParentPin(
+            profile_id=row["profile_id"],
+            lineage_root_id=row["lineage_root_id"],
+            session_id=row["session_id"],
+            purpose=RoutePurpose(row["route_purpose"]),
+            lane_id=row["lane_id"],
+            adapter_kind=AdapterKind(row["adapter_kind"]),
+            provider_id=row["provider_id"],
+            model_id=row["model_id"],
+            effort=row["effort"],
+            fast_mode=bool(row["fast_mode"]),
+            qualification_evidence_hash=row["qualification_evidence_hash"],
+            route_identity=row["route_identity"],
+            selection_reason=ReasonCode(row["selection_reason"]),
+            status=row["status"],
+        )
+
+    @staticmethod
+    def _parent_lease(row: sqlite3.Row) -> ParentLeaseHandle:
+        return ParentLeaseHandle(
+            profile_id=row["profile_id"],
+            lineage_root_id=row["lineage_root_id"],
+            lane_id=row["lane_id"],
+            owner_uuid=row["owner_uuid"],
+            generation=int(row["generation"]),
+            reserved_pct=Decimal(row["reserved_pct"]),
+            expires_at=_datetime(row["expires_at"]),
+        )
+
+    @staticmethod
+    def _parent_correlation(profile_id: str, lineage_root_id: str) -> str:
+        return f"parent:{profile_id}:{lineage_root_id}"
+
+    @staticmethod
+    def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+        return (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            is not None
+        )
+
     def read_pin(self, task_id: str) -> TaskPin | None:
         connection = self._connect_existing()
         if connection is None:
@@ -157,6 +241,26 @@ class FleetStore:
                 "SELECT * FROM tasks WHERE task_id=?", (task_id,)
             ).fetchone()
             return self._pin(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def read_parent_pin(
+        self, profile_id: str, lineage_root_id: str
+    ) -> ParentPin | None:
+        connection = self._connect_existing()
+        if connection is None:
+            return None
+        try:
+            if not self._table_exists(connection, "parent_sessions"):
+                return None
+            row = connection.execute(
+                """
+                SELECT * FROM parent_sessions
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (profile_id, lineage_root_id),
+            ).fetchone()
+            return self._parent_pin(row) if row is not None else None
         finally:
             connection.close()
 
@@ -211,22 +315,69 @@ class FleetStore:
                 event_type="LEASE_EXPIRED",
                 reason="LEASE_TTL_EXPIRED",
             )
-        return len(rows)
+        parent_rows = connection.execute(
+            """
+            SELECT profile_id,lineage_root_id,lane_id FROM parent_leases
+            WHERE released_at IS NULL AND expires_at <= ?
+            """,
+            (_iso(now),),
+        ).fetchall()
+        for row in parent_rows:
+            connection.execute(
+                """
+                UPDATE parent_leases SET released_at=?
+                WHERE profile_id=? AND lineage_root_id=? AND released_at IS NULL
+                """,
+                (
+                    _iso(now),
+                    row["profile_id"],
+                    row["lineage_root_id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE parent_sessions SET status='pinned',updated_at=?
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (
+                    _iso(now),
+                    row["profile_id"],
+                    row["lineage_root_id"],
+                ),
+            )
+            FleetStore._audit(
+                connection,
+                at=now,
+                task_id=FleetStore._parent_correlation(
+                    row["profile_id"], row["lineage_root_id"]
+                ),
+                lane_id=row["lane_id"],
+                event_type="PARENT_LEASE_EXPIRED",
+                reason="LEASE_TTL_EXPIRED",
+            )
+        return len(rows) + len(parent_rows)
 
     @staticmethod
     def _lane_usage(
         connection: sqlite3.Connection, lane_id: str, now: datetime
     ) -> tuple[int, Decimal]:
-        row = connection.execute(
-            """
-            SELECT COUNT(*) AS active_count,
-                   COALESCE(SUM(CAST(reserved_pct AS REAL)), 0) AS reserved
-            FROM leases
-            WHERE lane_id=? AND released_at IS NULL AND expires_at > ?
-            """,
-            (lane_id, _iso(now)),
-        ).fetchone()
-        return int(row["active_count"]), Decimal(str(row["reserved"]))
+        active_count = 0
+        reserved = Decimal("0")
+        for table in ("leases", "parent_leases"):
+            if not FleetStore._table_exists(connection, table):
+                continue
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS active_count,
+                       COALESCE(SUM(CAST(reserved_pct AS REAL)), 0) AS reserved
+                FROM {table}
+                WHERE lane_id=? AND released_at IS NULL AND expires_at > ?
+                """,
+                (lane_id, _iso(now)),
+            ).fetchone()
+            active_count += int(row["active_count"])
+            reserved += Decimal(str(row["reserved"]))
+        return active_count, reserved
 
     @staticmethod
     def _cooldown_in_txn(
@@ -276,18 +427,35 @@ class FleetStore:
         return tuple(live)
 
     @staticmethod
-    def _rotation(connection: sqlite3.Connection) -> int:
+    def _rotation_policy(purpose: RoutePurpose) -> str:
+        return (
+            "fleet-parent-v1"
+            if purpose is RoutePurpose.DESKTOP_PARENT
+            else "fleet-v1"
+        )
+
+    @classmethod
+    def _rotation(
+        cls,
+        connection: sqlite3.Connection,
+        purpose: RoutePurpose = RoutePurpose.TASK_WORKER,
+    ) -> int:
         row = connection.execute(
-            "SELECT next_lane_index FROM rotation WHERE policy_id='fleet-v1'"
+            "SELECT next_lane_index FROM rotation WHERE policy_id=?",
+            (cls._rotation_policy(purpose),),
         ).fetchone()
         return int(row["next_lane_index"]) if row is not None else 0
 
-    def rotation_cursor(self) -> int:
+    def rotation_cursor(
+        self, *, purpose: RoutePurpose = RoutePurpose.TASK_WORKER
+    ) -> int:
         connection = self._connect_existing()
         if connection is None:
             return 0
         try:
-            return self._rotation(connection)
+            if not self._table_exists(connection, "rotation"):
+                return 0
+            return self._rotation(connection, purpose)
         finally:
             connection.close()
 
@@ -514,9 +682,7 @@ class FleetStore:
                     "selection_reason": decision.reason.value,
                     "capacity_source": (
                         winner.capacity.source_id
-                        if winner.capacity
-                        and decision.reason is ReasonCode.MET
-                        else None
+                        if winner.capacity else None
                     ),
                     "qualification": winner.qualification_evidence_id,
                 },
@@ -551,6 +717,360 @@ class FleetStore:
         finally:
             connection.close()
 
+    def admit_parent(
+        self,
+        *,
+        profile_id: str,
+        lineage_root_id: str,
+        session_id: str,
+        task: TaskSpec,
+        candidates: Sequence[LaneInputs],
+        now: datetime,
+        inject_failure: bool = False,
+    ) -> ParentAdmission:
+        """Atomically select and persist one immutable Desktop parent pin."""
+
+        if not profile_id or not lineage_root_id or not session_id:
+            raise ValueError("parent admission identity fields must be non-empty")
+        at = _at(now)
+        correlation = self._parent_correlation(profile_id, lineage_root_id)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._reap(connection, at)
+            existing = connection.execute(
+                """
+                SELECT * FROM parent_sessions
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (profile_id, lineage_root_id),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return ParentAdmission(
+                    ReasonCode.MET,
+                    self._parent_pin(existing),
+                )
+
+            live_inputs = self._live_inputs(connection, candidates, at)
+            evaluations = tuple(
+                evaluate_lane(
+                    candidate,
+                    task,
+                    now=at,
+                    purpose=RoutePurpose.DESKTOP_PARENT,
+                )
+                for candidate in live_inputs
+            )
+            cursor = self._rotation(connection, RoutePurpose.DESKTOP_PARENT)
+            decision = select_lane(evaluations, rotation_index=cursor)
+            decision_evaluations = decision.evaluations
+            if decision.lane_id is None:
+                self._audit(
+                    connection,
+                    at=at,
+                    task_id=correlation,
+                    event_type="PARENT_ROUTE_DENIED",
+                    reason=ReasonCode.NO_ELIGIBLE_LANE.value,
+                    decision={
+                        "purpose": RoutePurpose.DESKTOP_PARENT.value,
+                        "lanes": {
+                            item.lane_id: [
+                                reason.value for reason in item.reasons
+                            ]
+                            for item in decision_evaluations
+                        },
+                    },
+                )
+                connection.commit()
+                return ParentAdmission(
+                    ReasonCode.NO_ELIGIBLE_LANE,
+                    None,
+                    decision_evaluations,
+                )
+
+            winner = next(
+                item
+                for item in decision_evaluations
+                if item.lane_id == decision.lane_id
+            )
+            assert winner.selected_model is not None
+            assert winner.selected_effort is not None
+            qualification_hash = hashlib.sha256(
+                winner.qualification_evidence_id.encode("utf-8")
+            ).hexdigest()
+            route_identity = "sha256:" + hashlib.sha256(
+                "\0".join(
+                    (
+                        winner.profile.provider_id,
+                        winner.selected_model,
+                        winner.selected_effort,
+                        qualification_hash,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO parent_sessions(
+                  profile_id,lineage_root_id,session_id,route_purpose,lane_id,
+                  adapter_kind,provider_id,model_id,effort,fast_mode,
+                  qualification_evidence_hash,route_identity,selection_reason,
+                  status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    profile_id,
+                    lineage_root_id,
+                    session_id,
+                    RoutePurpose.DESKTOP_PARENT.value,
+                    winner.lane_id,
+                    winner.profile.adapter_kind.value,
+                    winner.profile.provider_id,
+                    winner.selected_model,
+                    winner.selected_effort,
+                    0,
+                    qualification_hash,
+                    route_identity,
+                    decision.reason.value,
+                    "pinned",
+                    _iso(at),
+                    _iso(at),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO rotation(
+                  policy_id,next_lane_index,generation,updated_at
+                ) VALUES(?,?,?,?)
+                ON CONFLICT(policy_id) DO UPDATE SET
+                  next_lane_index=excluded.next_lane_index,
+                  generation=rotation.generation+1,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    self._rotation_policy(RoutePurpose.DESKTOP_PARENT),
+                    decision.rotation_index,
+                    1,
+                    _iso(at),
+                ),
+            )
+            capacity = winner.capacity
+            self._audit(
+                connection,
+                at=at,
+                task_id=correlation,
+                lane_id=winner.lane_id,
+                event_type="PARENT_ROUTE_SELECTED",
+                reason=decision.reason.value,
+                decision={
+                    "purpose": RoutePurpose.DESKTOP_PARENT.value,
+                    "adapter_kind": winner.profile.adapter_kind.value,
+                    "provider_id": winner.profile.provider_id,
+                    "model_id": winner.selected_model,
+                    "effort": winner.selected_effort,
+                    "fast_mode": False,
+                    "selection_reason": decision.reason.value,
+                    "qualification_evidence_hash": qualification_hash,
+                    "route_identity": route_identity,
+                    "capacity": (
+                        {
+                            "source_kind": capacity.source_kind,
+                            "source_hash": capacity.source_id.rpartition("#")[2],
+                            "captured_at": _iso(capacity.captured_at),
+                            "read_at": _iso(capacity.read_at),
+                            "expires_at": _iso(capacity.expires_at),
+                            "freshness": capacity.freshness.value,
+                            "confidence": capacity.confidence.value,
+                            "comparability_group": capacity.comparability_group,
+                            "quota_window_id": capacity.quota_window_id,
+                            "measurement_kind": capacity.measurement_kind.value,
+                        }
+                        if capacity is not None
+                        else None
+                    ),
+                },
+            )
+            if inject_failure:
+                raise RuntimeError("injected parent transaction failure")
+            connection.commit()
+            return ParentAdmission(
+                ReasonCode.MET,
+                self.read_parent_pin(profile_id, lineage_root_id),
+                decision_evaluations,
+            )
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def acquire_parent_turn(
+        self,
+        *,
+        profile_id: str,
+        lineage_root_id: str,
+        task: TaskSpec,
+        candidates: Sequence[LaneInputs],
+        owner_uuid: str,
+        ttl_seconds: int,
+        now: datetime,
+    ) -> ParentTurnAcquisition:
+        at = _at(now)
+        correlation = self._parent_correlation(profile_id, lineage_root_id)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._reap(connection, at)
+            row = connection.execute(
+                """
+                SELECT * FROM parent_sessions
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (profile_id, lineage_root_id),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return ParentTurnAcquisition(
+                    ReasonCode.PINNED_LANE_UNAVAILABLE,
+                    None,
+                    None,
+                )
+            pin = self._parent_pin(row)
+            live_inputs = self._live_inputs(connection, candidates, at)
+            evaluations = tuple(
+                evaluate_lane(
+                    candidate,
+                    task,
+                    now=at,
+                    purpose=RoutePurpose.DESKTOP_PARENT,
+                )
+                for candidate in live_inputs
+            )
+            evaluation = next(
+                (item for item in evaluations if item.lane_id == pin.lane_id),
+                None,
+            )
+            if evaluation is None or not evaluation.eligible:
+                self._audit(
+                    connection,
+                    at=at,
+                    task_id=correlation,
+                    lane_id=pin.lane_id,
+                    event_type="PARENT_ROUTE_DENIED",
+                    reason=ReasonCode.PINNED_LANE_UNAVAILABLE.value,
+                    decision={
+                        "purpose": RoutePurpose.DESKTOP_PARENT.value,
+                        "reasons": [
+                            reason.value
+                            for reason in (
+                                evaluation.reasons if evaluation is not None else ()
+                            )
+                        ],
+                    },
+                )
+                connection.commit()
+                return ParentTurnAcquisition(
+                    ReasonCode.PINNED_LANE_UNAVAILABLE,
+                    pin,
+                    None,
+                    evaluations,
+                )
+            current = connection.execute(
+                """
+                SELECT * FROM parent_leases
+                WHERE profile_id=? AND lineage_root_id=?
+                  AND released_at IS NULL AND expires_at > ?
+                """,
+                (profile_id, lineage_root_id, _iso(at)),
+            ).fetchone()
+            if current is not None:
+                connection.commit()
+                return ParentTurnAcquisition(
+                    ReasonCode.LEASE_CONFLICT,
+                    pin,
+                    self._parent_lease(current),
+                    evaluations,
+                )
+            previous = connection.execute(
+                """
+                SELECT generation FROM parent_leases
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (profile_id, lineage_root_id),
+            ).fetchone()
+            generation = int(previous["generation"]) + 1 if previous else 1
+            expires = at + timedelta(seconds=ttl_seconds)
+            connection.execute(
+                """
+                INSERT INTO parent_leases(
+                  profile_id,lineage_root_id,lane_id,owner_uuid,generation,
+                  reserved_pct,acquired_at,heartbeat_at,expires_at,released_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,NULL)
+                ON CONFLICT(profile_id,lineage_root_id) DO UPDATE SET
+                  lane_id=excluded.lane_id,
+                  owner_uuid=excluded.owner_uuid,
+                  generation=excluded.generation,
+                  reserved_pct=excluded.reserved_pct,
+                  acquired_at=excluded.acquired_at,
+                  heartbeat_at=excluded.heartbeat_at,
+                  expires_at=excluded.expires_at,
+                  released_at=NULL
+                """,
+                (
+                    profile_id,
+                    lineage_root_id,
+                    pin.lane_id,
+                    owner_uuid,
+                    generation,
+                    str(task.reservation_pct),
+                    _iso(at),
+                    _iso(at),
+                    _iso(expires),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE parent_sessions SET status='active',updated_at=?
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (_iso(at), profile_id, lineage_root_id),
+            )
+            self._audit(
+                connection,
+                at=at,
+                task_id=correlation,
+                lane_id=pin.lane_id,
+                event_type="PARENT_LEASE_ACQUIRED",
+                reason=ReasonCode.MET.value,
+                decision={
+                    "purpose": RoutePurpose.DESKTOP_PARENT.value,
+                    "generation": generation,
+                },
+            )
+            connection.commit()
+            lease = ParentLeaseHandle(
+                profile_id=profile_id,
+                lineage_root_id=lineage_root_id,
+                lane_id=pin.lane_id,
+                owner_uuid=owner_uuid,
+                generation=generation,
+                reserved_pct=task.reservation_pct,
+                expires_at=expires,
+            )
+            return ParentTurnAcquisition(
+                ReasonCode.MET,
+                replace(pin, status="active"),
+                lease,
+                evaluations,
+            )
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def active_reserved_pct(self, lane_id: str, *, now: datetime) -> Decimal:
         connection = self._connect_existing()
         if connection is None:
@@ -565,6 +1085,8 @@ class FleetStore:
         if connection is None:
             return 0, Decimal("0")
         try:
+            if not self._table_exists(connection, "leases"):
+                return 0, Decimal("0")
             return self._lane_usage(connection, lane_id, _at(now))
         finally:
             connection.close()
@@ -657,6 +1179,53 @@ class FleetStore:
         finally:
             connection.close()
 
+    def heartbeat_parent(
+        self,
+        lease: ParentLeaseHandle,
+        *,
+        ttl_seconds: int,
+        now: datetime,
+    ) -> ParentLeaseHandle | None:
+        connection = self._connect()
+        at = _at(now)
+        expires = at + timedelta(seconds=ttl_seconds)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE parent_leases SET heartbeat_at=?,expires_at=?
+                WHERE profile_id=? AND lineage_root_id=? AND owner_uuid=?
+                  AND generation=? AND released_at IS NULL AND expires_at > ?
+                """,
+                (
+                    _iso(at),
+                    _iso(expires),
+                    lease.profile_id,
+                    lease.lineage_root_id,
+                    lease.owner_uuid,
+                    lease.generation,
+                    _iso(at),
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            self._audit(
+                connection,
+                at=at,
+                task_id=self._parent_correlation(
+                    lease.profile_id, lease.lineage_root_id
+                ),
+                lane_id=lease.lane_id,
+                event_type="PARENT_LEASE_HEARTBEAT",
+                reason=ReasonCode.MET.value,
+                decision={"generation": lease.generation},
+            )
+            connection.commit()
+            return replace(lease, expires_at=expires)
+        finally:
+            connection.close()
+
     def release(
         self, lease: LeaseHandle, *, outcome: str, now: datetime
     ) -> bool:
@@ -695,6 +1264,60 @@ class FleetStore:
                 event_type="LEASE_RELEASED",
                 reason=ReasonCode.RELEASED.value,
                 decision={"generation": lease.generation, "outcome": outcome},
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def release_parent_turn(
+        self,
+        lease: ParentLeaseHandle,
+        *,
+        outcome: str,
+        now: datetime,
+    ) -> bool:
+        connection = self._connect()
+        at = _at(now)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE parent_leases SET released_at=?
+                WHERE profile_id=? AND lineage_root_id=? AND owner_uuid=?
+                  AND generation=? AND released_at IS NULL
+                """,
+                (
+                    _iso(at),
+                    lease.profile_id,
+                    lease.lineage_root_id,
+                    lease.owner_uuid,
+                    lease.generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.execute(
+                """
+                UPDATE parent_sessions SET status='pinned',updated_at=?
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (_iso(at), lease.profile_id, lease.lineage_root_id),
+            )
+            self._audit(
+                connection,
+                at=at,
+                task_id=self._parent_correlation(
+                    lease.profile_id, lease.lineage_root_id
+                ),
+                lane_id=lease.lane_id,
+                event_type="PARENT_LEASE_RELEASED",
+                reason=ReasonCode.RELEASED.value,
+                decision={
+                    "generation": lease.generation,
+                    "outcome": outcome,
+                },
             )
             connection.commit()
             return True

@@ -16,8 +16,12 @@ from .types import (
     FleetRunResult,
     LaneInputs,
     LaneProfile,
+    ParentAdmission,
+    ParentPin,
+    ParentTurnAcquisition,
     Qualification,
     ReasonCode,
+    RoutePurpose,
     RouteDecision,
     TaskSpec,
 )
@@ -53,7 +57,12 @@ class FleetService:
         self._now = now or (lambda: datetime.now(timezone.utc))
         self.owner_uuid = owner_uuid or str(uuid.uuid4())
 
-    def _inputs(self, at: datetime) -> tuple[LaneInputs, ...]:
+    def _inputs(
+        self,
+        at: datetime,
+        *,
+        purpose: RoutePurpose = RoutePurpose.TASK_WORKER,
+    ) -> tuple[LaneInputs, ...]:
         candidates: list[LaneInputs] = []
         for profile in self.profiles:
             lane_config = self.config.lanes[profile.lane_id]
@@ -63,7 +72,11 @@ class FleetService:
                 LaneInputs(
                     profile=profile,
                     enabled=lane_config.enabled,
-                    adapter_found=profile.lane_id in self.adapters,
+                    adapter_found=(
+                        profile.lane_id in self.adapters
+                        if purpose is RoutePurpose.TASK_WORKER
+                        else profile.supports_parent_session
+                    ),
                     qualification=self.qualifications.get(profile.lane_id),
                     capacity=self.capacity_source.read(
                         profile.lane_id,
@@ -94,12 +107,96 @@ class FleetService:
             for candidate in self._inputs(at)
         )
 
+    def inspect_parent(self, task: TaskSpec) -> tuple:
+        at = self._now().astimezone(timezone.utc)
+        return tuple(
+            evaluate_lane(
+                candidate,
+                task,
+                now=at,
+                minimum_confidence=self.config.minimum_confidence,
+                purpose=RoutePurpose.DESKTOP_PARENT,
+            )
+            for candidate in self._inputs(
+                at, purpose=RoutePurpose.DESKTOP_PARENT
+            )
+        )
+
     def plan(self, task: TaskSpec) -> RouteDecision:
         evaluations = self.inspect(task)
         return select_lane(
             evaluations,
             rotation_index=self.store.rotation_cursor(),
             switch_delta=self.config.switch_delta_pct,
+        )
+
+    def preview_parent(self, task: TaskSpec) -> RouteDecision:
+        evaluations = self.inspect_parent(task)
+        if not self.config.enabled or not self.config.parent_desktop_enabled:
+            return RouteDecision(
+                lane_id=None,
+                reason=ReasonCode.FLEET_DISABLED,
+                evaluations=evaluations,
+                rotation_index=self.store.rotation_cursor(
+                    purpose=RoutePurpose.DESKTOP_PARENT
+                ),
+            )
+        return select_lane(
+            evaluations,
+            rotation_index=self.store.rotation_cursor(
+                purpose=RoutePurpose.DESKTOP_PARENT
+            ),
+            switch_delta=self.config.switch_delta_pct,
+        )
+
+    def admit_parent(
+        self,
+        *,
+        profile_id: str,
+        lineage_root_id: str,
+        session_id: str,
+        task: TaskSpec,
+    ) -> ParentAdmission:
+        existing = self.store.read_parent_pin(profile_id, lineage_root_id)
+        if existing is not None:
+            return ParentAdmission(ReasonCode.MET, existing)
+        if not self.config.enabled or not self.config.parent_desktop_enabled:
+            return ParentAdmission(ReasonCode.FLEET_DISABLED, None)
+        at = self._now().astimezone(timezone.utc)
+        return self.store.admit_parent(
+            profile_id=profile_id,
+            lineage_root_id=lineage_root_id,
+            session_id=session_id,
+            task=task,
+            candidates=self._inputs(
+                at, purpose=RoutePurpose.DESKTOP_PARENT
+            ),
+            now=at,
+        )
+
+    def resolve_parent_pin(
+        self, *, profile_id: str, lineage_root_id: str
+    ) -> ParentPin | None:
+        return self.store.read_parent_pin(profile_id, lineage_root_id)
+
+    def acquire_parent_turn(
+        self,
+        *,
+        profile_id: str,
+        lineage_root_id: str,
+        task: TaskSpec,
+    ) -> ParentTurnAcquisition:
+        at = self._now().astimezone(timezone.utc)
+        return self.store.acquire_parent_turn(
+            profile_id=profile_id,
+            lineage_root_id=lineage_root_id,
+            task=task,
+            candidates=self._inputs(
+                at, purpose=RoutePurpose.DESKTOP_PARENT
+            ),
+            owner_uuid=self.owner_uuid,
+            ttl_seconds=self.config.lease_ttl_seconds,
+            now=at,
         )
 
     def run(self, task: TaskSpec, *, prompt: str) -> FleetRunResult:

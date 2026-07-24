@@ -35,6 +35,7 @@ def _profile(lane_id: str, order: int) -> LaneProfile:
         supported_efforts=("low", "high"),
         capabilities=frozenset({"workspace_write", "shell"}),
         allowed_auth_kinds=frozenset({"oauth_subscription"}),
+        supports_parent_session=True,
     )
 
 
@@ -122,6 +123,7 @@ def _service(tmp_path, *, enabled=True, adapter=None):
         {
             "fleet": {
                 "enabled": enabled,
+                "parent_desktop_enabled": True,
                 "bridge_usage_file": str(bridge),
                 "lanes": {
                     "chatgpt_codex": {"enabled": True},
@@ -322,7 +324,7 @@ def test_stale_rotation_rate_limit_keeps_cooldown_and_audit_contract(tmp_path):
     )
     assert route["reason_code"] == ReasonCode.ROTATION.value
     assert route["decision"]["selection_reason"] == route["reason_code"]
-    assert route["decision"]["capacity_source"] is None
+    assert route["decision"]["capacity_source"].startswith("bridge_file:")
 
 
 def test_plan_is_read_only_and_does_not_advance_rotation(tmp_path):
@@ -333,4 +335,16 @@ def test_plan_is_read_only_and_does_not_advance_rotation(tmp_path):
 
     assert first == second
     assert first.lane_id == "chatgpt_codex"
+    assert not service.store.path.exists()
+
+
+def test_parent_preview_is_read_only_and_uses_parent_rotation(tmp_path):
+    service, _, _ = _service(tmp_path)
+
+    first = service.preview_parent(_task("parent-preview"))
+    second = service.preview_parent(_task("parent-preview"))
+
+    assert first == second
+    assert first.lane_id == "chatgpt_codex"
+    assert first.reason is ReasonCode.ROTATION
     assert not service.store.path.exists()

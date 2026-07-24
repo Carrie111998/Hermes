@@ -289,3 +289,10 @@ def test_32_concurrent_selectors_cannot_double_reserve_capacity_one(tmp_path):
         result.reason for result in results if result.lease is None
     } == {ReasonCode.NO_ELIGIBLE_LANE}
     assert FleetStore(db).active_reserved_pct("chatgpt_codex", now=NOW) == 5
+
+
+def test_parent_pin_read_is_read_only_on_an_absent_database(tmp_path):
+    store = FleetStore(tmp_path / "fleet" / "state.db")
+
+    assert store.read_parent_pin("default", "lineage-1") is None
+    assert not store.path.exists()
