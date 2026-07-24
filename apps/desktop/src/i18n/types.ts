@@ -189,6 +189,7 @@ export interface Translations {
       microphoneFailed: string
       microphoneInUse: string
       microphonePermissionDenied: string
+      microphoneSecureContextRequired: string
       microphoneStartFailed: string
       microphoneUnsupported: string
       noMicrophone: string
