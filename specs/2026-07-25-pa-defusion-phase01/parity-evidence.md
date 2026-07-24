@@ -24,7 +24,7 @@ excluded. No client deploy or `tgg-app-1` access occurred in this execution.
 | Widen client-plane surface | PASS | `35196fc867` adds `deploy/finexis/` and the general `deploy/<client>/` classification, with regression tests. |
 | Honest re-baseline | PASS, warnings exposed | `93da88bd57` preserves 23 established entries and records all 75 newly exposed entries in `plane-lint-findings.md`; none of the 75 were suppressed. Warn mode exits 0. Strict mode intentionally exits 1 until later phases remove or legitimately classify those findings. |
 | D1-35 root-manifest quick kill | PASS in Hermes | Root `pa-agent.manifest.json` moved under `deploy/tgg/christopher/`; all Hermes callers/docs/tests now use explicit manifest paths (`35196fc867`, `5531250691`). |
-| D1-35 CLI refusal | PASS in marshal source | `531fd40df92cc9db5ae19c1a2242ca7b806667fc` requires an explicit manifest for both Commander and programmatic bundle construction. Independent verification: 7 focused tests pass and `tsc --noEmit` passes. |
+| D1-35 CLI refusal | PASS on marshal `origin/main` | `531fd40df92cc9db5ae19c1a2242ca7b806667fc` requires an explicit manifest for both Commander and programmatic bundle construction. Independent verification: 7 focused tests pass and `tsc --noEmit` passes; remote ancestry and head were verified after push. |
 | Neutral examples | PASS, description-only | Neutralized comment/docstring examples in `gateway/pa_observability.py`. Tool schema examples were deliberately unchanged because the registry-dump parity gate is byte-exact. |
 
 ## Phase 1 replay-chain parity
@@ -75,7 +75,8 @@ passed / 2 failed): `Namespace` lacks `prod_pilot_run_id` in
 | edna workspace | Plan §0.2 documentation sync | `a79433fbcc891a77ab01187a0e6b9c68718fbafb` |
 
 No release or client deployment is part of these commits. The marshal gate is
-source-level until a separately authorized release.
+merged on source `origin/main` but remains undeployed until a separately
+authorized release.
 
 ## Review dispositions
 
