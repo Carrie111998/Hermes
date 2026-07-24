@@ -74,6 +74,7 @@ def _is_client_error(exc: Exception) -> bool:
 # Config
 # ---------------------------------------------------------------------------
 
+
 def _load_config() -> dict:
     """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
 
@@ -101,8 +102,9 @@ def _load_config() -> dict:
     if config_path.exists():
         try:
             file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            config.update({k: v for k, v in file_cfg.items()
-                           if v is not None and v != ""})
+            config.update({
+                k: v for k, v in file_cfg.items() if v is not None and v != ""
+            })
         except Exception:
             pass
 
@@ -127,8 +129,14 @@ SEARCH_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
-            "top_k": {"type": "integer", "description": "Max results (default: 10, max: 50)."},
-            "rerank": {"type": "boolean", "description": "Rerank results for relevance (default: false, platform mode only)."},
+            "top_k": {
+                "type": "integer",
+                "description": "Max results (default: 10, max: 50).",
+            },
+            "rerank": {
+                "type": "boolean",
+                "description": "Rerank results for relevance (default: false, platform mode only).",
+            },
         },
         "required": ["query"],
     },
@@ -190,6 +198,7 @@ DELETE_SCHEMA = {
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
+
 class Mem0MemoryProvider(MemoryProvider):
     """Mem0 memory with server-side extraction and semantic search.
 
@@ -227,15 +236,31 @@ class Mem0MemoryProvider(MemoryProvider):
         cfg = _load_config()
         mode = cfg.get("mode", "platform")
         if mode == "oss":
-            return bool(cfg.get("oss", {}).get("vector_store"))
-        # Platform needs an api_key; self-hosted needs a host (api_key optional
-        # when the server runs with AUTH_DISABLED).
-        return bool(cfg.get("api_key") or cfg.get("host"))
+            if not cfg.get("oss", {}).get("vector_store"):
+                return False
+        else:
+            # Platform needs an api_key; self-hosted needs a host (api_key
+            # optional when the server runs with AUTH_DISABLED).
+            if not (cfg.get("api_key") or cfg.get("host")):
+                return False
+        # Config looks right, but the provider cannot function until the SDK
+        # is importable. Verify offline (no network, no install) so callers —
+        # and `hermes memory status` — don't report "available" for a provider
+        # whose dependency is missing. The lazy-install in _create_backend()
+        # still installs the SDK on first real use; this check only gates the
+        # readiness signal, and stays within the offline is_available() contract.
+        try:
+            import importlib.util as _ilu
+
+            return _ilu.find_spec("mem0") is not None
+        except Exception:
+            return False
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
         import json
         from pathlib import Path
+
         config_path = Path(hermes_home) / "mem0.json"
         existing = {}
         if config_path.exists():
@@ -245,6 +270,7 @@ class Mem0MemoryProvider(MemoryProvider):
                 pass
         existing.update(values)
         from utils import atomic_json_write
+
         atomic_json_write(config_path, existing, mode=0o600)
 
     def get_config_schema(self):
@@ -252,15 +278,37 @@ class Mem0MemoryProvider(MemoryProvider):
         mode = cfg.get("mode", "platform")
         api_key_required = mode != "oss"
         return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": api_key_required, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
-            {"key": "host", "description": "Self-hosted Mem0 server URL (leave blank for cloud)", "required": False, "env_var": "MEM0_HOST"},
-            {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
+            {
+                "key": "api_key",
+                "description": "Mem0 Platform API key",
+                "secret": True,
+                "required": api_key_required,
+                "env_var": "MEM0_API_KEY",
+                "url": "https://app.mem0.ai",
+            },
+            {
+                "key": "host",
+                "description": "Self-hosted Mem0 server URL (leave blank for cloud)",
+                "required": False,
+                "env_var": "MEM0_HOST",
+            },
+            {
+                "key": "user_id",
+                "description": "User identifier",
+                "default": "hermes-user",
+            },
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "false", "choices": ["true", "false"]},
+            {
+                "key": "rerank",
+                "description": "Enable reranking for recall",
+                "default": "false",
+                "choices": ["true", "false"],
+            },
         ]
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         from ._setup import post_setup
+
         post_setup(hermes_home, config)
 
     def _create_backend(self):
@@ -271,6 +319,7 @@ class Mem0MemoryProvider(MemoryProvider):
         # produces the canonical error, captured below.
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
+
             _lazy_ensure("memory.mem0", prompt=False)
         except ImportError:
             pass
@@ -279,14 +328,19 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             if self._mode == "oss":
                 from ._backend import OSSBackend
+
                 return OSSBackend(self._config.get("oss", {}))
             if self._host:
                 from ._backend import SelfHostedBackend
+
                 return SelfHostedBackend(self._api_key, self._host)
             from ._backend import PlatformBackend
+
             return PlatformBackend(self._api_key)
         except Exception as e:
-            logger.error("Mem0 backend failed to initialize (%s mode): %s", self._mode, e)
+            logger.error(
+                "Mem0 backend failed to initialize (%s mode): %s", self._mode, e
+            )
             self._init_error = str(e)
             return None
 
@@ -330,7 +384,9 @@ class Mem0MemoryProvider(MemoryProvider):
             logger.warning(
                 "Mem0 circuit breaker tripped after %d consecutive failures. "
                 "Pausing API calls for %ds.%s",
-                count, _BREAKER_COOLDOWN_SECS, hint,
+                count,
+                _BREAKER_COOLDOWN_SECS,
+                hint,
             )
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -393,7 +449,11 @@ class Mem0MemoryProvider(MemoryProvider):
         else:
             mode_label = "platform (cloud API)"
         # Rerank is a Mem0 Platform feature only.
-        rerank_note = " Rerank is available on search." if (self._mode == "platform" and not self._host) else ""
+        rerank_note = (
+            " Rerank is available on search."
+            if (self._mode == "platform" and not self._host)
+            else ""
+        )
         return (
             "# Mem0 Memory\n"
             f"Active. Mode: {mode_label}. User: {self._user_id}.\n"
@@ -440,9 +500,14 @@ class Mem0MemoryProvider(MemoryProvider):
             body = ""
             try:
                 results = backend.search(
-                    query, filters=self._read_filters(), top_k=10, rerank=False,
+                    query,
+                    filters=self._read_filters(),
+                    top_k=10,
+                    rerank=False,
                 )
-                lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
+                lines = [
+                    r.get("memory", "") for r in (results or []) if r.get("memory")
+                ]
                 if lines:
                     body = "## Mem0 Memory\n" + "\n".join(f"- {l}" for l in lines)
                 self._record_success()
@@ -475,7 +540,9 @@ class Mem0MemoryProvider(MemoryProvider):
         # Slow backend: skip injection; mem0_search tool remains the backstop.
         return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self, user_content: str, assistant_content: str, *, session_id: str = ""
+    ) -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
         if self._backend is None or self._is_breaker_open():
             return
@@ -507,7 +574,9 @@ class Mem0MemoryProvider(MemoryProvider):
             # If still alive after timeout, skip to avoid duplicate ingestion.
             if self._sync_thread and self._sync_thread.is_alive():
                 return
-            self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
+            self._sync_thread = threading.Thread(
+                target=_sync, daemon=True, name="mem0-sync"
+            )
             self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -527,7 +596,9 @@ class Mem0MemoryProvider(MemoryProvider):
             msg = "Mem0 temporarily unavailable (multiple consecutive failures). Will retry automatically."
             if self._mode == "oss":
                 vs = self._config.get("oss", {}).get("vector_store", {})
-                msg += f" Check that your {vs.get('provider', 'vector store')} is running."
+                msg += (
+                    f" Check that your {vs.get('provider', 'vector store')} is running."
+                )
             return json.dumps({"error": msg})
 
         if tool_name == "mem0_search":
@@ -541,12 +612,20 @@ class Mem0MemoryProvider(MemoryProvider):
                     rerank = rerank_raw.lower() not in ("false", "0", "no")
                 else:
                     rerank = bool(rerank_raw)
-                results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
+                results = self._backend.search(
+                    query, filters=self._read_filters(), top_k=top_k, rerank=rerank
+                )
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [{"id": r.get("id"), "memory": r.get("memory", ""),
-                          "score": r.get("score", 0)} for r in results]
+                items = [
+                    {
+                        "id": r.get("id"),
+                        "memory": r.get("memory", ""),
+                        "score": r.get("score", 0),
+                    }
+                    for r in results
+                ]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 if not _is_client_error(e):
@@ -568,7 +647,11 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 event_id = result.get("event_id") if isinstance(result, dict) else None
                 # Cloud add is async (server-side extraction); OSS and self-hosted store synchronously.
-                msg = "Fact stored." if (self._mode == "oss" or self._host) else "Fact queued for storage."
+                msg = (
+                    "Fact stored."
+                    if (self._mode == "oss" or self._host)
+                    else "Fact queued for storage."
+                )
                 return json.dumps({"result": msg, "event_id": event_id})
             except Exception as e:
                 self._record_failure()
