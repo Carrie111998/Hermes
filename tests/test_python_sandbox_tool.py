@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -332,6 +333,14 @@ def test_probe_failure_is_actionable_and_handler_fails_closed(monkeypatch):
     response = json.loads(sandbox._handle_python_sandbox({"code": "print(1)"}))
     assert response["status"] == "unavailable"
     assert "permission denied" in response["error"]
+
+
+def test_cpu_limit_wrapper_status_is_recognized():
+    assert sandbox._cpu_limit_exhausted(
+        1, "unshare: sigprocmask unblock failed: Invalid argument"
+    )
+    assert sandbox._cpu_limit_exhausted(128 + signal.SIGXCPU, "")
+    assert not sandbox._cpu_limit_exhausted(1, "ordinary script failure")
 
 
 def _can_run_jail() -> bool:

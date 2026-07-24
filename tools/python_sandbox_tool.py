@@ -552,6 +552,20 @@ def _unavailable(reason: str) -> str:
     return json.dumps({"status": "unavailable", "error": reason, "result": None})
 
 
+def _cpu_limit_exhausted(returncode: int, stderr: str) -> bool:
+    """Recognize direct and util-linux-wrapped SIGXCPU termination."""
+    if returncode in (-signal.SIGXCPU, 128 + signal.SIGXCPU):
+        return True
+    lowered = stderr.lower()
+    return (
+        "signal 24" in lowered
+        or "cpu time limit" in lowered
+        # util-linux unshare 2.39 emits this instead of propagating SIGXCPU
+        # when its pid-namespace child dies at the CPU hard limit.
+        or "sigprocmask unblock failed" in lowered
+    )
+
+
 def python_sandbox(
     code: str,
     datasets: list[str] | None = None,
@@ -703,7 +717,7 @@ def python_sandbox(
             status = "timeout"
         elif returncode == 0:
             status = "success"
-        elif returncode in (-signal.SIGXCPU, 128 + signal.SIGXCPU):
+        elif _cpu_limit_exhausted(returncode, stderr):
             status = "error"
             stderr += (
                 f"\nCPU limit ({limits['cpu_seconds']}s) exhausted — "
