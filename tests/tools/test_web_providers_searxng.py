@@ -280,6 +280,31 @@ class TestSearXNGSearchProviderSearch:
         assert captured_params.get("q") == "query"
         assert captured_params.get("format") == "json"
 
+    def test_reserved_params_not_overridden_by_url(self, monkeypatch):
+        """URL query params must not override Hermes-owned fields (q, format, pageno).
+
+        Regression test: if SEARXNG_URL contains ?q=stale&format=html, the
+        provider must still use the actual query and JSON format.
+        """
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/?q=stale&format=html&pageno=99&p_token=abc")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("real query", limit=5)
+
+        # Hermes-owned fields must win
+        assert captured_params["q"] == "real query"
+        assert captured_params["format"] == "json"
+        assert captured_params["pageno"] == 1
+        # Non-reserved URL params should still pass through
+        assert captured_params["p_token"] == "abc"
+
 
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available recognizes "searxng"

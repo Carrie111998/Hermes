@@ -95,7 +95,12 @@ class SearXNGWebSearchProvider(WebSearchProvider):
             "format": "json",
             "pageno": 1,
         }
-        params.update(extra_params)
+        # Merge extra params from the URL, but never let them override
+        # Hermes-owned request fields (q, format, pageno).
+        _reserved = {"q", "format", "pageno"}
+        for key, value in extra_params.items():
+            if key not in _reserved:
+                params[key] = value
 
         try:
             resp = httpx.get(
