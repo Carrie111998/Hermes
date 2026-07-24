@@ -385,6 +385,54 @@ class EventBus:
                                r["event_id"], e)
         return events
 
+    def head_rowid(self) -> int:
+        """Current maximum rowid (0 when the table is empty).
+
+        Snapshot this BEFORE a windowed read so a write landing mid-read is
+        deferred to the next window rather than double-counted or dropped.
+        """
+        row = self._get_conn().execute("SELECT MAX(rowid) FROM events").fetchone()
+        return row[0] if row and row[0] is not None else 0
+
+    def query_rowid_range(self, after: int, through: int) -> List[Event]:
+        """Events with ``after < rowid <= through``, ascending.
+
+        Half-open lower / closed upper bound: ``after`` is an exclusive
+        watermark (the prior digest's high-water rowid), ``through`` a head
+        snapshot taken before reading. Plans as an INTEGER PRIMARY KEY seek —
+        the whole point, replacing DigestComposer's timestamp SCAN.
+
+        Mirrors ``query()``'s version-skew tolerance: a producer on newer code
+        can write event_types this process hasn't loaded; skip the unparseable
+        row + WARN rather than crashing the digest (2026-07-10 regression).
+        """
+        rows = self._get_conn().execute(
+            "SELECT * FROM events WHERE rowid > ? AND rowid <= ? ORDER BY rowid ASC",
+            (after, through),
+        ).fetchall()
+        events: List[Event] = []
+        for r in rows:
+            try:
+                events.append(self._row_to_event(r))
+            except ValueError as e:
+                logger.warning("query_rowid_range: skipping unparseable event %s: %s",
+                               r["event_id"], e)
+        return events
+
+    def min_rowid_since(self, timestamp: str) -> Optional[int]:
+        """Smallest rowid whose ``timestamp >= ?`` (or None).
+
+        One-time seed helper: on the first digest after deploy, translate the
+        legacy ``last_digest_at`` timestamp watermark into a rowid floor. This
+        is the only remaining timestamp-based scan and never repeats once
+        ``last_digest_rowid`` is persisted.
+        """
+        row = self._get_conn().execute(
+            "SELECT MIN(rowid) FROM events WHERE timestamp >= ?",
+            (timestamp,),
+        ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def checkpoint(self, mode: str = "PASSIVE") -> Optional[tuple]:
         """Run a WAL checkpoint; returns (busy, log_frames, checkpointed_frames).
 

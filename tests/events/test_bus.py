@@ -649,3 +649,52 @@ class TestCheckpointModes:
         bus.emit(EventType.GATEWAY_STARTED, "test", {})
         result = bus.checkpoint()
         assert result is not None and len(result) == 3
+
+
+class TestRowidWindow:
+    """rowid-range windowing for DigestComposer (replaces timestamp SCAN)."""
+
+    def test_head_rowid_empty_and_populated(self, bus):
+        assert bus.head_rowid() == 0
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})
+        assert bus.head_rowid() == 2
+
+    def test_query_rowid_range_is_half_open_lower_closed_upper(self, bus):
+        ids = [bus.emit(EventType.JOB_DISCOVERED, "scout", {"i": i})
+               for i in range(5)]  # rowids 1..5
+        got = bus.query_rowid_range(2, 4)  # rowid 3 and 4
+        assert [e.event_id for e in got] == [ids[2], ids[3]]
+
+    def test_query_rowid_range_empty_window(self, bus):
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})
+        assert bus.query_rowid_range(1, 1) == []
+
+    def test_query_rowid_range_plans_as_pk_seek(self, bus):
+        for i in range(50):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            plan = " ".join(
+                row[3] for row in conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT * FROM events "
+                    "WHERE rowid > ? AND rowid <= ? ORDER BY rowid ASC",
+                    (10, 40),
+                )
+            )
+        finally:
+            conn.close()
+        assert "SEARCH" in plan, f"expected a seek, got: {plan}"
+        assert "SCAN" not in plan, f"unexpected scan: {plan}"
+        assert "INTEGER PRIMARY KEY" in plan, (
+            f"rowid window must use the PK, not another index: {plan}")
+
+    def test_min_rowid_since(self, bus):
+        import time
+        for i in range(3):
+            bus.emit(EventType.JOB_DISCOVERED, "scout", {"i": i})
+            time.sleep(0.001)  # Ensure different timestamps
+        all_events = bus.query()  # ordered by rowid ASC
+        ts_second = all_events[1].timestamp
+        assert bus.min_rowid_since(ts_second) == 2
+        assert bus.min_rowid_since("2099-01-01T00:00:00+00:00") is None
