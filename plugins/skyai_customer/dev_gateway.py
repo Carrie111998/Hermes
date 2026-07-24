@@ -128,6 +128,10 @@ NON_PRODUCT_PATH_PREFIXES = frozenset(
 )
 
 AgentRunner = Callable[..., Awaitable[Any]]
+SKYAI_MODEL_UNAVAILABLE_MESSAGE = (
+    "В момента не успявам да се свържа с асистента. "
+    "Моля, опитайте отново след малко."
+)
 
 
 @dataclass(frozen=True)
@@ -607,12 +611,26 @@ def _run_agent_turn(
         from run_agent import AIAgent
 
         runtime = _resolve_agent_runtime(load_config())
+        credential_pool = runtime.get("credential_pool")
+        pool_entries = []
+        if credential_pool is not None:
+            try:
+                pool_entries = list(credential_pool.entries())
+            except Exception:
+                pool_entries = []
+        initial_pool_entry_id = None
+        if credential_pool is not None:
+            try:
+                initial_pool_entry_id = getattr(credential_pool.current(), "id", None)
+            except Exception:
+                initial_pool_entry_id = None
         agent = AIAgent(
             model=runtime["model"],
             provider=runtime["provider"],
             base_url=runtime["base_url"],
             api_key=runtime["api_key"] or None,
             api_mode=runtime["api_mode"],
+            credential_pool=credential_pool,
             enabled_toolsets=[SKYAI_TOOLSET],
             disabled_toolsets=[],
             max_iterations=8,
@@ -635,6 +653,22 @@ def _run_agent_turn(
                 trace.setdefault("model", runtime["model"])
                 trace.setdefault("provider", runtime["provider"])
                 trace.setdefault("api_mode", runtime["api_mode"])
+                trace.setdefault("fallback", bool(getattr(agent, "_fallback_activated", False)))
+                trace.setdefault("credential_pool_size", len(pool_entries))
+                final_pool_entry_id = None
+                if credential_pool is not None:
+                    try:
+                        final_pool_entry_id = getattr(credential_pool.current(), "id", None)
+                    except Exception:
+                        final_pool_entry_id = None
+                trace.setdefault(
+                    "credential_rotated",
+                    bool(
+                        initial_pool_entry_id
+                        and final_pool_entry_id
+                        and initial_pool_entry_id != final_pool_entry_id
+                    ),
+                )
         return result
     finally:
         reset_hermes_home_override(token)
@@ -665,19 +699,38 @@ def _resolve_agent_runtime(
     config: dict[str, Any],
     *,
     codex_credential_resolver: Callable[..., dict[str, Any]] | None = None,
-) -> dict[str, str]:
+    runtime_provider_resolver: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     runtime = _resolve_profile_runtime(config)
     if runtime["provider"] != "openai-codex":
         return runtime
 
-    if codex_credential_resolver is None:
-        from hermes_cli.auth import resolve_codex_runtime_credentials
+    # Preserve the narrow injectable credential resolver used by existing
+    # tests and integrations. The production path deliberately goes through
+    # the canonical runtime-provider resolver so a profile-scoped
+    # same-provider credential pool is selected and attached to AIAgent.
+    if codex_credential_resolver is not None:
+        creds = codex_credential_resolver(refresh_if_expiring=True)
+        runtime["api_key"] = str(creds.get("api_key") or "").strip()
+        runtime["base_url"] = runtime["base_url"] or str(creds.get("base_url") or "").strip()
+        return runtime
 
-        codex_credential_resolver = resolve_codex_runtime_credentials
+    if runtime_provider_resolver is None:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    creds = codex_credential_resolver(refresh_if_expiring=True)
-    runtime["api_key"] = str(creds.get("api_key") or "").strip()
-    runtime["base_url"] = runtime["base_url"] or str(creds.get("base_url") or "").strip()
+        runtime_provider_resolver = resolve_runtime_provider
+
+    resolved = runtime_provider_resolver(
+        requested=runtime["provider"],
+        target_model=runtime["model"] or None,
+    )
+    runtime["provider"] = str(resolved.get("provider") or runtime["provider"]).strip()
+    runtime["api_mode"] = str(resolved.get("api_mode") or runtime["api_mode"]).strip()
+    runtime["api_key"] = str(resolved.get("api_key") or "").strip()
+    runtime["base_url"] = (
+        runtime["base_url"] or str(resolved.get("base_url") or "").strip()
+    )
+    runtime["credential_pool"] = resolved.get("credential_pool")
     return runtime
 
 
@@ -1688,12 +1741,23 @@ async def build_chat_response(
         system_prompt,
     )
     reply, runner_cards = _coerce_runner_result(runner_result)
+    runner_failed = bool(
+        isinstance(runner_result, dict)
+        and (
+            runner_result.get("failed") is True
+            or runner_result.get("completed") is False
+            or runner_result.get("error")
+        )
+    )
+    if runner_failed:
+        reply = SKYAI_MODEL_UNAVAILABLE_MESSAGE
+        runner_cards = []
     voice_action = _extract_voice_action_from_runner_result(runner_result) if surface == "voice" else None
     cards = (runner_cards or await asyncio.to_thread(build_cards_from_reply, reply))[:MAX_VISIBLE_PRODUCT_CARDS]
     latency_ms = int((time.monotonic() - started) * 1000)
 
     response = {
-        "status": "ok",
+        "status": "error" if runner_failed else "ok",
         "version": settings.version,
         "behavior_version": settings.behavior_version,
         "conversation_id": conversation_id,
@@ -1710,11 +1774,22 @@ async def build_chat_response(
             "surface": surface,
         },
     }
+    if runner_failed:
+        response["error"] = "provider_unavailable"
     runner_trace = runner_result.get("trace") if isinstance(runner_result, dict) else None
     if isinstance(runner_trace, dict):
         for key in ("model", "provider", "api_mode"):
             if runner_trace.get(key):
                 response["trace"][key] = str(runner_trace[key])
+        if isinstance(runner_trace.get("fallback"), bool):
+            response["trace"]["fallback"] = runner_trace["fallback"]
+        for key in ("credential_pool_size", "credential_rotated"):
+            if key in runner_trace:
+                response["trace"][key] = runner_trace[key]
+    if isinstance(runner_result, dict):
+        failure_reason = str(runner_result.get("failure_reason") or "").strip()
+        if failure_reason in {"rate_limit", "billing", "auth", "overloaded", "connection"}:
+            response["trace"]["failure_reason"] = failure_reason
     if voice_action:
         response["voice_action"] = voice_action
         response["trace"]["voice_action"] = voice_action.get("voice_action")

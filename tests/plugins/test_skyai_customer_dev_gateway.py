@@ -192,6 +192,44 @@ async def test_build_chat_response_exposes_resolved_model_trace(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_build_chat_response_fails_closed_on_provider_error(tmp_path: Path) -> None:
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        return {
+            "final_response": (
+                "API call failed after 3 retries: HTTP 429: "
+                "The usage limit has been reached"
+            ),
+            "completed": False,
+            "failed": True,
+            "error": "The usage limit has been reached",
+            "failure_reason": "rate_limit",
+            "trace": {
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+                "credential_pool_size": 4,
+                "credential_rotated": False,
+            },
+        }
+
+    response = await dev_gateway.build_chat_response(
+        {"conversation_id": "c1", "message": "Здравей"},
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "error"
+    assert response["error"] == "provider_unavailable"
+    assert response["reply"] == dev_gateway.SKYAI_MODEL_UNAVAILABLE_MESSAGE
+    assert "429" not in response["reply"]
+    assert "usage limit" not in response["reply"].lower()
+    assert response["cards"] == []
+    assert response["trace"]["failure_reason"] == "rate_limit"
+    assert response["trace"]["credential_pool_size"] == 4
+    assert response["trace"]["credential_rotated"] is False
+
+
+@pytest.mark.asyncio
 async def test_build_chat_response_passes_voice_system_prompt_to_hermes_runner(tmp_path: Path) -> None:
     seen = {}
 
@@ -1026,6 +1064,39 @@ def test_resolve_agent_runtime_refreshes_codex_credentials() -> None:
         "api_mode": "codex_responses",
         "api_key": "fresh-oauth-token",
     }
+
+
+def test_resolve_agent_runtime_attaches_profile_credential_pool() -> None:
+    pool = object()
+    seen = {}
+
+    def fake_runtime_resolver(**kwargs):
+        seen.update(kwargs)
+        return {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "selected-pool-token",
+            "credential_pool": pool,
+        }
+
+    runtime = dev_gateway._resolve_agent_runtime(
+        {
+            "model": {
+                "default": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            }
+        },
+        runtime_provider_resolver=fake_runtime_resolver,
+    )
+
+    assert seen == {
+        "requested": "openai-codex",
+        "target_model": "gpt-5.6-sol",
+    }
+    assert runtime["api_key"] == "selected-pool-token"
+    assert runtime["credential_pool"] is pool
 
 
 def test_sanitize_runtime_error_redacts_token_markers() -> None:
