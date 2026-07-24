@@ -651,3 +651,24 @@ tokenizer.normalizer = NFKC()
    - Save with model
    - Document special tokens
    - Track vocabulary changes
+
+## Model families by algorithm
+
+Which production models were trained with which algorithm — use this to pick the
+algorithm that matches the architecture you are reproducing.
+
+| Algorithm | Used by |
+|-----------|---------|
+| BPE | GPT-2, GPT-3, RoBERTa, BART, DeBERTa |
+| WordPiece | BERT, DistilBERT, MobileBERT |
+| Unigram | ALBERT, T5, mBART, XLNet (via SentencePiece) |
+
+Additional algorithm-specific caveats:
+
+- **BPE**: tokenization depends on merge order, so it may split common words
+  unexpectedly; vocabulary size stays flexible and OOV words break into subwords.
+- **WordPiece**: unknown words fall back to `[UNK]` when no subword match exists;
+  it saves the vocabulary rather than the merge rules, producing larger files.
+- **Unigram**: computationally expensive to train and has more hyperparameters to
+  tune, but works well for languages without word boundaries and diverse linguistic
+  contexts.

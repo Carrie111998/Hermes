@@ -116,3 +116,20 @@ The Balance Sheet check row (below Total Liabilities and Equity) uses conditiona
 - EBITDA Margin > 50% → WARNING: Unusually high
 - Net Margin < 0% → FLAG: Net losses (may be acceptable in growth phase)
 - Net Margin > Gross Margin → ERROR: Formula issue
+
+## Formatting — Professional Blue/Grey Palette (Default unless template/user specifies otherwise)
+
+**Keep colors minimal.** Use only blues and greys for cell fills. Do NOT introduce greens, yellows, oranges, or multiple accent colors — a clean model uses restraint.
+
+| Element | Fill | Font |
+|---|---|---|
+| Section headers (IS / BS / CF titles) | Dark blue `#1F4E79` | White bold |
+| Column headers (FY2024A, FY2025E, etc.) | Light blue `#D9E1F2` | Black bold |
+| Input cells (historicals, assumption drivers) | Light grey `#F2F2F2` or white | Blue `#0000FF` |
+| Formula cells | White | Black |
+| Cross-tab links | White | Green `#008000` |
+| Check rows / key totals | Medium blue `#BDD7EE` | Black bold |
+
+**That's 3 blues + 1 grey + white.** If the template has its own color scheme, follow the template instead.
+
+Font color signals *what* a cell is (input/formula/link). Fill color signals *where* you are (header/data/check).

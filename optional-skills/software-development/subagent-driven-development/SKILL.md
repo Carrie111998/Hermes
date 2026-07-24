@@ -33,173 +33,32 @@ Use this skill when:
 - Consistent quality checks across all tasks
 - Subagents can ask questions before starting work
 
-## The Process
+## End-to-End Skeleton
 
-### 1. Read and Parse Plan
-
-Read the plan file. Extract ALL tasks with their full text and context upfront. Create a todo list:
-
-```python
-# Read the plan
-read_file("docs/plans/feature-plan.md")
-
-# Create todo list with all tasks
-todo([
-    {"id": "task-1", "content": "Create User model with email field", "status": "pending"},
-    {"id": "task-2", "content": "Add password hashing utility", "status": "pending"},
-    {"id": "task-3", "content": "Create login endpoint", "status": "pending"},
-])
+```
+read_file(plan)  →  todo([all tasks])            # read the plan ONCE
+for each task:
+    delegate_task(implementer)                    # full task text in context, TDD
+    delegate_task(spec reviewer)   → PASS?        # else fix + re-review
+    delegate_task(quality reviewer) → APPROVED?   # else fix + re-review
+    todo(task -> completed, merge=True)
+delegate_task(final integration reviewer)
+pytest tests/ -q  &&  git diff --stat  &&  commit
 ```
 
-**Key:** Read the plan ONCE. Extract everything. Don't make subagents read the plan file — provide the full task text directly in context.
+Exact `delegate_task` goals, contexts, and checklists for every box above: `references/orchestration-playbook.md`.
 
-### 2. Per-Task Workflow
+## Routing — load the reference you need
 
-For EACH task in the plan:
-
-#### Step 1: Dispatch Implementer Subagent
-
-Use `delegate_task` with complete context:
-
-```python
-delegate_task(
-    goal="Implement Task 1: Create User model with email and password_hash fields",
-    context="""
-    TASK FROM PLAN:
-    - Create: src/models/user.py
-    - Add User class with email (str) and password_hash (str) fields
-    - Use bcrypt for password hashing
-    - Include __repr__ for debugging
-
-    FOLLOW TDD:
-    1. Write failing test in tests/models/test_user.py
-    2. Run: pytest tests/models/test_user.py -v (verify FAIL)
-    3. Write minimal implementation
-    4. Run: pytest tests/models/test_user.py -v (verify PASS)
-    5. Run: pytest tests/ -q (verify no regressions)
-    6. Commit: git add -A && git commit -m "feat: add User model with password hashing"
-
-    PROJECT CONTEXT:
-    - Python 3.11, Flask app in src/app.py
-    - Existing models in src/models/
-    - Tests use pytest, run from project root
-    - bcrypt already in requirements.txt
-    """,
-    toolsets=['terminal', 'file']
-)
-```
-
-#### Step 2: Dispatch Spec Compliance Reviewer
-
-After the implementer completes, verify against the original spec:
-
-```python
-delegate_task(
-    goal="Review if implementation matches the spec from the plan",
-    context="""
-    ORIGINAL TASK SPEC:
-    - Create src/models/user.py with User class
-    - Fields: email (str), password_hash (str)
-    - Use bcrypt for password hashing
-    - Include __repr__
-
-    CHECK:
-    - [ ] All requirements from spec implemented?
-    - [ ] File paths match spec?
-    - [ ] Function signatures match spec?
-    - [ ] Behavior matches expected?
-    - [ ] Nothing extra added (no scope creep)?
-
-    OUTPUT: PASS or list of specific spec gaps to fix.
-    """,
-    toolsets=['file']
-)
-```
-
-**If spec issues found:** Fix gaps, then re-run spec review. Continue only when spec-compliant.
-
-#### Step 3: Dispatch Code Quality Reviewer
-
-After spec compliance passes:
-
-```python
-delegate_task(
-    goal="Review code quality for Task 1 implementation",
-    context="""
-    FILES TO REVIEW:
-    - src/models/user.py
-    - tests/models/test_user.py
-
-    CHECK:
-    - [ ] Follows project conventions and style?
-    - [ ] Proper error handling?
-    - [ ] Clear variable/function names?
-    - [ ] Adequate test coverage?
-    - [ ] No obvious bugs or missed edge cases?
-    - [ ] No security issues?
-
-    OUTPUT FORMAT:
-    - Critical Issues: [must fix before proceeding]
-    - Important Issues: [should fix]
-    - Minor Issues: [optional]
-    - Verdict: APPROVED or REQUEST_CHANGES
-    """,
-    toolsets=['file']
-)
-```
-
-**If quality issues found:** Fix issues, re-review. Continue only when approved.
-
-#### Step 4: Mark Complete
-
-```python
-todo([{"id": "task-1", "content": "Create User model with email field", "status": "completed"}], merge=True)
-```
-
-### 3. Final Review
-
-After ALL tasks are complete, dispatch a final integration reviewer:
-
-```python
-delegate_task(
-    goal="Review the entire implementation for consistency and integration issues",
-    context="""
-    All tasks from the plan are complete. Review the full implementation:
-    - Do all components work together?
-    - Any inconsistencies between tasks?
-    - All tests passing?
-    - Ready for merge?
-    """,
-    toolsets=['terminal', 'file']
-)
-```
-
-### 4. Verify and Commit
-
-```bash
-# Run full test suite
-pytest tests/ -q
-
-# Review all changes
-git diff --stat
-
-# Final commit if needed
-git add -A && git commit -m "feat: complete [feature name] implementation"
-```
-
-## Task Granularity
-
-**Each task = 2-5 minutes of focused work.**
-
-**Too big:**
-- "Implement user authentication system"
-
-**Right size:**
-- "Create User model with email and password fields"
-- "Add password hashing function"
-- "Create login endpoint"
-- "Add JWT token generation"
-- "Create registration endpoint"
+| Intent | Read |
+|---|---|
+| Run the loop: full implementer / spec-reviewer / quality-reviewer dispatch contexts, final review, verify+commit commands | `references/orchestration-playbook.md` |
+| Size the tasks (2-5 min each), too-big vs right-size examples | `references/orchestration-playbook.md` |
+| Combine with `plan`, `test-driven-development`, `requesting-code-review`, `systematic-debugging` | `references/orchestration-playbook.md` |
+| See a worked 2-task run end to end, including a failed spec review | `references/orchestration-playbook.md` |
+| Design or name a validation checkpoint; decide what happens when a check fails and who resumes | `references/gates-taxonomy.md` |
+| Subagent asked a question / reviewer found issues / subagent failed the task | `references/gates-taxonomy.md` |
+| Run will consume significant context — read-depth rules, four-tier degradation model, silent-degradation warning signs, why fresh-subagent-per-task pays off | `references/context-budget-discipline.md` |
 
 ## Red Flags — Never Do These
 
@@ -216,119 +75,6 @@ git add -A && git commit -m "feat: complete [feature name] implementation"
 - **Start code quality review before spec compliance is PASS** (wrong order)
 - Move to next task while either review has open issues
 
-## Handling Issues
-
-### If Subagent Asks Questions
-
-- Answer clearly and completely
-- Provide additional context if needed
-- Don't rush them into implementation
-
-### If Reviewer Finds Issues
-
-- Implementer subagent (or a new one) fixes them
-- Reviewer reviews again
-- Repeat until approved
-- Don't skip the re-review
-
-### If Subagent Fails a Task
-
-- Dispatch a new fix subagent with specific instructions about what went wrong
-- Don't try to fix manually in the controller session (context pollution)
-
-## Efficiency Notes
-
-**Why fresh subagent per task:**
-- Prevents context pollution from accumulated state
-- Each subagent gets clean, focused context
-- No confusion from prior tasks' code or reasoning
-
-**Why two-stage review:**
-- Spec review catches under/over-building early
-- Quality review ensures the implementation is well-built
-- Catches issues before they compound across tasks
-
-**Cost trade-off:**
-- More subagent invocations (implementer + 2 reviewers per task)
-- But catches issues early (cheaper than debugging compounded problems later)
-
-## Integration with Other Skills
-
-### With plan
-
-This skill EXECUTES plans created by the `plan` skill:
-1. User requirements → plan → implementation plan
-2. Implementation plan → subagent-driven-development → working code
-
-### With test-driven-development
-
-Implementer subagents should follow TDD:
-1. Write failing test first
-2. Implement minimal code
-3. Verify test passes
-4. Commit
-
-Include TDD instructions in every implementer context.
-
-### With requesting-code-review
-
-The two-stage review process IS the code review. For final integration review, use the requesting-code-review skill's review dimensions.
-
-### With systematic-debugging
-
-If a subagent encounters bugs during implementation:
-1. Follow systematic-debugging process
-2. Find root cause before fixing
-3. Write regression test
-4. Resume implementation
-
-## Example Workflow
-
-```
-[Read plan: docs/plans/auth-feature.md]
-[Create todo list with 5 tasks]
-
---- Task 1: Create User model ---
-[Dispatch implementer subagent]
-  Implementer: "Should email be unique?"
-  You: "Yes, email must be unique"
-  Implementer: Implemented, 3/3 tests passing, committed.
-
-[Dispatch spec reviewer]
-  Spec reviewer: ✅ PASS — all requirements met
-
-[Dispatch quality reviewer]
-  Quality reviewer: ✅ APPROVED — clean code, good tests
-
-[Mark Task 1 complete]
-
---- Task 2: Password hashing ---
-[Dispatch implementer subagent]
-  Implementer: No questions, implemented, 5/5 tests passing.
-
-[Dispatch spec reviewer]
-  Spec reviewer: ❌ Missing: password strength validation (spec says "min 8 chars")
-
-[Implementer fixes]
-  Implementer: Added validation, 7/7 tests passing.
-
-[Dispatch spec reviewer again]
-  Spec reviewer: ✅ PASS
-
-[Dispatch quality reviewer]
-  Quality reviewer: Important: Magic number 8, extract to constant
-  Implementer: Extracted MIN_PASSWORD_LENGTH constant
-  Quality reviewer: ✅ APPROVED
-
-[Mark Task 2 complete]
-
-... (continue for all tasks)
-
-[After all tasks: dispatch final integration reviewer]
-[Run full test suite: all passing]
-[Done!]
-```
-
 ## Remember
 
 ```
@@ -342,11 +88,4 @@ Catch issues early
 
 **Quality is not an accident. It's the result of systematic process.**
 
-## Further reading (load when relevant)
-
-When the orchestration involves significant context usage, long review loops, or complex validation checkpoints, load these references for the specific discipline:
-
-- **`references/context-budget-discipline.md`** — Four-tier context degradation model (PEAK / GOOD / DEGRADING / POOR), read-depth rules that scale with context window size, and early warning signs of silent degradation. Load when a run will clearly consume significant context (multi-phase plans, many subagents, large artifacts).
-- **`references/gates-taxonomy.md`** — The four canonical gate types (Pre-flight, Revision, Escalation, Abort) with behavior, recovery, and examples. Load when designing or reviewing any workflow that has validation checkpoints — use the vocabulary explicitly so each gate has defined entry, failure behavior, and resumption rules.
-
-Both references adapted from gsd-build/get-shit-done (MIT © 2025 Lex Christopherson).
+`references/gates-taxonomy.md` and `references/context-budget-discipline.md` are adapted from gsd-build/get-shit-done (MIT © 2025 Lex Christopherson).

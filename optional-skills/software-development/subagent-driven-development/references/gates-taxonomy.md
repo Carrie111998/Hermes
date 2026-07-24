@@ -91,3 +91,23 @@ Answering these three up front means your skill never hits "what do we do now?" 
 ```
 
 The vocabulary is small on purpose. Every gate in every workflow should fit one of these four. If you find yourself inventing a fifth, it's probably a revision gate with extra branching, or an escalation gate in disguise.
+
+## Handling issues at a gate
+
+### If Subagent Asks Questions
+
+- Answer clearly and completely
+- Provide additional context if needed
+- Don't rush them into implementation
+
+### If Reviewer Finds Issues
+
+- Implementer subagent (or a new one) fixes them
+- Reviewer reviews again
+- Repeat until approved
+- Don't skip the re-review
+
+### If Subagent Fails a Task
+
+- Dispatch a new fix subagent with specific instructions about what went wrong
+- Don't try to fix manually in the controller session (context pollution)

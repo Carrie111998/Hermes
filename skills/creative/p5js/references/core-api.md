@@ -408,3 +408,25 @@ let geo = font.textToModel('HELLO', 0, 0, 200);
 ```html
 <script src="https://cdn.jsdelivr.net/npm/p5@2/lib/p5.min.js"></script>
 ```
+
+## Instance Mode (Multiple Sketches)
+
+Global mode pollutes `window`. For production embedding — several sketches on one
+page, or integration with a framework — use instance mode:
+
+```javascript
+const sketch = (p) => {
+  p.setup = function() {
+    p.createCanvas(800, 800);
+  };
+  p.draw = function() {
+    p.background(0);
+    p.ellipse(p.mouseX, p.mouseY, 50);
+  };
+};
+new p5(sketch, 'canvas-container');
+```
+
+Every p5 function and constant must be prefixed with the instance handle (`p.`).
+Required when embedding multiple sketches on one page or integrating with
+frameworks.

@@ -7,6 +7,8 @@
 - Multi-node distributed serving
 - Production configuration examples
 - Health checks and monitoring
+- Launch configurations by model size
+- Production rollout checklist
 
 ## Docker deployment
 
@@ -173,7 +175,7 @@ export MASTER_PORT=29500
 export RANK=0
 export WORLD_SIZE=2
 
-vllm serve meta-llama/Llama-2-70b-hf \
+vllm serve <model> \
   --tensor-parallel-size 8 \
   --pipeline-parallel-size 2
 ```
@@ -185,7 +187,7 @@ export MASTER_PORT=29500
 export RANK=1
 export WORLD_SIZE=2
 
-vllm serve meta-llama/Llama-2-70b-hf \
+vllm serve <model> \
   --tensor-parallel-size 8 \
   --pipeline-parallel-size 2
 ```
@@ -253,3 +255,95 @@ scrape_configs:
 - TTFT p99: `histogram_quantile(0.99, vllm_time_to_first_token_seconds_bucket)`
 - GPU cache usage: `vllm_gpu_cache_usage_perc`
 - Active requests: `vllm_num_requests_running`
+
+## Launch configurations by model size
+
+```bash
+# For 7B-13B models on single GPU
+vllm serve meta-llama/Llama-3-8B-Instruct \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 8192 \
+  --port 8000
+
+# For 30B-70B models with tensor parallelism
+vllm serve <model> \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.9 \
+  --quantization awq \
+  --port 8000
+
+# For production with caching and metrics
+vllm serve meta-llama/Llama-3-8B-Instruct \
+  --gpu-memory-utilization 0.9 \
+  --enable-prefix-caching \
+  --enable-metrics \
+  --metrics-port 9090 \
+  --port 8000 \
+  --host 0.0.0.0
+```
+
+## Production rollout checklist
+
+Copy this checklist and track progress:
+
+```
+Deployment Progress:
+- [ ] Step 1: Configure server settings
+- [ ] Step 2: Test with limited traffic
+- [ ] Step 3: Enable monitoring
+- [ ] Step 4: Deploy to production
+- [ ] Step 5: Verify performance metrics
+```
+
+**Step 1: Configure server settings**
+
+Choose a launch configuration from "Launch configurations by model size" above
+(or "Production configuration examples" for workload-shaped tuning).
+
+**Step 2: Test with limited traffic**
+
+Run load test before production:
+
+```bash
+# Install load testing tool
+pip install locust
+
+# Create test_load.py with sample requests
+# Run: locust -f test_load.py --host http://localhost:8000
+```
+
+Verify TTFT (time to first token) < 500ms and throughput > 100 req/sec.
+
+**Step 3: Enable monitoring**
+
+vLLM exposes Prometheus metrics on port 9090:
+
+```bash
+curl http://localhost:9090/metrics | grep vllm
+```
+
+Key metrics to monitor:
+- `vllm:time_to_first_token_seconds` - Latency
+- `vllm:num_requests_running` - Active requests
+- `vllm:gpu_cache_usage_perc` - KV cache utilization
+
+**Step 4: Deploy to production**
+
+Use Docker for consistent deployment:
+
+```bash
+# Run vLLM in Docker
+docker run --gpus all -p 8000:8000 \
+  vllm/vllm-openai:latest \
+  --model meta-llama/Llama-3-8B-Instruct \
+  --gpu-memory-utilization 0.9 \
+  --enable-prefix-caching
+```
+
+**Step 5: Verify performance metrics**
+
+Check that deployment meets targets:
+- TTFT < 500ms (for short prompts)
+- Throughput > target req/sec
+- GPU utilization > 80%
+- No OOM errors in logs

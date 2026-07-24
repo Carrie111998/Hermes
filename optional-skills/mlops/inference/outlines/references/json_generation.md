@@ -645,6 +645,22 @@ def test_product_model():
 # Run tests before using in production
 ```
 
+### 6. Provide Context in Prompts
+
+The schema constrains the shape, not the content — the prompt still has to say what to extract.
+
+```python
+# ✅ Good: clear context
+prompt = """
+Extract product information from the following text.
+Text: iPhone 15 Pro costs $999 and is currently in stock.
+Product:
+"""
+
+# ❌ Bad: minimal context
+prompt = "iPhone 15 Pro costs $999 and is currently in stock."
+```
+
 ## Resources
 
 - **Pydantic Docs**: https://docs.pydantic.dev

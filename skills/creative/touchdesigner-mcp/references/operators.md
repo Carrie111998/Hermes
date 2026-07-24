@@ -237,3 +237,18 @@ Containers, 3D scene elements, UI components.
 | DAT | SOP | DAT to SOP | `dattosopSop` |
 | SOP | TOP | (use Render TOP + Geometry COMP) | — |
 | TOP | SOP | TOP to SOP | `toptosopSop` |
+
+---
+
+## Family Quick Reference
+
+Color coding, common Python classes / MCP type strings, and naming suffix per family.
+
+| Family | Color | Python class / MCP type | Suffix |
+|--------|-------|-------------|--------|
+| TOP | Purple | noiseTOP, glslTOP, compositeTOP, levelTop, blurTOP, textTOP, nullTOP | TOP |
+| CHOP | Green | audiofileinCHOP, audiospectrumCHOP, mathCHOP, lfoCHOP, constantCHOP | CHOP |
+| SOP | Blue | gridSOP, sphereSOP, transformSOP, noiseSOP | SOP |
+| DAT | White | textDAT, tableDAT, scriptDAT, webserverDAT | DAT |
+| MAT | Yellow | phongMAT, pbrMAT, glslMAT, constMAT | MAT |
+| COMP | Gray | geometryCOMP, containerCOMP, cameraCOMP, lightCOMP, windowCOMP | COMP |

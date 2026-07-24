@@ -302,6 +302,113 @@ for idx, val in zip(top_consistent.indices, top_consistent.values):
 
 ---
 
+## Tutorial 6: Reusable probing and steering helpers
+
+### Goal
+Keep two small helpers on hand: one that ranks texts by how strongly they fire a chosen feature, and one that steers generation along a feature direction.
+
+### Probe what activates a specific feature
+
+```python
+from transformer_lens import HookedTransformer
+from sae_lens import SAE
+import torch
+
+model = HookedTransformer.from_pretrained("gpt2-small", device="cuda")
+sae, _, _ = SAE.from_pretrained(
+    release="gpt2-small-res-jb",
+    sae_id="blocks.8.hook_resid_pre",
+    device="cuda"
+)
+
+# Find what activates a specific feature
+feature_idx = 1234
+test_texts = [
+    "The scientist conducted an experiment",
+    "I love chocolate cake",
+    "The code compiles successfully",
+    "Paris is beautiful in spring",
+]
+
+for text in test_texts:
+    tokens = model.to_tokens(text)
+    _, cache = model.run_with_cache(tokens)
+    features = sae.encode(cache["resid_pre", 8])
+    activation = features[0, :, feature_idx].max().item()
+    print(f"{activation:.3f}: {text}")
+```
+
+### Steering helper function
+
+```python
+def steer_with_feature(model, sae, prompt, feature_idx, strength=5.0):
+    """Add SAE feature direction to residual stream."""
+    tokens = model.to_tokens(prompt)
+
+    # Get feature direction from decoder
+    feature_direction = sae.W_dec[feature_idx]  # [d_model]
+
+    def steering_hook(activation, hook):
+        # Add scaled feature direction at all positions
+        activation += strength * feature_direction
+        return activation
+
+    # Generate with steering
+    output = model.generate(
+        tokens,
+        max_new_tokens=50,
+        fwd_hooks=[("blocks.8.hook_resid_pre", steering_hook)]
+    )
+    return model.to_string(output[0])
+```
+
+### Compact logit attribution
+
+```python
+# Which features most affect a specific output?
+tokens = model.to_tokens("The capital of France is")
+_, cache = model.run_with_cache(tokens)
+
+# Get features at final position
+features = sae.encode(cache["resid_pre", 8])[0, -1]  # [d_sae]
+
+# Get logit attribution per feature
+# Feature contribution = feature_activation × decoder_weight × unembedding
+W_dec = sae.W_dec  # [d_sae, d_model]
+W_U = model.W_U    # [d_model, vocab]
+
+# Contribution to "Paris" logit
+paris_token = model.to_single_token(" Paris")
+feature_contributions = features * (W_dec @ W_U[:, paris_token])
+
+top_features = feature_contributions.topk(10)
+print("Top features for 'Paris' prediction:")
+for idx, val in zip(top_features.indices, top_features.values):
+    print(f"  Feature {idx.item()}: {val.item():.3f}")
+```
+
+---
+
+## Workflow checklists
+
+### Loading and analyzing a pre-trained SAE
+- [ ] Load model with TransformerLens
+- [ ] Load matching SAE for target layer
+- [ ] Encode activations to sparse features
+- [ ] Identify top-activating features per token
+- [ ] Validate reconstruction quality
+
+### Training a custom SAE
+- [ ] Choose target layer and hook point
+- [ ] Set expansion factor (d_sae = 4-16× d_model)
+- [ ] Tune L1 coefficient for desired sparsity
+- [ ] Enable L1 warm-up to prevent dead features
+- [ ] Monitor metrics during training (W&B)
+- [ ] Validate L0 and CE loss recovery
+- [ ] Check dead feature ratio
+
+---
+
 ## External Resources
 
 ### Official Tutorials

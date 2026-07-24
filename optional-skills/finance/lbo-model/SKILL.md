@@ -9,6 +9,7 @@ metadata:
   hermes:
     tags: [finance, valuation, lbo, private-equity, excel, openpyxl, modeling]
     related_skills: [excel-author, pptx-author, dcf-model, 3-statement-model]
+    requires: [excel-author]
 ---
 
 ## Environment
@@ -16,6 +17,8 @@ metadata:
 This skill assumes **headless openpyxl** — you are producing an .xlsx file on disk.
 Follow the `excel-author` skill's conventions for cell coloring, formulas, named ranges, and sensitivity tables.
 Recalculate before delivery: `python /path/to/excel-author/scripts/recalc.py ./out/model.xlsx`.
+
+> **Hard dependency — `excel-author` (required, not just related).** `recalc.py` ships in the sibling `excel-author` skill at `excel-author/scripts/recalc.py`; it is NOT bundled here. If you installed `lbo-model` standalone without `excel-author`, every recalc step will fail with a missing-script error. Install it first: `hermes skills install excel-author`.
 
 ---
 

@@ -1,12 +1,59 @@
 # Quantization Guide
 
 ## Contents
+- Quantized serving rollout checklist
 - Quantization methods comparison
 - AWQ setup and usage
 - GPTQ setup and usage
 - FP8 quantization (H100)
 - Model preparation
 - Accuracy vs compression trade-offs
+
+## Quantized serving rollout checklist
+
+Use this to fit a large model into limited GPU memory.
+
+```
+Quantization Setup:
+- [ ] Step 1: Choose quantization method
+- [ ] Step 2: Find or create quantized model
+- [ ] Step 3: Launch with quantization flag
+- [ ] Step 4: Verify accuracy
+```
+
+**Step 1: Choose quantization method**
+
+- **AWQ**: Best for 70B models, minimal accuracy loss
+- **GPTQ**: Wide model support, good compression
+- **FP8**: Fastest on H100 GPUs
+
+Full comparison table below.
+
+**Step 2: Find or create quantized model**
+
+Prefer pre-quantized models from HuggingFace (e.g. `TheBloke/Llama-2-70B-AWQ`).
+To quantize your own, see "Model preparation".
+
+**Step 3: Launch with quantization flag**
+
+```bash
+# Using pre-quantized model
+vllm serve TheBloke/Llama-2-70B-AWQ \
+  --quantization awq \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.95
+
+# Results: 70B model in ~40GB VRAM
+```
+
+The `--quantization` value must match how the checkpoint was produced; a
+mismatch fails at load time rather than degrading silently.
+
+**Step 4: Verify accuracy**
+
+Compare quantized vs non-quantized responses on your own task set and confirm
+task-specific performance is unchanged before shipping. See
+"Accuracy vs compression trade-offs" for a measurable procedure.
 
 ## Quantization methods comparison
 
@@ -75,7 +122,7 @@ print(response.choices[0].message.content)
 from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer
 
-model_path = "meta-llama/Llama-2-70b-hf"
+model_path = "<model>"
 quant_path = "llama-2-70b-awq"
 
 # Load model
@@ -125,7 +172,7 @@ vllm serve MODEL \
 from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 from transformers import AutoTokenizer
 
-model_name = "meta-llama/Llama-2-13b-hf"
+model_name = "<model>"
 quantized_name = "llama-2-13b-gptq"
 
 # Load model

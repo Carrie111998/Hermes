@@ -1,6 +1,6 @@
 ---
 name: prompt-repair
-description: "Use when an Atlas image/video generation fails, produces a poor result, violates the brief, or needs revision; converts failure evidence into a safer retry prompt and provider-aware retry plan."
+description: "Repair a failed or off-brief Atlas image/video generation: turn the failure evidence into a safer retry prompt plus a provider-aware retry plan."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

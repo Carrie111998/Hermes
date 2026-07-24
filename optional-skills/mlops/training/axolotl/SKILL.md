@@ -163,4 +163,11 @@ To refresh this skill with updated documentation:
 1. Re-run the scraper with the same configuration
 2. The skill will be rebuilt with the latest information
 
+## References
 
+Scraped upstream Axolotl documentation, loaded on demand:
+
+- **[Index](references/index.md)** - Category index of the scraped reference pages.
+- **[API](references/api.md)** - Full config schema and Python API surface (150 pages).
+- **[Dataset Formats](references/dataset-formats.md)** - Every supported dataset/prompt format with examples (9 pages).
+- **[Other](references/other.md)** - Remaining guides: multi-GPU, DeepSpeed/FSDP, RLHF, troubleshooting (26 pages).

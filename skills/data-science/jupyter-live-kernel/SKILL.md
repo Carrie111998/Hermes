@@ -54,12 +54,19 @@ uv run "$SCRIPT" servers
 
 If no servers found, start one:
 ```
-jupyter-lab --no-browser --port=8888 --notebook-dir=$HOME/notebooks \
+jupyter-lab --no-browser --ip=127.0.0.1 --port=8888 --notebook-dir=$HOME/notebooks \
   --IdentityProvider.token='' --ServerApp.password='' > /tmp/jupyter.log 2>&1 &
 sleep 3
 ```
 
-Note: Token/password disabled for local agent access. The server runs headless.
+**`--ip=127.0.0.1` is mandatory and must never be relaxed.** Token and password are
+disabled here for local agent access, so the kernel will execute any code it is
+handed with no authentication whatsoever. Binding to `0.0.0.0` (or any non-loopback
+address) with auth disabled exposes arbitrary code execution to the whole network.
+If you need remote access, do NOT widen `--ip` — keep the loopback bind and tunnel
+over SSH (`ssh -L 8888:127.0.0.1:8888 <host>`), or re-enable a token/password.
+
+The server runs headless.
 
 ### Creating a Notebook for REPL Use
 

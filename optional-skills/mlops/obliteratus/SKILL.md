@@ -1,6 +1,6 @@
 ---
 name: obliteratus
-description: "OBLITERATUS: abliterate LLM refusals (diff-in-means)."
+description: "Weight surgery on open-weight LLMs: permanently ablate the refusal direction (diff-in-means/SVD projection) and write modified safetensors. Not a general training or mlops tool."
 version: 2.0.0
 author: Hermes Agent
 license: MIT
@@ -139,6 +139,8 @@ obliteratus recommend <model_name> --insights  # global cross-architecture ranki
 ### 4 Python-API-Only Methods
 (NOT available via CLI — require Python import, which violates AGPL boundary. Mention to user only if they explicitly want to use OBLITERATUS as a library in their own AGPL project.)
 - failspy, gabliteration, heretic, rdo
+
+See `skill_view(name="obliteratus", file_path="references/methods-guide.md")` for the full per-method reference (parameters, trade-offs, when each one wins).
 
 ## Step 5: Run Abliteration
 

@@ -1,6 +1,6 @@
 ---
 name: openhands
-description: Delegate coding to OpenHands CLI (model-agnostic, LiteLLM).
+description: Delegate coding to OpenHands CLI — provider-agnostic via LiteLLM, you bring any model/key. Use for open-source, self-hosted agent runs where you choose the backing LLM.
 version: 0.1.0
 author: Tim Koepsel (xzessmedia), Hermes Agent
 license: MIT

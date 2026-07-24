@@ -1,6 +1,6 @@
 ---
 name: antigravity-cli
-description: "Operate the Antigravity CLI (agy): plugins, auth, sandbox."
+description: "Delegate coding to Antigravity CLI (agy) — operate the agy agentic coder: install, one-shot agy -p, plugins, auth, sandbox. Use when the task should run through Antigravity specifically."
 version: 0.2.0
 author: Tony Simons (asimons81), Hermes Agent
 license: MIT

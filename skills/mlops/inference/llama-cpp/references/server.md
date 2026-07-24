@@ -34,14 +34,14 @@ Use the file-specific form when the repo has custom naming or when you already e
 ```bash
 # Basic server
 ./llama-server \
-    -m models/llama-2-7b-chat.Q4_K_M.gguf \
+    -m models/<model>.Q4_K_M.gguf \
     --host 0.0.0.0 \
     --port 8080 \
     -c 4096  # Context size
 
 # With GPU acceleration
 ./llama-server \
-    -m models/llama-2-70b.Q4_K_M.gguf \
+    -m models/<model>.Q4_K_M.gguf \
     -ngl 40  # Offload 40 layers to GPU
 ```
 
@@ -52,7 +52,7 @@ Use the file-specific form when the repo has custom naming or when you already e
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-2",
+    "model": "<model>",
     "messages": [
       {"role": "system", "content": "You are helpful"},
       {"role": "user", "content": "Hello"}
@@ -67,7 +67,7 @@ curl http://localhost:8080/v1/chat/completions \
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-2",
+    "model": "<model>",
     "messages": [{"role": "user", "content": "Count to 10"}],
     "stream": true
   }'

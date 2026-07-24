@@ -72,3 +72,25 @@ Prefix inline comments with the severity icon so they're scannable:
 ## For Local (Pre-Push) Review
 
 When reviewing locally before push, use the same structure but present it as a message to the user instead of a PR comment. Skip the PR metadata header and just start with the severity sections.
+
+Worked example (plain-text severity headings are fine for a local message):
+
+```
+## Code Review Summary
+
+### Critical
+- **src/auth.py:45** — SQL injection: user input passed directly to query.
+  Suggestion: Use parameterized queries.
+
+### Warnings
+- **src/models/user.py:23** — Password stored in plaintext. Use bcrypt or argon2.
+- **src/api/routes.py:112** — No rate limiting on login endpoint.
+
+### Suggestions
+- **src/utils/helpers.py:8** — Duplicates logic in `src/core/utils.py:34`. Consolidate.
+- **tests/test_auth.py** — Missing edge case: expired token test.
+
+### Looks Good
+- Clean separation of concerns in the middleware layer
+- Good test coverage for the happy path
+```

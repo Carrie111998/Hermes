@@ -80,5 +80,11 @@ To refresh this skill with updated documentation:
 
 <!-- Trigger re-upload 1763621536 -->
 
+## References
 
+Scraped upstream Unsloth documentation, loaded on demand:
 
+- **[Index](references/index.md)** - Category index of the scraped reference pages.
+- **[Docs Link Map](references/llms.md)** - One-line map of every Unsloth doc page; read this first to pick a target.
+- **[Docs (paged)](references/llms-txt.md)** - Full Unsloth docs split into 136 pages.
+- **[Docs (full)](references/llms-full.md)** - Single-file dump of the complete Unsloth docs. Very large - prefer llms.md then llms-txt.md.

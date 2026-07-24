@@ -276,5 +276,5 @@ tests exist, tests pass, no regressions.
 - **delegate_task returns non-JSON** — retry once with stricter prompt, then treat as FAIL
 - **False positives** — if reviewer flags something intentional, note it in fix prompt
 - **No test framework found** — skip regression check, reviewer verdict still runs
-- **Lint tools not installed** — skip that check silently, don't fail
+- **Lint tools not installed** — skip that check, don't fail, but record it explicitly in the report as `lint: NOT RUN (tool not installed: <name>)`. Never omit a skipped check from the report.
 - **Auto-fix introduces new issues** — counts as a new failure, cycle continues

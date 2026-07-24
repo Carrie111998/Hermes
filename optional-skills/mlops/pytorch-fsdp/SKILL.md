@@ -1,6 +1,6 @@
 ---
 name: pytorch-fsdp
-description: Expert guidance for Fully Sharded Data Parallel training with PyTorch FSDP - parameter sharding, mixed precision, CPU offloading, FSDP2
+description: "PyTorch FSDP: raw torch.distributed sharding API (FSDP1/FSDP2) - hand-wire parameter, gradient and optimizer sharding with CPU offload and mixed precision, no wrapper framework."
 version: 1.0.0
 author: Orchestra Research
 license: MIT
@@ -127,4 +127,9 @@ To refresh this skill with updated documentation:
 1. Re-run the scraper with the same configuration
 2. The skill will be rebuilt with the latest information
 
+## References
 
+Scraped upstream PyTorch distributed/FSDP documentation, loaded on demand:
+
+- **[Index](references/index.md)** - Category index of the scraped reference pages.
+- **[Other](references/other.md)** - Full text of the 15 scraped PyTorch distributed/FSDP doc pages (API signatures, backend matrix, wrapping policies, checkpointing).

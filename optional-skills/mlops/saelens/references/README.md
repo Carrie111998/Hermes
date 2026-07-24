@@ -4,8 +4,10 @@ This directory contains comprehensive reference materials for SAELens.
 
 ## Contents
 
+- [concepts.md](concepts.md) - Superposition/polysemanticity background, metric targets, hyperparameter ranges, architecture selection
 - [api.md](api.md) - Complete API reference for SAE, TrainingSAE, and configuration classes
-- [tutorials.md](tutorials.md) - Step-by-step tutorials for training and analyzing SAEs
+- [tutorials.md](tutorials.md) - Step-by-step tutorials for training, analyzing and steering SAEs, plus workflow checklists
+- [troubleshooting.md](troubleshooting.md) - Dead features, poor reconstruction, uninterpretable features, OOM
 
 ## Quick Links
 

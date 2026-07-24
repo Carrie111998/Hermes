@@ -162,6 +162,43 @@ results = index.query(
 )
 ```
 
+## Performance envelope
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| Upsert | ~50-100ms | Per batch |
+| Query (p50) | ~50ms | Depends on index size |
+| Query (p95) | ~100ms | SLA target |
+| Metadata filter | ~+10-20ms | Additional overhead |
+
+Service characteristics: fully managed SaaS, auto-scales to billions of vectors,
+p95 latency <100ms, 99.9% uptime SLA.
+
+## Pricing (as of 2025)
+
+**Serverless**:
+- $0.096 per million read units
+- $0.06 per million write units
+- $0.06 per GB storage/month
+
+**Free tier**:
+- 1 serverless index
+- 100K vectors (1536 dimensions)
+- Great for prototyping
+
+## Operational best practices
+
+1. **Use serverless** - Auto-scaling, cost-effective
+2. **Batch upserts** - More efficient (100-200 per batch)
+3. **Add metadata** - Enable filtering
+4. **Use namespaces** - Isolate data by user/tenant
+5. **Monitor usage** - Check Pinecone dashboard
+6. **Optimize filters** - Index frequently filtered fields
+7. **Test with free tier** - 1 index, 100K vectors free
+8. **Use hybrid search** - Better quality
+9. **Set appropriate dimensions** - Match embedding model
+10. **Regular backups** - Export important data
+
 ## Best practices
 
 1. **Use serverless for development** - Cost-effective

@@ -33,7 +33,7 @@ metric_list:
 **Run it**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks simple_qa \
   --include_path my_tasks/
 ```
@@ -507,7 +507,7 @@ task:
 **Run entire suite**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks my_eval_suite \
   --include_path my_tasks/
 ```

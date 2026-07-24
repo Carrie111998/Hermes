@@ -23,7 +23,7 @@ Each GPU loads a full copy of the model and processes a subset of evaluation dat
 ```bash
 accelerate launch --multi_gpu --num_processes 8 \
   -m lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf,dtype=bfloat16 \
+  --model_args pretrained=<model>,dtype=bfloat16 \
   --tasks mmlu,gsm8k,hellaswag \
   --batch_size 16
 ```
@@ -40,7 +40,7 @@ Split model weights across GPUs for models too large for single GPU.
 ```bash
 lm_eval --model hf \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     parallelize=True,\
     dtype=bfloat16 \
   --tasks mmlu,gsm8k \
@@ -53,7 +53,7 @@ lm_eval --model hf \
 ```bash
 lm_eval --model hf \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     parallelize=True,\
     device_map_option=auto,\
     max_memory_per_gpu=40GB,\
@@ -77,7 +77,7 @@ Use both for very large models.
 accelerate launch --multi_gpu --num_processes 2 \
   -m lm_eval --model hf \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     parallelize=True,\
     dtype=bfloat16 \
   --tasks mmlu \
@@ -101,7 +101,7 @@ mixed_precision: bf16
 **Then run**:
 ```bash
 accelerate launch -m lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks mmlu
 ```
 
@@ -115,7 +115,7 @@ vLLM provides highly optimized distributed inference.
 ```bash
 lm_eval --model vllm \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     tensor_parallel_size=4,\
     dtype=auto,\
     gpu_memory_utilization=0.9 \
@@ -131,7 +131,7 @@ lm_eval --model vllm \
 ```bash
 lm_eval --model vllm \
   --model_args \
-    pretrained=meta-llama/Llama-2-7b-hf,\
+    pretrained=<model>,\
     data_parallel_size=4,\
     dtype=auto,\
     gpu_memory_utilization=0.8 \
@@ -147,7 +147,7 @@ lm_eval --model vllm \
 ```bash
 lm_eval --model vllm \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     tensor_parallel_size=4,\
     data_parallel_size=2,\
     dtype=auto,\
@@ -169,7 +169,7 @@ ray start --head --port=6379
 # Run evaluation
 lm_eval --model vllm \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     tensor_parallel_size=8,\
     dtype=auto \
   --tasks mmlu
@@ -234,7 +234,7 @@ Currently not supported by lm-evaluation-harness.
 ```bash
 lm_eval --model sglang \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     tp_size=4,\
     dtype=auto \
   --tasks gsm8k \
@@ -248,7 +248,7 @@ lm_eval --model sglang \
 ```bash
 lm_eval --model sglang \
   --model_args \
-    pretrained=meta-llama/Llama-2-7b-hf,\
+    pretrained=<model>,\
     dp_size=4,\
     dtype=auto \
   --tasks mmlu
@@ -332,7 +332,7 @@ Memory per GPU = Total Memory / TP
 srun accelerate launch --multi_gpu \
   --num_processes $((SLURM_NNODES * 8)) \
   -m lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks mmlu,gsm8k,hellaswag \
   --batch_size 16
 ```
@@ -354,7 +354,7 @@ accelerate launch \
   --main_process_port 29500 \
   --machine_rank $NODE_RANK \
   -m lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks mmlu
 ```
 
@@ -369,7 +369,7 @@ accelerate launch \
 Test on small sample first:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-70b-hf,parallelize=True \
+  --model_args pretrained=<model-70b>,parallelize=True \
   --tasks mmlu \
   --limit 100  # Just 100 samples
 ```
@@ -457,7 +457,7 @@ export NCCL_IB_DISABLE=0  # Use InfiniBand if available
 **Profile**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks mmlu \
   --limit 100 \
   --log_samples  # Check timing
@@ -481,7 +481,7 @@ lm_eval --model hf \
 accelerate launch --multi_gpu --num_processes 8 \
   -m lm_eval --model hf \
   --model_args \
-    pretrained=meta-llama/Llama-2-7b-hf,\
+    pretrained=<model>,\
     dtype=bfloat16 \
   --tasks mmlu,gsm8k,hellaswag,arc_challenge \
   --num_fewshot 5 \
@@ -496,7 +496,7 @@ accelerate launch --multi_gpu --num_processes 8 \
 # 8 H100s, tensor parallel
 lm_eval --model vllm \
   --model_args \
-    pretrained=meta-llama/Llama-2-70b-hf,\
+    pretrained=<model-70b>,\
     tensor_parallel_size=8,\
     dtype=auto,\
     gpu_memory_utilization=0.9 \

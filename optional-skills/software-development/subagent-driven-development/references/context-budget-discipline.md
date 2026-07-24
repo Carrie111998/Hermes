@@ -51,3 +51,21 @@ When these signs appear, checkpoint the work and either reset context or hand of
 When you orchestrate, you cannot verify semantic correctness of subagent output — only structural completeness ("did the file appear?", "does the test pass?"). Semantic verification requires either running the code yourself or delegating a review pass to another fresh subagent.
 
 **Mitigation:** in every task you delegate, include explicit "must-have" truths the subagent must confirm in its response (e.g., "confirm your test actually tests X, not just that X was imported"). The subagent re-asserting concrete facts is evidence; vague summaries are not.
+
+## Why fresh-subagent-per-task pays for itself
+
+**Why fresh subagent per task:**
+- Prevents context pollution from accumulated state
+- Each subagent gets clean, focused context
+- No confusion from prior tasks' code or reasoning
+
+**Why two-stage review:**
+- Spec review catches under/over-building early
+- Quality review ensures the implementation is well-built
+- Catches issues before they compound across tasks
+
+**Cost trade-off:**
+- More subagent invocations (implementer + 2 reviewers per task)
+- But catches issues early (cheaper than debugging compounded problems later)
+
+Corollary for the orchestrator: when a subagent fails a task, dispatch a new fix subagent rather than fixing it yourself in the controller session — manual repair in the controller is exactly the context pollution this model exists to avoid.

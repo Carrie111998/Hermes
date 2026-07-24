@@ -254,4 +254,6 @@ results = collection.query(
 - **Colab**: https://colab.research.google.com/github/openai/clip/
 - **License**: MIT
 
+## References
 
+- **[Applications](references/applications.md)** - Zero-shot classification, image/text retrieval, content moderation and other worked CLIP use cases.

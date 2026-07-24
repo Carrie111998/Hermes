@@ -1,5 +1,16 @@
 # Troubleshooting Guide
 
+## Quick fix index
+
+| Symptom | First flags to try | Section |
+|---------|--------------------|---------|
+| OOM during model loading | `--gpu-memory-utilization 0.7 --max-model-len 4096`, or `--quantization awq` | Out of memory (OOM) errors |
+| Slow first token (TTFT > 1 s) | `--enable-prefix-caching`, `--enable-chunked-prefill` | Performance issues |
+| Model not found / custom architecture | `--trust-remote-code` | Model loading errors |
+| Low throughput (<50 req/sec) | `--max-num-seqs 512`, check `nvidia-smi` for >80% GPU util | Performance issues |
+| Slower than expected with multiple GPUs | `--tensor-parallel-size` must be a power of 2 (4, not 3) | Performance issues |
+| Generation itself is slow | `--speculative-model DRAFT_MODEL` | Performance issues |
+
 ## Contents
 - Out of memory (OOM) errors
 - Performance issues

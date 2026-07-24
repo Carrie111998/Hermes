@@ -6,6 +6,89 @@ Complete guide to Direct Preference Optimization loss variants in TRL.
 
 DPO optimizes models using preference data (chosen/rejected pairs). TRL supports 10+ loss variants for different scenarios.
 
+## Basic DPO Workflow
+
+Align a model with preferences without training a separate reward model.
+
+```
+DPO Training:
+- [ ] Step 1: Prepare preference dataset
+- [ ] Step 2: Configure DPO
+- [ ] Step 3: Train with DPOTrainer
+- [ ] Step 4: Evaluate alignment
+```
+
+**Step 1: Prepare preference dataset**
+
+Dataset format:
+```json
+{
+  "prompt": "What is the capital of France?",
+  "chosen": "The capital of France is Paris.",
+  "rejected": "I don't know."
+}
+```
+
+Load dataset:
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
+# Or load your own
+# dataset = load_dataset("json", data_files="preferences.json")
+```
+
+**Step 2: Configure DPO**
+
+```python
+from trl import DPOConfig
+
+config = DPOConfig(
+    output_dir="Qwen2.5-0.5B-DPO",
+    per_device_train_batch_size=4,
+    num_train_epochs=1,
+    learning_rate=5e-7,
+    beta=0.1,  # KL penalty strength
+    max_prompt_length=512,
+    max_length=1024,
+    logging_steps=10
+)
+```
+
+**Step 3: Train with DPOTrainer**
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOTrainer
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+
+trainer = DPOTrainer(
+    model=model,
+    args=config,
+    train_dataset=dataset,
+    processing_class=tokenizer
+)
+
+trainer.train()
+trainer.save_model()
+```
+
+**CLI alternative**:
+```bash
+trl dpo \
+    --model_name_or_path Qwen/Qwen2.5-0.5B-Instruct \
+    --dataset_name argilla/Capybara-Preferences \
+    --output_dir Qwen2.5-0.5B-DPO \
+    --per_device_train_batch_size 4 \
+    --learning_rate 5e-7 \
+    --beta 0.1
+```
+
+**Step 4: Evaluate alignment** — compare generations against the pre-DPO checkpoint on
+held-out prompts before shipping.
+
 ## Loss Types
 
 ### 1. Sigmoid (Standard DPO)

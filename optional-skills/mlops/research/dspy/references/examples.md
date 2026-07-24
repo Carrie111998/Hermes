@@ -109,6 +109,38 @@ result = multi_rag(question="Who wrote the book that inspired Blade Runner?")
 # Hop 2: Find author of that book
 ```
 
+### Query-rewrite RAG (generate query, then retrieve)
+
+Simplest multi-stage pipeline: rewrite the question into a search query, retrieve,
+then answer. Returns the retrieved context alongside the answer for inspection.
+
+```python
+import dspy
+
+class MultiHopQA(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.retrieve = dspy.Retrieve(k=3)
+        self.generate_query = dspy.ChainOfThought("question -> search_query")
+        self.generate_answer = dspy.ChainOfThought("context, question -> answer")
+
+    def forward(self, question):
+        # Stage 1: Generate search query
+        search_query = self.generate_query(question=question).search_query
+
+        # Stage 2: Retrieve context
+        passages = self.retrieve(search_query).passages
+        context = "\n".join(passages)
+
+        # Stage 3: Generate answer
+        answer = self.generate_answer(context=context, question=question).answer
+        return dspy.Prediction(answer=answer, context=context)
+
+# Use the pipeline
+qa_system = MultiHopQA()
+result = qa_system(question="Who wrote the book that inspired the movie Blade Runner?")
+```
+
 ### RAG with Reranking
 
 ```python

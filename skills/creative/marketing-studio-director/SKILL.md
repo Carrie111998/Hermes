@@ -1,6 +1,6 @@
 ---
 name: marketing-studio-director
-description: "Use when turning an ad concept into a production-ready Higgsfield Marketing Studio video prompt; routes UGC, tutorial, unboxing, hyper motion, product review, TV spot, wild card, and virtual try-on presets."
+description: "Write a Higgsfield Marketing Studio video prompt from an ad concept. Routes UGC, tutorial, unboxing, hyper motion, product review, TV spot, wild card, and virtual try-on presets."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

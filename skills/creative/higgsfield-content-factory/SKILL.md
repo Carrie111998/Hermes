@@ -1,6 +1,6 @@
 ---
 name: higgsfield-content-factory
-description: "Use when building a product content campaign pipeline across UGC entertainment, street interview, unboxing, product review, and ASMR formats; plans prompts, batch generation, image asset packs, publishing, and cost reporting."
+description: "Plan a multi-format product content campaign: UGC, street interview, unboxing, review, ASMR. Covers prompts, batch generation, image asset packs, publishing, and cost reporting."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

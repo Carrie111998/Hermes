@@ -25,6 +25,14 @@ For this turn, you are planning only.
 - You may inspect the repo or other context with read-only commands/tools when needed.
 - Your deliverable is a markdown plan saved inside the active workspace under `.hermes/plans/`.
 
+## Reference Map
+
+| To do this | Read |
+|---|---|
+| Copy the required plan header and the per-task format (objective / files / TDD steps / commit) | `references/plan-document-template.md` |
+| Follow the 6-step authoring process, including codebase exploration calls and the pre-delivery review checklist | `references/writing-process.md` |
+| See DRY / YAGNI / TDD / commit principles worked out, and the four common plan mistakes | `references/principles-and-common-mistakes.md` |
+
 ## Output requirements
 
 Write a markdown plan that is concrete and actionable.
@@ -83,6 +91,18 @@ Assume the implementer is a skilled developer but knows almost nothing about the
 - You plan to implement it yourself (future you needs guidance)
 - Working alone (documentation matters)
 
+## End-to-End Skeleton
+
+```
+1. Understand the requirements; ask if genuinely underspecified.
+2. Explore the codebase read-only; find the closest existing pattern.
+3. Decide architecture, file layout, test strategy.
+4. Write tasks in order: setup → core (TDD each) → edge cases → integration → cleanup.
+5. Fill in exact paths, complete copy-pasteable code, exact commands + expected output.
+6. Run the review checklist, then save to .hermes/plans/YYYY-MM-DD_HHMMSS-<slug>.md.
+7. Report the path and offer the subagent-driven-development handoff.
+```
+
 ## Bite-Sized Task Granularity
 
 **Each task = 2-5 minutes of focused work.**
@@ -94,222 +114,20 @@ Every step is one action:
 - "Run the tests and make sure they pass" — step
 - "Commit" — step
 
-**Too big:**
-```markdown
-### Task 1: Build authentication system
-[50 lines of code across 5 files]
-```
-
-**Right size:**
-```markdown
-### Task 1: Create User model with email field
-[10 lines, 1 file]
-
-### Task 2: Add password hash field to User
-[8 lines, 1 file]
-
-### Task 3: Create password hashing utility
-[15 lines, 1 file]
-```
-
-## Plan Document Structure
-
-### Header (Required)
-
-Every plan MUST start with:
-
-```markdown
-# [Feature Name] Implementation Plan
-
-> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
-
-**Goal:** [One sentence describing what this builds]
-
-**Architecture:** [2-3 sentences about approach]
-
-**Tech Stack:** [Key technologies/libraries]
-
----
-```
-
-### Task Structure
-
-Each task follows this format:
-
-````markdown
-### Task N: [Descriptive Name]
-
-**Objective:** What this task accomplishes (one sentence)
-
-**Files:**
-- Create: `exact/path/to/new_file.py`
-- Modify: `exact/path/to/existing.py:45-67` (line numbers if known)
-- Test: `tests/path/to/test_file.py`
-
-**Step 1: Write failing test**
-
-```python
-def test_specific_behavior():
-    result = function(input)
-    assert result == expected
-```
-
-**Step 2: Run test to verify failure**
-
-Run: `pytest tests/path/test.py::test_specific_behavior -v`
-Expected: FAIL — "function not defined"
-
-**Step 3: Write minimal implementation**
-
-```python
-def function(input):
-    return expected
-```
-
-**Step 4: Run test to verify pass**
-
-Run: `pytest tests/path/test.py::test_specific_behavior -v`
-Expected: PASS
-
-**Step 5: Commit**
-
-```bash
-git add tests/path/test.py src/path/file.py
-git commit -m "feat: add specific feature"
-```
-````
-
-## Writing Process
-
-### Step 1: Understand Requirements
-
-Read and understand:
-- Feature requirements
-- Design documents or user description
-- Acceptance criteria
-- Constraints
-
-### Step 2: Explore the Codebase
-
-Use Hermes tools to understand the project:
-
-```python
-# Understand project structure
-search_files("*.py", target="files", path="src/")
-
-# Look at similar features
-search_files("similar_pattern", path="src/", file_glob="*.py")
-
-# Check existing tests
-search_files("*.py", target="files", path="tests/")
-
-# Read key files
-read_file("src/app.py")
-```
-
-### Step 3: Design Approach
-
-Decide:
-- Architecture pattern
-- File organization
-- Dependencies needed
-- Testing strategy
-
-### Step 4: Write Tasks
-
-Create tasks in order:
-1. Setup/infrastructure
-2. Core functionality (TDD for each)
-3. Edge cases
-4. Integration
-5. Cleanup/documentation
-
-### Step 5: Add Complete Details
-
-For each task, include:
-- **Exact file paths** (not "the config file" but `src/config/settings.py`)
-- **Complete code examples** (not "add validation" but the actual code)
-- **Exact commands** with expected output
-- **Verification steps** that prove the task works
-
-### Step 6: Review the Plan
-
-Check:
-- [ ] Tasks are sequential and logical
-- [ ] Each task is bite-sized (2-5 min)
-- [ ] File paths are exact
-- [ ] Code examples are complete (copy-pasteable)
-- [ ] Commands are exact with expected output
-- [ ] No missing context
-- [ ] DRY, YAGNI, TDD principles applied
-
-## Principles
-
-### DRY (Don't Repeat Yourself)
-
-**Bad:** Copy-paste validation in 3 places
-**Good:** Extract validation function, use everywhere
-
-### YAGNI (You Aren't Gonna Need It)
-
-**Bad:** Add "flexibility" for future requirements
-**Good:** Implement only what's needed now
-
-```python
-# Bad — YAGNI violation
-class User:
-    def __init__(self, name, email):
-        self.name = name
-        self.email = email
-        self.preferences = {}  # Not needed yet!
-        self.metadata = {}     # Not needed yet!
-
-# Good — YAGNI
-class User:
-    def __init__(self, name, email):
-        self.name = name
-        self.email = email
-```
-
-### TDD (Test-Driven Development)
-
-Every task that produces code should include the full TDD cycle:
-1. Write failing test
-2. Run to verify failure
-3. Write minimal code
-4. Run to verify pass
-
-See `test-driven-development` skill for details.
-
-### Frequent Commits
-
-Commit after every task:
-```bash
-git add [files]
-git commit -m "type: description"
-```
-
-## Common Mistakes
-
-### Vague Tasks
-
-**Bad:** "Add authentication"
-**Good:** "Create User model with email and password_hash fields"
-
-### Incomplete Code
-
-**Bad:** "Step 1: Add validation function"
-**Good:** "Step 1: Add validation function" followed by the complete function code
-
-### Missing Verification
-
-**Bad:** "Step 3: Test it works"
-**Good:** "Step 3: Run `pytest tests/test_auth.py -v`, expected: 3 passed"
-
-### Missing File Paths
-
-**Bad:** "Create the model file"
-**Good:** "Create: `src/models/user.py`"
+Sizing examples (too big vs right size): `references/plan-document-template.md`.
+
+## Non-Negotiables for the Plan Content
+
+- **Exact file paths.** Not "the config file" — `src/config/settings.py`.
+- **Complete, copy-pasteable code.** Not "add validation" — the actual function body.
+- **Exact commands with expected output.** Not "test it works" — the command and the pass count.
+- **Every code-producing task carries the full TDD cycle** (failing test → verify fail → minimal
+  code → verify pass). See `test-driven-development`.
+- **A commit at the end of every task.**
+- **DRY and YAGNI applied.** No speculative flexibility for requirements nobody asked for.
+- **No task larger than 2-5 minutes.** If it doesn't fit, split it.
+
+Review the plan against `references/writing-process.md` Step 6 before you deliver it.
 
 ## Execution Handoff
 

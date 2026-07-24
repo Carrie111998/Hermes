@@ -1,6 +1,6 @@
 ---
 name: gpt-image-2-director
-description: "Use when turning a plain concept into a GPT Image 2.0 prompt; routes UI, infographic, poster, mockup, character sheet, editorial layout, and cinematic single-image requests into the right prompt format."
+description: "Write a GPT Image 2.0 prompt from a plain concept: UI, infographic, poster, mockup, character sheet, editorial layout, or cinematic single image. Routes each request into the prompt format that surface expects."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

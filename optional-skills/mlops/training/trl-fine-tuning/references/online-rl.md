@@ -67,6 +67,59 @@ trainer.train()
 - `max_new_tokens`: 64-256
 - Learning rate: 1e-5 to 1e-4
 
+### Reward function signatures
+
+A reward function receives the generated `completions` and returns one float per
+completion. Extra dataset columns (including `prompts`) arrive as keyword arguments.
+
+```python
+def reward_function(completions, **kwargs):
+    """
+    Compute rewards for completions.
+
+    Args:
+        completions: List of generated texts
+
+    Returns:
+        List of reward scores (floats)
+    """
+    rewards = []
+    for completion in completions:
+        # Example: reward based on length and unique words
+        score = len(completion.split())  # Favor longer responses
+        score += len(set(completion.lower().split()))  # Reward unique words
+        rewards.append(score)
+    return rewards
+```
+
+Or delegate to a trained reward model:
+
+```python
+from transformers import pipeline
+
+reward_model = pipeline("text-classification", model="reward-model-path")
+
+def reward_from_model(completions, prompts, **kwargs):
+    # Combine prompt + completion
+    full_texts = [p + c for p, c in zip(prompts, completions)]
+    # Get reward scores
+    results = reward_model(full_texts)
+    return [r["score"] for r in results]
+```
+
+For reward-function *design philosophy* (composite rewards, format vs correctness staging,
+mode-collapse avoidance) see [grpo-training.md](grpo-training.md).
+
+### GRPO from the CLI
+
+```bash
+trl grpo \
+    --model_name_or_path Qwen/Qwen2-0.5B-Instruct \
+    --dataset_name trl-lib/tldr \
+    --output_dir Qwen2-GRPO \
+    --num_generations 4
+```
+
 ## Memory Comparison
 
 | Method | Memory (7B) | Speed | Use Case |

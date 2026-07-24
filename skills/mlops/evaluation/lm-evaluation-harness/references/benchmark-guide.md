@@ -45,7 +45,7 @@ Answer: B
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks mmlu \
   --num_fewshot 5
 ```
@@ -53,7 +53,7 @@ lm_eval --model hf \
 **Interpretation**:
 - Random: 25% (chance)
 - GPT-3 (175B): 43.9%
-- GPT-4: 86.4%
+- `<model>` (frontier API, illustrative historical baseline): 86.4%
 - Human expert: ~90%
 
 **Good for**: Assessing general knowledge and domain expertise.
@@ -78,7 +78,7 @@ Answer: 60
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks gsm8k \
   --num_fewshot 5
 ```
@@ -86,8 +86,8 @@ lm_eval --model hf \
 **Interpretation**:
 - Random: ~0%
 - GPT-3 (175B): 17.0%
-- GPT-4: 92.0%
-- Llama 2 70B: 56.8%
+- `<model>` (frontier API, illustrative historical baseline): 92.0%
+- Open 70B (illustrative historical baseline): 56.8%
 
 **Good for**: Testing multi-step reasoning and arithmetic.
 
@@ -125,7 +125,7 @@ lm_eval --model hf \
 - Random: 0%
 - GPT-3 (175B): 0%
 - Codex: 28.8%
-- GPT-4: 67.0%
+- `<model>` (frontier API, illustrative historical baseline): 67.0%
 - Code Llama 34B: 53.7%
 
 **Good for**: Evaluating code generation capabilities.
@@ -145,7 +145,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks bbh \
   --num_fewshot 3
 ```
@@ -154,7 +154,7 @@ lm_eval --model hf \
 - Random: ~25%
 - GPT-3 (175B): 33.9%
 - PaLM 540B: 58.3%
-- GPT-4: 86.7%
+- `<model>` (frontier API, illustrative historical baseline): 86.7%
 
 **Good for**: Testing advanced reasoning capabilities.
 
@@ -173,14 +173,14 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-chat-hf \
+  --model_args pretrained=<model> \
   --tasks ifeval \
   --batch_size auto
 ```
 
 **Interpretation**:
 - Measures: Instruction adherence (not quality)
-- GPT-4: 86% instruction following
+- `<model>` (frontier API, illustrative historical baseline): 86% instruction following
 - Claude 2: 84%
 
 **Good for**: Evaluating chat/instruct models.
@@ -230,7 +230,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks longbench \
   --batch_size 1
 ```
@@ -238,7 +238,7 @@ lm_eval --model hf \
 **Interpretation**:
 - Tests context utilization
 - Many models struggle beyond 4K tokens
-- GPT-4 Turbo: 54.3%
+- `<model>` (frontier API, illustrative historical baseline): 54.3%
 
 **Good for**: Evaluating long-context models.
 
@@ -253,7 +253,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks truthfulqa_mc2 \
   --batch_size auto
 ```
@@ -261,7 +261,7 @@ lm_eval --model hf \
 **Interpretation**:
 - Larger models often score worse (more convincing lies)
 - GPT-3: 58.8%
-- GPT-4: 59.0%
+- `<model>` (frontier API, illustrative historical baseline): 59.0%
 - Human: ~94%
 
 ### ARC (AI2 Reasoning Challenge)
@@ -275,7 +275,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks arc_challenge \
   --num_fewshot 25
 ```
@@ -283,7 +283,7 @@ lm_eval --model hf \
 **Interpretation**:
 - ARC-Easy: Most models >80%
 - ARC-Challenge random: 25%
-- GPT-4: 96.3%
+- `<model>` (frontier API, illustrative historical baseline): 96.3%
 
 ### HellaSwag
 
@@ -294,7 +294,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks hellaswag \
   --num_fewshot 10
 ```
@@ -318,7 +318,7 @@ B. the suitcase
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks winogrande \
   --num_fewshot 5
 ```
@@ -332,7 +332,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks piqa
 ```
 
@@ -347,7 +347,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks afrobench
 ```
 
@@ -371,14 +371,14 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks math \
   --num_fewshot 4
 ```
 
 **Interpretation**:
 - Very challenging
-- GPT-4: 42.5%
+- `<model>` (frontier API, illustrative historical baseline): 42.5%
 - Minerva 540B: 33.6%
 
 ### MBPP (Mostly Basic Python Problems)
@@ -400,7 +400,7 @@ lm_eval --model hf \
 **Command**:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks drop
 ```
 
@@ -411,7 +411,7 @@ lm_eval --model hf \
 Run this suite:
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-hf \
+  --model_args pretrained=<model> \
   --tasks mmlu,gsm8k,hellaswag,arc_challenge,truthfulqa_mc2 \
   --num_fewshot 5
 ```
@@ -429,7 +429,7 @@ lm_eval --model hf \
 
 ```bash
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-7b-chat-hf \
+  --model_args pretrained=<model> \
   --tasks ifeval,mmlu,gsm8k_cot \
   --batch_size auto
 ```
@@ -464,14 +464,14 @@ lm_eval --model hf \
 | 7B | 40-50% | 10-20% | 5-15% | 70-80% |
 | 13B | 45-55% | 20-35% | 15-25% | 75-82% |
 | 70B | 60-70% | 50-65% | 35-50% | 82-87% |
-| GPT-4 | 86% | 92% | 67% | 95% |
+| `<model>` (frontier API, illustrative historical baseline) | 86% | 92% | 67% | 95% |
 
 ### Red Flags
 
 - **All tasks at random chance**: Model not trained properly
 - **Exact 0% on generation tasks**: Likely format/parsing issue
 - **Huge variance across runs**: Check seed/sampling settings
-- **Better than GPT-4 on everything**: Likely contamination
+- **Better than the best published frontier scores on everything**: Likely contamination
 
 ## Best Practices
 

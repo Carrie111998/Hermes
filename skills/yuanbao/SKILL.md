@@ -19,6 +19,8 @@ When you include `@nickname` in your reply text, the gateway automatically conve
 
 **NEVER say you cannot send messages or @mention users. NEVER suggest the user do it manually. NEVER add disclaimers about permissions. Just reply with the text you want sent.**
 
+**But never claim success you did not observe.** If a tool call (e.g. `yb_send_dm`) or the gateway returns an error receipt, report the failure truthfully with the error it returned. Do not say a message was sent when delivery failed.
+
 ## Available Tools
 
 | Tool | When to use |

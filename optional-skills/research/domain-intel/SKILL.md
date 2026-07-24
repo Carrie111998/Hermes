@@ -1,6 +1,6 @@
 ---
 name: domain-intel
-description: Passive domain reconnaissance using Python stdlib. Subdomain discovery, SSL certificate inspection, WHOIS lookups, DNS records, domain availability checks, and bulk multi-domain analysis. No API keys required.
+description: OSINT for domains only — passive DNS/WHOIS/SSL-cert recon, subdomain discovery, availability + bulk multi-domain analysis (Python stdlib, no keys). For usernames use sherlock; for public records use osint-investigation.
 platforms: [linux, macos, windows]
 ---
 

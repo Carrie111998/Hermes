@@ -1,6 +1,6 @@
 ---
 name: osint-investigation
-description: Public-records OSINT investigation framework — SEC EDGAR filings, USAspending contracts, Senate lobbying, OFAC sanctions, ICIJ offshore leaks, NYC property records (ACRIS), OpenCorporates registries, CourtListener court records, Wayback Machine archives, Wikipedia + Wikidata, GDELT news monitoring. Entity resolution across sources, cross-link analysis, timing correlation, evidence chains. Python stdlib only.
+description: OSINT via public records only — SEC EDGAR, USAspending, OFAC sanctions, ICIJ offshore leaks, ACRIS property, OpenCorporates, CourtListener, Wayback, Wikidata, GDELT. Entity resolution + cross-link analysis across sources (Python stdlib). For usernames use sherlock; for domains use domain-intel.
 version: 0.1.0
 platforms: [linux, macos, windows]
 author: Hermes Agent (adapted from ShinMegamiBoson/OpenPlanter, MIT)

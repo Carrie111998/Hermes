@@ -2,6 +2,8 @@
 
 Guide to training and fine-tuning LLaVA models.
 
+> **Path note**: `scripts/v1_5/*.sh` and `scripts/zero2.json` below live inside the **cloned upstream LLaVA repo** (https://github.com/haotian-liu/LLaVA), not in this skill directory. Run them from the repo root after `git clone` + `pip install -e .`.
+
 ## Training stages
 
 ### Stage 1: Feature alignment (Pretraining)

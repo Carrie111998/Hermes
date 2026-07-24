@@ -3,11 +3,24 @@
 Complete guide to configuring Outlines with different model backends.
 
 ## Table of Contents
+- Installation
 - Local Models (Transformers, llama.cpp, vLLM)
 - API Models (OpenAI)
 - Performance Comparison
 - Configuration Examples
 - Production Deployment
+
+## Installation
+
+```bash
+# Base installation
+pip install outlines
+
+# With specific backends
+pip install outlines transformers      # Hugging Face models
+pip install outlines llama-cpp-python  # llama.cpp
+pip install outlines vllm              # vLLM for high-throughput
+```
 
 ## Transformers (Hugging Face)
 

@@ -5,7 +5,7 @@ Guide to evaluating OpenAI, Anthropic, and other API-based language models.
 ## Overview
 
 The lm-evaluation-harness supports evaluating API-based models through a unified `TemplateAPI` interface. This allows benchmarking of:
-- OpenAI models (GPT-4, GPT-3.5, etc.)
+- OpenAI models (any chat or completion model the API exposes)
 - Anthropic models (Claude 3, Claude 2, etc.)
 - Local OpenAI-compatible APIs
 - Custom API endpoints
@@ -54,11 +54,11 @@ lm_eval --model openai-completions \
 
 ### Chat Models
 
-**Available models**: `gpt-4`, `gpt-4-turbo`, `gpt-3.5-turbo`
+**Available models**: any chat model the endpoint exposes; pass it as `model=<model>`
 
 ```bash
 lm_eval --model openai-chat-completions \
-  --model_args model=gpt-4-turbo \
+  --model_args model=<model> \
   --tasks mmlu,gsm8k,humaneval \
   --num_fewshot 5 \
   --batch_size auto
@@ -76,7 +76,7 @@ lm_eval --model openai-chat-completions \
 ```bash
 lm_eval --model openai-chat-completions \
   --model_args \
-    model=gpt-4-turbo,\
+    model=<model>,\
     base_url=https://api.openai.com/v1,\
     num_concurrent=5,\
     max_retries=3,\
@@ -101,7 +101,7 @@ OpenAI charges per token. Estimate costs before running:
 # Rough estimate
 num_samples = 1000
 avg_tokens_per_sample = 500  # input + output
-cost_per_1k_tokens = 0.01  # GPT-3.5 Turbo
+cost_per_1k_tokens = 0.01  # replace with your model's blended rate
 
 total_cost = (num_samples * avg_tokens_per_sample / 1000) * cost_per_1k_tokens
 print(f"Estimated cost: ${total_cost:.2f}")
@@ -109,7 +109,7 @@ print(f"Estimated cost: ${total_cost:.2f}")
 
 **Cost-saving tips**:
 - Use `--limit N` for testing
-- Start with `gpt-3.5-turbo` before `gpt-4`
+- Start with the cheapest tier the endpoint offers before the flagship tier
 - Set `max_gen_toks` to minimum needed
 - Use `num_fewshot=0` for zero-shot when possible
 
@@ -186,7 +186,7 @@ Many local inference servers expose OpenAI-compatible APIs (vLLM, Text Generatio
 
 **Start server**:
 ```bash
-vllm serve meta-llama/Llama-2-7b-hf \
+vllm serve <model> \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -195,7 +195,7 @@ vllm serve meta-llama/Llama-2-7b-hf \
 ```bash
 lm_eval --model local-completions \
   --model_args \
-    model=meta-llama/Llama-2-7b-hf,\
+    model=<model>,\
     base_url=http://localhost:8000/v1,\
     num_concurrent=1 \
   --tasks mmlu,gsm8k \
@@ -208,14 +208,14 @@ lm_eval --model local-completions \
 ```bash
 docker run --gpus all --shm-size 1g -p 8080:80 \
   ghcr.io/huggingface/text-generation-inference:latest \
-  --model-id meta-llama/Llama-2-7b-hf
+  --model-id <model>
 ```
 
 **Evaluate**:
 ```bash
 lm_eval --model local-completions \
   --model_args \
-    model=meta-llama/Llama-2-7b-hf,\
+    model=<model>,\
     base_url=http://localhost:8080/v1 \
   --tasks hellaswag,arc_challenge
 ```
@@ -241,7 +241,7 @@ lm_eval --model local-completions \
 
 **Start server**:
 ```bash
-./server -m models/llama-2-7b.gguf --host 0.0.0.0 --port 8080
+./server -m models/<model>.gguf --host 0.0.0.0 --port 8080
 ```
 
 **Evaluate**:
@@ -315,34 +315,36 @@ results = evaluator.simple_evaluate(
 ### Side-by-Side Evaluation
 
 ```bash
-# Evaluate OpenAI GPT-4
+# Evaluate an OpenAI-hosted chat model
 lm_eval --model openai-chat-completions \
-  --model_args model=gpt-4-turbo \
+  --model_args model=<model> \
   --tasks mmlu,gsm8k,hellaswag \
   --num_fewshot 5 \
-  --output_path results/gpt4.json
+  --output_path results/api-model.json
 
-# Evaluate open Llama 2 70B
+# Evaluate a self-hosted 70B open model
 lm_eval --model hf \
-  --model_args pretrained=meta-llama/Llama-2-70b-hf,dtype=bfloat16 \
+  --model_args pretrained=<model-70b>,dtype=bfloat16 \
   --tasks mmlu,gsm8k,hellaswag \
   --num_fewshot 5 \
-  --output_path results/llama2-70b.json
+  --output_path results/open-70b.json
 
 # Compare results
 python scripts/compare_results.py \
-  results/gpt4.json \
-  results/llama2-70b.json
+  results/api-model.json \
+  results/open-70b.json
 ```
 
 ### Typical Comparisons
 
+Rows below are illustrative historical baselines, not current numbers. Re-measure before citing.
+
 | Model | MMLU | GSM8K | HumanEval | Cost |
 |-------|------|-------|-----------|------|
-| GPT-4 Turbo | 86.4% | 92.0% | 67.0% | $$$$ |
+| `<model>` (frontier API, illustrative historical baseline) | 86.4% | 92.0% | 67.0% | $$$$ |
 | Claude 3 Opus | 86.8% | 95.0% | 84.9% | $$$$ |
-| GPT-3.5 Turbo | 70.0% | 57.1% | 48.1% | $$ |
-| Llama 2 70B | 68.9% | 56.8% | 29.9% | Free (self-host) |
+| `<model>` (cheap API tier, illustrative historical baseline) | 70.0% | 57.1% | 48.1% | $$ |
+| Open 70B (illustrative historical baseline) | 68.9% | 56.8% | 29.9% | Free (self-host) |
 | Mixtral 8x7B | 70.6% | 58.4% | 40.2% | Free (self-host) |
 
 ## Best Practices
@@ -353,7 +355,7 @@ Respect API rate limits:
 ```bash
 lm_eval --model openai-chat-completions \
   --model_args \
-    model=gpt-4-turbo,\
+    model=<model>,\
     num_concurrent=3,\  # Lower concurrency
     timeout=120 \  # Longer timeout
   --tasks mmlu
@@ -364,7 +366,7 @@ lm_eval --model openai-chat-completions \
 Set temperature to 0 for deterministic results:
 ```bash
 lm_eval --model openai-chat-completions \
-  --model_args model=gpt-4-turbo \
+  --model_args model=<model> \
   --tasks mmlu \
   --gen_kwargs temperature=0.0
 ```
@@ -383,13 +385,13 @@ API models automatically cache responses to avoid redundant calls:
 ```bash
 # First run: makes API calls
 lm_eval --model openai-chat-completions \
-  --model_args model=gpt-4-turbo \
+  --model_args model=<model> \
   --tasks mmlu \
   --limit 100
 
 # Second run: uses cache (instant, free)
 lm_eval --model openai-chat-completions \
-  --model_args model=gpt-4-turbo \
+  --model_args model=<model> \
   --tasks mmlu \
   --limit 100
 ```
@@ -402,7 +404,7 @@ APIs can fail. Use retries:
 ```bash
 lm_eval --model openai-chat-completions \
   --model_args \
-    model=gpt-4-turbo,\
+    model=<model>,\
     max_retries=5,\
     timeout=120 \
   --tasks mmlu
@@ -446,7 +448,7 @@ curl http://localhost:8000/v1/models
 Use `--limit` for testing:
 ```bash
 lm_eval --model openai-chat-completions \
-  --model_args model=gpt-4-turbo \
+  --model_args model=<model> \
   --tasks mmlu \
   --limit 50  # Only 50 samples
 ```
@@ -476,7 +478,7 @@ lm_eval --model local-completions \
 ```bash
 lm_eval --model openai-chat-completions \
   --model_args \
-    model=gpt-4-turbo,\
+    model=<model>,\
     tokenizer=gpt2,\
     tokenizer_backend=huggingface
 ```

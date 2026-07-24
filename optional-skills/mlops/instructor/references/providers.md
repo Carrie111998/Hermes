@@ -2,6 +2,18 @@
 
 Guide to using Instructor with different LLM providers.
 
+## Installation
+
+```bash
+# Base installation
+pip install instructor
+
+# With specific providers
+pip install "instructor[anthropic]"  # Anthropic Claude
+pip install "instructor[openai]"     # OpenAI
+pip install "instructor[all]"        # All providers
+```
+
 ## Anthropic Claude
 
 ```python
@@ -68,3 +80,25 @@ result = client.chat.completions.create(
 - `Mode.ANTHROPIC_TOOLS`: Recommended for Claude
 - `Mode.TOOLS`: OpenAI function calling
 - `Mode.JSON`: Fallback for unsupported providers
+
+Pass the mode when patching a client that lacks native structured outputs:
+
+```python
+client = instructor.from_anthropic(
+    Anthropic(),
+    mode=instructor.Mode.JSON  # JSON mode
+)
+```
+
+## Client Lifecycle (Context Manager)
+
+```python
+# Single-use client, closed automatically
+with instructor.from_anthropic(Anthropic()) as client:
+    result = client.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=1024,
+        messages=[...],
+        response_model=YourModel
+    )
+```

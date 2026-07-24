@@ -1,6 +1,6 @@
 ---
 name: faiss
-description: Facebook's library for efficient similarity search and clustering of dense vectors. Supports billions of vectors, GPU acceleration, and various index types (Flat, IVF, HNSW). Use for fast k-NN search, large-scale vector retrieval, or when you need pure similarity search without metadata. Best for high-performance applications.
+description: "FAISS: raw ANN index library - no DB, no metadata, no server; you manage persistence. Billion-scale k-NN with Flat/IVF/HNSW/PQ indexes and GPU acceleration for pure similarity search."
 version: 1.0.0
 author: Orchestra Research
 license: MIT
@@ -222,4 +222,6 @@ vector_store = FaissVectorStore(faiss_index=faiss_index)
 - **Wiki**: https://github.com/facebookresearch/faiss/wiki
 - **License**: MIT
 
+## References
 
+- **[Index Types](references/index_types.md)** - How to choose between Flat / IVF / HNSW / PQ / OPQ, their build+search parameters, and the recall-vs-latency trade-off per dataset size.

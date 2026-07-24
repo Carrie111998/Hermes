@@ -421,3 +421,12 @@ function draw() {
   plane(width, height);
 }
 ```
+
+## WebGL Mode Gotchas
+
+- `createCanvas(w, h, WEBGL)` — origin is center, not top-left
+- Y-axis is inverted (positive Y goes up in WEBGL, down in P2D)
+- `translate(-width/2, -height/2)` to get P2D-like coordinates
+- `push()`/`pop()` around every transform — the matrix stack overflows silently
+- `texture()` before `rect()`/`plane()` — not after
+- Custom shaders: `createShader(vert, frag)` — test on multiple browsers

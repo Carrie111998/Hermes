@@ -1,5 +1,17 @@
 # SAELens API Reference
 
+## Class overview
+
+| Class | Purpose |
+|-------|---------|
+| `SAE` | Sparse Autoencoder model |
+| `LanguageModelSAERunnerConfig` | Training configuration |
+| `SAETrainingRunner` | Training loop manager |
+| `ActivationsStore` | Activation collection and batching |
+| `HookedSAETransformer` | TransformerLens + SAE integration |
+
+---
+
 ## SAE Class
 
 The core class representing a Sparse Autoencoder.

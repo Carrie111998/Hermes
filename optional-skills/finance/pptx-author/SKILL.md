@@ -45,7 +45,7 @@ Revenue: $1,250M  (Source: model.xlsx, Inputs!C3)
 Never transcribe numbers from memory or from a summary — open the workbook, read the named range, and bind the deck value to it programmatically when you can.
 
 ### Use the firm template when one is mounted
-If `./templates/firm-template.pptx` exists, load it so the deck inherits branded colors, fonts, and master layouts.
+This skill does **not** ship a `firm-template.pptx` — none is bundled. You must supply your own branded template by placing it at `./templates/firm-template.pptx` (relative to the working directory). If `./templates/firm-template.pptx` exists, load it so the deck inherits branded colors, fonts, and master layouts; if it is absent, the code below falls back to a blank `Presentation()` and the deck uses python-pptx defaults. This is expected behavior, not an error — only provide a template when you want firm branding.
 
 ```python
 from pptx import Presentation

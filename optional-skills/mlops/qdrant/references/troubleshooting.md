@@ -614,6 +614,40 @@ def test_connection(host="localhost", port=6333):
 test_connection()
 ```
 
+## Three Most Common Failures (quick fixes)
+
+**Slow search with filters** — the filtered field has no payload index:
+
+```python
+client.create_payload_index(
+    collection_name="docs",
+    field_name="category",
+    field_schema=PayloadSchemaType.KEYWORD
+)
+```
+
+**Out of memory** — enable quantization and push payload to disk:
+
+```python
+client.create_collection(
+    collection_name="large_collection",
+    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    quantization_config=ScalarQuantization(...),
+    on_disk_payload=True
+)
+```
+
+**Connection issues** — raise the timeout and prefer gRPC:
+
+```python
+client = QdrantClient(
+    host="localhost",
+    port=6333,
+    timeout=30,
+    prefer_grpc=True  # gRPC for better performance
+)
+```
+
 ## Getting Help
 
 1. **Documentation**: https://qdrant.tech/documentation/

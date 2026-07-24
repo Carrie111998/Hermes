@@ -214,6 +214,30 @@ lm += "Rate: " + gen("rate", regex=r"[0-9]+\.[0-9]{1,2}%")
 
 ## Grammar-Based Generation
 
+Grammars are for complex structured outputs, nested data structures, programming-language syntax, and domain-specific languages.
+
+### Inline Grammar Template (`grammar=` kwarg)
+
+Instead of composing with `+`, a whole grammar can be passed as a template string to a single `gen`:
+
+```python
+from guidance import models, gen
+
+lm = models.Anthropic("claude-sonnet-4-5-20250929")
+
+json_grammar = """
+{
+    "name": <gen name regex="[A-Za-z ]+" max_tokens=20>,
+    "age": <gen age regex="[0-9]+" max_tokens=3>,
+    "email": <gen email regex="[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}" max_tokens=50>
+}
+"""
+
+lm += gen("person", grammar=json_grammar)
+
+print(lm["person"])  # Guaranteed valid JSON structure
+```
+
 ### JSON Grammar
 
 ```python

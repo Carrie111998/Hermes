@@ -2,6 +2,32 @@
 
 Configuration file location: `~/.config/himalaya/config.toml`
 
+## Installation
+
+```bash
+# Pre-built binary (Linux/macOS — recommended)
+curl -sSL https://raw.githubusercontent.com/pimalaya/himalaya/master/install.sh | PREFIX=~/.local sh
+
+# macOS via Homebrew
+brew install himalaya
+
+# Or via cargo (any platform with Rust)
+cargo install himalaya --locked
+```
+
+Verify with `himalaya --version`.
+
+## Interactive wizard
+
+Instead of writing the TOML by hand, run:
+
+```bash
+himalaya account configure
+```
+
+The wizard requires interactive input — from Hermes, use PTY mode:
+`terminal(command="himalaya account configure", pty=true)`.
+
 ## Minimal IMAP + SMTP Setup
 
 ```toml

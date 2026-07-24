@@ -1,6 +1,14 @@
 # Float8 Training in TorchTitan
 
-Float8 training provides substantial speedups for models where GEMMs are large enough that the FP8 tensorcore speedup outweighs dynamic quantization overhead.
+Float8 training provides substantial speedups (roughly 30-50% on H100) for models where GEMMs are large enough that the FP8 tensorcore speedup outweighs dynamic quantization overhead.
+
+> Commands below use `run_train.sh` and `torchtitan/models/.../train_configs/*.toml` from the
+> root of the cloned upstream torchtitan repo (https://github.com/pytorch/torchtitan) — these
+> are not files shipped in this skill directory.
+
+Three-step enablement checklist: install torchao, add the `[quantize.linear.float8]` TOML
+block, launch with `--compile.enable`. See
+[training-workflows.md](training-workflows.md) Workflow 3 for the condensed version.
 
 ## Hardware Requirements
 

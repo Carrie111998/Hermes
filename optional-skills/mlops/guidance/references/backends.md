@@ -3,11 +3,23 @@
 Complete guide to configuring Guidance with different LLM backends.
 
 ## Table of Contents
+- Installation
 - API-Based Models (Anthropic, OpenAI)
 - Local Models (Transformers, llama.cpp)
 - Backend Comparison
 - Performance Tuning
 - Advanced Configuration
+
+## Installation
+
+```bash
+# Base installation
+pip install guidance
+
+# With specific backends
+pip install guidance[transformers]  # Hugging Face models
+pip install guidance[llama_cpp]     # llama.cpp models
+```
 
 ## API-Based Models
 

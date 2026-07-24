@@ -59,6 +59,10 @@ cli-config.yaml
 
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
+# Hub remote-index cache. The real one is $HERMES_HOME/skills/.hub/index-cache
+# with a 1h TTL (tools/skills_hub.py:INDEX_CACHE_DIR); a copy under skills/ is
+# never read by anything and only produces noisy diffs.
+skills/index-cache/
 ignored/
 .worktrees/
 environments/benchmarks/evals/

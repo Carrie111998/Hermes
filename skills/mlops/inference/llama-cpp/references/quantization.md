@@ -43,19 +43,19 @@ Use the Hub page first, and only fall back to the generic heuristics below when 
 
 ```bash
 # 1. Download Hugging Face model
-hf download meta-llama/Llama-2-7b-chat-hf \
-    --local-dir models/llama-2-7b-chat/
+hf download <model> \
+    --local-dir models/<model>/
 
 # 2. Convert to FP16 GGUF
 python convert_hf_to_gguf.py \
-    models/llama-2-7b-chat/ \
+    models/<model>/ \
     --outtype f16 \
-    --outfile models/llama-2-7b-chat-f16.gguf
+    --outfile models/<model>-f16.gguf
 
 # 3. Quantize to Q4_K_M
 ./llama-quantize \
-    models/llama-2-7b-chat-f16.gguf \
-    models/llama-2-7b-chat-Q4_K_M.gguf \
+    models/<model>-f16.gguf \
+    models/<model>-Q4_K_M.gguf \
     Q4_K_M
 ```
 

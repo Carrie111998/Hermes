@@ -478,6 +478,48 @@ def multiscale_segment(image, predictor, point, scales=[0.5, 1.0, 2.0]):
     return final_mask
 ```
 
+## ONNX Deployment
+
+### Export model
+
+```bash
+python scripts/export_onnx_model.py \
+    --checkpoint sam_vit_h_4b8939.pth \
+    --model-type vit_h \
+    --output sam_onnx.onnx \
+    --return-single-mask
+```
+
+Only the prompt encoder + mask decoder are exported. The image encoder still runs
+in PyTorch (or a separate exported graph), so the ONNX session consumes
+precomputed `image_embeddings`.
+
+### Use ONNX model
+
+```python
+import onnxruntime
+
+# Load ONNX model
+ort_session = onnxruntime.InferenceSession("sam_onnx.onnx")
+
+# Run inference (image embeddings computed separately)
+masks = ort_session.run(
+    None,
+    {
+        "image_embeddings": image_embeddings,
+        "point_coords": point_coords,
+        "point_labels": point_labels,
+        "mask_input": np.zeros((1, 1, 256, 256), dtype=np.float32),
+        "has_mask_input": np.array([0], dtype=np.float32),
+        "orig_im_size": np.array([h, w], dtype=np.float32)
+    }
+)
+```
+
+`--return-single-mask` skips multimask output and is the faster deployment
+choice. Export/runtime failures (opset versions, provider selection, input
+shapes) are covered in `troubleshooting.md`.
+
 ## Performance Optimization
 
 ### TensorRT acceleration

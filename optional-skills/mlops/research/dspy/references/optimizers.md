@@ -182,7 +182,7 @@ optimized_qa = optimizer.compile(qa, trainset=trainset)
 # You then fine-tune using your LM provider's API
 
 # After fine-tuning, load your model:
-finetuned_lm = dspy.OpenAI(model="ft:gpt-3.5-turbo:your-model-id")
+finetuned_lm = dspy.OpenAI(model="ft:<model>:your-model-id")
 dspy.settings.configure(lm=finetuned_lm)
 ```
 
@@ -348,6 +348,40 @@ def metric_with_trace(example, pred, trace=None):
 ```
 
 ## Evaluation Best Practices
+
+### Running Evaluate
+
+`Evaluate` runs a metric over a dev/test set; use it to quantify the gain from
+optimization instead of eyeballing outputs.
+
+```python
+from dspy.evaluate import Evaluate
+
+# Create evaluator
+evaluator = Evaluate(
+    devset=testset,
+    metric=exact_match,
+    num_threads=4,
+    display_progress=True
+)
+
+# Evaluate model
+score = evaluator(qa_system)
+print(f"Accuracy: {score}")
+
+# Compare optimized vs unoptimized
+score_before = evaluator(qa)
+score_after = evaluator(optimized_qa)
+print(f"Improvement: {score_after - score_before:.2%}")
+```
+
+Case-insensitive exact match is a common starting metric:
+
+```python
+def exact_match(example, pred, trace=None):
+    """Exact match metric (case-insensitive)."""
+    return example.answer.lower() == pred.answer.lower()
+```
 
 ### Train/Val/Test Split
 

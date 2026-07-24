@@ -290,3 +290,57 @@ NOL Non-Negative:       = Ending NOL Balance ≥ 0         (must be TRUE)
 NOL Starting Balance:   = Beginning NOL (Year 1) = 0     (must be TRUE for new business)
 NOL Accumulation:       = NOL increases only when EBT < 0 (losses generate NOL)
 ```
+
+---
+
+## Margin Analysis
+
+**Note: The following margin analysis should only be performed if prompted by the user or if the template explicitly requires it. If no prompt is given, skip this section.**
+
+Calculate and display profitability margins on the Income Statement (IS) tab to track operational efficiency and enable peer comparison.
+
+### Core Margins to Include
+
+| Margin | Formula | What It Measures |
+|--------|---------|------------------|
+| Gross Margin | Gross Profit / Revenue | Pricing power, production efficiency |
+| EBITDA Margin | EBITDA / Revenue | Core operating profitability |
+| EBIT Margin | EBIT / Revenue | Operating profitability after D&A |
+| Net Income Margin | Net Income / Revenue | Bottom-line profitability |
+
+### Income Statement Layout with Margins
+
+Display margin percentages directly below each profit line item:
+- Gross Margin % below Gross Profit
+- EBIT Margin % below EBIT
+- EBITDA Margin % below EBITDA
+- Net Income Margin % below Net Income
+
+## Credit Metrics
+
+**Note: The following Credit analysis should only be performed if prompted by the user or if the template explicitly requires it. If no prompt is given, skip this section.**
+
+Calculate and display credit/leverage metrics on the Balance Sheet (BS) tab to assess financial health, debt capacity, and covenant compliance.
+
+### Core Credit Metrics to Include
+
+| Metric | Formula | What It Measures |
+|--------|---------|------------------|
+| Total Debt / EBITDA | Total Debt / LTM EBITDA | Leverage multiple |
+| Net Debt / EBITDA | (Total Debt - Cash) / LTM EBITDA | Leverage net of cash |
+| Interest Coverage | EBITDA / Interest Expense | Ability to service debt |
+| Debt / Total Cap | Total Debt / (Total Debt + Equity) | Capital structure |
+| Debt / Equity | Total Debt / Total Equity | Financial leverage |
+| Current Ratio | Current Assets / Current Liabilities | Short-term liquidity |
+| Quick Ratio | (Current Assets - Inventory) / Current Liabilities | Immediate liquidity |
+
+### Credit Metric Hierarchy Checks
+
+Validate that Upside shows strongest credit profile:
+- Leverage: Upside < Base < Downside (lower is better)
+- Coverage: Upside > Base > Downside (higher is better)
+- Liquidity: Upside > Base > Downside (higher is better)
+
+### Covenant Compliance Tracking
+
+If debt covenants are known, add explicit compliance checks comparing actual metrics to covenant thresholds.

@@ -564,3 +564,19 @@ function prngFromHash(hash) {
 
 const rng = prngFromHash(hash);
 ```
+
+## Standard Key Bindings Convention
+
+Every sketch should include these in `keyPressed()` so the user has a
+predictable capture/reseed interface:
+
+```javascript
+function keyPressed() {
+  if (key === 's' || key === 'S') saveCanvas('output', 'png');
+  if (key === 'g' || key === 'G') saveGif('output', 5);
+  if (key === 'r' || key === 'R') { randomSeed(millis()); noiseSeed(millis()); }
+  if (key === ' ') CONFIG.paused = !CONFIG.paused;
+}
+```
+
+Tell the user which keys are bound whenever you hand off a sketch.

@@ -27,6 +27,37 @@ class CustomModule(dspy.Module):
         return result
 ```
 
+## Signatures
+
+Signatures declare the structure of a task (inputs → outputs). Every module is
+constructed from one.
+
+```python
+# Inline signature (simple)
+qa = dspy.Predict("question -> answer")
+
+# Class signature (detailed)
+class Summarize(dspy.Signature):
+    """Summarize text into key points."""
+    text = dspy.InputField()
+    summary = dspy.OutputField(desc="bullet points, 3-5 items")
+
+summarizer = dspy.ChainOfThought(Summarize)
+```
+
+**When to use each:**
+- **Inline**: Quick prototyping, simple tasks
+- **Class**: Complex tasks, type hints, better documentation
+
+A signature with input and output fields can also be reused across modules, e.g.
+`dspy.Predict("context, question -> answer")`:
+
+```python
+predictor = dspy.Predict("context, question -> answer")
+result = predictor(context="Paris is the capital of France",
+                   question="What is the capital?")
+```
+
 ## Core Modules
 
 ### dspy.Predict
@@ -210,6 +241,33 @@ print(answer)  # "4"
 - Combining multiple model outputs
 - Reducing variance in predictions
 - Ensemble approaches
+
+### Manual self-consistency module
+
+When you need control over sampling or want the vote inside a reusable module,
+wrap the loop yourself instead of using `majority`.
+
+```python
+import dspy
+from collections import Counter
+
+class ConsistentQA(dspy.Module):
+    def __init__(self, num_samples=5):
+        super().__init__()
+        self.qa = dspy.ChainOfThought("question -> answer")
+        self.num_samples = num_samples
+
+    def forward(self, question):
+        # Generate multiple answers
+        answers = []
+        for _ in range(self.num_samples):
+            result = self.qa(question=question)
+            answers.append(result.answer)
+
+        # Return most common answer
+        most_common = Counter(answers).most_common(1)[0][0]
+        return dspy.Prediction(answer=most_common)
+```
 
 ## Advanced Modules
 

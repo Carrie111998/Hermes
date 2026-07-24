@@ -284,6 +284,21 @@ model.generate(**inputs, temperature=0.1, do_sample=False)
 # Train for more epochs
 ```
 
+4. **Increase adapter capacity**:
+```python
+# Increase rank
+LoraConfig(r=32, lora_alpha=64)
+
+# Target more modules
+target_modules = "all-linear"
+
+# Use more training data and epochs
+TrainingArguments(num_train_epochs=5)
+
+# Lower learning rate
+TrainingArguments(learning_rate=1e-4)
+```
+
 ### Wrong Adapter Active
 
 **Problem**: Model using wrong adapter or no adapter.

@@ -129,3 +129,11 @@ Apply to every investigation regardless of template:
 - [ ] Check if the repository changed ownership or transferred orgs near the incident
 - [ ] Look for "cleanup" commits immediately after the malicious commit (cover-up pattern)
 - [ ] Check related packages/repos by the same author for similar patterns
+
+---
+
+## Example Scenarios
+
+- **Scenario A: Dependency Confusion**: A malicious package `internal-lib-v2` is uploaded to NPM with a higher version than the internal one. The investigator must track when this package was first seen and if any PushEvents in the target repo updated `package.json` to this version.
+- **Scenario B: Maintainer Takeover**: A long-term contributor's account is used to push a backdoored `.github/workflows/build.yml`. The investigator looks for PushEvents from this user after a long period of inactivity or from a new IP/location (if detectable via BigQuery).
+- **Scenario C: Force-Push Hide**: A developer accidentally commits a production secret, then force-pushes to "fix" it. The investigator uses `git fsck` and GH Archive to recover the original commit SHA and verify what was leaked.

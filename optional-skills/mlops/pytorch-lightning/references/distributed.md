@@ -482,6 +482,23 @@ strategy = DeepSpeedStrategy(
 )
 ```
 
+## Hardware and precision support matrix
+
+| Target | Support |
+|--------|---------|
+| CPU | Works (good for debugging) |
+| Single GPU | Works |
+| Multi-GPU | DDP (default), FSDP, or DeepSpeed |
+| Multi-node | DDP, FSDP, DeepSpeed |
+| TPU | Supported (8 cores) |
+| Apple MPS | Supported |
+
+**Precision options**:
+- FP32 (default)
+- FP16 (V100, older GPUs)
+- BF16 (A100/H100, recommended)
+- FP8 (H100, requires `transformer-engine[pytorch]`)
+
 ## Resources
 
 - Distributed strategies: https://lightning.ai/docs/pytorch/stable/accelerators/gpu_intermediate.html
