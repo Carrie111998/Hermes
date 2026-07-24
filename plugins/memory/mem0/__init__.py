@@ -227,10 +227,19 @@ class Mem0MemoryProvider(MemoryProvider):
         cfg = _load_config()
         mode = cfg.get("mode", "platform")
         if mode == "oss":
-            return bool(cfg.get("oss", {}).get("vector_store"))
-        # Platform needs an api_key; self-hosted needs a host (api_key optional
-        # when the server runs with AUTH_DISABLED).
-        return bool(cfg.get("api_key") or cfg.get("host"))
+            config_ok = bool(cfg.get("oss", {}).get("vector_store"))
+        else:
+            # Platform needs an api_key; self-hosted needs a host (api_key optional
+            # when the server runs with AUTH_DISABLED).
+            config_ok = bool(cfg.get("api_key") or cfg.get("host"))
+        if not config_ok:
+            return False
+        # Verify the mem0 SDK is actually installed — config alone is not enough.
+        try:
+            import mem0  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
