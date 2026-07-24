@@ -16,6 +16,10 @@ the provider or model of an existing Hermes conversation.
   Untrusted percentages never affect the 20-point override or reserve
   arithmetic, and selection is audited as
   `ROTATION_WITHOUT_FRESH_CAPACITY`.
+- Selection defaults to persisted cyclic rotation across the eligible pool.
+  Fresh, high-confidence capacity may override the cyclic lane only at a
+  difference of at least 20 percentage points. A stale fallback can rotate
+  when explicitly enabled, but can never trigger or win that override.
 - `status`, `doctor`, `plan`, and `audit` are read-only. In particular, `plan`
   does not create the fleet database, acquire a lease, reserve capacity, or
   advance rotation.

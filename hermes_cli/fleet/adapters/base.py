@@ -12,6 +12,7 @@ _ENV_ALLOWLIST = frozenset(
     {
         "COMSPEC",
         "HOME",
+        "HERMES_HOME",
         "LANG",
         "LC_ALL",
         "LOCALAPPDATA",

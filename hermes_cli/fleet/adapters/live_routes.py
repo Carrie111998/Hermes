@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -14,48 +16,77 @@ from .native_provider import NativeProviderAdapter
 from ..types import AdapterKind, AdapterRequest, AdapterResult, Qualification, ReasonCode
 
 
+_NATIVE_CHILD = Path(__file__).resolve().parents[1] / "native_child.py"
+_NATIVE_SUCCESS_FIELDS = frozenset(
+    {
+        "ok",
+        "provider_id",
+        "model_id",
+        "effort",
+        "auth_kind",
+        "auth_source",
+        "fallback_enabled",
+        "fast_mode",
+        "output",
+    }
+)
+_MAX_STDERR_CHARS = 4096
+
+
+def _stderr_receipt(stderr: str | bytes | None) -> str:
+    """Return bounded diagnostics without retaining or echoing stderr text."""
+
+    if isinstance(stderr, bytes):
+        raw = stderr[:_MAX_STDERR_CHARS]
+    else:
+        raw = str(stderr or "")[:_MAX_STDERR_CHARS].encode(
+            "utf-8", errors="replace"
+        )
+    return f"bytes={len(raw)} sha256={hashlib.sha256(raw).hexdigest()}"
+
+
 def run_native_hermes_child(**request: Any) -> Mapping[str, Any]:
-    """Run a fresh exact-provider Hermes child; never mutate the parent model."""
+    """Run the exact native route in a killable, isolated Python child."""
 
-    from hermes_cli.runtime_provider import resolve_runtime_provider
-    from hermes_constants import parse_reasoning_effort
-    from run_agent import AIAgent
-
-    provider = str(request["provider_id"])
-    model = str(request["model"])
-    runtime = resolve_runtime_provider(requested=provider, target_model=model)
-    if runtime.get("provider") != provider:
-        raise RuntimeError("resolved provider identity mismatch")
-    agent = AIAgent(
-        api_key=runtime.get("api_key"),
-        base_url=runtime.get("base_url"),
-        provider=provider,
-        api_mode=runtime.get("api_mode"),
-        credential_pool=runtime.get("credential_pool"),
-        model=model,
-        reasoning_config=parse_reasoning_effort(request["effort"]),
-        fallback_model=None,
-        quiet_mode=True,
-        platform="subagent",
-        skip_context_files=False,
-        skip_memory=False,
+    child_request = {
+        "provider_id": str(request["provider_id"]),
+        "model": str(request["model"]),
+        "effort": str(request["effort"]),
+        "prompt": str(request["prompt"]),
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(_NATIVE_CHILD)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=Path(request["cwd"]),
+        env=safe_child_environment(),
+        shell=False,
     )
     try:
-        result = agent.run_conversation(str(request["prompt"]))
-        output = result.get("final_response")
-        if not isinstance(output, str):
-            raise RuntimeError("native child returned no final response")
-        return {
-            "ok": True,
-            "provider_id": provider,
-            "model_id": model,
-            "auth_kind": "oauth_subscription",
-            "output": output,
-            "fallback_enabled": False,
-            "fast_mode": False,
-        }
-    finally:
-        agent.close()
+        stdout, stderr = process.communicate(
+            json.dumps(child_request, separators=(",", ":"), sort_keys=True),
+            timeout=request["timeout_seconds"],
+        )
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.communicate()
+        raise TimeoutError("native child execution timed out") from exc
+    stderr_receipt = _stderr_receipt(stderr)
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"native child exited {process.returncode}; stderr {stderr_receipt}"
+        )
+    if not isinstance(stdout, str) or stdout != stdout.strip():
+        raise ValueError("native child stdout was not a strict JSON envelope")
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("native child stdout was not JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != _NATIVE_SUCCESS_FIELDS:
+        raise ValueError("native child stdout envelope fields were invalid")
+    return payload
 
 
 class _SubscriptionCliAdapter(ExternalCliAdapter):

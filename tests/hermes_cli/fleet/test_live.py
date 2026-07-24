@@ -218,7 +218,11 @@ def test_default_service_qualifies_and_executes_each_live_lane(
             "ok": True,
             "provider_id": kwargs["provider_id"],
             "model_id": kwargs["model"],
+            "effort": kwargs["effort"],
             "auth_kind": "oauth_subscription",
+            "auth_source": f"{kwargs['provider_id']}:pool:test",
+            "fallback_enabled": False,
+            "fast_mode": False,
             "output": "native complete",
         }
 

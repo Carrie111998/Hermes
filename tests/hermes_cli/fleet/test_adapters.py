@@ -129,7 +129,11 @@ def test_native_adapter_enforces_subscription_billing_and_fast_off(
         "ok": True,
         "provider_id": profile.provider_id,
         "model_id": "m1",
+        "effort": "low",
         "auth_kind": "oauth_subscription",
+        "auth_source": "subscription-store",
+        "fallback_enabled": False,
+        "fast_mode": False,
         "output": "done",
     })
 
@@ -159,7 +163,11 @@ def test_native_adapter_rejects_runner_provenance_mismatch(field, value, reason)
         "ok": True,
         "provider_id": profile.provider_id,
         "model_id": "m1",
+        "effort": "low",
         "auth_kind": "oauth_subscription",
+        "auth_source": "subscription-store",
+        "fallback_enabled": False,
+        "fast_mode": False,
         "output": "done",
     }
     payload[field] = value

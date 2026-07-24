@@ -239,21 +239,24 @@ it is not a dependency and is never watched continuously in v1.
 
 ## Deterministic selection
 
-Let `P` be the first eligible lane in the fixed order and let `B` be the
-largest `effective_remaining_pct` among eligible lanes.
+**D1 ratified:** user intent is cyclic rotation across the eligible pool by
+default. Let `C` be the lane at the persisted round-robin cursor and let `B` be
+the largest trustworthy `effective_remaining_pct` among fresh eligible lanes.
 
-1. If `B - P.effective_remaining_pct < 20.000`, choose `P`.
-2. If the difference is at least `20.000`, form the switch set containing the
-   eligible lanes whose effective remaining capacity equals `B` exactly after
-   `0.001` quantization.
-3. Choose from the switch set by persisted round-robin cursor over the fixed
-   lane order. Advance the cursor only in the same transaction that commits the
-   winning pin, lease, reservation, and audit decision.
+1. Choose `C` by default and advance the cursor only in the same transaction
+   that commits the winning pin, lease, reservation, and audit decision.
+2. When `C` has fresh, high-confidence capacity and
+   `B - C.effective_remaining_pct >= 20.000`, fresh trustworthy capacity may
+   override the cycle and choose a lane at `B`.
+3. A stale/missing-capacity fallback may participate in cyclic rotation only
+   when `rotation_without_fresh_capacity` is enabled. Its untrusted percentage
+   never enters reserve arithmetic and it can never trigger or win a capacity
+   override.
 
-Thus `60.000` versus `79.999` stays on the priority lane, while `60.000`
-versus `80.000` switches. A dry-run `plan` computes the same candidate but
-does not advance rotation. Repeated evaluation of identical state returns the
-same decision; committed tied selections rotate deterministically.
+Thus a cyclic lane at `60.000` stays selected against `79.999`, while a fresh
+lane at `80.000` may override it. A dry-run `plan` computes the same candidate
+but does not advance rotation. Repeated evaluation of identical state returns
+the same decision; committed selections rotate deterministically.
 
 The selector never runs for an existing task pin. A pinned lane becoming stale,
 full, cooled down, unauthenticated, or unavailable causes a reason-coded
