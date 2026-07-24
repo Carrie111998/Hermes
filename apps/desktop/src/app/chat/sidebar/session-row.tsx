@@ -7,6 +7,7 @@ import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { openSession } from '@/app/open-session'
+import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
@@ -98,7 +99,10 @@ function SidebarSessionRowImpl({
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
   const title = sessionTitle(session)
-  const age = formatAge(session.last_active || session.started_at, r)
+  const timestamp = session.last_active || session.started_at
+  const age = formatAge(timestamp, r)
+  const timestampDate = new Date(timestamp * 1000)
+  const absoluteAge = formatMessageTimestamp(timestampDate, t.assistant.thread)
   const handleLabel = `Reorder ${title}`
   // Opt-in row metadata from the sidebar's filter menu. Read from the store
   // rather than threaded as props: the subscription re-renders past the memo
@@ -125,8 +129,7 @@ function SidebarSessionRowImpl({
     rowMeta.includes('tokens') && totalTokens > 0 ? compactNumber(totalTokens) : null,
     // Sub-cent spend rounds to "$0.00", which reads as a bug rather than as a
     // cheap session — below a cent the row says nothing at all.
-    rowMeta.includes('cost') && cost >= 0.01 ? `$${cost.toFixed(2)}` : null,
-    pinnedAge ? age : null
+    rowMeta.includes('cost') && cost >= 0.01 ? `$${cost.toFixed(2)}` : null
   ].filter(Boolean) as string[]
 
   // Everything the Show menu puts after the title shares ONE right-aligned
@@ -146,8 +149,8 @@ function SidebarSessionRowImpl({
     trailing.push({ key: 'pr', node: <PrTag pr={pr} /> })
   }
 
-  if (figures.length) {
-    const head = figures.slice(0, -1).join(' · ')
+  if (figures.length || pinnedAge) {
+    const head = (pinnedAge ? figures : figures.slice(0, -1)).join(' · ')
 
     trailing.push({
       key: 'figures',
@@ -157,7 +160,20 @@ function SidebarSessionRowImpl({
           {/* The figures own their tail: the separator goes with it. */}
           <span className={cn('inline-block text-right', TAIL_HIDES)}>
             {head && ' · '}
-            {figures.at(-1)}
+            {pinnedAge ? (
+              <Tip label={absoluteAge} side="top">
+                <time
+                  aria-label={`${age}, ${absoluteAge}`}
+                  className="pointer-events-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring"
+                  dateTime={timestampDate.toISOString()}
+                  tabIndex={0}
+                >
+                  {age}
+                </time>
+              </Tip>
+            ) : (
+              figures.at(-1)
+            )}
           </span>
         </span>
       )
@@ -165,7 +181,7 @@ function SidebarSessionRowImpl({
   }
 
   // A chip that ends the slot hides whole; the figures handle their own tail.
-  const chipEndsSlot = trailing.length > 0 && !figures.length
+  const chipEndsSlot = trailing.length > 0 && !figures.length && !pinnedAge
   // A handed-off session's live source is local, but it originated on a
   // messaging platform — surface that origin as a small badge so e.g. a
   // Telegram thread continued here still reads as Telegram.
