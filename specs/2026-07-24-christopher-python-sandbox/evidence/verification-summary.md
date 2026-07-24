@@ -9,7 +9,7 @@
 
 ## Linux jailed E2E
 
-The dedicated `Python sandbox` GitHub Actions job runs the complete focused file on Ubuntu after enabling unprivileged user namespaces. It covers the five cases skipped locally: 600-row reconciliation, empty network namespace, filesystem escape prevention, timeout/orphan cleanup, and distinct OOM handling. The Actions run URL and transcript are recorded after the branch push.
+The dedicated `Python sandbox` GitHub Actions job runs the complete focused file on Ubuntu after enabling unprivileged user namespaces. It covers the five cases skipped locally: 600-row reconciliation, empty network namespace, filesystem escape prevention, timeout/orphan cleanup, and distinct OOM handling. Green run: https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30132405057 (`linux-jailed-e2e.txt`), `22 passed` with all five jailed cases executed.
 
 ## Deployment boundary
 
