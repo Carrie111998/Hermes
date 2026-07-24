@@ -2476,6 +2476,24 @@ class WorkflowEngine:
                     except Exception:
                         pass  # Non-fatal: heartbeat sweep has created_at fallback
                     print(f"   ✓ {nid} → card {card_id}")
+                    # Subscribe final-layer cards immediately after dispatch
+                    # so the notification subscription exists before the card
+                    # completes (avoids race with notifier removing terminal subs).
+                    if layer_idx == len(layers) - 1 and _session_info:
+                        try:
+                            from hermes_cli import kanban_db as _skb
+                            _board = self.kanban_board
+                            with _skb.connect(board=_board) as _sconn:
+                                _skb.add_notify_sub(
+                                    _sconn, task_id=card_id,
+                                    platform=_session_info.get("platform", ""),
+                                    chat_id=_session_info.get("chat_id", ""),
+                                    thread_id=_session_info.get("thread_id"),
+                                    user_id=_session_info.get("user_id"),
+                                    notifier_profile=_session_info.get("profile"),
+                                )
+                        except Exception:
+                            pass
                 except Exception as e:
                     state.status = "failed"
                     state.error = str(e)

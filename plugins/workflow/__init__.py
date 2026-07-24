@@ -139,10 +139,71 @@ def register(ctx):
     ctx.register_hook("kanban_task_blocked", _on_kanban_task_blocked)
 
 
+def _check_final_layer_subscription(task_id: str):
+    """Subscribe final-layer cards for notification.
+
+    Runs after every card completion. Handles two cases:
+    1. Card is in a state file — check if all final-layer nodes are done
+    2. Card is NOT in any state file — match card title to final-layer nodes
+    """
+    try:
+        result = _find_state_for_card(task_id)
+        if result is not None:
+            state, _ = result
+            layers = state.get("layers", [])
+            if layers:
+                final_layer_nids = layers[-1]
+                all_final_done = all(
+                    state.get("states", {}).get(nid, {}).get("status") == "done"
+                    for nid in final_layer_nids
+                )
+                if all_final_done and state.get("session_info"):
+                    _subscribe_final_layer(state, len(layers) - 1, layers)
+        else:
+            # Card not in any state file — find state with session_info
+            # and match card title to final-layer nodes
+            import json as _j
+            from pathlib import Path as _P
+            state_dir = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state"
+            for sf in sorted(state_dir.glob("*_state.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    state2 = _j.loads(sf.read_text())
+                    if not state2.get("session_info"):
+                        continue
+                    layers2 = state2.get("layers", [])
+                    if not layers2:
+                        continue
+                    final_layer_nids = layers2[-1]
+                    from hermes_cli import kanban_db as kb
+                    board = state2.get("kanban_board")
+                    if not board:
+                        continue
+                    conn = kb.connect(board=board)
+                    try:
+                        card = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                        if card:
+                            title = card[0] if isinstance(card, tuple) else card["title"]
+                            for nid in final_layer_nids:
+                                if f"[{nid}]" in title:
+                                    _subscribe_final_layer(state2, len(layers2) - 1, layers2)
+                                    break
+                    finally:
+                        conn.close()
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
 def _on_kanban_task_completed(*, task_id: str, **kwargs):
     """Update the job log DB when a workflow node card completes."""
     _update_node_card_db(task_id, "done")
     _handle_workflow_node_event(task_id, "done")
+    # Always check final-layer subscriptions — the handler may return
+    # early if the card isn't in a state file, but the card could still
+    # be a final-layer card that needs a subscription for notification.
+    _check_final_layer_subscription(task_id)
 
 
 def _on_kanban_task_blocked(*, task_id: str, reason: str = None, **kwargs):
@@ -421,6 +482,8 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
     # Always check if final-layer cards need subscribing — the hook above
     # may return early if current_layer is already advanced past the end,
     # but the final-layer cards still need a subscription for notification.
+    # Also handles cards not in any state file (created by a supervisor
+    # that already exited).
     try:
         result2 = _find_state_for_card(task_id)
         if result2 is not None:
@@ -434,6 +497,39 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                 )
                 if all_final_done and state2.get("session_info"):
                     _subscribe_final_layer(state2, len(layers2) - 1, layers2)
+        else:
+            # Card not in any state file — find state with session_info and
+            # match card title to final-layer nodes
+            import json as _j
+            from pathlib import Path as _P
+            state_dir = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state"
+            for sf in sorted(state_dir.glob("*_state.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    state2 = _j.loads(sf.read_text())
+                    if not state2.get("session_info"):
+                        continue
+                    layers2 = state2.get("layers", [])
+                    if not layers2:
+                        continue
+                    final_layer_nids = layers2[-1]
+                    from hermes_cli import kanban_db as kb
+                    board = state2.get("kanban_board")
+                    if not board:
+                        continue
+                    conn = kb.connect(board=board)
+                    try:
+                        card = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                        if card:
+                            title = card[0] if isinstance(card, tuple) else card["title"]
+                            for nid in final_layer_nids:
+                                if f"[{nid}]" in title:
+                                    _subscribe_final_layer(state2, len(layers2) - 1, layers2)
+                                    break
+                    finally:
+                        conn.close()
+                    break
+                except Exception:
+                    continue
     except Exception:
         pass
 
@@ -474,6 +570,26 @@ def _subscribe_final_layer(state, completed_layer_idx, layers):
         card_id = ns.get("kanban_card_id")
         if card_id:
             card_ids.append(card_id)
+    # If state file doesn't have card_ids (supervisor created them but
+    # state was overwritten), query kanban DB by title pattern
+    if not card_ids:
+        try:
+            from hermes_cli import kanban_db as kb
+            board = state.get("kanban_board")
+            if board:
+                conn = kb.connect(board=board)
+                try:
+                    for nid in final_layer:
+                        rows = conn.execute(
+                            "SELECT id FROM tasks WHERE title LIKE ? AND status != 'deleted' ORDER BY created_at DESC LIMIT 1",
+                            (f"%{nid}%",)
+                        ).fetchall()
+                        if rows:
+                            card_ids.append(rows[0][0])
+                finally:
+                    conn.close()
+        except Exception:
+            pass
     if not card_ids:
         return
     # Create subscriptions
