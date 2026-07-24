@@ -1,0 +1,105 @@
+"""Ultra Studio's bounded workflow routing index."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def discover_skill_metadata() -> list[dict[str, Any]]:
+    """Add trusted routing frontmatter to Hermes' already-filtered skill index."""
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from tools.skills_tool import SKILLS_DIR, _find_all_skills, _parse_frontmatter
+
+    skills = _find_all_skills()
+    by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in skills
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    wanted = set(by_name)
+    seen: set[str] = set()
+    roots = [SKILLS_DIR] if SKILLS_DIR.exists() else []
+    roots.extend(get_external_skills_dirs())
+    for root in roots:
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                frontmatter, _ = _parse_frontmatter(
+                    skill_md.read_text(encoding="utf-8")[:4000]
+                )
+            except Exception as error:
+                logger.warning("Could not inspect Skill routing at %s: %s", skill_md, error)
+                continue
+            name = str(frontmatter.get("name") or skill_md.parent.name).strip()
+            if name not in wanted or name in seen:
+                continue
+            seen.add(name)
+            routing = frontmatter.get("routing")
+            if isinstance(routing, dict):
+                by_name[name] = {**by_name[name], "routing": routing}
+    return list(by_name.values())
+
+
+def workflow_routing(item: dict[str, Any]) -> tuple[int, list[str], list[str]]:
+    """Validate one workflow's compact positive and negative route hints."""
+    name = str(item.get("name") or "").strip()
+    routing = item.get("routing")
+    if not isinstance(routing, dict):
+        raise ValueError(f"workflow skill has no routing metadata: {name}")
+    priority = routing.get("priority")
+    triggers = routing.get("triggers")
+    negative = routing.get("negative")
+    if (
+        not isinstance(priority, int)
+        or isinstance(priority, bool)
+        or not 0 <= priority <= 100
+        or not isinstance(triggers, list)
+        or len(triggers) < 3
+        or any(not isinstance(value, str) or not value.strip() for value in triggers)
+        or not isinstance(negative, list)
+        or not negative
+        or any(not isinstance(value, str) or not value.strip() for value in negative)
+    ):
+        raise ValueError(f"workflow skill has invalid routing metadata: {name}")
+    return (
+        priority,
+        [value.strip() for value in triggers],
+        [value.strip() for value in negative],
+    )
+
+
+def format_allowed_skills(
+    allowed_names: set[str],
+    discovered: list[dict[str, Any]],
+) -> str:
+    """Render an exact, deterministic model-routing index."""
+    if not allowed_names:
+        return ""
+    available = {
+        str(item.get("name") or "").strip(): item
+        for item in discovered
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    }
+    missing = sorted(allowed_names - available.keys())
+    if missing:
+        raise ValueError("allowed skills unavailable: " + ", ".join(missing))
+
+    indexed: list[tuple[int, str, str]] = []
+    for name in allowed_names:
+        item = available[name]
+        description = " ".join(str(item.get("description") or "").split())
+        if item.get("category") == "workflow-generation":
+            priority, triggers, negative = workflow_routing(item)
+            detail = (
+                f"priority={priority}; applies={'; '.join(triggers)}; "
+                f"not={'; '.join(negative)}"
+            )
+        else:
+            priority = -1
+            detail = description
+        line = f"- {name}: {detail}" if detail else f"- {name}"
+        indexed.append((priority, name, line))
+    lines = [line for _, _, line in sorted(indexed, key=lambda row: (-row[0], row[1]))]
+    return "\n\n<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
