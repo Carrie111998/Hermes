@@ -44,6 +44,8 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolvePairTimeoutSeconds,
+  writePairEventAndExit,
 } from './bridge_helpers.js';
 
 // Terminal contract with the Python adapter: unlike generic startup failures,
@@ -106,6 +108,9 @@ try {
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
+const PAIR_TIMEOUT_SECONDS = resolvePairTimeoutSeconds(
+  getArg('pair-timeout-seconds', '600'),
+);
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -384,12 +389,20 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+let pairTimeoutTimer = null;
 
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
     console.log(JSON.stringify({ ts: Date.now(), ...event }));
   } catch {}
+}
+
+function clearPairTimeout() {
+  if (pairTimeoutTimer) {
+    clearTimeout(pairTimeoutTimer);
+    pairTimeoutTimer = null;
+  }
 }
 
 async function startSocket() {
@@ -452,6 +465,7 @@ async function startSocket() {
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      clearPairTimeout();
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -1109,7 +1123,20 @@ if (PAIR_ONLY) {
     console.log(`📁 Session: ${SESSION_DIR}`);
     console.log();
   }
+  pairTimeoutTimer = setTimeout(() => {
+    if (PAIR_JSON) {
+      writePairEventAndExit(
+        { event: 'error', error: 'pair_timeout' },
+        { code: 124 },
+      );
+      return;
+    }
+    console.error(`✗ WhatsApp pairing timed out after ${PAIR_TIMEOUT_SECONDS} seconds.`);
+    process.exit(124);
+  }, PAIR_TIMEOUT_SECONDS * 1000);
+  pairTimeoutTimer.unref?.();
   startSocket().catch((err) => {
+    clearPairTimeout();
     emitPairEvent({ event: 'error', error: err?.message || String(err) });
     if (!PAIR_JSON) {
       console.error(err);

@@ -69,7 +69,9 @@ class TestIdentityGuard:
         proc = _spawn_sleeper()
         try:
             _write_bridge_pidfile(tmp_path, proc.pid)
-            _kill_stale_bridge_by_pidfile(tmp_path)
+            recorded_start = get_process_start_time(proc.pid)
+            owners = _kill_stale_bridge_by_pidfile(tmp_path)
+            assert owners == [(proc.pid, recorded_start)]
             assert _wait_dead(proc), "the real bridge process should be killed"
             assert not (tmp_path / "bridge.pid").exists()
         finally:

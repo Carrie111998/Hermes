@@ -2802,6 +2802,7 @@ def cmd_whatsapp(args):
     )
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    replace_existing_session = False
     if (session_dir / "creds.json").exists():
         print("✓ Existing WhatsApp session found")
         try:
@@ -2811,19 +2812,49 @@ def cmd_whatsapp(args):
         except (EOFError, KeyboardInterrupt):
             response = "n"
         if response.lower() in {"y", "yes"}:
-            shutil.rmtree(session_dir, ignore_errors=True)
-            session_dir.mkdir(parents=True, exist_ok=True)
-            print("  ✓ Session cleared")
+            replace_existing_session = True
         else:
-            # Existing pairing — ensure WHATSAPP_ENABLED reflects that.
-            # (Older installs may have lost the env var; covers re-runs
-            # where the user picked "no, keep my session" but the var
-            # was never set or got removed.)
-            if (get_env_value("WHATSAPP_ENABLED") or "").lower() != "true":
-                save_env_value("WHATSAPP_ENABLED", "true")
-            print("\n✓ WhatsApp is configured and paired!")
-            print("  Start the gateway with: hermes gateway")
+            # A revoked linked-device session retains creds.json.  Never
+            # promote enabled state or claim pairing success from the file
+            # alone; the live bridge verdict is authoritative.
+            print("\n✓ Existing session retained (not re-verified).")
+            print("  Re-run and choose re-pair if the gateway reports logged out.")
             return
+
+    node = find_node_executable("node")
+    if not node:
+        print("\n✗ node not found on PATH — install Node.js first")
+        return
+
+    # Pairing is a single-owner maintenance operation. Disable WhatsApp in
+    # both persisted config stores and restart a running gateway before
+    # touching the session directory. Failed/cancelled pairing stays disabled.
+    from hermes_cli import profiles
+    from hermes_cli.whatsapp_setup import (
+        prepare_whatsapp_pairing,
+        resolve_whatsapp_gateway_profile,
+    )
+
+    try:
+        current_profile = profiles.get_active_profile_name()
+        pairing_profile = None if current_profile == "custom" else current_profile
+        gateway_profile = resolve_whatsapp_gateway_profile(pairing_profile)
+        gateway_restarted = prepare_whatsapp_pairing(
+            profile=pairing_profile,
+            gateway_profile=gateway_profile,
+            session_path=session_dir,
+        )
+    except Exception as exc:
+        print(f"\n✗ Could not prepare WhatsApp pairing: {exc}")
+        print("  WhatsApp remains disabled; fix the gateway restart and try again.")
+        return
+
+    if gateway_restarted:
+        print("✓ Gateway restarted with WhatsApp disabled for exclusive pairing")
+    if replace_existing_session:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        print("  ✓ Session cleared")
 
     # ── Step 6: QR code pairing ──────────────────────────────────────────
     print()
@@ -2838,41 +2869,73 @@ def cmd_whatsapp(args):
     print("─" * 50)
     print()
 
+    pair_result = None
     try:
-        subprocess.run(
+        pair_result = subprocess.run(
             [
-                find_node_executable("node") or "node",
+                node,
                 str(bridge_script),
                 "--pair-only",
+                "--pair-timeout-seconds",
+                "600",
                 "--session",
                 str(session_dir),
             ],
             cwd=str(bridge_dir),
             env=with_hermes_node_path(),
+            timeout=620,
         )
+    except subprocess.TimeoutExpired:
+        print("\n  ✗ Pairing timed out after 10 minutes")
     except KeyboardInterrupt:
-        pass
+        print("\n  ✗ Pairing cancelled")
 
     # ── Step 7: Post-pairing ─────────────────────────────────────────────
     print()
-    if (session_dir / "creds.json").exists():
-        # Only enable WhatsApp now that pairing actually succeeded.  If the
-        # user Ctrl+C'd at any earlier step, WHATSAPP_ENABLED stays unset
-        # and `hermes gateway` skips it cleanly instead of paying a 30s
-        # bridge timeout + queueing the platform for indefinite retries.
-        save_env_value("WHATSAPP_ENABLED", "true")
+    pairing_succeeded = (
+        pair_result is not None
+        and pair_result.returncode == 0
+        and (session_dir / "creds.json").exists()
+    )
+    if pairing_succeeded:
+        from hermes_cli.whatsapp_setup import (
+            activate_whatsapp_after_pairing,
+            restart_gateway_if_running,
+        )
+
+        try:
+            activate_whatsapp_after_pairing(restart_gateway=False)
+        except Exception as exc:
+            print(f"  ✗ WhatsApp paired, but could not be enabled: {exc}")
+            print("  The verified session was retained, but WhatsApp remains disabled.")
+            return
+        try:
+            gateway_restarted = restart_gateway_if_running(
+                profile=gateway_profile,
+            )
+        except Exception as exc:
+            gateway_restarted = False
+            print(f"  ⚠ Paired and enabled, but gateway restart failed: {exc}")
         print("✓ WhatsApp paired successfully!")
+        if gateway_restarted:
+            print("✓ Gateway restarted with the verified WhatsApp session")
         print()
         if wa_mode == "bot":
             print("  Next steps:")
-            print("    1. Start the gateway:  hermes gateway")
+            if gateway_restarted:
+                print("    1. Confirm the gateway: hermes gateway status")
+            else:
+                print("    1. Start the gateway: hermes gateway start")
             print("    2. Send a message to the bot's WhatsApp number")
             print("    3. The agent will reply automatically")
             print()
             print("  Tip: Agent responses are prefixed with '⚕ Hermes Agent'")
         else:
             print("  Next steps:")
-            print("    1. Start the gateway:  hermes gateway")
+            if gateway_restarted:
+                print("    1. Confirm the gateway: hermes gateway status")
+            else:
+                print("    1. Start the gateway: hermes gateway start")
             print("    2. Open WhatsApp → Message Yourself")
             print("    3. Type a message — the agent will reply")
             print()
@@ -2881,7 +2944,7 @@ def cmd_whatsapp(args):
         print()
         print("  Or install as a service: hermes gateway install")
     else:
-        print("⚠ Pairing may not have completed. Run 'hermes whatsapp' to try again.")
+        print("⚠ Pairing did not complete. WhatsApp remains disabled; run 'hermes whatsapp' to try again.")
 
 
 def cmd_whatsapp_cloud(args):

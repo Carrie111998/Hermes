@@ -7254,6 +7254,34 @@ def write_platform_config_field(
     save_config(config)
 
 
+def remove_platform_config_field(
+    platform_key: str,
+    field_key: str,
+    *,
+    raw: bool = False,
+) -> None:
+    """Remove one field under ``platforms.<platform_key>`` if it exists.
+
+    Empty containers created solely for the removed field are pruned so a
+    rollback can restore an originally absent platform setting exactly.
+    """
+    config = read_raw_config() if raw else load_config()
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        return
+
+    platform_config = platforms.get(platform_key)
+    if not isinstance(platform_config, dict) or field_key not in platform_config:
+        return
+
+    del platform_config[field_key]
+    if not platform_config:
+        platforms.pop(platform_key, None)
+    if not platforms:
+        config.pop("platforms", None)
+    save_config(config)
+
+
 TERMINAL_CONFIG_ENV_MAP = {
     "backend": "TERMINAL_ENV",
     "modal_mode": "TERMINAL_MODAL_MODE",

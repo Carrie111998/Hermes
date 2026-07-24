@@ -1083,6 +1083,7 @@ class WhatsAppOnboardingStart(BaseModel):
     mode: Optional[str] = "bot"
     allowed_users: Optional[str] = ""
     profile: Optional[str] = None
+    replace_existing: bool = False
 
 
 class WhatsAppOnboardingApply(BaseModel):
@@ -3410,6 +3411,7 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 # report liveness and exit code without shelling out to ``ps``.
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
 _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
+_GATEWAY_RESTART_LOCK = threading.Lock()
 
 # ``name`` → completed synthetic action result for actions the server handled
 # without spawning a subprocess (for example, unsupported Docker updates).
@@ -3445,7 +3447,13 @@ def _dashboard_spawn_executable() -> str:
     return exe
 
 
-def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+def _spawn_hermes_action(
+    subcommand: List[str],
+    name: str,
+    *,
+    scrub_env_prefixes: Tuple[str, ...] = (),
+    preserve_env_prefixes: Tuple[str, ...] = (),
+) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
     Uses the running interpreter's ``hermes_cli.main`` module so the action
@@ -3468,6 +3476,12 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     # drops it (gateway/run.py); mirror that here (#52470).
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
+    for key in list(action_env):
+        if (
+            any(key.startswith(prefix) for prefix in scrub_env_prefixes)
+            and not any(key.startswith(prefix) for prefix in preserve_env_prefixes)
+        ):
+            action_env.pop(key, None)
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
@@ -3539,8 +3553,39 @@ def _tail_lines(path: Path, n: int) -> List[str]:
     return lines[-n:]
 
 
-def _gateway_subcommand(profile: Optional[str], verb: str) -> List[str]:
-    return _profile_cli_args(profile) + ["gateway", verb]
+def _gateway_subcommand(
+    profile: Optional[str],
+    verb: str,
+    *,
+    explicit_default: bool = False,
+) -> List[str]:
+    requested = (profile or "").strip()
+    profile_args = (
+        ["-p", "default"]
+        if explicit_default and requested.lower() in {"", "current", "default"}
+        else _profile_cli_args(profile)
+    )
+    return profile_args + ["gateway", verb]
+
+
+def _gateway_restart_target_home(profile: Optional[str]) -> Path:
+    """Resolve the semantic HERMES_HOME owned by a restart request."""
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        from hermes_constants import get_process_hermes_home
+
+        return get_process_hermes_home().expanduser().resolve()
+
+    from hermes_cli import profiles as profiles_mod
+
+    return profiles_mod.get_profile_dir(requested).expanduser().resolve()
+
+
+def _gateway_restart_target_from_command(command: Tuple[str, ...]) -> Path:
+    """Recover a recorded restart's semantic target from its CLI argv."""
+    if len(command) >= 2 and command[0] in {"-p", "--profile"}:
+        return _gateway_restart_target_home(command[1])
+    return _gateway_restart_target_home(None)
 
 
 def _gateway_display_command(profile: Optional[str], verb: str) -> str:
@@ -3603,25 +3648,82 @@ def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> Non
             )
 
 
-def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Popen, bool]:
-    """Spawn ``hermes gateway restart``, reusing an in-flight restart.
+def _spawn_gateway_restart(
+    profile: Optional[str] = None,
+    *,
+    explicit_default: bool = False,
+    scrub_whatsapp_env: bool = False,
+    require_fresh: bool = False,
+    fresh_wait_timeout: float = 120.0,
+) -> Tuple[subprocess.Popen, bool]:
+    """Spawn ``hermes gateway restart``, normally reusing an in-flight restart.
 
     Multiple dashboard paths can request a restart in quick succession
     (restart button double-click, or a stale cached frontend firing its own
     restart after the server already auto-restarted post-onboarding). Two
     concurrent ``hermes gateway restart`` children race each other on the
-    manual kill-and-start path, so reuse the live one instead.
+    manual kill-and-start path, so reuse the live one instead. When
+    ``require_fresh`` is true, wait for a compatible in-flight restart to
+    finish and then start a new one. This is required after a config activation:
+    an older child may already have read the pre-activation configuration.
 
     Returns ``(proc, reused)``.
     """
-    subcommand = _gateway_subcommand(profile, "restart")
-    existing = _ACTION_PROCS.get("gateway-restart")
-    if existing is not None and existing.poll() is None:
-        existing_command = _ACTION_COMMANDS.get("gateway-restart")
-        if existing_command is None or existing_command == tuple(subcommand):
-            return existing, True
-        raise RuntimeError("gateway restart already in progress for another profile")
-    return _spawn_hermes_action(subcommand, "gateway-restart"), False
+    with _GATEWAY_RESTART_LOCK:
+        subcommand = _gateway_subcommand(
+            profile,
+            "restart",
+            explicit_default=explicit_default,
+        )
+        existing = _ACTION_PROCS.get("gateway-restart")
+        if existing is not None and existing.poll() is None:
+            existing_command = _ACTION_COMMANDS.get("gateway-restart")
+            same_target = (
+                existing_command is not None
+                and _gateway_restart_target_from_command(existing_command)
+                == _gateway_restart_target_home(profile)
+            )
+            compatible = (
+                existing_command is None
+                or existing_command == tuple(subcommand)
+                or same_target
+            )
+            if not compatible:
+                raise RuntimeError(
+                    "gateway restart already in progress for another profile"
+                )
+            if not require_fresh:
+                return existing, True
+
+            deadline = time.monotonic() + max(0.0, fresh_wait_timeout)
+            while existing.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "the pre-activation gateway restart is still in progress; "
+                        "a fresh post-activation restart could not be started"
+                    )
+                time.sleep(min(0.1, remaining))
+
+        spawn_kwargs: Dict[str, Any] = {}
+        if scrub_whatsapp_env:
+            from hermes_cli.whatsapp_setup import (
+                BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES,
+                BAILEYS_WHATSAPP_ENV_PREFIXES,
+            )
+
+            spawn_kwargs["scrub_env_prefixes"] = BAILEYS_WHATSAPP_ENV_PREFIXES
+            spawn_kwargs["preserve_env_prefixes"] = (
+                BAILEYS_WHATSAPP_ENV_EXCLUDED_PREFIXES
+            )
+        return (
+            _spawn_hermes_action(
+                subcommand,
+                "gateway-restart",
+                **spawn_kwargs,
+            ),
+            False,
+        )
 
 
 def _restart_gateway_after_webhook_enable(profile: Optional[str] = None) -> dict[str, Any]:
@@ -8065,6 +8167,7 @@ def _write_platform_enabled(platform_id: str, enabled: bool) -> None:
 
 
 _WHATSAPP_ONBOARDING_TTL_SECONDS = 600
+_WHATSAPP_PAIRING_TIMEOUT_SECONDS = _WHATSAPP_ONBOARDING_TTL_SECONDS - 30
 _WHATSAPP_ONBOARDING_TERMINAL_STATUSES = {"connected", "error", "expired", "cancelled"}
 
 
@@ -8077,6 +8180,7 @@ class _WhatsAppOnboardingSession:
     expires_at: str
     expires_at_ts: float
     profile: str | None = None
+    gateway_profile: str | None = None
     status: str = "starting"
     qr_payload: str | None = None
     account_id: str | None = None
@@ -8202,9 +8306,10 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
         )
 
 
-def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
+def _ensure_whatsapp_pairing_ready() -> None:
+    """Prove bridge, Node, and dependencies before session credentials move."""
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from hermes_constants import find_node_executable
 
     bridge_dir = resolve_whatsapp_bridge_dir()
     bridge_script = bridge_dir / "bridge.js"
@@ -8213,14 +8318,27 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             status_code=500,
             detail=f"WhatsApp bridge script was not found at {bridge_script}.",
         )
-    node = find_node_executable("node")
-    if not node:
+    if not find_node_executable("node"):
         raise HTTPException(
             status_code=500,
             detail="Node.js was not found. WhatsApp setup needs Node.js.",
         )
-
     _ensure_whatsapp_bridge_dependencies(bridge_dir)
+
+
+def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
+    from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    _ensure_whatsapp_pairing_ready()
+    bridge_dir = resolve_whatsapp_bridge_dir()
+    bridge_script = bridge_dir / "bridge.js"
+    node = find_node_executable("node")
+    if not node:
+        raise HTTPException(
+            status_code=500,
+            detail="Node.js became unavailable before WhatsApp setup could start.",
+        )
     session_path.mkdir(parents=True, exist_ok=True)
 
     env = with_hermes_node_path()
@@ -8232,6 +8350,8 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             str(bridge_script),
             "--pair-only",
             "--pair-json",
+            "--pair-timeout-seconds",
+            str(_WHATSAPP_PAIRING_TIMEOUT_SECONDS),
             "--session",
             str(session_path),
         ],
@@ -8293,7 +8413,10 @@ def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
                             record.account_id = account_id or None
                             record.account_name = account_name or None
                             record.account_phone = _whatsapp_phone_from_identifier(account_id)
-                        record.status = "connected"
+                        # The bridge keeps running briefly after this event to
+                        # flush credentials. Do not expose an applyable state
+                        # until proc.wait() below proves that pair-only exited.
+                        record.status = "finalizing"
                         record.error = None
                     elif event == "error":
                         record.status = "error"
@@ -8313,7 +8436,18 @@ def _watch_whatsapp_pairing(pairing_id: str, proc: subprocess.Popen) -> None:
         record = _whatsapp_onboarding_sessions.get(pairing_id)
         if not record or record.proc is not proc:
             return
-        if record.status in {"connected", "cancelled", "expired"}:
+        if record.status == "finalizing":
+            if returncode == 0:
+                record.status = "connected"
+                record.error = None
+            else:
+                record.status = "error"
+                record.error = (
+                    f"WhatsApp pairing process exited with code {returncode} "
+                    "while finalizing credentials."
+                )
+            return
+        if record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             return
         record.status = "error"
         record.error = (
@@ -8328,7 +8462,6 @@ def _run_whatsapp_pairing(pairing_id: str, session_path: Path, mode: str) -> Non
         record = _whatsapp_onboarding_sessions.get(pairing_id)
         if not record or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             return
-        record.status = "installing"
 
     try:
         proc = _spawn_whatsapp_pairing_process(session_path, mode)
@@ -8351,17 +8484,109 @@ def _run_whatsapp_pairing(pairing_id: str, session_path: Path, mode: str) -> Non
     _watch_whatsapp_pairing(pairing_id, proc)
 
 
+def _prepare_and_run_whatsapp_pairing(
+    pairing_id: str,
+    session_path: Path,
+    mode: str,
+    profile: Optional[str],
+) -> None:
+    """Quiesce the selected gateway, then launch the pollable pair-only flow."""
+    with _whatsapp_onboarding_lock:
+        record = _whatsapp_onboarding_sessions.get(pairing_id)
+        if (
+            not record
+            or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+        ):
+            return
+        record.status = "installing"
+
+    try:
+        _ensure_whatsapp_pairing_ready()
+    except Exception as exc:
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                record
+                and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                record.status = "error"
+                record.error = f"Could not prepare the WhatsApp bridge: {exc}"
+        return
+
+    try:
+        from hermes_cli.whatsapp_setup import (
+            prepare_whatsapp_pairing,
+            resolve_whatsapp_gateway_profile,
+        )
+
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                not record
+                or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                return
+            record.status = "preparing"
+        gateway_profile = resolve_whatsapp_gateway_profile(profile)
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                not record
+                or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                return
+            record.gateway_profile = gateway_profile
+        with _config_profile_scope(profile):
+            prepare_whatsapp_pairing(
+                profile=profile,
+                gateway_profile=gateway_profile,
+                session_path=session_path,
+            )
+            with _whatsapp_onboarding_lock:
+                record = _whatsapp_onboarding_sessions.get(pairing_id)
+                if (
+                    not record
+                    or record.status in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+                ):
+                    return
+                # The final active-session check and credential replacement are
+                # one cancellation-critical section. A cancel that wins this
+                # lock preserves the existing credentials; it cannot interleave
+                # after the check and before deletion.
+                if session_path.exists() or session_path.is_symlink():
+                    shutil.rmtree(session_path)
+                if session_path.exists() or session_path.is_symlink():
+                    raise RuntimeError(
+                        "Existing WhatsApp session credentials could not be removed"
+                    )
+                session_path.mkdir(parents=True, exist_ok=False)
+    except Exception as exc:
+        with _whatsapp_onboarding_lock:
+            record = _whatsapp_onboarding_sessions.get(pairing_id)
+            if (
+                record
+                and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
+            ):
+                record.status = "error"
+                record.error = f"Could not quiesce WhatsApp before pairing: {exc}"
+        return
+
+    _run_whatsapp_pairing(pairing_id, session_path, mode)
+
+
 def _prune_whatsapp_onboarding_sessions() -> None:
     now = time.time()
     remove_ids: list[str] = []
     for pairing_id, record in _whatsapp_onboarding_sessions.items():
-        if (
-            record.proc is not None
-            and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES
-            and record.proc.poll() is not None
-        ):
-            record.status = "error"
-            record.error = "WhatsApp pairing process exited before pairing completed."
+        if record.proc is not None and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+            returncode = record.proc.poll()
+            if returncode is not None:
+                if record.status == "finalizing" and returncode == 0:
+                    record.status = "connected"
+                    record.error = None
+                else:
+                    record.status = "error"
+                    record.error = "WhatsApp pairing process exited before pairing completed."
         if record.expires_at_ts <= now and record.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
             _terminate_whatsapp_pairing(record.proc)
             record.status = "expired"
@@ -8374,7 +8599,10 @@ def _prune_whatsapp_onboarding_sessions() -> None:
 
 def _supersede_whatsapp_onboarding_sessions(session_path: Path) -> None:
     for existing in _whatsapp_onboarding_sessions.values():
-        if existing.session_path == str(session_path) and existing.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+        if (
+            existing.session_path == str(session_path)
+            and existing.status not in {"error", "expired", "cancelled"}
+        ):
             existing.status = "cancelled"
             existing.error = "Superseded by a newer WhatsApp setup session."
             _terminate_whatsapp_pairing(existing.proc)
@@ -8397,7 +8625,19 @@ def _whatsapp_onboarding_payload(pairing_id: str, record: _WhatsAppOnboardingSes
 
 def _restart_gateway_after_whatsapp_onboarding(profile: Optional[str] = None) -> dict[str, Any]:
     try:
-        proc, reused = _spawn_gateway_restart(profile)
+        proc, reused = _spawn_gateway_restart(
+            profile,
+            explicit_default=True,
+            # save_env_value updates the dashboard process environment as well
+            # as the selected profile's .env. A restart may target a different
+            # multiplex owner, so let that child load its own profile-scoped
+            # WhatsApp values instead of inheriting the just-edited profile.
+            scrub_whatsapp_env=True,
+            # An earlier restart may already have read disabled WhatsApp state.
+            # Applying verified credentials therefore requires a new child
+            # that starts only after activation was persisted.
+            require_fresh=True,
+        )
     except Exception as exc:
         _log.exception("Failed to auto-restart gateway after WhatsApp onboarding")
         return {
@@ -8428,7 +8668,7 @@ async def start_whatsapp_onboarding(
         session_path = _whatsapp_session_path()
         expires_at_ts = time.time() + _WHATSAPP_ONBOARDING_TTL_SECONDS
         expires_at = _utc_iso_from_ts(expires_at_ts)
-        if (session_path / "creds.json").exists():
+        if (session_path / "creds.json").exists() and not body.replace_existing:
             pairing_id = secrets.token_urlsafe(16)
             account_id, account_name, account_phone = _whatsapp_linked_account_from_session(session_path)
             record = _WhatsAppOnboardingSession(
@@ -8450,6 +8690,13 @@ async def start_whatsapp_onboarding(
                 _whatsapp_onboarding_sessions[pairing_id] = record
             return _whatsapp_onboarding_payload(pairing_id, record)
 
+        # Stop any older pair-only process before quiescing the gateway or
+        # deleting credentials. Two pairers are just as unsafe as a pairer and
+        # gateway sharing the Baileys session.
+        with _whatsapp_onboarding_lock:
+            _prune_whatsapp_onboarding_sessions()
+            _supersede_whatsapp_onboarding_sessions(session_path)
+
     pairing_id = secrets.token_urlsafe(16)
     record = _WhatsAppOnboardingSession(
         proc=None,
@@ -8467,8 +8714,8 @@ async def start_whatsapp_onboarding(
         _whatsapp_onboarding_sessions[pairing_id] = record
 
     threading.Thread(
-        target=_run_whatsapp_pairing,
-        args=(pairing_id, session_path, mode),
+        target=_prepare_and_run_whatsapp_pairing,
+        args=(pairing_id, session_path, mode, effective_profile),
         daemon=True,
     ).start()
 
@@ -8504,6 +8751,11 @@ async def apply_whatsapp_onboarding(
             )
         if record.status != "connected":
             raise HTTPException(status_code=409, detail="WhatsApp setup is not connected yet.")
+        if record.proc is not None and record.proc.poll() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="WhatsApp setup is still finishing its credential flush.",
+            )
         mode = _normalize_whatsapp_onboarding_mode(body.mode or record.mode)
         allowed_users = _normalize_whatsapp_allowed_users(
             record.allowed_users if body.allowed_users is None else body.allowed_users
@@ -8511,8 +8763,19 @@ async def apply_whatsapp_onboarding(
         if mode == "self-chat" and not allowed_users:
             allowed_users = record.account_phone or record.account_id or ""
         record_profile = record.profile
+        gateway_profile = record.gateway_profile
 
     effective_profile = body.profile or profile or record_profile
+    requested_profile = (effective_profile or "").strip()
+    if requested_profile and requested_profile.lower() != "current":
+        # Ownership resolution probes gateway pid/state paths. Validate the
+        # profile before any of those paths are derived so an apply-body
+        # override cannot escape the profiles root.
+        _resolve_profile_dir(requested_profile)
+    if gateway_profile is None or effective_profile != record_profile:
+        from hermes_cli.whatsapp_setup import resolve_whatsapp_gateway_profile
+
+        gateway_profile = resolve_whatsapp_gateway_profile(effective_profile)
     try:
         with _config_profile_scope(effective_profile):
             save_env_value("WHATSAPP_MODE", mode)
@@ -8521,8 +8784,9 @@ async def apply_whatsapp_onboarding(
                 save_env_value("WHATSAPP_ALLOWED_USERS", allowed_users)
             # Blank means "keep the existing allowlist"; explicit clearing
             # still lives in the normal config editor where the field is visible.
-            save_env_value("WHATSAPP_ENABLED", "true")
-            _write_platform_enabled("whatsapp", True)
+            from hermes_cli.whatsapp_setup import persist_whatsapp_enabled
+
+            persist_whatsapp_enabled(True)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -8537,7 +8801,7 @@ async def apply_whatsapp_onboarding(
     with _whatsapp_onboarding_lock:
         _whatsapp_onboarding_sessions.pop(pairing_id, None)
 
-    restart_result = _restart_gateway_after_whatsapp_onboarding(effective_profile)
+    restart_result = _restart_gateway_after_whatsapp_onboarding(gateway_profile)
     return {
         "ok": True,
         "platform": "whatsapp",

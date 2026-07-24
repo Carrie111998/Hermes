@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 
@@ -50,6 +51,28 @@ def test_whatsapp_pairing_watcher_records_qr_and_connected():
     assert record.account_name == "Hermes Bot"
     assert record.account_phone == "15551234567"
     assert record.error is None
+    ws._whatsapp_onboarding_sessions.clear()
+
+
+def test_whatsapp_pairing_watcher_preserves_structured_timeout_error():
+    from hermes_cli import web_server as ws
+
+    proc = _FakeProc(['{"event":"error","error":"pair_timeout"}\n'], returncode=124)
+    record = ws._WhatsAppOnboardingSession(
+        proc=proc,
+        mode="bot",
+        allowed_users="",
+        session_path="/tmp/session",
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    ws._watch_whatsapp_pairing("pairing", proc)
+
+    assert record.status == "error"
+    assert record.error == "pair_timeout"
     ws._whatsapp_onboarding_sessions.clear()
 
 
@@ -126,19 +149,32 @@ def test_messaging_payload_includes_safe_whatsapp_setup(monkeypatch):
 
 
 def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
+    from contextlib import contextmanager
+
     from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
 
     saved = {}
     removed = []
     enabled = []
+    restarted = []
 
+    @contextmanager
+    def profile_scope(_profile):
+        yield
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_resolve_profile_dir", lambda _profile: None)
     monkeypatch.setattr(ws, "save_env_value", lambda key, value: saved.setdefault(key, value))
     monkeypatch.setattr(ws, "remove_env_value", lambda key: removed.append(key))
-    monkeypatch.setattr(ws, "_write_platform_enabled", lambda platform, value: enabled.append((platform, value)))
+    monkeypatch.setattr(whatsapp_setup, "persist_whatsapp_enabled", lambda value: enabled.append(value))
     monkeypatch.setattr(
         ws,
         "_restart_gateway_after_whatsapp_onboarding",
-        lambda profile=None: {"restart_started": True, "restart_pid": 12345},
+        lambda profile=None: restarted.append(profile) or {
+            "restart_started": True,
+            "restart_pid": 12345,
+        },
     )
 
     record = ws._WhatsAppOnboardingSession(
@@ -148,6 +184,8 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
         session_path="/tmp/session",
         expires_at="2099-01-01T00:00:00Z",
         expires_at_ts=time.time() + 600,
+        profile="work",
+        gateway_profile="default",
         status="connected",
     )
     ws._whatsapp_onboarding_sessions.clear()
@@ -163,21 +201,281 @@ def test_apply_whatsapp_onboarding_saves_pairing_policy(monkeypatch):
     assert result["ok"] is True
     assert saved["WHATSAPP_MODE"] == "bot"
     assert saved["WHATSAPP_DM_POLICY"] == "pairing"
-    assert saved["WHATSAPP_ENABLED"] == "true"
+    assert "WHATSAPP_ENABLED" not in saved
     assert "WHATSAPP_ALLOWED_USERS" not in removed
-    assert enabled == [("whatsapp", True)]
+    assert enabled == [True]
+    assert restarted == ["default"]
     assert "pairing" not in ws._whatsapp_onboarding_sessions
+
+
+def test_apply_whatsapp_onboarding_validates_profile_before_gateway_probe(monkeypatch):
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path="/tmp/session",
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+        profile="work",
+        status="connected",
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+    probes = []
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda profile: probes.append(profile) or "default",
+    )
+
+    try:
+        asyncio.run(
+            ws.apply_whatsapp_onboarding(
+                "pairing",
+                ws.WhatsAppOnboardingApply(profile="../escape"),
+            )
+        )
+    except ws.HTTPException as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("path-like profile must be rejected")
+
+    assert probes == []
+    assert "pairing" in ws._whatsapp_onboarding_sessions
+
+
+def test_whatsapp_restart_forces_explicit_default_owner(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    captured = {}
+
+    class Proc:
+        pid = 12345
+
+    def spawn(
+        profile=None,
+        *,
+        explicit_default=False,
+        scrub_whatsapp_env=False,
+        require_fresh=False,
+    ):
+        captured["profile"] = profile
+        captured["explicit_default"] = explicit_default
+        captured["scrub_whatsapp_env"] = scrub_whatsapp_env
+        captured["require_fresh"] = require_fresh
+        return Proc(), False
+
+    monkeypatch.setattr(ws, "_spawn_gateway_restart", spawn)
+
+    result = ws._restart_gateway_after_whatsapp_onboarding("default")
+
+    assert result["restart_started"] is True
+    assert captured == {
+        "profile": "default",
+        "explicit_default": True,
+        "scrub_whatsapp_env": True,
+        "require_fresh": True,
+    }
+    assert ws._gateway_subcommand(
+        "default",
+        "restart",
+        explicit_default=True,
+    ) == ["-p", "default", "gateway", "restart"]
+
+
+def test_whatsapp_restart_forces_implicit_default_owner(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    captured = {}
+
+    class Proc:
+        pid = 12345
+
+    def spawn(
+        profile=None,
+        *,
+        explicit_default=False,
+        scrub_whatsapp_env=False,
+        require_fresh=False,
+    ):
+        captured["profile"] = profile
+        captured["explicit_default"] = explicit_default
+        captured["scrub_whatsapp_env"] = scrub_whatsapp_env
+        captured["require_fresh"] = require_fresh
+        return Proc(), False
+
+    monkeypatch.setattr(ws, "_spawn_gateway_restart", spawn)
+
+    result = ws._restart_gateway_after_whatsapp_onboarding(None)
+
+    assert result["restart_started"] is True
+    assert captured == {
+        "profile": None,
+        "explicit_default": True,
+        "scrub_whatsapp_env": True,
+        "require_fresh": True,
+    }
+    assert ws._gateway_subcommand(
+        None,
+        "restart",
+        explicit_default=True,
+    ) == ["-p", "default", "gateway", "restart"]
+
+
+def test_whatsapp_restart_scrubs_profile_scoped_whatsapp_env(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+
+    captured = {}
+
+    class Proc:
+        pid = 12345
+
+        def poll(self):
+            return 0
+
+    def popen(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return Proc()
+
+    ws._ACTION_PROCS.clear()
+    ws._ACTION_COMMANDS.clear()
+    monkeypatch.setattr(ws, "_ACTION_LOG_DIR", tmp_path)
+    monkeypatch.setattr(ws.subprocess, "Popen", popen)
+    monkeypatch.setenv("WHATSAPP_ENABLED", "true")
+    monkeypatch.setenv("WHATSAPP_MODE", "self-chat")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "profile-user")
+    monkeypatch.setenv("WHATSAPP_CLOUD_ACCESS_TOKEN", "cloud-token")
+
+    try:
+        result = ws._restart_gateway_after_whatsapp_onboarding("default")
+    finally:
+        ws._ACTION_PROCS.clear()
+        ws._ACTION_COMMANDS.clear()
+
+    assert result["restart_started"] is True
+    assert captured["args"][-4:] == [
+        "-p",
+        "default",
+        "gateway",
+        "restart",
+    ]
+    assert "WHATSAPP_ENABLED" not in captured["env"]
+    assert "WHATSAPP_MODE" not in captured["env"]
+    assert "WHATSAPP_ALLOWED_USERS" not in captured["env"]
+    assert captured["env"]["WHATSAPP_CLOUD_ACCESS_TOKEN"] == "cloud-token"
+
+
+def test_whatsapp_restart_reuses_equivalent_bare_default_restart(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+
+    custom_home = tmp_path / "custom-hermes"
+    custom_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+
+    class Proc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    existing = Proc()
+    ws._ACTION_PROCS.clear()
+    ws._ACTION_COMMANDS.clear()
+    ws._ACTION_PROCS["gateway-restart"] = existing
+    ws._ACTION_COMMANDS["gateway-restart"] = ("gateway", "restart")
+    monkeypatch.setattr(
+        ws,
+        "_spawn_hermes_action",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("equivalent default restart must be reused")
+        ),
+    )
+
+    try:
+        proc, reused = ws._spawn_gateway_restart(
+            "default",
+            explicit_default=True,
+        )
+    finally:
+        ws._ACTION_PROCS.clear()
+        ws._ACTION_COMMANDS.clear()
+
+    assert proc is existing
+    assert reused is True
+
+
+def test_whatsapp_apply_waits_for_inflight_restart_then_starts_fresh(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+
+    custom_home = tmp_path / "custom-hermes"
+    custom_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(custom_home))
+    spawned = []
+
+    class ExistingProc:
+        pid = 11111
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+
+    class FreshProc:
+        pid = 22222
+
+        def poll(self):
+            return None
+
+    existing = ExistingProc()
+    fresh = FreshProc()
+    ws._ACTION_PROCS.clear()
+    ws._ACTION_COMMANDS.clear()
+    ws._ACTION_PROCS["gateway-restart"] = existing
+    ws._ACTION_COMMANDS["gateway-restart"] = ("gateway", "restart")
+    monkeypatch.setattr(
+        ws,
+        "_spawn_hermes_action",
+        lambda subcommand, name, **kwargs: (
+            spawned.append((subcommand, name, kwargs)) or fresh
+        ),
+    )
+
+    try:
+        result = ws._restart_gateway_after_whatsapp_onboarding("default")
+    finally:
+        ws._ACTION_PROCS.clear()
+        ws._ACTION_COMMANDS.clear()
+
+    assert result["restart_started"] is True
+    assert result["restart_pid"] == 22222
+    assert existing.polls >= 2
+    assert len(spawned) == 1
+    assert spawned[0][0] == ["-p", "default", "gateway", "restart"]
 
 
 def test_apply_whatsapp_onboarding_self_chat_defaults_to_linked_account(monkeypatch):
     from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
 
     saved = {}
     removed = []
 
     monkeypatch.setattr(ws, "save_env_value", lambda key, value: saved.setdefault(key, value))
     monkeypatch.setattr(ws, "remove_env_value", lambda key: removed.append(key))
-    monkeypatch.setattr(ws, "_write_platform_enabled", lambda platform, value: None)
+    monkeypatch.setattr(whatsapp_setup, "persist_whatsapp_enabled", lambda value: None)
     monkeypatch.setattr(
         ws,
         "_restart_gateway_after_whatsapp_onboarding",
@@ -210,6 +508,52 @@ def test_apply_whatsapp_onboarding_self_chat_defaults_to_linked_account(monkeypa
     assert saved["WHATSAPP_ALLOWED_USERS"] == "15551234567"
     assert "WHATSAPP_ALLOWED_USERS" not in removed
     assert "pairing" not in ws._whatsapp_onboarding_sessions
+
+
+def test_apply_whatsapp_onboarding_waits_for_pair_only_exit(monkeypatch):
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    writes = []
+    proc = _FakeProc()
+    record = ws._WhatsAppOnboardingSession(
+        proc=proc,
+        mode="bot",
+        allowed_users="",
+        session_path="/tmp/session",
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+        gateway_profile="default",
+        status="connected",
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+    monkeypatch.setattr(
+        ws,
+        "save_env_value",
+        lambda key, value: writes.append((key, value)),
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "persist_whatsapp_enabled",
+        lambda value: writes.append(("enabled", value)),
+    )
+
+    try:
+        asyncio.run(
+            ws.apply_whatsapp_onboarding(
+                "pairing",
+                ws.WhatsAppOnboardingApply(mode="bot", allowed_users=""),
+            )
+        )
+    except ws.HTTPException as exc:
+        assert exc.status_code == 409
+        assert "still finishing" in str(exc.detail)
+    else:
+        raise AssertionError("apply must wait for pair-only process exit")
+
+    assert writes == []
+    assert "pairing" in ws._whatsapp_onboarding_sessions
 
 
 def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeypatch, tmp_path):
@@ -254,6 +598,115 @@ def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeyp
     ws._whatsapp_onboarding_sessions.clear()
 
 
+def test_start_whatsapp_onboarding_replaces_existing_session_exclusively(monkeypatch, tmp_path):
+    from hermes_cli import web_server as ws
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    creds = session_dir / "creds.json"
+    creds.write_text('{"revoked":true}', encoding="utf-8")
+    captured = {}
+    old_proc = _FakeProc(returncode=1)
+    old_record = ws._WhatsAppOnboardingSession(
+        proc=old_proc,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            captured["target"] = target
+            captured["args"] = args
+            captured["daemon"] = daemon
+
+        def start(self):
+            captured["started"] = True
+
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["old"] = old_record
+    monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: session_dir)
+    monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda size: "replacement")
+    monkeypatch.setattr(ws.threading, "Thread", FakeThread)
+
+    result = asyncio.run(
+        ws.start_whatsapp_onboarding(
+            ws.WhatsAppOnboardingStart(
+                mode="bot",
+                allowed_users="",
+                replace_existing=True,
+            )
+        )
+    )
+
+    assert old_record.status == "cancelled"
+    assert old_proc.terminated is True
+    assert creds.exists()
+    assert result["pairing_id"] == "replacement"
+    assert result["status"] == "starting"
+    assert captured["target"] is ws._prepare_and_run_whatsapp_pairing
+    assert captured["args"] == ("replacement", session_dir, "bot", None)
+    assert captured["started"] is True
+    ws._whatsapp_onboarding_sessions.clear()
+
+
+def test_replacement_invalidates_stale_connected_onboarding_record(monkeypatch, tmp_path):
+    from hermes_cli import web_server as ws
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "creds.json").write_text('{"old":true}', encoding="utf-8")
+    stale = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+        status="connected",
+    )
+
+    class FakeThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["stale-connected"] = stale
+    monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: session_dir)
+    monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda size: "replacement")
+    monkeypatch.setattr(ws.threading, "Thread", FakeThread)
+
+    asyncio.run(
+        ws.start_whatsapp_onboarding(
+            ws.WhatsAppOnboardingStart(
+                mode="bot",
+                allowed_users="",
+                replace_existing=True,
+            )
+        )
+    )
+
+    assert stale.status == "cancelled"
+    try:
+        asyncio.run(
+            ws.apply_whatsapp_onboarding(
+                "stale-connected",
+                ws.WhatsAppOnboardingApply(mode="bot", allowed_users=""),
+            )
+        )
+    except ws.HTTPException as exc:
+        assert exc.status_code == 409
+        assert "not connected" in str(exc.detail)
+    else:
+        raise AssertionError("superseded connected records must not remain applyable")
+    ws._whatsapp_onboarding_sessions.clear()
+
+
 def test_start_whatsapp_onboarding_returns_before_bridge_spawn(monkeypatch, tmp_path):
     from hermes_cli import web_server as ws
 
@@ -282,8 +735,8 @@ def test_start_whatsapp_onboarding_returns_before_bridge_spawn(monkeypatch, tmp_
     assert result["pairing_id"] == "pairing-start"
     assert result["status"] == "starting"
     assert result["qr_payload"] is None
-    assert captured["target"] is ws._run_whatsapp_pairing
-    assert captured["args"] == ("pairing-start", tmp_path / "session", "bot")
+    assert captured["target"] is ws._prepare_and_run_whatsapp_pairing
+    assert captured["args"] == ("pairing-start", tmp_path / "session", "bot", None)
     assert captured["daemon"] is True
     assert captured["started"] is True
     assert ws._whatsapp_onboarding_sessions["pairing-start"].proc is None
@@ -330,6 +783,271 @@ def test_start_whatsapp_onboarding_honors_query_profile(monkeypatch, tmp_path):
     ws._whatsapp_onboarding_sessions.clear()
 
 
+def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
+    monkeypatch,
+    tmp_path,
+):
+    from contextlib import contextmanager
+
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    creds = session_dir / "creds.json"
+    creds.write_text('{"old":true}', encoding="utf-8")
+    events = []
+
+    @contextmanager
+    def profile_scope(profile):
+        events.append(("profile", profile))
+        yield
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: events.append(("ready", creds.exists())))
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda profile: "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **kwargs: events.append(("quiesced", kwargs, creds.exists())),
+    )
+    monkeypatch.setattr(
+        ws,
+        "_run_whatsapp_pairing",
+        lambda pairing_id, path, mode: events.append(
+            ("paired", pairing_id, path, mode, creds.exists())
+        ),
+    )
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    ws._prepare_and_run_whatsapp_pairing(
+        "pairing",
+        session_dir,
+        "bot",
+        "work",
+    )
+
+    assert events == [
+        ("ready", True),
+        ("profile", "work"),
+        (
+            "quiesced",
+            {
+                "profile": "work",
+                "gateway_profile": "default",
+                "session_path": session_dir,
+            },
+            True,
+        ),
+        ("paired", "pairing", session_dir, "bot", False),
+    ]
+    assert record.status == "preparing"
+    assert record.gateway_profile == "default"
+    ws._whatsapp_onboarding_sessions.clear()
+
+
+def test_prepare_pairing_fails_closed_when_stale_credentials_survive_removal(
+    monkeypatch,
+    tmp_path,
+):
+    from contextlib import contextmanager
+
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    creds = session_dir / "creds.json"
+    creds.write_text('{"still":"valid"}', encoding="utf-8")
+    paired = []
+
+    @contextmanager
+    def profile_scope(_profile):
+        yield
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: None)
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda _profile: "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(ws.shutil, "rmtree", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        ws,
+        "_run_whatsapp_pairing",
+        lambda *_args: paired.append(True),
+    )
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    ws._prepare_and_run_whatsapp_pairing(
+        "pairing",
+        session_dir,
+        "bot",
+        "work",
+    )
+
+    assert paired == []
+    assert creds.exists()
+    assert record.status == "error"
+    assert "credentials" in (record.error or "").lower()
+    ws._whatsapp_onboarding_sessions.clear()
+
+
+def test_session_replacement_is_atomic_with_whatsapp_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    from contextlib import contextmanager
+
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "creds.json").write_text('{"still":"valid"}', encoding="utf-8")
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
+    cancel_started = threading.Event()
+    original_rmtree = ws.shutil.rmtree
+
+    @contextmanager
+    def profile_scope(_profile):
+        yield
+
+    def blocking_rmtree(path):
+        delete_entered.set()
+        assert allow_delete.wait(timeout=2)
+        original_rmtree(path)
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: None)
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda _profile: "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(ws.shutil, "rmtree", blocking_rmtree)
+    monkeypatch.setattr(ws, "_run_whatsapp_pairing", lambda *_args: None)
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    worker = threading.Thread(
+        target=ws._prepare_and_run_whatsapp_pairing,
+        args=("pairing", session_dir, "bot", "work"),
+    )
+    worker.start()
+    assert delete_entered.wait(timeout=2)
+    def cancel():
+        cancel_started.set()
+        asyncio.run(ws.cancel_whatsapp_onboarding("pairing"))
+
+    canceller = threading.Thread(target=cancel)
+    canceller.start()
+    assert cancel_started.wait(timeout=2)
+    time.sleep(0.05)
+    try:
+        assert canceller.is_alive(), (
+            "cancellation interleaved after the active-session check and before "
+            "credential replacement completed"
+        )
+    finally:
+        allow_delete.set()
+        worker.join(timeout=2)
+        canceller.join(timeout=2)
+        ws._whatsapp_onboarding_sessions.clear()
+
+    assert not worker.is_alive()
+    assert not canceller.is_alive()
+
+
+def test_prepare_pairing_keeps_credentials_when_bridge_preflight_fails(
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    creds = session_dir / "creds.json"
+    creds.write_text('{"still":"valid"}', encoding="utf-8")
+    prepared = []
+    monkeypatch.setattr(
+        ws,
+        "_ensure_whatsapp_pairing_ready",
+        lambda: (_ for _ in ()).throw(RuntimeError("Node missing")),
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **kwargs: prepared.append(kwargs),
+    )
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    ws._prepare_and_run_whatsapp_pairing(
+        "pairing",
+        session_dir,
+        "bot",
+        "work",
+    )
+
+    assert creds.exists()
+    assert prepared == []
+    assert record.status == "error"
+    assert "Node missing" in (record.error or "")
+    ws._whatsapp_onboarding_sessions.clear()
+
+
 def test_spawn_whatsapp_pairing_process_uses_json_mode(monkeypatch, tmp_path):
     from gateway.platforms import whatsapp_common
     from hermes_cli import web_server as ws
@@ -358,6 +1076,9 @@ def test_spawn_whatsapp_pairing_process_uses_json_mode(monkeypatch, tmp_path):
     assert isinstance(proc, _FakeProc)
     assert "--pair-only" in captured["args"]
     assert "--pair-json" in captured["args"]
+    assert "--pair-timeout-seconds" in captured["args"]
+    timeout_index = captured["args"].index("--pair-timeout-seconds")
+    assert captured["args"][timeout_index + 1] == "570"
     assert str(session_dir) in captured["args"]
     assert captured["kwargs"]["env"]["WHATSAPP_MODE"] == "bot"
     assert captured["kwargs"]["env"]["WHATSAPP_DM_POLICY"] == "pairing"

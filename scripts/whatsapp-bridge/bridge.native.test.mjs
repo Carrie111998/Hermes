@@ -21,7 +21,45 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolvePairTimeoutSeconds,
+  writePairEventAndExit,
 } from './bridge_helpers.js';
+
+// -- bounded pairing lifecycle -------------------------------------------
+{
+  assert.equal(resolvePairTimeoutSeconds('15'), 15);
+  assert.equal(resolvePairTimeoutSeconds('0'), 600);
+  assert.equal(resolvePairTimeoutSeconds('not-a-number'), 600);
+  assert.equal(resolvePairTimeoutSeconds('15seconds'), 600);
+  console.log('  ✓ pair-only timeout parsing is bounded and deterministic');
+}
+
+{
+  let pendingFlush = null;
+  let exitCode = null;
+  let output = '';
+  writePairEventAndExit(
+    { event: 'error', error: 'pair_timeout' },
+    {
+      code: 124,
+      now: () => 123,
+      stream: {
+        write(line, callback) {
+          output += line;
+          pendingFlush = callback;
+        },
+      },
+      exit(code) {
+        exitCode = code;
+      },
+    },
+  );
+  assert.equal(exitCode, null);
+  assert.equal(output, '{"ts":123,"event":"error","error":"pair_timeout"}\n');
+  pendingFlush();
+  assert.equal(exitCode, 124);
+  console.log('  ✓ pair-only timeout exits only after its JSON event flushes');
+}
 
 // -- quoted outbound text -------------------------------------------------
 {

@@ -21,6 +21,7 @@ from hermes_cli.config import (
     migrate_config,
     read_raw_config,
     remove_env_value,
+    remove_platform_config_field,
     save_config,
     save_env_value,
     save_env_value_secure,
@@ -502,6 +503,23 @@ class TestSaveAndLoadRoundtrip:
             saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
             assert saved["model"] == "test/custom-model"
             assert saved["platforms"]["email"]["unauthorized_dm_behavior"] == "pair"
+
+    def test_remove_platform_config_field_prunes_empty_containers(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(
+                "model: test/custom-model\nplatforms:\n  whatsapp:\n    enabled: true\n",
+                encoding="utf-8",
+            )
+
+            remove_platform_config_field(
+                "whatsapp",
+                "enabled",
+                raw=True,
+            )
+
+            saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+            assert saved["model"] == "test/custom-model"
+            assert "platforms" not in saved
 
 
 class TestSaveEnvValueSecure:

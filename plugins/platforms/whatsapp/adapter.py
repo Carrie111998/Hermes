@@ -128,8 +128,12 @@ def _listener_pids_on_port(port: int) -> list:
     return pids
 
 
-def _kill_port_process(port: int, session_path: Path) -> None:
-    """Kill only a verified bridge process listening on ``port``."""
+def _kill_port_process(
+    port: int,
+    session_path: Path,
+) -> list[tuple[int, Optional[int]]]:
+    """Signal verified bridge listeners and return identities to await."""
+    owners: list[tuple[int, Optional[int]]] = []
     try:
         if _IS_WINDOWS:
             from hermes_cli._subprocess_compat import windows_hide_flags
@@ -148,6 +152,7 @@ def _kill_port_process(port: int, session_path: Path) -> None:
                         pid = int(parts[4])
                         if not _bridge_pid_is_ours(pid, session_path, None):
                             continue
+                        owners.append((pid, None))
                         try:
                             subprocess.run(
                                 ["taskkill", "/PID", parts[4], "/F"],
@@ -163,12 +168,14 @@ def _kill_port_process(port: int, session_path: Path) -> None:
             for pid in _listener_pids_on_port(port):
                 if not _bridge_pid_is_ours(pid, session_path, None):
                     continue
+                owners.append((pid, None))
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
     except Exception:
         pass
+    return owners
 
 
 def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
@@ -202,7 +209,9 @@ def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
     return ("node" in cmdline) and (str(session_path) in cmdline)
 
 
-def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
+def _kill_stale_bridge_by_pidfile(
+    session_path: Path,
+) -> list[tuple[int, Optional[int]]]:
     """Kill a bridge process recorded in a PID file from a previous run.
 
     The bridge writes ``bridge.pid`` into the session directory when it
@@ -215,7 +224,8 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
     """
     pid_file = session_path / "bridge.pid"
     if not pid_file.exists():
-        return
+        return []
+    owners: list[tuple[int, Optional[int]]] = []
     pid = None
     recorded_start = None
     try:
@@ -230,8 +240,9 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
             pid_file.unlink()
         except OSError:
             pass
-        return
+        return owners
     if _bridge_pid_is_ours(pid, session_path, recorded_start):
+        owners.append((pid, recorded_start))
         try:
             os.kill(pid, signal.SIGTERM)
             logger.info("[whatsapp] Killed stale bridge PID %d from pidfile", pid)
@@ -249,6 +260,7 @@ def _kill_stale_bridge_by_pidfile(session_path: Path) -> None:
         pid_file.unlink()
     except OSError:
         pass
+    return owners
 
 
 def _write_bridge_pidfile(session_path: Path, pid: int) -> None:
