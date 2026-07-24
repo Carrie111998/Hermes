@@ -8,6 +8,8 @@ description: End-to-end coding tasks against real temp repos using terminal + fi
 scenarios:
   - id: C1_bugfix_repro
     description: Reproduce a failing test, fix the bug, verify test passes
+    deterministic_skip: true
+    deterministic_skip_reason: Tier 2 live model and filesystem tools required
     user_message: |
       I have a bug in my Python project. Create a file buggy.py with this content:
       ```python
@@ -33,6 +35,8 @@ scenarios:
 
   - id: C2_feature_tdd
     description: Implement a feature from a spec and test stub
+    deterministic_skip: true
+    deterministic_skip_reason: Tier 2 live model and filesystem tools required
     user_message: |
       Create a file spec.py with this test:
       ```python
@@ -57,6 +61,8 @@ scenarios:
 
   - id: C3_refactor_extract
     description: Extract a function from a god-file, preserving behavior
+    deterministic_skip: true
+    deterministic_skip_reason: Tier 2 live model and filesystem tools required
     user_message: |
       Create a file god.py with:
       ```python
@@ -91,6 +97,8 @@ scenarios:
 
   - id: C5_self_test
     description: Agent writes its own test for its change, then runs it
+    deterministic_skip: true
+    deterministic_skip_reason: Tier 2 live model and filesystem tools required
     user_message: |
       Create a function `is_valid_email(email)` in a file validator.py that:
       - Returns True if the string contains exactly one '@' and at least one '.' after the '@'

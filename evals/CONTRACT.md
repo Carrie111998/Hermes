@@ -15,6 +15,9 @@ scenarios:
     enabled_toolsets: [terminal, file, delegation]
     skip_memory: true
     skip_context_files: true
+    # Tier 2/live-only scenarios must skip deterministic mode explicitly.
+    deterministic_skip: true
+    deterministic_skip_reason: "Tier 2 live provider required"
     pass_conditions:
       - type: delegate_call_count
         min: 2
@@ -39,6 +42,12 @@ def grade(scenario: dict, result: dict) -> dict:
     """Return {pass: bool, score: float 0-1, details: dict}"""
     ...
 ```
+
+When no suite-specific rubric exists, every declared fallback condition must
+be supported and pass. Unknown or missing conditions fail closed. A scenario
+run with `--deterministic-only` must either provide `_mock_*` fixture data or
+declare `deterministic_skip`; otherwise it is reported as an error rather than
+being graded against an empty transcript.
 
 ## Runner Output Format
 ```json

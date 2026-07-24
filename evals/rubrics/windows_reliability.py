@@ -28,6 +28,13 @@ def grade(scenario: dict, result: dict) -> dict:
             "details": {"error": error, "reason": "scenario errored"},
         }
 
+    if not str(final or "").strip() or not messages:
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": "insufficient Windows execution evidence"},
+        }
+
     # Check for mojibake (common Windows encoding failure)
     has_mojibake = _detect_mojibake(final)
     if has_mojibake:
@@ -61,6 +68,7 @@ def grade(scenario: dict, result: dict) -> dict:
     checks_passed = 0
     details = {}
 
+    unsupported_conditions = []
     for cond in conditions:
         ctype = cond.get("type", "")
         if ctype == "response_contains":
@@ -74,12 +82,18 @@ def grade(scenario: dict, result: dict) -> dict:
             if not has_tool_error:
                 checks_passed += 1
         else:
-            checks_passed += 1
+            unsupported_conditions.append(str(ctype or "<missing>"))
 
     total = len(conditions) if conditions else 1
     score = checks_passed / total
+    if unsupported_conditions:
+        details["unsupported_conditions"] = unsupported_conditions
     return {
-        "pass": score >= 0.5,
+        "pass": (
+            bool(conditions)
+            and checks_passed == len(conditions)
+            and not unsupported_conditions
+        ),
         "score": round(score, 3),
         "details": details,
     }

@@ -431,6 +431,29 @@ def grade(scenario: dict, result: dict) -> dict:
     messages = result.get("messages", []) or []
     snapshots = result.get("api_call_snapshots")
 
+    if result.get("error"):
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": result["error"], "reason": "scenario errored"},
+        }
+    if not snapshots:
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": "missing API-call snapshot evidence"},
+        }
+    if (
+        scenario_id
+        in {"E1_cache_stable", "E2_toolset_swap_forbidden", "E4_system_prompt_byte_stable"}
+        and len(snapshots) < 2
+    ):
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": "at least 2 API-call snapshots required"},
+        }
+
     # Run the shared trajectory analysis (deterministic — no API calls)
     analysis = _detect_cache_break_events(messages, snapshots)
 

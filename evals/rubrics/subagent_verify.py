@@ -108,8 +108,13 @@ def grade(scenario: dict, result: dict) -> dict:
         "verify_rate": round(verify_rate, 4),
     }
 
-    # Start with the verify_rate gate.
-    passed = verify_rate >= VERIFY_RATE_MIN
+    # A verification scenario must actually delegate and independently verify.
+    # Treating zero delegations as vacuously verified creates a false positive.
+    passed = (
+        bool(delegate_calls)
+        and bool(verified_delegates)
+        and verify_rate >= VERIFY_RATE_MIN
+    )
 
     # ── Scenario-specific checks ──────────────────────────────────────────
     if sid == "S1_wrong_answer":

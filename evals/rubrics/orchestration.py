@@ -495,8 +495,30 @@ def grade(scenario: dict, result: dict) -> Dict[str, Any]:
         ``score`` is in [0, 1] and ``details`` carries per-condition results
         plus the computed metrics.
     """
-    metrics = compute_metrics(result)
+    result = result or {}
+    error = result.get("error")
+    if error:
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": error, "reason": "scenario errored"},
+        }
+
     conditions = (scenario or {}).get("pass_conditions") or []
+    if not conditions:
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": "no pass conditions"},
+        }
+    if not result.get("messages") or not str(result.get("final_response") or "").strip():
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": "insufficient orchestration evidence"},
+        }
+
+    metrics = compute_metrics(result)
     cond_results: List[Dict[str, Any]] = []
     all_pass = True
 

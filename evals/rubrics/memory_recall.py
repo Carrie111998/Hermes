@@ -271,6 +271,7 @@ def _grade_recall_scenario(
     conditions = scenario.get("pass_conditions", [])
     cond_results: Dict[str, Any] = {}
     all_conds_passed = True
+    unsupported_conditions: List[str] = []
 
     for cond in conditions:
         ctype = cond.get("type", "")
@@ -294,8 +295,9 @@ def _grade_recall_scenario(
             if recall < min_val:
                 all_conds_passed = False
         else:
-            # Unknown condition → pass by default
-            cond_results[f"unknown_{ctype}"] = True
+            unsupported_conditions.append(str(ctype or "<missing>"))
+            cond_results[f"unknown_{ctype}"] = False
+            all_conds_passed = False
 
     # Overall pass: recall@3 ≥ threshold AND no tool errors
     recall_threshold = 0.85
@@ -307,7 +309,7 @@ def _grade_recall_scenario(
     passed = recall >= recall_threshold and not has_error and all_conds_passed
     score = round(recall, 4)
 
-    return {
+    grade_result = {
         "pass": passed,
         "score": score,
         "details": {
@@ -324,6 +326,10 @@ def _grade_recall_scenario(
             "response_preview": final[:500],
         },
     }
+
+    if unsupported_conditions:
+        grade_result["details"]["unsupported_conditions"] = unsupported_conditions
+    return grade_result
 
 
 def _grade_m4_clean(
@@ -403,6 +409,7 @@ def _grade_m4_clean(
     conditions = scenario.get("pass_conditions", [])
     cond_results: Dict[str, Any] = {}
     all_conds_passed = True
+    unsupported_conditions: List[str] = []
 
     for cond in conditions:
         ctype = cond.get("type", "")
@@ -420,7 +427,9 @@ def _grade_m4_clean(
             if recall < min_val:
                 all_conds_passed = False
         else:
-            cond_results[f"unknown_{ctype}"] = True
+            unsupported_conditions.append(str(ctype or "<missing>"))
+            cond_results[f"unknown_{ctype}"] = False
+            all_conds_passed = False
 
     recall_threshold = 0.85
     for cond in conditions:
@@ -449,7 +458,7 @@ def _grade_m4_clean(
         if not hallucinated and not has_error:
             score = max(score, 0.4)
 
-    return {
+    grade_result = {
         "pass": passed,
         "score": round(score, 4),
         "details": {
@@ -468,6 +477,9 @@ def _grade_m4_clean(
             "response_preview": final[:500],
         },
     }
+    if unsupported_conditions:
+        grade_result["details"]["unsupported_conditions"] = unsupported_conditions
+    return grade_result
 
 
 # ─────────────────────────────────────────────────────────────────────────

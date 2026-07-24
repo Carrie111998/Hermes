@@ -47,7 +47,11 @@ def load_rubric(suite_name: str):
     """Dynamically import a rubric module from evals/rubrics/<suite_name>.py."""
     rubric_path = _EVALS_DIR / "rubrics" / f"{suite_name}.py"
     if not rubric_path.exists():
-        print(f"WARNING: No rubric at {rubric_path} — all scenarios will pass by default", file=sys.stderr)
+        print(
+            f"WARNING: No rubric at {rubric_path} — falling back to "
+            "pass_conditions (fail-closed)",
+            file=sys.stderr,
+        )
         return None
     spec = importlib.util.spec_from_file_location(f"rubric_{suite_name}", rubric_path)
     module = importlib.util.module_from_spec(spec)
@@ -227,17 +231,27 @@ def grade_scenario(scenario: dict, result: dict, rubric_module) -> dict:
     # Fallback: check pass_conditions directly
     conditions = scenario.get("pass_conditions", [])
     if not conditions:
-        return {"pass": True, "score": 1.0, "details": {"note": "no conditions specified"}}
+        return {
+            "pass": False,
+            "score": 0.0,
+            "details": {"error": "no pass conditions and no rubric"},
+        }
 
     checks_passed = 0
     details = {}
+    unsupported_conditions = []
     for cond in conditions:
         ctype = cond.get("type", "")
         if ctype == "delegate_call_count":
             count = _count_delegate_calls(result.get("messages", []))
-            min_val = cond.get("min", 1)
-            details[f"delegate_calls"] = count
-            if count >= min_val:
+            min_val = cond.get("min")
+            max_val = cond.get("max")
+            if min_val is None and max_val is None:
+                min_val = 1
+            details["delegate_calls"] = count
+            min_ok = min_val is None or count >= min_val
+            max_ok = max_val is None or count <= max_val
+            if min_ok and max_ok:
                 checks_passed += 1
         elif ctype == "no_cache_break":
             breaks = _count_cache_breaks(result.get("messages", []))
@@ -255,10 +269,16 @@ def grade_scenario(scenario: dict, result: dict, rubric_module) -> dict:
             if not has_error:
                 checks_passed += 1
         else:
-            checks_passed += 1  # Unknown condition → pass by default
+            unsupported_conditions.append(str(ctype or "<missing>"))
 
+    if unsupported_conditions:
+        details["unsupported_conditions"] = unsupported_conditions
     score = checks_passed / len(conditions) if conditions else 1.0
-    return {"pass": score >= 0.5, "score": score, "details": details}
+    return {
+        "pass": checks_passed == len(conditions) and not unsupported_conditions,
+        "score": score,
+        "details": details,
+    }
 
 
 def _count_delegate_calls(messages: list) -> int:
@@ -301,6 +321,7 @@ def run_suite(
     model: str = "anthropic/claude-haiku-4.5",
     output_path: Optional[Path] = None,
     deterministic_only: bool = False,
+    quiet: bool = False,
 ) -> dict:
     """Run a full eval suite and return the report dict."""
     suite = load_yaml(suite_path)
@@ -309,7 +330,28 @@ def run_suite(
 
     if not scenarios:
         print(f"WARNING: No scenarios found in {suite_path}", file=sys.stderr)
-        return {"suite": suite_name, "error": "no scenarios", "total": 0, "passed": 0, "failed": 0}
+        report = {
+            "suite": suite_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "provider": provider,
+            "model": model,
+            "deterministic_only": deterministic_only,
+            "error": "no scenarios",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errored": 1,
+            "skipped": 0,
+            "pass_rate": 0.0,
+            "scenarios": [],
+        }
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        return report
 
     rubric = load_rubric(suite_name)
     results = []
@@ -320,7 +362,12 @@ def run_suite(
 
     for i, scenario in enumerate(scenarios):
         sid = scenario.get("id", f"S{i}")
-        print(f"  [{i+1}/{len(scenarios)}] {sid}: {scenario.get('description', '')[:80]}", file=sys.stderr)
+        if not quiet:
+            print(
+                f"  [{i+1}/{len(scenarios)}] {sid}: "
+                f"{scenario.get('description', '')[:80]}",
+                file=sys.stderr,
+            )
 
         t0 = time.time()
 
@@ -347,10 +394,33 @@ def run_suite(
                 "api_calls": 0,
                 "duration_s": round(time.time() - t0, 2),
             })
-            print(f"    ↷ skipped (deterministic): {reason}", file=sys.stderr)
+            if not quiet:
+                print(f"    ↷ skipped (deterministic): {reason}", file=sys.stderr)
             continue
 
         if deterministic_only:
+            fixture_keys = {
+                "_mock_messages",
+                "_mock_final_response",
+                "_mock_api_calls",
+                "_mock_api_call_snapshots",
+            }
+            if not any(key in scenario for key in fixture_keys):
+                errored += 1
+                results.append({
+                    "id": sid,
+                    "pass": False,
+                    "score": 0.0,
+                    "details": {
+                        "error": (
+                            "deterministic fixture missing; add _mock_* data or "
+                            "set deterministic_skip"
+                        )
+                    },
+                    "api_calls": 0,
+                    "duration_s": round(time.time() - t0, 2),
+                })
+                continue
             # Deterministic mode: grade structural invariants against embedded
             # mock transcripts (_mock_messages). No live API call.
             messages = scenario.get("_mock_messages", []) or []
@@ -426,7 +496,8 @@ def run_suite(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
-        print(f"Report written to {output_path}", file=sys.stderr)
+        if not quiet:
+            print(f"Report written to {output_path}", file=sys.stderr)
 
     return report
 
@@ -530,18 +601,24 @@ def main():
         model=args.model,
         output_path=output_path,
         deterministic_only=args.deterministic_only,
+        quiet=args.quiet,
     )
 
     print_summary(report)
 
     if args.baseline:
         diff = compare_baseline(report, Path(args.baseline))
-        print(f"Baseline comparison: {diff['status']}  (Δ={diff['delta']:+.2%})")
+        if diff["status"] == "no_baseline":
+            print(f"Baseline comparison: no_baseline  ({diff['message']})")
+        else:
+            print(f"Baseline comparison: {diff['status']}  (Δ={diff['delta']:+.2%})")
         if diff.get("regressions"):
             print(f"Regressions: {', '.join(diff['regressions'])}")
             sys.exit(1)
+        if diff.get("status") == "regression":
+            sys.exit(1)
 
-    if report["pass_rate"] < 0.5:
+    if report.get("error") or report.get("failed", 0) or report.get("errored", 0):
         sys.exit(1)
 
     sys.exit(0)

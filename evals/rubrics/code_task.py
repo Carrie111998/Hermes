@@ -104,6 +104,7 @@ def grade(scenario: dict, result: dict) -> dict:
 
     conditions = scenario.get("pass_conditions", [])
     checks_passed = 0
+    unsupported_conditions = []
     details: dict = {
         "test_passed": test_passed,
         "final_test_passed": final_test_passed,
@@ -129,19 +130,22 @@ def grade(scenario: dict, result: dict) -> dict:
             if found:
                 checks_passed += 1
         else:
-            checks_passed += 1
+            unsupported_conditions.append(str(ctype or "<missing>"))
 
     total = len(conditions) if conditions else 1
     if total == 0:
         total = 1
 
-    # Bonus: test actually passed and no real errors remain.
-    if test_passed and not has_error:
-        checks_passed = max(checks_passed, total)
-
     score = min(checks_passed / total, 1.0)
+    if unsupported_conditions:
+        details["unsupported_conditions"] = unsupported_conditions
     return {
-        "pass": score >= 0.6 and not has_error,
+        "pass": (
+            bool(conditions)
+            and checks_passed == len(conditions)
+            and not has_error
+            and not unsupported_conditions
+        ),
         "score": round(score, 3),
         "details": details,
     }

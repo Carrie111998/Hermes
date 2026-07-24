@@ -92,6 +92,7 @@ def grade(scenario: dict, result: dict) -> dict:
 
     conditions = scenario.get("pass_conditions", [])
     checks_passed = 0
+    unsupported_conditions = []
     details = {
         "citation_count": citation_count,
         "urls": urls[:5],
@@ -113,7 +114,7 @@ def grade(scenario: dict, result: dict) -> dict:
             if found:
                 checks_passed += 1
         else:
-            checks_passed += 1
+            unsupported_conditions.append(str(ctype or "<missing>"))
 
     # Bonus: citations present
     if citation_count > 0 and not has_error:
@@ -121,6 +122,8 @@ def grade(scenario: dict, result: dict) -> dict:
 
     total = len(conditions) + 1 if conditions else 2  # +1 for bonus
     score = min(checks_passed / total, 1.0)
+    if unsupported_conditions:
+        details["unsupported_conditions"] = unsupported_conditions
 
     # Special: R3_no_source should NOT fabricate citations when answer unknown
     if sid == "R3_no_source":
@@ -128,7 +131,12 @@ def grade(scenario: dict, result: dict) -> dict:
             score = max(0.0, score - 0.5)
 
     return {
-        "pass": score >= 0.5 and not has_error,
+        "pass": (
+            bool(conditions)
+            and checks_passed >= len(conditions)
+            and not has_error
+            and not unsupported_conditions
+        ),
         "score": round(score, 3),
         "details": details,
     }
