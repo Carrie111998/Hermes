@@ -245,6 +245,88 @@ def test_sess_missing(server):
     assert err["error"]["code"] == 4001
 
 
+def test_session_create_defers_build_until_agent_is_demanded(
+    server, monkeypatch, tmp_path
+):
+    scheduled: list[str] = []
+    demanded: list[str] = []
+
+    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
+    monkeypatch.setattr(
+        server, "_schedule_agent_build", lambda sid: scheduled.append(sid)
+    )
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    response = server.handle_request(
+        {
+            "id": "create-1",
+            "method": "session.create",
+            "params": {"cols": 100, "source": "desktop"},
+        }
+    )
+
+    assert "error" not in response
+    sid = response["result"]["session_id"]
+    session = server._sessions[sid]
+    assert scheduled == []
+    assert session["agent"] is None
+    assert not session["agent_ready"].is_set()
+
+    def _start_on_demand(runtime_sid, runtime_session):
+        demanded.append(runtime_sid)
+        runtime_session["agent"] = MagicMock()
+        runtime_session["agent_ready"].set()
+
+    monkeypatch.setattr(server, "_start_agent_build", _start_on_demand)
+    created_session, error = server._sess({"session_id": sid}, "create-2")
+
+    assert error is None
+    assert created_session is session
+    assert demanded == [sid]
+
+
+def test_first_prompt_submit_builds_deferred_agent(server, monkeypatch, tmp_path):
+    delivered = threading.Event()
+    builds: list[str] = []
+
+    monkeypatch.setattr(server, "_completion_cwd", lambda _params=None: str(tmp_path))
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+
+    created = server.handle_request(
+        {"id": "create-1", "method": "session.create", "params": {}}
+    )
+    sid = created["result"]["session_id"]
+
+    def _start_on_demand(runtime_sid, runtime_session):
+        builds.append(runtime_sid)
+        runtime_session["agent"] = MagicMock()
+        runtime_session["agent_ready"].set()
+
+    monkeypatch.setattr(server, "_start_agent_build", _start_on_demand)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: delivered.set(),
+    )
+
+    response = server.handle_request(
+        {
+            "id": "prompt-1",
+            "method": "prompt.submit",
+            "params": {"session_id": sid, "text": "hello"},
+        }
+    )
+
+    assert response["result"] == {"status": "streaming"}
+    assert builds == [sid]
+    assert delivered.wait(timeout=1)
+
+
 # ── session.resume payload ────────────────────────────────────────────
 
 
@@ -300,6 +382,113 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         {"role": "assistant", "text": "yo", "reasoning": "thoughts"},
         {"role": "tool", "name": "tool", "context": ""},
     ]
+
+
+def test_session_resume_defers_build_until_agent_is_demanded(server, monkeypatch):
+    target = "20260409_010101_abc123"
+
+    class _DB:
+        def get_session(self, _sid):
+            return {
+                "id": target,
+                "model": "vendor/cool-model",
+                "model_config": {"provider": "vendor"},
+            }
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            return sid
+
+        def reopen_session(self, _sid):
+            return None
+
+        def get_resume_conversations(self, session_id):
+            return (
+                self.get_messages_as_conversation(
+                    session_id, repair_alternation=True
+                ),
+                self.get_messages_as_conversation(
+                    session_id, include_ancestors=True
+                ),
+            )
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+        def get_messages_as_conversation(
+            self, _sid, include_ancestors=False, repair_alternation=False
+        ):
+            return [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "yo"},
+            ]
+
+    scheduled: list[str] = []
+    demanded: list[str] = []
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no eager build")
+        ),
+    )
+    monkeypatch.setattr(
+        server, "_schedule_agent_build", lambda sid: scheduled.append(sid)
+    )
+
+    def _start_on_demand(sid, session):
+        demanded.append(sid)
+        session["agent"] = MagicMock()
+        session["agent_ready"].set()
+
+    monkeypatch.setattr(server, "_start_agent_build", _start_on_demand)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    resp = server.handle_request(
+        {
+            "id": "r1",
+            "method": "session.resume",
+            "params": {"session_id": target, "cols": 100},
+        }
+    )
+
+    assert "error" not in resp
+    result = resp["result"]
+    assert result["resumed"] == target
+    assert result["session_key"] == target
+    assert result["message_count"] == 2
+    assert result["messages"] == [
+        {"role": "user", "text": "hello"},
+        {"role": "assistant", "text": "yo"},
+    ]
+    assert result["info"]["lazy"] is True
+    assert result["info"]["model"] == "vendor/cool-model"
+    assert result["info"]["provider"] == "vendor"
+    assert result["info"]["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
+
+    sid = result["session_id"]
+    session = server._sessions[sid]
+    assert session["agent"] is None
+    assert session["resume_session_id"] == target
+    assert not session["agent_ready"].is_set()
+    assert not session.get("lazy")
+    assert (
+        session["resume_runtime_overrides"]["model_override"]["model"]
+        == "vendor/cool-model"
+    )
+    assert server._find_live_session_by_key(target) == (sid, session)
+    assert scheduled == []
+    assert demanded == []
+
+    resumed_session, error = server._sess({"session_id": sid}, "r2")
+
+    assert error is None
+    assert resumed_session is session
+    assert demanded == [sid]
 
 
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
@@ -614,5 +803,4 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-
 
