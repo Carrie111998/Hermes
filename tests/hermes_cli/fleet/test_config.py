@@ -8,14 +8,17 @@ from hermes_cli.config import DEFAULT_CONFIG
 from hermes_cli.fleet.config import FleetConfigError, parse_fleet_config
 from hermes_cli.fleet.profiles import ordered_profiles
 from hermes_cli.fleet.types import AdapterKind, Confidence
+from hermes_cli.fleet.usage_paths import default_native_usage_path
 
 
-def test_defaults_are_disabled_conservative_and_documented_in_main_config():
+def test_defaults_are_disabled_conservative_and_documented_in_main_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     config = parse_fleet_config({})
 
     assert config.enabled is False
     assert config.parent_desktop_enabled is False
-    assert config.bridge_usage_file.as_posix() == "C:/HermesBridge/usage-weekly.json"
+    assert config.bridge_usage_file == default_native_usage_path()
+    assert config.bridge_usage_file.as_posix().endswith("/fleet/usage-weekly.json")
     assert config.switch_delta_pct == Decimal("20.000")
     assert config.minimum_confidence is Confidence.HIGH
     assert config.rotation_without_fresh_capacity is False
@@ -26,6 +29,7 @@ def test_defaults_are_disabled_conservative_and_documented_in_main_config():
     assert DEFAULT_CONFIG["fleet"]["enabled"] is False
     assert DEFAULT_CONFIG["fleet"]["parent_desktop_enabled"] is False
     assert DEFAULT_CONFIG["fleet"]["rotation_without_fresh_capacity"] is False
+    assert DEFAULT_CONFIG["fleet"]["bridge_usage_file"] == ""
 
 
 def test_deprecated_stale_capacity_flag_is_accepted_but_ignored():
@@ -68,6 +72,8 @@ def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():
     assert profiles[1].selected_effort == "high"
     assert profiles[1].supports_task_worker
     assert profiles[1].supports_parent_session
+    assert profiles[1].ordered_models == ("claude-opus-4-8",)
+    assert "sonnet" not in " ".join(profiles[1].ordered_models).lower()
     assert profiles[2].provider_id == "xai-oauth"
     assert profiles[2].supported_efforts[-2:] == ("max", "ultra")
     assert profiles[2].selected_effort == "max"
@@ -78,7 +84,7 @@ def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():
     assert profiles[3].supported_efforts == ("low", "medium", "high")
     assert profiles[3].selected_effort == "medium"
     assert profiles[3].supports_task_worker
-    assert not profiles[3].supports_parent_session
+    assert profiles[3].supports_parent_session
     assert not profiles[4].implemented
     assert not profiles[4].supports_task_worker
     assert not profiles[4].supports_parent_session

@@ -946,10 +946,11 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     # Subscription-aware fleet routing is opt-in. Parent Desktop admission is
     # separately gated and happens only before a new agent is constructed.
+    # bridge_usage_file blank → {HERMES_HOME}/fleet/usage-weekly.json.
     "fleet": {
         "enabled": False,
         "parent_desktop_enabled": False,
-        "bridge_usage_file": "C:/HermesBridge/usage-weekly.json",
+        "bridge_usage_file": "",
         "switch_delta_pct": 20.0,
         "minimum_confidence": "high",
         "rotation_without_fresh_capacity": False,

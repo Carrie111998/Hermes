@@ -226,6 +226,11 @@ def build_inspection_payload(
         "command": command,
         "ok": True if command == "status" else has_route,
         "enabled": service.config.enabled,
+        "capacity_source": {
+            "path": str(service.config.bridge_usage_file),
+            "kind": "native_hermes_home",
+            "adapter": type(service.capacity_source).__name__,
+        },
         "reason": (
             ReasonCode.MET.value if has_route else ReasonCode.NO_ELIGIBLE_LANE.value
         ),

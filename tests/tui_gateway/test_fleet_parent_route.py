@@ -743,3 +743,118 @@ def test_make_agent_uses_distinct_external_parent_driver(monkeypatch, tmp_path):
     )
 
     assert agent is expected
+
+
+def test_stale_composer_sonnet_default_is_forced_to_backend_admission(monkeypatch):
+    events: list[str] = []
+
+    def admit(**kwargs):
+        events.append("admit")
+        pin = _pin(
+            lane_id="chatgpt_codex",
+            provider_id="openai-codex",
+            model_id="gpt-5.6-sol",
+        )
+        return ParentAdmission(
+            reason=ReasonCode.MET,
+            pin=ParentPin(
+                **{
+                    **pin.__dict__,
+                    "lineage_root_id": kwargs["lineage_root_id"],
+                    "session_id": kwargs["session_id"],
+                }
+            ),
+        )
+
+    monkeypatch.setattr(server, "_fleet_parent_gates_open", lambda **kwargs: True)
+    monkeypatch.setattr(server, "_admit_fleet_parent_session", admit)
+    monkeypatch.setattr(
+        server,
+        "_schedule_agent_build",
+        lambda sid: events.append("build"),
+    )
+
+    response = server._methods["session.create"](
+        "request-stale-sonnet",
+        {
+            "cols": 80,
+            "source": "desktop",
+            "model_source": "default",
+            "model": "claude-sonnet-4-6",
+            "provider": "anthropic",
+            "reasoning_effort": "max",
+        },
+    )
+
+    assert events == ["admit", "build"]
+    assert "error" not in response
+    result = response["result"]
+    info = result["info"]
+    assert info["model"] == "gpt-5.6-sol"
+    assert info["provider"] == "openai-codex"
+    assert info["model_source"] == "fleet_auto"
+    assert info["fleet_lane_id"] == "chatgpt_codex"
+    assert info["display_label"] == "Codex · Fleet"
+    session = server._sessions[result["session_id"]]
+    assert session["model_override"] == {
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+    }
+
+
+def test_manual_sonnet_is_rejected_when_fleet_parent_is_on(monkeypatch):
+    monkeypatch.setattr(server, "_fleet_parent_gates_open", lambda **kwargs: True)
+    monkeypatch.setattr(
+        server,
+        "_admit_fleet_parent_session",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("sonnet manual must not reach admission")
+        ),
+    )
+
+    response = server._methods["session.create"](
+        "request-manual-sonnet",
+        {
+            "source": "desktop",
+            "model_source": "manual",
+            "model": "claude-sonnet-4-6",
+            "provider": "anthropic",
+        },
+    )
+
+    assert response["error"]["code"] == 4004
+    assert "Sonnet" in response["error"]["message"]
+    assert "claude-opus-4-8" in response["error"]["message"]
+    assert server._sessions == {}
+
+
+def test_resume_pin_stability_ignores_stale_composer_model():
+    pin = _pin(
+        lane_id="chatgpt_codex",
+        provider_id="openai-codex",
+        model_id="gpt-5.6-sol",
+    )
+
+    class FakeStore:
+        def read_parent_pin(self, profile_id, lineage_root_id):
+            return pin
+
+    route = fleet_parent.restore_parent_route(
+        {
+            "model_config": {
+                "model_source": "fleet_auto",
+                "fleet_lineage_root_id": "stored-root",
+                "fleet_route_identity": "sha256:route",
+                # Stale UI-ish fields must not reselect Sonnet on resume.
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic",
+            }
+        },
+        profile_id="default",
+        store=FakeStore(),
+    )
+
+    assert route is not None
+    assert route["model"] == "gpt-5.6-sol"
+    assert route["provider"] == "openai-codex"
+    assert route["fleet_lane_id"] == "chatgpt_codex"

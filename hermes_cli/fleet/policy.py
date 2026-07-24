@@ -19,6 +19,7 @@ from .types import (
     RouteDecision,
     TaskSpec,
 )
+from .parent_models import is_sonnet_model
 
 
 SWITCH_DELTA = Decimal("20.000")
@@ -109,6 +110,10 @@ def evaluate_lane(
         )
         if selected_model is None:
             reasons.append(ReasonCode.QUALIFICATION_FAILED)
+        elif is_sonnet_model(selected_model):
+            # Sonnet is catalog-only; never a fleet parent/worker admission target.
+            selected_model = None
+            reasons.append(ReasonCode.MODEL_NOT_ADMITTED)
         if (
             selected_effort is None
             or selected_effort not in qualification.efforts

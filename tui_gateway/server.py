@@ -4034,6 +4034,27 @@ def _admit_fleet_parent_session(
             reset_hermes_home_override(home_token)
 
 
+def _fleet_parent_gates_open(*, profile_home: Path | None) -> bool:
+    """True when Desktop parent admission is commissioned for this profile."""
+
+    home_token = (
+        set_hermes_home_override(str(profile_home))
+        if profile_home is not None
+        else None
+    )
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fleet.config import parse_fleet_config
+
+        config = parse_fleet_config(load_config_readonly())
+        return bool(config.enabled and config.parent_desktop_enabled)
+    except Exception:
+        return False
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
 def _restore_fleet_parent_route(
     *,
     profile_id: str,
@@ -6365,6 +6386,22 @@ def _(rid, params: dict) -> dict:
     if model_source not in {"default", "manual", "fleet_auto"}:
         return _err(rid, 4004, "model_source must be default, manual, or fleet_auto")
     fleet_parent_route = None
+    # When Desktop parent admission is commissioned, the backend — not stale
+    # composer localStorage — selects and pins the route before agent build.
+    # Stale/manual Sonnet state cannot create an uncommissioned parent.
+    fleet_parent_on = (
+        source == "desktop" and _fleet_parent_gates_open(profile_home=profile_home)
+    )
+    if fleet_parent_on:
+        from hermes_cli.fleet.parent_models import (
+            is_sonnet_model,
+            reject_sonnet_parent_reason,
+        )
+
+        if model_source == "manual" and is_sonnet_model(create_model):
+            return _err(rid, 4004, reject_sonnet_parent_reason(create_model))
+        if model_source != "manual":
+            model_source = "fleet_auto"
     if model_source == "fleet_auto":
         from hermes_constants import parse_reasoning_effort
         from tui_gateway.fleet_parent import (
@@ -6385,6 +6422,7 @@ def _(rid, params: dict) -> dict:
             fleet_parent_route = parent_route_metadata(admission.pin)
         except ValueError as exc:
             return _err(rid, 5033, f"Fleet Auto parent admission failed: {exc}")
+        # Authoritative backend route wins over any stale composer model.
         session_model_override = {
             "model": fleet_parent_route["model"],
             "provider": fleet_parent_route["provider"],
@@ -6393,6 +6431,7 @@ def _(rid, params: dict) -> dict:
             fleet_parent_route["reasoning_effort"]
         )
         create_service_tier_override = ""
+        create_model = fleet_parent_route["model"]
 
     ready = threading.Event()
     now = time.time()

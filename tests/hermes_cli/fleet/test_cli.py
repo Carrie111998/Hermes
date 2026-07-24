@@ -34,7 +34,7 @@ def test_help_exposes_only_the_bounded_v1_surface(capsys):
 
     assert caught.value.code == 0
     output = capsys.readouterr().out
-    for command in ("doctor", "plan", "run", "status", "audit", "release"):
+    for command in ("doctor", "plan", "run", "status", "audit", "release", "refresh-usage"):
         assert command in output
     assert "continue" not in output
 

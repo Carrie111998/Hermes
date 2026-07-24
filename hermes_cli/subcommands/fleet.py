@@ -87,6 +87,21 @@ def build_fleet_parser(subparsers) -> argparse.ArgumentParser:
     )
     _add_json_flag(release)
 
+    refresh = commands.add_parser(
+        "refresh-usage",
+        help="Refresh native fleet usage capacity (no WSL; auto lanes only)",
+    )
+    refresh.add_argument(
+        "--no-mirror",
+        action="store_true",
+        help="Skip optional Cockpit bridge mirror write",
+    )
+    refresh.add_argument(
+        "--path",
+        help="Override native usage path (default: {HERMES_HOME}/fleet/usage-weekly.json)",
+    )
+    _add_json_flag(refresh)
+
     fleet.set_defaults(func=fleet_command)
     return fleet
 
@@ -196,10 +211,21 @@ def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
             f"pins task_worker={worker_total} "
             f"desktop_parent={parent_total}"
         )
+    capacity_source = payload.get("capacity_source")
+    if isinstance(capacity_source, dict) and capacity_source.get("path"):
+        print(f"capacity_source={capacity_source['path']}")
     if payload.get("task_id"):
         print(f"task_id={payload['task_id']}")
     if payload.get("output"):
         print(payload["output"])
+    if payload.get("path") and payload.get("command") == "refresh-usage":
+        print(f"usage_path={payload['path']}")
+        for lane in payload.get("lanes") or []:
+            print(
+                f"  {lane.get('lane_id')}: updated={lane.get('updated')} "
+                f"checked_at={lane.get('checked_at') or 'none'} "
+                f"detail={lane.get('detail')}"
+            )
 
 
 def fleet_command(
@@ -218,6 +244,36 @@ def fleet_command(
         )
         _emit(payload, json_output=args.json)
         return EXIT_OK if action == "status" or payload["ok"] else EXIT_NO_ROUTE
+
+    if action == "refresh-usage":
+        from hermes_cli.fleet.usage_paths import COCKPIT_MIRROR_PATH
+        from hermes_cli.fleet.usage_refresh import (
+            UsageRefreshError,
+            refresh_usage_document,
+            serialize_refresh_report,
+        )
+
+        try:
+            report = refresh_usage_document(
+                path=getattr(args, "path", None),
+                mirror_path=None if args.no_mirror else COCKPIT_MIRROR_PATH,
+            )
+        except UsageRefreshError as exc:
+            payload = {
+                "schema_version": 1,
+                "command": action,
+                "ok": False,
+                "reason": str(exc),
+            }
+            _emit(payload, json_output=args.json)
+            return EXIT_EXECUTION_FAILED
+        payload = {
+            "schema_version": 1,
+            "command": action,
+            **serialize_refresh_report(report),
+        }
+        _emit(payload, json_output=args.json)
+        return EXIT_OK if report.ok else EXIT_EXECUTION_FAILED
 
     if action == "plan":
         try:

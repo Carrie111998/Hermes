@@ -39,17 +39,27 @@ migrates an active conversation.
 - Desktop Fleet Auto admits exactly once before parent construction. Every
   turn, resume, and compression continuation resolves the original lineage
   pin. Provider failure is reported; it cannot silently select a replacement.
-- The optional `C:/HermesBridge/usage-weekly.json` source is opened read-only.
-  It is capacity evidence only, never authentication evidence.
+- The optional capacity file defaults to the profile-safe native path
+  `{HERMES_HOME}/fleet/usage-weekly.json` (opened read-only by the router).
+  Refresh it with `hermes fleet refresh-usage` (native Windows, no WSL). An
+  optional Cockpit mirror to `C:/HermesBridge/usage-weekly.json` is best-effort
+  compatibility only and is never the router source of truth. Capacity evidence
+  is never authentication evidence.
+  Only auto-queryable lanes (ChatGPT/Codex, Claude) receive a fresh
+  per-lane `checked_at`. Grok and Antigravity stay console-only until they have
+  attributable evidence; missing row timestamps keep them stale so they cannot
+  win a capacity override.
 
 ## Parent route truth
 
-Codex (`openai-codex`), Claude Opus 4.8 (`anthropic`), and Grok 4.5
-(`xai-oauth`) are native-parent candidates only when their exact
-subscription-only, no-paid-fallback, capability, model, effort, and fast-off
-gates pass. The Claude route reads the live Claude Code OAuth credential
-through the existing Anthropic adapter; it never substitutes
-`ANTHROPIC_API_KEY`.
+Codex (`openai-codex` / `gpt-5.6-sol`), Claude Opus 4.8 only
+(`anthropic` / exact `claude-opus-4-8`), and Grok 4.5 (`xai-oauth`) are
+native-parent candidates only when their exact subscription-only,
+no-paid-fallback, capability, model, effort, and fast-off gates pass. Sonnet is
+never an eligible fleet parent route, capacity candidate, fallback, or
+commissioned model — it may remain in the generic non-fleet catalog only. The
+Claude route reads the live Claude Code OAuth credential through the existing
+Anthropic adapter; it never substitutes `ANTHROPIC_API_KEY`.
 
 Antigravity is a distinct external parent driver, never a native `AIAgent`.
 Hermes binds its `agy` conversation ID to the immutable Hermes lineage,
@@ -58,7 +68,7 @@ through `agy --conversation`, and requires consumer-subscription, Antigravity
 Cloud Code, and exact served-model receipts for Gemini 3.1 Pro (High) on every
 turn. Raw logs are reduced to secret-free evidence receipts. Fleet never passes
 `GOOGLE_API_KEY`, `GEMINI_API_KEY`, or any other API-key environment variable
-to this route. Kimi remains disabled for both surfaces.
+to this route. Kimi remains parent-ineligible and disabled for both surfaces.
 
 Desktop settings show task-worker and parent matrices separately. A fresh
 Fleet Auto draft displays selection as pending; after `session.create`, the
@@ -70,12 +80,18 @@ authoritative. Manual pre-session model selection bypasses Fleet Auto.
 ```text
 hermes fleet status [--json]
 hermes fleet doctor [--lane LANE] [--json]
+hermes fleet refresh-usage [--json] [--no-mirror] [--path PATH]
 hermes fleet plan --task-file PATH [--cwd PATH] [--json]
 hermes fleet run --task-file PATH [--cwd PATH] [--task-id UUID] [--json]
 hermes fleet audit [--task-id UUID] [--reason CODE] [--jsonl]
 hermes fleet release TASK_ID [--outcome completed|failed|cancelled] [--json]
 ```
 
+`refresh-usage` is the native, profile-scoped capacity writer. On Windows, prefer
+`pwsh` + `scripts/fleet_refresh_usage.ps1` (or
+`scripts/install_fleet_usage_refresh_task.ps1` for a 30-minute scheduled task)
+instead of any WSL/PowerShell-5.1 bridge chain. JSON status includes
+`capacity_source.path` and per-lane freshness timestamps.
 On native Windows, Antigravity qualification also checks
 `%LOCALAPPDATA%/agy/bin/agy.exe` when `agy` is absent from `PATH`; the resolved
 file is used for both qualification and execution.

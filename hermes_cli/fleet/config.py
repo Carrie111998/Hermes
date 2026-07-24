@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .types import Confidence
+from .usage_paths import resolve_usage_path
 
 
 LANE_ORDER = (
@@ -22,7 +23,8 @@ DEFERRED_LANES = frozenset({"kimi"})
 DEFAULT_FLEET_CONFIG: dict[str, Any] = {
     "enabled": False,
     "parent_desktop_enabled": False,
-    "bridge_usage_file": "C:/HermesBridge/usage-weekly.json",
+    # Empty → resolve to {hermes_home}/fleet/usage-weekly.json at parse time.
+    "bridge_usage_file": "",
     "switch_delta_pct": 20.0,
     "minimum_confidence": "high",
     "rotation_without_fresh_capacity": False,
@@ -154,8 +156,12 @@ def parse_fleet_config(config: Mapping[str, Any] | None) -> FleetConfig:
     bridge = root.get(
         "bridge_usage_file", DEFAULT_FLEET_CONFIG["bridge_usage_file"]
     )
-    if not isinstance(bridge, str) or not bridge.strip():
-        raise FleetConfigError("bridge_usage_file must be a non-empty path")
+    if bridge is None:
+        bridge = ""
+    if not isinstance(bridge, str):
+        raise FleetConfigError("bridge_usage_file must be a path string")
+    # Blank means the profile-safe native default under Hermes home.
+    resolved_bridge = resolve_usage_path(bridge.strip() or None)
     switch = _percentage(
         root.get("switch_delta_pct", 20.0), "switch_delta_pct"
     )
@@ -222,7 +228,7 @@ def parse_fleet_config(config: Mapping[str, Any] | None) -> FleetConfig:
     return FleetConfig(
         enabled=enabled,
         parent_desktop_enabled=parent_desktop_enabled,
-        bridge_usage_file=Path(bridge),
+        bridge_usage_file=resolved_bridge,
         switch_delta_pct=switch,
         minimum_confidence=Confidence.HIGH,
         # Accepted for one compatibility release, but intentionally ignored.

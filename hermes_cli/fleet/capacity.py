@@ -17,6 +17,7 @@ from .types import (
     MeasurementKind,
     ReasonCode,
 )
+from .usage_paths import default_native_usage_path
 
 
 _QUANTUM = Decimal("0.001")
@@ -95,17 +96,22 @@ def _optional_identifier(value: object, field: str) -> str | None:
 
 
 class BridgeUsageAdapter:
-    """Normalize an optional HermesBridge JSON file without mutating it."""
+    """Normalize the native Hermes-home usage JSON without mutating it.
+
+    The historical class name remains for compatibility; the default path is
+    the profile-scoped native file under the active Hermes home, not a
+    hardcoded bridge directory.
+    """
 
     def __init__(
         self,
-        path: str | Path = "C:/HermesBridge/usage-weekly.json",
+        path: str | Path | None = None,
         *,
         max_age: timedelta = timedelta(hours=2),
         max_bytes: int = 256 * 1024,
         future_tolerance: timedelta = timedelta(seconds=30),
     ) -> None:
-        self.path = Path(path)
+        self.path = Path(path) if path is not None else default_native_usage_path()
         self.max_age = max_age
         self.max_bytes = max_bytes
         self.future_tolerance = future_tolerance
