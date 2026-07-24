@@ -108,6 +108,14 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
 
 def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_hermes_oauth_credentials",
+        lambda: None,
+    )
     global_root = tmp_path / ".hermes"
     global_root.mkdir()
     profile_home = global_root / "profiles" / "coder"

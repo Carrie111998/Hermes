@@ -1,6 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
-
 import { JsonRpcGatewayClient } from '@hermes/shared'
+import { describe, expect, it, vi } from 'vitest'
 
 type Listener = (event?: unknown) => void
 

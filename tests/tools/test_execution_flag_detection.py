@@ -4,11 +4,19 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
 
 from tools.approval import detect_dangerous_command, detect_hardline_command
+
+
+def _command_help(command: str) -> str:
+    completed = subprocess.run(
+        [command, "--help"], text=True, capture_output=True, timeout=5
+    )
+    return f"{completed.stdout}\n{completed.stderr}"
 
 
 @pytest.mark.parametrize(
@@ -49,11 +57,27 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "sort" and sys.platform != "linux":
+        pytest.skip("the real sort compression-program probe is Linux-specific")
+    if tool == "sort" and "--compress-program" not in _command_help(tool):
+        pytest.skip("installed sort does not support --compress-program")
+    if tool == "man" and "--pager" in args and "--pager" not in _command_help(tool):
+        pytest.skip("installed man does not support --pager")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
-    payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
-    payload.chmod(0o755)
+    if tool == "sort":
+        gzip = shutil.which("gzip")
+        if gzip is None:
+            pytest.skip("gzip is required to exercise sort --compress-program")
+        # A shebang script whose basename starts with '-' can be reparsed by
+        # sh as interpreter flags. Use a real compressor binary so successful
+        # external sorting proves the dash-prefixed program was executed.
+        shutil.copyfile(gzip, payload)
+        payload.chmod(0o755)
+    else:
+        payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
+        payload.chmod(0o755)
     input_file = tmp_path / "input.txt"
     input_file.write_text("needle\n")
     resolved_args = [arg.format(input=str(input_file)) for arg in args]
@@ -70,11 +94,23 @@ def test_real_binaries_execute_leading_dash_program_payload(
     }
     argv = [tool, *resolved_args]
     if needs_tty:
-        argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
+        script_help = _command_help("script")
+        if "--command" in script_help:
+            argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
+        else:
+            # BSD script accepts the command as positional argv after the
+            # transcript path; util-linux requires -c with a shell string.
+            argv = ["script", "-q", "/dev/null", *argv]
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    completed = subprocess.run(
+        argv, input=input_text, text=True, capture_output=True, env=env, timeout=20
+    )
 
-    assert marker.read_text() == "executed"
+    if tool == "sort":
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.splitlines() == sorted(input_text.splitlines())
+    else:
+        assert marker.read_text() == "executed"
 
 
 @pytest.mark.parametrize(

@@ -266,48 +266,6 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    """Parse '0.13.0' into (0, 13, 0) for comparison. Non-numeric segments become 0."""
-    parts = []
-    for segment in v.split("."):
-        try:
-            parts.append(int(segment))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
-
-
-def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
-    """Fetch the latest version of a package from PyPI. Returns None on failure."""
-    try:
-        import urllib.request
-        url = f"https://pypi.org/pypi/{package}/json"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            return data.get("info", {}).get("version")
-    except Exception:
-        return None
-
-
-def check_via_pypi() -> Optional[int]:
-    """Compare installed version against PyPI latest.
-
-    Returns 0 if up-to-date, 1 if behind, None on failure.
-    """
-    latest = _fetch_pypi_latest()
-    if latest is None:
-        return None
-    if latest == VERSION:
-        return 0
-    try:
-        if _version_tuple(latest) > _version_tuple(VERSION):
-            return 1
-        return 0
-    except Exception:
-        return 1 if latest != VERSION else 0
-
-
 def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
@@ -327,16 +285,11 @@ def check_for_updates() -> Optional[int]:
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
-    # HERMES_REVISION (that's nix-only). Without this guard the checks below
-    # fall through to `check_via_pypi()`, whose PyPI-version mismatch flag (1)
-    # then gets rendered by the CLI banner and the TUI badge as a phantom
-    # "1 commit behind" — even though no git repo or commit math is involved,
-    # and `hermes update` correctly refuses to run in-place inside the
-    # container anyway. The dashboard's REST `/api/hermes/update/check`
-    # endpoint already short-circuits docker the same way (web_server.py);
-    # mirror that here so the banner/TUI surfaces agree. Returning None makes
-    # both the Rich banner (build_welcome_banner) and the Ink badge
-    # (branding.tsx, guarded on `typeof === 'number' && > 0`) show nothing.
+    # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
+    # banner (build_welcome_banner) and the Ink badge (branding.tsx, guarded
+    # on `typeof === 'number' && > 0`) show nothing. The dashboard's REST
+    # `/api/hermes/update/check` endpoint short-circuits docker the same way
+    # (web_server.py); mirror that here so the banner/TUI surfaces agree.
     try:
         from hermes_cli.config import detect_install_method, get_project_root
         if detect_install_method(get_project_root()) == "docker":
@@ -375,7 +328,9 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     elif repo_dir is None:
-        behind = check_via_pypi()
+        # No git checkout and no embedded revision — unsupported install
+        # layouts cannot produce a trustworthy update comparison.
+        behind = None
     else:
         behind = _check_via_local_git(repo_dir)
 
@@ -907,27 +862,6 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
                 right_lines.append(line)
     except Exception:
         pass  # Never break the banner over an update check
-
-    # Unsupported install-method warning — pip/PyPI and Homebrew are no
-    # longer an officially supported distribution method (see
-    # website/docs/getting-started/platform-support.md). Such installs miss
-    # the git checkout + installer-managed deps, so updates, self-update, and
-    # issue triage don't behave correctly. Warn, don't block. NixOS is fully
-    # supported and never hits this.
-    try:
-        from hermes_cli.config import (
-            detect_install_method,
-            format_unsupported_install_warning,
-            is_unsupported_install_method,
-            get_project_root
-        )
-        _install_method = detect_install_method(get_project_root())
-        if is_unsupported_install_method(_install_method):
-            right_lines.append(
-                f"[bold yellow]⚠ {format_unsupported_install_warning(_install_method)}[/]"
-            )
-    except Exception:
-        pass  # Never break the banner over the install-method check
 
     right_content = "\n".join(right_lines)
     layout_table.add_row(left_content, right_content)

@@ -12,13 +12,6 @@ def _load_optional_dependencies():
     return project["optional-dependencies"]
 
 
-def _load_package_data():
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    with pyproject_path.open("rb") as handle:
-        tool = tomllib.load(handle)["tool"]
-    return tool["setuptools"]["package-data"]
-
-
 def test_desktop_version_matches_python_project_and_workspace_lock():
     """A release is one product version across CLI, Desktop, and npm installs."""
     root = Path(__file__).resolve().parents[1]
@@ -47,7 +40,9 @@ def test_matrix_extra_not_in_all():
     """
     optional_dependencies = _load_optional_dependencies()
 
-    assert "matrix" in optional_dependencies, "[matrix] extra must still exist for explicit `pip install hermes-agent[matrix]`"
+    assert "matrix" in optional_dependencies, (
+        "[matrix] extra must still exist for `uv sync --extra matrix`"
+    )
     assert all("mautrix[encryption]" not in dep for dep in optional_dependencies["matrix"]), (
         "[matrix] must stay plaintext-capable. Do not pull python-olm via "
         "mautrix[encryption] unless MATRIX_ENCRYPTION is explicitly enabled."
@@ -250,25 +245,3 @@ def test_nemo_relay_extra_uses_supported_official_distribution_range():
         spec == "hermes-agent[nemo-relay]"
         for spec in optional_dependencies["all"]
     )
-
-
-def test_dashboard_plugin_manifests_and_assets_are_packaged():
-    """Bundled dashboard plugins need their manifests and built assets in
-    wheel installs so /api/dashboard/plugins can discover them outside a
-    source checkout."""
-    package_data = _load_package_data()
-    plugin_data = package_data["plugins"]
-
-    assert "*/dashboard/manifest.json" in plugin_data
-    assert "*/dashboard/dist/*" in plugin_data
-    assert "*/dashboard/dist/**/*" in plugin_data
-
-
-def test_nested_bundled_plugin_metadata_is_packaged():
-    """Nested opt-in plugins need manifests and READMEs in wheel installs."""
-    package_data = _load_package_data()
-    plugin_data = package_data["plugins"]
-
-    assert "**/plugin.yaml" in plugin_data
-    assert "**/plugin.yml" in plugin_data
-    assert "**/README.md" in plugin_data

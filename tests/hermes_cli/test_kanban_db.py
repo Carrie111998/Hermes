@@ -3342,6 +3342,15 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
+    # This test owns the NFS locking-protocol branch. Keep it independent of
+    # the separate SQLite WAL-reset-vulnerability safety branch.
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state, "is_sqlite_wal_reset_vulnerable", lambda: False
+    )
+    monkeypatch.setattr(hermes_state, "_wal_fallback_warned_paths", set())
+
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
 
