@@ -14,6 +14,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
+from hermes_cli.cli_output import format_box
 from hermes_cli.colors import Colors, color
 
 def log_info(msg: str):
@@ -513,9 +514,8 @@ def run_gui_uninstall(args):
     skip_confirm = bool(getattr(args, "yes", False))
 
     print()
-    print(color("┌─────────────────────────────────────────────────────────┐", Colors.MAGENTA, Colors.BOLD))
-    print(color("│         ⚕ Hermes Chat GUI Uninstaller                  │", Colors.MAGENTA, Colors.BOLD))
-    print(color("└─────────────────────────────────────────────────────────┘", Colors.MAGENTA, Colors.BOLD))
+    for line in format_box([("⚕ Hermes Chat GUI Uninstaller", 9)]):
+        print(color(line, Colors.MAGENTA, Colors.BOLD))
     print()
 
     if not summary["gui_installed"]:
@@ -610,9 +610,8 @@ def run_uninstall(args):
         return
 
     print()
-    print(color("┌─────────────────────────────────────────────────────────┐", Colors.MAGENTA, Colors.BOLD))
-    print(color("│            ⚕ Hermes Agent Uninstaller                  │", Colors.MAGENTA, Colors.BOLD))
-    print(color("└─────────────────────────────────────────────────────────┘", Colors.MAGENTA, Colors.BOLD))
+    for line in format_box([("⚕ Hermes Agent Uninstaller", 12)]):
+        print(color(line, Colors.MAGENTA, Colors.BOLD))
     print()
     
     # Show what will be affected
