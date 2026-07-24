@@ -1885,10 +1885,19 @@ def _strip_quotes(command: str) -> str:
 
     This prevents false positives when keywords like 'nohup' or 'setsid' appear
     in commit messages, Python -c code, echo arguments, or PR body text.
-    Also strips backtick-quoted content and heredoc-style inline text.
+    Also strips backtick-quoted content and heredoc bodies.
     """
+    # Remove heredoc bodies first — before quote stripping, which would mangle
+    # the delimiter name (e.g. << 'EOF' → << '' losing the delimiter).
+    # Matches << [-] ['"]? WORD ['"]? ... \n <body> \n WORD at start of line.
+    result = re.sub(
+        r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\1(?=\n|$)",
+        "",
+        command,
+        flags=re.DOTALL,
+    )
     # Remove single-quoted strings (no escaping inside single quotes in shell)
-    result = re.sub(r"'[^']*'", "''", command)
+    result = re.sub(r"'[^']*'", "''", result)
     # Remove double-quoted strings (handle escaped quotes)
     result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
     # Remove backtick-quoted strings
