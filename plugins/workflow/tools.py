@@ -324,6 +324,27 @@ def _handle_workflow_start_predefined(
         logger.exception("workflow_start failed for %s", workflow)
         return _err(f"execution failed: {exc}")
 
+    # Inject session_info into the state file — the engine's _save_state
+    # may not persist it because the supervisor subprocess overwrites the
+    # file. The tool handler runs in the gateway process where ContextVars
+    # are live, so we patch the state file directly after execute() returns.
+    if _sess:
+        try:
+            from pathlib import Path as _P
+            import json as _j
+            state_dir = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state"
+            for sf in sorted(state_dir.glob(f"{workflow}_*_state.json"),
+                             key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    data = _j.loads(sf.read_text())
+                    if not data.get("session_info"):
+                        data["session_info"] = _sess
+                        sf.write_text(_j.dumps(data, indent=2))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     return _ok({
         "status": "dispatched",
         "workflow": workflow,
