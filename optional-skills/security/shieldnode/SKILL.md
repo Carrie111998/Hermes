@@ -77,7 +77,7 @@ curl -sS -H "X-Api-Key: $SHIELDNODE_KEY" \
 }
 ```
 
-That gives you the upstream, the configured `base_url` (which fixes your path convention) and whether the next call goes straight through (`active: true`) or triggers an approval push. `alias` is the name the user gave the key, so refer to it by that rather than showing any part of its value. whoami never returns credentials, is never forwarded upstream, and fires no push.
+That gives you the upstream, the configured `base_url` (which fixes your path convention) and whether the next call goes straight through (`active: true`) or triggers an approval push. `alias` is the label the user put on the key, usually the name of the agent it was issued to. Name a key by its **service** when you talk about it, and use `alias` only to disambiguate when several keys exist on the same service. Never quote any part of the key value. whoami never returns credentials, is never forwarded upstream, and fires no push.
 
 **Then write the service doc, without being asked.** If there is no `services/<slug>.md` for the service whoami just named, create one from the template in `references/service-docs.md`. No command and no question to the user: whoami already gave you the service, the base URL and the auth shape. Later sessions read that file instead of deriving it again.
 
