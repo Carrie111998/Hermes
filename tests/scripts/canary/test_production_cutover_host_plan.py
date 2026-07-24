@@ -398,3 +398,160 @@ def test_writer_unit_invokes_release_bound_production_readiness() -> None:
         "Requires=muncho-canonical-writer-phase-b-readiness.service\n"
         in rendered
     )
+
+
+def test_derived_validation_sees_revision_without_exposing_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts.canary import (
+        production_cutover_owner_launcher as owner_launcher,
+    )
+
+    inputs = _unit_inputs()
+    rows = {
+        name: {
+            "staged_path": f"/staged/{name}",
+            "target_path": target,
+            "sha256": f"{index:064x}",
+        }
+        for index, (name, (target, _binding)) in enumerate(
+            package.HOST_ARTIFACT_TARGETS.items(),
+            start=1,
+        )
+    }
+    initial = {"cron_continuity_plan": {"cutover_executable": True}}
+    manifest = {
+        "manifest_sha256": "a" * 64,
+        "host_artifact_contract": {"contract_sha256": "b" * 64},
+    }
+    source = b"source"
+    staging = {
+        "release_manifest_sha256": manifest["manifest_sha256"],
+        "host_artifact_contract_sha256": manifest[
+            "host_artifact_contract"
+        ]["contract_sha256"],
+        "source_gateway_config_sha256": producer._sha(source),
+        "source_writer_config_sha256": producer._sha(source),
+        "staged_files": rows,
+        "capability_topology": {"topology": "fixed"},
+        "secret_foundation": {
+            "operational_edge_key_foundation": {"foundation": "fixed"},
+            "operational_edge_key_foundation_sha256": "c" * 64,
+            "operational_edge_receipt_public_key_ids": {"edge": "d" * 64},
+        },
+    }
+    monkeypatch.setattr(
+        owner_launcher,
+        "validate_initial_collector_receipt",
+        lambda *_args, **_kwargs: initial,
+    )
+    monkeypatch.setattr(
+        producer.package,
+        "verify_release_artifacts",
+        lambda *_args, **_kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        producer,
+        "_read_regular",
+        lambda *_args, **_kwargs: (source, {}),
+    )
+    monkeypatch.setattr(producer, "_decode", lambda _raw: {})
+    monkeypatch.setattr(
+        producer,
+        "_validate_staging_receipt",
+        lambda *_args, **_kwargs: staging,
+    )
+    monkeypatch.setattr(
+        producer,
+        "_staged_rows",
+        lambda **_kwargs: rows,
+    )
+    monkeypatch.setattr(
+        producer,
+        "_identity_foundation",
+        lambda _inputs: {"identity": "fixed"},
+    )
+    monkeypatch.setattr(
+        producer,
+        "_discord_key_foundation",
+        lambda **_kwargs: {"keys": "fixed"},
+    )
+    monkeypatch.setattr(
+        producer.host_authority,
+        "_target_pre_state",
+        lambda *_args, **_kwargs: {
+            "state": "absent",
+            "uid": None,
+            "gid": None,
+            "mode": None,
+        },
+    )
+    monkeypatch.setattr(
+        producer,
+        "_target_file_identity",
+        lambda *_args, **_kwargs: (1, 2, 0o400),
+    )
+    monkeypatch.setattr(
+        producer,
+        "_metadata_only",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        producer,
+        "_validate_reconciliation_intent",
+        lambda *_args, **_kwargs: ({}, {}),
+    )
+    monkeypatch.setattr(
+        producer.cutover,
+        "build_discord_policy_continuity",
+        lambda **_kwargs: {"policy": "fixed"},
+    )
+    monkeypatch.setattr(
+        producer,
+        "_directory_prestate",
+        lambda *_args, **_kwargs: {
+            "state": "absent",
+            "uid": None,
+            "gid": None,
+            "mode": None,
+        },
+    )
+    captured: dict[str, object] = {}
+
+    def validate(
+        request: dict[str, object],
+        *,
+        initial: dict[str, object],
+    ) -> None:
+        captured["request"] = request
+        captured["initial"] = initial
+        assert request["release_revision"] == REVISION
+
+    monkeypatch.setattr(
+        producer.host_authority,
+        "_validate_transition_and_plan",
+        validate,
+    )
+
+    result = producer.collect_fixed_host_plan(
+        REVISION,
+        {},
+        release_root=tmp_path,
+        filesystem_root=tmp_path,
+        unit_inputs=inputs,
+        require_root=False,
+    )
+
+    assert captured["initial"] is initial
+    assert set(captured["request"]) == {*result, "release_revision"}
+    assert "release_revision" not in result
+    assert set(result) == {
+        "release_manifest_sha256",
+        "gateway_target_identity",
+        "writer_target_identity",
+        "connector_target_identity",
+        "host_transition",
+        "capability_topology",
+        "cron_continuity_plan",
+    }
