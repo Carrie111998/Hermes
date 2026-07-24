@@ -244,6 +244,7 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     assert res["outcome"] == "blocked_budget"
     assert res["turns_used"] == 3
     assert "turn budget" in blocked["reason"].lower()
+    assert blocked["kind"] == "transient"
 
 
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
@@ -273,17 +274,22 @@ def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
     _patch_judge(monkeypatch, ["done", "done"])
     blocked = {}
 
+    def _block(reason, kind=None):
+        blocked["reason"] = reason
+        blocked["kind"] = kind
+
     res = goals.run_kanban_goal_loop(
         task_id="t5",
         goal_text="task",
         run_turn=lambda p: "still not finalizing",
         task_status_fn=lambda: "running",
-        block_fn=lambda r: blocked.update(reason=r),
+        block_fn=_block,
         max_turns=10,
         first_response="looks done",
     )
     assert res["outcome"] == "blocked_budget"
     assert "finalize" in blocked["reason"].lower()
+    assert blocked["kind"] == "transient"
 
 
 def test_loop_stops_if_task_reclaimed(monkeypatch):
@@ -297,6 +303,44 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         first_response="x",
     )
     assert res["outcome"] == "stopped"
+
+
+def test_cli_goal_loop_forwards_block_kind(monkeypatch):
+    import types
+
+    import cli as cli_mod
+
+    class _Conn:
+        def close(self):
+            pass
+
+    task = types.SimpleNamespace(title="task", body=None, goal_max_turns=3)
+    block_calls = []
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t1")
+    monkeypatch.setattr(kb, "connect", lambda: _Conn())
+    monkeypatch.setattr(kb, "get_task", lambda conn, task_id: task)
+    monkeypatch.setattr(
+        kb,
+        "block_task",
+        lambda conn, task_id, **kwargs: block_calls.append((task_id, kwargs)) or True,
+    )
+
+    def _fake_loop(**kwargs):
+        kwargs["block_fn"]("budget", kind="transient")
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _fake_loop)
+    fake_cli = types.SimpleNamespace(
+        agent=types.SimpleNamespace(),
+        conversation_history=[],
+        session_id=None,
+    )
+
+    cli_mod._run_kanban_goal_loop_q(fake_cli, "first")
+
+    assert block_calls == [
+        ("t1", {"reason": "budget", "kind": "transient"}),
+    ]
 
 
 # ---------------------------------------------------------------------------
