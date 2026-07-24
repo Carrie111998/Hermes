@@ -285,7 +285,6 @@ def _wrap_with_execute_command_guards(
                     command_label.strip(),
                     os.getenv("TERMINAL_ENV", "local"),
                     approval_callback=approval_cb,
-                    source="claude-code-acp",
                 )
                 if isinstance(result, dict) and result.get("approved"):
                     return "once"
@@ -352,7 +351,6 @@ def _make_gateway_request_callback(
             result = request_fn(
                 tool_name=tool_name,
                 reason=reason,
-                source="claude-code-acp",
             )
         except Exception:
             logger.warning(
