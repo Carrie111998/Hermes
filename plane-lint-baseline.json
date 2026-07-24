@@ -1,0 +1,211 @@
+{
+  "tool": "plane_lint.py",
+  "generated": "2026-07-24T05:14:37+00:00",
+  "count": 68,
+  "entries": {
+    "deploy/finexis/mtu/OPS-NOTE.md::client-token::mtu:bor_": {
+      "note": "content x4, first at line 10"
+    },
+    "deploy/finexis/mtu/OPS-NOTE.md::client-token::mtu:finexis": {
+      "note": "path; content x3, first at line 14"
+    },
+    "deploy/finexis/mtu/OPS-NOTE.md::client-token::mtu:mtu": {
+      "note": "path; content x23, first at line 1"
+    },
+    "deploy/finexis/mtu/OPS-NOTE.md::client-token::tgg:christopher": {
+      "note": "content x2, first at line 11"
+    },
+    "deploy/finexis/mtu/README.md::client-token::mtu:bor_": {
+      "note": "content x2, first at line 5"
+    },
+    "deploy/finexis/mtu/README.md::client-token::mtu:finexis": {
+      "note": "path; content x5, first at line 1"
+    },
+    "deploy/finexis/mtu/README.md::client-token::mtu:mtu": {
+      "note": "path; content x14, first at line 1"
+    },
+    "deploy/finexis/mtu/README.md::client-token::tgg:christopher": {
+      "note": "content x1, first at line 3"
+    },
+    "deploy/finexis/mtu/README.md::client-token::tgg:tgg": {
+      "note": "content x1, first at line 3"
+    },
+    "deploy/finexis/mtu/SOUL.md::client-token::mtu:bor_": {
+      "note": "content x1, first at line 5"
+    },
+    "deploy/finexis/mtu/SOUL.md::client-token::mtu:finexis": {
+      "note": "path; content x2, first at line 3"
+    },
+    "deploy/finexis/mtu/SOUL.md::client-token::mtu:mtu": {
+      "note": "path; content x8, first at line 1"
+    },
+    "deploy/finexis/mtu/config.yaml::client-token::mtu:bor_": {
+      "note": "content x1, first at line 25"
+    },
+    "deploy/finexis/mtu/config.yaml::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/config.yaml::client-token::mtu:mtu": {
+      "note": "path; content x5, first at line 1"
+    },
+    "deploy/finexis/mtu/config.yaml::client-token::tgg:christopher": {
+      "note": "content x2, first at line 6"
+    },
+    "deploy/finexis/mtu/knowledge/bor-draft-template.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/knowledge/bor-draft-template.md::client-token::mtu:mtu": {
+      "note": "path; content x1, first at line 1"
+    },
+    "deploy/finexis/mtu/knowledge/bor-required-checks.yaml::client-token::mtu:finexis": {
+      "note": "path; content x1, first at line 4"
+    },
+    "deploy/finexis/mtu/knowledge/bor-required-checks.yaml::client-token::mtu:mtu": {
+      "note": "path; content x2, first at line 1"
+    },
+    "deploy/finexis/mtu/knowledge/replacement-path-taxonomy.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/knowledge/replacement-path-taxonomy.md::client-token::mtu:mtu": {
+      "note": "path; content x1, first at line 1"
+    },
+    "deploy/finexis/mtu/knowledge/standard-disclosures.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/knowledge/standard-disclosures.md::client-token::mtu:mtu": {
+      "note": "path; content x1, first at line 1"
+    },
+    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::mtu:bor_": {
+      "note": "content x3, first at line 4"
+    },
+    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::mtu:finexis": {
+      "note": "path; content x3, first at line 20"
+    },
+    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::mtu:mtu": {
+      "note": "path; content x8, first at line 1"
+    },
+    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::tgg:christopher": {
+      "note": "content x2, first at line 3"
+    },
+    "deploy/finexis/mtu/mtu_constitution.yaml::client-token::tgg:tgg": {
+      "note": "content x1, first at line 3"
+    },
+    "deploy/finexis/mtu/scripts/bootstrap_local.sh::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/scripts/bootstrap_local.sh::client-token::mtu:mtu": {
+      "note": "path; content x10, first at line 2"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-13-synthetic-e2e.md::client-token::mtu:bor_": {
+      "note": "content x8, first at line 3"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-13-synthetic-e2e.md::client-token::mtu:finexis": {
+      "note": "path; content x1, first at line 5"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-13-synthetic-e2e.md::client-token::mtu:mtu": {
+      "note": "path; content x20, first at line 1"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-affordability-boolean-regression.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-affordability-boolean-regression.md::client-token::mtu:mtu": {
+      "note": "path; content x1, first at line 1"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-concision-regression.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-concision-regression.md::client-token::mtu:mtu": {
+      "note": "path; content x1, first at line 1"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-draft-first-placeholders.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-draft-first-placeholders.md::client-token::mtu:mtu": {
+      "note": "path; content x3, first at line 1"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-hospital-field-contract-regression.md::client-token::mtu:finexis": {
+      "note": "path"
+    },
+    "deploy/finexis/mtu/test-transcripts/2026-07-14-hospital-field-contract-regression.md::client-token::mtu:mtu": {
+      "note": "path; content x1, first at line 1"
+    },
+    "gateway/durable_jsonl_consumer.py::client-token::tgg:christopher": {
+      "note": "content x3, first at line 3483"
+    },
+    "gateway/durable_jsonl_consumer.py::client-token::tgg:tgg": {
+      "note": "content x17, first at line 754"
+    },
+    "gateway/pa_observability.py::client-token::tgg:christopher": {
+      "note": "content x4, first at line 18"
+    },
+    "gateway/pa_observability.py::client-token::tgg:tgg": {
+      "note": "content x2, first at line 10"
+    },
+    "gateway/platforms/whatsapp.py::client-token::tgg:hdb": {
+      "note": "content x1, first at line 1054"
+    },
+    "gateway/platforms/whatsapp.py::client-token::tgg:tgg": {
+      "note": "content x6, first at line 586"
+    },
+    "gateway/replay.py::client-token::tgg:christopher": {
+      "note": "content x1, first at line 501"
+    },
+    "gateway/replay.py::client-token::tgg:tgg": {
+      "note": "content x7, first at line 134"
+    },
+    "gateway/replay_orchestrator.py::client-token::tgg:tgg": {
+      "note": "content x3, first at line 28"
+    },
+    "gateway/run.py::client-token::tgg:tgg": {
+      "note": "content x2, first at line 8315"
+    },
+    "hermes_cli/replay.py::client-token::tgg:tgg": {
+      "note": "content x4, first at line 215"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:SK/JOB": {
+      "note": "content x9, first at line 542"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:christopher": {
+      "note": "content x4, first at line 306"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:hdb": {
+      "note": "content x15, first at line 31"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:ilinked": {
+      "note": "content x23, first at line 28"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:sprucing": {
+      "note": "content x2, first at line 2274"
+    },
+    "tools/pa_business_tools.py::client-token::tgg:tgg": {
+      "note": "content x173, first at line 311"
+    },
+    "tools/pa_photo_pair_classifier.py::client-token::tgg:sprucing": {
+      "note": "content x1, first at line 1"
+    },
+    "tools/tgg_ilinked_lookup.py::client-token::tgg:christopher": {
+      "note": "content x5, first at line 1"
+    },
+    "tools/tgg_ilinked_lookup.py::client-token::tgg:ilinked": {
+      "note": "path; content x32, first at line 1"
+    },
+    "tools/tgg_ilinked_lookup.py::client-token::tgg:tgg": {
+      "note": "path; content x7, first at line 3"
+    },
+    "tools/tgg_ilinked_reads.py::client-token::tgg:christopher": {
+      "note": "content x8, first at line 1"
+    },
+    "tools/tgg_ilinked_reads.py::client-token::tgg:ilinked": {
+      "note": "path; content x33, first at line 1"
+    },
+    "tools/tgg_ilinked_reads.py::client-token::tgg:tgg": {
+      "note": "path; content x7, first at line 19"
+    },
+    "toolsets.py::client-token::tgg:sprucing": {
+      "note": "content x1, first at line 210"
+    },
+    "toolsets.py::client-token::tgg:tgg": {
+      "note": "content x20, first at line 185"
+    }
+  }
+}

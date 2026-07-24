@@ -1,0 +1,21 @@
+{
+  "$comment": "Anti-drift plane boundary declaration (PA de-fusion Phase 0.2). Consumed by scripts/plane_lint.py. Client planes win over shared planes on overlap: deploy/ is shared EXCEPT deploy/tgg/, which is client-plane. clients/ is the future hermes client-pack root (Phase 2). loaderSeamExceptions is the ONLY sanctioned shared->client import seam (the pack loader / tenant registration entry point); empty until the Phase-2 tool-pack loader lands.",
+  "sharedPlanePaths": [
+    "gateway/",
+    "tools/",
+    "hermes_cli/",
+    "agent/",
+    "toolsets.py",
+    "deploy/"
+  ],
+  "clientPlanePaths": [
+    "deploy/tgg/",
+    "tests/fixtures/clients/",
+    "clients/"
+  ],
+  "loaderSeamExceptions": [],
+  "clientTokenRegistry": {
+    "tgg": ["tgg", "christopher", "SK/JOB", "hdb", "ilinked", "huidapcl", "sprucing"],
+    "mtu": ["mtu", "finexis", "bor_"]
+  }
+}
