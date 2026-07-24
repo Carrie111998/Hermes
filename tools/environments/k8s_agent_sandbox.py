@@ -153,7 +153,6 @@ class K8sSandboxBackend(BaseEnvironment):
             f"tar cf {shlex.quote(rel_remote_tar)} -C /app {shlex.quote(rel_base)}"
         )
         content = self._sandbox.files.read(rel_remote_tar)
-        print("dest", dest)
         with open(dest, "wb") as fo:
             fo.write(content)
         try:

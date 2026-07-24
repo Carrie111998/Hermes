@@ -3084,15 +3084,6 @@ if __name__ == "__main__":
     print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")
     print(f"  TERMINAL_LIFETIME_SECONDS: {os.getenv('TERMINAL_LIFETIME_SECONDS', '300')}")
 
-    import json
-
-    output = terminal_tool(command='echo "test message" > test.txt')
-    output = terminal_tool(command='ls -la')
-    try:
-        print("dima success", json.loads(output)["output"])
-    except:
-        print("dima error", output)
-
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
