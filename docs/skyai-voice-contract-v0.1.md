@@ -11,19 +11,22 @@ chat backends. The PBX talks SIP/RTP to the gateway. The gateway handles call
 state, audio codecs, STT, TTS, barge-in, silence timeout, and transfer. SkyAI
 receives clean text turns plus call metadata through a stable adapter contract.
 
-This keeps the future PBX work reusable when production moves from current
-SkyAI v1 to SkyAI v2 Hermes. The gateway must target a stable SkyAI adapter,
-not a frontend widget implementation.
+Production now uses SkyAI v2 Hermes. The gateway must target its stable SkyAI
+adapter, not a frontend widget implementation. The v1 target remains only for
+historical DEV comparison while the archived standalone repository is retired.
 
 ## Current SkyAI Architecture
 
 ### Current production chat backend
 
-Current production SkyAI is a chat-only backend behind the production ingress:
+Current production SkyAI is the Hermes v2 backend behind the production
+ingress:
 
 - environment: production;
-- service identity: `skyai-hermes-assistant-prod`;
-- current version family: `skyai-chat-prod.v*`;
+- runtime: `hermes_agent`;
+- toolset: `skyai_customer`;
+- current behavior line at the 2026-07-24 archive audit: `v2.5`;
+- deployed build at that audit: `df9fbccdc`;
 - public chat surface: `POST /chatkit/message`;
 - health/readiness surfaces: `GET /health`, `GET /ready`, `GET /version`;
 - current customer model lane: `openai-codex` / `gpt-5.6-sol` through the existing
@@ -34,9 +37,20 @@ Current production SkyAI is a chat-only backend behind the production ingress:
 - no admin, DevOps, Shopify admin, order mutation, payment mutation, voucher
   mutation, raw analytics disclosure, or Muncho brain access.
 
-### SkyAI v2 Hermes canary backend
+### Legacy v1 DEV backend
 
-SkyAI v2 is a Hermes profile plus `skyai_customer` plugin and a canary gateway:
+The separate `skyai_v1` DEV ingress is frozen historical comparison evidence:
+
+- it is not production and has no Discord or mutation capabilities;
+- its source repository `lomliev/skyvision-hermes-ai-assistant` is archived;
+- it must not receive new behavior, knowledge, or deployment work;
+- rebuilding or promoting it requires an explicit decision to unarchive the
+  historical repository.
+
+### SkyAI v2 Hermes DEV backend
+
+SkyAI v2 DEV is a Hermes profile plus `skyai_customer` plugin and a canary
+gateway:
 
 - environment: DEV/canary;
 - runtime: Hermes/AIAgent;
@@ -114,7 +128,7 @@ PBX extension/IVR
   -> SIP/RTP to SkyAI Voice Gateway
   -> STT
   -> SkyAI Voice Adapter
-  -> SkyAI v1 or v2 chat backend
+  -> SkyAI v2 Hermes backend
   -> TTS
   -> RTP audio back to caller
 ```
@@ -486,8 +500,8 @@ Recommended first MVP:
 3. No recording by default.
 4. STT/TTS provider hidden behind the Voice Gateway interface.
 5. SkyAI text backend target is configurable:
-   - `skyai_v1_chatkit`;
-   - `skyai_v2_chatkit`.
+   - `skyai_v2_chatkit` is authoritative;
+   - `skyai_v1_chatkit` is historical DEV comparison compatibility only.
 6. DTMF `0` transfers directly; natural-language handoff requests are decided
    by Hermes and returned as a structured `skyai_voice_transfer_to_human` action.
 7. End-to-end test matrix:

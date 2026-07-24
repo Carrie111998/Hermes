@@ -7,6 +7,7 @@ def test_disallowed_files_allows_only_skyai_v2_edge_layer() -> None:
     files = [
         "plugins/skyai_customer/public_tools.py",
         "skills/productivity/skyai-customer-hermes-v2/SKILL.md",
+        "docs/skyai-v1-legacy-archive.md",
         "docs/skyai-v2-hermes-plugin-bootstrap.md",
         "docs/skyai-voice-contract-v0.1.md",
         "docs/voice/skyai-voice-joint-contract-v0.1.md",

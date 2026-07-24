@@ -52,6 +52,23 @@ Current line:
   repetition, and repeats earlier details only when the customer explicitly
   asks or prior information must be corrected. No backend deduplication or
   keyword guard is added.
+- `v2.6` - voucher issuer boundary: before giving account, activation, or
+  redemption steps, Hermes reasons about who issued the voucher. SkyVision
+  profile flows apply only to SkyVision-issued vouchers; externally issued
+  vouchers remain under their issuer even when the same experience is listed
+  by SkyVision. No brand-specific classifier or router is added.
+
+## Canonical Source
+
+This plugin in `lomliev/hermes-agent` is the only source for future SkyAI
+customer behavior. The former standalone repository
+`lomliev/skyvision-hermes-ai-assistant` is a read-only historical archive and
+must not receive new prompt, knowledge, evaluation, voice-brain, or deployment
+work.
+
+The `skyai_v1_chatkit` voice target is retained only as a wire-compatibility
+label for historical DEV comparison. It is not a second business brain and
+does not make the archived repository a runtime source for SkyAI v2.
 
 ## Voice Contract
 

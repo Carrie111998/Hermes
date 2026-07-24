@@ -16,6 +16,7 @@ from pathlib import Path
 ALLOWED_PREFIXES = (
     "plugins/skyai_customer/",
     "skills/productivity/skyai-customer-hermes-v2/",
+    "docs/skyai-v1-legacy-archive.md",
     "docs/skyai-v2-",
     "docs/skyai-voice-contract-v0.1.md",
     "docs/voice/skyai-voice-joint-contract-v0.1.md",

@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - exercised by runtime health checks
 
 
 VERSION = "skyai-hermes-v2.canary"
-SKYAI_BEHAVIOR_VERSION = "v2.5"
+SKYAI_BEHAVIOR_VERSION = "v2.6"
 SKYAI_TOOLSET = "skyai_customer"
 SKYAI_PLUGIN_KEY = "skyai-customer"
 DEFAULT_HOST = "127.0.0.1"

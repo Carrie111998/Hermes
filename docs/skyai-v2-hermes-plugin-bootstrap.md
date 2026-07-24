@@ -2,6 +2,18 @@
 
 Date: 2026-07-03
 
+## Current Canonical Status
+
+As of 2026-07-24, SkyAI v2 is the production customer assistant and this
+plugin worktree is the only canonical source for future SkyAI behavior.
+Production health reports the Hermes runtime with the `skyai_customer` toolset.
+
+The former standalone repository `lomliev/skyvision-hermes-ai-assistant` is a
+read-only historical v1/clean-room archive. Its separate `skyai_v1` DEV ingress
+may remain temporarily available as frozen comparison evidence, but it is not
+the production source and must not receive new behavior or deployment work.
+See `docs/skyai-v1-legacy-archive.md`.
+
 ## Decision
 
 SkyAI v2 starts as a plugin/skills layer on top of clean upstream Hermes

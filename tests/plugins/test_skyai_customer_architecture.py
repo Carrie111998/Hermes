@@ -12,10 +12,15 @@ QA_PRINCIPLES_PATH = Path("plugins/skyai_customer/fixtures/qa_behavior_principle
 
 def test_architecture_contract_declares_hermes_led_reasoning() -> None:
     text = ARCHITECTURE_PATH.read_text(encoding="utf-8")
+    compact = " ".join(text.split())
 
     assert "Hermes reasons" in text
     assert "The SkyAI backend and tools provide public facts" in text
     assert "Do not reintroduce keyword routers" in text
+    assert "only canonical source" in compact
+    assert "historical v1/clean-room archive" in compact
+    assert "Keyword classifiers, synthetic response templates" in compact
+    assert "wire compatibility only" in compact
     assert "Plugin vs Fork" in text
     assert "Daily Upstream Hermes Update Flow" in text
 

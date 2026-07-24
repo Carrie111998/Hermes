@@ -2,6 +2,23 @@
 
 This document is the source of truth for SkyAI v2 customer-facing behavior.
 
+## Canonical Source And Legacy Archive
+
+The `skyai_customer` plugin in `lomliev/hermes-agent` is the only canonical
+source for SkyAI customer behavior, public facts, evaluation principles, and
+voice-brain semantics.
+
+The former standalone repository `lomliev/skyvision-hermes-ai-assistant` is a
+historical v1/clean-room archive. It may be consulted for provenance and
+forensic review, but no future behavior fix may be implemented or deployed
+from it. Useful facts must be revalidated and expressed here as public evidence
+and Hermes principles. Keyword classifiers, synthetic response templates,
+phrase matchers, and v1 safety addenda must not be migrated.
+
+Historical `skyai_v1_chatkit` adapter support is wire compatibility only. It
+does not authorize a second business brain or a source dependency on the
+archived repository.
+
 ## Fundamental Principle
 
 Hermes reasons. The SkyAI backend and tools provide public facts, structured
@@ -193,9 +210,9 @@ truth for the first PBX/voice design gate is
 
 The contract keeps SIP/RTP, STT, TTS, barge-in, silence timeouts, call state,
 recording policy, and human transfer behavior inside a future SkyAI Voice
-Gateway. The gateway may target the current SkyAI v1 chat backend or the SkyAI
-v2 Hermes backend through the same adapter surface, so PBX work remains usable
-after v2 promotion.
+Gateway. The gateway targets the SkyAI v2 Hermes backend. Historical
+`skyai_v1_chatkit` support is comparison compatibility through the same adapter
+surface, not a second business brain or an active source dependency.
 
 The DEV gateway may register `/voice/*` HTTP transcript/event routes as the
 stable adapter surface. Those routes must remain transport-only: no SIP client,
