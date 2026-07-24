@@ -51,10 +51,31 @@ def board_task(isolated_bridge):
         task_id = kb.create_task(
             conn,
             title="Task 3 receipt destination",
+            assignee="forge",
             created_by="gauge",
             initial_status="running",
         )
-    return task_id
+        assert kb.claim_task(conn, task_id, claimer="bridge-claim") is not None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.current_run_id is not None
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id='workflow-v1', current_step_key='implement' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+    return ad.BridgeAuthorityContext(
+        kanban_db_path=str(isolated_bridge["kanban_path"].resolve()),
+        workflow_id="workflow-v1",
+        step_key="implement",
+        step_attempt_id=f"workflow-v1/implement/{task.current_run_id}",
+        task_id=task_id,
+        run_id=task.current_run_id,
+        claim_token="bridge-claim",
+        lane="forge",
+        route="test-model",
+        owner_id="parent-session",
+    )
 
 
 def _public(name: str) -> Callable:
@@ -63,19 +84,32 @@ def _public(name: str) -> Callable:
     return value
 
 
-def _dispatch(logical_key: str, digest: str, runner: Callable, **extra):
+def _dispatch(
+    logical_key: str,
+    runner: Callable,
+    authority_context: ad.BridgeAuthorityContext,
+    *,
+    goal: str = "verify logical receipt",
+    context: str = "Task 3 RED",
+    role: str = "leaf",
+    **extra,
+):
+    digest = ad.canonical_json_digest(
+        ad.canonical_dispatch_input(goal, context, role)
+    )
     return _public("dispatch_logical_delegation")(
         logical_key=logical_key,
         input_digest=digest,
-        goal="verify logical receipt",
-        context="Task 3 RED",
+        goal=goal,
+        context=context,
         toolsets=None,
-        role="leaf",
+        role=role,
         model="test-model",
         session_key="source-session",
         parent_session_id="parent-session",
         runner=runner,
         max_async_children=8,
+        authority_context=authority_context,
         **extra,
     )
 
@@ -102,11 +136,16 @@ def _terminal_runner(summary: str = "done"):
     }
 
 
-def _attach(logical_key: str, isolated_bridge, board_task: str, **extra):
+def _attach(
+    logical_key: str,
+    isolated_bridge,
+    board_task: ad.BridgeAuthorityContext,
+    **extra,
+):
     return _public("attach_logical_dispatch_receipt")(
         logical_key=logical_key,
         kanban_db_path=isolated_bridge["kanban_path"],
-        task_id=board_task,
+        task_id=board_task.task_id,
         **extra,
     )
 
@@ -127,7 +166,7 @@ def _bridge_counts(kanban_path: Path, task_id: str, logical_key: str) -> dict[st
     return {"receipt": receipt, "event": event, "continuation": continuation}
 
 
-def test_stable_logical_key_reserves_before_launch_and_reuses_one_execution():
+def test_stable_logical_key_reserves_before_launch_and_reuses_one_execution(board_task):
     gate = threading.Event()
     entered = threading.Event()
     calls = {"count": 0}
@@ -140,10 +179,10 @@ def test_stable_logical_key_reserves_before_launch_and_reuses_one_execution():
         gate.wait(timeout=5)
         return _terminal_runner()
 
-    first = _dispatch("workflow/step/attempt", "sha256:input-a", runner)
+    first = _dispatch("workflow/step/attempt", runner, board_task)
     assert first["state"] in {"reserved", "running"}
     assert entered.wait(timeout=2)
-    second = _dispatch("workflow/step/attempt", "sha256:input-a", runner)
+    second = _dispatch("workflow/step/attempt", runner, board_task)
 
     assert second["delegation_id"] == first["delegation_id"]
     assert second["execution_id"] == first["execution_id"]
@@ -159,7 +198,7 @@ def test_stable_logical_key_reserves_before_launch_and_reuses_one_execution():
 def test_terminal_source_evidence_is_durable_before_kanban_attachment(
     isolated_bridge, board_task
 ):
-    dispatched = _dispatch("durable/source", "sha256:input", _terminal_runner)
+    dispatched = _dispatch("durable/source", _terminal_runner, board_task)
     terminal = _wait_state("durable/source", {"terminal_unattached"})
     ad._reset_for_tests()  # discard process memory; the next read must come from SQLite
     terminal = _get("durable/source")
@@ -170,7 +209,9 @@ def test_terminal_source_evidence_is_durable_before_kanban_attachment(
     assert terminal["receipt_id"] is None
     assert terminal["source_acknowledged_at"] is None
     assert isolated_bridge["kanban_path"].exists()
-    assert _bridge_counts(isolated_bridge["kanban_path"], board_task, "durable/source") == {
+    assert _bridge_counts(
+        isolated_bridge["kanban_path"], board_task.task_id, "durable/source"
+    ) == {
         "receipt": 0,
         "event": 0,
         "continuation": 0,
@@ -185,7 +226,7 @@ def test_replay_at_attach_and_source_ack_boundaries_is_exactly_once(
     boundary, isolated_bridge, board_task
 ):
     logical_key = f"replay/{boundary}"
-    _dispatch(logical_key, "sha256:stable", _terminal_runner)
+    _dispatch(logical_key, _terminal_runner, board_task)
     _wait_state(logical_key, {"terminal_unattached"})
 
     if boundary == "before_attach":
@@ -213,7 +254,7 @@ def test_replay_at_attach_and_source_ack_boundaries_is_exactly_once(
     _public("acknowledge_logical_dispatch")(logical_key=logical_key)
     _public("acknowledge_logical_dispatch")(logical_key=logical_key)
 
-    assert _bridge_counts(isolated_bridge["kanban_path"], board_task, logical_key) == {
+    assert _bridge_counts(isolated_bridge["kanban_path"], board_task.task_id, logical_key) == {
         "receipt": 1,
         "event": 1,
         "continuation": 1,
@@ -232,18 +273,31 @@ def test_conflicting_digest_quarantines_logical_key_and_cannot_continue(
         calls["count"] += 1
         return _terminal_runner()
 
-    first = _dispatch("conflict/key", "sha256:a", runner)
-    conflict = _dispatch("conflict/key", "sha256:b", runner)
+    first = _dispatch("conflict/key", runner, board_task)
+    conflict = _dispatch(
+        "conflict/key",
+        runner,
+        board_task,
+        context="Task 3 RED changed input",
+    )
 
     assert conflict["status"] == "quarantined"
     assert conflict["delegation_id"] == first["delegation_id"]
-    assert conflict["expected_digest"] == "sha256:a"
-    assert conflict["observed_digest"] == "sha256:b"
+    assert conflict["expected_digest"] == ad.canonical_json_digest(
+        ad.canonical_dispatch_input("verify logical receipt", "Task 3 RED", "leaf")
+    )
+    assert conflict["observed_digest"] == ad.canonical_json_digest(
+        ad.canonical_dispatch_input(
+            "verify logical receipt", "Task 3 RED changed input", "leaf"
+        )
+    )
     assert calls["count"] == 1
     replay = _attach("conflict/key", isolated_bridge, board_task)
     assert replay["status"] == "quarantined"
     assert _get("conflict/key")["state"] == "quarantined"
-    assert _bridge_counts(isolated_bridge["kanban_path"], board_task, "conflict/key") == {
+    assert _bridge_counts(
+        isolated_bridge["kanban_path"], board_task.task_id, "conflict/key"
+    ) == {
         "receipt": 0,
         "event": 0,
         "continuation": 0,
@@ -255,7 +309,7 @@ def test_retention_protects_unfinished_bridge_evidence_and_overflow_backpressure
 ):
     keys = ["retain/unattached", "retain/pending-receipt", "retain/unacknowledged"]
     for key in keys:
-        _dispatch(key, f"sha256:{key}", _terminal_runner)
+        _dispatch(key, _terminal_runner, board_task)
         _wait_state(key, {"terminal_unattached"})
 
     pending = _attach(
@@ -285,8 +339,8 @@ def test_retention_protects_unfinished_bridge_evidence_and_overflow_backpressure
 
     rejected = _dispatch(
         "retain/overflow",
-        "sha256:overflow",
         _terminal_runner,
+        board_task,
         max_pending_records=1,
     )
     assert rejected["status"] == "backpressure"

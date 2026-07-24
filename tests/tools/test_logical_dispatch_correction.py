@@ -59,7 +59,9 @@ def _claimed_authority(board: Path, *, title: str = "bridge target"):
 
 def _reserve_terminal(authority, result):
     key = ad.canonical_logical_key(authority)
-    digest = ad.canonical_json_digest({"goal": "bounded receipt"})
+    digest = ad.canonical_json_digest(
+        ad.canonical_dispatch_input("bounded receipt", None, "leaf")
+    )
     reserved = ad.reserve_logical_delegation(
         logical_key=key,
         input_digest=digest,
@@ -75,6 +77,203 @@ def _reserve_terminal(authority, result):
     committed = ad.commit_logical_delegation_result(key, digest, result)
     assert committed["state"] == "terminal_unattached"
     return key, digest
+
+
+def _bridge_counts(board: Path, task_id: str, logical_key: str):
+    with sqlite3.connect(board) as conn:
+        receipt = conn.execute(
+            "SELECT COUNT(*) FROM delegation_receipts WHERE logical_key=?",
+            (logical_key,),
+        ).fetchone()[0]
+        continuation = conn.execute(
+            "SELECT COUNT(*) FROM delegation_continuations WHERE logical_key=?",
+            (logical_key,),
+        ).fetchone()[0]
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='delegation_receipted'",
+            (task_id,),
+        ).fetchall()
+    event = sum(json.loads(payload)["logical_key"] == logical_key for (payload,) in events)
+    return {"receipt": receipt, "event": event, "continuation": continuation}
+
+
+def test_direct_dispatch_without_current_run_claim_emits_no_authoritative_bridge_state(
+    tmp_path: Path,
+):
+    board = tmp_path / "unclaimed.db"
+    kb.init_db(board)
+    with kb.connect_closing(board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="unclaimed compatibility target",
+            created_by="correction-test",
+            initial_status="running",
+        )
+
+    goal = "unclaimed direct dispatch"
+    logical_key = "compatibility/unclaimed"
+    input_digest = ad.canonical_json_digest(
+        {"tasks": [{"goal": goal, "context": None, "role": "leaf"}]}
+    )
+    dispatched = ad.dispatch_logical_delegation(
+        logical_key=logical_key,
+        input_digest=input_digest,
+        goal=goal,
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="local",
+        session_key="forge",
+        parent_session_id="parent",
+        runner=lambda: {"status": "PASS", "summary": "compatibility evidence"},
+    )
+    assert dispatched["status"] == "dispatched"
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        record = ad.get_logical_delegation(logical_key)
+        if record and record["state"] == "terminal_unattached":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("direct logical dispatch did not become terminal")
+
+    attached = ad.attach_logical_dispatch_receipt(
+        logical_key=logical_key,
+        kanban_db_path=board,
+        task_id=task_id,
+        acknowledge_source=False,
+    )
+
+    assert attached["status"] == "non_authoritative"
+    with sqlite3.connect(board) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM delegation_receipts WHERE logical_key=?",
+            (logical_key,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM delegation_continuations WHERE logical_key=?",
+            (logical_key,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='delegation_receipted'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_authoritative_reservation_rejects_sha256_prefixed_non_hex_digest(tmp_path: Path):
+    authority = _claimed_authority(tmp_path / "malformed-digest.db")
+    logical_key = ad.canonical_logical_key(authority)
+
+    rejected = ad.reserve_logical_delegation(
+        logical_key=logical_key,
+        input_digest="sha256:not-a-canonical-hex-digest",
+        goal="malformed digest",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="local",
+        authority_context=authority,
+    )
+
+    assert rejected["status"] == "rejected"
+    assert ad.get_logical_delegation(logical_key) is None
+
+
+def test_compatibility_evidence_is_explicitly_non_authoritative_and_cannot_attach(
+    tmp_path: Path,
+):
+    board = tmp_path / "claimed-compatibility.db"
+    authority = _claimed_authority(board)
+    goal = "retain non-authoritative compatibility evidence"
+    logical_key = "compatibility/claimed"
+    input_digest = ad.canonical_json_digest(
+        {"tasks": [{"goal": goal, "context": None, "role": "leaf"}]}
+    )
+    dispatched = ad.dispatch_logical_delegation(
+        logical_key=logical_key,
+        input_digest=input_digest,
+        goal=goal,
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="local",
+        session_key="forge",
+        parent_session_id="parent",
+        runner=lambda: {"status": "PASS", "summary": "compatibility evidence"},
+    )
+    assert dispatched["status"] == "dispatched"
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        record = ad.get_logical_delegation(logical_key)
+        if record and record["state"] == "terminal_unattached":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("compatibility dispatch did not become terminal")
+
+    attached = ad.attach_logical_dispatch_receipt(
+        logical_key=logical_key,
+        kanban_db_path=board,
+        task_id=authority.task_id,
+        acknowledge_source=False,
+    )
+    record = ad.get_logical_delegation(logical_key)
+
+    assert record is not None
+    assert attached["status"] == "non_authoritative"
+    assert attached["status"] != "committed"
+    assert record["authority"] == {
+        "authoritative": False,
+        "compatibility_mode": "direct_dispatch",
+    }
+    assert record["state"] == "terminal_unattached"
+    assert record["receipt_id"] is None
+    assert record["continuation_id"] is None
+    assert _bridge_counts(board, authority.task_id, logical_key) == {
+        "receipt": 0,
+        "event": 0,
+        "continuation": 0,
+    }
+
+
+def test_kanban_receipt_authorization_rejects_task_state_without_current_authority(
+    tmp_path: Path,
+):
+    board = tmp_path / "task-state-only.db"
+    kb.init_db(board)
+    with kb.connect_closing(board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="task state is not authority",
+            created_by="correction-test",
+            initial_status="running",
+        )
+        result = kb.record_delegation_receipt(
+            conn,
+            logical_key="task-state-only",
+            input_digest="sha256:" + "a" * 64,
+            delegation_id="deleg_task_state_only",
+            execution_id="exec_task_state_only",
+            result_digest="sha256:" + "b" * 64,
+            terminal_status="PASS",
+            result={"status": "PASS", "summary": "must not authorize"},
+            task_id=task_id,
+            allow_legacy_running_task=True,
+        )
+
+        assert result["status"] == "conflict"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM delegation_receipts WHERE logical_key='task-state-only'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM delegation_continuations WHERE logical_key='task-state-only'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='delegation_receipted'",
+            (task_id,),
+        ).fetchone()[0] == 0
 
 
 def test_receipt_requires_current_claim_and_stores_only_bounded_redacted_projection(tmp_path: Path):
@@ -207,12 +406,22 @@ def test_conflict_before_launch_executes_zero_runners():
 
 
 def test_cross_board_attach_cas_mutates_exactly_one_target(tmp_path: Path):
-    key = "attach/race"
-    digest = "sha256:attach-race"
+    targets = []
+    for label in ("a", "b"):
+        board = tmp_path / f"board-{label}.db"
+        authority = _claimed_authority(board, title=label)
+        targets.append((label, board, authority))
+
+    source_authority = targets[0][2]
+    key = ad.canonical_logical_key(source_authority)
+    goal = "attach once"
+    digest = ad.canonical_json_digest(
+        ad.canonical_dispatch_input(goal, None, "leaf")
+    )
     dispatched = ad.dispatch_logical_delegation(
         logical_key=key,
         input_digest=digest,
-        goal="attach once",
+        goal=goal,
         context=None,
         toolsets=None,
         role="leaf",
@@ -220,6 +429,7 @@ def test_cross_board_attach_cas_mutates_exactly_one_target(tmp_path: Path):
         session_key="forge",
         parent_session_id="parent",
         runner=lambda: {"status": "PASS", "summary": "one execution"},
+        authority_context=source_authority,
     )
     assert dispatched["status"] == "dispatched"
     deadline = time.time() + 5
@@ -230,14 +440,6 @@ def test_cross_board_attach_cas_mutates_exactly_one_target(tmp_path: Path):
         time.sleep(0.01)
     else:
         pytest.fail("logical dispatch did not become terminal")
-
-    targets = []
-    for label in ("a", "b"):
-        board = tmp_path / f"board-{label}.db"
-        kb.init_db(board)
-        with kb.connect_closing(board) as conn:
-            task_id = kb.create_task(conn, title=label, created_by="forge")
-        targets.append((label, board, task_id))
 
     original_get = ad.get_logical_delegation
     barrier = threading.Barrier(2)
@@ -258,11 +460,11 @@ def test_cross_board_attach_cas_mutates_exactly_one_target(tmp_path: Path):
     ad.get_logical_delegation = _synchronized_get
     results = {}
 
-    def _attach(label, board, task_id):
+    def _attach(label, board, authority):
         results[label] = ad.attach_logical_dispatch_receipt(
             logical_key=key,
             kanban_db_path=board,
-            task_id=task_id,
+            task_id=authority.task_id,
             acknowledge_source=False,
         )
 
@@ -279,21 +481,144 @@ def test_cross_board_attach_cas_mutates_exactly_one_target(tmp_path: Path):
     finally:
         ad.get_logical_delegation = original_get
 
-    counts = []
-    for _, board, task_id in targets:
+    outcomes = []
+    for label, board, authority in targets:
         with sqlite3.connect(board) as conn:
-            counts.append(
-                conn.execute(
-                    "SELECT COUNT(*) FROM delegation_receipts WHERE logical_key=?",
-                    (key,),
-                ).fetchone()[0]
-            )
-            assert conn.execute(
+            receipt_count = conn.execute(
+                "SELECT COUNT(*) FROM delegation_receipts WHERE logical_key=?",
+                (key,),
+            ).fetchone()[0]
+            event_count = conn.execute(
                 "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='delegation_receipted'",
-                (task_id,),
-            ).fetchone()[0] == counts[-1]
-    assert sorted(counts) == [0, 1]
-    assert sorted(result["status"] for result in results.values()) == ["committed", "conflict"]
+                (authority.task_id,),
+            ).fetchone()[0]
+            continuation_count = conn.execute(
+                "SELECT COUNT(*) FROM delegation_continuations WHERE logical_key=?",
+                (key,),
+            ).fetchone()[0]
+        outcomes.append(
+            (
+                receipt_count,
+                event_count,
+                continuation_count,
+                results[label]["status"],
+            )
+        )
+    assert sorted(outcomes) == [
+        (0, 0, 0, "conflict"),
+        (1, 1, 1, "committed"),
+    ]
+
+
+def test_concurrent_attach_refuses_missing_run_claim_before_cas_and_commits_authorized(
+    tmp_path: Path,
+):
+    authorized_board = tmp_path / "authorized.db"
+    authorized = _claimed_authority(authorized_board, title="authorized target")
+    authorized_key, authorized_digest = _reserve_terminal(
+        authorized,
+        {"status": "PASS", "summary": "authorized execution"},
+    )
+
+    refused_board = tmp_path / "missing-authority.db"
+    kb.init_db(refused_board)
+    with kb.connect_closing(refused_board) as conn:
+        refused_task_id = kb.create_task(
+            conn,
+            title="missing run and claim",
+            assignee="forge",
+            created_by="correction-test",
+            initial_status="running",
+        )
+        refused_task = kb.get_task(conn, refused_task_id)
+        assert refused_task is not None
+        assert refused_task.current_run_id is None
+        assert refused_task.claim_lock is None
+
+    refused_key = "compatibility/b3-missing-run-claim"
+    refused_goal = "refuse incomplete authority"
+    refused_digest = ad.canonical_json_digest(
+        ad.canonical_dispatch_input(refused_goal, None, "leaf")
+    )
+    refused_dispatch = ad.dispatch_logical_delegation(
+        logical_key=refused_key,
+        input_digest=refused_digest,
+        goal=refused_goal,
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="local",
+        session_key="forge",
+        parent_session_id="parent",
+        runner=lambda: {"status": "PASS", "summary": "non-authoritative evidence"},
+    )
+    assert refused_dispatch["status"] == "dispatched"
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        refused_source = ad.get_logical_delegation(refused_key)
+        if refused_source and refused_source["state"] == "terminal_unattached":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("incomplete-authority logical dispatch did not become terminal")
+
+    assert authorized_digest == ad.canonical_json_digest(
+        ad.canonical_dispatch_input("bounded receipt", None, "leaf")
+    )
+    assert refused_digest == ad.canonical_json_digest(
+        ad.canonical_dispatch_input(refused_goal, None, "leaf")
+    )
+
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def _attach(label, logical_key, board, task_id):
+        barrier.wait(timeout=5)
+        results[label] = ad.attach_logical_dispatch_receipt(
+            logical_key=logical_key,
+            kanban_db_path=board,
+            task_id=task_id,
+            acknowledge_source=False,
+        )
+
+    threads = [
+        threading.Thread(
+            target=_attach,
+            args=("authorized", authorized_key, authorized_board, authorized.task_id),
+            name="b3-authorized-attach",
+        ),
+        threading.Thread(
+            target=_attach,
+            args=("refused", refused_key, refused_board, refused_task_id),
+            name="b3-refused-attach",
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    assert results["authorized"]["status"] == "committed"
+    assert results["refused"]["status"] == "non_authoritative"
+    assert sum(result["status"] == "committed" for result in results.values()) == 1
+    assert _bridge_counts(authorized_board, authorized.task_id, authorized_key) == {
+        "receipt": 1,
+        "event": 1,
+        "continuation": 1,
+    }
+    assert _bridge_counts(refused_board, refused_task_id, refused_key) == {
+        "receipt": 0,
+        "event": 0,
+        "continuation": 0,
+    }
+    refused_source = ad.get_logical_delegation(refused_key)
+    assert refused_source is not None
+    assert refused_source["state"] == "terminal_unattached"
+    assert refused_source["kanban_db_path"] is None
+    assert refused_source["task_id"] is None
+    assert refused_source["receipt_id"] is None
+    assert refused_source["continuation_id"] is None
 
 
 def test_prune_health_matches_reservation_capacity_at_boundaries():

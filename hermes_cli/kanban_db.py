@@ -2883,33 +2883,40 @@ def record_delegation_receipt(
     )
     with write_txn(conn):
         if allow_legacy_running_task:
-            authority = conn.execute(
-                "SELECT id FROM tasks WHERE id=? AND status IN ('ready','running')",
-                (task_id,),
-            ).fetchone()
-        elif expected_run_id is None or not expected_claim_token:
-            return {"status": "conflict", "reason": "worker authority is required"}
-        else:
-            authority = conn.execute(
-                """SELECT t.id
-                     FROM tasks AS t
-                     JOIN task_runs AS r
-                       ON r.id=t.current_run_id AND r.task_id=t.id
-                    WHERE t.id=? AND t.status='running'
-                      AND t.current_run_id=? AND t.claim_lock=?
-                      AND r.status='running' AND r.ended_at IS NULL
-                      AND r.claim_lock=?
-                      AND (? IS NULL OR t.workflow_template_id=?)
-                      AND (? IS NULL OR t.current_step_key=?)
-                      AND (? IS NULL OR t.assignee=?)""",
-                (
-                    task_id, int(expected_run_id), expected_claim_token,
-                    expected_claim_token,
-                    expected_workflow_id, expected_workflow_id,
-                    expected_step_key, expected_step_key,
-                    expected_lane, expected_lane,
-                ),
-            ).fetchone()
+            return {
+                "status": "conflict",
+                "reason": "legacy task state is not receipt authority",
+            }
+        if (
+            expected_run_id is None
+            or not expected_claim_token
+            or not expected_workflow_id
+            or not expected_step_key
+            or not expected_lane
+        ):
+            return {"status": "conflict", "reason": "complete worker authority is required"}
+        authority = conn.execute(
+            """SELECT t.id
+                 FROM tasks AS t
+                 JOIN task_runs AS r
+                   ON r.id=t.current_run_id AND r.task_id=t.id
+                WHERE t.id=? AND t.status='running'
+                  AND t.current_run_id=? AND t.claim_lock=?
+                  AND r.status='running' AND r.ended_at IS NULL
+                  AND r.claim_lock=?
+                  AND t.workflow_template_id=?
+                  AND t.current_step_key=?
+                  AND t.assignee=?""",
+            (
+                task_id,
+                int(expected_run_id),
+                expected_claim_token,
+                expected_claim_token,
+                expected_workflow_id,
+                expected_step_key,
+                expected_lane,
+            ),
+        ).fetchone()
         if authority is None:
             return {"status": "conflict", "reason": "worker authority is stale or mismatched"}
         row = conn.execute(

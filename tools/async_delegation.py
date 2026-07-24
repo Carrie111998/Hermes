@@ -77,8 +77,20 @@ class BridgeAuthorityContext:
     owner_id: str
 
     def __post_init__(self) -> None:
-        if not self.task_id or not self.claim_token or int(self.run_id) <= 0:
-            raise ValueError("bridge authority requires task, run, and claim identity")
+        if (
+            not self.task_id
+            or not self.claim_token
+            or int(self.run_id) <= 0
+            or not self.workflow_id
+            or not self.step_key
+            or not self.step_attempt_id
+            or not self.lane
+        ):
+            raise ValueError(
+                "bridge authority requires task, run, claim, workflow, step, and lane identity"
+            )
+        if self.step_attempt_id != f"{self.workflow_id}/{self.step_key}/{int(self.run_id)}":
+            raise ValueError("bridge authority step attempt does not match current run")
         object.__setattr__(
             self,
             "kanban_db_path",
@@ -619,6 +631,29 @@ def canonical_json_digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def canonical_dispatch_input(goal: str, context: Optional[str], role: str) -> Dict[str, Any]:
+    """Return the model-facing dispatch object bound by ``input_digest``."""
+    return {"tasks": [{"goal": goal, "context": context, "role": role}]}
+
+
+def _canonical_dispatch_digest(goal: str, context: Optional[str], role: str) -> str:
+    return canonical_json_digest(canonical_dispatch_input(goal, context, role))
+
+
+def _is_canonical_sha256_digest(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 71 or not value.startswith("sha256:"):
+        return False
+    return all(character in "0123456789abcdef" for character in value[7:])
+
+
+def _authority_json(authority: BridgeAuthorityContext) -> str:
+    return json.dumps(
+        {**asdict(authority), "authoritative": True},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 _LOGICAL_COLUMNS = (
     "logical_key", "input_digest", "delegation_id", "execution_id", "state",
     "goal", "context_json", "toolsets_json", "role", "model", "session_key",
@@ -763,11 +798,15 @@ def reserve_logical_delegation(
     if authority_context is not None:
         if logical_key != canonical_logical_key(authority_context):
             return {"status": "rejected", "error": "logical_key is not canonical for authority"}
-        if not str(input_digest).startswith("sha256:"):
-            return {"status": "rejected", "error": "input_digest must use sha256"}
-        authority_json = json.dumps(
-            asdict(authority_context), sort_keys=True, separators=(",", ":")
-        )
+        expected_digest = _canonical_dispatch_digest(goal, context, role)
+        if not _is_canonical_sha256_digest(input_digest):
+            return {"status": "rejected", "error": "input_digest must be canonical sha256"}
+        if input_digest != expected_digest:
+            return {
+                "status": "rejected",
+                "error": "input_digest does not match canonical dispatch input",
+            }
+        authority_json = _authority_json(authority_context)
     return _reserve_logical_delegation_legacy(
         logical_key=logical_key,
         input_digest=input_digest,
@@ -837,12 +876,29 @@ def dispatch_logical_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     max_pending_records: int = _MAX_DURABLE_PENDING,
+    authority_context: Optional[BridgeAuthorityContext] = None,
 ) -> Dict[str, Any]:
     """Reserve one logical identity durably, then launch exactly one runner."""
     logical_key = str(logical_key or "").strip()
     input_digest = str(input_digest or "").strip()
     if not logical_key or not input_digest:
         return {"status": "rejected", "error": "logical_key and input_digest are required"}
+    if authority_context is not None:
+        expected_digest = _canonical_dispatch_digest(goal, context, role)
+        if not _is_canonical_sha256_digest(input_digest):
+            return {"status": "rejected", "error": "input_digest must be canonical sha256"}
+        if input_digest != expected_digest:
+            return {
+                "status": "rejected",
+                "error": "input_digest does not match canonical dispatch input",
+            }
+        authority_json = _authority_json(authority_context)
+    else:
+        authority_json = json.dumps(
+            {"authoritative": False, "compatibility_mode": "direct_dispatch"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     now = time.time()
     with _DB_LOCK, _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -887,7 +943,7 @@ def dispatch_logical_delegation(
                 json.dumps(context) if context is not None else None,
                 json.dumps(list(toolsets)) if toolsets else None,
                 role, model, session_key, parent_session_id, now, now,
-                '{"compatibility_mode":"direct_dispatch"}',
+                authority_json,
             ),
         )
 
@@ -1031,19 +1087,39 @@ def attach_logical_dispatch_receipt(
     if record["state"] == "quarantined":
         return {**record, "status": "quarantined"}
     authority = record.get("authority")
-    compatibility_mode = (authority or {}).get("compatibility_mode")
     if not authority:
         quarantined = _quarantine_logical(
             logical_key, "logical dispatch lacks kernel worker authority"
         )
         return {**quarantined, "status": "conflict"}
+    if authority.get("authoritative") is not True:
+        return {
+            **record,
+            "status": "non_authoritative",
+            "authoritative": False,
+            "error": "compatibility evidence cannot create a Kanban receipt",
+        }
     canonical_board_path = str(Path(kanban_db_path).expanduser().resolve())
-    if not compatibility_mode and (
+    if (
         authority.get("kanban_db_path") != canonical_board_path
         or authority.get("task_id") != task_id
     ):
+        return {
+            **record,
+            "status": "conflict",
+            "error": "Kanban target conflicts with immutable worker authority",
+        }
+    expected_input_digest = _canonical_dispatch_digest(
+        record["goal"], record.get("context"), record["role"]
+    )
+    if (
+        not _is_canonical_sha256_digest(record["input_digest"])
+        or record["input_digest"] != expected_input_digest
+    ):
         quarantined = _quarantine_logical(
-            logical_key, "Kanban target conflicts with immutable worker authority"
+            logical_key,
+            "source input digest does not match canonical dispatch input",
+            expected_input_digest,
         )
         return {**quarantined, "status": "conflict"}
     if record.get("task_id") and record["task_id"] != task_id:
@@ -1129,16 +1205,11 @@ def attach_logical_dispatch_receipt(
             terminal_status=record["terminal_status"],
             result=receipt_projection,
             task_id=task_id,
-            expected_run_id=(
-                int(authority["run_id"]) if not compatibility_mode else None
-            ),
-            expected_claim_token=(
-                authority["claim_token"] if not compatibility_mode else None
-            ),
-            expected_workflow_id=authority.get("workflow_id"),
-            expected_step_key=authority.get("step_key"),
-            expected_lane=authority.get("lane"),
-            allow_legacy_running_task=bool(compatibility_mode),
+            expected_run_id=int(authority["run_id"]),
+            expected_claim_token=authority["claim_token"],
+            expected_workflow_id=authority["workflow_id"],
+            expected_step_key=authority["step_key"],
+            expected_lane=authority["lane"],
         )
     if receipt["status"] == "conflict":
         quarantined = _quarantine_logical(
