@@ -23,6 +23,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import sys
 import threading
 import time
 from concurrent.futures import (
@@ -3886,6 +3887,154 @@ DELEGATE_TASK_SCHEMA = {
         "required": [],
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Live upgrade: checkpoint active subagents before restart / adopt orphans
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_DIR_NAME = "state"
+_CHECKPOINT_FILE_NAME = "subagent_checkpoints.json"
+
+
+def _checkpoint_dir() -> str:
+    """Return the path to the state directory under HERMES_HOME."""
+    try:
+        from hermes_constants import get_hermes_home
+        d = str(get_hermes_home() / _CHECKPOINT_DIR_NAME)
+    except Exception:
+        d = ""
+    if d and not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+    return d
+
+
+def _checkpoint_path() -> str:
+    return os.path.join(_checkpoint_dir(), _CHECKPOINT_FILE_NAME)
+
+
+def checkpoint_active_subagents() -> str | None:
+    """Serialize info about currently running subagents before a restart.
+
+    Writes a JSON file ``$HERMES_HOME/state/subagent_checkpoints.json``
+    with one record per active subagent.  The ``agent`` field is excluded
+    (not serializable).  The current process PID is recorded so the orphan
+    adopt path can distinguish a post-upgrade restart from a fresh start.
+
+    Returns the path to the checkpoint file, or ``None`` if nothing was
+    written (no active subagents or path resolution failed).
+    """
+    snap = list_active_subagents()
+    if not snap:
+        return None
+    path = _checkpoint_path()
+    if not path:
+        return None
+    # Attach the parent PID so the adopter knows this checkpoint belongs to
+    # a fresh restart of the same process group.
+    payload = {
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "created_at": time.time(),
+        "subagents": snap,
+    }
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+        logger.info(
+            "Checkpointed %d running subagent(s) to %s (pid=%d)",
+            len(snap),
+            path,
+            os.getpid(),
+        )
+        return path
+    except (OSError, TypeError) as exc:
+        logger.warning("Failed to write subagent checkpoint: %s", exc)
+        return None
+
+
+def adopt_orphaned_subagents() -> int:
+    """Check for a checkpoint file from a previous process and log results.
+
+    Reads ``$HERMES_HOME/state/subagent_checkpoints.json`` left by a prior
+    process that restarted (e.g. after ``/update``).  Because subagents run
+    as in-process threads, the old process's children were terminated by the
+    exec/sys.exit.  This function logs their metadata so the user can
+    re-delegate lost work, then removes the checkpoint file.
+
+    Returns the number of previously running subagents that were recorded
+    (0 means no checkpoint was found, or it was empty).
+    """
+    path = _checkpoint_path()
+    if not path or not os.path.isfile(path):
+        return 0
+
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Corrupt subagent checkpoint at %s: %s", path, exc)
+        _remove_checkpoint_safe(path)
+        return 0
+
+    subagents = payload.get("subagents", [])
+    if not subagents:
+        _remove_checkpoint_safe(path)
+        return 0
+
+    old_pid = payload.get("pid", "<unknown>")
+    created = payload.get("created_at", 0)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created)) if created else "<unknown>"
+
+    count = len(subagents)
+    logger.warning(
+        "Live upgrade detected: %d subagent(s) were running when the "
+        "previous process (pid=%s) restarted at %s.  Their work was "
+        "terminated by the restart and should be re-delegated.",
+        count,
+        old_pid,
+        ts,
+    )
+    for i, sa in enumerate(subagents):
+        goal = (sa.get("goal") or "<no goal>")[:120]
+        sid = sa.get("subagent_id") or "<unknown>"
+        started = sa.get("started_at", 0)
+        started_str = (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started))
+            if started
+            else "<unknown>"
+        )
+        model = sa.get("model") or "<default>"
+        logger.warning(
+            "  Orphan subagent [%d/%d] id=%s goal=%s started=%s model=%s",
+            i + 1,
+            count,
+            sid,
+            goal,
+            started_str,
+            model,
+        )
+        print(
+            f"  ⚠ Orphan subagent [{i+1}/{count}]: \"{goal}\" "
+            f"(started {started_str}, model={model})",
+            file=sys.stderr,
+        )
+
+    _remove_checkpoint_safe(path)
+    return count
+
+
+def _remove_checkpoint_safe(path: str) -> None:
+    """Remove the checkpoint file, ignoring errors."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # --- Registry ---
