@@ -350,7 +350,7 @@ def _preexec(limits: Mapping[str, int]):
     def apply() -> None:
         if resource is None:
             raise RuntimeError("resource limits unavailable")
-        os.setsid()
+        os.setsid()  # windows-footgun: ok — availability probe requires Linux
         resource.setrlimit(
             resource.RLIMIT_AS, (limits["memory_mb"] * 1024**2,) * 2
         )
@@ -543,14 +543,16 @@ def _prune_runs(root: Path, config: Mapping[str, Any]) -> None:
 
 def _kill_group(proc: subprocess.Popen, grace: float = 5.0) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — Linux-only jail
     except (ProcessLookupError, PermissionError):
         return
     try:
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(  # windows-footgun: ok — Linux-only jail
+                proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+            )
         except (ProcessLookupError, PermissionError):
             pass
         try:
@@ -737,7 +739,7 @@ def python_sandbox(
                 f"\nCPU limit ({limits['cpu_seconds']}s) exhausted — "
                 "simplify the algorithm"
             )
-        elif returncode in (-signal.SIGKILL, 137):
+        elif returncode in (-getattr(signal, "SIGKILL", signal.SIGTERM), 137):
             status = "oom"
             stderr += (
                 f"\nmemory limit ({limits['memory_mb']}MB) exhausted — "
