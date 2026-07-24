@@ -70,6 +70,17 @@ App credential registration and credential rotation must be done by the user man
 - Never invent or approximate a post ID or handle. Resolve it from a read first.
 - Do not batch multiple write actions behind a single approval.
 
+## Command form (MANDATORY)
+
+- **For X Articles, use raw API mode**, not `xurl read`: the article body only
+  comes back from the raw endpoint with the right field expansions.
+- **In raw API mode, do not put `read` before a `/2/tweets/...` path** — the
+  path goes straight after the flags. `xurl read` takes a URL, never an API path.
+- Article fetches need `tweet.fields=created_at,lang,public_metrics` plus the
+  `referenced_tweets,article` expansions; the text lands in
+  `data.article.plain_text`. See `references/command-reference.md` for the exact
+  invocation.
+
 ## Rate limits & scopes
 
 - **Rate limits:** X enforces per-endpoint rate limits. A 429 means wait and retry — do not retry in a tight loop. Write endpoints (post, reply, like, repost) have tighter limits than reads.
