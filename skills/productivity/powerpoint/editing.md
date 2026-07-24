@@ -6,10 +6,12 @@ When using an existing presentation as a template:
 
 1. **Analyze existing slides**:
    ```bash
-   python scripts/thumbnail.py template.pptx
+   soffice --headless --convert-to pdf template.pptx
+   pdftoppm -jpeg -r 150 template.pdf template-slide
    python -m markitdown template.pptx
    ```
-   Review `thumbnails.jpg` to see layouts, and markitdown output to see placeholder text.
+   Review the `template-slide-NN.jpg` images to see layouts, and markitdown output to
+   see placeholder text.
 
 2. **Plan slide mapping**: For each content section, choose a template slide.
 
@@ -26,7 +28,7 @@ When using an existing presentation as a template:
 
    Match content type to layout style (e.g., key points → bullet slide, team info → multi-column, testimonials → quote slide).
 
-3. **Unpack**: `python scripts/office/unpack.py template.pptx unpacked/`
+3. **Unpack**: `unzip -o template.pptx -d unpacked/`
 
 4. **Build presentation** (do this yourself, not with subagents):
    - Delete unwanted slides (remove from `<p:sldIdLst>`)
@@ -39,7 +41,10 @@ When using an existing presentation as a template:
 
 6. **Clean**: `python scripts/clean.py unpacked/`
 
-7. **Pack**: `python scripts/office/pack.py unpacked/ output.pptx --original template.pptx`
+7. **Repack**: `cd unpacked && zip -r -X ../output.pptx . && cd ..`
+
+8. **Verify the file opens**: `soffice --headless --convert-to pdf output.pptx`.
+   A repack that produced a corrupt archive fails here — do not skip this step.
 
 ---
 
@@ -47,19 +52,16 @@ When using an existing presentation as a template:
 
 | Script | Purpose |
 |--------|---------|
-| `unpack.py` | Extract and pretty-print PPTX |
 | `add_slide.py` | Duplicate slide or create from layout |
 | `clean.py` | Remove orphaned files |
-| `pack.py` | Repack with validation |
-| `thumbnail.py` | Create visual grid of slides |
 
-### unpack.py
+Unpack and repack use `unzip` / `zip` directly — a .pptx is a zip archive. Slide
+XML inside a template is usually minified onto one line; pretty-print a file
+before editing it if that makes the edit safer:
 
 ```bash
-python scripts/office/unpack.py input.pptx unpacked/
+python -c "import defusedxml.minidom as m,sys; p=sys.argv[1]; open(p,'w').write(m.parse(p).toprettyxml(indent='  '))" unpacked/ppt/slides/slide1.xml
 ```
-
-Extracts PPTX, pretty-prints XML, escapes smart quotes.
 
 ### add_slide.py
 
@@ -77,24 +79,6 @@ python scripts/clean.py unpacked/
 ```
 
 Removes slides not in `<p:sldIdLst>`, unreferenced media, orphaned rels.
-
-### pack.py
-
-```bash
-python scripts/office/pack.py unpacked/ output.pptx --original input.pptx
-```
-
-Validates, repairs, condenses XML, re-encodes smart quotes.
-
-### thumbnail.py
-
-```bash
-python scripts/thumbnail.py input.pptx [output_prefix] [--cols N]
-```
-
-Creates `thumbnails.jpg` with slide filenames as labels. Default 3 columns, max 12 per grid.
-
-**Use for template analysis only** (choosing layouts). For visual QA, use `soffice` + `pdftoppm` to create full-resolution individual slide images—see SKILL.md.
 
 ---
 
@@ -184,7 +168,8 @@ Copy `<a:pPr>` from the original paragraph to preserve line spacing. Use `b="1"`
 
 ### Smart Quotes
 
-Handled automatically by unpack/pack. But the Edit tool converts smart quotes to ASCII.
+Smart quotes survive an `unzip`/`zip` round trip untouched, but the Edit tool converts
+them to ASCII.
 
 **When adding new text with quotes, use XML entities:**
 

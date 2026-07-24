@@ -27,11 +27,12 @@ Use this skill any time a .pptx file is involved in any way — as input, output
 # Text extraction
 python -m markitdown presentation.pptx
 
-# Visual overview
-python scripts/thumbnail.py presentation.pptx
+# Visual overview — render every slide to an image (see Converting to Images)
+soffice --headless --convert-to pdf presentation.pptx
+pdftoppm -jpeg -r 150 presentation.pdf slide
 
 # Raw XML
-python scripts/office/unpack.py presentation.pptx unpacked/
+unzip -o presentation.pptx -d unpacked/
 ```
 
 ---
@@ -40,8 +41,8 @@ python scripts/office/unpack.py presentation.pptx unpacked/
 
 **Read [editing.md](editing.md) for full details.**
 
-1. Analyze template with `thumbnail.py`
-2. Unpack → manipulate slides → edit content → clean → pack
+1. Render the template to images to see what you're working with (see [Converting to Images](#converting-to-images))
+2. Unpack → manipulate slides → edit content → clean → repack
 
 ---
 
@@ -214,7 +215,7 @@ Report ALL issues found, including minor ones.
 Convert presentations to individual slide images for visual inspection:
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.pptx
+soffice --headless --convert-to pdf output.pptx
 pdftoppm -jpeg -r 150 output.pdf slide
 ```
 
@@ -231,7 +232,7 @@ pdftoppm -jpeg -r 150 -f N -l N output.pdf slide-fixed
 ## Dependencies
 
 - `pip install "markitdown[pptx]"` - text extraction
-- `pip install Pillow` - thumbnail grids
+- `pip install defusedxml` - required by `scripts/clean.py`
 - `npm install -g pptxgenjs` - creating from scratch
-- LibreOffice (`soffice`) - PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
+- LibreOffice (`soffice`) - PDF conversion
 - Poppler (`pdftoppm`) - PDF to images

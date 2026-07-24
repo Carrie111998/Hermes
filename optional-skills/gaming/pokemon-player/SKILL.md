@@ -22,11 +22,13 @@ set up a Python 3.10+ virtual environment. Use uv (preferred for speed)
 to create the venv and install the package in editable mode with the
 pyboy extra. If uv is not available, fall back to python3 -m venv + pip.
 
-On this machine it is already set up at /home/teknium/pokemon-agent
-with a venv ready — just cd there and source .venv/bin/activate.
+If a checkout already exists, reuse it: ask the user for its path, or
+look for a `pokemon-agent` directory under `$HOME`. Do not assume a path —
+verify the directory exists before cd-ing into it, then source
+`.venv/bin/activate`.
 
-You also need a ROM file. Ask the user for theirs. On this machine
-one exists at roms/pokemon_red.gb inside that directory.
+You also need a ROM file. Ask the user for theirs — it belongs at
+`roms/pokemon_red.gb` inside the checkout.
 NEVER download or provide ROM files — always ask the user.
 
 ### 2. Start the game server
