@@ -132,15 +132,12 @@ def _parse_executor_confirmation(raw: Any) -> tuple[str, str]:
         text = raw.strip()
         if not text:
             return "failed", "executor returned no usable execution evidence"
-        if text.startswith("{"):
-            try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                return "failed", "executor returned malformed structured confirmation"
-        else:
-            if _FAILURE_EVIDENCE.search(text):
-                return "failed", text
-            return "completed", text
+        if not text.startswith("{"):
+            return "failed", "executor must return a structured confirmation with status and evidence"
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return "failed", "executor returned malformed structured confirmation"
 
     if isinstance(payload, Mapping):
         try:

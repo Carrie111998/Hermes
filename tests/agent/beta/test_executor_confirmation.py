@@ -33,11 +33,18 @@ def test_json_confirmation_is_validated():
     assert evidence == "process restarted; readiness probe=passing"
 
 
-def test_plain_failure_text_fails_closed():
+def test_plain_failure_text_fails_closed_without_becoming_confirmation():
     status, evidence = _parse_executor_confirmation("error: service restart timed out")
 
     assert status == "failed"
-    assert evidence == "error: service restart timed out"
+    assert "structured confirmation" in evidence
+
+
+def test_plain_positive_text_fails_closed_without_explicit_status():
+    status, evidence = _parse_executor_confirmation("service active; health check=ok")
+
+    assert status == "failed"
+    assert "structured confirmation" in evidence
 
 
 def test_malformed_structured_confirmation_fails_closed():

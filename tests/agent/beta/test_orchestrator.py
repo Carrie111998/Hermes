@@ -197,7 +197,7 @@ def test_empty_executor_evidence_fails_closed():
     assert any("no usable execution evidence" in failure for failure in run.response.partial_failures)
 
 
-def test_non_empty_executor_evidence_is_preserved():
+def test_plain_text_executor_confirmation_fails_closed():
     calls = []
     gate = ApprovalGate(requester=lambda _operation: {"approved": True})
 
@@ -206,7 +206,29 @@ def test_non_empty_executor_evidence_is_preserved():
         object(),
         delegate=_delegate_from(_base_findings(), calls),
         approval_gate=gate,
-        executor=lambda _operation: "  service state changed; health check=ok  ",
+        executor=lambda _operation: "service state changed; health check=ok",
+    )
+
+    assert len(run.executed_actions) == 1
+    assert run.executed_actions[0].status == "failed"
+    assert "structured confirmation" in run.executed_actions[0].evidence
+    assert run.response.result == "Approved execution failed validation"
+    assert "executed and validated" not in run.response.result.lower()
+
+
+def test_structured_executor_confirmation_is_preserved():
+    calls = []
+    gate = ApprovalGate(requester=lambda _operation: {"approved": True})
+
+    run = orchestrate_request(
+        REQUEST,
+        object(),
+        delegate=_delegate_from(_base_findings(), calls),
+        approval_gate=gate,
+        executor=lambda _operation: {
+            "status": "completed",
+            "evidence": "  service state changed; health check=ok  ",
+        },
     )
 
     assert len(run.executed_actions) == 1
