@@ -148,6 +148,22 @@ class TestSkillsDirectoryMount:
         assert visible == "/root/.hermes/skills/cat/my-skill"
         assert "\\" not in visible
 
+    def test_agent_visible_external_skill_path_uses_external_mount(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        external_root = tmp_path / "external"
+        skill_dir = external_root / "cat" / "my-skill"
+        skill_dir.mkdir(parents=True)
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home), "TERMINAL_ENV": "docker"}),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_root]),
+        ):
+            visible = to_agent_visible_skill_path(str(skill_dir))
+
+        assert visible == "/root/.hermes/external_skills/0/cat/my-skill"
+        assert "\\" not in visible
+
     def test_symlinks_are_sanitized(self, tmp_path):
         """Symlinks in skills dir should be excluded from the mount."""
         hermes_home = tmp_path / ".hermes"

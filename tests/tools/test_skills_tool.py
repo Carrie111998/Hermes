@@ -439,6 +439,42 @@ class TestSkillView:
         assert result["skill_dir"] == "/root/.hermes/skills/docker-skill"
         assert "Run /root/.hermes/skills/docker-skill/scripts/do.sh" in result["content"]
 
+    def test_skill_view_docker_external_skill_uses_external_mount(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "host-home" / ".hermes"
+        skills_dir = hermes_home / "skills"
+        external_root = tmp_path / "external-skills"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_root]),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                return_value={"template_vars": True, "inline_shell": False},
+            ),
+        ):
+            _make_skill(
+                external_root,
+                "external-docker-skill",
+                body="Run ${HERMES_SKILL_DIR}/scripts/do.sh",
+            )
+            raw = skill_view("external-docker-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert str(external_root) not in raw
+        assert (
+            result["skill_dir"]
+            == "/root/.hermes/external_skills/0/external-docker-skill"
+        )
+        assert (
+            "Run /root/.hermes/external_skills/0/external-docker-skill/scripts/do.sh"
+            in result["content"]
+        )
+
     def test_skill_view_internal_mode_preserves_host_skill_dir(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "host-home" / ".hermes"
         skills_dir = hermes_home / "skills"
