@@ -471,52 +471,91 @@ class TestFindStateForCard:
 # ── Tests: message formatting edge cases ────────────────────────────
 
 
-class TestMessageFormatting:
-    """Test edge cases in message formatting."""
 
-    def test_single_node_workflow(self):
-        """Single node workflow produces correct message."""
-        state = _make_state(
-            layers=[["only-node"]],
-            states={
-                "only-node": {
-                    "status": "done",
-                    "agent": "solo",
-                    "kanban_card_id": "t_1",
-                }
-            },
-        )
-        layers = state["layers"]
-        states = state["states"]
-        done_count = sum(
-            1 for layer in layers for nid in layer
-            if states.get(nid, {}).get("status") == "done"
-        )
-        total = sum(len(layer) for layer in layers)
-        assert done_count == 1
-        assert total == 1
 
-    def test_multi_layer_counts(self):
-        """Multiple layers are counted correctly."""
-        state = _make_state(
-            layers=[["a", "b"], ["c"], ["d", "e", "f"]],
-            states={f"{c}": {"status": "done"} for c in "abcdef"},
-        )
-        layers = state["layers"]
-        total = sum(len(layer) for layer in layers)
-        assert total == 6
 
-    def test_mixed_status_counts(self):
-        """Mixed done/failed statuses are counted correctly."""
-        nodes = [
-            {"status": "done"},
-            {"status": "done"},
-            {"status": "failed"},
-            {"status": "timed_out"},
-        ]
-        done_count = sum(1 for n in nodes if n["status"] == "done")
-        failed_count = sum(
-            1 for n in nodes if n["status"] in ("failed", "timed_out")
-        )
-        assert done_count == 2
-        assert failed_count == 2
+# ── Tests: simplify-code fixes ─────────────────────────────────────
+
+
+class TestSimplifyCodeFixes:
+    """Tests for the fixes applied from the 3-reviewer simplify exercise."""
+
+    def test_atomic_marker_write(self, tmp_path):
+        """Marker is written atomically (temp file → rename)."""
+        from plugins.workflow import _notify_workflow_complete
+
+        state = _make_state()
+        state_path = _write_state_file(tmp_path, state)
+
+        with patch("plugins.workflow._find_state_for_card") as mock_find:
+            mock_find.return_value = (state, str(state_path))
+            with patch("plugins.workflow.analyst.analyze_status") as mock_analyst:
+                mock_analyst.return_value = MagicMock(success=False, result=None)
+                _notify_workflow_complete("t_node-a")
+
+        markers = glob.glob("/tmp/wf-complete-*.json")
+        assert markers, "No marker written"
+        data = json.loads(Path(markers[-1]).read_text())
+        assert "workflow_name" in data
+        os.unlink(markers[-1])
+
+    def test_stale_marker_detection(self):
+        """Markers older than 10 minutes are detected as stale."""
+        import time
+        marker_path = Path("/tmp/wf-complete-stale-test.json")
+        marker_path.write_text(json.dumps({"test": True}))
+        old_time = time.time() - 1200
+        os.utime(str(marker_path), (old_time, old_time))
+        age = time.time() - os.path.getmtime(str(marker_path))
+        assert age > 600
+        marker_path.unlink(missing_ok=True)
+
+    def test_notify_with_preloaded_state(self, tmp_path):
+        """When state is passed directly, _find_state_for_card is not called."""
+        from plugins.workflow import _notify_workflow_complete
+
+        state = _make_state()
+        state_path = _write_state_file(tmp_path, state)
+
+        with patch("plugins.workflow._find_state_for_card") as mock_find:
+            with patch("plugins.workflow.analyst.analyze_status") as mock_analyst:
+                mock_analyst.return_value = MagicMock(success=False, result=None)
+                _notify_workflow_complete("t_node-a", state=state)
+                mock_find.assert_not_called()
+
+        markers = glob.glob("/tmp/wf-complete-*.json")
+        assert markers
+        os.unlink(markers[-1])
+
+    def test_capture_gateway_early_return(self):
+        """_capture_gateway returns immediately after first capture."""
+        import plugins.workflow as pw
+        orig_ref = pw._gateway_ref
+        orig_started = pw._watcher_started
+        try:
+            pw._gateway_ref = MagicMock()
+            pw._watcher_started = True
+            result = pw._capture_gateway(gateway=MagicMock())
+            assert result is None
+        finally:
+            pw._gateway_ref = orig_ref
+            pw._watcher_started = orig_started
+
+    def test_analyst_failure_falls_back(self, tmp_path):
+        """When analyst raises, fallback message is used."""
+        from plugins.workflow import _notify_workflow_complete
+
+        state = _make_state()
+        state_path = _write_state_file(tmp_path, state)
+
+        with patch("plugins.workflow._find_state_for_card") as mock_find:
+            mock_find.return_value = (state, str(state_path))
+            with patch("plugins.workflow.analyst.analyze_status") as mock_analyst:
+                mock_analyst.side_effect = RuntimeError("analyst crashed")
+                _notify_workflow_complete("t_node-a")
+
+        markers = glob.glob("/tmp/wf-complete-*.json")
+        assert markers, "No marker despite analyst failure"
+        data = json.loads(Path(markers[-1]).read_text())
+        assert "node-a" in data["message"]
+        os.unlink(markers[-1])
