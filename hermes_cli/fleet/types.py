@@ -35,6 +35,7 @@ class ReasonCode(str, Enum):
     CAPACITY_INVALID = "CAPACITY_INVALID"
     CAPACITY_STALE = "CAPACITY_STALE"
     CAPACITY_CONFIDENCE_LOW = "CAPACITY_CONFIDENCE_LOW"
+    ROTATION_WITHOUT_FRESH_CAPACITY = "ROTATION_WITHOUT_FRESH_CAPACITY"
     LANE_COOLDOWN = "LANE_COOLDOWN"
     NO_ELIGIBLE_LANE = "NO_ELIGIBLE_LANE"
     PINNED_LANE_UNAVAILABLE = "PINNED_LANE_UNAVAILABLE"
@@ -159,6 +160,7 @@ class LaneInputs:
     max_concurrency: int = 1
     reserve_floor_pct: Decimal = Decimal("0")
     cooldown_until: datetime | None = None
+    rotation_without_fresh_capacity: bool = False
 
 
 @dataclass(frozen=True)
@@ -170,6 +172,7 @@ class LaneEvaluation:
     reasons: tuple[ReasonCode, ...]
     selected_model: str | None
     selected_effort: str | None
+    fallback_eligible: bool = False
     qualification_evidence_id: str = ""
     qualification_detail: str = ""
 

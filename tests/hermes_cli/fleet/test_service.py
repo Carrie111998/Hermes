@@ -248,6 +248,75 @@ def test_rate_limit_result_sets_cooldown_and_releases_lease(tmp_path):
     assert service.store.active_reserved_pct("chatgpt_codex", now=NOW) == 0
 
 
+def test_stale_fallback_rate_limit_keeps_cooldown_and_audit_contract(tmp_path):
+    bridge = tmp_path / "usage.json"
+    bridge.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "captured_at": "2026-07-23T00:00:00Z",
+                "lanes": {
+                    "grok": {
+                        "used_pct": "1",
+                        "remaining_pct": "99",
+                        "confidence": "low",
+                        "overage_disabled": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile = _profile("grok", 0)
+    failure = AdapterResult(
+        ok=False,
+        reason=ReasonCode.EXECUTION_FAILED,
+        provider_id=profile.provider_id,
+        model_id="m1",
+        auth_kind="oauth_subscription",
+        adapter_kind=AdapterKind.NATIVE_PROVIDER,
+        metadata={"cooldown_seconds": 120, "classification": "rate_limit"},
+    )
+    adapter = _CountingAdapter(failure)
+    config = parse_fleet_config(
+        {
+            "fleet": {
+                "enabled": True,
+                "bridge_usage_file": str(bridge),
+                "rotation_without_fresh_capacity": True,
+                "lanes": {"grok": {"enabled": True}},
+            }
+        }
+    )
+    service = FleetService(
+        config=config,
+        store=FleetStore(tmp_path / "state.db"),
+        profiles=(profile,),
+        qualifications={"grok": _qualification(profile)},
+        adapters={"grok": adapter},
+        capacity_source=BridgeUsageAdapter(bridge),
+        now=lambda: NOW,
+        owner_uuid="service-owner",
+    )
+
+    result = service.run(_task(), prompt="bounded task")
+
+    assert not result.ok
+    assert result.evaluations[0].fallback_eligible
+    assert service.store.cooldown("grok", now=NOW) == (
+        NOW + timedelta(seconds=120),
+        "PROVIDER_RATE_LIMIT",
+    )
+    route = next(
+        event
+        for event in service.store.audit(task_id="task-1")
+        if event["event_type"] == "ROUTE_SELECTED"
+    )
+    assert route["reason_code"] == ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY.value
+    assert route["decision"]["selection_reason"] == route["reason_code"]
+    assert route["decision"]["capacity_source"] is None
+
+
 def test_plan_is_read_only_and_does_not_advance_rotation(tmp_path):
     service, _, _ = _service(tmp_path)
 

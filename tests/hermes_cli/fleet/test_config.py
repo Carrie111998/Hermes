@@ -17,11 +17,21 @@ def test_defaults_are_disabled_conservative_and_documented_in_main_config():
     assert config.bridge_usage_file.as_posix() == "C:/HermesBridge/usage-weekly.json"
     assert config.switch_delta_pct == Decimal("20.000")
     assert config.minimum_confidence is Confidence.HIGH
+    assert config.rotation_without_fresh_capacity is False
     assert config.lease_ttl_seconds == 1800
     assert config.default_reservation_pct == Decimal("5.000")
     assert config.lanes["chatgpt_codex"].enabled is True
     assert config.lanes["claude_code"].enabled is False
     assert DEFAULT_CONFIG["fleet"]["enabled"] is False
+    assert DEFAULT_CONFIG["fleet"]["rotation_without_fresh_capacity"] is False
+
+
+def test_stale_capacity_rotation_is_explicitly_opt_in():
+    config = parse_fleet_config(
+        {"fleet": {"rotation_without_fresh_capacity": True}}
+    )
+
+    assert config.rotation_without_fresh_capacity is True
 
 
 def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():

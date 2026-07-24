@@ -48,6 +48,7 @@ class FleetQualificationDoctor:
         command: Callable[[Sequence[str]], tuple[int, str, str]] = _command,
         environment: Mapping[str, str] | None = None,
         now: Callable[[], datetime] | None = None,
+        platform_name: str | None = None,
     ) -> None:
         if auth_status is None:
             from hermes_cli.auth import get_auth_status
@@ -58,6 +59,7 @@ class FleetQualificationDoctor:
         self.command = command
         self.environment = dict(os.environ if environment is None else environment)
         self.now = now or (lambda: datetime.now(timezone.utc))
+        self.platform_name = os.name if platform_name is None else platform_name
 
     def _failed(
         self, profile: LaneProfile, detail: str, *, executable: str | None = None
@@ -83,7 +85,7 @@ class FleetQualificationDoctor:
     def _external_receipt(
         self, profile: LaneProfile, executable: str
     ) -> tuple[str | None, tuple[str, ...], str | None]:
-        command_name = profile.executable or executable
+        command_name = executable
         version_code, version_out, _ = self.command((command_name, "--version"))
         if version_code != 0 or not version_out.strip():
             return None, (), "version command failed"
@@ -126,6 +128,25 @@ class FleetQualificationDoctor:
             return None, (), "required exact model absent from agy models"
         return version_out.strip().splitlines()[0], qualified_models, None
 
+    def _external_executable(self, profile: LaneProfile) -> str | None:
+        executable = self.which(profile.executable or "")
+        if executable:
+            return str(Path(executable).resolve())
+        if (
+            self.platform_name == "nt"
+            and profile.lane_id == "antigravity"
+            and self.environment.get("LOCALAPPDATA")
+        ):
+            candidate = (
+                Path(self.environment["LOCALAPPDATA"])
+                / "agy"
+                / "bin"
+                / "agy.exe"
+            ).resolve()
+            if candidate.is_file():
+                return str(candidate)
+        return None
+
     def qualify(self, profiles: Iterable[LaneProfile]) -> dict[str, Qualification]:
         result: dict[str, Qualification] = {}
         for profile in profiles:
@@ -167,7 +188,7 @@ class FleetQualificationDoctor:
                     continue
                 auth_source = f"{profile.provider_id}:{source}"
             else:
-                executable = self.which(profile.executable or "")
+                executable = self._external_executable(profile)
                 if not executable:
                     result[profile.lane_id] = self._failed(
                         profile, f"executable not found: {profile.executable}"

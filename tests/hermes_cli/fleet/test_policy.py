@@ -278,6 +278,81 @@ def test_exact_top_capacity_ties_rotate_in_fixed_order_without_hidden_mutation()
     assert second.lane_id == "claude_code"
 
 
+def test_live_capacity_shape_rotates_fallbacks_without_stale_override():
+    candidates = (
+        _inputs(_profile("chatgpt_codex", 0), "84.000"),
+        _inputs(_profile("claude_code", 1), "11.000"),
+        replace(
+            _inputs(_profile("grok", 2), "99.000"),
+            rotation_without_fresh_capacity=True,
+            capacity=replace(
+                _capacity("grok", "99.000"),
+                snapshot=replace(
+                    _capacity("grok", "99.000").snapshot,
+                    freshness=Freshness.STALE,
+                    confidence=Confidence.LOW,
+                ),
+                reason=ReasonCode.CAPACITY_STALE,
+            ),
+        ),
+        replace(
+            _inputs(_profile("antigravity", 3), "100.000"),
+            rotation_without_fresh_capacity=True,
+            capacity=replace(
+                _capacity("antigravity", "100.000"),
+                snapshot=replace(
+                    _capacity("antigravity", "100.000").snapshot,
+                    freshness=Freshness.STALE,
+                    confidence=Confidence.LOW,
+                ),
+                reason=ReasonCode.CAPACITY_STALE,
+            ),
+        ),
+    )
+    evaluations = tuple(
+        evaluate_lane(candidate, TASK, now=NOW) for candidate in candidates
+    )
+
+    claude, grok, agy = evaluations[1:]
+    assert not claude.eligible and not claude.fallback_eligible
+    assert ReasonCode.RESERVE_FLOOR in claude.reasons
+    assert not grok.eligible and grok.fallback_eligible
+    assert not agy.eligible and agy.fallback_eligible
+    assert ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY in grok.reasons
+    assert ReasonCode.MET not in grok.reasons
+
+    first = select_lane(evaluations, rotation_index=0)
+    grok_turn = select_lane(evaluations, rotation_index=1)
+    agy_turn = select_lane(evaluations, rotation_index=2)
+
+    assert (first.lane_id, first.rotation_index) == ("chatgpt_codex", 1)
+    assert (grok_turn.lane_id, grok_turn.rotation_index) == ("grok", 2)
+    assert grok_turn.reason is ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY
+    assert (agy_turn.lane_id, agy_turn.rotation_index) == ("antigravity", 0)
+    assert agy_turn.reason is ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY
+
+
+def test_stale_fallback_capacity_never_participates_in_reserve_arithmetic():
+    stale = replace(
+        _inputs(_profile("grok", 0), "1.000"),
+        rotation_without_fresh_capacity=True,
+        capacity=replace(
+            _capacity("grok", "1.000"),
+            snapshot=replace(
+                _capacity("grok", "1.000").snapshot,
+                freshness=Freshness.STALE,
+                confidence=Confidence.LOW,
+            ),
+            reason=ReasonCode.CAPACITY_STALE,
+        ),
+    )
+
+    evaluation = evaluate_lane(stale, TASK, now=NOW)
+
+    assert evaluation.fallback_eligible
+    assert ReasonCode.RESERVE_FLOOR not in evaluation.reasons
+
+
 def test_no_eligible_lane_returns_complete_evaluations():
     items = (
         replace(_inputs(_profile("chatgpt_codex", 0)), enabled=False),

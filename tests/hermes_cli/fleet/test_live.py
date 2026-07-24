@@ -12,6 +12,7 @@ import pytest
 from hermes_cli.fleet.adapters.live_routes import (
     AntigravityAdapter,
     ClaudeCodeAdapter,
+    live_adapters,
 )
 from hermes_cli.fleet.adapters.native_provider import NativeProviderAdapter
 from hermes_cli.fleet.live import FleetQualificationDoctor
@@ -29,17 +30,18 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
 
     def run(argv):
         commands.append(tuple(argv))
-        if argv[0] == "claude" and tuple(argv[1:3]) == ("auth", "status"):
+        executable = Path(argv[0]).stem
+        if executable == "claude" and tuple(argv[1:3]) == ("auth", "status"):
             return 0, (
                 '{"loggedIn":true,"authMethod":"claude.ai",'
                 '"apiProvider":"firstParty","email":"never-record@example.com",'
                 '"org":"never-record"}'
             ), ""
-        if argv[0] == "claude":
+        if executable == "claude":
             return 0, "2.1.217 (Claude Code)", ""
-        if argv[0] == "agy" and argv[1] == "--version":
+        if executable == "agy" and argv[1] == "--version":
             return 0, "agy 1.2.3", ""
-        if argv[0] == "agy" and argv[1] == "models":
+        if executable == "agy" and argv[1] == "models":
             return 0, "gemini-3.1-pro-high\nGemini 3.6 Flash", ""
         raise AssertionError(argv)
 
@@ -75,9 +77,9 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
     assert qualifications["antigravity"].models == ("gemini-3.1-pro-high",)
     assert qualifications["antigravity"].efforts == ("low", "medium", "high")
     assert qualifications["antigravity"].qualified
-    assert ("claude", "auth", "status", "--json") in commands
-    assert ("agy", "models") in commands
-    assert not any(command[0] == "agy" and "auth" in command for command in commands)
+    assert any(command[1:] == ("auth", "status", "--json") for command in commands)
+    assert any(command[1:] == ("models",) for command in commands)
+    assert not any(Path(command[0]).stem == "agy" and "auth" in command for command in commands)
     assert "provider-reported served-model" in qualifications["antigravity"].detail
 
 
@@ -102,6 +104,43 @@ def test_live_doctor_requires_exact_agy_model_list_qualification():
 
     assert not qualification.qualified
     assert qualification.detail == "required exact model absent from agy models"
+
+
+def test_live_doctor_discovers_native_windows_agy_outside_path(tmp_path):
+    agy = tmp_path / "agy" / "bin" / "agy.exe"
+    agy.parent.mkdir(parents=True)
+    agy.write_bytes(b"qualified executable")
+    commands = []
+
+    def run(argv):
+        commands.append(tuple(argv))
+        if argv[1] == "--version":
+            return 0, "agy 1.2.3", ""
+        if argv[1] == "models":
+            return 0, "gemini-3.1-pro-high", ""
+        raise AssertionError(argv)
+
+    doctor = FleetQualificationDoctor(
+        which=lambda _: None,
+        command=run,
+        environment={"LOCALAPPDATA": str(tmp_path)},
+        now=lambda: NOW,
+        platform_name="nt",
+    )
+
+    qualification = doctor.qualify((profile_map()["antigravity"],))[
+        "antigravity"
+    ]
+
+    assert qualification.qualified
+    assert qualification.executable == str(agy.resolve())
+    assert commands == [
+        (str(agy.resolve()), "--version"),
+        (str(agy.resolve()), "models"),
+    ]
+    assert live_adapters(qualifications={"antigravity": qualification})[
+        "antigravity"
+    ].executable == str(agy.resolve())
 
 
 def test_live_doctor_rejects_forbidden_api_key_without_exposing_value():
@@ -154,13 +193,11 @@ def test_default_service_qualifies_and_executes_each_live_lane(
     )
 
     def command(argv):
-        if argv[0] == "claude" and argv[1] == "--version":
+        if argv[1] == "--version":
             return 0, "2.1.217 (Claude Code)", ""
-        if argv[0] == "claude":
+        if argv[1] == "auth":
             return 0, '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}', ""
-        if argv[0] == "agy" and argv[1] == "--version":
-            return 0, "agy 1.2.3", ""
-        if argv[0] == "agy" and argv[1] == "models":
+        if argv[1] == "models":
             return 0, "gemini-3.1-pro-high", ""
         raise AssertionError(argv)
 

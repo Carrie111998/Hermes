@@ -24,6 +24,7 @@ DEFAULT_FLEET_CONFIG: dict[str, Any] = {
     "bridge_usage_file": "C:/HermesBridge/usage-weekly.json",
     "switch_delta_pct": 20.0,
     "minimum_confidence": "high",
+    "rotation_without_fresh_capacity": False,
     "lease_ttl_seconds": 1800,
     "execution_timeout_seconds": 1800,
     "default_reservation_pct": 5.0,
@@ -85,6 +86,7 @@ class FleetConfig:
     bridge_usage_file: Path
     switch_delta_pct: Decimal
     minimum_confidence: Confidence
+    rotation_without_fresh_capacity: bool
     lease_ttl_seconds: int
     execution_timeout_seconds: int
     default_reservation_pct: Decimal
@@ -156,6 +158,10 @@ def parse_fleet_config(config: Mapping[str, Any] | None) -> FleetConfig:
     minimum = root.get("minimum_confidence", "high")
     if minimum != Confidence.HIGH.value:
         raise FleetConfigError("minimum_confidence must be high in v1")
+    rotation_without_fresh_capacity = _bool(
+        root.get("rotation_without_fresh_capacity", False),
+        "rotation_without_fresh_capacity",
+    )
     ttl = _positive_int(
         root.get("lease_ttl_seconds", 1800), "lease_ttl_seconds"
     )
@@ -212,6 +218,7 @@ def parse_fleet_config(config: Mapping[str, Any] | None) -> FleetConfig:
         bridge_usage_file=Path(bridge),
         switch_delta_pct=switch,
         minimum_confidence=Confidence.HIGH,
+        rotation_without_fresh_capacity=rotation_without_fresh_capacity,
         lease_ttl_seconds=ttl,
         execution_timeout_seconds=timeout,
         default_reservation_pct=reservation,

@@ -114,3 +114,24 @@ The 198-test regression subset was rerun at 09:51 ICT:
 uv run --with pytest pytest tests/hermes_cli/test_config_validation.py tests/hermes_cli/test_subparser_routing_fallback.py tests/hermes_cli/test_commands.py -q
 198 passed in 13.25s
 ```
+
+## Native Windows and stale-capacity fallback correction
+
+A live doctor run showed the Windows `agy.exe` installation was outside `PATH`,
+and current Grok/Antigravity cockpit percentages were stale. The correction:
+
+- discovers `%LOCALAPPDATA%/agy/bin/agy.exe` without a username-specific path;
+- passes the qualified executable into the runtime adapter;
+- keeps stale percentages out of override and reserve arithmetic; and
+- permits explicit, auditable round-robin fallback only when
+  `rotation_without_fresh_capacity` is enabled.
+
+Final GREEN:
+
+```text
+uv run --with pytest pytest tests/hermes_cli/fleet -q
+106 passed in 4.76s
+
+uv run --with pytest pytest tests/hermes_cli/test_config_validation.py tests/hermes_cli/test_subparser_routing_fallback.py tests/hermes_cli/test_commands.py -q
+198 passed in 23.45s
+```

@@ -37,6 +37,7 @@ def evaluate_lane(
     profile = inputs.profile
     qualification = inputs.qualification
     reasons: list[ReasonCode] = []
+    capacity_reasons: list[ReasonCode] = []
 
     # 1. Basic eligibility.
     if not inputs.enabled:
@@ -101,11 +102,18 @@ def evaluate_lane(
     if inputs.active_leases >= inputs.max_concurrency:
         reasons.append(ReasonCode.OCCUPANCY_FULL)
 
-    # 6. Protected reserve.
     snapshot = inputs.capacity.snapshot
-    if snapshot is not None:
+    trustworthy_capacity = (
+        snapshot is not None
+        and snapshot.freshness is Freshness.FRESH
+        and _CONFIDENCE_RANK[snapshot.confidence]
+        >= _CONFIDENCE_RANK[minimum_confidence]
+    )
+
+    # 6. Protected reserve. Untrusted percentages never enter arithmetic.
+    if trustworthy_capacity:
         after_reservation = (
-            snapshot.remaining_pct
+            snapshot.remaining_pct  # type: ignore[union-attr]
             - inputs.active_reserved_pct
             - task.reservation_pct
         )
@@ -114,16 +122,36 @@ def evaluate_lane(
 
     # 7. Capacity evidence.
     if snapshot is None:
-        reasons.append(inputs.capacity.reason or ReasonCode.CAPACITY_MISSING)
+        capacity_reasons.append(
+            inputs.capacity.reason or ReasonCode.CAPACITY_MISSING
+        )
     else:
         if snapshot.freshness is not Freshness.FRESH:
-            reasons.append(inputs.capacity.reason or ReasonCode.CAPACITY_STALE)
+            capacity_reasons.append(
+                inputs.capacity.reason or ReasonCode.CAPACITY_STALE
+            )
         if _CONFIDENCE_RANK[snapshot.confidence] < _CONFIDENCE_RANK[minimum_confidence]:
-            reasons.append(ReasonCode.CAPACITY_CONFIDENCE_LOW)
+            capacity_reasons.append(ReasonCode.CAPACITY_CONFIDENCE_LOW)
 
     # 8. Cooldown.
     if inputs.cooldown_until is not None and inputs.cooldown_until > at:
         reasons.append(ReasonCode.LANE_COOLDOWN)
+
+    stale_or_missing = (
+        snapshot is None
+        and (inputs.capacity.reason or ReasonCode.CAPACITY_MISSING)
+        is ReasonCode.CAPACITY_MISSING
+    ) or (
+        snapshot is not None and snapshot.freshness is Freshness.STALE
+    )
+    fallback_eligible = (
+        inputs.rotation_without_fresh_capacity
+        and stale_or_missing
+        and not reasons
+    )
+    if fallback_eligible:
+        reasons.append(ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY)
+    reasons.extend(capacity_reasons)
 
     # Preserve deterministic ordering while avoiding duplicate codes caused by
     # related auth/capacity evidence.
@@ -137,6 +165,7 @@ def evaluate_lane(
         reasons=(ReasonCode.MET,) if eligible else unique_reasons,
         selected_model=selected_model,
         selected_effort=selected_effort,
+        fallback_eligible=fallback_eligible,
         qualification_evidence_id=(
             qualification.evidence_id if qualification is not None else ""
         ),
@@ -155,12 +184,12 @@ def select_lane(
     """Select a lane deterministically without mutating rotation state."""
 
     ordered = tuple(sorted(evaluations, key=lambda item: item.profile.order))
-    eligible = tuple(
+    pool = tuple(
         item
         for item in ordered
-        if item.eligible and item.capacity is not None
+        if item.eligible or item.fallback_eligible
     )
-    if not eligible:
+    if not pool:
         return RouteDecision(
             lane_id=None,
             reason=ReasonCode.NO_ELIGIBLE_LANE,
@@ -168,47 +197,34 @@ def select_lane(
             rotation_index=rotation_index,
         )
 
-    priority = eligible[0]
-    best_remaining = max(
-        item.capacity.effective_remaining_pct  # type: ignore[union-attr]
-        for item in eligible
-    )
-    top = tuple(
-        item
-        for item in eligible
-        if item.capacity is not None
-        and item.capacity.effective_remaining_pct == best_remaining
-    )
-    difference = (
-        best_remaining - priority.capacity.effective_remaining_pct
-    )  # type: ignore[union-attr]
-
-    # Exact top ties rotate even when the priority lane is in the tie. This is
-    # the persisted fairness rule; a non-tied lane must clear the exact delta.
-    if len(top) > 1:
-        chosen_pos = rotation_index % len(top)
-        chosen = top[chosen_pos]
-        return RouteDecision(
-            lane_id=chosen.lane_id,
-            reason=ReasonCode.MET,
-            evaluations=ordered,
-            rotation_index=(chosen_pos + 1) % len(top),
-            switch_applied=chosen is not priority,
+    chosen_pos = rotation_index % len(pool)
+    cyclic = pool[chosen_pos]
+    chosen = cyclic
+    if cyclic.eligible and cyclic.capacity is not None:
+        fresh = tuple(item for item in pool if item.eligible)
+        best_remaining = max(
+            item.capacity.effective_remaining_pct  # type: ignore[union-attr]
+            for item in fresh
         )
-
-    if difference < switch_delta:
-        return RouteDecision(
-            lane_id=priority.lane_id,
-            reason=ReasonCode.MET,
-            evaluations=ordered,
-            rotation_index=rotation_index,
+        difference = (
+            best_remaining - cyclic.capacity.effective_remaining_pct
         )
+        if difference >= switch_delta:
+            chosen = next(
+                item
+                for item in fresh
+                if item.capacity is not None
+                and item.capacity.effective_remaining_pct == best_remaining
+            )
 
-    chosen = top[0]
     return RouteDecision(
         lane_id=chosen.lane_id,
-        reason=ReasonCode.MET,
+        reason=(
+            ReasonCode.ROTATION_WITHOUT_FRESH_CAPACITY
+            if chosen.fallback_eligible
+            else ReasonCode.MET
+        ),
         evaluations=ordered,
-        rotation_index=rotation_index,
-        switch_applied=chosen is not priority,
+        rotation_index=(chosen_pos + 1) % len(pool),
+        switch_applied=chosen is not cyclic,
     )

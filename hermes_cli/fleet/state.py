@@ -335,7 +335,9 @@ class FleetStore:
                         self._lease(current),
                         evaluations,
                     )
-                if evaluation is None or not evaluation.eligible:
+                if evaluation is None or not (
+                    evaluation.eligible or evaluation.fallback_eligible
+                ):
                     self._audit(
                         connection,
                         at=at,
@@ -502,15 +504,19 @@ class FleetStore:
                 task_id=task.task_id,
                 lane_id=profile.lane_id,
                 event_type="ROUTE_SELECTED",
-                reason=ReasonCode.MET.value,
+                reason=decision.reason.value,
                 decision={
                     "adapter_kind": profile.adapter_kind.value,
                     "provider_id": profile.provider_id,
                     "model_id": winner.selected_model,
                     "effort": winner.selected_effort,
                     "fast_mode": False,
+                    "selection_reason": decision.reason.value,
                     "capacity_source": (
-                        winner.capacity.source_id if winner.capacity else None
+                        winner.capacity.source_id
+                        if winner.capacity
+                        and decision.reason is ReasonCode.MET
+                        else None
                     ),
                     "qualification": winner.qualification_evidence_id,
                 },

@@ -109,14 +109,19 @@ def _default_service(
         load_config_readonly() if config_data is None else config_data
     )
     profiles = ordered_profiles()
+    qualifications = (doctor or FleetQualificationDoctor()).qualify(profiles)
     return FleetService(
         config=config,
         store=FleetStore(
             store_path or (get_hermes_home() / "fleet" / "state.db")
         ),
         profiles=profiles,
-        qualifications=(doctor or FleetQualificationDoctor()).qualify(profiles),
-        adapters=dict(adapters or live_adapters()),
+        qualifications=qualifications,
+        adapters=dict(
+            live_adapters(qualifications=qualifications)
+            if adapters is None
+            else adapters
+        ),
         capacity_source=BridgeUsageAdapter(config.bridge_usage_file),
         now=now,
     )

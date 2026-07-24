@@ -75,6 +75,9 @@ class FleetService:
                     max_concurrency=lane_config.max_concurrency,
                     reserve_floor_pct=lane_config.reserve_floor_pct,
                     cooldown_until=cooldown[0] if cooldown else None,
+                    rotation_without_fresh_capacity=(
+                        self.config.rotation_without_fresh_capacity
+                    ),
                 )
             )
         return tuple(candidates)

@@ -184,10 +184,20 @@ class AntigravityAdapter(_SubscriptionCliAdapter):
 def live_adapters(
     *,
     native_runner: Callable[..., Mapping[str, Any]] = run_native_hermes_child,
+    qualifications: Mapping[str, Qualification] | None = None,
 ) -> dict[str, object]:
+    qualifications = qualifications or {}
+    claude = qualifications.get("claude_code")
+    antigravity = qualifications.get("antigravity")
     return {
         "chatgpt_codex": NativeProviderAdapter(native_runner),
-        "claude_code": ClaudeCodeAdapter(),
+        "claude_code": ClaudeCodeAdapter(
+            claude.executable if claude and claude.qualified and claude.executable else "claude"
+        ),
         "grok": NativeProviderAdapter(native_runner),
-        "antigravity": AntigravityAdapter(),
+        "antigravity": AntigravityAdapter(
+            antigravity.executable
+            if antigravity and antigravity.qualified and antigravity.executable
+            else "agy"
+        ),
     }

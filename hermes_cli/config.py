@@ -951,6 +951,7 @@ DEFAULT_CONFIG = {
         "bridge_usage_file": "C:/HermesBridge/usage-weekly.json",
         "switch_delta_pct": 20.0,
         "minimum_confidence": "high",
+        "rotation_without_fresh_capacity": False,
         "lease_ttl_seconds": 1800,
         "execution_timeout_seconds": 1800,
         "default_reservation_pct": 5.0,
