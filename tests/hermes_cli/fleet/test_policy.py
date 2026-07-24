@@ -232,6 +232,25 @@ def test_desktop_parent_excludes_external_worker_without_parent_session_support(
     assert ReasonCode.PARENT_SESSION_UNSUPPORTED in evaluation.reasons
 
 
+def test_external_parent_requires_separate_persistent_session_proof():
+    profile = replace(
+        _profile("antigravity"),
+        adapter_kind=AdapterKind.EXTERNAL_CLI,
+        supports_parent_session=True,
+    )
+    inputs = _inputs(profile)
+
+    evaluation = evaluate_lane(
+        inputs,
+        TASK,
+        now=NOW,
+        purpose=RoutePurpose.DESKTOP_PARENT,
+    )
+
+    assert not evaluation.eligible
+    assert ReasonCode.PARENT_SESSION_UNPROVEN in evaluation.reasons
+
+
 @pytest.mark.parametrize(
     ("lane_id", "provider_id"),
     [

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from .types import (
+    AdapterKind,
     Confidence,
     Freshness,
     LaneEvaluation,
@@ -54,6 +55,15 @@ def evaluate_lane(
         and not profile.supports_parent_session
     ):
         reasons.append(ReasonCode.PARENT_SESSION_UNSUPPORTED)
+    if (
+        purpose is RoutePurpose.DESKTOP_PARENT
+        and profile.adapter_kind is AdapterKind.EXTERNAL_CLI
+        and (
+            qualification is None
+            or not qualification.parent_session_proven
+        )
+    ):
+        reasons.append(ReasonCode.PARENT_SESSION_UNPROVEN)
     if not profile.implemented:
         reasons.append(ReasonCode.ADAPTER_UNIMPLEMENTED)
     if not profile.platform_supported:

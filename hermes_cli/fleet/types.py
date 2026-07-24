@@ -23,6 +23,7 @@ class ReasonCode(str, Enum):
     LANE_DISABLED = "LANE_DISABLED"
     PURPOSE_UNSUPPORTED = "PURPOSE_UNSUPPORTED"
     PARENT_SESSION_UNSUPPORTED = "PARENT_SESSION_UNSUPPORTED"
+    PARENT_SESSION_UNPROVEN = "PARENT_SESSION_UNPROVEN"
     ADAPTER_UNIMPLEMENTED = "ADAPTER_UNIMPLEMENTED"
     PLATFORM_UNSUPPORTED = "PLATFORM_UNSUPPORTED"
     ADAPTER_NOT_FOUND = "ADAPTER_NOT_FOUND"
@@ -181,6 +182,7 @@ class Qualification:
     subscription_only_proven: bool = False
     paid_fallback_absent: bool = False
     overage_state: OverageState = OverageState.UNKNOWN
+    parent_session_proven: bool = False
 
 
 @dataclass(frozen=True)

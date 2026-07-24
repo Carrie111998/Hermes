@@ -235,8 +235,10 @@ class FleetQualificationDoctor:
                 policy_detail = (
                     "policy evidence: agy executable/version plus exact model "
                     "qualification from `agy models` and forbidden billable API-key "
-                    "env absent; requested model is not provider-reported served-model "
-                    "proof; provider overage state requires separate billing telemetry"
+                    "env absent; parent session remains unproven until a strict two-turn "
+                    "canary verifies stable identity through --conversation and --continue, "
+                    "--remote-control execution, and exact provider-reported served-model "
+                    "evidence; provider overage state requires separate billing telemetry"
                 )
             else:
                 policy_detail = (
