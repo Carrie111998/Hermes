@@ -36,6 +36,8 @@ export PS_REPLAY_PROVIDER_ADMIN_TOKEN="..."
 
 hermes replay-run start \
   --tenant tgg \
+  --agent-id christopher \
+  --job-type replay \
   --provider-url "$PS_REPLAY_PROVIDER_URL" \
   --provider-admin-token "$PS_REPLAY_PROVIDER_ADMIN_TOKEN" \
   --source-data-dir /path/to/source-ps-data \
@@ -45,6 +47,14 @@ hermes replay-run start \
   --out-dir /path/to/replay-runs \
   --tool-error-budget 0
 ```
+
+For a `bridge_message_log` corpus, `tenant`, `agent_id`, and `job_type` are
+required replay-context fields. They may be supplied by the command line as
+shown above or explicitly in that corpus source block. Existing persisted
+plans that omit them are rejected rather than inferred. Because these fields
+are part of the canonical source manifest, a plan created before this contract
+change has a different digest; finish or abandon an in-flight run with its
+original code version rather than mixing versions.
 
 The command writes:
 
@@ -86,6 +96,9 @@ A failed verify marks the target dirty locally and through the provider dirty en
 Promotion must be called through the orchestrator manifest. Do not call the provider promote endpoint directly.
 
 For this phase, use only non-prod target directories. Real TGG production promote is held for the gated validation phase.
+The confirmation token is tenant-derived:
+`ORCHESTRATOR_<NORMALIZED_TENANT>_TARGET` (for example,
+`ORCHESTRATOR_TGG_TARGET`).
 
 ```bash
 hermes replay-run promote \
