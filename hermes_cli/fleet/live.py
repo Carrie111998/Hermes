@@ -186,7 +186,13 @@ class FleetQualificationDoctor:
                         profile, f"{profile.provider_id} auth source is not attributable"
                     )
                     continue
-                auth_source = f"{profile.provider_id}:{source}"
+                # Credential-pool aliases (for example ``pool:...``) and the
+                # runtime resolver's source label (for example
+                # ``manual:device_code``) describe the same OAuth credential
+                # through different layers.  Bind execution to the stable,
+                # provider-scoped subscription identity after both layers have
+                # independently proven their attributable source.
+                auth_source = f"{profile.provider_id}:oauth_subscription"
             else:
                 executable = self._external_executable(profile)
                 if not executable:

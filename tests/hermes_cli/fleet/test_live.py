@@ -60,6 +60,10 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
     qualifications = doctor.qualify(profiles.values())
 
     assert qualifications["chatgpt_codex"].qualified
+    assert (
+        qualifications["chatgpt_codex"].auth_source
+        == "openai-codex:oauth_subscription"
+    )
     assert qualifications["chatgpt_codex"].models == ("gpt-5.6-sol",)
     assert qualifications["chatgpt_codex"].efforts[-2:] == ("max", "ultra")
     assert qualifications["chatgpt_codex"].overage_disabled is True
@@ -220,7 +224,7 @@ def test_default_service_qualifies_and_executes_each_live_lane(
             "model_id": kwargs["model"],
             "effort": kwargs["effort"],
             "auth_kind": "oauth_subscription",
-            "auth_source": f"{kwargs['provider_id']}:pool:test",
+            "auth_source": f"{kwargs['provider_id']}:oauth_subscription",
             "fallback_enabled": False,
             "fast_mode": False,
             "output": "native complete",

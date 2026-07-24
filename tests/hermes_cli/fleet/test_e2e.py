@@ -58,7 +58,7 @@ def _qualification(profile: LaneProfile) -> Qualification:
         captured_at=NOW,
         expires_at=NOW + timedelta(hours=1),
         auth_kind="oauth_subscription",
-        auth_source="openai-codex:manual:device_code",
+        auth_source="openai-codex:oauth_subscription",
         overage_disabled=True,
         provider_id=profile.provider_id,
         models=profile.ordered_models,
@@ -143,7 +143,7 @@ def _native_payload(**request: object) -> dict[str, object]:
         "model_id": request["model"],
         "effort": request["effort"],
         "auth_kind": "oauth_subscription",
-        "auth_source": "openai-codex:manual:device_code",
+        "auth_source": "openai-codex:oauth_subscription",
         "fallback_enabled": False,
         "fast_mode": False,
         "output": "fake completed",
@@ -371,7 +371,7 @@ def test_runtime_auth_source_is_derived_and_token_presence_is_not_rejected():
         }
         assert _runtime_identity(runtime, provider) == (
             "oauth_subscription",
-            f"{provider}:{source}",
+            f"{provider}:oauth_subscription",
         )
 
 

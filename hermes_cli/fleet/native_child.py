@@ -66,7 +66,7 @@ def _runtime_identity(
         or not source
     ):
         raise RuntimeError("resolved runtime is not an attributable OAuth route")
-    return "oauth_subscription", f"{provider}:{source}"
+    return "oauth_subscription", f"{provider}:oauth_subscription"
 
 
 def execute_request(request: Mapping[str, Any]) -> dict[str, Any]:
