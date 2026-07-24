@@ -156,9 +156,9 @@ describe('FleetRouterSettings', () => {
 
     const antigravity = within(screen.getByRole('article', { name: 'Antigravity' }))
     expect(antigravity.getByText('Enabled')).toBeTruthy()
-    expect(antigravity.getByText('Rotation fallback')).toBeTruthy()
+    expect(antigravity.getByText('In rotation')).toBeTruthy()
     expect(antigravity.queryByText('Disabled')).toBeNull()
-    expect(antigravity.getByText(/This lane is enabled; it is not disabled/)).toBeTruthy()
+    expect(antigravity.getByText(/normal rotation, not provider-failure fallback/)).toBeTruthy()
     expect(antigravity.getByText('stale')).toBeTruthy()
   })
 

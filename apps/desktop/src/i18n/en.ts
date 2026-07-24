@@ -855,7 +855,7 @@ export const en: Translations = {
         healthyDetail: 'At least one lane passes every required qualification and capacity check.',
         attentionDetail: 'No lane currently passes every required check. Review the exact reason codes below.',
         fallbackSummary:
-          'No lane has fully fresh capacity evidence, but at least one enabled lane remains selectable through the configured rotation fallback.',
+          'No lane has fully fresh capacity evidence, so deterministic rotation is active for eligible lanes.',
         lanesTitle: 'Subscription lanes',
         laneNames: {
           chatgpt_codex: 'ChatGPT / Codex',
@@ -868,9 +868,9 @@ export const en: Translations = {
         disabled: 'Disabled',
         selectable: 'Selectable',
         blocked: 'Blocked',
-        rotationFallback: 'Rotation fallback',
+        rotationFallback: 'In rotation',
         fallbackDetail:
-          'Selectable by the configured rotation fallback because capacity is stale or missing. This lane is enabled; it is not disabled.',
+          'Included in deterministic rotation because capacity telemetry is stale or missing. This is normal rotation, not provider-failure fallback.',
         provider: 'Provider',
         model: 'Model',
         effort: 'Effort',

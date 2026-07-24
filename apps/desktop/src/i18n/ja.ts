@@ -915,9 +915,9 @@ export const ja = defineLocale({
         disabled: '無効',
         selectable: '選択可能',
         blocked: 'ブロック',
-        rotationFallback: 'ローテーションフォールバック',
+        rotationFallback: 'ローテーション対象',
         fallbackDetail:
-          '容量情報が古いか不足しているため、設定済みのローテーションフォールバックで選択できます。このレーンは有効であり、無効ではありません。',
+          '容量テレメトリが古いか不足しているため、決定論的ローテーションに含まれます。これは通常のローテーションであり、プロバイダー障害時のフォールバックではありません。',
         provider: 'プロバイダー',
         model: 'モデル',
         effort: '推論強度',
