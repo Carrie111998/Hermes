@@ -35,6 +35,7 @@ export PS_REPLAY_PROVIDER_URL="http://127.0.0.1:5192"
 export PS_REPLAY_PROVIDER_ADMIN_TOKEN="..."
 
 hermes replay-run start \
+  --tenant tgg \
   --provider-url "$PS_REPLAY_PROVIDER_URL" \
   --provider-admin-token "$PS_REPLAY_PROVIDER_ADMIN_TOKEN" \
   --source-data-dir /path/to/source-ps-data \
@@ -72,6 +73,7 @@ Re-run the gate:
 
 ```bash
 hermes replay-run verify \
+  --tenant tgg \
   --manifest /path/to/replay-runs/<run-id>/run-manifest.json \
   --session-db ~/.hermes/state.db \
   --tool-error-budget 0
@@ -87,15 +89,17 @@ For this phase, use only non-prod target directories. Real TGG production promot
 
 ```bash
 hermes replay-run promote \
+  --tenant tgg \
   --manifest /path/to/replay-runs/<run-id>/run-manifest.json \
   --prod-data-dir /path/to/non-prod-prod-dir \
-  --confirm ORCHESTRATOR_PROMOTE
+  --confirm ORCHESTRATOR_TGG_TARGET
 ```
 
 Rollback uses the provider promotion manifest recorded in `run-manifest.json`:
 
 ```bash
 hermes replay-run rollback \
+  --tenant tgg \
   --manifest /path/to/replay-runs/<run-id>/run-manifest.json
 ```
 
@@ -103,6 +107,7 @@ If the provider manifest path must be supplied manually:
 
 ```bash
 hermes replay-run rollback \
+  --tenant tgg \
   --manifest /path/to/replay-runs/<run-id>/run-manifest.json \
   --promotion-manifest-path /path/to/provider/promotions/<promotion>.json
 ```
