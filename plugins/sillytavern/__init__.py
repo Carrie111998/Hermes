@@ -463,6 +463,7 @@ def sillytavern_proxy_start(args, **kwargs) -> str:
                 "routes": {
                     "codex": f"http://127.0.0.1:{_PROXY_PORT}/codex/v1",
                     "xai": f"http://127.0.0.1:{_PROXY_PORT}/xai/v1",
+                    "llama": f"http://127.0.0.1:{_PROXY_PORT}/llama/v1",
                 },
             }
         )
@@ -493,6 +494,7 @@ def sillytavern_proxy_start(args, **kwargs) -> str:
                     "routes": {
                         "codex": f"http://127.0.0.1:{_PROXY_PORT}/codex/v1",
                         "xai": f"http://127.0.0.1:{_PROXY_PORT}/xai/v1",
+                        "llama": f"http://127.0.0.1:{_PROXY_PORT}/llama/v1",
                     },
                 }
             )
@@ -540,6 +542,7 @@ def sillytavern_proxy_status(args, **kwargs) -> str:
             "routes": {
                 "codex": f"http://127.0.0.1:{_PROXY_PORT}/codex/v1",
                 "xai": f"http://127.0.0.1:{_PROXY_PORT}/xai/v1",
+                "llama": f"http://127.0.0.1:{_PROXY_PORT}/llama/v1",
             },
         }
     )

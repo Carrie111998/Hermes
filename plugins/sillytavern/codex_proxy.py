@@ -29,6 +29,7 @@ _CODEX_AUTH = Path(os.path.expanduser("~/.codex/auth.json"))
 # Codex ChatGPT-backend chat surface reachable with an OAuth access_token.
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
 XAI_BASE = "https://api.x.ai/v1"
+LLAMA_BASE = os.environ.get("SILLYTAVERN_LLAMA_URL", "http://127.0.0.1:8080/v1")
 
 
 def _load_env() -> dict:
@@ -98,6 +99,9 @@ def _resolve_route(path: str):
     if path.startswith("/xai/"):
         key = env.get("XAI_API_KEY", "")
         return XAI_BASE, f"Bearer {key}" if key else "", path[len("/xai"):], {}
+    if path.startswith("/llama/"):
+        # Local llama-server is already OpenAI-compatible; api key is nominal.
+        return LLAMA_BASE, "Bearer local", path[len("/llama"):], {}
     return None, None, None, {}
 
 
@@ -142,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy(self):
         base, auth, remainder, extra = _resolve_route(self.path)
         if base is None:
-            self.send_error(404, "unknown route; use /codex/... or /xai/...")
+            self.send_error(404, "unknown route; use /codex/, /xai/, or /llama/")
             return
         if not auth:
             self.send_error(401, "missing credential for route")
@@ -151,9 +155,9 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else None
 
-        # remainder is like "/v1/chat/completions"; xAI already expects /v1,
-        # Codex backend expects the path without the extra /v1 prefix and maps
-        # chat/completions -> responses (with a body-shape conversion).
+        # remainder is like "/v1/chat/completions". Codex maps chat/completions
+        # -> responses; xAI and llama already carry /v1 in their base URL, so
+        # strip the duplicate /v1 prefix from the remainder.
         if base == CODEX_BASE:
             tail = remainder[len("/v1"):] if remainder.startswith("/v1") else remainder
             if tail.endswith("/chat/completions"):
@@ -161,7 +165,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = _chat_to_responses(body)
             target = base + tail
         else:
-            target = base + remainder
+            tail = remainder[len("/v1"):] if remainder.startswith("/v1") else remainder
+            target = base + tail
         length = len(body) if body else 0
 
         req = urllib.request.Request(target, data=body, method=self.command)
@@ -205,8 +210,8 @@ def main():
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"codex/xai proxy listening on http://127.0.0.1:{port}")
-    print("  routes: /codex/v1/...  /xai/v1/...")
+    print(f"codex/xai/llama proxy listening on http://127.0.0.1:{port}")
+    print("  routes: /codex/v1/...  /xai/v1/...  /llama/v1/...")
     server.serve_forever()
 
 

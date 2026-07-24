@@ -157,3 +157,15 @@ def test_codex_headers_pins_originator():
     headers = mod._codex_headers("not.a.jwt")
     assert headers["originator"] == "codex_cli_rs"
     assert "codex_cli_rs" in headers["User-Agent"]
+
+
+def test_resolve_route_llama_and_xai():
+    mod = _load_proxy()
+    base, auth, remainder, extra = mod._resolve_route("/llama/v1/models")
+    assert base == mod.LLAMA_BASE
+    assert auth == "Bearer local"
+    assert remainder == "/v1/models"
+    base2, _, _, _ = mod._resolve_route("/xai/v1/models")
+    assert base2 == mod.XAI_BASE
+    base3, _, _, _ = mod._resolve_route("/bogus/v1/models")
+    assert base3 is None
