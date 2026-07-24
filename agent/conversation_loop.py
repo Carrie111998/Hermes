@@ -952,6 +952,13 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    # Counts consecutive iterations where the model ONLY produces tool calls
+    # without a final assistant message. When this exceeds the threshold, the
+    # turn is force-completed to prevent the desktop input locking permanently.
+    # Reset whenever the model returns a non-tool-call final response.
+    # See issue #70837.
+    consecutive_tool_only_iterations = 0
+    MAX_CONSECUTIVE_TOOL_ONLY = 25
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
     # overflow/413 retry handlers, and the post-tool compaction gate.
@@ -5320,6 +5327,11 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                # Track consecutive tool-only iterations for the desktop
+                # input-lock guard (#70837).  Reset when the model produces
+                # a final response (non-tool-call branch below).
+                consecutive_tool_only_iterations += 1
+
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -5864,12 +5876,48 @@ def run_conversation(
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
-                
+
+                # ── Consecutive tool-only iteration guard ──────────────
+                # The model keeps calling tools without ever producing a
+                # final assistant message.  After MAX_CONSECUTIVE_TOOL_ONLY
+                # iterations, force-complete the turn so the desktop input
+                # doesn't stay locked forever (#70837).
+                # (counter already incremented at the top of this branch)
+                if consecutive_tool_only_iterations >= MAX_CONSECUTIVE_TOOL_ONLY:
+                    _turn_exit_reason = "consecutive_tool_only_exceeded"
+                    final_response = (
+                        "I've been calling tools for too many consecutive "
+                        "iterations without producing a final response. "
+                        "Please rephrase your request or check if the tools "
+                        "are working correctly."
+                    )
+                    logger.warning(
+                        "Turn force-completed after %d consecutive "
+                        "tool-call-only iterations (session=%s); "
+                        "turn_exit_reason=%s",
+                        consecutive_tool_only_iterations,
+                        agent.session_id or "-",
+                        _turn_exit_reason,
+                    )
+                    agent._emit_status(
+                        f"⚠️ Turn force-completed after "
+                        f"{consecutive_tool_only_iterations} consecutive "
+                        f"tool-call iterations — "
+                        f"no final response was produced."
+                    )
+                    messages.append(
+                        {"role": "assistant", "content": final_response}
+                    )
+                    break
+
                 # Continue loop for next response
                 continue
             
             else:
                 # No tool calls - this is the final response
+                # Reset the consecutive-tool-only counter since the model
+                # produced a final response (issue #70837).
+                consecutive_tool_only_iterations = 0
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
