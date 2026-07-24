@@ -1093,6 +1093,69 @@ def test_review_runtime_carries_auxiliary_extra_body(curator_env):
     }
 
 
+def test_run_llm_review_uses_curator_fallback_chain_when_primary_fork_fails(curator_env, monkeypatch):
+    """Curator reviews honor auxiliary.curator.fallback_chain for fork failures."""
+    curator = curator_env["curator"]
+    import importlib
+    importlib.reload(curator)
+
+    cfg = {
+        "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+        "auxiliary": {
+            "curator": {
+                "provider": "openrouter",
+                "model": "primary-model",
+                "fallback_chain": [
+                    {"provider": "gemini", "model": "fallback-model"},
+                ],
+            },
+        },
+    }
+    resolved = []
+    attempts = []
+
+    def _fake_resolve_runtime_provider(**kwargs):
+        resolved.append((kwargs["requested"], kwargs["target_model"]))
+        return {
+            "provider": kwargs["requested"],
+            "model": kwargs["target_model"],
+            "api_key": f"{kwargs['requested']}-key",
+            "base_url": f"https://{kwargs['requested']}.example/v1",
+        }
+
+    class _StubAgent:
+        def __init__(self, *args, **kwargs):
+            attempts.append((kwargs.get("provider"), kwargs.get("model")))
+            if kwargs.get("provider") == "openrouter":
+                raise RuntimeError("primary curator route down")
+            self._memory_write_origin = "assistant_tool"
+            self._memory_nudge_interval = 10
+            self._skill_nudge_interval = 10
+            self._session_messages = []
+
+        def run_conversation(self, user_message=None, **kwargs):
+            return {"final_response": "fallback ok"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _fake_resolve_runtime_provider,
+    )
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+
+    meta = curator._run_llm_review("review prompt")
+
+    assert meta.get("error") is None, meta.get("error")
+    assert meta["final"] == "fallback ok"
+    assert meta["provider"] == "gemini"
+    assert meta["model"] == "fallback-model"
+    assert resolved == [("openrouter", "primary-model"), ("gemini", "fallback-model")]
+    assert attempts == [("openrouter", "primary-model"), ("gemini", "fallback-model")]
+
+
 def test_review_runtime_ignores_auxiliary_credentials_when_using_main(curator_env):
     """Falling through to main model must not pick up stray auxiliary.curator secrets."""
     curator = curator_env["curator"]
