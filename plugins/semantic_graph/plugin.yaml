@@ -1,0 +1,63 @@
+name: semantic-graph
+version: 0.1.0
+description: "Typed provenance graph for AI memory, evidence, and outputs."
+author: "Ryo Minegishi (@zapabob), Hermes Agent"
+kind: standalone
+
+provides_tools:
+  - semantic_graph_status
+  - semantic_graph_begin_run
+  - semantic_graph_ingest
+  - semantic_graph_submit_fragment
+  - semantic_graph_search
+  - semantic_graph_get
+  - semantic_graph_finalize
+  - semantic_graph_evaluate_output
+  - semantic_graph_feedback
+  - semantic_graph_export
+
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - post_tool_call
+  - subagent_start
+  - subagent_stop
+  - on_session_finalize
+
+config:
+  db_subdir:
+    type: string
+    default: semantic-graph
+  capture_turns:
+    type: boolean
+    default: true
+  capture_tool_events:
+    type: boolean
+    default: false
+  capture_subagents:
+    type: boolean
+    default: true
+  auto_extract:
+    type: string
+    default: explicit
+  retrieval_enabled:
+    type: boolean
+    default: true
+  retrieval_top_k:
+    type: integer
+    default: 8
+  retrieval_max_chars:
+    type: integer
+    default: 3500
+  min_recall_confidence:
+    type: number
+    default: 0.60
+  max_artifact_chars:
+    type: integer
+    default: 12000
+  tool_result_preview_chars:
+    type: integer
+    default: 1000
+  retention_days:
+    type: integer
+    default: 365
