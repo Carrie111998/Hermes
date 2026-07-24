@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger("plugins.workflow")
+_COMPLETIONS_DIR = Path.home() / ".hermes" / "workflows" / "completions"
 
 # ---------------------------------------------------------------------------
 # Plugin config loader
@@ -612,7 +613,8 @@ def _notify_workflow_complete(task_id: str, state=None):
             "message": full_message,
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
-        marker_path = Path(f"/tmp/wf-complete-{ts}.json")
+        _COMPLETIONS_DIR.mkdir(parents=True, exist_ok=True)
+        marker_path = _COMPLETIONS_DIR / f"wf-complete-{ts}.json"
         # Atomic write: temp file → rename (prevents TOCTOU reads of partial JSON)
         tmp_fd, tmp_path = tempfile.mkstemp(prefix="wf-complete-", suffix=".json")
         try:
@@ -663,7 +665,7 @@ def _start_completion_watcher():
         while True:
             time.sleep(2)
             try:
-                markers = sorted(_glob.glob("/tmp/wf-complete-*.json"))
+                markers = sorted(_glob.glob(str(_COMPLETIONS_DIR / "wf-complete-*.json")))
                 # Skip stale markers older than 10 minutes
                 now = time.time()
                 markers = [m for m in markers if now - os.path.getmtime(m) < 600]

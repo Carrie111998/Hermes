@@ -95,7 +95,7 @@ class TestNotifyWorkflowComplete:
                 _notify_workflow_complete("t_node-a")
 
         # Check marker was written
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         assert len(markers) >= 1, "No completion marker written"
 
         # Clean up
@@ -126,7 +126,7 @@ class TestNotifyWorkflowComplete:
             mock_find.return_value = (state, "/fake/path")
             _notify_workflow_complete("t_a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         # Should NOT have written a new marker (clean up any old ones first)
         assert not any(
             "test-workflow" in Path(m).read_text() for m in markers
@@ -146,7 +146,7 @@ class TestNotifyWorkflowComplete:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_node-a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         assert markers, "No marker written"
         data = json.loads(Path(markers[-1]).read_text())
         assert data["board"] == "adventours"
@@ -166,7 +166,7 @@ class TestNotifyWorkflowComplete:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_node-a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         data = json.loads(Path(markers[-1]).read_text())
         expected_key = "agent:main:discord:thread:123456:123456"
         assert data["session_key"] == expected_key
@@ -191,7 +191,7 @@ class TestNotifyWorkflowComplete:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_s")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
         assert "✅ spec" in msg
@@ -221,7 +221,7 @@ class TestNotifyWorkflowComplete:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
         assert "ideation" in msg
@@ -250,7 +250,7 @@ class TestNotifyWorkflowComplete:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_c")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         assert markers, "No marker written"
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
@@ -295,7 +295,7 @@ class TestNotifyWorkflowComplete:
                 )
                 _notify_workflow_complete("t_node-a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
         # Analyst report should be included
@@ -316,7 +316,7 @@ class TestNotifyWorkflowComplete:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_node-a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         data = json.loads(Path(markers[-1]).read_text())
         assert data["workflow_name"] == "ideation"
         assert data["status"] == "completed"
@@ -474,7 +474,7 @@ class TestSimplifyCodeFixes:
                 mock_analyst.return_value = MagicMock(success=False, result=None)
                 _notify_workflow_complete("t_node-a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         assert markers, "No marker written"
         data = json.loads(Path(markers[-1]).read_text())
         assert "workflow_name" in data
@@ -503,7 +503,7 @@ class TestSimplifyCodeFixes:
                 _notify_workflow_complete("t_node-a", state=state)
                 mock_find.assert_not_called()
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         assert markers
         os.unlink(markers[-1])
 
@@ -534,7 +534,7 @@ class TestSimplifyCodeFixes:
                 mock_analyst.side_effect = RuntimeError("analyst crashed")
                 _notify_workflow_complete("t_node-a")
 
-        markers = glob.glob("/tmp/wf-complete-*.json")
+        markers = glob.glob(str(Path.home() / ".hermes" / "workflows" / "completions" / "wf-complete-*.json"))
         assert markers, "No marker despite analyst failure"
         data = json.loads(Path(markers[-1]).read_text())
         assert "node-a" in data["message"]
