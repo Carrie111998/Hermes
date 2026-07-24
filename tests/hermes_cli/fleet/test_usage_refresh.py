@@ -76,7 +76,7 @@ def test_bridge_adapter_default_path_is_native(tmp_path, monkeypatch):
     assert adapter.path == default_native_usage_path()
 
 
-def test_refresh_atomic_write_and_per_lane_freshness(tmp_path):
+def test_refresh_atomic_write_and_per_lane_freshness(tmp_path, monkeypatch):
     path = tmp_path / "fleet" / "usage-weekly.json"
     mirror = tmp_path / "mirror" / "usage-weekly.json"
 
@@ -86,6 +86,11 @@ def test_refresh_atomic_write_and_per_lane_freshness(tmp_path):
         if provider == "anthropic":
             return _Snapshot((_Window("Current week", 44.0),))
         return None
+
+    monkeypatch.setattr(
+        "hermes_cli.fleet.usage_refresh._probe_console_lane_health",
+        lambda lane_id: (False, "unhealthy in unit test"),
+    )
 
     report = refresh_usage_document(
         path=path,
@@ -344,3 +349,58 @@ def test_fleet_refresh_usage_ps1_has_no_dated_worktree_fallback():
     assert "fleet-parent-routing-20260724" not in text
     assert "PSScriptRoot" in text
     assert "hermes-agent" in text
+
+
+def test_console_health_probe_stamps_freshness_without_inventing_pct(tmp_path, monkeypatch):
+    path = tmp_path / "usage-weekly.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "plans-1",
+                "checked_at": "2026-07-01T00:00:00.000Z",
+                "plans": [
+                    {
+                        "label": "SuperGrok",
+                        "weekly_pct_used": 12,
+                        "resets": "weekly",
+                    },
+                    {
+                        "label": "Google AI · Antigravity",
+                        "weekly_pct_used": 18,
+                        "resets": "weekly",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fetch(provider: str):
+        if provider == "openai-codex":
+            return _Snapshot((_Window("Weekly", 20.0),))
+        if provider == "anthropic":
+            return _Snapshot((_Window("Weekly", 30.0),))
+        return None
+
+    monkeypatch.setattr(
+        "hermes_cli.fleet.usage_refresh._probe_console_lane_health",
+        lambda lane_id: (True, f"{lane_id} healthy"),
+    )
+
+    report = refresh_usage_document(
+        path=path,
+        home=tmp_path,
+        mirror_path=None,
+        fetch_usage=fetch,
+        now=NOW,
+    )
+    assert report.ok
+    document = json.loads(path.read_text(encoding="utf-8"))
+    by_label = {row["label"]: row for row in document["plans"]}
+    grok = by_label["SuperGrok"]
+    agy = by_label["Google AI · Antigravity"]
+    assert grok["weekly_pct_used"] == 12
+    assert agy["weekly_pct_used"] == 18
+    assert grok["checked_at"] == "2026-07-24T12:00:00.000Z"
+    assert agy["measurement_kind"] == "measured"
+    assert grok["comparability_group"] == "subscription-weekly"

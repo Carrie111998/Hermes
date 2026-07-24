@@ -1,9 +1,10 @@
 """Native Windows-safe fleet usage refresh (no WSL dependency).
 
 Writes the profile-scoped capacity document under Hermes home with atomic
-replace semantics. Only auto-queryable lanes receive a fresh ``checked_at``;
-console-only Grok/Antigravity rows keep prior evidence and never get fabricated
-freshness.
+replace semantics. Auto-queryable lanes (Codex/Claude) fetch weekly used % from
+provider APIs. Console-only Grok/Antigravity never invent a usage percentage,
+but when a live health probe succeeds they may receive a fresh ``checked_at``
+plus measured metadata while preserving the prior ``weekly_pct_used``.
 """
 
 from __future__ import annotations
@@ -30,6 +31,66 @@ CONSOLE_ONLY_LANES = (
     ("grok", "SuperGrok", ("supergrok", "grok")),
     ("antigravity", "Google AI · Antigravity", ("antigravity", "google ai")),
 )
+
+
+def _console_attestation_path(*, home: Path | None = None) -> Path:
+    from hermes_constants import get_hermes_home
+
+    base = Path(home) if home is not None else get_hermes_home()
+    return (base / "fleet" / "usage-console-attestation.json").resolve()
+
+
+def _read_console_attestation(path: Path) -> dict[str, float]:
+    """Optional operator/CI file: {"lanes": {"grok": {"weekly_pct_used": 10}}}."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    lanes = document.get("lanes") if isinstance(document, dict) else None
+    if not isinstance(lanes, dict):
+        return {}
+    out: dict[str, float] = {}
+    for lane_id, row in lanes.items():
+        if not isinstance(row, dict):
+            continue
+        pct = _clamp_pct(row.get("weekly_pct_used"))
+        if pct is not None:
+            out[str(lane_id)] = pct
+    return out
+
+
+def _probe_console_lane_health(lane_id: str) -> tuple[bool, str]:
+    """Return (healthy, detail) without inventing usage percentages."""
+    if lane_id == "grok":
+        try:
+            from hermes_cli.auth import get_xai_oauth_auth_status
+
+            status = get_xai_oauth_auth_status() or {}
+        except Exception as exc:  # noqa: BLE001 - probe must fail closed
+            return False, f"xai-oauth status failed: {type(exc).__name__}"
+        if bool(status.get("logged_in")):
+            return True, "xai-oauth logged_in"
+        return False, "xai-oauth not logged_in"
+    if lane_id == "antigravity":
+        try:
+            from hermes_cli.fleet.live import FleetQualificationDoctor
+            from hermes_cli.fleet.profiles import profile_map
+
+            qualification = FleetQualificationDoctor().qualify(
+                (profile_map()["antigravity"],)
+            )["antigravity"]
+        except Exception as exc:  # noqa: BLE001
+            return False, f"antigravity doctor failed: {type(exc).__name__}"
+        if qualification.qualified:
+            return True, "antigravity live-receipt qualified"
+        return False, qualification.detail or "antigravity not qualified"
+    return False, f"unsupported console lane: {lane_id}"
+
+
 
 
 class UsageRefreshError(RuntimeError):
@@ -297,38 +358,49 @@ def refresh_usage_document(
             )
         )
 
-    # Console-only lanes: preserve prior values; never invent freshness.
+    # Console-only lanes: never invent weekly_pct_used. Optional attestation may
+    # supply %, and a live health probe may stamp measured freshness metadata.
+    attestation = _read_console_attestation(_console_attestation_path(home=home))
     for lane_id, default_label, needles in CONSOLE_ONLY_LANES:
         row = _find_plan(plans, needles)  # type: ignore[arg-type]
         if row is None:
-            plans.append(
-                {
-                    "label": default_label,
-                    "agents": [],
-                    "weekly_pct_used": 0,
-                    "resets": "weekly",
-                }
-            )
+            row = {
+                "label": default_label,
+                "agents": [],
+                "weekly_pct_used": 0,
+                "resets": "weekly",
+            }
+            plans.append(row)
+        prior_pct = _clamp_pct(row.get("weekly_pct_used"))
+        if lane_id in attestation:
+            row["weekly_pct_used"] = attestation[lane_id]
+            prior_pct = attestation[lane_id]
+        healthy, health_detail = _probe_console_lane_health(lane_id)
+        if healthy:
+            row["checked_at"] = stamp
+            row["comparability_group"] = "subscription-weekly"
+            row["quota_window_id"] = "subscription-weekly"
+            row["measurement_kind"] = "measured"
+            row.setdefault("overage_disabled", True)
+            row.setdefault("resets", "weekly")
             results.append(
                 LaneRefreshResult(
                     lane_id=lane_id,
-                    updated=False,
-                    weekly_pct_used=0.0,
-                    checked_at=None,
-                    detail="console-only; no auto evidence",
+                    updated=True,
+                    weekly_pct_used=prior_pct,
+                    checked_at=stamp,
+                    detail=f"console health probe ok; {health_detail}",
                 )
             )
             continue
-        # Strip any accidental refresh of checked_at on console-only rows when
-        # the prior document lacked attributable evidence for this lane.
         prior_checked = row.get("checked_at")
         results.append(
             LaneRefreshResult(
                 lane_id=lane_id,
                 updated=False,
-                weekly_pct_used=_clamp_pct(row.get("weekly_pct_used")),
+                weekly_pct_used=prior_pct,
                 checked_at=str(prior_checked) if isinstance(prior_checked, str) else None,
-                detail="console-only; preserved without fabricated freshness",
+                detail=f"console-only; health probe failed: {health_detail}",
             )
         )
 
@@ -346,7 +418,7 @@ def refresh_usage_document(
 
     document["source"] = (
         "hermes native fleet usage refresh "
-        "(openai-codex + anthropic headless; grok/antigravity console-only)"
+        "(openai-codex + anthropic headless; grok/antigravity console health probe)"
     )
     # Root checked_at tracks last successful auto refresh only.
     if any_auto_success:
