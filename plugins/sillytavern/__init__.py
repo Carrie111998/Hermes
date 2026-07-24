@@ -548,6 +548,137 @@ def sillytavern_proxy_status(args, **kwargs) -> str:
     )
 
 
+# ── ST-native features (characters/sessions/lore/persona) ───────────
+
+def _native():
+    import importlib.util
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "st_native.py")
+    spec = importlib.util.spec_from_file_location("st_native", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def st_character_create(args, **kwargs) -> str:
+    try:
+        n = _native()
+        cid = n.create_character(
+            args.get("name", "Character"),
+            description=args.get("description", ""),
+            personality=args.get("personality", ""),
+            scenario=args.get("scenario", ""),
+            first_mes=args.get("first_mes", ""),
+            system_prompt=args.get("system_prompt", ""),
+        )
+        return json.dumps({"ok": True, "character_id": cid})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_character_list(args, **kwargs) -> str:
+    try:
+        return json.dumps({"ok": True, "characters": _native().list_characters()},
+                          ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_persona_create(args, **kwargs) -> str:
+    try:
+        pid = _native().create_persona(
+            args.get("name", "User"),
+            description=args.get("description", ""),
+            is_default=bool(args.get("is_default", True)),
+        )
+        return json.dumps({"ok": True, "persona_id": pid})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_lore_add(args, **kwargs) -> str:
+    try:
+        lid = _native().add_lore(
+            args.get("book", "default"),
+            args.get("keys", []),
+            args.get("content", ""),
+            enabled=bool(args.get("enabled", True)),
+        )
+        return json.dumps({"ok": True, "lore_id": lid})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_session_start(args, **kwargs) -> str:
+    try:
+        sid = _native().create_session(
+            args.get("character_id"),
+            persona_id=args.get("persona_id"),
+            title=args.get("title", ""),
+        )
+        return json.dumps({"ok": True, "session_id": sid})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_session_say(args, **kwargs) -> str:
+    """Add a user turn and return the assembled ST-style prompt to answer it."""
+    try:
+        n = _native()
+        sid = args.get("session_id")
+        user_msg = args.get("message", "")
+        n.add_message(sid, "user", user_msg, name=args.get("user_name", ""))
+        prompt = n.build_prompt(
+            sid, user_msg, lore_book=args.get("lore_book"),
+            history_limit=int(args.get("history_limit", 20)),
+        )
+        return json.dumps({"ok": True, **prompt}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_session_reply(args, **kwargs) -> str:
+    """Record the character's reply message into the session."""
+    try:
+        n = _native()
+        mid = n.add_message(
+            args.get("session_id"), "assistant",
+            args.get("content", ""), name=args.get("character_name", ""),
+        )
+        return json.dumps({"ok": True, "message_id": mid})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_session_summary(args, **kwargs) -> str:
+    try:
+        _native().set_summary(args.get("session_id"), args.get("summary", ""))
+        return json.dumps({"ok": True})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_session_to_memory(args, **kwargs) -> str:
+    """Emit memory records from a session for Hermes ebbinghaus ingestion."""
+    try:
+        recs = _native().session_to_memory_records(args.get("session_id"))
+        return json.dumps({"ok": True, "record_count": len(recs), "records": recs},
+                          ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def st_memory_to_lore(args, **kwargs) -> str:
+    """Ingest Hermes memory records into a lorebook (keys from tags)."""
+    try:
+        added = _native().import_memory_to_lore(
+            args.get("book", "memory"), args.get("records", []),
+        )
+        return json.dumps({"ok": True, "added": added})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
 # ── Register ────────────────────────────────────────────────────────
 
 def register(ctx):
@@ -618,4 +749,92 @@ def register(ctx):
         description="Report Codex/xAI proxy state and Codex OAuth token validity.",
         schema=empty,
         handler=sillytavern_proxy_status,
+    )
+    # ── ST-native roleplay features (no ST server needed) ──
+    ctx.register_tool(
+        name="st_character_create",
+        description="Create a roleplay character (name/description/personality/scenario/first_mes).",
+        schema={"type": "object", "properties": {
+            "name": {"type": "string"}, "description": {"type": "string"},
+            "personality": {"type": "string"}, "scenario": {"type": "string"},
+            "first_mes": {"type": "string"}, "system_prompt": {"type": "string"},
+        }, "required": ["name"]},
+        handler=st_character_create,
+    )
+    ctx.register_tool(
+        name="st_character_list",
+        description="List stored roleplay characters.",
+        schema=empty,
+        handler=st_character_list,
+    )
+    ctx.register_tool(
+        name="st_persona_create",
+        description="Create a user persona (who the user is in roleplay).",
+        schema={"type": "object", "properties": {
+            "name": {"type": "string"}, "description": {"type": "string"},
+            "is_default": {"type": "boolean"},
+        }, "required": ["name"]},
+        handler=st_persona_create,
+    )
+    ctx.register_tool(
+        name="st_lore_add",
+        description="Add a lorebook/world-info entry with keyword triggers.",
+        schema={"type": "object", "properties": {
+            "book": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}},
+            "content": {"type": "string"}, "enabled": {"type": "boolean"},
+        }, "required": ["book", "content"]},
+        handler=st_lore_add,
+    )
+    ctx.register_tool(
+        name="st_session_start",
+        description="Start a roleplay chat session for a character (seeds first_mes).",
+        schema={"type": "object", "properties": {
+            "character_id": {"type": "integer"}, "persona_id": {"type": "integer"},
+            "title": {"type": "string"},
+        }, "required": ["character_id"]},
+        handler=st_session_start,
+    )
+    ctx.register_tool(
+        name="st_session_say",
+        description="Add a user turn and get the assembled ST-style prompt (system+lore+history).",
+        schema={"type": "object", "properties": {
+            "session_id": {"type": "integer"}, "message": {"type": "string"},
+            "lore_book": {"type": "string"}, "history_limit": {"type": "integer"},
+            "user_name": {"type": "string"},
+        }, "required": ["session_id", "message"]},
+        handler=st_session_say,
+    )
+    ctx.register_tool(
+        name="st_session_reply",
+        description="Record the character's generated reply into the session.",
+        schema={"type": "object", "properties": {
+            "session_id": {"type": "integer"}, "content": {"type": "string"},
+            "character_name": {"type": "string"},
+        }, "required": ["session_id", "content"]},
+        handler=st_session_reply,
+    )
+    ctx.register_tool(
+        name="st_session_summary",
+        description="Set/update the running summary for a roleplay session.",
+        schema={"type": "object", "properties": {
+            "session_id": {"type": "integer"}, "summary": {"type": "string"},
+        }, "required": ["session_id", "summary"]},
+        handler=st_session_summary,
+    )
+    ctx.register_tool(
+        name="st_session_to_memory",
+        description="Emit session summary/chat as memory records for Hermes ebbinghaus ingestion.",
+        schema={"type": "object", "properties": {
+            "session_id": {"type": "integer"},
+        }, "required": ["session_id"]},
+        handler=st_session_to_memory,
+    )
+    ctx.register_tool(
+        name="st_memory_to_lore",
+        description="Ingest Hermes memory records into a lorebook (tags become keyword triggers).",
+        schema={"type": "object", "properties": {
+            "book": {"type": "string"},
+            "records": {"type": "array", "items": {"type": "object"}},
+        }, "required": ["book", "records"]},
+        handler=st_memory_to_lore,
     )
