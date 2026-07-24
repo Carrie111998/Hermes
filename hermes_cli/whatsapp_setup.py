@@ -47,12 +47,27 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
         load_config,
         load_env,
         read_raw_config,
+        remove_env_value,
         save_env_value,
         write_platform_config_field,
     )
     from hermes_cli import managed_scope
 
     value = "true" if enabled else "false"
+    previous_env = load_env()
+    previous_raw_config = read_raw_config()
+    previous_platforms = previous_raw_config.get("platforms")
+    previous_whatsapp = (
+        previous_platforms.get("whatsapp")
+        if isinstance(previous_platforms, dict)
+        else None
+    )
+    previous_yaml_value = (
+        previous_whatsapp.get("enabled")
+        if isinstance(previous_whatsapp, dict)
+        and isinstance(previous_whatsapp.get("enabled"), bool)
+        else False
+    )
     try:
         # Write config first. A config failure must never leave the stronger
         # WHATSAPP_ENABLED env override enabled on its own.
@@ -88,17 +103,27 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
             raise RuntimeError("persisted WhatsApp state did not read back")
     except Exception as exc:
         rollback_errors: list[str] = []
-        if enabled:
-            # Pairing preparation established disabled state before activation.
-            # Restore that invariant if either write or read-back fails.
-            try:
-                write_platform_config_field("whatsapp", "enabled", False)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"config rollback failed: {rollback_exc}")
-            try:
-                save_env_value("WHATSAPP_ENABLED", "false")
-            except Exception as rollback_exc:
-                rollback_errors.append(f"env rollback failed: {rollback_exc}")
+        # Restore the exact logical state observed before either store was
+        # mutated. This is symmetric: a failed managed disable must not leave
+        # config.yaml false while a protected env override remains true.
+        try:
+            write_platform_config_field(
+                "whatsapp",
+                "enabled",
+                previous_yaml_value,
+            )
+        except Exception as rollback_exc:
+            rollback_errors.append(f"config rollback failed: {rollback_exc}")
+        try:
+            if "WHATSAPP_ENABLED" in previous_env:
+                save_env_value(
+                    "WHATSAPP_ENABLED",
+                    previous_env["WHATSAPP_ENABLED"],
+                )
+            else:
+                remove_env_value("WHATSAPP_ENABLED")
+        except Exception as rollback_exc:
+            rollback_errors.append(f"env rollback failed: {rollback_exc}")
         desired = "enabled" if enabled else "disabled"
         rollback = (
             f" Safety rollback also failed ({'; '.join(rollback_errors)})."
@@ -297,22 +322,34 @@ def _quiesce_whatsapp_bridge(
 ) -> None:
     """Stop and verify any pidfile/port-owned bridge before pair-only starts."""
     from plugins.platforms.whatsapp.adapter import (
+        _bridge_pid_is_ours,
         _kill_port_process,
         _kill_stale_bridge_by_pidfile,
     )
 
     port = bridge_port if bridge_port is not None else _configured_whatsapp_bridge_port()
-    _kill_stale_bridge_by_pidfile(session_path)
-    _kill_port_process(port, session_path)
+    owners = [
+        *(_kill_stale_bridge_by_pidfile(session_path) or []),
+        *(_kill_port_process(port, session_path) or []),
+    ]
+    owners = list(dict.fromkeys(owners))
+    if not owners:
+        return
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _loopback_port_is_listening(port):
+        remaining = [
+            (pid, started)
+            for pid, started in owners
+            if _bridge_pid_is_ours(pid, session_path, started)
+        ]
+        if not remaining:
             return
         time.sleep(poll_interval)
+    owner_pids = ", ".join(str(pid) for pid, _started in owners)
     raise RuntimeError(
         "WhatsApp pairing cannot start because the existing bridge still "
-        f"owns {session_path} on port {port}. Stop that bridge, then retry."
+        f"owns {session_path} (PID {owner_pids}). Stop that bridge, then retry."
     )
 
 

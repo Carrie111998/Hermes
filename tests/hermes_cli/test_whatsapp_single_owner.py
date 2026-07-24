@@ -72,6 +72,7 @@ def test_enable_env_failure_rolls_config_back_to_disabled(monkeypatch):
 
     config_writes = []
     env_writes = []
+    env_removes = []
 
     monkeypatch.setattr(
         config,
@@ -87,6 +88,11 @@ def test_enable_env_failure_rolls_config_back_to_disabled(monkeypatch):
             raise PermissionError("env is read-only")
 
     monkeypatch.setattr(config, "save_env_value", save_env)
+    monkeypatch.setattr(
+        config,
+        "remove_env_value",
+        lambda key: env_removes.append(key) or False,
+    )
 
     try:
         setup.persist_whatsapp_enabled(True)
@@ -99,10 +105,8 @@ def test_enable_env_failure_rolls_config_back_to_disabled(monkeypatch):
         ("whatsapp", "enabled", True),
         ("whatsapp", "enabled", False),
     ]
-    assert env_writes == [
-        ("WHATSAPP_ENABLED", "true"),
-        ("WHATSAPP_ENABLED", "false"),
-    ]
+    assert env_writes == [("WHATSAPP_ENABLED", "true")]
+    assert env_removes == ["WHATSAPP_ENABLED"]
 
 
 def test_persist_whatsapp_enabled_refuses_unapplied_managed_write(monkeypatch):
@@ -143,6 +147,65 @@ def test_persist_whatsapp_enabled_refuses_unapplied_managed_write(monkeypatch):
         assert "pairing was stopped before touching the session" in str(exc)
     else:
         raise AssertionError("expected managed write refusal")
+
+
+def test_failed_managed_disable_restores_previous_yaml_state(monkeypatch):
+    from hermes_cli import config
+    from hermes_cli import managed_scope
+    from hermes_cli import whatsapp_setup as setup
+
+    persisted = {
+        "env": {"WHATSAPP_ENABLED": "true"},
+        "yaml": True,
+    }
+    writes: list[tuple] = []
+
+    def write_yaml(_platform, _field, value):
+        writes.append(("yaml", value))
+        persisted["yaml"] = value
+
+    def write_env(_key, value):
+        writes.append(("env", value))
+        # Simulate a managed/read-only env store: the requested value is ignored.
+
+    monkeypatch.setattr(config, "write_platform_config_field", write_yaml)
+    monkeypatch.setattr(config, "save_env_value", write_env)
+    monkeypatch.setattr(
+        config,
+        "remove_env_value",
+        lambda key: writes.append(("remove-env", key)) or False,
+    )
+    monkeypatch.setattr(config, "load_env", lambda: dict(persisted["env"]))
+    monkeypatch.setattr(
+        config,
+        "read_raw_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": persisted["yaml"]}}},
+    )
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": persisted["yaml"]}}},
+    )
+    monkeypatch.setattr(
+        managed_scope,
+        "load_managed_env",
+        lambda: {"WHATSAPP_ENABLED": "true"},
+    )
+
+    try:
+        setup.persist_whatsapp_enabled(False)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected managed disable failure")
+
+    assert persisted["yaml"] is True
+    assert writes == [
+        ("yaml", False),
+        ("env", "false"),
+        ("yaml", True),
+        ("env", "true"),
+    ]
 
 
 def test_prepare_disables_before_gateway_restart(monkeypatch):
@@ -211,27 +274,30 @@ def test_prepare_refuses_pairing_when_reused_bridge_survives_restart(monkeypatch
     ]
 
 
-def test_quiesce_kills_known_bridge_owners_and_verifies_port_release(monkeypatch):
+def test_quiesce_kills_known_bridge_owners_and_waits_for_pid_exit(monkeypatch):
     from hermes_cli import whatsapp_setup as setup
     from plugins.platforms.whatsapp import adapter
 
     session_path = Path("/tmp/whatsapp-session")
     events: list[object] = []
-    listening = iter([True, False])
+    alive = iter([True, False])
     monkeypatch.setattr(
         adapter,
         "_kill_stale_bridge_by_pidfile",
-        lambda path: events.append(("pidfile", path)),
+        lambda path: events.append(("pidfile", path)) or [(123, 456)],
     )
     monkeypatch.setattr(
         adapter,
         "_kill_port_process",
-        lambda port, path: events.append(("port", port, path)),
+        lambda port, path: events.append(("port", port, path)) or [],
     )
     monkeypatch.setattr(
-        setup,
-        "_loopback_port_is_listening",
-        lambda port: events.append(("probe", port)) or next(listening),
+        adapter,
+        "_bridge_pid_is_ours",
+        lambda pid, path, started: events.append(
+            ("owner", pid, path, started)
+        )
+        or next(alive),
     )
     monkeypatch.setattr(setup.time, "sleep", lambda delay: events.append(("sleep", delay)))
 
@@ -245,10 +311,28 @@ def test_quiesce_kills_known_bridge_owners_and_verifies_port_release(monkeypatch
     assert events == [
         ("pidfile", session_path),
         ("port", 3412, session_path),
-        ("probe", 3412),
+        ("owner", 123, session_path, 456),
         ("sleep", 0.01),
-        ("probe", 3412),
+        ("owner", 123, session_path, 456),
     ]
+
+
+def test_quiesce_ignores_an_unrelated_listener_on_the_bridge_port(monkeypatch):
+    from hermes_cli import whatsapp_setup as setup
+    from plugins.platforms.whatsapp import adapter
+
+    session_path = Path("/tmp/whatsapp-session")
+    monkeypatch.setattr(adapter, "_kill_stale_bridge_by_pidfile", lambda _path: [])
+    monkeypatch.setattr(adapter, "_kill_port_process", lambda _port, _path: [])
+    monkeypatch.setattr(
+        setup,
+        "_loopback_port_is_listening",
+        lambda _port: (_ for _ in ()).throw(
+            AssertionError("an unrelated listener must not gate pair-only setup")
+        ),
+    )
+
+    setup._quiesce_whatsapp_bridge(session_path, bridge_port=3000)
 
 
 def test_prepare_system_gateway_preflight_runs_before_disable(monkeypatch):

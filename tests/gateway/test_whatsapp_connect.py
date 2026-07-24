@@ -596,10 +596,11 @@ class TestKillPortProcess:
              patch("plugins.platforms.whatsapp.adapter._bridge_pid_is_ours", return_value=True), \
              patch("plugins.platforms.whatsapp.adapter.os.kill",
                    side_effect=lambda pid, sig: kills.append((pid, sig))):
-            wa._kill_port_process(3000, Path("/whatsapp/session"))
+            owners = wa._kill_port_process(3000, Path("/whatsapp/session"))
 
         mock_listeners.assert_called_once_with(3000)
         assert kills == [(55555, signal.SIGTERM)]
+        assert owners == [(55555, None)]
 
     def test_no_kill_when_no_listener_on_port(self):
         """No LISTENer on the port → nothing is signalled."""
