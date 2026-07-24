@@ -902,6 +902,13 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+def _platform_default_auth_file_path() -> Path:
+    """Return the native user's auth path without following HERMES_HOME."""
+    from hermes_constants import _get_platform_default_hermes_home
+
+    return _get_platform_default_hermes_home() / "auth.json"
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
@@ -910,11 +917,15 @@ def _auth_file_path() -> Path:
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
+        real_home_auth = _platform_default_auth_file_path().resolve(strict=False)
         try:
             resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
+        except Exception as exc:
+            raise RuntimeError(
+                f"Refusing to touch real user auth store during test run: {path}. "
+                "Could not safely resolve the target path; set HERMES_HOME to "
+                "a tmp_path in your test fixture."
+            ) from exc
         if resolved == real_home_auth:
             raise RuntimeError(
                 f"Refusing to touch real user auth store during test run: {path}. "
@@ -961,28 +972,22 @@ def _load_global_auth_store() -> Dict[str, Any]:
     Returns an empty dict when no global fallback exists (classic mode,
     or the global auth.json is absent). Never raises on missing file.
 
-    Seat belt: under pytest, refuses to read the real user's
-    ``~/.hermes/auth.json`` even when HERMES_HOME is set to a profile
-    path. The hermetic conftest does not redirect ``HOME``, so
-    ``get_default_hermes_root()`` for a profile-shaped HERMES_HOME can
-    still resolve to the real user's home on a dev machine. That would
-    leak real credentials into tests. This guard uses the unmodified
-    ``HOME`` env var (what ``os.path.expanduser('~')`` would resolve to),
-    not ``Path.home()``, because ``Path.home`` is sometimes monkeypatched
-    by fixtures that want to relocate the global root to a tmp path.
+    Seat belt: under pytest, refuses to read the platform-native user's
+    auth store even when HERMES_HOME is set to a profile path. This uses
+    the same platform-aware path as the write guard, so native Windows
+    resolves to ``%LOCALAPPDATA%\\hermes\\auth.json`` rather than
+    ``~/.hermes/auth.json``.
     """
     global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
         return {}
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return {}
-            except Exception:
-                pass
+        real_root = _platform_default_auth_file_path()
+        try:
+            if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                return {}
+        except Exception:
+            return {}
     try:
         return _load_auth_store(global_path)
     except Exception:
@@ -1123,8 +1128,8 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text())
-    except Exception as exc:
+        raw = json.loads(auth_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
             import shutil
@@ -4421,19 +4426,16 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
     if global_path is None:
         # Classic mode (profile == root); the profile save already hit root.
         return
-    # Seat belt: under pytest, refuse to write the real user's
-    # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
-    # (mirrors the read-side guard in _load_global_auth_store). Uses the
-    # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
+    # Seat belt: under pytest, refuse to write the platform-native user's
+    # auth store even when HERMES_HOME points at a profile path (mirrors the
+    # read-side guard in _load_global_auth_store).
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
-            except Exception:
+        real_root = _platform_default_auth_file_path()
+        try:
+            if global_path.resolve(strict=False) == real_root.resolve(strict=False):
                 return
+        except Exception:
+            return
     try:
         _persist_provider_state_to_store(
             "xai-oauth",

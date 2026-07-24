@@ -11,7 +11,6 @@ import uuid
 import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
@@ -551,19 +550,15 @@ def _write_through_provider_state_to_global_root(
     if global_path is None:
         # Classic mode (profile == root); the profile save already hit root.
         return
-    # Seat belt: under pytest, refuse to write the real user's
-    # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
-    # (mirrors the read-side guard in _load_global_auth_store). Uses the
-    # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
+    # Seat belt: under pytest, refuse to write the platform-native user's
+    # auth store even when HERMES_HOME points at a profile path.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
-            except Exception:
+        real_root = auth_mod._platform_default_auth_file_path()
+        try:
+            if global_path.resolve(strict=False) == real_root.resolve(strict=False):
                 return
+        except Exception:
+            return
     try:
         auth_mod._persist_provider_state_to_store(
             provider_id,
