@@ -773,6 +773,8 @@ export const zh: Translations = {
       needsApiKey: name => `${name} 需要一个 API 密钥 — 设置后才能选择模型。`,
       signInBrowser: name => `${name} 通过浏览器登录 — 奇计 会自动完成登录流程。`,
       customEndpointNeedsKey: '自定义端点需要一个 API 密钥 — 设置后才能选择模型。',
+      otherProviders: '其他提供方',
+      staleAuxWarning: (count, names, provider) => `${count} 个辅助任务（${names}）仍在使用 ${provider}，而非主模型。`,
       auxiliaryTitle: '辅助模型',
       resetAllToMain: '全部重置为主模型',
       auxiliaryDesc: '辅助任务默认使用主模型。你可以为任意任务指定专用模型。',

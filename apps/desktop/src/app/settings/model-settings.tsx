@@ -17,7 +17,7 @@ import {
 import type { AuxiliaryModelsResponse, ModelOptionProvider, StaleAuxAssignment } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
-import { displayModelName } from '@/lib/model-status-label'
+import { displayModelName, providerDisplayName } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
@@ -79,23 +79,25 @@ interface StaleAuxWarningProps {
 // $0-balance provider after switching main away from it) and offers the
 // existing one-click reset rather than auto-clearing legitimate pins.
 function StaleAuxWarning({ applying, onReset, slots, taskLabel }: StaleAuxWarningProps) {
+  const { t } = useI18n()
+  const m = t.settings.model
+
   if (!slots.length) {
     return null
   }
 
   const provider = slots[0].provider
   const allSameProvider = slots.every(slot => slot.provider === provider)
-  const names = slots.map(slot => taskLabel(slot.task)).join(', ')
+  const names = slots.map(slot => taskLabel(slot.task)).join('、')
 
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
       <AlertTriangle className="size-3.5 shrink-0" />
       <span className="grow">
-        {slots.length} auxiliary task{slots.length === 1 ? '' : 's'} ({names}) still run on{' '}
-        <span className="font-mono">{allSameProvider ? provider : 'other providers'}</span>, not your main model.
+        {m.staleAuxWarning(slots.length, names, allSameProvider ? providerDisplayName(provider) : m.otherProviders)}
       </span>
       <Button disabled={applying} onClick={onReset} size="sm" variant="textStrong">
-        Reset all to main
+        {m.resetAllToMain}
       </Button>
     </div>
   )
@@ -426,7 +428,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             <SelectContent>
               {providerOptions.map(provider => (
                 <SelectItem key={provider.slug || 'none'} value={provider.slug || 'none'}>
-                  {provider.name}
+                  {providerDisplayName(provider.name)}
                 </SelectItem>
               ))}
             </SelectContent>

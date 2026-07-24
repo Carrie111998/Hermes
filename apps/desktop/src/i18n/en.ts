@@ -581,6 +581,8 @@ export const en: Translations = {
       needsApiKey: name => `${name} needs an API key — set it up to choose a model.`,
       signInBrowser: name => `${name} signs in through your browser — Qiji runs the flow for you.`,
       customEndpointNeedsKey: 'Custom endpoint needs an API key — set it up to choose a model.',
+      otherProviders: 'other providers',
+      staleAuxWarning: (count, names, provider) => `${count} auxiliary task${count === 1 ? '' : 's'} (${names}) still run on ${provider}, not your main model.`,
       auxiliaryTitle: 'Auxiliary models',
       resetAllToMain: 'Reset all to main',
       auxiliaryDesc: 'Helper tasks run on the main model by default. Assign a dedicated model to any task to override.',

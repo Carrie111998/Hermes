@@ -82,6 +82,56 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   'mixtral': 'Mixtral'
 }
 
+// Chinese-friendly provider names (maps backend slug/name → display name).
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  'openai': 'OpenAI',
+  'anthropic': 'Anthropic',
+  'google': '谷歌',
+  'gemini': '谷歌 Gemini',
+  'deepseek': 'DeepSeek',
+  'qwen': '通义千问',
+  'zhipu': '智谱',
+  'glm': '智谱',
+  'moonshot': '月之暗面',
+  'kimi': '月之暗面',
+  'baichuan': '百川',
+  'spark': '讯飞星火',
+  'hunyuan': '腾讯混元',
+  'doubao': '字节豆包',
+  'minimax': 'MiniMax',
+  'mistral': 'Mistral',
+  'cohere': 'Cohere',
+  'meta': 'Meta',
+  'llama': 'Meta Llama',
+  'nous': 'Nous Research',
+  'openrouter': 'OpenRouter',
+  'groq': 'Groq',
+  'together': 'Together AI',
+  'fireworks': 'Fireworks AI',
+  'perplexity': 'Perplexity',
+  'x-ai': 'xAI',
+  'xai': 'xAI',
+  'custom': '自定义端点',
+  'local': '本地',
+  'zai': '智谱'
+}
+
+export function providerDisplayName(slugOrName: string): string {
+  const lower = (slugOrName || '').trim().toLowerCase()
+
+  if (PROVIDER_DISPLAY_NAMES[lower]) {
+    return PROVIDER_DISPLAY_NAMES[lower]
+  }
+
+  for (const key of Object.keys(PROVIDER_DISPLAY_NAMES)) {
+    if (lower.startsWith(key) || lower.includes(key)) {
+      return PROVIDER_DISPLAY_NAMES[key]
+    }
+  }
+
+  return slugOrName
+}
+
 function lookupDisplayName(base: string): string | null {
   const lower = base.toLowerCase()
 

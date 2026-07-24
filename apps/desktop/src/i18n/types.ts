@@ -470,6 +470,8 @@ export interface Translations {
       needsApiKey: (name: string) => string
       signInBrowser: (name: string) => string
       customEndpointNeedsKey: string
+      otherProviders: string
+      staleAuxWarning: (count: number, names: string, provider: string) => string
       auxiliaryTitle: string
       resetAllToMain: string
       auxiliaryDesc: string
