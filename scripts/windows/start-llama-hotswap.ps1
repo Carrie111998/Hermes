@@ -75,20 +75,30 @@ function Resolve-SecondaryGgufPath {
 
 function Stop-LlamaOnPort {
     param([int]$TargetPort)
-    $conns = @()
+    # Avoid Get-NetTCPConnection / Get-CimInstance here — both can hang for minutes on this host.
+    # Prefer netstat + taskkill with short bounded waits.
+    $pids = New-Object 'System.Collections.Generic.HashSet[int]'
     try {
-        $conns = @(Get-NetTCPConnection -LocalPort $TargetPort -State Listen -ErrorAction SilentlyContinue)
-    } catch {
-        # NetTCPIP may be unavailable; fall through to process scan.
-    }
-    foreach ($c in $conns) {
-        if ($c.OwningProcess) {
-            Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue
+        $net = & netstat.exe -ano -p tcp 2>$null
+        foreach ($line in $net) {
+            if ($line -notmatch 'LISTENING') { continue }
+            if ($line -notmatch (":{0}\s+" -f $TargetPort)) { continue }
+            $parts = ($line -split '\s+') | Where-Object { $_ }
+            $own = 0
+            if ([int]::TryParse($parts[-1], [ref]$own) -and $own -gt 0) { [void]$pids.Add($own) }
         }
+    } catch {}
+    try {
+        $task = & tasklist.exe /FI "IMAGENAME eq llama-server.exe" /FO CSV /NH 2>$null
+        foreach ($row in $task) {
+            if ($row -match '"llama-server\.exe","(\d+)"') {
+                [void]$pids.Add([int]$Matches[1])
+            }
+        }
+    } catch {}
+    foreach ($procId in @($pids)) {
+        & taskkill.exe /F /PID $procId 2>$null | Out-Null
     }
-    Get-CimInstance Win32_Process -Filter "Name='llama-server.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match ("--port\s+{0}\b" -f $TargetPort) -or $_.CommandLine -match ("--port[`\`"]?{0}\b" -f $TargetPort) } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
 }
 
