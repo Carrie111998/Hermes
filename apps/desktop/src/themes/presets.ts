@@ -277,13 +277,60 @@ export const slateTheme: DesktopTheme = {
   }
 }
 
+/**
+ * Aura — the AURA liquid-glass identity. A near-black surface palette tuned
+ * for the 8-layer optical glass system (see hooks/use-optical-glass.ts and
+ * components/aura-glass/). When this theme is active, `applyTheme()` sets
+ * `data-aura="true"` on :root, which gates the `.aura-*` CSS layers on.
+ *
+ * The palette is intentionally dark-only so the glass layers (which rely on
+ * dark surfaces for correct blending) always render against a dark backdrop.
+ * `darkColors` is omitted — both light and dark mode resolve to `colors`.
+ */
+export const auraTheme: DesktopTheme = {
+  name: 'aura',
+  label: 'Aura',
+  description: 'Liquid glass — 8-layer optical surface',
+  colors: {
+    background: '#070808',
+    foreground: '#ddddda',
+    card: '#0d0e0e',
+    cardForeground: '#ddddda',
+    muted: '#151616',
+    mutedForeground: '#858786',
+    popover: '#0f1010',
+    popoverForeground: '#ddddda',
+    primary: '#c5c8c5',
+    primaryForeground: '#070808',
+    secondary: '#151616',
+    secondaryForeground: '#bfc1be',
+    accent: '#c5c8c5',
+    accentForeground: '#070808',
+    border: 'rgb(221 221 218 / 11%)',
+    input: 'rgb(221 221 218 / 14%)',
+    ring: '#c5c8c5',
+    midground: '#c5c8c5',
+    composerRing: '#ddddda',
+    destructive: '#cf2d56',
+    destructiveForeground: '#ffffff',
+    sidebarBackground: '#0a0b0b',
+    sidebarBorder: 'rgb(221 221 218 / 8%)',
+    userBubble: '#151616',
+    userBubbleBorder: 'rgb(221 221 218 / 12%)'
+  },
+  typography: {
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`
+  }
+}
+
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
   nous: nousTheme,
   midnight: midnightTheme,
   ember: emberTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,
-  slate: slateTheme
+  slate: slateTheme,
+  aura: auraTheme
 }
 
 export const BUILTIN_THEME_LIST = Object.values(BUILTIN_THEMES)

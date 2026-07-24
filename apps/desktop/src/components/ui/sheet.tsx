@@ -3,6 +3,7 @@
 import { Dialog as SheetPrimitive } from 'radix-ui'
 import * as React from 'react'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { Codicon } from '@/components/ui/codicon'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
@@ -47,6 +48,7 @@ function SheetContent({
   showCloseButton?: boolean
 }) {
   const { t } = useI18n()
+  const auraActive = useAuraActive()
 
   return (
     <SheetPortal>
@@ -67,6 +69,7 @@ function SheetContent({
         data-slot="sheet-content"
         {...props}
       >
+        {auraActive && <AuraLayers surface="dense" />}
         {children}
         {showCloseButton && (
           <SheetPrimitive.Close

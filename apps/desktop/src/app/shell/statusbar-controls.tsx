@@ -1,6 +1,7 @@
 import { type ComponentProps, type ReactNode, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Tip, TipKeybindLabel, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
@@ -63,6 +64,7 @@ interface StatusbarControlsProps extends ComponentProps<'footer'> {
 
 export function StatusbarControls({ className, leftItems = [], items = [], ...props }: StatusbarControlsProps) {
   const navigate = useNavigate()
+  const auraActive = useAuraActive()
 
   return (
     <footer
@@ -73,6 +75,7 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
       data-slot="statusbar"
       {...props}
     >
+      {auraActive && <AuraLayers surface="dense" />}
       {/* `overflow-x-clip` (not `overflow-x-auto`) so a wide status item — for
           example "Connecting…" on a fresh/untitled session — can't paint a
           horizontal scrollbar across the bottom of the window. Items already

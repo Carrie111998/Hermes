@@ -1,6 +1,7 @@
 import type { Unstable_TriggerItem } from '@assistant-ui/core'
 import { Fragment } from 'react'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
@@ -68,6 +69,7 @@ export function ComposerTriggerPopover({
 }: ComposerTriggerPopoverProps) {
   const { t } = useI18n()
   const copy = t.composer
+  const auraActive = useAuraActive()
   const isSlash = kind === '/'
 
   let lastGroup: string | undefined
@@ -80,6 +82,7 @@ export function ComposerTriggerPopover({
       onMouseDown={event => event.preventDefault()}
       role="listbox"
     >
+      {auraActive && <AuraLayers surface="dense" />}
       {items.length === 0 ? (
         loading ? (
           <div className="flex items-center gap-2 px-2 py-1.5 text-(--ui-text-tertiary)">

@@ -2,6 +2,7 @@ import type { Unstable_TriggerAdapter } from '@assistant-ui/core'
 import { ComposerPrimitive } from '@assistant-ui/react'
 import type { ReactNode } from 'react'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { composerPanelCard } from '@/components/chat/composer-dock'
 import { cn } from '@/lib/utils'
 
@@ -28,6 +29,8 @@ export function ComposerCompletionDrawer({
   char: string
   children: ReactNode
 }) {
+  const auraActive = useAuraActive()
+
   return (
     <ComposerPrimitive.Unstable_TriggerPopover
       adapter={adapter}
@@ -36,6 +39,7 @@ export function ComposerCompletionDrawer({
       className={COMPLETION_DRAWER_CLASS}
       data-slot="composer-completion-drawer"
     >
+      {auraActive && <AuraLayers surface="dense" />}
       {children}
     </ComposerPrimitive.Unstable_TriggerPopover>
   )

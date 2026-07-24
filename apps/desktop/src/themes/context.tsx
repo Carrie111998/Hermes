@@ -191,6 +191,16 @@ function applyTheme(theme: DesktopTheme, mode: 'light' | 'dark') {
   root.dataset.hermesMode = rendered
   root.classList.toggle('dark', isDark)
 
+  // Gate the AURA 8-layer optical glass system on the Aura theme. The CSS in
+  // styles.css uses `[data-aura='true']` to enable `.aura-*` layer opacity and
+  // resolve --light-color / --bounce-color from the active DesktopTheme tokens.
+  // On any non-Aura theme the glass surfaces fall back to a plain bordered box.
+  if (skinName === 'aura') {
+    root.dataset.aura = 'true'
+  } else {
+    delete root.dataset.aura
+  }
+
   // Brand seeds feed every glass + shadcn token via `color-mix()` in styles.css.
   const seeds: Record<string, string> = {
     '--theme-foreground': c.foreground,

@@ -2,6 +2,7 @@ import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useRef } from 'react'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { composerFill, composerSurfaceGlass } from '@/components/chat/composer-dock'
 import { Button } from '@/components/ui/button'
 import { Slot as ContribSlot } from '@/contrib/react/slot'
@@ -144,6 +145,7 @@ export function ChatBar({
   const composingRef = useRef(false) // true during IME composition (CJK input)
 
   const { availableThemes, themeName } = useTheme()
+  const auraActive = useAuraActive()
   const at = useAtCompletions({ gateway: gateway ?? null, sessionId: sessionId ?? null, cwd: cwd ?? null })
   const slash = useSlashCompletions({ activeSkin: themeName, gateway: gateway ?? null, skinThemes: availableThemes })
 
@@ -958,8 +960,10 @@ export function ChatBar({
               data-slot="composer-surface"
               ref={composerSurfaceRef}
             >
+              {auraActive && <AuraLayers surface="clear" />}
               <div
                 aria-hidden
+                data-slot="composer-fill"
                 className={cn(
                   'pointer-events-none absolute inset-0 -z-10 rounded-[inherit]',
                   composerFill,

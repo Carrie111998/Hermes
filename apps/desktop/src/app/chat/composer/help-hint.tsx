@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { KbdCombo } from '@/components/ui/kbd'
 import { useI18n } from '@/i18n'
 
@@ -22,9 +23,11 @@ const COMPOSER_HOTKEY_ROWS = [
 export function HelpHint() {
   const { t } = useI18n()
   const c = t.composer
+  const auraActive = useAuraActive()
 
   return (
     <div className={COMPLETION_DRAWER_CLASS} data-slot="composer-completion-drawer" data-state="open" role="dialog">
+      {auraActive && <AuraLayers surface="dense" />}
       <Section title={c.commonCommands}>
         {COMMON_COMMAND_KEYS.map(key => (
           <Row description={c.commandDescs[key] ?? ''} key={key} keyLabel={key} mono />

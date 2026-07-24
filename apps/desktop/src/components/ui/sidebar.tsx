@@ -4,6 +4,7 @@ import { cva, type VariantProps } from 'class-variance-authority'
 import { Slot } from 'radix-ui'
 import * as React from 'react'
 
+import { AuraLayers, useAuraActive } from '@/components/aura-glass/glass-system'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
@@ -142,6 +143,7 @@ function Sidebar({
 }) {
   const { isMobile, state, openMobile, setOpenMobile } = useSidebar()
   const { t } = useI18n()
+  const auraActive = useAuraActive()
 
   if (collapsible === 'none') {
     return (
@@ -150,6 +152,7 @@ function Sidebar({
         data-slot="sidebar"
         {...props}
       >
+        {auraActive && <AuraLayers surface="dense" />}
         {children}
       </div>
     )
@@ -174,7 +177,10 @@ function Sidebar({
             <SheetTitle>{t.ui.sidebar.title}</SheetTitle>
             <SheetDescription>{t.ui.sidebar.description}</SheetDescription>
           </SheetHeader>
-          <div className="flex h-full w-full flex-col">{children}</div>
+          <div className="flex h-full w-full flex-col">
+            {auraActive && <AuraLayers surface="dense" />}
+            {children}
+          </div>
         </SheetContent>
       </Sheet>
     )
@@ -221,6 +227,7 @@ function Sidebar({
           data-sidebar="sidebar"
           data-slot="sidebar-inner"
         >
+          {auraActive && <AuraLayers surface="dense" />}
           {children}
         </div>
       </div>

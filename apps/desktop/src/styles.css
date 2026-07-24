@@ -1850,3 +1850,472 @@ text-* variant utilities. */ .btn-arc {
     opacity: 0.4;
   }
 }
+
+/* ============================================================================
+   AURA v3.6 — multilayer physically-inspired liquid glass
+   Ported from Albert-Einstein-UI. Opt-in via [data-aura="true"] on an ancestor.
+   The `--aura-enabled` flag (set to 1 by [data-aura]) gates visual intensity
+   so non-Aura themes are completely unaffected.
+   ============================================================================ */
+
+[data-aura='true'] {
+  --aura-enabled: 1;
+
+  /* Bridge: resolve --light-color / --bounce-color from DesktopTheme tokens.
+     The original hook left these unset; CSS resolves them here. We use
+     color-mix() throughout (not rgb(r g b / a%)) so any valid CSS color
+     token works — hex, color-mix, or named. */
+  --aura-light-color: var(--dt-foreground, #ddddda);
+  --aura-bounce-color: var(--dt-primary, #0053fd);
+}
+
+/* The glass surface itself. Custom properties are written by the
+   useOpticalGlass hook based on pointer position; CSS vars below are
+   the depth/bezel/thickness scales and geometric fallbacks. */
+.aura-glass {
+  --light-x: 76%;
+  --light-y: 12%;
+  --light-nx: 0.52;
+  --light-ny: -0.76;
+  --fresnel: 0.07;
+  --glass-radius: 14px;
+  --inner-radius: calc(var(--glass-radius) - var(--glass-bezel, 2px));
+  --glass-depth: 10px;
+  --glass-bezel: 2px;
+  --glass-thickness: 7px;
+  --light-intensity: 0.5;
+  --transmission: 0.5;
+  --caustic-x: 50%;
+  --caustic-y: 50%;
+  --shadow-x: 0px;
+  --shadow-y: 0px;
+  --light-angle: 0deg;
+  --light-elevation: 0deg;
+
+  position: relative;
+  isolation: isolate;
+  border-radius: var(--glass-radius);
+  transform: translateZ(0);
+  perspective: 900px;
+  contain: layout style;
+}
+
+.aura-glass > [aria-hidden='true'],
+[data-aura='true'] [data-slot='composer-surface'] .aura-host > [aria-hidden='true'],
+[data-aura='true'] [data-slot='composer-completion-drawer'] .aura-host > [aria-hidden='true'],
+[data-aura='true'] [data-slot='dialog-content'] .aura-host > [aria-hidden='true'],
+[data-aura='true'] [data-slot='sheet-content'] .aura-host > [aria-hidden='true'],
+[data-aura='true'] [data-slot='sidebar'] .aura-host > [aria-hidden='true'],
+[data-aura='true'] [data-slot='statusbar'] .aura-host > [aria-hidden='true'] {
+  position: absolute;
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* Umbra — the cast shadow beneath the glass. */
+.aura-umbra {
+  z-index: -5;
+  inset: 2% 1% -2%;
+  transform: translate(var(--shadow-x), var(--shadow-y));
+  background: rgb(0 0 0 / 78%);
+  filter: blur(calc(var(--glass-depth) * 1.5));
+  opacity: calc(0.42 * var(--aura-enabled, 0));
+}
+
+/* Volume — ambient light flooding the area around the glass. */
+.aura-volume {
+  z-index: -4;
+  inset: calc(var(--glass-bezel) * -1);
+  background: radial-gradient(
+    ellipse at var(--light-x) var(--light-y),
+    color-mix(in srgb, var(--aura-light-color, #ddd) 6%, transparent),
+    transparent 55%
+  );
+  filter: blur(calc(var(--glass-depth) * 2));
+  opacity: calc(var(--light-intensity) * 0.24 * var(--aura-enabled, 0));
+}
+
+/* Caustic — refracted bounce light on the opposite side. */
+.aura-caustic {
+  z-index: -3;
+  inset: 8% 6% -7%;
+  transform: translate(
+    calc(var(--light-nx) * var(--glass-thickness)),
+    calc(var(--light-ny) * var(--glass-thickness))
+  );
+  background: radial-gradient(
+    ellipse 55% 28% at var(--caustic-x) var(--caustic-y),
+    color-mix(in srgb, var(--aura-bounce-color, #0053fd) 10%, transparent),
+    transparent 78%
+  );
+  filter: blur(calc(var(--glass-thickness) * 2.4));
+  opacity: calc(var(--transmission) * var(--light-intensity) * 0.25 * var(--aura-enabled, 0));
+}
+
+/* Body — the conic-gradient edge bevel that gives the glass its solid rim. */
+.aura-body {
+  z-index: 0;
+  inset: 0;
+  padding: var(--glass-bezel);
+  background: conic-gradient(
+    from calc(var(--light-angle) + 90deg),
+    #0b0c0c 0deg,
+    #252726 42deg,
+    #737573 50deg,
+    #1a1b1b 68deg,
+    #090a0a 145deg,
+    #181919 245deg,
+    #535553 294deg,
+    #111212 320deg
+  );
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 252 / 10%),
+    0 1px 0 rgb(255 255 252 / 7%);
+}
+.aura-body::after {
+  content: '';
+  position: absolute;
+  inset: var(--glass-bezel);
+  border-radius: var(--inner-radius);
+  background: color-mix(in srgb, var(--dt-background, #070808) 96%, transparent);
+}
+
+/* Bevel — the bright specular highlight on the lit edge. */
+.aura-bevel {
+  z-index: 3;
+  inset: 0;
+  border: var(--glass-bezel) solid transparent;
+  background: radial-gradient(
+    ellipse 42% 15% at var(--light-x) var(--light-y),
+    color-mix(in srgb, var(--aura-light-color, #ddd) 45%, transparent),
+    color-mix(in srgb, var(--aura-light-color, #ddd) 10%, transparent) 34%,
+    transparent 76%
+  )
+    border-box;
+  mask:
+    linear-gradient(#000 0 0) padding-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  opacity: calc((0.2 + var(--light-intensity) * 0.25) * var(--aura-enabled, 0));
+  filter: saturate(0.35);
+}
+
+/* Inner — the translucent body fill with micro-texture and inset shadows. */
+.aura-inner {
+  z-index: 1;
+  inset: calc(var(--glass-bezel) + 1px);
+  overflow: hidden;
+  border-radius: var(--inner-radius);
+  background-color: color-mix(in srgb, var(--dt-background, #090a0a) 87%, transparent);
+  background-image:
+    radial-gradient(
+      ellipse 90% 55% at var(--light-x) var(--light-y),
+      color-mix(in srgb, var(--aura-light-color, #ddd) 8%, transparent),
+      transparent 50%
+    ),
+    repeating-radial-gradient(
+      ellipse at 52% 45%,
+      rgb(255 255 255 / 1.8%) 0 1px,
+      transparent 1px 5px
+    );
+  box-shadow:
+    inset calc(var(--light-nx) * var(--glass-thickness) * -1)
+      calc(var(--light-ny) * var(--glass-thickness) * -1)
+      calc(var(--glass-thickness) * 2.3) rgb(255 255 252 / 8%),
+    inset calc(var(--light-nx) * var(--glass-thickness))
+      calc(var(--light-ny) * var(--glass-thickness))
+      calc(var(--glass-thickness) * 2) rgb(0 0 0 / 80%);
+  backdrop-filter: blur(calc(var(--glass-thickness) * 0.7px)) saturate(0.65);
+}
+.aura-inner::after {
+  content: '';
+  position: absolute;
+  inset: -30%;
+  background: repeating-conic-gradient(
+    from var(--light-angle) at 50% 45%,
+    transparent 0 3deg,
+    rgb(255 255 255 / 1.5%) 3.4deg 4deg,
+    transparent 4.5deg 10deg
+  );
+  filter: blur(1px);
+  opacity: calc(0.42 * var(--aura-enabled, 0));
+  transform: scale(1.25);
+}
+
+/* Glare — the broad soft specular sheen across the lit face. */
+.aura-glare {
+  z-index: 2;
+  inset: calc(var(--glass-bezel) + 2px);
+  border-radius: var(--inner-radius);
+  background: radial-gradient(
+    ellipse 62% 35% at var(--light-x) var(--light-y),
+    color-mix(in srgb, var(--aura-light-color, #ddd) 15%, transparent),
+    transparent 65%
+  );
+  mix-blend-mode: screen;
+  opacity: calc(var(--light-intensity) * 0.65 * var(--aura-enabled, 0));
+}
+
+/* Fresnel — edge rim lighting, strongest at grazing angles. */
+.aura-fresnel {
+  z-index: 4;
+  inset: calc(var(--glass-bezel) + 1px);
+  border-radius: var(--inner-radius);
+  box-shadow:
+    inset calc(var(--light-nx) * -7px) calc(var(--light-ny) * -7px)
+      calc(8px + var(--glass-thickness))
+      color-mix(in srgb, var(--aura-light-color, #ddd) 15%, transparent),
+    inset calc(var(--light-nx) * 8px) calc(var(--light-ny) * 8px)
+      calc(10px + var(--glass-thickness)) rgb(0 0 0 / 75%);
+  opacity: calc((0.55 + var(--fresnel) * 3) * var(--aura-enabled, 0));
+}
+
+/* Content — the actual UI sits above all optical layers. */
+.aura-content {
+  position: relative;
+  z-index: 7;
+}
+
+/* Surface variants — control how opaque the inner body is. */
+.aura-clear .aura-inner {
+  background-color: color-mix(in srgb, var(--dt-background, #080909) 68%, transparent);
+}
+.aura-dense .aura-inner {
+  background-color: color-mix(in srgb, var(--dt-background, #070808) 95%, transparent);
+}
+
+/* Glass control — icon-button container used inside glass surfaces. */
+.glass-control {
+  display: inline-grid;
+  flex: none;
+}
+.glass-control button {
+  position: relative;
+  z-index: 8;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 34px;
+  min-height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: var(--dt-muted-foreground, #858786);
+}
+.glass-control button:hover,
+.glass-control button:focus-visible,
+.glass-control[data-active='true'] button {
+  color: var(--dt-foreground, #ddddda);
+}
+.glass-control svg {
+  width: 15px;
+  height: 15px;
+}
+.glass-control-compact {
+  width: 34px;
+  height: 34px;
+}
+
+/* Glass input — text input embedded in a glass surface. */
+.glass-input .aura-content {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+.glass-input input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--dt-foreground, #ddddda);
+}
+
+/* Glass panel body — the scrollable content region of a GlassPanel. */
+.glass-panel-body {
+  position: relative;
+  z-index: 8;
+}
+
+/* When AURA is not enabled, suppress all optical layers so a GlassCard
+   renders as a plain bordered box — no visual surprise in light themes. */
+:not([data-aura='true']) .aura-glass {
+  border: 1px solid var(--dt-border, rgb(0 0 0 / 10%));
+  background: var(--dt-card, transparent);
+}
+:not([data-aura='true']) .aura-glass > [aria-hidden='true'],
+:not([data-aura='true']) .aura-host,
+:not([data-aura='true']) .aura-host > [aria-hidden='true'] {
+  display: none;
+}
+
+/* Reduced motion: the blanket override at the top of this file already
+   kills transitions/animations. Additionally freeze the pointer-driven
+   caustic/fresnel opacity so the glass is static. */
+@media (prefers-reduced-motion: reduce) {
+  .aura-volume,
+  .aura-caustic,
+  .aura-glare,
+  .aura-fresnel {
+    opacity: 0 !important;
+  }
+}
+
+/* ============================================================================
+   Phase 3 — Surgical glass application on existing surfaces using real DOM
+   AURA layers. The 8 <span aria-hidden> layers (umbra, volume, caustic, body,
+   bevel, inner, glare, fresnel) are rendered by the React <AuraLayers> helper
+   and injected into Hermes' existing surfaces. This matches the way Albert-
+   Einstein-UI builds glass: the layers are real siblings, not pseudo-elements.
+
+   When [data-aura="true"] is on :root, these rules:
+     - Scope the AURA glass variables on each host surface
+     - Force a consistent border-radius that matches the surface's role
+     - Ensure the host is `position: relative; isolation: isolate` so the 8
+       absolutely-positioned span layers clip to its box
+     - Hide the built-in composer fill div because `.aura-inner` takes over
+
+   When AURA is not active, the layers render as inert empty spans because the
+   parent host is NOT inside a `[data-aura='true']` scope.
+   ============================================================================ */
+
+/* Glass-layer host reset: every AURA surface must be the positioning context
+   for its 8 absolutely-positioned <AuraLayers> siblings. */
+[data-aura='true'] [data-slot='composer-surface'],
+[data-aura='true'] [data-slot='composer-completion-drawer'],
+[data-aura='true'] [data-slot='dialog-content'],
+[data-aura='true'] [data-slot='sheet-content'],
+[data-aura='true'] [data-slot='sidebar'],
+[data-aura='true'] [data-slot='statusbar'] {
+  position: relative;
+  isolation: isolate;
+  /* Use the native glass border color (the AURA body/bevel already paint the
+     rim light, so a static border is not needed). */
+  border-color: color-mix(in srgb, var(--aura-light-color) 12%, transparent) !important;
+  /* Backgrounds are delegated to the .aura-inner / .aura-body layers. */
+  background-color: transparent !important;
+  backdrop-filter: none;
+}
+
+/* Scope the glass variables + a consistent border-radius per surface role.
+   The `.aura-host` parent (and thus all 8 child layers) inherits these via
+   the cascade. --glass-radius and --inner-radius are consumed by .aura-glass,
+   .aura-body, .aura-bevel, .aura-inner, .aura-glare and .aura-fresnel. */
+[data-aura='true'] [data-slot='composer-surface'] {
+  --glass-radius: 22px;
+  --inner-radius: calc(var(--glass-radius) - var(--glass-bezel, 2px));
+  border-radius: var(--glass-radius);
+  box-shadow: 0 10px 28px rgb(0 0 0 / 28%);
+}
+[data-aura='true'] [data-slot='composer-completion-drawer'] {
+  --glass-radius: 14px;
+  --inner-radius: calc(var(--glass-radius) - var(--glass-bezel, 2px));
+  border-radius: var(--glass-radius);
+  box-shadow:
+    0 12px 40px rgb(0 0 0 / 32%),
+    0 0 0 1px color-mix(in srgb, var(--aura-light-color) 8%, transparent);
+}
+[data-aura='true'] [data-slot='dialog-content'] {
+  --glass-radius: 18px;
+  --inner-radius: calc(var(--glass-radius) - var(--glass-bezel, 2px));
+  border-radius: var(--glass-radius);
+  box-shadow:
+    0 12px 48px rgb(0 0 0 / 40%),
+    0 0 0 1px color-mix(in srgb, var(--aura-light-color) 6%, transparent);
+}
+[data-aura='true'] [data-slot='sheet-content'] {
+  --glass-radius: 18px;
+  --inner-radius: calc(var(--glass-radius) - var(--glass-bezel, 2px));
+  border-radius: var(--glass-radius);
+  box-shadow:
+    0 12px 40px rgb(0 0 0 / 34%),
+    0 0 0 1px color-mix(in srgb, var(--aura-light-color) 6%, transparent);
+}
+[data-aura='true'] [data-slot='sidebar'] {
+  --glass-radius: 0px;
+  --inner-radius: 0px;
+  border-radius: 0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aura-light-color) 5%, transparent);
+}
+[data-aura='true'] [data-slot='statusbar'] {
+  --glass-radius: 0px;
+  --inner-radius: 0px;
+  border-radius: 0;
+  box-shadow: 0 -1px 0 color-mix(in srgb, var(--aura-light-color) 6%, transparent);
+}
+
+/* Surface variants — match the inner body density to the role. */
+[data-aura='true'] [data-slot='composer-surface'] .aura-host,
+[data-aura='true'] [data-slot='composer-completion-drawer'] .aura-host {
+  /* clear-ish: let the chat surface show through */
+  --transmission: 0.62;
+  --light-intensity: 0.55;
+}
+[data-aura='true'] [data-slot='dialog-content'] .aura-host,
+[data-aura='true'] [data-slot='sheet-content'] .aura-host,
+[data-aura='true'] [data-slot='sidebar'] .aura-host {
+  /* dense: near-opaque panels that float over the workspace */
+  --transmission: 0.32;
+  --light-intensity: 0.48;
+}
+[data-aura='true'] [data-slot='statusbar'] .aura-host {
+  --transmission: 0.45;
+  --light-intensity: 0.35;
+  --glass-thickness: 4px;
+}
+
+/* Hide the composer's built-in backdrop-blur fill div; .aura-inner handles it. */
+[data-aura='true'] [data-slot='composer-surface'] > [data-slot='composer-fill'] {
+  display: none !important;
+}
+
+/* Ensure the real content sits above the 8 optical layers. */
+[data-aura='true'] [data-slot='composer-surface'] > :not(.aura-host),
+[data-aura='true'] [data-slot='composer-completion-drawer'] > :not(.aura-host),
+[data-aura='true'] [data-slot='dialog-content'] > :not(.aura-host),
+[data-aura='true'] [data-slot='sheet-content'] > :not(.aura-host),
+[data-aura='true'] [data-slot='sidebar'] > :not(.aura-host),
+[data-aura='true'] [data-slot='statusbar'] > :not(.aura-host) {
+  position: relative;
+  z-index: 7;
+}
+
+/* Sidebar/File panes: also target the DetailPane/ListColumn containers
+   from master-detail.tsx (section/aside elements without data-slot). These
+   are harmless no-ops if the elements don't exist. */
+[data-aura='true'] section.bg-\(--ui-chat-surface-background\) {
+  position: relative;
+  isolation: isolate;
+  border-radius: 14px;
+  background-color: transparent !important;
+}
+[data-aura='true'] section.bg-\(--ui-chat-surface-background\)::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 0;
+  background-color: color-mix(in srgb, #090a0a 92%, transparent);
+  backdrop-filter: blur(10px) saturate(0.8);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aura-light-color) 12%, transparent);
+}
+
+/* Chat surface background — a subtle radial gradient so glass surfaces have
+   something to refract. */
+[data-aura='true'] body {
+  background-image:
+    radial-gradient(
+      ellipse 80% 50% at 50% 0%,
+      color-mix(in srgb, var(--dt-foreground) 3%, transparent),
+      transparent 60%
+    );
+}
+
+/* Glass buttons inside the composer: a subtle tinted hover so they blend with
+   the composer's glass surface. */
+[data-aura='true'] [data-slot='composer-surface'] button:where([aria-label]):hover {
+  background-color: color-mix(in srgb, var(--aura-light-color) 6%, transparent);
+  backdrop-filter: blur(4px);
+}
