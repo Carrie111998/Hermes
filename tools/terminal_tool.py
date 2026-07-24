@@ -2157,6 +2157,22 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # Guardrail: background=True but command still has a trailing '&'.
+        # The shell double-backgrounds the process so Hermes tracks the wrong
+        # pid and cannot poll, wait, or stream output correctly.
+        if background and (_INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command)):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Command contains '&' backgrounding but background=true is already set — "
+                    "remove the '&' from the command string and re-submit. "
+                    "Use background=true alone; adding '&' causes the shell to double-background "
+                    "the process so Hermes tracks the wrong pid."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
+
         # Start cleanup thread
         _start_cleanup_thread()
 
