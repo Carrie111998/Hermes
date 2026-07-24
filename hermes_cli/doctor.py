@@ -932,7 +932,14 @@ def run_doctor(args):
         try:
             import yaml as _yaml
             cfg = _yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            model_section = cfg.get("model") or {}
+            model_val = cfg.get("model")
+            if isinstance(model_val, dict):
+                model_section = model_val
+            elif isinstance(model_val, str) and model_val.strip():
+                # Scalar model key (e.g. ``model: gpt-4o``) — treat as default
+                model_section = {"default": model_val.strip()}
+            else:
+                model_section = {}
             provider_raw = (model_section.get("provider") or "").strip()
             provider = provider_raw.lower()
             default_model = (model_section.get("default") or model_section.get("model") or "").strip()
