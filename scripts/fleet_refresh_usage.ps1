@@ -1,5 +1,10 @@
 # Native Hermes fleet usage refresh — no WSL, pwsh 7+.
 # Schedule below the capacity max_age (2h); default every 30 minutes.
+#
+# This script is staged by install_fleet_usage_refresh_task.ps1 to the short
+# stable path {HermesHome}\scripts\fleet_refresh_usage.ps1 so schtasks /TR stays
+# under the Windows 261-character limit. When staged, locate usage_refresh.py
+# under {HermesHome}\hermes-agent (never an ephemeral worktree path).
 param(
     [string]$HermesHome = $env:HERMES_HOME,
     [switch]$NoMirror,
@@ -20,8 +25,8 @@ function Resolve-Python {
         return $Preferred
     }
     foreach ($candidate in @(
-        (Join-Path $PSScriptRoot "..\.venv\Scripts\python.exe"),
         (Join-Path $HermesHome "hermes-agent\.venv\Scripts\python.exe"),
+        (Join-Path $PSScriptRoot "..\.venv\Scripts\python.exe"),
         "python",
         "py"
     )) {
@@ -43,15 +48,20 @@ function Resolve-Python {
 }
 
 $py = Resolve-Python -Preferred $Python
-# Resolve only from this script's repository root or the installed Hermes home.
+
+# Resolve only from the installed Hermes home or this script's repository root.
+# Prefer HermesHome\hermes-agent first so a staged copy under HermesHome\scripts
+# never binds to an ephemeral worktree checkout via PSScriptRoot\..
 # Never fall back to a dated worktree path — those are ephemeral build checkouts.
 $repoCandidates = @(
-    (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue),
-    (Join-Path $HermesHome "hermes-agent")
-) | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ "hermes_cli\fleet\usage_refresh.py")) }
+    (Join-Path $HermesHome "hermes-agent"),
+    (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue)
+) | Where-Object {
+    $_ -and (Test-Path -LiteralPath (Join-Path $_ "hermes_cli\fleet\usage_refresh.py"))
+}
 
 if (-not $repoCandidates) {
-    throw "Could not locate hermes_cli.fleet.usage_refresh in known paths"
+    throw "Could not locate hermes_cli.fleet.usage_refresh in known paths (expected under $HermesHome\hermes-agent)"
 }
 $repo = [string]$repoCandidates[0]
 Set-Location -LiteralPath $repo
