@@ -122,6 +122,16 @@ EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 
+# Cap on consecutive "failed key hint matched no entry" rotations. That
+# branch (see mark_exhausted_and_rotate) deliberately avoids marking any
+# credential exhausted, so a single-entry pool whose runtime key no longer
+# matches the hint would otherwise rotate to the same dead key forever (the
+# caller ``continue``s until disconnect — a silent ~2.5min hang with no error
+# surfaced). After this many non-converging rotations we force-mark every
+# non-DEAD entry exhausted so selection reaches the "no available entries"
+# state and the real 401 surfaces to the user instead of looping.
+NO_MATCH_401_DEADLOCK_LIMIT = 5
+
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
 # compression/moa/titles), so when a pool is empty or fully exhausted the
@@ -594,6 +604,11 @@ class CredentialPool:
         # Re-armed to None on every successful selection so a recover→re-exhaust
         # transition logs promptly instead of being swallowed by a stale window.
         self._last_no_entries_log_at: Optional[float] = None
+        # Consecutive non-converging rotations via the "no matching entry"
+        # branch of mark_exhausted_and_rotate. Incremented only on that path
+        # and reset whenever a normal exhaust+rotate converges, so a sustained
+        # climb means rotation is not making progress (the deadlock above).
+        self._no_match_streak: int = 0
 
     def has_credentials(self) -> bool:
         with self._lock:
@@ -1782,11 +1797,42 @@ class CredentialPool:
                     # mark an INNOCENT healthy key exhausted for the full
                     # cooldown TTL.  Don't guess — just hand back a fresh
                     # selection so the caller can retry.
+                    self._no_match_streak += 1
                     logger.info(
                         "credential pool: failed key hint matched no %s entry; "
-                        "rotating without marking any credential exhausted",
+                        "rotating without marking any credential exhausted "
+                        "(no-match streak=%d/%d)",
                         self.provider,
+                        self._no_match_streak,
+                        NO_MATCH_401_DEADLOCK_LIMIT,
                     )
+                    # Convergence guard: if we keep hitting this branch the pool
+                    # is NOT making progress — a single-entry pool whose runtime
+                    # key no longer matches the hint will rotate to the same dead
+                    # key forever and the caller loops until the client
+                    # disconnects (a silent ~2.5min hang). Once the streak is
+                    # exhausted, force every non-DEAD entry into the exhausted/DEAD
+                    # state so _select_unlocked() reaches "no available entries"
+                    # and the real auth error surfaces instead of spinning. The
+                    # streak is reset only on a converging rotation below.
+                    if self._no_match_streak >= NO_MATCH_401_DEADLOCK_LIMIT:
+                        logger.warning(
+                            "credential pool: %s no-match rotation did not converge "
+                            "after %d attempts; force-marking all non-DEAD entries "
+                            "exhausted so the auth failure can propagate instead of "
+                            "hanging. Re-auth (hermes auth) to recover.",
+                            self.provider,
+                            self._no_match_streak,
+                        )
+                        for candidate in self._entries:
+                            if candidate.last_status != STATUS_DEAD:
+                                self._mark_exhausted(
+                                    candidate, status_code, error_context, persist=False
+                                )
+                        self._persist()
+                        self._no_match_streak = 0
+                        self._current_id = None
+                        return None
                     self._current_id = None
                     return self._select_unlocked()
             if entry is None:
@@ -1834,6 +1880,10 @@ class CredentialPool:
                     _label, status_code,
                 )
             self._current_id = None
+            # A normal exhaust+rotate converged (entries got marked), so clear
+            # the no-match deadlock streak — the pool can now reach the
+            # "no available entries" state if it must.
+            self._no_match_streak = 0
             next_entry = self._select_unlocked()
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
