@@ -5,6 +5,7 @@ import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } f
 import { SessionDraftTitle } from '@/app/chat/session-draft-title'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution, paletteToggle } from '@/app/command-palette/contrib'
+import { RunBoardPane, RunBoardStatusbarItem } from '@/app/run-board/run-board'
 import { type StatusbarItem } from '@/app/shell/statusbar-controls'
 import { IdleMount } from '@/components/idle-mount'
 import { $layoutEditMode, toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
@@ -37,6 +38,7 @@ import { Slot } from '@/contrib/react/slot'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
+import { translateNow } from '@/i18n'
 import { NEW_SESSION_TITLE, sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { Download, FileText, LayoutDashboard, PanelBottom, Terminal, Upload, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
@@ -169,6 +171,23 @@ registry.registerMany([
       uncloseable: true
     },
     render: renderWorkspacePane
+  },
+  {
+    id: 'run-board',
+    area: 'panes',
+    title: translateNow('runBoard.title'),
+    data: {
+      // Operational session state remains visible independently of the
+      // collapsible Files/Review rail. Workspace stays the sole main pane.
+      placement: 'right',
+      persistent: true,
+      dock: { pane: 'workspace', pos: 'right' },
+      width: 'clamp(16rem, 22vw, 24rem)',
+      minWidth: '15rem',
+      maxWidth: '30rem',
+      uncloseable: true
+    },
+    render: () => <RunBoardPane />
   },
   {
     id: 'terminal',
@@ -323,6 +342,14 @@ registry.registerMany([
       keywords: ['profile', 'import', 'share', 'bundle', 'archive', 'restore'],
       run: () => void runImportProfileFlow()
     } satisfies PaletteContribution
+  },
+  {
+    id: 'run-board.status',
+    area: 'statusBar.left',
+    data: {
+      id: 'run-board.status',
+      render: () => <RunBoardStatusbarItem />
+    } satisfies StatusbarItem
   }
 ])
 
@@ -344,6 +371,7 @@ const DEFAULT_TREE = split(
   [
     group(['sessions'], { id: 'grp-sessions' }),
     group(['workspace'], { id: 'grp-main' }),
+    group(['run-board'], { id: 'grp-run-board' }),
     split(
       'column',
       [
@@ -359,16 +387,24 @@ const DEFAULT_TREE = split(
       'spl-right'
     )
   ],
-  [1, 3.4, 1.25],
+  [1, 3.4, 1.25, 1.25],
   'spl-root'
 )
 
-const FOCUS_TREE = split('row', [group(['sessions']), group(['workspace', 'files', 'review', 'terminal'])], [1, 4.6])
+const FOCUS_TREE = split(
+  'row',
+  [group(['sessions']), group(['workspace', 'files', 'review', 'terminal']), group(['run-board'])],
+  [1, 4.2, 1.3]
+)
 
 const TERMINAL_TREE = split(
   'column',
   [
-    split('row', [group(['sessions']), group(['workspace']), group(['files', 'review'])], [1, 3.2, 1.2]),
+    split(
+      'row',
+      [group(['sessions']), group(['workspace']), group(['run-board']), group(['files', 'review'])],
+      [1, 3.2, 1.15, 1.2]
+    ),
     group(['terminal'])
   ],
   [3, 1]
@@ -377,7 +413,7 @@ const TERMINAL_TREE = split(
 const QUAD_TREE = split(
   'column',
   [
-    split('row', [group(['sessions', 'files']), group(['workspace'])], [1, 3]),
+    split('row', [group(['sessions', 'files']), group(['workspace']), group(['run-board'])], [1, 3, 1.15]),
     split('row', [group(['terminal']), group(['review'])], [1.4, 1])
   ],
   [3, 1]
