@@ -617,10 +617,11 @@ def _notify_workflow_complete(task_id: str, state=None):
             "message": full_message,
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
-        _COMPLETIONS_DIR.mkdir(parents=True, exist_ok=True)
-        marker_path = _COMPLETIONS_DIR / f"wf-complete-{ts}.json"
+        wf_marker_dir = _COMPLETIONS_DIR / workflow_name
+        wf_marker_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = wf_marker_dir / f"{ts}.json"
         # Atomic write: temp file → rename (prevents TOCTOU reads of partial JSON)
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="wf-complete-", suffix=".json")
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json")
         try:
             with os.fdopen(tmp_fd, "w") as tmp_f:
                 json.dump(marker, tmp_f, indent=2, default=str)
@@ -628,7 +629,7 @@ def _notify_workflow_complete(task_id: str, state=None):
         except Exception:
             os.unlink(tmp_path)
             raise
-        print(f"   📨 Workflow completion marker written: {marker_path.name}")
+        print(f"   📨 Workflow completion marker written: {marker_path.relative_to(_COMPLETIONS_DIR)}")
     except Exception as e:
         print(f"   ⚠  Failed to write completion marker: {e}")
 
@@ -669,7 +670,7 @@ def _start_completion_watcher():
         while True:
             time.sleep(2)
             try:
-                markers = sorted(_glob.glob(str(_COMPLETIONS_DIR / "wf-complete-*.json")))
+                markers = sorted(_glob.glob(str(_COMPLETIONS_DIR / "*" / "*.json")))
                 # Skip stale markers older than 10 minutes
                 now = time.time()
                 markers = [m for m in markers if now - os.path.getmtime(m) < 600]

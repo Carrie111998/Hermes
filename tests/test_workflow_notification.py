@@ -98,7 +98,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         assert len(markers) >= 1, "No completion marker written"
 
@@ -133,7 +133,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         # Should NOT have written a new marker (clean up any old ones first)
         assert not any(
@@ -157,7 +157,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         assert markers, "No marker written"
         data = json.loads(Path(markers[-1]).read_text())
@@ -181,7 +181,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         data = json.loads(Path(markers[-1]).read_text())
         expected_key = "agent:main:discord:thread:123456:123456"
@@ -210,7 +210,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
@@ -244,7 +244,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
@@ -277,7 +277,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         assert markers, "No marker written"
         data = json.loads(Path(markers[-1]).read_text())
@@ -326,7 +326,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         data = json.loads(Path(markers[-1]).read_text())
         msg = data["message"]
@@ -351,7 +351,7 @@ class TestNotifyWorkflowComplete:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         data = json.loads(Path(markers[-1]).read_text())
         assert data["workflow_name"] == "ideation"
@@ -513,7 +513,7 @@ class TestSimplifyCodeFixes:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         assert markers, "No marker written"
         data = json.loads(Path(markers[-1]).read_text())
@@ -546,7 +546,7 @@ class TestSimplifyCodeFixes:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         assert markers
         os.unlink(markers[-1])
@@ -581,7 +581,7 @@ class TestSimplifyCodeFixes:
         markers = glob.glob(str(
             Path(os.environ.get("HERMES_WORKFLOW_FILES",
                 str(Path(__file__).resolve().parent.parent / "docs" / "fleet-pipelines"))
-            ) / "completions" / "wf-complete-*.json"
+            ) / "completions" / "*" / "*.json"
         ))
         assert markers, "No marker despite analyst failure"
         data = json.loads(Path(markers[-1]).read_text())
