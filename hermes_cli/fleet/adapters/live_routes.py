@@ -537,13 +537,10 @@ def live_adapters(
     qualifications: Mapping[str, Qualification] | None = None,
 ) -> dict[str, object]:
     qualifications = qualifications or {}
-    claude = qualifications.get("claude_code")
     antigravity = qualifications.get("antigravity")
     return {
         "chatgpt_codex": NativeProviderAdapter(native_runner),
-        "claude_code": ClaudeCodeAdapter(
-            claude.executable if claude and claude.qualified and claude.executable else "claude"
-        ),
+        "claude_code": NativeProviderAdapter(native_runner),
         "grok": NativeProviderAdapter(native_runner),
         "antigravity": AntigravityAdapter(
             antigravity.executable

@@ -236,6 +236,7 @@ def test_desktop_parent_excludes_external_worker_without_parent_session_support(
     ("lane_id", "provider_id"),
     [
         ("chatgpt_codex", "openai-codex"),
+        ("claude_code", "anthropic"),
         ("grok", "xai-oauth"),
     ],
 )
@@ -271,6 +272,17 @@ def test_native_parent_requires_exact_subscription_qualification(
     assert qualified.eligible
     assert not unproven.eligible
     assert ReasonCode.SUBSCRIPTION_NOT_PROVEN in unproven.reasons
+
+
+def test_builtin_claude_lane_is_a_native_parent_not_a_cli_worker():
+    from hermes_cli.fleet.profiles import profile_map
+
+    profile = profile_map()["claude_code"]
+
+    assert profile.adapter_kind is AdapterKind.NATIVE_PROVIDER
+    assert profile.provider_id == "anthropic"
+    assert profile.allowed_auth_kinds == frozenset({"oauth_subscription"})
+    assert profile.supports_parent_session is True
 
 
 @pytest.mark.parametrize(

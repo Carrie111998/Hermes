@@ -61,12 +61,13 @@ def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():
     assert profiles[0].selected_effort == "max"
     assert profiles[0].supports_task_worker
     assert profiles[0].supports_parent_session
-    assert profiles[1].adapter_kind is AdapterKind.EXTERNAL_CLI
-    assert profiles[1].executable == "claude"
+    assert profiles[1].adapter_kind is AdapterKind.NATIVE_PROVIDER
+    assert profiles[1].provider_id == "anthropic"
+    assert profiles[1].executable is None
     assert profiles[1].supported_efforts == ("low", "medium", "high", "max")
     assert profiles[1].selected_effort == "high"
     assert profiles[1].supports_task_worker
-    assert not profiles[1].supports_parent_session
+    assert profiles[1].supports_parent_session
     assert profiles[2].provider_id == "xai-oauth"
     assert profiles[2].supported_efforts[-2:] == ("max", "ultra")
     assert profiles[2].selected_effort == "max"

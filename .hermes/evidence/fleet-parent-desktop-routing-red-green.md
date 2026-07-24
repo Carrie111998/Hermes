@@ -149,3 +149,156 @@ The Windows parallel runner emitted a post-result `UnicodeEncodeError` while
 printing its checkmark through cp1252. The process exit code was zero and the
 authoritative test summaries above reported zero failed tests; production and
 test files were not changed to mask the runner-only display issue.
+
+## Phase 3 — gateway admission and exact native route
+
+### RED: Fleet Auto admission before deferred construction
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 1 test failed because `tui_gateway.server` had no
+  `_admit_fleet_parent_session` gateway boundary.
+- The focused test requires admission to happen before the deferred build,
+  and requires the immediate response plus live session overrides to report
+  the selected exact Grok route.
+
+### RED: explicit manual-model precedence
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 1 test passed and 1 failed because the immediate server response did not
+  expose `model_source=manual` or the corresponding `MANUAL_OVERRIDE` reason.
+- The admission spy was not invoked, proving the pre-existing bypass portion
+  while isolating the missing truthful server metadata.
+
+### RED: exact native runtime without fallback
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 2 tests passed and 1 failed because `_make_agent` did not accept an
+  `exact_route` contract.
+- The focused test arms a valid xAI OAuth runtime, makes the ordinary fallback
+  resolver fatal if invoked, and requires `fallback_model=None` plus priority
+  service disabled at `AIAgent` construction.
+
+### RED: safe durable route metadata
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 3 tests passed and 1 failed because first-activity session persistence did
+  not include the fleet lineage root, lane, adapter kind, route identity, and
+  model-source fields.
+- The test also guards that qualification evidence hashes are not copied into
+  ordinary session metadata.
+
+### RED: post-build session-info authority
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 4 tests passed and 1 failed because `_session_info` dropped the committed
+  model source, fleet lane, route identity, and safe display label after agent
+  construction.
+
+### RED: resume resolves the authoritative lineage pin
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 5 tests passed and 1 failed because the gateway fleet bridge had no
+  `restore_parent_route` path from safe SessionDB metadata to the
+  authoritative fleet SQLite pin.
+
+### RED: active-turn occupancy guard
+
+Command:
+
+`bash scripts/run_tests.sh tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 6 tests passed and 1 failed because the gateway fleet bridge had no
+  `acquire_parent_turn_guard`.
+- The focused contract requires release of the exact owner/generation lease
+  and a future-admission cooldown after a provider failure.
+
+### Owner correction RED: Claude is a native Anthropic parent
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet/test_policy.py tests/hermes_cli/fleet/test_live.py tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Expected RED:
+
+- 49 tests passed and 9 failed.
+- Failures proved the restored Claude lane was still external-only, the live
+  doctor had no explicit Claude Code OAuth evidence seam, and the exact gateway
+  runtime admitted only Codex and Grok.
+
+### Owner correction GREEN: exact Claude Code OAuth route
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet/test_policy.py tests/hermes_cli/fleet/test_live.py tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Result:
+
+- 58 tests passed and 0 failed.
+- Claude now qualifies only from an attributable live Claude Code OAuth record
+  and constructs the native Anthropic Messages route directly.
+- `ANTHROPIC_API_KEY`, generic runtime fallback, custom endpoints, fast mode,
+  service priority, and fallback models cannot satisfy the exact route.
+
+### Gateway and Fleet phase verification
+
+Command:
+
+`bash scripts/run_tests.sh tests/hermes_cli/fleet tests/tui_gateway/test_fleet_parent_route.py -q`
+
+Result:
+
+- 158 tests passed and 0 failed across 12 files.
+
+The canonical wrapper cannot collect `tests/test_tui_gateway_server.py` on
+native Windows because its `env -i` process omits `USERPROFILE` and
+`LOCALAPPDATA`; `pathlib.Path.home()` fails before test collection. A fallback
+run used the same per-file runner with a newly created isolated test home,
+credential variables removed, and deterministic test environment values.
+It reported 430 passed after one retry. The first attempt had one unrelated
+metadata-mirror event-order mismatch; the builder diff does not modify that
+test's compute-host completion function, so no unrelated change was made.
+
+### Antigravity persistent-parent live gate
+
+Read-only discovery proved installed `agy` version `1.1.6` exposes
+`--conversation`, `--continue`, and `--remote-control`, and `agy models`
+includes exact `gemini-3.1-pro-high`.
+
+An isolated empty-directory first-turn canary was terminated after the CLI
+outlived its own 60-second print timeout. Its bounded log reported that the
+current Antigravity CLI is not logged in, so strict two-turn continuity and
+served-model evidence cannot be established on this machine. External-parent
+activation must remain fail-closed; catalog visibility and a dormant
+contract-tested driver may not be represented as live qualification.

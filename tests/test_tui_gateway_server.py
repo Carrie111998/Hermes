@@ -11559,6 +11559,77 @@ def test_start_agent_build_passes_session_model_override(
         server._sessions.clear()
 
 
+def test_start_agent_build_passes_committed_fleet_route_exactly(monkeypatch):
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def close(self):
+            pass
+
+    route = {
+        "model_source": "fleet_auto",
+        "fleet_profile_id": "default",
+        "fleet_lineage_root_id": "fleet-root",
+        "fleet_lane_id": "grok",
+        "fleet_adapter_kind": "native_provider",
+        "fleet_route_purpose": "desktop_parent",
+        "fleet_selection_reason": "ROTATION",
+        "fleet_pin_status": "pinned",
+        "fleet_route_identity": "sha256:route",
+        "model": "grok-4.5",
+        "provider": "xai-oauth",
+        "reasoning_effort": "max",
+        "fast": False,
+        "display_label": "Grok · Fleet",
+    }
+
+    def fake_make_agent(sid, key, session_id=None, session_db=None, **kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(model="grok-4.5")
+
+    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
+    monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+
+    sid = "fleet-build-sid"
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "fleet-root",
+        "profile_home": None,
+        "model_override": {
+            "model": "grok-4.5",
+            "provider": "xai-oauth",
+        },
+        "create_reasoning_override": {"enabled": True, "effort": "max"},
+        "create_service_tier_override": "",
+        "fleet_parent_route": route,
+    }
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_ready"].wait(timeout=3), "agent build did not finish"
+        assert captured["model_override"] == {
+            "model": "grok-4.5",
+            "provider": "xai-oauth",
+        }
+        assert captured["exact_route"] == route
+        assert captured["service_tier_override"] == ""
+    finally:
+        server._sessions.clear()
+
+
 # ── billing/subscription state + error serialization ─────────────────
 
 

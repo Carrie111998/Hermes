@@ -11,7 +11,6 @@ import pytest
 
 from hermes_cli.fleet.adapters.live_routes import (
     AntigravityAdapter,
-    ClaudeCodeAdapter,
     live_adapters,
 )
 from hermes_cli.fleet.adapters.native_provider import NativeProviderAdapter
@@ -51,6 +50,11 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
             "auth_mode": "chatgpt" if provider == "openai-codex" else "oauth_device_code",
             "source": "pool:test",
         },
+        claude_oauth_status=lambda: {
+            "logged_in": True,
+            "auth_mode": "claude_code_oauth",
+            "source": "claude_code_credentials_file",
+        },
         which=lambda name: f"C:/tools/{name}.exe",
         command=run,
         environment={},
@@ -84,7 +88,7 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
     assert qualifications["antigravity"].models == ("gemini-3.1-pro-high",)
     assert qualifications["antigravity"].efforts == ("low", "medium", "high")
     assert qualifications["antigravity"].qualified
-    assert any(command[1:] == ("auth", "status", "--json") for command in commands)
+    assert not any(Path(command[0]).stem == "claude" for command in commands)
     assert any(command[1:] == ("models",) for command in commands)
     assert not any(Path(command[0]).stem == "agy" and "auth" in command for command in commands)
     assert "provider-reported served-model" in qualifications["antigravity"].detail
@@ -214,6 +218,11 @@ def test_default_service_qualifies_and_executes_each_live_lane(
             "auth_mode": "chatgpt" if provider == "openai-codex" else "oauth_device_code",
             "source": "pool:test",
         },
+        claude_oauth_status=lambda: {
+            "logged_in": True,
+            "auth_mode": "claude_code_oauth",
+            "source": "claude_code_credentials_file",
+        },
         which=lambda _: sys.executable,
         command=command,
         environment={},
@@ -222,13 +231,18 @@ def test_default_service_qualifies_and_executes_each_live_lane(
     )
 
     def native(**kwargs):
+        auth_source = (
+            "anthropic:claude_code_oauth"
+            if kwargs["provider_id"] == "anthropic"
+            else f"{kwargs['provider_id']}:oauth_subscription"
+        )
         return {
             "ok": True,
             "provider_id": kwargs["provider_id"],
             "model_id": kwargs["model"],
             "effort": kwargs["effort"],
             "auth_kind": "oauth_subscription",
-            "auth_source": f"{kwargs['provider_id']}:oauth_subscription",
+            "auth_source": auth_source,
             "fallback_enabled": False,
             "fast_mode": False,
             "output": "native complete",
@@ -259,7 +273,7 @@ def test_default_service_qualifies_and_executes_each_live_lane(
 
     adapters = {
         "chatgpt_codex": NativeProviderAdapter(native),
-        "claude_code": ClaudeCodeAdapter(sys.executable, run_process=process),
+        "claude_code": NativeProviderAdapter(native),
         "grok": NativeProviderAdapter(native),
         "antigravity": AntigravityAdapter(sys.executable, run_process=process),
     }
@@ -293,6 +307,10 @@ def test_default_service_qualifies_and_executes_each_live_lane(
     assert result.ok
     assert result.pin is not None
     assert result.pin.lane_id == lane_id
+    if lane_id == "claude_code":
+        assert process_calls == []
+        assert result.adapter_result.adapter_kind.value == "native_provider"
+        assert result.adapter_result.provider_id == "anthropic"
     if lane_id == "antigravity":
         assert len(process_calls) == 1
         argv = process_calls[0]

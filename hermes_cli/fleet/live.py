@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
@@ -37,6 +36,32 @@ def _command(argv: Sequence[str]) -> tuple[int, str, str]:
         return 1, "", type(exc).__name__
 
 
+def _claude_code_oauth_status() -> Mapping[str, object]:
+    """Return secret-free evidence for the live Claude Code OAuth record."""
+
+    from agent.anthropic_adapter import (
+        _is_oauth_token,
+        is_claude_code_token_valid,
+        read_claude_code_credentials,
+    )
+
+    credentials = read_claude_code_credentials()
+    if not isinstance(credentials, dict):
+        return {"logged_in": False}
+    token = str(credentials.get("accessToken") or "").strip()
+    source = str(credentials.get("source") or "").strip()
+    return {
+        "logged_in": bool(
+            source
+            and token
+            and _is_oauth_token(token)
+            and is_claude_code_token_valid(credentials)
+        ),
+        "auth_mode": "claude_code_oauth",
+        "source": source,
+    }
+
+
 class FleetQualificationDoctor:
     """Inspect route identity without returning or persisting credentials."""
 
@@ -44,6 +69,7 @@ class FleetQualificationDoctor:
         self,
         *,
         auth_status: Callable[[str], Mapping[str, object]] | None = None,
+        claude_oauth_status: Callable[[], Mapping[str, object]] | None = None,
         which: Callable[[str], str | None] = shutil.which,
         command: Callable[[Sequence[str]], tuple[int, str, str]] = _command,
         environment: Mapping[str, str] | None = None,
@@ -56,6 +82,9 @@ class FleetQualificationDoctor:
 
             auth_status = get_auth_status
         self.auth_status = auth_status
+        self.claude_oauth_status = (
+            claude_oauth_status or _claude_code_oauth_status
+        )
         self.which = which
         self.command = command
         self.environment = dict(os.environ if environment is None else environment)
@@ -91,32 +120,6 @@ class FleetQualificationDoctor:
         version_code, version_out, _ = self.command((command_name, "--version"))
         if version_code != 0 or not version_out.strip():
             return None, (), "version command failed"
-        if profile.lane_id == "claude_code":
-            code, stdout, _ = self.command(
-                (command_name, "auth", "status", "--json")
-            )
-            if code != 0:
-                return None, (), "subscription auth status command failed"
-            try:
-                receipt = json.loads(stdout)
-            except (TypeError, json.JSONDecodeError):
-                return None, (), "subscription auth status was not JSON"
-            if not isinstance(receipt, dict) or receipt.get("loggedIn") is not True:
-                return None, (), "subscription auth is not logged in"
-            method = str(receipt.get("authMethod") or "")
-            provider = str(receipt.get("apiProvider") or "")
-            if method != "claude.ai" or provider != "firstParty":
-                return (
-                    None,
-                    (),
-                    "Claude route is not first-party claude.ai subscription",
-                )
-            return (
-                version_out.strip().splitlines()[0],
-                profile.ordered_models,
-                None,
-            )
-
         code, stdout, _ = self.command((command_name, "models"))
         if code != 0:
             return None, (), "agy models command failed"
@@ -173,10 +176,16 @@ class FleetQualificationDoctor:
             auth_source = None
             auth_kind = "oauth_subscription"
             if profile.adapter_kind is AdapterKind.NATIVE_PROVIDER:
-                status = self.auth_status(profile.provider_id)
-                expected_mode = (
-                    "chatgpt" if profile.provider_id == "openai-codex" else "oauth_device_code"
-                )
+                if profile.provider_id == "anthropic":
+                    status = self.claude_oauth_status()
+                    expected_mode = "claude_code_oauth"
+                else:
+                    status = self.auth_status(profile.provider_id)
+                    expected_mode = (
+                        "chatgpt"
+                        if profile.provider_id == "openai-codex"
+                        else "oauth_device_code"
+                    )
                 if status.get("logged_in") is not True or status.get("auth_mode") != expected_mode:
                     result[profile.lane_id] = self._failed(
                         profile, f"{profile.provider_id} subscription OAuth is not proven"
@@ -194,7 +203,11 @@ class FleetQualificationDoctor:
                 # through different layers.  Bind execution to the stable,
                 # provider-scoped subscription identity after both layers have
                 # independently proven their attributable source.
-                auth_source = f"{profile.provider_id}:oauth_subscription"
+                auth_source = (
+                    "anthropic:claude_code_oauth"
+                    if profile.provider_id == "anthropic"
+                    else f"{profile.provider_id}:oauth_subscription"
+                )
             else:
                 executable = self._external_executable(profile)
                 if not executable:
@@ -211,15 +224,11 @@ class FleetQualificationDoctor:
                     )
                     continue
                 auth_kind = "cli_subscription"
-                auth_source = (
-                    "claude_code:claude-auth-status"
-                    if profile.lane_id == "claude_code"
-                    else "antigravity:agy-models-policy"
-                )
+                auth_source = "antigravity:agy-models-policy"
             if profile.lane_id == "claude_code":
                 policy_detail = (
-                    "policy evidence: authenticated first-party Claude subscription "
-                    "route and forbidden billable API-key env absent; "
+                    "observed evidence: live Claude Code OAuth credential, exact "
+                    "native Anthropic route, and forbidden billable API-key env absent; "
                     "provider overage state requires separate billing telemetry"
                 )
             elif profile.lane_id == "antigravity":
