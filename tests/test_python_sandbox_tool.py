@@ -190,7 +190,7 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
     assert "$HOME" not in script
     assert "HERMES_HOME" not in script
     assert "pivot_root" in script
-    assert "mount -o remount,ro /" in script
+    assert 'mount -o remount,ro "$JAIL"' in script
     assert "exec /venv/bin/python -I /script.py" in script
     assert 'mkdir -p "$JAIL/opt/python/3.13"' in script
     assert 'ro_dir /opt/python/3.13 "$JAIL/opt/python/3.13"' in script

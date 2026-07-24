@@ -279,13 +279,12 @@ def _generate_init_script(
             f'mount --bind {_q(run_dir / "work")} "$JAIL/work"',
             'mount -o remount,bind,rw "$JAIL/work"',
             'mount -t proc -o nosuid,nodev,noexec proc "$JAIL/proc"',
+            # Assembly is complete. Freeze the tmpfs root before pivot;
+            # nested /work stays a separate writable bind mount.
+            'mount -o remount,ro "$JAIL"',
             'pivot_root "$JAIL" "$JAIL/.oldroot"',
             "cd /",
             "umount -l /.oldroot",
-            "rmdir /.oldroot",
-            # The tmpfs root starts writable so the jail can be assembled.
-            # Freeze it after pivot; /work remains its own writable bind mount.
-            "mount -o remount,ro /",
             "exec /venv/bin/python -I /script.py",
             "",
         ]
