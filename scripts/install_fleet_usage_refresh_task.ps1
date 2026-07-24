@@ -2,10 +2,10 @@
 # Uses pwsh (PowerShell 7+), not Windows PowerShell 5.1.
 # Interval defaults to 30 minutes (safely below the 2h capacity max_age).
 #
-# schtasks /TR is hard-capped at 261 characters on Windows. We therefore:
-#   - verify pwsh exists via Get-Command, but put only the short command name
-#     "pwsh.exe" into /TR (PATH lookup at task runtime -- avoids long
-#     WindowsApps paths blowing the budget)
+# schtasks /TR is hard-capped at 261 characters on Windows. Task Scheduler's
+# restricted PATH also cannot resolve bare "pwsh.exe" (0x80070002). We therefore:
+#   - verify pwsh via Get-Command and embed the verified absolute .Source path
+#     (quoted) into /TR so the task does not depend on PATH
 #   - keep flags minimal
 #   - omit -HermesHome when it equals %LOCALAPPDATA%\hermes (refresher default)
 #   - measure length and fail before schtasks /Create if still over the limit
@@ -38,9 +38,24 @@ if (-not (Test-Path -LiteralPath $script)) {
 }
 $scriptFull = (Resolve-Path -LiteralPath $script).Path
 
-# Verify PowerShell 7+ is installed. Do NOT embed .Source into /TR -- store
-# installs under WindowsApps yield paths that alone can exceed the 261 cap.
-$null = Get-Command pwsh -ErrorAction Stop
+# Resolve PowerShell 7+ to an absolute path. Task Scheduler's restricted PATH
+# cannot find bare "pwsh.exe" (Last Result -2147024894 / 0x80070002).
+$pwshCmd = Get-Command pwsh -ErrorAction Stop
+$pwshExe = $pwshCmd.Source
+if ([string]::IsNullOrWhiteSpace($pwshExe)) {
+    throw "Get-Command pwsh returned empty .Source"
+}
+if (-not (Test-Path -LiteralPath $pwshExe)) {
+    throw "pwsh .Source does not exist: $pwshExe"
+}
+# Normalize to a rooted filesystem path (rejects relative / bare names).
+$pwshFull = [System.IO.Path]::GetFullPath($pwshExe)
+if (-not [System.IO.Path]::IsPathRooted($pwshFull)) {
+    throw "pwsh path is not absolute: $pwshFull"
+}
+if (-not (Test-Path -LiteralPath $pwshFull)) {
+    throw "pwsh absolute path does not exist: $pwshFull"
+}
 
 $defaultHome = Join-Path $env:LOCALAPPDATA "hermes"
 if (-not $HermesHome -or [string]::IsNullOrWhiteSpace($HermesHome)) {
@@ -74,11 +89,11 @@ $includeHermesHome = -not $resolvedHome.Equals(
     [System.StringComparison]::OrdinalIgnoreCase
 )
 
-# Short, stable /TR: command-name form + minimal flags + quoted -File path.
+# /TR: quoted absolute pwsh + minimal flags + quoted -File path.
 # -ExecutionPolicy Bypass keeps the task runnable under Restricted hosts.
 # -WindowStyle Hidden avoids a console flash at each interval tick.
 $trParts = [System.Collections.Generic.List[string]]::new()
-$trParts.Add('pwsh.exe')
+$trParts.Add(('"{0}"' -f $pwshFull))
 $trParts.Add('-NoProfile')
 $trParts.Add('-WindowStyle')
 $trParts.Add('Hidden')
@@ -103,6 +118,7 @@ if ($DryRun) {
     Write-Host "TR_LENGTH=$($tr.Length)"
     Write-Host "TR=$tr"
     Write-Host "INCLUDE_HERMES_HOME=$includeHermesHome"
+    Write-Host "PWSH=$pwshFull"
     exit 0
 }
 
@@ -116,4 +132,5 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Registered $TaskName every $IntervalMinutes minutes via pwsh"
 Write-Host "TR_LENGTH=$($tr.Length)"
 Write-Host "TR=$tr"
+Write-Host "PWSH=$pwshFull"
 exit 0
