@@ -34,9 +34,9 @@ def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
 
     Returns (profile_path, root_path). The pytest seat belt in
-    ``_write_through_xai_oauth_to_global_root`` only refuses the *real* user's
-    ``$HOME/.hermes/auth.json``; a tmp_path root is allowed, so we point HOME
-    away from the tmp root to keep the guard from tripping on these fixtures.
+    ``_write_through_xai_oauth_to_global_root`` refuses only the platform-native
+    user auth store; this tmp_path root is allowed. HOME is pointed elsewhere
+    to prove legacy HOME-based matching does not control the decision.
     """
     profile_path = tmp_path / "profiles" / "work" / "auth.json"
     root_path = tmp_path / "root" / "auth.json"

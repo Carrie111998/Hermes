@@ -57,9 +57,9 @@ def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
 
     The pytest seat belt in ``_write_through_provider_state_to_global_root``
-    only refuses the *real* user's ``$HOME/.hermes/auth.json``; a tmp_path
-    root is allowed, so point HOME away from the tmp root to keep the guard
-    from tripping on these fixtures.
+    refuses only the platform-native user auth store; this tmp_path root is
+    allowed. Point HOME away as an additional assertion that legacy HOME-based
+    matching is not what grants access.
     """
     profile_path = tmp_path / "profiles" / "work" / "auth.json"
     root_path = tmp_path / "root" / "auth.json"
@@ -189,6 +189,29 @@ def test_write_through_helper_is_noop_in_classic_mode(monkeypatch, tmp_path):
     CP._write_through_provider_state_to_global_root(
         "openai-codex", {"tokens": {"access_token": "a", "refresh_token": "r"}}
     )
+
+
+def test_write_through_helper_refuses_platform_store_under_pytest(
+    monkeypatch, tmp_path
+):
+    """Pool refresh tests must not write OAuth state into the native root."""
+    global_path = tmp_path / "AppData" / "Local" / "hermes" / "auth.json"
+    persist_calls = []
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "pool global write seat belt")
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setattr(A, "_platform_default_auth_file_path", lambda: global_path)
+    monkeypatch.setattr(
+        A,
+        "_persist_provider_state_to_store",
+        lambda *args, **kwargs: persist_calls.append((args, kwargs)),
+    )
+
+    CP._write_through_provider_state_to_global_root(
+        "openai-codex", {"tokens": {"access_token": "fake"}}
+    )
+
+    assert persist_calls == []
 
 
 def test_global_write_through_preserves_concurrent_root_update(
