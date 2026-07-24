@@ -406,6 +406,17 @@ export interface Translations {
     }
     fieldLabels: Record<string, string>
     fieldDescriptions: Record<string, string>
+    /**
+     * Localized labels for dynamic select *option values*, keyed by schema key
+     * (fieldCopy camelCase form, e.g. 'agent.imageInputMode') then by the raw
+     * runtime option value:
+     *   optionLabels['approvals.mode']['off'] -> 'معطل'
+     * Optional and locale-additive: `en` omits it entirely (English keeps
+     * rendering prettyName(option) verbatim). Only stylistic/enum fields are
+     * populated per locale; brand/model/provider values are intentionally
+     * absent so they fall through to prettyName and stay literal.
+     */
+    optionLabels?: Record<string, Record<string, string>>
     about: {
       heading: string
       version: (value: string) => string

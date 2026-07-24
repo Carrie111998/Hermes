@@ -579,6 +579,42 @@ export const ar = defineLocale({
       'updates.nonInteractiveLocalChanges':
         'عندما يحدّث Hermes نفسه من التطبيق دون موجه طرفية، احتفظ بتعديلات المصدر المحلية أو تجاهلها.'
     },
+    optionLabels: {
+      // أنماط أسلوبية بحتة — كل القيم قابلة للترجمة (ليست أعلاماً)
+      'approvals.mode': { manual: 'يدوي', smart: 'ذكي', off: 'معطل' },
+      'agent.imageInputMode': { auto: 'تلقائي', native: 'أصلي', text: 'نصي' },
+      'codeExecution.mode': { project: 'مشروع', strict: 'صارم' },
+      'context.engine': { compressor: 'ضاغط', default: 'افتراضي', custom: 'مخصص' },
+      'delegation.reasoningEffort': {
+        minimal: 'أدنى',
+        low: 'منخفض',
+        medium: 'متوسط',
+        high: 'عالٍ',
+        xhigh: 'فائق',
+        max: 'أقصى',
+        ultra: 'خارق'
+      },
+      // قائمة الشخصيات — أساليب عرض (تُترجم أو تُنقحر، ليست علامات تجارية)
+      'display.personality': {
+        helpful: 'متعاون',
+        concise: 'مقتضب',
+        technical: 'تقني',
+        creative: 'مبدع',
+        teacher: 'معلم',
+        kawaii: 'كاواي',
+        catgirl: 'فتاة القطط',
+        pirate: 'القرصان',
+        shakespeare: 'شكسبير',
+        surfer: 'راكب أمواج',
+        noir: 'نوار',
+        uwu: 'يو وو',
+        philosopher: 'فيلسوف',
+        hype: 'حماسي'
+      },
+      // ترجمة جزئية: local كلمة عامة تُترجم؛ Docker/Singularity/Modal/Daytona/SSH
+      // أعلام تُترك عمداً فتسقط إلى prettyName حرفياً
+      'terminal.backend': { local: 'محلي' }
+    },
     about: {
       heading: 'حول Hermes',
       version: value => `الإصدار ${value}`,
