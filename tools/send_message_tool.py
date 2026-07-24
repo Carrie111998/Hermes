@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -488,12 +489,15 @@ def _handle_send(args):
             _slack_dm_target = f"user:{_slack_dm_target}"
         if _slack_dm_target.startswith(("user:", "user_name:")):
             from model_tools import _run_async
-            _resolved, _resolve_err = _run_async(
+            _resolved, _resolve_err, _resolved_token = _run_async(
                 _resolve_slack_user_target(pconfig.token, _slack_dm_target)
             )
             if _resolve_err:
                 return json.dumps(_resolve_err)
             chat_id = _resolved
+            if _resolved_token:
+                pconfig = copy.copy(pconfig)
+                pconfig.token = _resolved_token
 
     try:
         from model_tools import _run_async
@@ -1530,26 +1534,35 @@ async def _resolve_slack_user_target(token, chat_id):
     chat.postMessage requires a conversation ID. ``user_name:`` targets are
     first resolved to a user ID through users.list (stable handle match only).
 
-    Returns ``(chat_id, None)`` on success or ``(None, error_dict)`` on failure.
+    Returns ``(chat_id, None, selected_token)`` on success or
+    ``(None, error_dict, None)`` on failure. The selected token must follow the
+    resolved DM into delivery so a multi-workspace lookup cannot resolve with
+    one workspace and then send with another.
     """
     if not (chat_id.startswith("user:") or chat_id.startswith("user_name:")):
-        return chat_id, None
+        return chat_id, None, None
+    tokens = [part.strip() for part in str(token or "").split(",") if part.strip()]
+    if not tokens:
+        return None, _error("Slack DM resolution failed: no bot token configured"), None
     try:
         import aiohttp
     except ImportError:
-        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
+        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}, None
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url()
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         base_url = "https://slack.com/api"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        async def post_api(session, method, payload):
+        async def post_api(session, bearer_token, method, payload):
+            headers = {
+                "Authorization": f"Bearer {bearer_token}",
+                "Content-Type": "application/json",
+            }
             async with session.post(f"{base_url}/{method}", headers=headers, json=payload, **_req_kw) as resp:
                 return await resp.json()
 
-        async def resolve_user_name(session, name):
+        async def resolve_user_name(session, bearer_token, name):
             query = name.strip().lstrip("@").lower()
             matches = []
             cursor = None
@@ -1557,7 +1570,7 @@ async def _resolve_slack_user_target(token, chat_id):
                 payload = {"limit": 200}
                 if cursor:
                     payload["cursor"] = cursor
-                data = await post_api(session, "users.list", payload)
+                data = await post_api(session, bearer_token, "users.list", payload)
                 if not data.get("ok"):
                     return None, f"Slack users.list error: {data.get('error', 'unknown')}"
                 for member in data.get("members", []):
@@ -1578,25 +1591,42 @@ async def _resolve_slack_user_target(token, chat_id):
             return matches[0].get("id"), None
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            if chat_id.startswith("user_name:"):
-                user_id, error = await resolve_user_name(session, chat_id[len("user_name:"):])
-                if error:
-                    return None, _error(error)
-                chat_id = f"user:{user_id}"
+            last_error = "Slack DM resolution failed"
+            for bearer_token in tokens:
+                candidate = chat_id
+                if candidate.startswith("user_name:"):
+                    user_id, error = await resolve_user_name(
+                        session,
+                        bearer_token,
+                        candidate[len("user_name:"):],
+                    )
+                    if error:
+                        last_error = error
+                        continue
+                    candidate = f"user:{user_id}"
 
-            user_id = chat_id[len("user:"):]
-            opened = await post_api(session, "conversations.open", {"users": user_id})
-            if not opened.get("ok"):
-                return None, _error(
-                    f"Slack conversations.open error: {opened.get('error', 'unknown')}. "
-                    "Check bot permissions (im:write)."
+                user_id = candidate[len("user:"):]
+                opened = await post_api(
+                    session,
+                    bearer_token,
+                    "conversations.open",
+                    {"users": user_id},
                 )
-            dm_id = (opened.get("channel") or {}).get("id")
-            if not dm_id:
-                return None, _error("Slack conversations.open did not return a DM channel ID")
-            return dm_id, None
+                if not opened.get("ok"):
+                    last_error = (
+                        f"Slack conversations.open error: {opened.get('error', 'unknown')}. "
+                        "Check bot permissions (im:write)."
+                    )
+                    continue
+                dm_id = (opened.get("channel") or {}).get("id")
+                if not dm_id:
+                    last_error = "Slack conversations.open did not return a DM channel ID"
+                    continue
+                return dm_id, None, bearer_token
+
+            return None, _error(last_error), None
     except Exception as e:
-        return None, _error(f"Slack DM resolution failed: {e}")
+        return None, _error(f"Slack DM resolution failed: {e}"), None
 
 
 async def _send_signal(extra, chat_id, message, media_files=None):

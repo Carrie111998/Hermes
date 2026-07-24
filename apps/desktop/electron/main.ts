@@ -48,6 +48,7 @@ import {
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayHttpError,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
@@ -121,6 +122,7 @@ import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './nat
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
+  parseStoredTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   tokenNeedsRefresh
@@ -3839,7 +3841,7 @@ function fetchJson(url, token, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            reject(gatewayHttpError(res.statusCode, text || res.statusMessage))
 
             return
           }
@@ -3933,7 +3935,7 @@ function fetchPublicJson(url, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            reject(gatewayHttpError(res.statusCode, text || res.statusMessage))
 
             return
           }
@@ -5635,9 +5637,7 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
         const statusCode = res.statusCode || 500
 
         if (statusCode >= 400) {
-          const err = new Error(`${statusCode}: ${text || ''}`) as any
-          err.statusCode = statusCode
-          reject(err)
+          reject(gatewayHttpError(statusCode, text))
 
           return
         }
@@ -5756,7 +5756,7 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
       return null
     }
 
-    const tokens = parseTokenResponse(JSON.parse(plaintext))
+    const tokens = parseStoredTokenSet(JSON.parse(plaintext))
     _nativeTokens.set(baseUrl, tokens)
 
     return tokens
@@ -5845,7 +5845,7 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
 // callers treat that as "needs re-login".
 async function mintGatewayWsTicket(baseUrl) {
   // Native flow: mint the ticket with the bearer token, no cookie involved.
-  const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+  const nativeAt = await ensureNativeAccessToken(baseUrl)
 
   if (nativeAt) {
     const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
@@ -7101,7 +7101,7 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
   if (conn.authMode === 'oauth') {
     // Native RFC 8252 flow: authenticate with the bearer token (cookieless)
     // when we hold one for this gateway; otherwise use the cookie partition.
-    const nativeAt = await ensureNativeAccessToken(conn.baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(conn.baseUrl)
 
     if (nativeAt) {
       return fetchJson(url, null, { ...opts, bearer: nativeAt })
@@ -9342,7 +9342,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     // Native bearer first (cookieless). ensureNativeAccessToken transparently
     // refreshes a near-expiry AT via /auth/native/refresh; a null return means
     // no native session (resolveOauthRestAuth then selects the cookie path).
-    const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+    const nativeAt = await ensureNativeAccessToken(connection.baseUrl)
     const restAuth = resolveOauthRestAuth(nativeAt)
 
     if (restAuth.kind === 'bearer') {

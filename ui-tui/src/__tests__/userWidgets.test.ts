@@ -64,4 +64,21 @@ describe('user widget loading', () => {
     expect(result.removed).toEqual(['soon-gone'])
     expect(getWidgetApp('soon-gone')).toBeUndefined()
   })
+
+  it('a changed file unregisters ids that it no longer defines', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tui-widgets-'))
+    const file = join(dir, 'renamed.mjs')
+
+    await writeFile(file, WIDGET.replace('test-user-widget', 'old-widget-id'))
+    await loadUserWidgets(dir)
+    expect(getWidgetApp('old-widget-id')).toBeDefined()
+
+    await writeFile(file, WIDGET.replace('test-user-widget', 'new-widget-id'))
+    const result = await loadUserWidgets(dir)
+
+    expect(result.added).toEqual(['new-widget-id'])
+    expect(result.removed).toEqual(['old-widget-id'])
+    expect(getWidgetApp('old-widget-id')).toBeUndefined()
+    expect(getWidgetApp('new-widget-id')).toBeDefined()
+  })
 })

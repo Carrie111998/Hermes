@@ -23,6 +23,7 @@ import {
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayHttpError,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   isGatewayAuthRejection,
@@ -547,6 +548,17 @@ test('gateway ticket failures classify only explicit auth rejection statuses as 
   const serverFailure = gatewayTicketFailure(new Error('network timeout'), 'sign in', 'retry connection') as any
   assert.equal(serverFailure.message, 'retry connection')
   assert.equal(serverFailure.needsOauthLogin, undefined)
+})
+
+test('gatewayHttpError preserves the HTTP status used by auth classification', () => {
+  const unauthorized = gatewayHttpError(401, 'invalid bearer') as any
+  const forbidden = gatewayHttpError(403, '') as any
+
+  assert.equal(unauthorized.message, '401: invalid bearer')
+  assert.equal(unauthorized.statusCode, 401)
+  assert.equal(isGatewayAuthRejection(unauthorized), true)
+  assert.equal(forbidden.statusCode, 403)
+  assert.equal(isGatewayAuthRejection(forbidden), true)
 })
 
 test('gateway WS URL IPC result serializes success and the auth-vs-transport matrix', async () => {

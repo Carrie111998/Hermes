@@ -8929,26 +8929,16 @@ class TestFormatMessageTableIntegration:
 
 
 class TestSlackUserAgent:
-    """Pin the User-Agent attribution wired in connect().
+    """Outbound Slack calls use the SDK default identity.
 
-    Slack platform partners (analytics, abuse-detection, etc.) attribute
-    outbound API traffic by ``User-Agent``. The Slack adapter sets
-    ``user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX`` on every
-    ``AsyncWebClient`` it builds and threads the primary client into
-    ``AsyncApp(client=...)`` so the prefix sticks on the app-owned client too.
-    Pin both behaviors at the actual call sites — a future refactor that
-    drops either kwarg would silently break attribution otherwise.
+    Product-identifying attribution is not necessary for Slack functionality
+    and must not be added to every workspace's API traffic without an explicit
+    operator opt-in.
     """
 
-    def test_hermes_slack_user_agent_prefix_format(self):
-        """Module constant matches the HermesAgent/<version> convention used
-        elsewhere in the codebase for platform-partner attribution."""
-        assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-
     @pytest.mark.asyncio
-    async def test_async_web_client_constructed_with_hermes_user_agent_prefix(self):
-        """Every AsyncWebClient built by ``connect()`` carries the prefix, and
-        ``AsyncApp`` receives a pre-built ``client=`` so the prefix sticks."""
+    async def test_async_web_client_uses_sdk_default_user_agent(self):
+        """Every client omits a product-identifying user_agent_prefix."""
         # Multi-token config exercises both construction sites:
         # the primary AsyncApp client AND the per-token loop.
         config = PlatformConfig(
@@ -8992,26 +8982,17 @@ class TestSlackUserAgent:
         ):
             await adapter.connect()
 
-        expected_prefix = _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX
-
-        # AsyncWebClient must be constructed at least once (primary) and
-        # every construction must pass user_agent_prefix.
         assert web_client_mock.call_count >= 1, (
             "AsyncWebClient was never constructed during connect()"
         )
         for idx, call_args in enumerate(web_client_mock.call_args_list):
-            assert call_args.kwargs.get("user_agent_prefix") == expected_prefix, (
-                f"AsyncWebClient call #{idx} missing "
-                f"user_agent_prefix={expected_prefix!r}: {call_args}"
+            assert "user_agent_prefix" not in call_args.kwargs, (
+                f"AsyncWebClient call #{idx} unexpectedly adds product "
+                f"attribution: {call_args}"
             )
 
-        # AsyncApp must be wired with the pre-built primary client. Without
-        # the ``client=`` kwarg, the bolt SDK would build its own client and
-        # the User-Agent prefix would not stick on ``self._app.client``,
-        # which the rest of the adapter uses for app-scoped API calls.
         async_app_kwargs = async_app_mock.call_args.kwargs
         assert "client" in async_app_kwargs, (
-            "AsyncApp must receive a pre-built client= so the "
-            "user_agent_prefix sticks on the app-owned client; got "
+            "AsyncApp must keep using the pre-built primary client; got "
             f"kwargs={async_app_kwargs}"
         )

@@ -20,6 +20,7 @@ import {
   nativeRefreshUrl,
   nativeTokenUrl,
   parseLoopbackCallback,
+  parseStoredTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   statusSupportsNativeFlow,
@@ -174,6 +175,29 @@ test('parseTokenResponse tolerates an absent refresh token / expiry', () => {
 
   assert.equal(t.refreshToken, '')
   assert.equal(t.expiresAt, 0)
+})
+
+test('parseStoredTokenSet reloads the camelCase shape persisted by the desktop', () => {
+  const t = parseStoredTokenSet({
+    accessToken: 'AT',
+    refreshToken: 'RT',
+    expiresAt: 1893456000,
+    provider: 'nous',
+    userId: 'u-1'
+  })
+
+  assert.deepEqual(t, {
+    accessToken: 'AT',
+    refreshToken: 'RT',
+    expiresAt: 1893456000,
+    provider: 'nous',
+    userId: 'u-1'
+  })
+})
+
+test('parseStoredTokenSet rejects token-response and malformed shapes', () => {
+  assert.throws(() => parseStoredTokenSet({ access_token: 'AT' }), /missing accessToken/i)
+  assert.throws(() => parseStoredTokenSet({ refreshToken: 'RT' }), /missing accessToken/i)
 })
 
 // --- refresh timing ---

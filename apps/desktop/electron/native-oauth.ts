@@ -194,6 +194,30 @@ export function parseTokenResponse(body: any): NativeTokenSet {
 }
 
 /**
+ * Validate the camelCase NativeTokenSet shape encrypted by
+ * `_persistNativeTokens`. This is intentionally separate from
+ * parseTokenResponse: gateway wire responses are snake_case, while the local
+ * JSON store serializes the normalized TypeScript object.
+ */
+export function parseStoredTokenSet(body: any): NativeTokenSet {
+  const accessToken = String(body?.accessToken || '')
+
+  if (!accessToken) {
+    throw new Error('Stored native token set missing accessToken')
+  }
+
+  const expiresAt = Number(body?.expiresAt)
+
+  return {
+    accessToken,
+    refreshToken: String(body?.refreshToken || ''),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    provider: String(body?.provider || ''),
+    userId: String(body?.userId || '')
+  }
+}
+
+/**
  * True when a stored token set is at/near expiry and should be refreshed
  * before use. `skewSeconds` refreshes slightly early to avoid a race where
  * the token expires in flight (mirrors the server's 60s cookie floor).

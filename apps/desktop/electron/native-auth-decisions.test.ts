@@ -7,6 +7,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
 import { test } from 'vitest'
 
@@ -65,4 +66,16 @@ test('resolveOauthRestAuth falls back to cookie when there is no native token', 
   assert.deepEqual(resolveOauthRestAuth(undefined), { kind: 'cookie' })
   // Empty string is not a usable bearer — must fall back, not send "Bearer ".
   assert.deepEqual(resolveOauthRestAuth(''), { kind: 'cookie' })
+})
+
+test('native refresh outages propagate instead of silently selecting cookie fallback', () => {
+  const mainSource = readFileSync(new URL('./main.ts', import.meta.url), 'utf8')
+  const nativeTokenCalls = mainSource.match(/await ensureNativeAccessToken\([^)]*\)/g) ?? []
+
+  assert.ok(nativeTokenCalls.length >= 3, 'expected every native-token request seam to remain covered')
+  assert.doesNotMatch(
+    mainSource,
+    /ensureNativeAccessToken\([^)]*\)\.catch\(\(\) => null\)/,
+    'only an explicit null result may select cookie fallback; refresh errors must propagate'
+  )
 })

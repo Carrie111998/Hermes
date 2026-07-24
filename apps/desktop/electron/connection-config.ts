@@ -99,6 +99,16 @@ function isGatewayAuthRejection(error) {
   return statusCode === 401 || statusCode === 403
 }
 
+/** Build an HTTP error whose status survives every gateway auth call path. */
+function gatewayHttpError(statusCode, detail) {
+  const normalizedStatus = Number.isFinite(Number(statusCode)) ? Number(statusCode) : 500
+  const err = new Error(`${normalizedStatus}: ${String(detail || '')}`) as Error & { statusCode: number }
+
+  err.statusCode = normalizedStatus
+
+  return err
+}
+
 function gatewayTicketFailure(error, authMessage, transportMessage) {
   const needsOauthLogin = isGatewayAuthRejection(error)
   const err = new Error(needsOauthLogin ? authMessage : transportMessage)
@@ -491,6 +501,7 @@ export {
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayHttpError,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
