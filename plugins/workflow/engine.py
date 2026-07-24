@@ -2504,6 +2504,31 @@ class WorkflowEngine:
             self._save_state(workflow_name, states, results, layer_idx, layers,
                             run_id=workflow.run_id, context=context)
 
+            # Subscribe final-layer cards for notification. Must happen
+            # BEFORE monitoring so subscriptions exist before cards complete
+            # (the notifier removes subs for terminal tasks).
+            if layer_idx == len(layers) - 1 and _session_info:
+                final_card_ids = [
+                    states[nid].kanban_card_id for nid in layer
+                    if states[nid].kanban_card_id
+                ]
+                if final_card_ids:
+                    try:
+                        from hermes_cli import kanban_db as _skb
+                        with _skb.connect(board=self.kanban_board) as _sconn:
+                            for _cid in final_card_ids:
+                                _skb.add_notify_sub(
+                                    _sconn, task_id=_cid,
+                                    platform=_session_info.get("platform", ""),
+                                    chat_id=_session_info.get("chat_id", ""),
+                                    thread_id=_session_info.get("thread_id"),
+                                    user_id=_session_info.get("user_id"),
+                                    notifier_profile=_session_info.get("profile"),
+                                )
+                        print(f"   📬 Subscribed {len(final_card_ids)} final-layer card(s)")
+                    except Exception:
+                        pass
+
             # Monitor completion for this layer. Synthetic nodes were
             # auto-completed in the dispatch loop above (state.status
             # == "done"), so they have no work to do here. Filtering
