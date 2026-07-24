@@ -719,12 +719,23 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "изтрие ваучера" in result["vouchers"]["manual_extension_refresh"]
     assert "добави отново" in result["vouchers"]["manual_extension_refresh"]
     assert "друг потребител" in result["vouchers"]["ownership_conflict"]
+    issuer_scope = result["vouchers"]["issuer_scope"]
+    assert issuer_scope["skyvision_issued_vouchers"] == {
+        "profile_compatible": True,
+        "service_authority": "SkyVision",
+    }
+    assert issuer_scope["externally_issued_vouchers"]["profile_compatible"] is False
+    assert "издал ваучера" in issuer_scope["externally_issued_vouchers"]["service_authority"]
+    assert issuer_scope["catalog_overlap_changes_issuer_or_compatibility"] is False
+    assert issuer_scope["compatibility_is_issuer_scoped"] is True
     panel = result["vouchers"]["customer_panel"]
+    assert panel["scope"] == "Процесът в SkyVision профила е за ваучери, издадени от SkyVision."
     assert panel["main_area"] == "Профил -> Ваучери / Моите ваучери"
     assert panel["left_navigation"] == ["Ваучери", "Резервации", "Запитвания", "Поръчки", "Настройки", "Изход"]
     assert "Чакащо запитване" in panel["voucher_filters"]
     assert "Добави ваучер" in panel["empty_state"]
     assert "серийния номер на ваучера на латиница" in " ".join(panel["add_voucher_flow"])
+    assert panel["add_voucher_flow"][0].startswith("За ваучер, издаден от SkyVision")
     assert panel["voucher_list_columns"] == ["Услуга", "Ваучер", "Депозит", "Статус", "Валидност", "Действия"]
     assert "„Използвай“" in " ".join(panel["common_actions"])
     assert panel["customer_remains_actor"] is True

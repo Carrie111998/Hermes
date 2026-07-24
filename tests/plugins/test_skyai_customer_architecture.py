@@ -58,6 +58,29 @@ def test_skyai_prompt_treats_prior_turns_as_shared_context() -> None:
     assert "keyword rule" in architecture
 
 
+def test_external_voucher_boundary_is_a_general_hermes_principle() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    support = public_tools.handle_skyai_support_knowledge(include_contacts=True)
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    principle = next(case for case in cases if case["id"] == "voucher_issuer_boundary")
+
+    assert "установи кой е издал ваучера" in prompt
+    assert "Само ваучерите на SkyVision важат в SkyVision профила" in prompt
+    assert "друга платформа или продавач" in prompt
+    assert "дори същото преживяване да е в SkyVision" in prompt
+    assert "при неясен произход първо го уточни" in prompt
+
+    issuer_scope = support["vouchers"]["issuer_scope"]
+    assert issuer_scope["skyvision_issued_vouchers"]["profile_compatible"] is True
+    assert issuer_scope["externally_issued_vouchers"]["profile_compatible"] is False
+    assert issuer_scope["catalog_overlap_changes_issuer_or_compatibility"] is False
+    assert issuer_scope["compatibility_is_issuer_scoped"] is True
+
+    assert principle["source_threads"] == ["1530167380133544067"]
+    assert "another platform, seller, or provider" in principle["principle"]
+    assert "If the origin is unclear" in principle["principle"]
+
+
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     result = public_tools.handle_skyai_campaign_knowledge()
     serialized = json.dumps(result, ensure_ascii=False)
@@ -146,6 +169,7 @@ def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
         "booknow_refund_language",
         "no_keyword_backend_patches",
         "session_context_concision",
+        "voucher_issuer_boundary",
     }
     assert all("principle" in case for case in cases)
     assert all("scoring" in case for case in cases)

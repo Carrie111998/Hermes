@@ -1282,7 +1282,20 @@ def handle_skyai_support_knowledge(
             ),
         },
         "vouchers": {
+            "issuer_scope": {
+                "skyvision_issued_vouchers": {
+                    "profile_compatible": True,
+                    "service_authority": "SkyVision",
+                },
+                "externally_issued_vouchers": {
+                    "profile_compatible": False,
+                    "service_authority": "платформата, търговецът или доставчикът, който е издал ваучера",
+                },
+                "catalog_overlap_changes_issuer_or_compatibility": False,
+                "compatibility_is_issuer_scoped": True,
+            },
             "customer_panel": {
+                "scope": "Процесът в SkyVision профила е за ваучери, издадени от SkyVision.",
                 "main_area": "Профил -> Ваучери / Моите ваучери",
                 "left_navigation": ["Ваучери", "Резервации", "Запитвания", "Поръчки", "Настройки", "Изход"],
                 "voucher_filters": [
@@ -1295,7 +1308,7 @@ def handle_skyai_support_knowledge(
                 ],
                 "empty_state": "Ако няма добавени ваучери, панелът показва бутон „Добави ваучер“.",
                 "add_voucher_flow": [
-                    "Клиентът отваря „Ваучери“ в профила си.",
+                    "За ваучер, издаден от SkyVision, клиентът отваря „Ваучери“ в профила си.",
                     "Натиска „Добави ваучер“.",
                     "В модала въвежда серийния номер на ваучера на латиница, както е изписан на гърба му.",
                     "Натиска „Добави ваучер“ и после управлява ваучера от списъка.",

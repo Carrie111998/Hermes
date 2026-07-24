@@ -40,6 +40,11 @@
     "focus": "voucher support, contacts when escalation is needed"
   },
   {
+    "id": "external_voucher_issuer_boundary",
+    "message": "Имам подаръчен ваучер, издаден от друга платформа, за преживяване, което виждам и в SkyVision. Мога ли да го добавя в профила си тук?",
+    "focus": "reason about voucher issuer authority; do not assume cross-platform compatibility or give SkyVision profile steps for an externally issued voucher"
+  },
+  {
     "id": "gift_wish_text",
     "message": "Искам да напиша лично пожелание във ваучера. Къде се пише?",
     "focus": "voucher greeting UI knowledge and edit window"

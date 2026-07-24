@@ -102,6 +102,12 @@
     "scoring": ["conversation_continuity", "conciseness", "natural_tone", "requested_recall"]
   },
   {
+    "id": "voucher_issuer_boundary",
+    "source_threads": ["1530167380133544067"],
+    "principle": "Before giving account, activation, redemption, validity, or support steps for a voucher, reason about who issued it. SkyVision profile and redemption flows apply only to vouchers issued by SkyVision. A voucher issued by another platform, seller, or provider remains under that issuer's system and terms, even when the same experience also appears in SkyVision. Explain the boundary clearly and direct the customer to the issuer shown on the voucher. If the origin is unclear, ask who issued it instead of assuming compatibility.",
+    "scoring": ["issuer_reasoning", "support_accuracy", "no_false_compatibility", "next_step_clarity"]
+  },
+  {
     "id": "no_keyword_backend_patches",
     "source_threads": ["architecture"],
     "principle": "Do not fix these issues with keyword guards or one-off backend branches. Use prompt principles, facts, and evaluation scoring.",

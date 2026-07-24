@@ -843,6 +843,11 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "Опцията за удължаване е налична" in prompt
     assert "customer-safe обучение от реални email/support казуси" in prompt
     assert "intent/state reasoning, а не като шаблон" in prompt
+    assert "установи кой е издал ваучера" in prompt
+    assert "Само ваучерите на SkyVision важат в SkyVision профила" in prompt
+    assert "Ваучер от друга платформа или продавач" in prompt
+    assert "се обслужва от издателя си" in prompt
+    assert "при неясен произход първо го уточни" in prompt
     assert "не коментирай самото ограничение" in prompt
     assert "представи се кратко като SkyAI" in prompt
     assert "не решавай учебни задачи" in prompt
