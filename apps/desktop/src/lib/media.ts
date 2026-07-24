@@ -56,10 +56,15 @@ export function mediaMime(path: string): string {
 }
 
 export function mediaName(path: string): string {
+  if (/^(?:[a-z]:[\\/]|\\\\)/i.test(path)) {
+    return path.split(/[\\/]/).filter(Boolean).pop() || path
+  }
+
   try {
     const url = new URL(path)
+    const name = url.pathname.split('/').filter(Boolean).pop()
 
-    return url.pathname.split('/').filter(Boolean).pop() || path
+    return name ? decodeURIComponent(name) : path
   } catch {
     return path.split(/[\\/]/).filter(Boolean).pop() || path
   }
@@ -112,6 +117,31 @@ export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
 // Resolve a media path to a URL the shell can open. Remote mode rewrites
 // gateway-local paths to an authenticated /api/files/download URL (the file
 // lives on the gateway, not this disk); local mode keeps the file:// form.
+function localMediaFileUrl(path: string): string {
+  if (/^file:/i.test(path)) {
+    try {
+      return new URL(path).toString()
+    } catch {
+      return path
+    }
+  }
+
+  const normalized = path.replace(/\\/g, '/')
+
+  if (normalized.startsWith('//')) {
+    const [host, ...segments] = normalized.slice(2).split('/')
+
+    return `file://${host}/${segments.map(encodeURIComponent).join('/')}`
+  }
+
+  const encoded = normalized
+    .split('/')
+    .map(segment => (/^[a-z]:$/i.test(segment) ? segment : encodeURIComponent(segment)))
+    .join('/')
+
+  return normalized.startsWith('/') ? `file://${encoded}` : `file:///${encoded}`
+}
+
 export function mediaExternalUrl(path: string): string {
   if (/^https?:/i.test(path)) {
     return path
@@ -127,7 +157,7 @@ export function mediaExternalUrl(path: string): string {
     }
   }
 
-  return /^file:/i.test(path) ? path : `file://${path}`
+  return localMediaFileUrl(path)
 }
 
 // Remote gateway audio/video is proxied by the Electron main process. OAuth
