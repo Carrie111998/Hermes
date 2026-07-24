@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli.fleet.config import parse_fleet_config
+from hermes_cli.fleet.service import FleetService
+from hermes_cli.fleet.state import FleetStore
+from hermes_cli.subcommands.fleet import (
+    EXIT_DISABLED,
+    EXIT_NO_ROUTE,
+    build_fleet_parser,
+    fleet_command,
+)
+
+from test_service import _service
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_fleet_parser(parser.add_subparsers(dest="command"))
+    return parser
+
+
+def test_help_exposes_only_the_bounded_v1_surface(capsys):
+    parser = _parser()
+
+    with pytest.raises(SystemExit) as caught:
+        parser.parse_args(["fleet", "--help"])
+
+    assert caught.value.code == 0
+    output = capsys.readouterr().out
+    for command in ("doctor", "plan", "run", "status", "audit", "release"):
+        assert command in output
+    assert "continue" not in output
+
+
+def test_plan_json_is_stable_provenance_rich_and_read_only(tmp_path, capsys):
+    service, _, _ = _service(tmp_path)
+    task = tmp_path / "task.txt"
+    task.write_text("bounded task", encoding="utf-8")
+    args = _parser().parse_args(
+        [
+            "fleet",
+            "plan",
+            "--task-file",
+            str(task),
+            "--cwd",
+            str(tmp_path),
+            "--json",
+        ]
+    )
+
+    code = fleet_command(args, service=service)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["schema_version"] == 1
+    assert payload["command"] == "plan"
+    assert payload["ok"] is True
+    assert payload["selected"]["lane_id"] == "chatgpt_codex"
+    capacity = payload["evaluations"][0]["capacity"]
+    assert capacity["source_kind"] == "bridge_file"
+    assert capacity["source_id"]
+    assert capacity["source_hash"]
+    assert capacity["captured_at"]
+    assert capacity["read_at"]
+    assert capacity["expires_at"]
+    assert capacity["freshness"] == "fresh"
+    assert capacity["confidence"] == "high"
+    assert capacity["remaining_pct"] == "80.000"
+    assert capacity["reserved_pct"] == "0.000"
+    assert capacity["effective_remaining_pct"] == "80.000"
+    assert not service.store.path.exists()
+
+
+def test_human_plan_names_lane_adapter_and_capacity_provenance(tmp_path, capsys):
+    service, _, _ = _service(tmp_path)
+    task = tmp_path / "task.txt"
+    task.write_text("bounded task", encoding="utf-8")
+    args = _parser().parse_args(
+        ["fleet", "plan", "--task-file", str(task)]
+    )
+
+    code = fleet_command(args, service=service)
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "chatgpt_codex" in output
+    assert "native_provider" in output
+    assert "bridge_file" in output
+    assert "fresh" in output
+    assert "high" in output
+
+
+def test_run_disabled_has_dedicated_exit_code_and_no_state(tmp_path, capsys):
+    service, _, _ = _service(tmp_path, enabled=False)
+    task = tmp_path / "task.txt"
+    task.write_text("bounded task", encoding="utf-8")
+    args = _parser().parse_args(
+        ["fleet", "run", "--task-file", str(task), "--json"]
+    )
+
+    code = fleet_command(args, service=service)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_DISABLED
+    assert payload["reason"] == "FLEET_DISABLED"
+    assert not service.store.path.exists()
+
+
+def test_doctor_no_eligible_lane_is_nonzero_with_complete_matrix(tmp_path, capsys):
+    service, _, _ = _service(tmp_path)
+    service.qualifications.clear()
+    args = _parser().parse_args(["fleet", "doctor", "--json"])
+
+    code = fleet_command(args, service=service)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_NO_ROUTE
+    assert payload["ok"] is False
+    assert len(payload["evaluations"]) == 2
+    assert all(item["reasons"] for item in payload["evaluations"])
+
+
+def test_status_is_read_only_even_when_no_lane_is_eligible(tmp_path, capsys):
+    service, _, _ = _service(tmp_path)
+    service.qualifications.clear()
+    args = _parser().parse_args(["fleet", "status", "--json"])
+
+    code = fleet_command(args, service=service)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["reason"] == "NO_ELIGIBLE_LANE"
+    assert not service.store.path.exists()
+
+
+def test_run_and_filtered_jsonl_audit_use_real_store(tmp_path, capsys):
+    service, adapter, _ = _service(tmp_path)
+    task = tmp_path / "task.txt"
+    task.write_text("bounded task", encoding="utf-8")
+    run_args = _parser().parse_args(
+        [
+            "fleet",
+            "run",
+            "--task-file",
+            str(task),
+            "--task-id",
+            "bfdb2ca5-9d89-41c5-a8ff-60fb1f552001",
+            "--json",
+        ]
+    )
+    assert fleet_command(run_args, service=service) == 0
+    run_payload = json.loads(capsys.readouterr().out)
+    assert run_payload["output"] == "worker complete"
+    assert len(adapter.calls) == 1
+
+    audit_args = _parser().parse_args(
+        [
+            "fleet",
+            "audit",
+            "--task-id",
+            "bfdb2ca5-9d89-41c5-a8ff-60fb1f552001",
+            "--reason",
+            "MET",
+            "--jsonl",
+        ]
+    )
+    assert fleet_command(audit_args, service=service) == 0
+    lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    assert lines
+    assert all(
+        event["task_id"] == "bfdb2ca5-9d89-41c5-a8ff-60fb1f552001"
+        and event["reason_code"] == "MET"
+        for event in lines
+    )
+    serialized = json.dumps(lines)
+    assert "bounded task" not in serialized
+    assert "worker complete" not in serialized
+
+
+def test_release_is_idempotent_and_reports_missing_live_lease(tmp_path, capsys):
+    service, _, _ = _service(tmp_path)
+    args = _parser().parse_args(
+        ["fleet", "release", "missing-task", "--outcome", "cancelled", "--json"]
+    )
+
+    code = fleet_command(args, service=service)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_NO_ROUTE
+    assert payload["released"] is False
