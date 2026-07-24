@@ -43,10 +43,11 @@ function Resolve-Python {
 }
 
 $py = Resolve-Python -Preferred $Python
+# Resolve only from this script's repository root or the installed Hermes home.
+# Never fall back to a dated worktree path — those are ephemeral build checkouts.
 $repoCandidates = @(
     (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue),
-    (Join-Path $HermesHome "hermes-agent"),
-    (Join-Path $env:LOCALAPPDATA "hermes\worktrees\fleet-parent-routing-20260724")
+    (Join-Path $HermesHome "hermes-agent")
 ) | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ "hermes_cli\fleet\usage_refresh.py")) }
 
 if (-not $repoCandidates) {

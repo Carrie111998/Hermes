@@ -216,14 +216,22 @@ def test_bridge_reads_live_plans_schema_with_deterministic_labels_and_row_times(
         },
     )
 
-    codex = BridgeUsageAdapter(path).read("chatgpt_codex", now=NOW).snapshot
-    claude = BridgeUsageAdapter(path).read("claude_code", now=NOW).snapshot
+    codex_read = BridgeUsageAdapter(path).read("chatgpt_codex", now=NOW)
+    claude_read = BridgeUsageAdapter(path).read("claude_code", now=NOW)
+    codex = codex_read.snapshot
+    claude = claude_read.snapshot
 
     assert codex is not None and claude is not None
     assert codex.used_pct == Decimal("25.000")
     assert codex.captured_at.isoformat() == "2026-07-23T23:45:00+00:00"
+    assert codex.freshness is Freshness.FRESH
+    assert codex_read.reason is None
     assert claude.used_pct == Decimal("40.500")
+    # Root stamp is provenance-only; without a per-lane checked_at Claude is stale.
     assert claude.captured_at.isoformat() == "2026-07-23T23:30:00+00:00"
+    assert claude.freshness is Freshness.STALE
+    assert claude.confidence is Confidence.LOW
+    assert claude_read.reason is ReasonCode.CAPACITY_STALE
     assert codex.overage_disabled is None
     assert codex.comparability_group is None
     assert codex.quota_window_id is None
@@ -235,11 +243,14 @@ def test_bridge_reads_live_plans_schema_with_deterministic_labels_and_row_times(
     [
         ("SuperGrok", "grok"),
         ("Google AI · Antigravity", "antigravity"),
+        ("Claude Max 20x", "claude_code"),
+        ("ChatGPT Pro · Codex", "chatgpt_codex"),
     ],
 )
-def test_bridge_missing_row_time_cannot_make_grok_or_agy_preempt(
+def test_bridge_missing_row_time_cannot_make_any_lane_preempt(
     tmp_path, label, lane_id
 ):
+    """Any lane without its own checked_at is stale/low-confidence — never inherits root freshness."""
     path = tmp_path / "usage-weekly.json"
     _write(
         path,
@@ -263,3 +274,4 @@ def test_bridge_missing_row_time_cannot_make_grok_or_agy_preempt(
     assert result.snapshot.freshness is Freshness.STALE
     assert result.snapshot.confidence is Confidence.LOW
     assert result.reason is ReasonCode.CAPACITY_STALE
+    assert "checked_at absent" in result.detail

@@ -251,9 +251,10 @@ class BridgeUsageAdapter:
             used = _plan_percentage(matched.get("weekly_pct_used"))
             remaining = (_TOTAL - used).quantize(_QUANTUM)
             row_time = matched.get("checked_at")
-            missing_sensitive_time = (
-                row_time is None and lane_id in {"grok", "antigravity"}
-            )
+            # Per-lane freshness is authoritative for every lane. A missing row
+            # checked_at must never inherit a sibling-advanced root stamp and
+            # masquerade as FRESH capacity (including auto lanes like Claude).
+            missing_row_time = row_time is None
             captured_at = (
                 _parse_timestamp(row_time) if row_time is not None else root_checked_at
             )
@@ -261,9 +262,9 @@ class BridgeUsageAdapter:
                 raise ValueError("plan checked_at is in the future")
             reserved = _percentage(str(reserved_pct))
             expires_at = captured_at + self.max_age
-            stale = missing_sensitive_time or read_at > expires_at
+            stale = missing_row_time or read_at > expires_at
             freshness = Freshness.STALE if stale else Freshness.FRESH
-            confidence = Confidence.LOW if missing_sensitive_time else Confidence.HIGH
+            confidence = Confidence.LOW if missing_row_time else Confidence.HIGH
             digest = hashlib.sha256(raw).hexdigest()
             snapshot = CapacitySnapshot(
                 lane_id=lane_id,
@@ -299,7 +300,7 @@ class BridgeUsageAdapter:
                 ReasonCode.CAPACITY_STALE if stale else None,
                 (
                     f"{lane_id}: row checked_at absent; stale low-confidence evidence"
-                    if missing_sensitive_time
+                    if missing_row_time
                     else ""
                 ),
             )

@@ -186,3 +186,161 @@ def test_missing_usage_file_create_shell_without_fabricating_console_freshness(t
     document = report.document
     grok = next(row for row in document["plans"] if "Grok" in row["label"])
     assert "checked_at" not in grok
+
+
+def _codex_ok_claude_fail(provider: str):
+    if provider == "openai-codex":
+        return _Snapshot((_Window("Weekly", 18.0),))
+    if provider == "anthropic":
+        raise RuntimeError("claude oauth unavailable")
+    return None
+
+
+def test_failed_claude_auto_fetch_from_fresh_shell_cannot_inherit_root_freshness(
+    tmp_path,
+):
+    """Fresh shell + Codex success must not make unfetched Claude appear FRESH@0%."""
+    path = tmp_path / "fresh-shell.json"
+
+    report = refresh_usage_document(
+        path=path,
+        mirror_path=None,
+        fetch_usage=_codex_ok_claude_fail,
+        now=NOW,
+    )
+    assert report.ok
+    document = json.loads(path.read_text(encoding="utf-8"))
+    plans = {row["label"]: row for row in document["plans"]}
+    assert plans["ChatGPT Pro · Codex"]["checked_at"].startswith("2026-07-24T12:00:00")
+    assert "checked_at" not in plans["Claude Max 20x"]
+    assert document["checked_at"].startswith("2026-07-24T12:00:00")
+
+    adapter = BridgeUsageAdapter(path)
+    claude = adapter.read("claude_code", now=NOW)
+    codex = adapter.read("chatgpt_codex", now=NOW)
+
+    assert codex.snapshot is not None
+    assert codex.snapshot.freshness is Freshness.FRESH
+    assert codex.reason is None
+    assert claude.snapshot is not None
+    assert claude.snapshot.freshness is Freshness.STALE
+    assert claude.snapshot.confidence.name == "LOW"
+    assert claude.reason is ReasonCode.CAPACITY_STALE
+    assert "checked_at absent" in claude.detail
+
+
+def test_failed_claude_auto_fetch_from_existing_document_cannot_inherit_root_freshness(
+    tmp_path,
+):
+    """Existing doc without Claude row time stays stale after sibling refresh advances root."""
+    path = tmp_path / "existing.json"
+    path.write_text(
+        json.dumps(
+            {
+                "checked_at": "2026-07-20T00:00:00Z",
+                "plans": [
+                    {
+                        "label": "ChatGPT Pro · Codex",
+                        "weekly_pct_used": 55,
+                        "checked_at": "2026-07-24T10:00:00Z",
+                    },
+                    {
+                        "label": "Claude Max 20x",
+                        "weekly_pct_used": 0,
+                        # Never had a per-lane checked_at.
+                    },
+                    {
+                        "label": "SuperGrok",
+                        "weekly_pct_used": 0,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = refresh_usage_document(
+        path=path,
+        mirror_path=None,
+        fetch_usage=_codex_ok_claude_fail,
+        now=NOW,
+    )
+    assert report.ok
+    document = json.loads(path.read_text(encoding="utf-8"))
+    plans = {row["label"]: row for row in document["plans"]}
+    assert plans["ChatGPT Pro · Codex"]["weekly_pct_used"] == 18.0
+    assert plans["ChatGPT Pro · Codex"]["checked_at"].startswith("2026-07-24T12:00:00")
+    assert "checked_at" not in plans["Claude Max 20x"]
+    assert plans["Claude Max 20x"]["weekly_pct_used"] == 0
+    assert document["checked_at"].startswith("2026-07-24T12:00:00")
+
+    adapter = BridgeUsageAdapter(path)
+    claude = adapter.read("claude_code", now=NOW)
+    codex = adapter.read("chatgpt_codex", now=NOW)
+    grok = adapter.read("grok", now=NOW)
+
+    assert codex.snapshot is not None
+    assert codex.snapshot.freshness is Freshness.FRESH
+    assert claude.snapshot is not None
+    assert claude.snapshot.freshness is Freshness.STALE
+    assert claude.snapshot.confidence.name == "LOW"
+    assert claude.reason is ReasonCode.CAPACITY_STALE
+    assert claude.snapshot.used_pct == 0  # decimal-comparable via == 0
+    assert grok.snapshot is not None
+    assert grok.snapshot.freshness is Freshness.STALE
+
+
+def test_failed_claude_preserves_prior_valid_row_timestamp(tmp_path):
+    """A previously valid Claude timestamp stays authoritative when Claude fetch fails."""
+    path = tmp_path / "prior-claude.json"
+    path.write_text(
+        json.dumps(
+            {
+                "checked_at": "2026-07-24T11:00:00Z",
+                "plans": [
+                    {
+                        "label": "ChatGPT Pro · Codex",
+                        "weekly_pct_used": 10,
+                        "checked_at": "2026-07-24T11:00:00Z",
+                    },
+                    {
+                        "label": "Claude Max 20x",
+                        "weekly_pct_used": 42,
+                        "checked_at": "2026-07-24T11:30:00Z",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    refresh_usage_document(
+        path=path,
+        mirror_path=None,
+        fetch_usage=_codex_ok_claude_fail,
+        now=NOW,
+    )
+    document = json.loads(path.read_text(encoding="utf-8"))
+    plans = {row["label"]: row for row in document["plans"]}
+    assert plans["Claude Max 20x"]["checked_at"] == "2026-07-24T11:30:00Z"
+    assert plans["Claude Max 20x"]["weekly_pct_used"] == 42
+    assert plans["ChatGPT Pro · Codex"]["checked_at"].startswith("2026-07-24T12:00:00")
+
+    adapter = BridgeUsageAdapter(path)
+    claude = adapter.read("claude_code", now=NOW)
+    assert claude.snapshot is not None
+    assert claude.snapshot.freshness is Freshness.FRESH
+    assert claude.snapshot.confidence.name == "HIGH"
+    assert claude.reason is None
+
+
+def test_fleet_refresh_usage_ps1_has_no_dated_worktree_fallback():
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "fleet_refresh_usage.ps1"
+    )
+    text = script.read_text(encoding="utf-8")
+    assert "fleet-parent-routing-20260724" not in text
+    assert "PSScriptRoot" in text
+    assert "hermes-agent" in text
