@@ -56,7 +56,21 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
         assert agent._primary_runtime["compressor_model"] == "chat-test"
         assert agent._fallback_chain == []
         assert agent._fallback_model is None
-        assert agent.valid_tool_names == {"skill_view", "ultra_media_job_create"}
+        assert agent.valid_tool_names == {
+            "ask_user_question",
+            "skill_view",
+            "ultra_media_job_create",
+        }
+        ask_schema = next(
+            tool["function"]["parameters"]
+            for tool in agent.tools
+            if tool["function"]["name"] == "ask_user_question"
+        )
+        option_schema = (
+            ask_schema["properties"]["questions"]["items"]
+            ["properties"]["options"]["items"]
+        )
+        assert option_schema["required"] == ["label", "value"]
         assert agent.ephemeral_system_prompt is None
         assert agent._cached_system_prompt == (
             "platform rules\n\ntrusted turn context\n\n"
@@ -206,6 +220,35 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "input_schema": {"type": "object", "properties": {}},
                 "route": "tokenrouter",
                 "allowed_skills": ["media-qa"],
+                "requires_skill_guidance": True,
+            }, {
+                "name": "ask_user_question",
+                "description": "ask one structured question",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["questions"],
+                    "properties": {
+                        "questions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "options": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "required": ["label", "value"],
+                                            "properties": {
+                                                "label": {"type": "string"},
+                                                "value": {"type": "string"},
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
             }],
         })
         assert response.status == 200
@@ -239,8 +282,14 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
         assert checkpoint["payload"]["message"]["tool_calls"][0]["id"] == "call_01"
         tool_request = json.loads(await response.content.readline())
         assert tool_request["type"] == "tool_request"
-        assert "skill" not in tool_request["payload"]
-        assert "skills" not in tool_request["payload"]
+        expected_proof = {
+            "name": "media-qa",
+            "digest": "sha256:" + hashlib.sha256(
+                b"workflow instructions",
+            ).hexdigest(),
+        }
+        assert tool_request["payload"]["skill"] == expected_proof
+        assert tool_request["payload"]["skills"] == [expected_proof]
 
         delivered = await client.post("/v1/runtime/runs/run_test/tool-results", json={
             "call_id": "call_01",
@@ -482,6 +531,11 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
     })
     first_result = json.loads(await first)
     assert first_result["error"]["code"] == "invalid_tool_arguments"
+    assert first_result["error"]["recovery"] == {
+        "action": "correct_arguments",
+        "remaining_attempts": 1,
+        "same_arguments_allowed": False,
+    }
     assert decisions == []
 
     second_result = json.loads(session.invoke_platform_tool(
@@ -492,6 +546,76 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
     assert second_result["error"]["code"] == "repeated_non_retryable_tool_call"
     assert decisions[0].code == "repeated_non_retryable_tool_call"
     assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_runtime_bridge_allows_one_corrected_argument_attempt_then_halts():
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_correction",
+        asyncio.get_running_loop(),
+        queue,
+        [{"name": "ask_user_question", "input_schema": {"type": "object"}}],
+        10_000,
+        "agent_correction",
+    )
+    decisions = []
+    agent = SimpleNamespace(_set_tool_guardrail_halt=decisions.append)
+    session.agent_ref[0] = agent
+
+    async def invoke(call_id, args, result):
+        agent._runtime_checkpoint_message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": call_id,
+                "function": {
+                    "name": "ask_user_question",
+                    "arguments": json.dumps(args),
+                },
+            }],
+        }
+        pending = asyncio.create_task(asyncio.to_thread(
+            session.invoke_platform_tool,
+            "ask_user_question",
+            args,
+            call_id,
+        ))
+        assert (await queue.get())["type"] == "checkpoint"
+        assert (await queue.get())["type"] == "tool_request"
+        assert session.submit_result({"call_id": call_id, **result})
+        return json.loads(await pending)
+
+    first = await invoke(
+        "call_invalid",
+        {"questions": [{"options": [{"label": "A"}]}]},
+        {
+            "ok": False,
+            "error": {
+                "code": "invalid_tool_arguments",
+                "message": "options[0].value is required",
+                "retryable": False,
+            },
+        },
+    )
+    assert first["error"]["recovery"]["action"] == "correct_arguments"
+
+    exhausted = await invoke(
+        "call_still_invalid",
+        {"questions": [{"options": [{"label": "A", "description": "retry"}]}]},
+        {
+            "ok": False,
+            "error": {
+                "code": "invalid_tool_arguments",
+                "message": "options[0].value is required",
+                "retryable": False,
+            },
+        },
+    )
+    assert exhausted["error"]["code"] == "argument_correction_exhausted"
+    assert exhausted["error"]["cause"]["code"] == "invalid_tool_arguments"
+    assert decisions[0].code == "argument_correction_exhausted"
+    assert decisions[0].count == 2
 
 
 @pytest.mark.asyncio

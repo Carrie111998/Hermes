@@ -18,6 +18,7 @@ _SESSIONS: dict[str, "RuntimeBridgeSession"] = {}
 _SESSIONS_LOCK = threading.RLock()
 _REGISTERED_MANAGERS: set[int] = set()
 _LOCAL_ACTIVITY_TOOLS = {"skill_view"}
+_MAX_ARGUMENT_CORRECTIONS = 1
 _TERMINAL_PLATFORM_ERROR_CODES = {
     "auth_rejected",
     "configuration_error",
@@ -122,27 +123,15 @@ def _allowed_skill_names(definitions: list[dict[str, Any]]) -> set[str]:
 
 
 def _discover_skill_metadata() -> list[dict[str, Any]]:
-    from tools.skills_tool import _find_all_skills
+    from gateway.ultrastudio_skill_routing import discover_skill_metadata
 
-    return _find_all_skills()
+    return discover_skill_metadata()
 
 
 def _allowed_skills_prompt(allowed_names: set[str]) -> str:
-    if not allowed_names:
-        return ""
-    available = {
-        str(item.get("name") or "").strip(): item
-        for item in _discover_skill_metadata()
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    }
-    missing = sorted(allowed_names - available.keys())
-    if missing:
-        raise ValueError("allowed skills unavailable: " + ", ".join(missing))
-    lines = []
-    for name in sorted(allowed_names):
-        description = " ".join(str(available[name].get("description") or "").split())
-        lines.append(f"- {name}: {description}" if description else f"- {name}")
-    return "\n\n<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
+    from gateway.ultrastudio_skill_routing import format_allowed_skills
+
+    return format_allowed_skills(allowed_names, _discover_skill_metadata())
 
 
 def _message_text(content: Any) -> str:
@@ -306,6 +295,7 @@ class RuntimeBridgeSession:
         self.local_activities: dict[str, str] = {}
         self.pending: dict[str, _PendingTool] = {}
         self.non_retryable_failures: dict[str, str] = {}
+        self.argument_correction_failures: dict[str, int] = {}
         self.agent_ref: list[Any] = [None]
         self.lock = threading.RLock()
         self.interrupted = threading.Event()
@@ -350,7 +340,14 @@ class RuntimeBridgeSession:
         if not self.is_skill_allowed(name):
             return
         serialized = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-        if '"error"' in serialized[:200].lower():
+        try:
+            parsed = json.loads(serialized)
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict) and (
+            parsed.get("success") is False
+            or ("error" in parsed and parsed.get("success") is not True)
+        ):
             return
         digest = "sha256:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         with self.lock:
@@ -476,10 +473,22 @@ class RuntimeBridgeSession:
             if not isinstance(required_skills, list):
                 legacy = str(definition.get("required_skill") or "").strip()
                 required_skills = [legacy] if legacy else []
-            proofs = [
-                {"name": skill_name, "digest": self.loaded_skills[skill_name]}
+            proof_names = {
+                skill_name
                 for value in required_skills
                 if (skill_name := str(value).strip()) and skill_name in self.loaded_skills
+            }
+            if definition.get("requires_skill_guidance") is True:
+                allowed = definition.get("allowed_skills")
+                if isinstance(allowed, list):
+                    proof_names.update(
+                        skill_name
+                        for value in allowed
+                        if (skill_name := str(value).strip()) and skill_name in self.loaded_skills
+                    )
+            proofs = [
+                {"name": skill_name, "digest": self.loaded_skills[skill_name]}
+                for skill_name in sorted(proof_names)
             ]
         payload: dict[str, Any] = {"call_id": call_id, "name": name, "arguments": args}
         if proofs:
@@ -495,6 +504,8 @@ class RuntimeBridgeSession:
             return json.dumps({"error": {"code": code, "message": message, "retryable": False}})
         result = pending.result or {}
         if result.get("ok"):
+            with self.lock:
+                self.argument_correction_failures.pop(name, None)
             return json.dumps(result.get("result"), ensure_ascii=False, separators=(",", ":"))
         error = result.get("error") if isinstance(result.get("error"), dict) else {
             "code": "invalid_tool_result",
@@ -502,6 +513,41 @@ class RuntimeBridgeSession:
             "retryable": False,
         }
         code = str(error.get("code") or "invalid_tool_result")
+        if code == "invalid_tool_arguments":
+            with self.lock:
+                correction_count = self.argument_correction_failures.get(name, 0) + 1
+                self.argument_correction_failures[name] = correction_count
+            if correction_count <= _MAX_ARGUMENT_CORRECTIONS:
+                error = {
+                    **error,
+                    "recovery": {
+                        "action": "correct_arguments",
+                        "remaining_attempts": _MAX_ARGUMENT_CORRECTIONS - correction_count + 1,
+                        "same_arguments_allowed": False,
+                    },
+                }
+            else:
+                message = (
+                    f"{name} produced invalid arguments after "
+                    f"{_MAX_ARGUMENT_CORRECTIONS} correction attempt."
+                )
+                self._halt_tool_loop(
+                    name,
+                    args,
+                    "argument_correction_exhausted",
+                    message,
+                    correction_count,
+                )
+                error = {
+                    "code": "argument_correction_exhausted",
+                    "message": message,
+                    "retryable": False,
+                    "cause": error,
+                }
+                code = "argument_correction_exhausted"
+        else:
+            with self.lock:
+                self.argument_correction_failures.pop(name, None)
         if error.get("retryable") is False and code != "domain_gate_required":
             with self.lock:
                 self.non_retryable_failures[signature_key] = code

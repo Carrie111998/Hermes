@@ -46,17 +46,17 @@ expected_underlying_tools assertions should remain satisfied.
 
 ## Atlas Opus Agent compatibility probe
 
-`atlas_opus_compat_probe.py` reproduces the difference between a healthy
-minimal Atlas stream and Ultra Studio's tool-enabled Agent request for Opus
-4.6, 4.7, and 4.8. Paid requests require an explicit safety flag:
+`atlas_opus_compat_probe.py` is a shareable single-file probe using only the
+Python standard library. It embeds the complete Ultra Studio Agent prompt and
+six real tool schemas, talks directly to Atlas, makes exactly one request per
+model/stage pair, and does not implement retry or model fallback. Paid requests
+require an explicit safety flag:
 
 ```bash
 python3 scripts/atlas_opus_compat_probe.py --confirm-live
 ```
 
-Add `--full` to exercise the real Run Orchestrator -> Hermes path. The script
-cancels each full-path run after its first logged API failure or after 135
-seconds, whichever comes first:
+Add `--full` to include the embedded complete Agent payload:
 
 ```bash
 python3 scripts/atlas_opus_compat_probe.py \
@@ -65,7 +65,8 @@ python3 scripts/atlas_opus_compat_probe.py \
   --output scripts/out/atlas-opus-compat.json
 ```
 
-The API key is read from `ATLAS_API_KEY` or `~/.hermes/.env`. On macOS the
-full-path signing key is read from the same Keychain item used by Panel BFF;
-it is never printed. Every Atlas request is single-attempt, and the probe does
-not implement model fallback.
+The API key is read from `ATLAS_API_KEY` or the active
+`$HERMES_HOME/.env`. No Hermes, Run Orchestrator checkout, PyYAML, httpx, or
+other package is required. Every JSON result records a client-generated
+correlation ID, Atlas `x-request-id` when response headers arrive, SSE event
+ID, CF-Ray, timing, payload sizes, and any disconnect error.
