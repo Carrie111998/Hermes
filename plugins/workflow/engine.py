@@ -2833,8 +2833,8 @@ class WorkflowEngine:
                             )
 
                 except Exception as e:
-                    # Card query failed — keep polling
-                    pass
+                    # Card query failed — log and keep polling
+                    logger.debug("monitor: card status check failed for %s: %s", nid, e)
 
         # Anything still pending after max_polls
         for nid in list(pending):
