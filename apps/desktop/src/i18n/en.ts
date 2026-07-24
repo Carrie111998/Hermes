@@ -327,6 +327,7 @@ export const en: Translations = {
       providerAccounts: 'Accounts',
       providerApiKeys: 'API keys',
       providerCustomEndpoints: 'Custom Endpoints',
+      providerFleetRouter: 'Fleet Router',
       gateway: 'Gateway',
       apiKeys: 'Tools & Keys',
       keybinds: 'Keyboard Shortcuts',
@@ -828,6 +829,64 @@ export const en: Translations = {
       localEndpoint: {
         title: 'Local / custom endpoint',
         description: 'Point Hermes at any OpenAI-compatible endpoint (Zyphra, vLLM, llama.cpp, Ollama, etc).'
+      },
+      fleet: {
+        title: 'Fleet Router',
+        intro:
+          'Read-only live status from the same qualification and capacity checks used by hermes fleet doctor. Server results are authoritative for this profile.',
+        refresh: 'Refresh',
+        refreshing: 'Refreshing…',
+        tryAgain: 'Try again',
+        checking: 'Checking fleet routes…',
+        unsupportedTitle: 'Fleet status is unavailable',
+        unsupportedDescription:
+          'This Hermes backend predates the Fleet Router status endpoint or returns an unsupported schema. Update the backend, then refresh.',
+        loadFailedTitle: 'Fleet status failed to load',
+        loadFailedDescription: message =>
+          message
+            ? `The backend could not inspect Fleet Router status. ${message}`
+            : 'The backend could not inspect Fleet Router status.',
+        fleetEnabled: 'Fleet enabled',
+        fleetDisabled: 'Fleet off',
+        healthy: 'Healthy',
+        attention: 'Needs attention',
+        fleetDisabledDetail:
+          'The router is globally off. Lane checks below still show which routes would qualify if Fleet Router were enabled.',
+        healthyDetail: 'At least one lane passes every required qualification and capacity check.',
+        attentionDetail: 'No lane currently passes every required check. Review the exact reason codes below.',
+        fallbackSummary:
+          'No lane has fully fresh capacity evidence, but at least one enabled lane remains selectable through the configured rotation fallback.',
+        lanesTitle: 'Subscription lanes',
+        laneNames: {
+          chatgpt_codex: 'ChatGPT / Codex',
+          claude_code: 'Claude Code',
+          grok: 'Grok',
+          antigravity: 'Antigravity',
+          kimi: 'Kimi'
+        },
+        enabled: 'Enabled',
+        disabled: 'Disabled',
+        selectable: 'Selectable',
+        blocked: 'Blocked',
+        rotationFallback: 'Rotation fallback',
+        fallbackDetail:
+          'Selectable by the configured rotation fallback because capacity is stale or missing. This lane is enabled; it is not disabled.',
+        provider: 'Provider',
+        model: 'Model',
+        effort: 'Effort',
+        adapter: 'Adapter kind',
+        remaining: 'Capacity remaining',
+        freshness: 'Freshness',
+        confidence: 'Confidence',
+        capacitySource: 'Capacity source',
+        reasons: 'Eligibility reason codes',
+        qualification: 'Qualification detail',
+        evidence: 'Evidence',
+        noQualificationDetail: 'No qualification detail reported.',
+        nativeProvider: 'Native provider',
+        externalCli: 'External CLI',
+        unavailable: 'Unavailable',
+        unknown: 'UNKNOWN'
       },
       loading: 'Loading providers...'
     },

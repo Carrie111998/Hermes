@@ -922,6 +922,55 @@ export interface LogsResponse {
   lines: string[]
 }
 
+export type FleetAdapterKind = 'external_cli' | 'native_provider'
+export type FleetCapacityConfidence = 'high' | 'low' | 'medium'
+export type FleetCapacityFreshness = 'fresh' | 'invalid' | 'stale'
+
+export interface FleetCapacitySnapshot {
+  lane_id: string
+  source_kind: string
+  source_id: string
+  source_hash: string
+  captured_at: string
+  read_at: string
+  expires_at: string
+  freshness: FleetCapacityFreshness
+  confidence: FleetCapacityConfidence
+  schema_version: string
+  used_pct: string
+  remaining_pct: string
+  reserved_pct: string
+  effective_remaining_pct: string
+  overage_disabled: boolean | null
+}
+
+export interface FleetLaneEvaluation {
+  lane_id: string
+  enabled: boolean
+  eligible: boolean
+  selectable: boolean
+  fallback_eligible: boolean
+  reasons: string[]
+  adapter_kind: FleetAdapterKind
+  provider_id: string
+  model_id: string | null
+  effort: string | null
+  qualification_evidence_id: string
+  qualification_detail: string
+  capacity: FleetCapacitySnapshot | null
+}
+
+/** Shared `hermes fleet doctor --json` payload exposed by
+ *  `GET /api/fleet/status`. */
+export interface FleetStatusResponse {
+  schema_version: number
+  command: string
+  ok: boolean
+  enabled: boolean
+  reason: string
+  evaluations: FleetLaneEvaluation[]
+}
+
 export interface PlatformStatus {
   error_code?: string
   error_message?: string

@@ -20,6 +20,7 @@ import type {
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
+  FleetStatusResponse,
   HermesConfig,
   HermesConfigRecord,
   LogsResponse,
@@ -611,6 +612,13 @@ export function getStatus(): Promise<StatusResponse> {
   return window.hermesDesktop.api<StatusResponse>({
     ...profileScoped(),
     path: '/api/status'
+  })
+}
+
+export function getFleetStatus(profile?: null | string): Promise<FleetStatusResponse> {
+  return window.hermesDesktop.api<FleetStatusResponse>({
+    ...profileScoped(profile),
+    path: '/api/fleet/status'
   })
 }
 

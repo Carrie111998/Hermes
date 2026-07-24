@@ -9,25 +9,22 @@ import uuid
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
-from hermes_cli.config import load_config_readonly
-from hermes_cli.fleet.capacity import BridgeUsageAdapter
-from hermes_cli.fleet.adapters.live_routes import live_adapters
-from hermes_cli.fleet.config import LANE_ORDER, parse_fleet_config
-from hermes_cli.fleet.live import FleetQualificationDoctor
-from hermes_cli.fleet.profiles import ordered_profiles
+from hermes_cli.fleet.config import LANE_ORDER
+from hermes_cli.fleet.inspection import (
+    DEFAULT_CAPABILITIES as _DEFAULT_CAPABILITIES,
+    build_fleet_service as _default_service,
+    build_inspection_payload,
+    serialize_evaluations,
+    serialize_selected,
+)
 from hermes_cli.fleet.service import FleetService
-from hermes_cli.fleet.state import FleetStore
 from hermes_cli.fleet.types import (
-    CapacitySnapshot,
-    LaneEvaluation,
     ReasonCode,
-    RouteDecision,
     TaskPin,
     TaskSpec,
 )
-from hermes_constants import get_hermes_home
 
 
 EXIT_OK = 0
@@ -36,7 +33,6 @@ EXIT_DISABLED = 3
 EXIT_NO_ROUTE = 4
 EXIT_EXECUTION_FAILED = 5
 _MAX_TASK_BYTES = 1024 * 1024
-_DEFAULT_CAPABILITIES = frozenset({"workspace_write", "shell"})
 
 
 def _add_json_flag(parser: argparse.ArgumentParser) -> None:
@@ -95,38 +91,6 @@ def build_fleet_parser(subparsers) -> argparse.ArgumentParser:
     return fleet
 
 
-def _default_service(
-    *,
-    config_data: Mapping[str, Any] | None = None,
-    doctor: FleetQualificationDoctor | None = None,
-    adapters: Mapping[str, object] | None = None,
-    store_path: Path | None = None,
-    now=None,
-) -> FleetService:
-    """Build the live service from read-only, attributable qualifications."""
-
-    config = parse_fleet_config(
-        load_config_readonly() if config_data is None else config_data
-    )
-    profiles = ordered_profiles()
-    qualifications = (doctor or FleetQualificationDoctor()).qualify(profiles)
-    return FleetService(
-        config=config,
-        store=FleetStore(
-            store_path or (get_hermes_home() / "fleet" / "state.db")
-        ),
-        profiles=profiles,
-        qualifications=qualifications,
-        adapters=dict(
-            live_adapters(qualifications=qualifications)
-            if adapters is None
-            else adapters
-        ),
-        capacity_source=BridgeUsageAdapter(config.bridge_usage_file),
-        now=now,
-    )
-
-
 def _task_from_args(
     args: argparse.Namespace,
     *,
@@ -161,62 +125,6 @@ def _task_from_args(
         ),
         prompt,
     )
-
-
-def _capacity(snapshot: CapacitySnapshot | None) -> dict[str, Any] | None:
-    if snapshot is None:
-        return None
-    source_hash = snapshot.source_id.rpartition("#")[2]
-    return {
-        "lane_id": snapshot.lane_id,
-        "source_kind": snapshot.source_kind,
-        "source_id": snapshot.source_id,
-        "source_hash": source_hash,
-        "captured_at": snapshot.captured_at.isoformat(),
-        "read_at": snapshot.read_at.isoformat(),
-        "expires_at": snapshot.expires_at.isoformat(),
-        "freshness": snapshot.freshness.value,
-        "confidence": snapshot.confidence.value,
-        "schema_version": snapshot.schema_version,
-        "used_pct": str(snapshot.used_pct),
-        "remaining_pct": str(snapshot.remaining_pct),
-        "reserved_pct": str(snapshot.reserved_pct),
-        "effective_remaining_pct": str(snapshot.effective_remaining_pct),
-        "overage_disabled": snapshot.overage_disabled,
-    }
-
-
-def _evaluation(item: LaneEvaluation) -> dict[str, Any]:
-    return {
-        "lane_id": item.lane_id,
-        "eligible": item.eligible,
-        "reasons": [reason.value for reason in item.reasons],
-        "adapter_kind": item.profile.adapter_kind.value,
-        "provider_id": item.profile.provider_id,
-        "model_id": item.selected_model,
-        "effort": item.selected_effort,
-        "qualification_evidence_id": item.qualification_evidence_id,
-        "qualification_detail": item.qualification_detail,
-        "capacity": _capacity(item.capacity),
-    }
-
-
-def _evaluations(
-    items: Sequence[LaneEvaluation], *, lane: str | None = None
-) -> list[dict[str, Any]]:
-    return [
-        _evaluation(item)
-        for item in items
-        if lane is None or item.lane_id == lane
-    ]
-
-
-def _selected(decision: RouteDecision) -> dict[str, Any] | None:
-    match = next(
-        (item for item in decision.evaluations if item.lane_id == decision.lane_id),
-        None,
-    )
-    return _evaluation(match) if match is not None else None
 
 
 def _pin(pin: TaskPin | None) -> dict[str, Any] | None:
@@ -257,15 +165,6 @@ def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
         print(payload["output"])
 
 
-def _inspection_task(command: str, *, reservation_pct: Decimal) -> TaskSpec:
-    return TaskSpec(
-        task_id=f"read-only-{command}",
-        cwd=Path.cwd(),
-        required_capabilities=_DEFAULT_CAPABILITIES,
-        reservation_pct=reservation_pct,
-    )
-
-
 def fleet_command(
     args: argparse.Namespace, *, service: FleetService | None = None
 ) -> int:
@@ -275,33 +174,13 @@ def fleet_command(
     action = args.fleet_action
 
     if action in {"status", "doctor"}:
-        evaluations = service.inspect(
-            _inspection_task(
-                action,
-                reservation_pct=service.config.default_reservation_pct,
-            )
+        payload = build_inspection_payload(
+            service,
+            command=action,
+            lane=getattr(args, "lane", None),
         )
-        visible = tuple(
-            item
-            for item in evaluations
-            if getattr(args, "lane", None) is None
-            or item.lane_id == getattr(args, "lane", None)
-        )
-        has_route = any(item.eligible for item in visible)
-        payload = {
-            "schema_version": 1,
-            "command": action,
-            "ok": True if action == "status" else has_route,
-            "enabled": service.config.enabled,
-            "reason": (
-                ReasonCode.MET.value
-                if has_route
-                else ReasonCode.NO_ELIGIBLE_LANE.value
-            ),
-            "evaluations": _evaluations(visible),
-        }
         _emit(payload, json_output=args.json)
-        return EXIT_OK if action == "status" or has_route else EXIT_NO_ROUTE
+        return EXIT_OK if action == "status" or payload["ok"] else EXIT_NO_ROUTE
 
     if action == "plan":
         try:
@@ -325,8 +204,8 @@ def fleet_command(
             "command": action,
             "ok": decision.lane_id is not None,
             "reason": decision.reason.value,
-            "selected": _selected(decision),
-            "evaluations": _evaluations(decision.evaluations),
+            "selected": serialize_selected(decision),
+            "evaluations": serialize_evaluations(decision.evaluations),
         }
         _emit(payload, json_output=args.json)
         return EXIT_OK if decision.lane_id is not None else EXIT_NO_ROUTE
@@ -357,7 +236,7 @@ def fleet_command(
             "output": (
                 result.adapter_result.output if result.adapter_result is not None else ""
             ),
-            "evaluations": _evaluations(result.evaluations),
+            "evaluations": serialize_evaluations(result.evaluations),
         }
         _emit(payload, json_output=args.json)
         if result.ok:

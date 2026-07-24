@@ -124,6 +124,10 @@ def test_doctor_no_eligible_lane_is_nonzero_with_complete_matrix(tmp_path, capsy
     assert payload["ok"] is False
     assert len(payload["evaluations"]) == 2
     assert all(item["reasons"] for item in payload["evaluations"])
+    assert all(
+        item["selectable"] == (item["eligible"] or item["fallback_eligible"])
+        for item in payload["evaluations"]
+    )
 
 
 def test_status_is_read_only_even_when_no_lane_is_eligible(tmp_path, capsys):

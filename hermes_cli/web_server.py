@@ -15279,6 +15279,39 @@ def _config_profile_scope(profile: Optional[str]):
         reset_hermes_home_override(token)
 
 
+@app.get("/api/fleet/status")
+async def get_fleet_status(profile: Optional[str] = None):
+    """Return the profile-scoped, read-only fleet doctor matrix.
+
+    This calls the same in-process service builder and serializer as
+    ``hermes fleet doctor --json``.  It deliberately does not shell out to the
+    CLI, and the blocking qualification probes run off the FastAPI event loop.
+    """
+
+    def _inspect():
+        from hermes_cli.fleet.inspection import (
+            build_fleet_service,
+            build_inspection_payload,
+        )
+
+        with _config_profile_scope(profile):
+            return build_inspection_payload(
+                build_fleet_service(),
+                command="doctor",
+            )
+
+    try:
+        return await asyncio.to_thread(_inspect)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/fleet/status failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to inspect the fleet router",
+        )
+
+
 class SkillToggle(BaseModel):
     name: str
     enabled: bool
