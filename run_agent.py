@@ -2702,6 +2702,17 @@ class AIAgent:
         from agent.agent_runtime_helpers import dump_api_request_debug
         return dump_api_request_debug(self, api_kwargs, reason=reason, error=error)
 
+    def _dump_api_response_debug(
+        self,
+        response: Any,
+        *,
+        reason: str,
+        error: Optional[Exception] = None,
+    ) -> Optional[Path]:
+        """Forwarder — see ``agent.agent_runtime_helpers.dump_api_response_debug``."""
+        from agent.agent_runtime_helpers import dump_api_response_debug
+        return dump_api_response_debug(self, response, reason=reason, error=error)
+
     @staticmethod
     def _clean_session_content(content: str) -> str:
         """Convert REASONING_SCRATCHPAD to think tags and clean up whitespace."""

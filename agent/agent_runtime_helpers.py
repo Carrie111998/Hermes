@@ -1750,6 +1750,56 @@ def dump_api_request_debug(
         return None
 
 
+def dump_api_response_debug(
+    agent,
+    *,
+    response: Any,
+    reason: str,
+    error: Optional[Exception] = None,
+) -> Optional[Path]:
+    """Write API response debug payload for post-mortem (e.g. terminal rejection)."""
+    try:
+        from agent.redact import redact_sensitive_text
+        from agent.utils import atomic_json_write
+        from agent.env_var import env_var_enabled
+
+        # 1. Prepare payload
+        if error:
+            _payload = {
+                "status": "error",
+                "error_type": error.__class__.__name__,
+                "error_message": str(error),
+                "reason": reason,
+            }
+        elif isinstance(response, dict):
+            _payload = copy.deepcopy(response)
+            _payload["reason"] = reason
+        else:
+            _payload = {"content": str(response), "reason": reason}
+
+        # 2. Redact
+        _serialized = json.dumps(_payload, ensure_ascii=False, indent=2, default=str)
+        _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
+
+        # 3. Write
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        safe_sid = _ra()._safe_session_filename_component(agent.session_id)
+        dump_file = agent.logs_dir / f"response_dump_{safe_sid}_{timestamp}.json"
+
+        atomic_json_write(dump_file, _redacted_payload, default=str)
+
+        agent._vprint(f"{agent.log_prefix}Response debug dump written to: {dump_file}")
+
+        if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
+            print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
+
+        return dump_file
+    except Exception as dump_error:
+        if agent.verbose_logging:
+            logger.warning(f"Failed to dump API response debug payload: {dump_error}")
+        return None
+
+
 
 def anthropic_prompt_cache_policy(
     agent,
@@ -1835,7 +1885,6 @@ def anthropic_prompt_cache_policy(
     # Kimi / Moonshot family via OpenRouter: same cache_control wire format
     # as Claude on OpenRouter (envelope layout).  Without this branch
     # moonshotai/kimi-k2.6 falls through to (False, False), serving ~1%
-    # cache hits on 64K-token prompts and re-billing the full prompt on
     # every turn.  Observed within-turn progression with cache enabled:
     # 1% → 67% → 84% → 97% (#25970).  Reuses the canonical family matcher
     # (covers bare k1./k2./k25 release slugs the substring check missed).
@@ -3523,6 +3572,7 @@ __all__ = [
     "restore_primary_runtime",
     "extract_reasoning",
     "dump_api_request_debug",
+    "dump_api_response_debug",
     "anthropic_prompt_cache_policy",
     "create_openai_client",
     "switch_model",

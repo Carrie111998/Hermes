@@ -2210,6 +2210,18 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
                         logger.error(f"{agent.log_prefix}Invalid API response after {max_retries} retries.")
+                        
+                        if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                            # Construct synthetic response for terminal failure path
+                            synthetic_response = {
+                                "content": None,
+                                "status": "error",
+                                "error_message": _failure_hint,
+                                "provider": provider_name,
+                                "usage": {}
+                            }
+                            agent._dump_api_response_debug(synthetic_response, reason="terminal_rejection")
+
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
