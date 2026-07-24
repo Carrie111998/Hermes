@@ -45,7 +45,12 @@ export const $activeProjectId = atom<null | string>(null)
 // fetched lazily on drill-in via `fetchProjectSessions`. This is the single
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
+export const $projectTreeProfile = atom<null | string>(null)
 export const $projectTreeLoading = atom(false)
+
+export function projectTreeSupportsProfile(treeProfile: null | string, profile: string): boolean {
+  return treeProfile === profile || treeProfile === ALL_PROFILES
+}
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -454,9 +459,10 @@ const PROJECT_TREE_REQUEST_TIMEOUT_MS = 60_000
 
 let projectTreeRefreshGeneration = 0
 
-function applyProjectTreePayload(res: ProjectTreePayload): void {
+function applyProjectTreePayload(res: ProjectTreePayload, profile: string): void {
   const scoped = new Set(res.scoped_session_ids ?? [])
   $projectTree.set(res.projects ?? [])
+  $projectTreeProfile.set(profile)
   $activeProjectId.set(res.active_id ?? null)
   const tombstones = $removedSessionIds.get()
 
@@ -477,7 +483,7 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
   const generation = ++projectTreeRefreshGeneration
   const { gateway, profile } = context
 
-  if (activeGateway() === gateway) {
+  if (stillOnProjectsContext(context)) {
     $projectTreeLoading.set(true)
   }
 
@@ -492,14 +498,14 @@ async function refreshProjectTreeOn(context: ActiveProjectsContext): Promise<voi
       return
     }
 
-    applyProjectTreePayload(res)
+    applyProjectTreePayload(res, profile)
     markProjectsRpcSuccess()
   } catch (err) {
     if (generation === projectTreeRefreshGeneration && stillOnProjectsContext(context)) {
       markProjectsRpcFailure(err)
     }
   } finally {
-    if (generation === projectTreeRefreshGeneration && activeGateway() === gateway) {
+    if (generation === projectTreeRefreshGeneration && stillOnProjectsContext(context)) {
       $projectTreeLoading.set(false)
     }
   }
@@ -542,7 +548,7 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
       return
     }
 
-    applyProjectTreePayload(res)
+    applyProjectTreePayload(res, ALL_PROFILES)
     markProjectsRpcSuccess()
   } catch (err) {
     markProjectsRpcFailure(err)

@@ -31,8 +31,14 @@ import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
-import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
-import { $projectTree, projectNameForCwd } from '@/store/projects'
+import {
+  $activeGatewayProfile,
+  $gatewaySwapTarget,
+  $newChatProfile,
+  $profiles,
+  resolveNewSessionProfile
+} from '@/store/profile'
+import { $projectTree, $projectTreeProfile, projectNameForCwd, projectTreeSupportsProfile } from '@/store/projects'
 import {
   $connection,
   $contextSuggestions,
@@ -67,7 +73,7 @@ import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { shouldShowIntro } from './intro-visibility'
-import { NewSessionHeader } from './new-session-header'
+import { isFreshSessionDraft, NewSessionHeader } from './new-session-header'
 import { ProfileTag } from './profile-tag'
 import { isRouteSessionMismatch } from './route-session-state'
 import { useRuntimeMessageRepository } from './runtime-repository'
@@ -122,13 +128,17 @@ interface ChatHeaderProps {
 function NewSessionDraftHeader({ showProfileTag }: { showProfileTag: boolean }) {
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const currentCwd = useStore($currentCwd)
+  const newChatProfile = useStore($newChatProfile)
   const projectTree = useStore($projectTree)
+  const projectTreeProfile = useStore($projectTreeProfile)
+  const profile = resolveNewSessionProfile(newChatProfile, activeGatewayProfile)
+  const projectTreeMatchesProfile = projectTreeSupportsProfile(projectTreeProfile, profile)
 
   return (
     <NewSessionHeader
       cwd={currentCwd}
-      profile={activeGatewayProfile}
-      projectName={projectNameForCwd(currentCwd, projectTree)}
+      profile={profile}
+      projectName={projectTreeMatchesProfile ? projectNameForCwd(currentCwd, projectTree) : null}
       showProfileTag={showProfileTag}
     />
   )
@@ -149,7 +159,7 @@ function ChatHeader({
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : NEW_SESSION_TITLE
-  const isFreshDraft = !selectedSessionId && !activeSessionId && !isRoutedSessionView
+  const isFreshDraft = isFreshSessionDraft({ activeSessionId, isRoutedSessionView, selectedSessionId })
 
   // Which agent/persona owns this chat — glanceable in the header once a
   // second profile exists, so the open session's ownership is never ambiguous
