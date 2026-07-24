@@ -298,6 +298,113 @@ def sillytavern_configure(args, **kwargs) -> str:
     return json.dumps({"ok": True, **result})
 
 
+# ── Import SillyTavern data into Hermes memory ──────────────────────
+
+def _scan_data() -> dict:
+    """Run st_import.scan() against the resolved install dir."""
+    import importlib.util
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "st_import.py")
+    spec = importlib.util.spec_from_file_location("st_import", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.scan(_get_dir())
+
+
+def sillytavern_scan(args, **kwargs) -> str:
+    """Summarise importable SillyTavern data (characters, chats, lorebooks)."""
+    try:
+        data = _scan_data()
+        summary = {
+            "ok": True,
+            "characters": [
+                {"name": c.get("name"), "file": c.get("_file")}
+                for c in data["characters"]
+            ],
+            "chats": [
+                {
+                    "character": c["character"],
+                    "file": c["file"],
+                    "messages": c["message_count"],
+                }
+                for c in data["chats"]
+            ],
+            "lorebooks": [
+                {"name": lb.get("name"), "entries": lb.get("entry_count")}
+                for lb in data["lorebooks"]
+            ],
+        }
+        return json.dumps(summary, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def sillytavern_import_memory(args, **kwargs) -> str:
+    """Emit SillyTavern data as memory records for Hermes to ingest.
+
+    Returns a list of {content, tags, salience} entries. The agent decides
+    which to persist via its own memory/ebbinghaus tools; this handler only
+    extracts and formats — it does not write to any store directly.
+    """
+    try:
+        data = _scan_data()
+        records = []
+
+        for c in data["characters"]:
+            name = c.get("name", "")
+            parts = []
+            for field in ("description", "personality", "scenario", "first_mes"):
+                val = str(c.get(field, "")).strip()
+                if val and val != name:
+                    parts.append(f"{field}: {val}")
+            if name and parts:
+                records.append(
+                    {
+                        "content": f"SillyTavern character '{name}': " + " | ".join(parts),
+                        "tags": "sillytavern,character," + name,
+                        "salience": 0.7,
+                    }
+                )
+
+        for lb in data["lorebooks"]:
+            for entry in lb.get("entries", []):
+                content = str(entry.get("content", "")).strip()
+                keys = ",".join(entry.get("keys", []))
+                if content:
+                    records.append(
+                        {
+                            "content": f"Lorebook '{lb['name']}' [{keys}]: {content[:800]}",
+                            "tags": f"sillytavern,lorebook,{lb['name']}",
+                            "salience": 0.6,
+                        }
+                    )
+
+        for chat in data["chats"]:
+            msgs = chat.get("messages", [])
+            if not msgs:
+                continue
+            convo = "\n".join(
+                f"{m['name']}: {m['mes']}" for m in msgs if m.get("mes")
+            )
+            records.append(
+                {
+                    "content": (
+                        f"SillyTavern chat with '{chat['character']}' "
+                        f"({chat['message_count']} msgs): {convo[:1500]}"
+                    ),
+                    "tags": f"sillytavern,chat,{chat['character']}",
+                    "salience": 0.5,
+                }
+            )
+
+        return json.dumps(
+            {"ok": True, "record_count": len(records), "records": records},
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
 # ── Register ────────────────────────────────────────────────────────
 
 def register(ctx):
@@ -335,5 +442,19 @@ def register(ctx):
         description="(Re-)run auto-configuration: sync Hermes API keys and settings into SillyTavern.",
         schema=empty,
         handler=sillytavern_configure,
+        check_fn=_installed,
+    )
+    ctx.register_tool(
+        name="sillytavern_scan",
+        description="List importable SillyTavern data (characters, chats, lorebooks).",
+        schema=empty,
+        handler=sillytavern_scan,
+        check_fn=_installed,
+    )
+    ctx.register_tool(
+        name="sillytavern_import_memory",
+        description="Extract SillyTavern characters/chats/lorebooks as memory records for Hermes to ingest.",
+        schema=empty,
+        handler=sillytavern_import_memory,
         check_fn=_installed,
     )
