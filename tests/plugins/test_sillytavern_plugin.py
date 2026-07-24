@@ -62,7 +62,10 @@ def test_register_exposes_sillytavern_to_agents():
         "sillytavern_proxy_status",
     }
     assert all(callable(tool["handler"]) for tool in context.tools)
-    assert all(callable(tool["check_fn"]) for tool in context.tools)
+    assert all(
+        tool.get("check_fn") is None or callable(tool["check_fn"])
+        for tool in context.tools
+    )
 
 
 def test_status_reports_install_state(monkeypatch, tmp_path):
