@@ -4697,7 +4697,11 @@ def refresh_xai_oauth_pure(
     # with a clear error so the user can re-run `hermes model` to refetch.
     _xai_validate_oauth_endpoint(endpoint, field="token_endpoint")
     timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
-    with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}) as client:
+    with httpx.Client(
+        timeout=timeout,
+        headers={"Accept": "application/json"},
+        verify=_resolve_verify(),
+    ) as client:
         response = client.post(
             endpoint,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
