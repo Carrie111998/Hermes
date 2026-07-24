@@ -561,12 +561,43 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     normalized = normalized.rstrip("/").lower()
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
+        or _is_bedrock_mantle_endpoint(normalized)
         or "azure.com" in normalized
         # Palantir Foundry LLM proxy (<org>.palantirfoundry.com/api/v2/llm/proxy/anthropic)
         # rejects x-api-key with 401 and requires Authorization: Bearer.
         # Hostname match (not substring) so e.g. evil.com/palantirfoundry
         # paths don't trigger Bearer auth.
         or base_url_host_matches(normalized, "palantirfoundry.com")
+    )
+
+
+def _is_bedrock_mantle_endpoint(base_url: str | None) -> bool:
+    """Return True only for AWS Bedrock Mantle Anthropic endpoints.
+
+    Mantle API keys are bearer credentials that must never share the native
+    Anthropic credential chain. Keep the match host- and path-scoped so an
+    attacker-controlled URL containing ``bedrock-mantle`` cannot receive the
+    Bedrock credential.
+    """
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(normalized)
+    except Exception:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    path = (parsed.path or "").rstrip("/").lower()
+    labels = hostname.split(".")
+    return (
+        parsed.scheme == "https"
+        and len(labels) == 4
+        and labels[0] == "bedrock-mantle"
+        and bool(labels[1])
+        and labels[2:] == ["api", "aws"]
+        and path in {"", "/anthropic"}
     )
 
 
@@ -1295,8 +1326,13 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
-def resolve_anthropic_token() -> Optional[str]:
+def resolve_anthropic_token(base_url: str | None = None) -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
+
+    Bedrock Mantle endpoints are a separate credential boundary. For those
+    endpoints, resolve only ``AWS_BEARER_TOKEN_BEDROCK`` and never inspect
+    Anthropic OAuth, Claude Code credentials, credential pools, or
+    ``ANTHROPIC_API_KEY``.
 
     Priority:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
@@ -1308,6 +1344,9 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
+    if _is_bedrock_mantle_endpoint(base_url):
+        return os.getenv("AWS_BEARER_TOKEN_BEDROCK", "").strip() or None
+
     creds = read_claude_code_credentials()
 
     # 1. Hermes-managed OAuth/setup token env var

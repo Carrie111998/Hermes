@@ -2133,10 +2133,11 @@ def _model_flow_stepfun(config, current_model=""):
         print("No change.")
 
 def _model_flow_bedrock_api_key(config, region, current_model=""):
-    """Bedrock API Key mode — uses the OpenAI-compatible bedrock-mantle endpoint.
+    """Configure a Bedrock API Key against the bedrock-mantle endpoints.
 
-    For developers who don't have an AWS account but received a Bedrock API Key
-    from their AWS admin. Works like any OpenAI-compatible endpoint.
+    Claude models use Mantle's Anthropic Messages endpoint so Hermes keeps its
+    native streaming, tool-use, and prompt-caching path. Other models continue
+    to use Mantle's OpenAI-compatible endpoint.
     """
     from hermes_cli.auth import (
         _prompt_model_selection,
@@ -2149,9 +2150,12 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         get_env_value,
         save_env_value,
     )
-    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.models import _PROVIDER_MODELS, fetch_api_models
 
     mantle_base_url = f"https://bedrock-mantle.{region}.api.aws/v1"
+    mantle_anthropic_base_url = (
+        f"https://bedrock-mantle.{region}.api.aws/anthropic"
+    )
 
     # Prompt for API key
     existing_key = get_env_value("AWS_BEARER_TOKEN_BEDROCK") or ""
@@ -2177,9 +2181,17 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         print("  ✓ API key saved.")
     print()
 
-    # Model selection — use static list (mantle doesn't need boto3 for discovery)
-    model_list = _PROVIDER_MODELS.get("bedrock", [])
-    print(f"  Showing {len(model_list)} curated models")
+    # The Mantle catalog uses different IDs from native Bedrock Converse.
+    # Probe it first and fall back to the curated list only when unavailable.
+    model_list = fetch_api_models(existing_key, mantle_base_url)
+    if model_list:
+        print(f"  Found {len(model_list)} model(s) from Bedrock Mantle")
+    else:
+        model_list = _PROVIDER_MODELS.get("bedrock", [])
+        print(
+            "  ⚠ Could not auto-detect models from Bedrock Mantle — "
+            f"showing {len(model_list)} curated models"
+        )
 
     if model_list:
         selected = _prompt_model_selection(
@@ -2198,16 +2210,22 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
     if selected:
         _save_model_choice(selected)
 
-        # Save as custom provider pointing to bedrock-mantle
         cfg = load_config()
         model = cfg.get("model")
         if not isinstance(model, dict):
             model = {"default": model} if model else {}
             cfg["model"] = model
-        model["provider"] = "custom"
-        model["base_url"] = mantle_base_url
-        model.pop("api_mode", None)  # chat_completions is the default
+        is_mantle_claude = selected.lower().startswith("anthropic.claude-")
         clear_model_endpoint_credentials(model, clear_api_mode=False)
+        if is_mantle_claude:
+            model["provider"] = "anthropic"
+            model["base_url"] = mantle_anthropic_base_url
+            model["api_mode"] = "anthropic_messages"
+            model["key_env"] = "AWS_BEARER_TOKEN_BEDROCK"
+        else:
+            model["provider"] = "custom"
+            model["base_url"] = mantle_base_url
+            model.pop("api_mode", None)  # chat_completions is the default
 
         # Also save region in bedrock config for reference
         bedrock_cfg = cfg.get("bedrock", {})
@@ -2216,15 +2234,21 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
         bedrock_cfg["region"] = region
         cfg["bedrock"] = bedrock_cfg
 
-        # Save the API key env var name so hermes knows where to find it
-        save_env_value("OPENAI_API_KEY", existing_key)
-        save_env_value("OPENAI_BASE_URL", mantle_base_url)
+        # Non-Claude models still use the OpenAI-compatible Mantle transport.
+        # Claude resolves the Bedrock key directly and must not duplicate it
+        # into ANTHROPIC_API_KEY or OPENAI_API_KEY.
+        if not is_mantle_claude:
+            save_env_value("OPENAI_API_KEY", existing_key)
+            save_env_value("OPENAI_BASE_URL", mantle_base_url)
 
         save_config(cfg)
         deactivate_provider()
 
         print(f"  Default model set to: {selected} (via Bedrock API Key, {region})")
-        print(f"  Endpoint: {mantle_base_url}")
+        print(
+            "  Endpoint: "
+            f"{mantle_anthropic_base_url if is_mantle_claude else mantle_base_url}"
+        )
     else:
         print("  No change.")
 

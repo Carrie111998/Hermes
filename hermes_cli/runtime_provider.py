@@ -452,6 +452,16 @@ def _resolve_runtime_from_pool_entry(
             if not _anthropic_base_url_override_ok(cfg_base_url):
                 cfg_base_url = ""
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
+        from agent.anthropic_adapter import (
+            _is_bedrock_mantle_endpoint,
+            resolve_anthropic_token,
+        )
+        if _is_bedrock_mantle_endpoint(base_url):
+            api_key = resolve_anthropic_token(base_url)
+            if not api_key:
+                raise AuthError(
+                    "No Bedrock API key found. Set AWS_BEARER_TOKEN_BEDROCK."
+                )
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":
@@ -1482,12 +1492,22 @@ def _resolve_explicit_runtime(
             if not _anthropic_base_url_override_ok(cfg_base_url):
                 cfg_base_url = ""
         base_url = explicit_base_url or cfg_base_url or "https://api.anthropic.com"
-        api_key = explicit_api_key
+        from agent.anthropic_adapter import (
+            _is_bedrock_mantle_endpoint,
+            resolve_anthropic_token,
+        )
+        api_key = (
+            resolve_anthropic_token(base_url)
+            if _is_bedrock_mantle_endpoint(base_url)
+            else explicit_api_key
+        )
         if not api_key:
-            from agent.anthropic_adapter import resolve_anthropic_token
-
-            api_key = resolve_anthropic_token()
+            api_key = resolve_anthropic_token(base_url)
             if not api_key:
+                if _is_bedrock_mantle_endpoint(base_url):
+                    raise AuthError(
+                        "No Bedrock API key found. Set AWS_BEARER_TOKEN_BEDROCK."
+                    )
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."
@@ -2013,10 +2033,21 @@ def resolve_runtime_provider(
         # would find the Claude Code OAuth token first (priority 3) and return
         # that instead, causing 401s. Detect Azure endpoints and use the env
         # key directly to bypass the OAuth priority chain.
+        from agent.anthropic_adapter import _is_bedrock_mantle_endpoint
+
+        _is_mantle_endpoint = _is_bedrock_mantle_endpoint(base_url)
         _is_azure_endpoint = "azure.com" in base_url.lower() or (
             cfg_base_url and "azure.com" in cfg_base_url.lower()
         )
-        if _is_azure_endpoint:
+        if _is_mantle_endpoint:
+            from agent.anthropic_adapter import resolve_anthropic_token
+
+            token = resolve_anthropic_token(base_url)
+            if not token:
+                raise AuthError(
+                    "No Bedrock API key found. Set AWS_BEARER_TOKEN_BEDROCK."
+                )
+        elif _is_azure_endpoint:
             # Honor user-specified env var hints on the model config before
             # falling back to the built-in AZURE_ANTHROPIC_KEY / ANTHROPIC_API_KEY
             # chain.  Accept both `key_env` (Hermes canonical — matches the
@@ -2048,7 +2079,7 @@ def resolve_runtime_provider(
                 )
         else:
             from agent.anthropic_adapter import resolve_anthropic_token
-            token = resolve_anthropic_token()
+            token = resolve_anthropic_token(base_url)
             if not token:
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
