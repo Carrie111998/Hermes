@@ -1,6 +1,7 @@
 """Tests for events.subscribers.digest_composer — 3x/day structured digests."""
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -189,3 +190,61 @@ class TestDeliveryTopicLookup:
             f"{captured.get('target')!r} — _deliver_telegram likely still "
             f"reading the dead v1 'digests' key"
         )
+
+
+class TestRowidWatermark:
+    """compose() windows by a persisted rowid watermark, not by wall-clock."""
+
+    def _composer(self, bus, tmp_path):
+        # notifier_snapshot_path points nowhere so the digest is event-only.
+        return DigestComposer(bus, notifier_snapshot_path=tmp_path / "no-snap.json")
+
+    def test_second_compose_excludes_first_window(self, bus, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        composer = self._composer(bus, tmp_path)
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {"title": "A"})
+        d1 = composer.compose()
+        assert "1 new jobs found" in d1
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {"title": "B"})
+        d2 = composer.compose()
+        assert "1 new jobs found" in d2  # only B, not A+B
+
+    def test_empty_window_still_advances_watermark(self, bus, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from events.paths import digest_state_path
+        from events.state import load_state
+        composer = self._composer(bus, tmp_path)
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})
+        composer.compose()
+        d2 = composer.compose()
+        assert "No activity" in d2
+        state = load_state(digest_state_path(), default={})
+        assert state["last_digest_rowid"] == bus.head_rowid()
+
+    def test_first_run_seeds_floor_from_last_digest_at(self, bus, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from events.paths import digest_state_path
+        from events.state import save_state
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {"title": "old"})
+        time.sleep(0.002)  # guarantee a strictly later timestamp for 'new'
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {"title": "new"})
+        new = bus.query()[1]
+        # State from before this change: a timestamp watermark, no rowid.
+        save_state(digest_state_path(), {"last_digest_at": new.timestamp})
+        composer = self._composer(bus, tmp_path)
+        d = composer.compose()
+        assert "1 new jobs found" in d  # floor derived from ts excludes 'old'
+
+    def test_window_is_rowid_not_walltime(self, bus, tmp_path, monkeypatch):
+        """Gap fix: once the rowid watermark is set, a stale/backward
+        last_digest_at must not gate inclusion. Old code stamped
+        last_digest_at=now() before delivery, dropping any event with an
+        earlier timestamp forever."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        composer = self._composer(bus, tmp_path)
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})
+        composer.compose()  # last_digest_rowid = 1
+        bus.emit(EventType.JOB_DISCOVERED, "scout", {})  # rowid 2
+        composer._last_digest_at = "2099-01-01T00:00:00+00:00"  # far future
+        d = composer.compose()
+        assert "1 new jobs found" in d  # rowid>1 picks up event 2 regardless

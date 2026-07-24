@@ -46,6 +46,7 @@ class DigestComposer(BaseSubscriber):
         self._last_digest_at: Optional[str] = None
         state = load_state(digest_state_path(), default={})
         self._last_digest_at = state.get("last_digest_at")
+        self._last_digest_rowid: Optional[int] = state.get("last_digest_rowid")
         self._snapshot_path = Path(notifier_snapshot_path) if notifier_snapshot_path else self.DEFAULT_SNAPSHOT_PATH
 
     def handle(self, event: Event) -> None:
@@ -59,10 +60,10 @@ class DigestComposer(BaseSubscriber):
 
         After formatting, delivers to Telegram (always) and WhatsApp (morning only).
         """
-        query_since = since or self._last_digest_at
-        events = self.bus.query(since=query_since) if query_since else self.bus.query()
-        self._last_digest_at = datetime.now(timezone.utc).isoformat()
-        save_state(digest_state_path(), {"last_digest_at": self._last_digest_at})
+        through = self.bus.head_rowid()  # snapshot head BEFORE reading (gap-free)
+        after = self._resolve_floor(since)
+        events = self.bus.query_rowid_range(after, through)
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         snapshot = self._load_notifier_snapshot()
 
@@ -86,7 +87,40 @@ class DigestComposer(BaseSubscriber):
             payload={"period": self._get_period_label(), "event_count": len(events)},
         )
 
+        # Persist watermark and timestamp after emit so watermark includes the digest event
+        self._last_digest_rowid = self.bus.head_rowid()
+        self._last_digest_at = now_iso
+        save_state(
+            digest_state_path(),
+            {"last_digest_at": now_iso, "last_digest_rowid": self._last_digest_rowid},
+        )
+
         return digest
+
+    def _resolve_floor(self, since: Optional[str]) -> int:
+        """Lower rowid bound (exclusive) for the next digest window.
+
+        Priority: an explicit timestamp override (tests / manual calls) →
+        the persisted rowid watermark → first-run seed derived once from the
+        legacy ``last_digest_at`` timestamp → 0 (whole bus).
+        """
+        if since is not None:
+            return self._floor_from_timestamp(since)
+        if self._last_digest_rowid is not None:
+            return self._last_digest_rowid
+        if self._last_digest_at:
+            return self._floor_from_timestamp(self._last_digest_at)
+        return 0
+
+    def _floor_from_timestamp(self, timestamp: str) -> int:
+        """Translate a timestamp watermark into an exclusive rowid floor.
+
+        ``min_rowid_since`` returns the first rowid at-or-after the timestamp;
+        subtract 1 so ``rowid > floor`` includes that boundary row. Falls back
+        to 0 (include everything) when nothing matches.
+        """
+        min_rowid = self.bus.min_rowid_since(timestamp)
+        return (min_rowid - 1) if min_rowid is not None else 0
 
     def _load_notifier_snapshot(self) -> Optional[Dict[str, Any]]:
         """Load the notifier's latest pipeline snapshot, if fresh.
