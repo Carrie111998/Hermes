@@ -3440,17 +3440,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         )
                         _cancel_current_stream_attempt("stream_mid_tool_retry_cleanup")
                         _close_request_client_once("stream_mid_tool_retry_cleanup")
-                        # #67142: anthropic streams on a request-local client,
-                        # already worker-owned-closed by _close_request_client_once
-                        # above; the next attempt builds a fresh one. The shared
-                        # _anthropic_client is never closed from inside a request.
-                        if agent.api_mode != "anthropic_messages":
-                            try:
-                                agent._replace_primary_openai_client(
-                                    reason="stream_mid_tool_retry_pool_cleanup"
-                                )
-                            except Exception:
-                                pass
+                        # #70773 / #67142: every stream (anthropic OR OpenAI-wire)
+                        # runs on a request-local client, already worker-owned-
+                        # closed by _close_request_client_once above; the next
+                        # attempt builds a fresh one. The shared client
+                        # (_anthropic_client / agent.client) is never closed from
+                        # inside a request — closing the shared OpenAI-wire pool
+                        # here (formerly _replace_primary_openai_client) could
+                        # release a TLS FD that a sibling in-flight request still
+                        # holds, recycling it onto a SQLite header (#70773).
                         continue
 
                     # SSE error events from proxies (e.g. OpenRouter sends
@@ -3503,19 +3501,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             # Close the stale request client before retry
                             _cancel_current_stream_attempt("stream_retry_cleanup")
                             _close_request_client_once("stream_retry_cleanup")
-                            # Also rebuild the primary client to purge any dead
-                            # connections from the pool. #67142: anthropic uses a
-                            # request-local client (already worker-owned-closed
-                            # above; next attempt builds fresh), so the shared
-                            # _anthropic_client is never closed from inside a
-                            # request — only the OpenAI-wire primary is refreshed.
-                            if agent.api_mode != "anthropic_messages":
-                                try:
-                                    agent._replace_primary_openai_client(
-                                        reason="stream_retry_pool_cleanup"
-                                    )
-                                except Exception:
-                                    pass
+                            # #70773 / #67142: every stream (anthropic OR
+                            # OpenAI-wire) uses a request-local client, already
+                            # worker-owned-closed above; the next attempt builds a
+                            # fresh one, so there are no dead connections to purge
+                            # from a shared pool. The shared client
+                            # (_anthropic_client / agent.client) is never closed
+                            # from inside a request — replacing the shared
+                            # OpenAI-wire client here (formerly
+                            # _replace_primary_openai_client) closed a pool that a
+                            # sibling in-flight request could still hold, releasing
+                            # a TLS FD the kernel recycled onto a SQLite header
+                            # (#70773; #67142 was the anthropic instance).
                             continue
                         # Retries exhausted. Log the final failure with
                         # full diagnostic detail (chain, headers,
@@ -3746,22 +3743,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
-            # Rebuild the primary client too — its connection pool
-            # may hold dead sockets from the same provider outage.
-            if agent.api_mode == "anthropic_messages":
-                # #67142: the stale stream ran on a request-local anthropic
-                # client, already socket-aborted above via
-                # _close_request_client_once (which unblocks the worker and
-                # preserves the #28161 no-hang guarantee). The shared
-                # _anthropic_client is NOT the in-flight transport, so we must
-                # not close it from this poll (stranger) thread — that was the
-                # FD-recycle corruption vector. Nothing further is needed.
-                pass
-            else:
-                try:
-                    agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
-                except Exception:
-                    pass
+            # #70773 / #67142: the stale stream ran on a *request-local* client
+            # (anthropic OR OpenAI-wire), already socket-aborted above via
+            # _close_request_client_once from this poll (stranger) thread, which
+            # unblocks the worker and preserves the #28161 no-hang guarantee.
+            # The shared client (agent._anthropic_client / agent.client) is NOT
+            # this stream's transport, so we must not close/replace it from this
+            # poll thread: doing so releases a TLS FD that a still-unwinding
+            # worker from a prior stale-killed attempt can write into after the
+            # kernel recycles it onto an unrelated SQLite handle (#70773 was the
+            # OpenAI-wire instance of this; #67142 the anthropic one). The next
+            # retry attempt builds a fresh request-local client, so there is no
+            # stale shared pool to purge here. Nothing further is needed.
             # Reset the timer so we don't kill repeatedly while
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
