@@ -104,6 +104,46 @@ test('checkLockDrift resolves dependencies hoisted to the workspace root', () =>
   }
 })
 
+// 2026-07-24: a concurrent `npm install` rewrote the lockfile to key
+// @assistant-ui/react under apps/desktop/node_modules but npm hoisted the real
+// files to the root node_modules; the nested path was absent. Reading the copy
+// at the lockfile's key path saw "not installed" and reported drift even though
+// the hoisted copy matched exactly. The installed version is the one node
+// resolves to, so a hoisted-but-matching copy is not drift.
+test('checkLockDrift accepts a package hoisted above its lockfile key', () => {
+  const ws = makeWorkspace({
+    manifest: { dependencies: { '@assistant-ui/react': '^0.14.24' } },
+    lockPackages: { 'apps/desktop/node_modules/@assistant-ui/react': { version: '0.14.24' } },
+    installed: { 'node_modules/@assistant-ui/react': '0.14.24' }
+  })
+  try {
+    assert.deepEqual(checkLockDrift(ws.root, ws.pkgDir), { ok: true, drift: [] })
+  } finally {
+    ws.cleanup()
+  }
+})
+
+// The flip side of the hoist case: a stray nested copy at the wrong version is
+// what node actually loads, so it must be reported even though the lockfile
+// keys the package (at the right version) higher up.
+test('checkLockDrift reports a stray nested copy that shadows the locked one', () => {
+  const ws = makeWorkspace({
+    manifest: { dependencies: { react: '^19.2.5' } },
+    lockPackages: { 'node_modules/react': { version: '19.2.7' } },
+    installed: {
+      'node_modules/react': '19.2.7',
+      'apps/desktop/node_modules/react': '18.3.1'
+    }
+  })
+  try {
+    const result = checkLockDrift(ws.root, ws.pkgDir)
+    assert.equal(result.ok, false)
+    assert.deepEqual(result.drift, [{ name: 'react', installed: '18.3.1', locked: '19.2.7' }])
+  } finally {
+    ws.cleanup()
+  }
+})
+
 // A nested copy shadows the hoisted one for anything under apps/desktop.
 test('checkLockDrift prefers the nested copy over the hoisted one', () => {
   const ws = makeWorkspace({
