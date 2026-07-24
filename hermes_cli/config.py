@@ -404,8 +404,10 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     1. Code-scoped stamp ``<install tree>/.install_method`` (next to the
        running code) — the authoritative marker.
     2. Legacy home-scoped stamp ``$HERMES_HOME/.install_method`` — read for
-       backward compatibility, but a ``docker`` value is IGNORED when we are
-       not actually running inside a container (see below).
+       backward compatibility, but a ``docker`` value is IGNORED when it
+       cannot describe this install: either we are not actually running
+       inside a container, or the running code is a git checkout (``.git``
+       present, which the published image never ships). See below.
     3. HERMES_MANAGED env / .managed marker (NixOS managed mode)
     4. /nix/store/ path detection -> 'nix' (nix run / nix profile install)
     5. .git directory presence -> 'git'
@@ -426,10 +428,13 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     its own truthful marker.
 
     Self-healing for already-poisoned homes: a legacy ``docker`` value in the
-    home-scoped stamp is only honoured when we are genuinely in a container.
-    On a host install that read a contaminating ``docker`` stamp, we fall
-    through to managed/.git detection instead — so existing shared-home
-    setups recover without the user touching anything.
+    home-scoped stamp is only honoured when it could plausibly be this
+    install — i.e. we are genuinely in a container AND the running code is
+    not a git checkout. On a host install that read a contaminating ``docker``
+    stamp, we fall through to managed/nix/.git detection instead — so
+    existing shared-home setups recover without the user touching anything.
+    (The published image excludes ``.git`` and carries a code-scoped stamp,
+    so a working tree with ``.git`` is never that image.)
 
     Note: running inside a container is NOT treated as "docker" on its own.
     The supported installs self-identify via the code-scoped stamp:
@@ -452,10 +457,8 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     except OSError:
         pass
 
-    # 2. Legacy home-scoped stamp — back-compat. Ignore a ``docker`` value
-    #    when we are not actually containerised: that is the signature of a
-    #    host install whose shared $HERMES_HOME was stamped by a co-located
-    #    container, and honouring it wrongly blocks ``hermes update``.
+    # 2. Legacy home-scoped stamp — back-compat, with the ``docker`` value
+    #    filtered as described below.
     try:
         method = (
             (get_hermes_home() / ".install_method")
@@ -463,7 +466,16 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
             .strip()
             .lower()
         )
-        if method in supported_methods and not (method == "docker" and not _running_in_container()):
+        # A ``docker`` stamp is untrustworthy — and must not block
+        # ``hermes update`` — when it cannot describe this install: either
+        # we are not containerised, or the running code is a git checkout
+        # (the published image ships no ``.git`` and stamps code-scoped).
+        # Both are the signature of a shared $HERMES_HOME stamped by a
+        # co-located container rather than by the running install.
+        docker_stamp_untrustworthy = method == "docker" and (
+            not _running_in_container() or _is_git_checkout(root)
+        )
+        if method in supported_methods and not docker_stamp_untrustworthy:
             return method
     except OSError:
         pass
@@ -483,20 +495,29 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     except OSError:
         pass
 
-    # detect git repo installs (normal installer, development env)
+    # detect git repo installs (normal installer, development env, worktrees)
+    if _is_git_checkout(root):
+        return "git"
+    return "unknown"
+
+
+def _is_git_checkout(root: Path) -> bool:
+    """Return True when ``root`` is a git checkout.
+
+    Recognises both a normal ``.git`` directory and a worktree/submodule
+    ``.git`` file (a text pointer beginning ``gitdir:``). The published
+    Docker image excludes ``.git`` entirely, so this doubles as "not the
+    published image" — see ``detect_install_method``.
+    """
     git_path = root / ".git"
     if git_path.is_dir():
-        return "git"
-
-    # detect git repo installs from worktrees
+        return True
     if git_path.is_file():
         try:
-            content = git_path.read_text(encoding="utf-8").strip()
-            if content.startswith("gitdir:"):
-                return "git"
+            return git_path.read_text(encoding="utf-8").strip().startswith("gitdir:")
         except OSError:
             pass
-    return "unknown"
+    return False
 
 
 def _running_in_container() -> bool:
