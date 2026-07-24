@@ -90,6 +90,43 @@ def test_poll_loop_preserves_last_digest_at_across_fire(tmp_path, monkeypatch):
     assert final.get("fired_digest_keys") == ["2026-04-19-08", "2026-04-19-13"]
 
 
+def test_poll_loop_preserves_last_digest_rowid_across_fire(tmp_path, monkeypatch):
+    """The gateway's post-compose state merge (reload -> set fired_digest_keys
+    -> save) must retain last_digest_rowid, or the next compose() would fall
+    back to seeding from last_digest_at on every restart. Mirrors the
+    last_digest_at guard above; the rowid watermark now shares that path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from events.paths import digest_state_path
+
+    save_state(digest_state_path(), {
+        "fired_digest_keys": ["2026-04-19-08"],
+        "last_digest_at": "2026-04-19T12:00:00+00:00",
+        "last_digest_rowid": 100,
+    })
+
+    state_at_thread_start = load_state(digest_state_path(), default={})
+    fired_digest_keys = list(state_at_thread_start.get("fired_digest_keys", []))
+
+    # compose() overwrites the file with the new watermark (both fields).
+    save_state(digest_state_path(), {
+        "last_digest_at": "2026-04-19T17:00:00+00:00",
+        "last_digest_rowid": 250,
+    })
+
+    # Poll loop reloads FIRST, then re-sets fired_digest_keys and saves.
+    fired_digest_keys.append("2026-04-19-13")
+    merged = load_state(digest_state_path(), default={})
+    merged["fired_digest_keys"] = fired_digest_keys
+    merged.pop("last_digest_key", None)
+    save_state(digest_state_path(), merged)
+
+    final = load_state(digest_state_path(), default={})
+    assert final.get("last_digest_rowid") == 250, (
+        "Gateway merge dropped last_digest_rowid — compose() would re-seed "
+        "from last_digest_at on every restart")
+    assert final.get("fired_digest_keys") == ["2026-04-19-08", "2026-04-19-13"]
+
+
 def test_legacy_last_digest_key_migrates_to_fired_digest_keys(tmp_path, monkeypatch):
     """The caller-side migration path: a state file written by the pre-
     2026-04-19 "latest-only" code uses ``last_digest_key`` as a scalar.

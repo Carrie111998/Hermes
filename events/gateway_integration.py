@@ -492,8 +492,9 @@ def _pick_digest_target(
     One key per call — the poll loop's sub-second cadence naturally
     sequences first-then-latest across successive ticks.  Firing both in
     the same tick would produce an empty second digest because
-    ``DigestComposer.compose()`` advances ``self._last_digest_at`` after
-    every call and uses it as the window's lower bound.
+    ``DigestComposer.compose()`` advances its rowid watermark
+    (``self._last_digest_rowid``) after every call and uses it as the
+    window's lower bound.
 
     Regression shield against the 2026-04-19 morning-digest loss: the
     previous "latest-only" rule silently skipped the 7:00 ET overnight
