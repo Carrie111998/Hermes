@@ -28,6 +28,14 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse an env var as float, returning default on missing/invalid."""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -965,6 +973,7 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    content_stale_timeout: float = 0.0,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -1002,6 +1011,11 @@ def _consume_codex_event_stream(
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
     * ``interrupt_check()`` — returns True to break the loop early.
+    * ``content_stale_timeout`` — if > 0, raises TimeoutError when only keepalive
+      / metadata events arrive for this many seconds without any content-bearing
+      event (text delta, reasoning, tool call, terminal).  Catches the class of
+      wedge where SSE keepalive / in_progress pings keep the connection alive
+      but the provider never delivers a real response chunk.
     """
     collected_output_items: List[Any] = []
     collected_text_deltas: List[str] = []
@@ -1015,6 +1029,12 @@ def _consume_codex_event_stream(
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+    # Content-stale watchdog: timestamp of the last meaningful event
+    # (text delta, reasoning, tool call, terminal, error).  Keepalive /
+    # in_progress pings do NOT update this — the watchdog catches the
+    # class of wedge where metadata events keep the connection alive
+    # but the provider never delivers a real response chunk.
+    _last_content_ts = time.time() if content_stale_timeout > 0 else None
 
     for event in event_iter:
         if on_event is not None:
@@ -1031,6 +1051,29 @@ def _consume_codex_event_stream(
         if interrupt_check is not None and interrupt_check():
             break
 
+        # Content-stale watchdog: if only keepalive/metadata events have arrived
+        # since the last meaningful event, kill the stream so the caller's retry
+        # loop can reconnect (and cron failure delivery can fire).  Meaningful
+        # events (text/reasoning deltas, tool calls, terminal/error frames) reset
+        # _last_content_ts; SSE keepalive / in_progress pings do not.
+        if _last_content_ts is not None and content_stale_timeout > 0:
+            _since_last_content = time.time() - _last_content_ts
+            if _since_last_content > content_stale_timeout:
+                logger.warning(
+                    "Codex Responses stream produced no content events for %.0fs "
+                    "(threshold %.0fs, model=%s).  The connection is alive (keepalive "
+                    "pings arriving) but the provider is not delivering real response "
+                    "chunks.  Killing stream.",
+                    _since_last_content, content_stale_timeout,
+                    model,
+                )
+                raise TimeoutError(
+                    f"Codex Responses stream produced no content events for "
+                    f"{int(_since_last_content)}s (threshold: "
+                    f"{int(content_stale_timeout)}s) — only keepalive/metadata "
+                    f"events received."
+                )
+
         event_type = _event_field(event, "type", "")
         if not isinstance(event_type, str):
             event_type = ""
@@ -1040,6 +1083,8 @@ def _consume_codex_event_stream(
         # but never appear in the terminal set.  Surface them as a structured
         # exception so the credential pool + error classifier see the body.
         if event_type == "error":
+            if _last_content_ts is not None:
+                _last_content_ts = time.time()  # error is meaningful
             _raise_stream_error(event)
 
         # Track the phase of the active streamed message item.  Codex/Harmony
@@ -1059,11 +1104,15 @@ def _consume_codex_event_stream(
                 active_message_phase = None
             if "function_call" in str(item_type):
                 has_tool_calls = True
+                if _last_content_ts is not None:
+                    _last_content_ts = time.time()  # tool call is meaningful
             continue
 
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
             delta_text = _event_field(event, "delta", "")
             if delta_text and active_message_phase == "commentary":
+                if _last_content_ts is not None:
+                    _last_content_ts = time.time()  # commentary delta is content
                 commentary_text_deltas.append(delta_text)
                 # Preserve CLI/backward compatibility when no first-class
                 # commentary consumer is installed.
@@ -1073,12 +1122,16 @@ def _consume_codex_event_stream(
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text and active_message_phase == "analysis":
+                if _last_content_ts is not None:
+                    _last_content_ts = time.time()  # analysis delta is content
                 if on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
                     except Exception:
                         logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             elif delta_text:
+                if _last_content_ts is not None:
+                    _last_content_ts = time.time()  # text delta is meaningful
                 collected_text_deltas.append(delta_text)
                 if not has_tool_calls:
                     if not first_delta_fired:
@@ -1097,20 +1150,27 @@ def _consume_codex_event_stream(
 
         if "function_call" in event_type:
             has_tool_calls = True
+            if _last_content_ts is not None:
+                _last_content_ts = time.time()  # tool call is meaningful
             # fall through — function_call items still get added on output_item.done
 
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
-            if reasoning_text and on_reasoning_delta is not None:
-                try:
-                    on_reasoning_delta(reasoning_text)
-                except Exception:
-                    logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+            if reasoning_text:
+                if _last_content_ts is not None:
+                    _last_content_ts = time.time()  # reasoning delta is meaningful
+                if on_reasoning_delta is not None:
+                    try:
+                        on_reasoning_delta(reasoning_text)
+                    except Exception:
+                        logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
             continue
 
         if event_type == "response.output_item.done":
             done_item = _event_field(event, "item")
             if done_item is not None:
+                if _last_content_ts is not None:
+                    _last_content_ts = time.time()  # completed item is meaningful
                 collected_output_items.append(done_item)
                 done_phase = _item_field(done_item, "phase", None)
                 done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None
@@ -1136,6 +1196,8 @@ def _consume_codex_event_stream(
             continue
 
         if event_type in _TERMINAL_EVENT_TYPES:
+            if _last_content_ts is not None:
+                _last_content_ts = time.time()  # terminal event is meaningful
             saw_terminal = True
             resp_obj = _event_field(event, "response")
             if resp_obj is not None:
@@ -1241,6 +1303,27 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    # Content-stale watchdog: the caller's interruptible-api-call polling loop
+    # keeps TTFB and event-idle detectors, but SSE keepalive / in_progress
+    # pings refresh its event timestamps — so a connection that delivers only
+    # keepalive pings with no real content never trips the caller's detectors.
+    # We add a content-stale watchdog inside _consume_codex_event_stream that
+    # ignores keepalive pings and tracks only meaningful events (text deltas,
+    # reasoning, tool calls, terminal/error frames).
+    _content_stale_timeout = _env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
+    # Scale for large contexts: slow models can think for minutes before
+    # producing the first token.  Matches the scaling in the chat_completions
+    # streaming stale detector.
+    try:
+        from agent.chat_completion_helpers import estimate_request_context_tokens
+        _est_tokens = estimate_request_context_tokens(api_kwargs)
+        if _est_tokens > 100_000:
+            _content_stale_timeout = max(_content_stale_timeout, 300.0)
+        elif _est_tokens > 50_000:
+            _content_stale_timeout = max(_content_stale_timeout, 240.0)
+    except Exception:
+        pass
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -1304,6 +1387,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,
+                    content_stale_timeout=_content_stale_timeout,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
