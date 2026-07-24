@@ -770,6 +770,23 @@ class TestEnvEnablement:
         assert seed["home_channel"]["chat_id"] == "alerts"
         assert seed["home_channel"]["name"] == "alerts"
 
+    @pytest.mark.parametrize("blank", [" ", "   ", "\t", "\n", " \t\n "])
+    def test_home_channel_whitespace_name_falls_back_to_id(
+        self, monkeypatch, blank
+    ):
+        """Whitespace-only NTFY_HOME_CHANNEL_NAME must also fall back to the
+        chat_id. This pins the ``.strip()`` half of the guard specifically:
+        the empty-string case above passes under a bare
+        ``os.getenv(..., "") or home``, but a value like ``"   "`` is truthy
+        and only ``.strip()`` collapses it, so this is the case that fails
+        without the production change."""
+        monkeypatch.setenv("NTFY_TOPIC", "hermes-in")
+        monkeypatch.setenv("NTFY_HOME_CHANNEL", "alerts")
+        monkeypatch.setenv("NTFY_HOME_CHANNEL_NAME", blank)
+        seed = _env_enablement()
+        assert seed["home_channel"]["chat_id"] == "alerts"
+        assert seed["home_channel"]["name"] == "alerts"
+
 
 # ---------------------------------------------------------------------------
 # 10. _standalone_send() — out-of-process cron delivery
