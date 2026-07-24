@@ -25,7 +25,6 @@ except ImportError:  # pragma: no cover - Windows availability is fail-closed
     resource = None
 
 from hermes_constants import get_hermes_home
-from tools.code_execution_tool import _scrub_child_env
 from tools.path_security import validate_within_dir
 from tools.registry import registry
 
@@ -37,6 +36,7 @@ DEFAULTS = {
     "cpu_seconds": 60,
     "memory_mb": 1024,
     "file_size_mb": 64,
+    "max_processes": 64,
     "max_open_files": 256,
     "max_snapshot_mb": 512,
 }
@@ -94,9 +94,12 @@ def _probe(force: bool = False) -> tuple[bool, str]:
     config = _load_config()
     if config.get("enabled") is not True:
         return False, "python_sandbox.enabled is false or missing"
-    binary = shutil.which("unshare")
-    if not binary:
-        return False, "unshare executable not found"
+    required = ("unshare", "mount", "findmnt", "pivot_root")
+    binaries = {name: shutil.which(name) for name in required}
+    missing = [name for name, path in binaries.items() if not path]
+    if missing:
+        return False, f"required sandbox executable(s) missing: {', '.join(missing)}"
+    binary = binaries["unshare"]
     now = time.monotonic()
     if not force and _PROBE is not None and now - _PROBE[0] < _PROBE_TTL:
         return _PROBE[1], _PROBE[2]
@@ -113,12 +116,14 @@ def _probe(force: bool = False) -> tuple[bool, str]:
                     "--mount",
                     "--pid",
                     "--fork",
-                    "true",
+                    "/bin/sh",
+                    "-c",
+                    "unshare --user --map-user=65534 --map-group=65534 true",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=10,
-                env=_scrub_child_env(os.environ),
+                env={"PATH": "/usr/bin:/bin"},
             )
             answer = (
                 completed.returncode == 0,
@@ -225,6 +230,7 @@ def _generate_init_script(
     venv: Path,
     tmpfs_mb: int = 64,
     base_prefix: Path | None = None,
+    max_processes: int = 64,
 ) -> str:
     """Generate the mount plan executed as namespace-root."""
     jail = run_dir / "jail"
@@ -239,8 +245,12 @@ def _generate_init_script(
         '"$JAIL/proc" "$JAIL/.oldroot"',
         'ro_dir() { src=$1; dst=$2; [ -e "$src" ] || return 0; '
         'mount --rbind "$src" "$dst"; mount --make-rslave "$dst"; '
-        'findmnt -Rrn -o TARGET "$dst" | sort -r | while IFS= read -r target; '
-        'do mount -o remount,bind,ro "$target"; done; }',
+        'targets="$JAIL/.mount-targets"; : > "$targets"; '
+        'findmnt -Rrn -o TARGET "$dst" > "$targets"; '
+        '[ -s "$targets" ] || { echo "findmnt returned no targets for $dst" >&2; exit 1; }; '
+        'sort -r -o "$targets" "$targets"; '
+        'while IFS= read -r target; do mount -o remount,bind,ro "$target"; '
+        'done < "$targets"; rm -f "$targets"; }',
         'ro_file() { src=$1; dst=$2; [ -e "$src" ] || return 0; '
         ': > "$dst"; mount --bind "$src" "$dst"; '
         'mount -o remount,bind,ro "$dst"; }',
@@ -285,7 +295,14 @@ def _generate_init_script(
             'pivot_root "$JAIL" "$JAIL/.oldroot"',
             "cd /",
             "umount -l /.oldroot",
-            "exec /venv/bin/python -I /script.py",
+            "exec /usr/bin/unshare --user --map-user=65534 --map-group=65534 "
+            "/venv/bin/python -I -c "
+            + _q(
+                "import os,resource;"
+                f"resource.setrlimit(resource.RLIMIT_NPROC, ({int(max_processes)},"
+                f"{int(max_processes)}));"
+                "os.execv('/venv/bin/python', ['/venv/bin/python','-I','/script.py'])"
+            ),
             "",
         ]
     )
@@ -295,20 +312,23 @@ def _generate_init_script(
 def _build_env(
     mounts: Mapping[str, Path], source_env: Mapping[str, str] | None = None
 ) -> dict[str, str]:
-    env = _scrub_child_env(dict(source_env or os.environ))
-    env.update(
-        {
-            "SANDBOX_INPUTS": json.dumps(
-                {name: f"/inputs/{name}" for name in mounts}, sort_keys=True
-            ),
-            "RESULT_PATH": "/work/result.json",
-            "TMPDIR": "/work",
-            "TZ": env.get("HERMES_TIMEZONE", "UTC"),
-            "PYTHONIOENCODING": "utf-8",
-            "PYTHONUTF8": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-    )
+    source = dict(source_env or os.environ)
+    # Do not inherit execute_code's configurable passthrough allowlist here:
+    # this boundary is deliberately fixed and credential-blind.
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "SANDBOX_INPUTS": json.dumps(
+            {name: f"/inputs/{name}" for name in mounts}, sort_keys=True
+        ),
+        "RESULT_PATH": "/work/result.json",
+        "TMPDIR": "/work",
+        "HOME": "/work",
+        "TZ": source.get("HERMES_TIMEZONE", "UTC"),
+        "LANG": "C.UTF-8",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     return env
 
 
@@ -511,7 +531,7 @@ def _prune_runs(root: Path, config: Mapping[str, Any]) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _kill_group(proc: subprocess.Popen, grace: float = 0.5) -> None:
+def _kill_group(proc: subprocess.Popen, grace: float = 5.0) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
@@ -597,6 +617,7 @@ def python_sandbox(
             venv,
             limits["file_size_mb"],
             Path(sys.base_prefix),
+            limits["max_processes"],
         ),
         encoding="utf-8",
     )
@@ -604,6 +625,7 @@ def python_sandbox(
     started = time.monotonic()
     status, stdout, stderr, returncode = "error", "", "", -1
     timed_out = False
+    interrupted_requested = False
     try:
         proc = subprocess.Popen(
             [
@@ -620,6 +642,7 @@ def python_sandbox(
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             env=_build_env(mounts),
             preexec_fn=_preexec(limits),
         )
@@ -658,6 +681,7 @@ def python_sandbox(
                 interrupted = False
             if interrupted or time.monotonic() >= deadline:
                 timed_out = not interrupted
+                interrupted_requested = interrupted
                 _kill_group(proc)
                 break
             try:
@@ -685,6 +709,8 @@ def python_sandbox(
                 f"\nCPU limit ({limits['cpu_seconds']}s) exhausted — "
                 "simplify the algorithm"
             )
+        elif interrupted_requested:
+            status = "interrupted"
         elif returncode in (-signal.SIGKILL, 137):
             status = "oom"
             stderr += (
@@ -711,6 +737,8 @@ def python_sandbox(
             f"killed at {wall}s — reduce work or raise timeout_seconds "
             f"(max {limits['max_wall_seconds']})"
         )
+    elif interrupted_requested:
+        payload["error"] = "sandbox execution interrupted"
     elif harvest_error:
         payload["error"] = harvest_error
     elif payload["status"] != "success":

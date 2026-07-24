@@ -23,5 +23,12 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install test and sandbox dependencies
         run: uv sync --extra dev --extra sandbox
-      - name: Run sandbox unit and jailed E2E battery
-        run: uv run pytest -q tests/test_python_sandbox_tool.py
+      - name: Run sandbox unit battery
+        run: uv run pytest -q -m "not sandbox_e2e" tests/test_python_sandbox_tool.py
+      - name: Run jailed E2E battery without skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run pytest -q -m sandbox_e2e tests/test_python_sandbox_tool.py | tee /tmp/sandbox-e2e.txt
+          grep -Eq '^7 passed in ' /tmp/sandbox-e2e.txt
+          ! grep -q skipped /tmp/sandbox-e2e.txt

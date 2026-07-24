@@ -191,7 +191,8 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
     assert "HERMES_HOME" not in script
     assert "pivot_root" in script
     assert 'mount -o remount,bind,ro "$JAIL"' in script
-    assert "exec /venv/bin/python -I /script.py" in script
+    assert "exec /usr/bin/unshare --user --map-user=65534" in script
+    assert "resource.setrlimit(resource.RLIMIT_NPROC" in script
     assert 'mkdir -p "$JAIL/opt/python/3.13"' in script
     assert 'ro_dir /opt/python/3.13 "$JAIL/opt/python/3.13"' in script
 
@@ -217,6 +218,8 @@ def test_child_env_scrubs_secrets_and_exposes_contract_paths(tmp_path):
     assert json.loads(env["SANDBOX_INPUTS"]) == {"records": "/inputs/records"}
     assert env["RESULT_PATH"] == "/work/result.json"
     assert env["TMPDIR"] == "/work"
+    assert env["HOME"] == "/work"
+    assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_stdout_head_tail_truncation_preserves_both_ends():
@@ -310,7 +313,10 @@ def test_probe_disabled_and_missing_binary(monkeypatch):
     )
     monkeypatch.setattr(sandbox, "_load_config", lambda: {"enabled": True})
     monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)
-    assert sandbox._probe(force=True) == (False, "unshare executable not found")
+    assert sandbox._probe(force=True) == (
+        False,
+        "required sandbox executable(s) missing: unshare, mount, findmnt, pivot_root",
+    )
 
 
 def test_probe_failure_is_actionable_and_handler_fails_closed(monkeypatch):
@@ -381,33 +387,59 @@ def test_jailed_network_and_write_escape_are_blocked(tmp_path, monkeypatch):
     source, csv = tmp_path / "records.db", tmp_path / "input.csv"
     _db(source)
     _csv(csv)
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "sample.txt").write_text("read-only", encoding="utf-8")
     config = _config(source, csv, wall_seconds=20)
+    config["datasets"]["media"] = {
+        "type": "path",
+        "path": str(media),
+        "description": "Generic directory dataset.",
+    }
     monkeypatch.setattr(sandbox, "_load_config", lambda: config)
     monkeypatch.setattr(sandbox, "get_hermes_home", lambda: tmp_path / "home")
     code = r'''
-import json, os, socket, urllib.request
+import ctypes, errno, json, os, socket, urllib.request
 inputs = json.loads(os.environ["SANDBOX_INPUTS"])
 blocked = {}
 for label, action in {
     "network": lambda: socket.create_connection(("1.1.1.1", 53), 1),
     "http": lambda: urllib.request.urlopen("http://1.1.1.1", timeout=1),
     "input_write": lambda: open(inputs["sheet"], "w"),
+    "directory_write": lambda: open(inputs["media"] + "/new.txt", "w"),
     "etc_write": lambda: open("/etc/x", "w"),
     "home_write": lambda: open(os.path.expanduser("~/x"), "w"),
+    "venv_write": lambda: open("/venv/probe.txt", "w"),
 }.items():
     try: action(); blocked[label] = False
     except Exception: blocked[label] = True
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                       ctypes.c_ulong, ctypes.c_void_p]
+for label, target in {
+    "venv_remount": b"/venv",
+    "directory_remount": inputs["media"].encode(),
+}.items():
+    ctypes.set_errno(0)
+    rc = libc.mount(None, target, None, 32 | 4096, None)
+    blocked[label] = rc == -1 and ctypes.get_errno() == errno.EPERM
 open("/work/ok.txt", "w").write("ok")
 open(os.environ["RESULT_PATH"], "w").write(json.dumps(blocked))
 '''
-    response = json.loads(sandbox.python_sandbox(code, ["sheet"], timeout_seconds=20))
+    response = json.loads(
+        sandbox.python_sandbox(code, ["sheet", "media"], timeout_seconds=20)
+    )
     assert response["status"] == "success", response
     assert response["result"] == {
         "network": True,
         "http": True,
         "input_write": True,
+        "directory_write": True,
         "etc_write": True,
         "home_write": True,
+        "venv_write": True,
+        "venv_remount": True,
+        "directory_remount": True,
     }
     assert any(item["path"] == "work/ok.txt" for item in response["files"])
 
@@ -489,6 +521,71 @@ def test_jailed_oom_has_distinct_status_and_guidance(tmp_path, monkeypatch):
     )
     assert response["status"] == "oom", response
     assert "stream/chunk" in response["error"]
+
+
+@pytest.mark.skipif(not _can_run_jail(), reason="kernel user namespaces unavailable")
+@pytest.mark.sandbox_e2e
+def test_jailed_cpu_limit_has_distinct_guidance(tmp_path, monkeypatch):
+    source, csv = tmp_path / "records.db", tmp_path / "input.csv"
+    _db(source)
+    _csv(csv)
+    config = _config(
+        source,
+        csv,
+        wall_seconds=10,
+        max_wall_seconds=10,
+        cpu_seconds=1,
+    )
+    monkeypatch.setattr(sandbox, "_load_config", lambda: config)
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: tmp_path / "home")
+    response = json.loads(
+        sandbox.python_sandbox("while True: pass", timeout_seconds=10)
+    )
+    assert response["status"] == "error", response
+    assert "CPU limit (1s) exhausted" in response["stderr"]
+
+
+@pytest.mark.skipif(not _can_run_jail(), reason="kernel user namespaces unavailable")
+@pytest.mark.sandbox_e2e
+def test_jailed_process_count_is_bounded(tmp_path, monkeypatch):
+    source, csv = tmp_path / "records.db", tmp_path / "input.csv"
+    _db(source)
+    _csv(csv)
+    config = _config(
+        source,
+        csv,
+        wall_seconds=20,
+        max_wall_seconds=20,
+        max_processes=16,
+    )
+    monkeypatch.setattr(sandbox, "_load_config", lambda: config)
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: tmp_path / "home")
+    code = r'''
+import json, os, subprocess
+children = []
+errors = 0
+for _ in range(40):
+    try:
+        children.append(subprocess.Popen(
+            ["/venv/bin/python", "-c", "import time; time.sleep(5)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ))
+    except OSError:
+        errors += 1
+for child in children:
+    child.terminate()
+for child in children:
+    child.wait()
+open(os.environ["RESULT_PATH"], "w").write(json.dumps(
+    {"spawned": len(children), "errors": errors}
+))
+'''
+    response = json.loads(sandbox.python_sandbox(code, timeout_seconds=20))
+    assert response["status"] == "success", response
+    assert response["result"]["spawned"] < 40
+    assert response["result"]["errors"] > 0
 
 
 def test_prune_removes_expired_and_excess_runs(tmp_path):
