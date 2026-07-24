@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from typing import Any, Mapping
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -560,6 +560,123 @@ def test_malformed_probe_cannot_authorize_or_poison_scratch_delete(
     assert provider.scratch_exists is True
     assert "delete_scratch" not in provider.calls
     assert not (root / "0008-probe_receipt.json").exists()
+
+
+def test_operation_lookup_is_source_scoped_and_preserves_pagination() -> None:
+    first = {
+        "kind": "sql#operation",
+        "name": "backup-operation-1",
+        "targetProject": cutover.PROJECT,
+        "targetId": cutover.PRODUCTION_SQL_INSTANCE,
+        "operationType": "BACKUP_VOLUME",
+        "insertTime": "2026-07-25T00:00:00Z",
+        "backupContext": {"backupId": "123456789"},
+    }
+    second = {
+        **first,
+        "name": "backup-operation-2",
+        "insertTime": "2026-07-25T00:01:00Z",
+    }
+    client = Mock()
+    client.request_json.side_effect = [
+        {
+            "items": [first],
+            "nextPageToken": "source-page-2",
+        },
+        {"items": [second]},
+    ]
+    provider = recovery.CloudSqlRecoveryProvider(client)
+
+    operation = provider._find_operation(
+        target=cutover.PRODUCTION_SQL_INSTANCE,
+        allowed_types=frozenset({"BACKUP_VOLUME"}),
+        backup_id="123456789",
+    )
+
+    assert operation == second
+    base = (
+        "https://sqladmin.googleapis.com/sql/v1beta4/projects/"
+        f"{cutover.PROJECT}/operations"
+    )
+    client.request_json.assert_has_calls([
+        call(
+            "GET",
+            f"{base}?maxResults=500&instance={cutover.PRODUCTION_SQL_INSTANCE}",
+            body=None,
+        ),
+        call(
+            "GET",
+            (
+                f"{base}?maxResults=500"
+                f"&instance={cutover.PRODUCTION_SQL_INSTANCE}"
+                "&pageToken=source-page-2"
+            ),
+            body=None,
+        ),
+    ])
+    assert client.request_json.call_count == 2
+
+
+def test_operation_lookup_is_release_bound_scratch_scoped() -> None:
+    scratch = cutover.database_recovery_scratch_instance(REVISION)
+    expected = {
+        "kind": "sql#operation",
+        "name": "scratch-create-operation",
+        "targetProject": cutover.PROJECT,
+        "targetId": scratch,
+        "operationType": "CREATE",
+        "insertTime": "2026-07-25T00:00:00Z",
+    }
+    client = Mock()
+    client.request_json.return_value = {"items": [expected]}
+    provider = recovery.CloudSqlRecoveryProvider(client)
+
+    operation = provider._find_operation(
+        target=scratch,
+        allowed_types=frozenset({"CREATE"}),
+        release_revision=REVISION,
+    )
+
+    assert operation == expected
+    client.request_json.assert_called_once_with(
+        "GET",
+        (
+            "https://sqladmin.googleapis.com/sql/v1beta4/projects/"
+            f"{cutover.PROJECT}/operations?maxResults=500&instance={scratch}"
+        ),
+        body=None,
+    )
+
+
+def test_operation_lookup_rejects_project_wide_and_unbound_targets() -> None:
+    client = Mock()
+    provider = recovery.CloudSqlRecoveryProvider(client)
+    scratch = cutover.database_recovery_scratch_instance(REVISION)
+
+    with pytest.raises(
+        recovery.ProductionDatabaseRecoveryError,
+        match="production_database_recovery_provider_contract_invalid",
+    ):
+        provider._pages("/operations", item_kind="sql#operation")
+    with pytest.raises(
+        recovery.ProductionDatabaseRecoveryError,
+        match="production_database_recovery_provider_contract_invalid",
+    ):
+        provider._find_operation(
+            target="caller-selected-instance",
+            allowed_types=frozenset({"CREATE"}),
+            release_revision=REVISION,
+        )
+    with pytest.raises(
+        recovery.ProductionDatabaseRecoveryError,
+        match="production_database_recovery_provider_contract_invalid",
+    ):
+        provider._find_operation(
+            target=scratch,
+            allowed_types=frozenset({"CREATE"}),
+        )
+
+    client.request_json.assert_not_called()
 
 
 def test_cloud_sql_mutation_contract_is_fixed_and_private(
