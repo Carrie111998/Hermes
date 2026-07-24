@@ -60,6 +60,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
+import glob
 import json
 import os
 import re
@@ -113,11 +115,14 @@ def load_manifest(root: str) -> dict:
             sys.exit(2)
     # Manifest self-verification: declared paths must exist (a path moving
     # without a manifest update is a loud config error, not a silent pass).
-    missing = [
-        p
-        for p in manifest["sharedPlanePaths"]
-        if not os.path.exists(os.path.join(root, p.rstrip("/")))
-    ]
+    missing = []
+    for entry in manifest["sharedPlanePaths"]:
+        # Wildcards declare a class of paths (for example repo-root manifests)
+        # and may legitimately have zero current members. Literal paths must exist.
+        if any(ch in entry for ch in "*?["):
+            continue
+        if not os.path.exists(os.path.join(root, entry.rstrip("/"))):
+            missing.append(entry)
     if missing:
         sys.stderr.write(
             "plane-lint: manifest sharedPlanePaths do not exist on disk: "
@@ -135,7 +140,20 @@ def under(rel: str, prefixes: list[str]) -> bool:
     directory prefix.
     """
     for prefix in prefixes:
-        p = prefix.rstrip("/")
+        directory_pattern = norm(prefix).endswith("/")
+        p = norm(prefix).rstrip("/")
+        if any(ch in p for ch in "*?["):
+            # A wildcard basename without a slash is a repo-root file pattern.
+            if "/" not in p:
+                if "/" not in rel and fnmatch.fnmatchcase(rel, p):
+                    return True
+                continue
+            # Directory patterns own the matched directory and its full subtree.
+            if directory_pattern and fnmatch.fnmatchcase(rel, p + "/**"):
+                return True
+            if not directory_pattern and fnmatch.fnmatchcase(rel, p):
+                return True
+            continue
         if rel == p or rel.startswith(p + "/"):
             return True
     return False
@@ -162,22 +180,27 @@ def iter_shared_files(root: str, manifest: dict):
     client = manifest["clientPlanePaths"]
     seen = set()
     for entry in shared:
-        abs_entry = os.path.join(root, entry.rstrip("/"))
-        if os.path.isfile(abs_entry):
-            rel = norm(os.path.relpath(abs_entry, root))
-            if rel not in seen and not under(rel, client):
-                seen.add(rel)
-                yield rel
-            continue
-        for dirpath, dirnames, filenames in os.walk(abs_entry):
-            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
-            for name in sorted(filenames):
-                abs_path = os.path.join(dirpath, name)
-                rel = norm(os.path.relpath(abs_path, root))
-                if rel in seen or under(rel, client):
-                    continue
-                seen.add(rel)
-                yield rel
+        raw_entry = entry.rstrip("/")
+        if any(ch in raw_entry for ch in "*?["):
+            candidates = sorted(glob.glob(os.path.join(root, raw_entry)))
+        else:
+            candidates = [os.path.join(root, raw_entry)]
+        for abs_entry in candidates:
+            if os.path.isfile(abs_entry):
+                rel = norm(os.path.relpath(abs_entry, root))
+                if rel not in seen and not under(rel, client):
+                    seen.add(rel)
+                    yield rel
+                continue
+            for dirpath, dirnames, filenames in os.walk(abs_entry):
+                dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
+                for name in sorted(filenames):
+                    abs_path = os.path.join(dirpath, name)
+                    rel = norm(os.path.relpath(abs_path, root))
+                    if rel in seen or under(rel, client):
+                        continue
+                    seen.add(rel)
+                    yield rel
 
 
 def token_occurrences(text: str, token: str, regex: re.Pattern) -> list[int]:
@@ -210,7 +233,7 @@ def build_token_matchers(manifest: dict):
 
 
 def client_module_prefixes(manifest: dict) -> list[str]:
-    """clientPlanePaths as python module prefixes: deploy/tgg/ -> deploy.tgg"""
+    """Client-plane path patterns as Python module patterns."""
     prefixes = []
     for entry in manifest["clientPlanePaths"]:
         mod = entry.strip("/").replace("/", ".")
@@ -307,7 +330,12 @@ def collect_violations(root: str, manifest: dict) -> list[dict]:
         if ext in PY_EXTENSIONS:
             for mod in python_imported_modules(rel, text):
                 for prefix in py_client_prefixes:
-                    if mod == prefix or mod.startswith(prefix + "."):
+                    if (
+                        mod == prefix
+                        or mod.startswith(prefix + ".")
+                        or fnmatch.fnmatchcase(mod, prefix)
+                        or fnmatch.fnmatchcase(mod, prefix + ".**")
+                    ):
                         violations.append(
                             {
                                 "file": rel,
