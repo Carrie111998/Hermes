@@ -55,6 +55,11 @@ def test_register_exposes_sillytavern_to_agents():
         "sillytavern_stop",
         "sillytavern_version",
         "sillytavern_configure",
+        "sillytavern_scan",
+        "sillytavern_import_memory",
+        "sillytavern_proxy_start",
+        "sillytavern_proxy_stop",
+        "sillytavern_proxy_status",
     }
     assert all(callable(tool["handler"]) for tool in context.tools)
     assert all(callable(tool["check_fn"]) for tool in context.tools)
