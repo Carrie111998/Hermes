@@ -137,6 +137,51 @@ def _psql_output(*, read_only: str = "on", rows: int = 14) -> bytes:
     )
 
 
+def test_read_only_sql_uses_native_uuid_order_for_event_extrema() -> None:
+    sql = " ".join(remote._READ_ONLY_SQL.split())
+
+    assert "pg_catalog.min(event_id)" not in sql
+    assert "pg_catalog.max(event_id)" not in sql
+    assert (
+        "(SELECT extrema.event_id::text "
+        "FROM public.canonical_event_log AS extrema "
+        "ORDER BY extrema.event_id LIMIT 1) AS minimum_event_id"
+    ) in sql
+    assert (
+        "(SELECT extrema.event_id::text "
+        "FROM public.canonical_event_log AS extrema "
+        "ORDER BY extrema.event_id DESC LIMIT 1) AS maximum_event_id"
+    ) in sql
+    assert "ORDER BY extrema.event_id::text" not in sql
+
+
+def test_psql_receipt_validates_extrema_with_canonical_uuid_ordering() -> None:
+    lines = _psql_output(rows=2).decode("ascii").splitlines()
+    content = json.loads(lines[2])
+    lower = uuid.UUID("0fffffff-ffff-ffff-ffff-ffffffffffff")
+    upper = uuid.UUID("10000000-0000-0000-0000-000000000000")
+    assert lower < upper
+    content["minimum_event_id"] = str(lower)
+    content["maximum_event_id"] = str(upper)
+    content["head"] = [
+        {"event_id": str(lower), "envelope_md5": "1".zfill(32)},
+        {"event_id": str(upper), "envelope_md5": "2".zfill(32)},
+    ]
+    content["tail"] = list(content["head"])
+    output = (
+        b"on\n"
+        + lines[1].encode("ascii")
+        + b"\n"
+        + owner._canonical(content)
+        + b"\n"
+    )
+
+    _, content_sha256, row_count = remote._parse_psql_output(output)
+
+    assert content_sha256 == owner._sha_json(content)
+    assert row_count == 2
+
+
 def _test_anonymous_descriptor(_label: str) -> int:
     descriptor, path = tempfile.mkstemp(prefix="muncho-recovery-test-")
     os.unlink(path)

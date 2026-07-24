@@ -108,8 +108,14 @@ SELECT pg_catalog.json_build_object(
   FROM schema_rows;
 WITH event_stats AS (
   SELECT pg_catalog.count(*)::bigint AS row_count,
-         pg_catalog.min(event_id)::text AS minimum_event_id,
-         pg_catalog.max(event_id)::text AS maximum_event_id,
+         (SELECT extrema.event_id::text
+            FROM public.canonical_event_log AS extrema
+           ORDER BY extrema.event_id
+           LIMIT 1) AS minimum_event_id,
+         (SELECT extrema.event_id::text
+            FROM public.canonical_event_log AS extrema
+           ORDER BY extrema.event_id DESC
+           LIMIT 1) AS maximum_event_id,
          pg_catalog.min(occurred_at)::text AS minimum_occurred_at,
          pg_catalog.max(occurred_at)::text AS maximum_occurred_at
     FROM public.canonical_event_log
