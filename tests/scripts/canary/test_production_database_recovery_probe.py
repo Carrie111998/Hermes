@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import stat
 import struct
 import tempfile
 import uuid
@@ -143,6 +144,290 @@ def _test_anonymous_descriptor(_label: str) -> int:
     observed = os.fstat(descriptor)
     assert observed.st_nlink == 0
     return descriptor
+
+
+def _anonymous_stat(
+    *,
+    directory: bool = False,
+    mode: int = 0o600,
+    nlink: int = 0,
+    uid: int = 0,
+    gid: int = 0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        st_mode=(stat.S_IFDIR if directory else stat.S_IFREG) | mode,
+        st_nlink=nlink,
+        st_uid=uid,
+        st_gid=gid,
+    )
+
+
+def _install_anonymous_descriptor_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in {
+        "MFD_CLOEXEC": 0x01,
+        "O_CLOEXEC": 0x02,
+        "O_DIRECTORY": 0x04,
+        "O_EXCL": 0x08,
+        "O_NOFOLLOW": 0x10,
+        "O_TMPFILE": 0x20,
+    }.items():
+        monkeypatch.setattr(remote.os, name, value, raising=False)
+
+
+def test_anonymous_descriptor_prefers_memfd_and_enforces_cloexec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_anonymous_descriptor_flags(monkeypatch)
+    monkeypatch.setattr(remote.sys, "platform", "linux")
+    created: list[tuple[str, int]] = []
+    inheritable: dict[int, bool] = {}
+    modes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    def create(label: str, *, flags: int) -> int:
+        created.append((label, flags))
+        return 11
+
+    monkeypatch.setattr(remote.os, "memfd_create", create, raising=False)
+    monkeypatch.setattr(
+        remote.os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("O_TMPFILE fallback was used"),
+    )
+    monkeypatch.setattr(
+        remote.os,
+        "set_inheritable",
+        lambda descriptor, value: inheritable.__setitem__(descriptor, value),
+    )
+    monkeypatch.setattr(
+        remote.os,
+        "get_inheritable",
+        lambda descriptor: inheritable.get(descriptor, False),
+    )
+    monkeypatch.setattr(
+        remote.os,
+        "fchmod",
+        lambda descriptor, mode: modes.append((descriptor, mode)),
+    )
+    monkeypatch.setattr(
+        remote.os,
+        "fstat",
+        lambda _descriptor: _anonymous_stat(),
+    )
+    monkeypatch.setattr(remote.os, "close", closed.append)
+
+    assert remote._anonymous_descriptor("recovery-secret") == 11
+    assert created == [("recovery-secret", remote.os.MFD_CLOEXEC)]
+    assert inheritable == {11: False}
+    assert modes == [(11, 0o600)]
+    assert closed == []
+
+
+def test_anonymous_descriptor_uses_unlinked_otmpfile_without_memfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_anonymous_descriptor_flags(monkeypatch)
+    monkeypatch.setattr(remote.sys, "platform", "linux")
+    monkeypatch.setattr(remote.os, "memfd_create", None, raising=False)
+    opens: list[tuple[object, ...]] = []
+    inheritable: dict[int, bool] = {}
+    closed: list[int] = []
+
+    def open_descriptor(path, flags, mode=0o777, *, dir_fd=None):
+        opens.append((path, flags, mode, dir_fd))
+        return 10 if dir_fd is None else 11
+
+    monkeypatch.setattr(remote.os, "open", open_descriptor)
+    monkeypatch.setattr(
+        remote.os,
+        "fstat",
+        lambda descriptor: (
+            _anonymous_stat(directory=True, mode=0o755, nlink=2)
+            if descriptor == 10
+            else _anonymous_stat()
+        ),
+    )
+    monkeypatch.setattr(
+        remote.os,
+        "set_inheritable",
+        lambda descriptor, value: inheritable.__setitem__(descriptor, value),
+    )
+    monkeypatch.setattr(
+        remote.os,
+        "get_inheritable",
+        lambda descriptor: inheritable.get(descriptor, False),
+    )
+    monkeypatch.setattr(remote.os, "fchmod", lambda *_args: None)
+    monkeypatch.setattr(remote.os, "close", closed.append)
+
+    assert remote._anonymous_descriptor("recovery-secret") == 11
+    assert opens[0][0] == remote.ANONYMOUS_SECRET_DIRECTORY
+    assert opens[0][1] & remote.os.O_DIRECTORY
+    assert opens[0][1] & remote.os.O_NOFOLLOW
+    assert opens[1][0] == "."
+    assert opens[1][2:] == (0o600, 10)
+    assert opens[1][1] & remote.os.O_TMPFILE
+    assert opens[1][1] & remote.os.O_EXCL
+    assert inheritable == {11: False}
+    assert closed == [10]
+
+
+@pytest.mark.parametrize(
+    "platform",
+    ("darwin", "win32"),
+)
+def test_anonymous_descriptor_rejects_non_linux_platforms(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+) -> None:
+    monkeypatch.setattr(remote.sys, "platform", platform)
+    monkeypatch.setattr(
+        remote.os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("filesystem was accessed"),
+    )
+    with pytest.raises(
+        remote.RecoveryProbeError,
+        match="^recovery_probe_anonymous_secret_unavailable$",
+    ):
+        remote._anonymous_descriptor("recovery-secret")
+
+
+@pytest.mark.parametrize(
+    "missing_flag",
+    ("O_CLOEXEC", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_TMPFILE"),
+)
+def test_anonymous_descriptor_fallback_requires_all_linux_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_flag: str,
+) -> None:
+    _install_anonymous_descriptor_flags(monkeypatch)
+    monkeypatch.setattr(remote.sys, "platform", "linux")
+    monkeypatch.setattr(remote.os, "memfd_create", None, raising=False)
+    monkeypatch.setattr(remote.os, missing_flag, 0, raising=False)
+    monkeypatch.setattr(
+        remote.os,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("filesystem was accessed"),
+    )
+    with pytest.raises(
+        remote.RecoveryProbeError,
+        match="^recovery_probe_anonymous_secret_unavailable$",
+    ):
+        remote._anonymous_descriptor("recovery-secret")
+
+
+@pytest.mark.parametrize(
+    ("directory", "inheritable"),
+    (
+        (_anonymous_stat(directory=False), False),
+        (_anonymous_stat(directory=True, mode=0o755, nlink=2, uid=1), False),
+        (_anonymous_stat(directory=True, mode=0o755, nlink=2, gid=1), False),
+        (_anonymous_stat(directory=True, mode=0o775, nlink=2), False),
+        (_anonymous_stat(directory=True, mode=0o755, nlink=2), True),
+    ),
+)
+def test_anonymous_descriptor_fallback_rejects_unsafe_run_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    directory: SimpleNamespace,
+    inheritable: bool,
+) -> None:
+    _install_anonymous_descriptor_flags(monkeypatch)
+    monkeypatch.setattr(remote.sys, "platform", "linux")
+    monkeypatch.setattr(remote.os, "memfd_create", None, raising=False)
+    monkeypatch.setattr(remote.os, "open", lambda *_args, **_kwargs: 10)
+    monkeypatch.setattr(remote.os, "fstat", lambda _descriptor: directory)
+    monkeypatch.setattr(
+        remote.os,
+        "get_inheritable",
+        lambda _descriptor: inheritable,
+    )
+    closed: list[int] = []
+    monkeypatch.setattr(remote.os, "close", closed.append)
+
+    with pytest.raises(
+        remote.RecoveryProbeError,
+        match="^recovery_probe_anonymous_secret_invalid$",
+    ):
+        remote._anonymous_descriptor("recovery-secret")
+
+    assert closed == [10]
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "inheritable"),
+    (
+        (_anonymous_stat(directory=True, mode=0o700, nlink=2), False),
+        (_anonymous_stat(nlink=1), False),
+        (_anonymous_stat(mode=0o640), False),
+        (_anonymous_stat(), True),
+    ),
+)
+def test_anonymous_descriptor_rejects_unsafe_inode(
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor: SimpleNamespace,
+    inheritable: bool,
+) -> None:
+    monkeypatch.setattr(remote.os, "set_inheritable", lambda *_args: None)
+    monkeypatch.setattr(remote.os, "fchmod", lambda *_args: None)
+    monkeypatch.setattr(remote.os, "fstat", lambda _descriptor: descriptor)
+    monkeypatch.setattr(
+        remote.os,
+        "get_inheritable",
+        lambda _descriptor: inheritable,
+    )
+
+    with pytest.raises(
+        remote.RecoveryProbeError,
+        match="^recovery_probe_anonymous_secret_invalid$",
+    ):
+        remote._validate_anonymous_descriptor(11)
+
+
+def test_anonymous_descriptor_closes_partial_memfd_after_validation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_anonymous_descriptor_flags(monkeypatch)
+    monkeypatch.setattr(remote.sys, "platform", "linux")
+    monkeypatch.setattr(
+        remote.os,
+        "memfd_create",
+        lambda *_args, **_kwargs: 11,
+        raising=False,
+    )
+    monkeypatch.setattr(remote.os, "set_inheritable", lambda *_args: None)
+    monkeypatch.setattr(remote.os, "fchmod", lambda *_args: None)
+    monkeypatch.setattr(
+        remote.os,
+        "fstat",
+        lambda _descriptor: _anonymous_stat(nlink=1),
+    )
+    monkeypatch.setattr(remote.os, "get_inheritable", lambda _descriptor: False)
+    closed: list[int] = []
+    monkeypatch.setattr(remote.os, "close", closed.append)
+
+    with pytest.raises(
+        remote.RecoveryProbeError,
+        match="^recovery_probe_anonymous_secret_invalid$",
+    ):
+        remote._anonymous_descriptor("recovery-secret")
+
+    assert closed == [11]
+
+
+def test_wipe_descriptor_overwrites_truncates_and_closes() -> None:
+    descriptor = _test_anonymous_descriptor("recovery-secret")
+    observer = os.dup(descriptor)
+    try:
+        os.write(descriptor, b"sensitive-material")
+        remote._wipe_descriptor(descriptor)
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        assert os.fstat(observer).st_size == 0
+    finally:
+        os.close(observer)
 
 
 def _psql_environment(

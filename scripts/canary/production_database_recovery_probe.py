@@ -9,7 +9,7 @@ transaction against the provider-read-back scratch private address.
 
 The PostgreSQL password is never accepted through argv or an environment
 variable.  It exists only in the received mutable frame and an anonymous
-``memfd`` used as ``PGPASSFILE``; both are overwritten before return.  psql
+descriptor used as ``PGPASSFILE``; both are overwritten before return.  psql
 stderr is discarded and stdout is read with a hard byte bound.
 """
 
@@ -59,6 +59,7 @@ EXPECTED_PRIVATE_IP = "10.90.0.2"
 TLS_MODE = "verify-ca"
 DATABASE_USER = "postgres"
 DATABASE_PORT = "5432"
+ANONYMOUS_SECRET_DIRECTORY = Path("/run")
 
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -540,24 +541,117 @@ def _validate_frame_metadata(
     return str(private_ip), str(ca_pem)
 
 
-def _anonymous_descriptor(label: str) -> int:
-    creator = getattr(os, "memfd_create", None)
-    if not callable(creator) or not sys.platform.startswith("linux"):
-        raise RecoveryProbeError("recovery_probe_anonymous_secret_unavailable")
+def _validate_anonymous_descriptor(descriptor: int) -> None:
     try:
-        descriptor = creator(label, flags=getattr(os, "MFD_CLOEXEC", 0))
+        os.set_inheritable(descriptor, False)
         os.fchmod(descriptor, 0o600)
         observed = os.fstat(descriptor)
-    except OSError as exc:
-        raise RecoveryProbeError("recovery_probe_anonymous_secret_unavailable") from exc
-    if (
-        not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 0
-        or stat.S_IMODE(observed.st_mode) != 0o600
-    ):
-        os.close(descriptor)
-        raise RecoveryProbeError("recovery_probe_anonymous_secret_invalid")
-    return descriptor
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 0
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or os.get_inheritable(descriptor)
+        ):
+            raise RecoveryProbeError("recovery_probe_anonymous_secret_invalid")
+    except RecoveryProbeError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise RecoveryProbeError(
+            "recovery_probe_anonymous_secret_unavailable"
+        ) from exc
+
+
+def _anonymous_directory_flags() -> int:
+    required = (
+        getattr(os, "O_CLOEXEC", 0),
+        getattr(os, "O_DIRECTORY", 0),
+        getattr(os, "O_NOFOLLOW", 0),
+    )
+    if any(type(flag) is not int or flag == 0 for flag in required):
+        raise RecoveryProbeError("recovery_probe_anonymous_secret_unavailable")
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _open_anonymous_tmpfile() -> int:
+    required = (
+        getattr(os, "O_CLOEXEC", 0),
+        getattr(os, "O_EXCL", 0),
+        getattr(os, "O_TMPFILE", 0),
+    )
+    if any(type(flag) is not int or flag == 0 for flag in required):
+        raise RecoveryProbeError("recovery_probe_anonymous_secret_unavailable")
+
+    directory_descriptor: int | None = None
+    descriptor: int | None = None
+    succeeded = False
+    try:
+        directory_descriptor = os.open(
+            ANONYMOUS_SECRET_DIRECTORY,
+            _anonymous_directory_flags(),
+        )
+        directory = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != 0
+            or directory.st_gid != 0
+            or stat.S_IMODE(directory.st_mode) & 0o022
+            or os.get_inheritable(directory_descriptor)
+        ):
+            raise RecoveryProbeError("recovery_probe_anonymous_secret_invalid")
+        descriptor = os.open(
+            ".",
+            os.O_RDWR | os.O_CLOEXEC | os.O_EXCL | os.O_TMPFILE,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        _validate_anonymous_descriptor(descriptor)
+        succeeded = True
+        return descriptor
+    except RecoveryProbeError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise RecoveryProbeError(
+            "recovery_probe_anonymous_secret_unavailable"
+        ) from exc
+    finally:
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError:
+                pass
+        if descriptor is not None and not succeeded:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _anonymous_descriptor(label: str) -> int:
+    if not sys.platform.startswith("linux"):
+        raise RecoveryProbeError("recovery_probe_anonymous_secret_unavailable")
+    creator = getattr(os, "memfd_create", None)
+    if not callable(creator):
+        return _open_anonymous_tmpfile()
+
+    descriptor: int | None = None
+    succeeded = False
+    try:
+        descriptor = creator(label, flags=getattr(os, "MFD_CLOEXEC", 0))
+        _validate_anonymous_descriptor(descriptor)
+        succeeded = True
+        return descriptor
+    except RecoveryProbeError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise RecoveryProbeError(
+            "recovery_probe_anonymous_secret_unavailable"
+        ) from exc
+    finally:
+        if descriptor is not None and not succeeded:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _write_all(descriptor: int, value: bytearray | bytes) -> None:
