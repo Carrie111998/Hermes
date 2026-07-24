@@ -26,8 +26,8 @@ terminal:
 # d'auto-activation de gateway/config.py (is_connected → True). Pour PAUSER WhatsApp,
 # il faut recommenter TOUT ce bloc ET retirer `- whatsapp` de gateway.platforms.
 # Poste fermé par défaut : group_policy=allowlist SANS JID => aucun groupe traité tant
-# que group_allow_from n'est pas rempli (sécurité). L'allowlist DM vient de la var
-# Railway WHATSAPP_ALLOWED_USERS (=33609152093, le perso de Gilles, pour piloter en DM).
+# que group_allow_from n'est pas rempli (sécurité). L'allowlist DM vient de
+# whatsapp.allow_from ci-dessous (voir le commentaire sous dm_policy).
 whatsapp:
   group_policy: "allowlist"
   group_allow_from:
@@ -39,7 +39,15 @@ whatsapp:
     - "@pippa"                        # le bot s'appelle Pippa
   free_response_chats:               # groupes où TOUT message = une demande (sans @mention)
     - "120363426647005883@g.us"      # Test Pippa (groupe de test → réponse à tout message)
-  dm_policy: "allowlist"             # allow_from fourni par WHATSAPP_ALLOWED_USERS (var Railway)
+  dm_policy: "allowlist"             # ⚠️ allow_from ci-dessous est OBLIGATOIRE : la porte DM du
+                                     # gateway (_is_dm_allowed) lit whatsapp.allow_from → config.extra
+                                     # SEULEMENT. La var Railway WHATSAPP_ALLOWED_USERS ne nourrit QUE
+                                     # l'allowlist du pont Node, jamais cette porte (aucun pont env→extra
+                                     # WhatsApp dans gateway/config.py). Sans ceci, tout DM est rejeté
+                                     # en silence (le groupe marche car group_allow_from est rempli).
+  allow_from:
+    - "33609152093"                  # Gilles — numéro perso
+    - "159180145049752"              # Gilles — LID (forme réelle d'arrivée des DM WhatsApp)
 
 compression:
   enabled: true
