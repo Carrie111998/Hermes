@@ -164,3 +164,7 @@ class ObsidianIndex:
                     self.delete_note(rel)
                     summary["deleted"] += 1
             return summary
+
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()

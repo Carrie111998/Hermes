@@ -11,13 +11,14 @@ _FRONTMATTER = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 
 
-def _strip_frontmatter(text: str) -> str:
+def strip_frontmatter(text: str) -> str:
+    """Return markdown without a leading YAML frontmatter block."""
     return _FRONTMATTER.sub("", text, count=1)
 
 
 def chunk_markdown(text: str) -> "list[Chunk]":
     """Dela en not i chunks per rubrik. Frontmatter strippas."""
-    body = _strip_frontmatter(text or "")
+    body = strip_frontmatter(text or "")
     chunks: list[Chunk] = []
     cur_trail = ""
     cur_lines: list[str] = []

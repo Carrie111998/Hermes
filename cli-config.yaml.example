@@ -669,11 +669,14 @@ memory:
   # under HERMES_HOME).
   # provider: obsidian   # enable the Obsidian provider
 
-# obsidian:
-#   vault_path: "/srv/dj/obsidian"
-#   top_k: 5
-#   # exclude_dirs: [".git", ".obsidian", ".trash"]
-#   # pinned: ["memory/core.md", "memory/daniel.md"]   # Phase B: always-on core
+# Provider-specific settings live under plugins.<provider>.
+# plugins:
+#   obsidian:
+#     vault_path: "/srv/dj/obsidian"
+#     top_k: 5
+#     sync_interval_minutes: 5   # 0 disables background re-indexing
+#     # exclude_dirs: [".git", ".obsidian", ".trash"]
+#     # pinned: ["memory/daniel.md"]   # static hot-core, loaded once per session
 
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
