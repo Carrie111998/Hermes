@@ -8,7 +8,8 @@ desktop, Tailscale Serve, and cron-sidecar scripts.
 | Script | Purpose |
 |--------|---------|
 | `scripts/windows/restart-hermes-stack.ps1` | Idempotent restart; **skips llama** unless `-StartLlama` |
-| `scripts/windows/start-hermes-gateway.ps1` | Messaging gateway (:8787) |
+| `scripts/windows/start-hermes-gateway.ps1` | Messaging gateway (does **not** bind :8787; use `hermes gateway status`) |
+| `scripts/windows/start-hermes-webui.ps1` | Hermes-WebUI (:8787, `HERMES_WEBUI_PORT`) |
 | `scripts/windows/start-hermes-dashboard.ps1` | Dashboard UI (:9120) |
 | `scripts/windows/start-hermes-desktop.ps1` | Launch desktop (`hermes desktop --source`) |
 | `scripts/windows/check-local-llm.ps1` | llama.cpp health on :8080/:8081 |
@@ -27,7 +28,7 @@ Config script: `%LOCALAPPDATA%\HermesWebUI\Update-HermesTailscaleServe.ps1`
 
 Typical routes on `https://<machine>.ts.net`:
 
-- `/` → gateway `127.0.0.1:8787`
+- `/` → Hermes-WebUI `127.0.0.1:8787`
 - `/line` → LINE webhook `127.0.0.1:8646`
 - `/v1`, `/llama/v1` → local LLM proxy (often `127.0.0.1:8081`)
 

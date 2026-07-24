@@ -11,7 +11,7 @@
 
 | Port | Service |
 |------|---------|
-| 8787 | Messaging gateway |
+| 8787 | Hermes-WebUI (`HERMES_WEBUI_PORT` / `start-hermes-webui.ps1`) — **not** the messaging gateway |
 | 9118 | Go watchdog managed prewarm `hermes serve` (not Desktop's default) |
 | 9119 | Desktop / `hermes serve` (headless backend) |
 | 9120 | `hermes dashboard` |
@@ -19,6 +19,8 @@
 | 8080 / 8081 | llama.cpp / proxy (optional; restart only with `-StartLlama`) |
 | 8646 | LINE ngrok/webhook helper |
 | 3001 | FreeLLMAPI local proxy |
+
+Messaging gateway (`start-hermes-gateway.ps1` / `hermes gateway`) is a **separate process** and does **not** bind to 8787. Check liveness with `hermes gateway status`, not by probing `:8787`.
 
 ## Go watchdog restart notes
 

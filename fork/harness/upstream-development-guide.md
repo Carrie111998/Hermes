@@ -1395,7 +1395,7 @@ them into invariants before re-requesting review.
 - `openclaw-vendor`, `book-to-skill`, `freebuff`, `worldmonitor-osint`, and `aituber-kit`: enable in `plugins.enabled`; install via `hermes … install` / `hermes … setup`.
 - AI-Scientist vendor sync: `py -3 scripts/sync_ai_scientist_vendor.py --execute` (preserves `nc_kan` / `hermes_self_evolve` templates).
 - Self-improver profile lives at `~/.hermes/profiles/self-improver/` (curator / weekly review workflows).
-- Windows ops: gateway can lock `agent.log` (rollover tolerates `PermissionError`); stack restart via `scripts/windows/restart-hermes-stack.ps1` (llama skipped unless `-StartLlama`); ports `:8787` gateway, `:9119` `hermes serve`, `:9120` dashboard.
+- Windows ops: gateway can lock `agent.log` (rollover tolerates `PermissionError`); stack restart via `scripts/windows/restart-hermes-stack.ps1` (llama skipped unless `-StartLlama`); ports `:8787` Hermes-WebUI (not messaging gateway), `:9119` `hermes serve`, `:9120` dashboard.
 - Desktop: session transcript bleed fixes in `use-message-stream.ts`, `use-session-state-cache.ts`, `use-session-actions.ts`; backend `HERMES_WEB_DIST` must be `hermes_cli/web_dist` via `resolveDashboardWebDist()` in `apps/desktop/electron/main.ts`.
 - Memory tooling: `sync_memory.py` (gateway sessions → Ebbinghaus → Obsidian); `scripts/obsidian_memory_graph.py` → `output/obsidian-memory-graph.html` (multi-vault wikilink/`#tag` 3D graph; WebXR needs HTTP). Static serve: Go `tools/memory-graph-server` → `bin/memory-graph-server.exe` on `:8765` via `scripts/windows/start-obsidian-memory-graph-server.ps1`.
 - Plugin tool handlers must accept `task_id` (or `**kwargs`).
