@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from agent.beta.chief_profile import ChiefProfile
 from agent.beta.consolidation import ConsolidatedResponse, consolidate_results
@@ -30,6 +31,15 @@ class ExecutedAction(BaseModel):
     evidence: str
 
 
+class ExecutorConfirmation(BaseModel):
+    """Structured confirmation returned by an operation executor."""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: str
+    evidence: str
+
+
 class BetaRun(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -41,6 +51,13 @@ class BetaRun(BaseModel):
     approval_receipts: tuple[ApprovalReceipt, ...] = ()
     executed_actions: tuple[ExecutedAction, ...] = ()
     chief_profile_revision: int = 0
+
+
+_FAILURE_EVIDENCE = re.compile(
+    r"\b(fail(?:ed|ure)?|error|timeout|timed\s*out|denied|unable|exception|rollback)\b",
+    re.IGNORECASE,
+)
+_SUCCESS_STATUSES = frozenset({"completed", "success", "succeeded", "ok"})
 
 
 def _qa_validator(
@@ -105,11 +122,49 @@ def _recommended_operations(request: str, response: ConsolidatedResponse) -> tup
     return tuple(operations)
 
 
+def _parse_executor_confirmation(raw: Any) -> tuple[str, str]:
+    """Return a fail-closed execution status and normalized evidence."""
+    if raw is None:
+        return "failed", "executor returned no usable execution evidence"
+
+    payload: Any = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return "failed", "executor returned no usable execution evidence"
+        if text.startswith("{"):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                return "failed", "executor returned malformed structured confirmation"
+        else:
+            if _FAILURE_EVIDENCE.search(text):
+                return "failed", text
+            return "completed", text
+
+    if isinstance(payload, Mapping):
+        try:
+            confirmation = ExecutorConfirmation.model_validate(payload)
+        except ValidationError as exc:
+            return "failed", f"executor returned invalid structured confirmation: {exc.errors()[0]['msg']}"
+        status = confirmation.status.strip().lower()
+        evidence = confirmation.evidence.strip()
+        if not evidence:
+            return "failed", "executor returned no usable execution evidence"
+        if status not in _SUCCESS_STATUSES:
+            return "failed", evidence
+        if _FAILURE_EVIDENCE.search(evidence):
+            return "failed", evidence
+        return "completed", evidence
+
+    return "failed", "executor returned unsupported confirmation type"
+
+
 def _execute_approved(
     operations: tuple[Operation, ...],
     receipts: dict[str, ApprovalReceipt],
     gate: ApprovalGate,
-    executor: Callable[[Operation], str] | None,
+    executor: Callable[[Operation], Any] | None,
 ) -> tuple[ExecutedAction, ...]:
     if executor is None:
         return ()
@@ -119,20 +174,11 @@ def _execute_approved(
         if not gate.authorized(operation, receipt):
             continue
         try:
-            raw_evidence = executor(operation)
-            evidence = "" if raw_evidence is None else str(raw_evidence).strip()
-            if not evidence:
-                executed.append(ExecutedAction(
-                    operation_fingerprint=operation.fingerprint,
-                    action=operation.action,
-                    status="failed",
-                    evidence="executor returned no usable execution evidence",
-                ))
-                continue
+            status, evidence = _parse_executor_confirmation(executor(operation))
             executed.append(ExecutedAction(
                 operation_fingerprint=operation.fingerprint,
                 action=operation.action,
-                status="completed",
+                status=status,
                 evidence=evidence,
             ))
         except Exception as exc:
@@ -203,7 +249,7 @@ def _reconcile_approved_without_executor(
     response: ConsolidatedResponse,
     operations: tuple[Operation, ...],
     authorized_fingerprints: set[str],
-    executor: Callable[[Operation], str] | None,
+    executor: Callable[[Operation], Any] | None,
 ) -> ConsolidatedResponse:
     """Represent approval as complete without claiming that execution occurred."""
     if executor is not None or not operations:
@@ -222,7 +268,7 @@ def orchestrate_request(
     parent_agent: Any,
     *,
     delegate: Callable[..., str] | None = None,
-    executor: Callable[[Operation], str] | None = None,
+    executor: Callable[[Operation], Any] | None = None,
     registry: SpecialistRegistry | None = None,
     approval_gate: ApprovalGate | None = None,
     approval_receipts: dict[str, ApprovalReceipt] | None = None,
