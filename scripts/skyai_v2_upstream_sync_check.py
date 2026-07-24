@@ -23,10 +23,10 @@ ALLOWED_PREFIXES = (
     "tests/plugins/test_skyai_customer_",
     "tests/scripts/test_skyai_v2_bootstrap_dev_profile.py",
     "tests/scripts/test_skyai_v2_compare_matrix.py",
-    "tests/scripts/test_skyai_v2_upstream_sync_check.py",
+    "tests/scripts/test_skyai_v2_upstream_sync_",
     "scripts/skyai_v2_bootstrap_dev_profile.py",
     "scripts/skyai_v2_compare_matrix.py",
-    "scripts/skyai_v2_upstream_sync_check.py",
+    "scripts/skyai_v2_upstream_sync_",
     "scripts/skyai_voice_",
 )
 

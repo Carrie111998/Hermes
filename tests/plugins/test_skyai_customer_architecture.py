@@ -22,7 +22,8 @@ def test_architecture_contract_declares_hermes_led_reasoning() -> None:
     assert "Keyword classifiers, synthetic response templates" in compact
     assert "wire compatibility only" in compact
     assert "Plugin vs Fork" in text
-    assert "Daily Upstream Hermes Update Flow" in text
+    assert "Three-Hour Upstream Hermes Update Flow" in text
+    assert "must not auto-merge or deploy" in compact
 
 
 def test_skyai_prompt_is_principle_based_not_script_pack() -> None:

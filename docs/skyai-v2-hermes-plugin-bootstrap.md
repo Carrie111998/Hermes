@@ -104,9 +104,23 @@ MVP is in DEV. Voice threads are intentionally marked separately, for example
 `🧪 TEST · 🎙️ Voice SkyAI · <conversation_id>`, so web/FAB and voice evidence
 can live in `1510888721614901358` without being confused.
 
-## Daily Upstream Sync Policy
+## Three-Hour Upstream Sync Policy
 
-Run daily after fetching `NousResearch/hermes-agent`:
+The deterministic upstream-sync rail is documented in
+`docs/skyai-v2-upstream-sync-automation.md`. Its default mode is read-only:
+
+```bash
+python3 scripts/skyai_v2_upstream_sync_routine.py
+```
+
+The scheduled mode may build/test and push one fork-only candidate PR:
+
+```bash
+python3 scripts/skyai_v2_upstream_sync_routine.py --execute --push-pr
+```
+
+It runs every three hours and never auto-merges or deploys. For a manual
+verification after fetching `NousResearch/hermes-agent`:
 
 ```bash
 git fetch origin --prune
@@ -125,3 +139,7 @@ rg -n "^(<<<<<<<|>>>>>>>)" -S . -g '!node_modules' -g '!venv' -g '!.venv'
 The sync check must stay green before any DEV or PROD canary work. If it fails,
 SkyAI v2 has started touching Hermes core and needs a separate architecture
 review before merge.
+
+The recurring rail also stops on dirty canonical state, unknown merge
+conflicts, concurrent execution, or any failed SkyAI/voice/architecture/schema
+test. Runtime deployment remains a separate explicit gate.

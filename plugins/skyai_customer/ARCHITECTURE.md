@@ -145,11 +145,13 @@ The 17 QA problems are training/evaluation material. They should become:
 - v2 vs v1 comparison rows;
 - no runtime keyword guards.
 
-### Gate 4: Daily Upstream Hermes Update Flow
+### Gate 4: Three-Hour Upstream Hermes Update Flow
 
-SkyAI v2 should stay close to upstream `NousResearch/hermes-agent`.
+SkyAI v2 should stay close to upstream `NousResearch/hermes-agent`. The
+mechanical automation may fetch, build/test an isolated candidate, and create
+or update one fork-only candidate PR. It must not auto-merge or deploy.
 
-Daily workflow:
+Manual catch-up workflow:
 
 1. Fetch upstream:
    `git fetch upstream main`
@@ -170,6 +172,13 @@ Daily workflow:
    - any conflict or manual resolution.
 6. Run targeted SkyAI tests and v2 comparison matrix.
 7. Do not deploy automatically. Deploy remains a separate explicit gate.
+
+The recurring implementation is
+`scripts/skyai_v2_upstream_sync_routine.py` and is documented in
+`docs/skyai-v2-upstream-sync-automation.md`. It runs every three hours,
+fails closed on dirty state, unknown conflicts, or failing verification, and
+never interprets customer meaning. The rolling automation branch is not the
+canonical source until a separate integration gate accepts it.
 
 ## Plugin vs Fork
 
