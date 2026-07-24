@@ -283,6 +283,9 @@ def _generate_init_script(
             "cd /",
             "umount -l /.oldroot",
             "rmdir /.oldroot",
+            # The tmpfs root starts writable so the jail can be assembled.
+            # Freeze it after pivot; /work remains its own writable bind mount.
+            "mount -o remount,ro /",
             "exec /venv/bin/python -I /script.py",
             "",
         ]
@@ -509,7 +512,7 @@ def _prune_runs(root: Path, config: Mapping[str, Any]) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _kill_group(proc: subprocess.Popen, grace: float = 5.0) -> None:
+def _kill_group(proc: subprocess.Popen, grace: float = 0.5) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
@@ -520,6 +523,10 @@ def _kill_group(proc: subprocess.Popen, grace: float = 5.0) -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             pass
 
 
