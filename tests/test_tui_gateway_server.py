@@ -13056,6 +13056,8 @@ def _fake_tts_modules(monkeypatch, *, requirements=True, playback_stops=None, li
         types.SimpleNamespace(
             check_tts_requirements=lambda: requirements,
             stream_tts_to_speaker=fake_stream,
+            _get_provider=lambda cfg: "edge",
+            get_env_value=lambda key, default="": default,
         ),
     )
     monkeypatch.setitem(
@@ -13187,7 +13189,7 @@ def test_tts_stream_vad_barge_in_cuts_pipeline_and_submits_capture(monkeypatch, 
     with server._tts_stream_lock:
         state = server._tts_stream_state
     assert state is not None
-    assert state["stop"].wait(2.0)
+    assert state["stop"].wait(5.0)  # grace period (2s) + fake_listen + margin
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and wav.exists():
         time.sleep(0.01)  # unlink (finally) runs after the transcript emit
