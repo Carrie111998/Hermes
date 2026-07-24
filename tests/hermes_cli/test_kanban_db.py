@@ -876,6 +876,22 @@ def _exited_status(code: int) -> int:
     return code << 8
 
 
+# Worker-exit classification and zombie reaping are POSIX-only: they rest on
+# os.WIFEXITED/WEXITSTATUS/WTERMSIG and os.waitpid(-1, WNOHANG), none of which
+# exist on Windows. The product knows this and degrades deliberately —
+# _classify_worker_exit wraps the WIFEXITED branch in `except Exception: pass`
+# and falls through to ("unknown", None), and Windows has no POSIX zombies to
+# reap. So these tests encode POSIX semantics and cannot hold here; they are
+# skipped rather than "fixed", because there is no defect on either side.
+# Gate on the capability, not on os.name, so any platform providing the wait
+# macros still runs them.
+_posix_wait_only = pytest.mark.skipif(
+    not hasattr(os, "WIFEXITED"),
+    reason="POSIX wait-status macros (os.WIFEXITED/waitpid) unavailable on this platform",
+)
+
+
+@_posix_wait_only
 def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     import hermes_cli.kanban_db as _kb
 
@@ -890,6 +906,7 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
+@_posix_wait_only
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
@@ -2158,8 +2175,11 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         check=True,
         capture_output=True,
         text=True,
-    ).stdout
-    assert f"worktree {expected}" in listed
+    ).stdout.replace("\\", "/")
+    # git prints POSIX separators even on Windows, where pathlib renders
+    # backslashes — compare both sides in POSIX form or this passes only on
+    # POSIX hosts.
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{t}" in listed
 
 
@@ -2242,8 +2262,9 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         check=True,
         capture_output=True,
         text=True,
-    ).stdout
-    assert f"worktree {target}" in listed
+    ).stdout.replace("\\", "/")
+    # POSIX-form comparison: see the note in the repo-root-anchor test above.
+    assert f"worktree {Path(target).as_posix()}" in listed
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -2281,8 +2302,9 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         check=True,
         capture_output=True,
         text=True,
-    ).stdout
-    assert f"worktree {expected}" in listed
+    ).stdout.replace("\\", "/")
+    # POSIX-form comparison: see the note in the repo-root-anchor test above.
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
@@ -2340,9 +2362,10 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         check=True,
         capture_output=True,
         text=True,
-    ).stdout
-    assert listed.count(f"worktree {expected}\n") == 1
-    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    ).stdout.replace("\\", "/")
+    # POSIX-form comparison: see the note in the repo-root-anchor test above.
+    assert listed.count(f"worktree {expected.as_posix()}\n") == 1
+    assert f"worktree {expected.as_posix()}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
 
 
@@ -3443,6 +3466,10 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX executable semantics: creates an extensionless chmod+x `hermes`, which Windows can never resolve — _path_search_names only tries PATHEXT suffixes there",
+)
 def test_resolve_hermes_argv_prefers_path_shim(monkeypatch):
     """When `hermes` is on PATH, use the shim — preserves familiar ps output."""
     import shutil
@@ -3495,6 +3522,10 @@ def test_resolve_hermes_argv_honors_hermes_bin_path_override(monkeypatch, tmp_pa
     assert kb._resolve_hermes_argv() == [str(shim)]
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX executable semantics: creates an extensionless chmod+x `hermes`, which Windows can never resolve — _path_search_names only tries PATHEXT suffixes there",
+)
 def test_resolve_hermes_argv_hermes_bin_bare_name_uses_path(monkeypatch, tmp_path):
     """Bare HERMES_BIN values keep PATH semantics instead of cwd shadowing."""
     import stat
@@ -3568,6 +3599,12 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    # Stubbing shutil.which only covers the POSIX branch: on Windows
+    # _resolve_hermes_argv calls _safe_which_no_cwd, which reads $PATH
+    # directly, so the stub is inert and a real installed hermes.EXE on the
+    # developer's PATH gets picked up instead of the module fallback. Empty
+    # PATH closes that branch too, making the test hold on both platforms.
+    monkeypatch.setenv("PATH", "")
     monkeypatch.setattr(shutil, "which", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
@@ -4749,6 +4786,7 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@_posix_wait_only
 def test_reap_worker_zombies_returns_count():
     """reap_worker_zombies() returns the list of reaped PIDs."""
     from unittest.mock import patch
@@ -4789,6 +4827,7 @@ def test_reap_worker_zombies_noop_no_children():
     assert result == []
 
 
+@_posix_wait_only
 def test_reap_worker_zombies_records_exit_status():
     """reap_worker_zombies() calls _record_worker_exit for each reaped pid."""
     from unittest.mock import patch
@@ -4821,6 +4860,7 @@ def test_reap_worker_zombies_handles_waitpid_os_error():
     assert result == []
 
 
+@_posix_wait_only
 def test_zombie_reaper_runs_despite_board_connect_failure():
     """reap_worker_zombies runs even when a board tick raises an error."""
     from unittest.mock import patch
@@ -4847,6 +4887,7 @@ def test_zombie_reaper_runs_despite_board_connect_failure():
     assert pids == [12345, 67890]
 
 
+@_posix_wait_only
 def test_zombie_reaper_survives_all_boards_failing():
     """reap_worker_zombies runs each tick regardless of board tick failures."""
     from unittest.mock import patch
@@ -4878,6 +4919,7 @@ def test_zombie_reaper_survives_all_boards_failing():
     assert total_reaped == 10
 
 
+@_posix_wait_only
 def test_dispatch_once_still_reaps_via_extracted_fn(kanban_home):
     """The reaper inside dispatch_once still works after refactor to reap_worker_zombies()."""
     from unittest.mock import patch

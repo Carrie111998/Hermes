@@ -471,7 +471,13 @@ def test_daemon_keeps_going_after_tick_exception(kanban_home, monkeypatch):
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    time.sleep(0.3)
+    # Poll for the condition instead of sleeping a fixed 0.3s. The point of the
+    # test is that the loop SURVIVES a raising tick, not how fast it gets there:
+    # a 0.05s interval clears 2 ticks in 0.3s only on an unloaded machine, so
+    # the fixed sleep made this fail as `assert 1 >= 2` under load.
+    deadline = time.monotonic() + 10.0
+    while calls[0] < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
     stop.set()
     t.join(timeout=2.0)
     # At minimum, second-tick+ should have run.
@@ -3814,7 +3820,12 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     def _monotonic_for_gateway_dispatcher():
         caller = inspect.currentframe().f_back  # type: ignore[union-attr]
         code = caller.f_code if caller is not None else None
-        filename = code.co_filename if code is not None else ""
+        # co_filename uses the host separator, so normalise before matching:
+        # on Windows this is ...\gateway\run.py and the POSIX-shaped suffixes
+        # below never matched, leaving the mock inert. Real monotonic time then
+        # kept the quarantine timer from expiring, so the dispatcher never
+        # retried the board and only one corruption message was logged.
+        filename = (code.co_filename if code is not None else "").replace("\\", "/")
         # The kanban dispatcher/notifier watcher loops were extracted from
         # gateway/run.py into gateway/kanban_watchers.py (god-file Phase 3),
         # so accept either filename for the time-travel mock.
@@ -4428,6 +4439,20 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
         _kb._pid_alive = original_alive
 
 
+# These drive crash detection with POSIX wait-status integers (see the
+# W_EXITCODE notes on the helpers below) and assert on the "protocol
+# violation" classification, which kanban_db derives via
+# _classify_worker_exit -> os.WIFEXITED/WEXITSTATUS. Those macros do not
+# exist on Windows, where the product deliberately degrades to
+# ("unknown", None) — so the violation reads as a generic crash and the
+# task blocks instead of retrying. Nothing is broken on either side;
+# the semantics simply are not expressible off POSIX.
+_posix_wait_only = pytest.mark.skipif(
+    not hasattr(os, "WIFEXITED"),
+    reason="POSIX wait-status macros (os.WIFEXITED) unavailable on this platform",
+)
+
+
 def _drive_protocol_violation(conn, tid, fake_pid):
     """One clean-exit protocol violation reaper pass for ``tid``.
 
@@ -4444,6 +4469,7 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
+@_posix_wait_only
 def test_detect_crashed_workers_protocol_violation_first_occurrence_retries(kanban_home):
     """A first clean-exit protocol violation gets a retry, not a block.
 
@@ -4490,6 +4516,7 @@ def test_detect_crashed_workers_protocol_violation_first_occurrence_retries(kanb
         conn.close()
 
 
+@_posix_wait_only
 def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_home):
     """The violation streak trips the terminal path exactly at the bound.
 
@@ -4531,6 +4558,7 @@ def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_
         conn.close()
 
 
+@_posix_wait_only
 def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
     """Mixed failure kinds must not consume the violation retry budget.
 
@@ -4579,6 +4607,7 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         conn.close()
 
 
+@_posix_wait_only
 def test_protocol_violation_streak_resets_on_other_failure_kind(kanban_home):
     """A non-violation failure between violations resets the streak.
 
@@ -4613,6 +4642,7 @@ def test_protocol_violation_streak_resets_on_other_failure_kind(kanban_home):
         conn.close()
 
 
+@_posix_wait_only
 def test_protocol_violation_respects_max_retries_precedence(kanban_home):
     """Per-task ``max_retries`` overrides the violation bound, both ways.
 
