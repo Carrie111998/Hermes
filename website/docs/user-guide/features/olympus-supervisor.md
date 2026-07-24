@@ -98,7 +98,7 @@ never executes a resume plan.
 
 ```bash
 hermes olympus-supervisor run --board olympus --max-cycles 20 --max-cycle-cost-usd 0 --max-cycle-tokens 0 --json
-hermes olympus-supervisor run-once
+hermes olympus-supervisor --board olympus run-once --max-cycle-cost-usd 0 --max-cycle-tokens 0 --json
 hermes olympus-supervisor inspect
 hermes olympus-supervisor queue
 hermes olympus-supervisor explain-next
@@ -130,6 +130,16 @@ remain in force:
 ```bash
 hermes olympus-supervisor run --board olympus --max-cycles 20 --json
 ```
+
+`run-once` executes one cycle only and requires both budget options explicitly.
+The cost ceiling must be finite, non-negative, and no greater than the
+configured `max_cycle_estimated_cost_usd`. The token ceiling must be an integer
+from 0 through 1,000,000,000 and no greater than the configured
+`max_cycle_estimated_tokens`. Boolean-like, malformed, negative, NaN, and
+infinite values are rejected. A zero/zero run remains strictly observational:
+tasks with nonzero or missing cost/token estimates are blocked from the
+prepared recommendation. These one-cycle limits are recorded in the checkpoint
+without creating or advancing short-soak state.
 
 `queue` and `explain-next` are fresh read-only evaluations. `resume` only
 clears the stop control; it does not start a cycle. Every action supports

@@ -223,6 +223,18 @@ def _supervisor(board, **kwargs) -> OlympusSupervisor:
     )
 
 
+def _run_once(
+    supervisor: OlympusSupervisor,
+    *,
+    max_cycle_cost_usd=0,
+    max_cycle_tokens=0,
+) -> dict:
+    return supervisor.run_once(
+        max_cycle_cost_usd=max_cycle_cost_usd,
+        max_cycle_tokens=max_cycle_tokens,
+    )
+
+
 def _reason_codes(item) -> set[str]:
     return {reason["code"] for reason in item["reasons"]}
 
@@ -357,7 +369,7 @@ def test_pending_approval_is_projected_and_drafted_without_consumption(board):
         body=_metadata(board["clock"], approval_required=True),
     )
     supervisor = _supervisor(board)
-    checkpoint = supervisor.run_once()
+    checkpoint = _run_once(supervisor)
 
     assert checkpoint["status"] == "blocked"
     assert checkpoint["pending_operator_decisions"] == [
@@ -649,7 +661,7 @@ def test_duplicate_supervisor_is_refused_even_without_live_lock(board):
     )
 
     with pytest.raises(DuplicateSupervisorError):
-        supervisor.run_once()
+        _run_once(supervisor)
     with pytest.raises(DuplicateSupervisorError):
         supervisor.run_forever(max_cycles=1)
 
@@ -662,15 +674,15 @@ def test_malformed_supervisor_lease_fails_closed(board):
     )
 
     with pytest.raises(OlympusSupervisorError, match="malformed_state"):
-        supervisor.run_once()
+        _run_once(supervisor)
 
 
 def test_restart_from_checkpoint_preserves_generation_and_suppresses_action(board):
     task_id = _write_task(board, title="candidate")
     first_supervisor = _supervisor(board)
-    first = first_supervisor.run_once()
+    first = _run_once(first_supervisor)
     second_supervisor = _supervisor(board)
-    second = second_supervisor.run_once()
+    second = _run_once(second_supervisor)
 
     assert second["completed_cycles"] == 2
     assert second["generation"] == first["generation"]
@@ -774,7 +786,7 @@ def test_successful_cycle_resets_persisted_failure_count(board):
 def test_checkpoint_drift_is_refused(board):
     supervisor = _supervisor(board)
     _write_task(board, title="candidate")
-    checkpoint = supervisor.run_once()
+    checkpoint = _run_once(supervisor)
     checkpoint["restart_checkpoint"]["generation"] += 1
     supervisor.store.write_json(supervisor.store.checkpoint_path, checkpoint)
 
@@ -800,7 +812,7 @@ def test_queue_drift_during_cycle_refuses_checkpoint(board):
 
     supervisor = _supervisor(board, stage_hook=mutate_after_snapshot)
     with pytest.raises(QueueDriftError):
-        supervisor.run_once()
+        _run_once(supervisor)
     assert not supervisor.store.checkpoint_path.exists()
 
 
@@ -873,14 +885,14 @@ def test_semantic_queue_identity_is_stable_under_operational_churn(board):
 
 def test_semantic_queue_identity_changes_on_real_queue_mutation(board):
     task_id = _write_task(board, title="candidate", priority=1)
-    first = _supervisor(board).run_once()
+    first = _run_once(_supervisor(board))
     conn = kb.connect(board["db_path"])
     try:
         conn.execute("UPDATE tasks SET priority = 9 WHERE id = ?", (task_id,))
         conn.commit()
     finally:
         conn.close()
-    second = _supervisor(board).run_once()
+    second = _run_once(_supervisor(board))
 
     assert second["semantic_queue_identity"] != first["semantic_queue_identity"]
     assert second["generation"] == first["generation"] + 1
@@ -889,9 +901,9 @@ def test_semantic_queue_identity_changes_on_real_queue_mutation(board):
 def test_duplicate_action_and_telegram_recommendation_are_suppressed(board):
     _write_task(board, title="candidate", priority=100)
     supervisor = _supervisor(board)
-    first = supervisor.run_once()
+    first = _run_once(supervisor)
     _write_task(board, title="lower priority queue change", priority=0)
-    second = supervisor.run_once()
+    second = _run_once(supervisor)
 
     recommendations = [
         item for item in _outbox(supervisor) if item["type"] == "new_recommended_task"
@@ -962,9 +974,9 @@ def test_stale_job_telegram_draft_ignores_changing_age(board):
         conn.close()
 
     supervisor = _supervisor(board, settings=_settings(stale_job_seconds=100))
-    supervisor.run_once()
+    _run_once(supervisor)
     board["clock"].value += 10
-    supervisor.run_once()
+    _run_once(supervisor)
 
     drafts = [
         item for item in _outbox(supervisor) if item["type"] == "stale_provider_job"
@@ -1046,7 +1058,7 @@ def test_blocked_job_is_persisted_and_drives_blocked_state(board):
         }
 
     supervisor = _supervisor(board, diagnostics_provider=diagnostics)
-    checkpoint = supervisor.run_once()
+    checkpoint = _run_once(supervisor)
     blocked = checkpoint["blocked_jobs"][0]
 
     assert checkpoint["status"] == "blocked"
@@ -1061,8 +1073,8 @@ def test_blocked_job_is_persisted_and_drives_blocked_state(board):
 
 def test_safe_idle_uses_bounded_backoff(board):
     supervisor = _supervisor(board)
-    first = supervisor.run_once()
-    second = supervisor.run_once()
+    first = _run_once(supervisor)
+    second = _run_once(supervisor)
 
     assert first["status"] == "idle"
     assert first["backoff"]["current_seconds"] == 20
@@ -1073,12 +1085,12 @@ def test_safe_idle_uses_bounded_backoff(board):
 def test_global_stop_preserves_checkpoint_and_prevents_new_cycle(board):
     _write_task(board, title="candidate")
     supervisor = _supervisor(board)
-    supervisor.run_once()
+    _run_once(supervisor)
     before = supervisor.store.checkpoint_path.read_bytes()
     stop = supervisor.request_stop("maintenance")
 
     with pytest.raises(StopRequested):
-        supervisor.run_once()
+        _run_once(supervisor)
 
     assert stop["reason"] == "maintenance"
     assert supervisor.store.checkpoint_path.read_bytes() == before
@@ -1146,7 +1158,7 @@ def test_stop_is_checked_during_cycle(board):
 
     supervisor = _supervisor(board, stage_hook=hook)
     with pytest.raises(StopRequested):
-        supervisor.run_once()
+        _run_once(supervisor)
     assert not supervisor.store.checkpoint_path.exists()
 
 
@@ -1168,8 +1180,8 @@ def test_unavailable_provider_is_not_selected(board):
 def test_telegram_drafts_are_low_noise_and_never_live(board):
     _write_task(board, title="candidate")
     supervisor = _supervisor(board)
-    supervisor.run_once()
-    supervisor.run_once()
+    _run_once(supervisor)
+    _run_once(supervisor)
     messages = _outbox(supervisor)
 
     assert len([item for item in messages if item["type"] == "supervisor_healthy"]) == 1
@@ -1178,7 +1190,7 @@ def test_telegram_drafts_are_low_noise_and_never_live(board):
     assert all(item["sent"] is False for item in messages)
 
     board["clock"].value += 86401
-    supervisor.run_once()
+    _run_once(supervisor)
     repeated = _outbox(supervisor)
     assert len([item for item in repeated if item["type"] == "supervisor_healthy"]) == 2
 
@@ -1186,7 +1198,7 @@ def test_telegram_drafts_are_low_noise_and_never_live(board):
 def test_mission_control_projection_matches_checkpoint(board):
     task_id = _write_task(board, title="candidate")
     supervisor = _supervisor(board)
-    checkpoint = supervisor.run_once()
+    checkpoint = _run_once(supervisor)
     projection = json.loads(
         supervisor.store.mission_control_path.read_text(encoding="utf-8")
     )
@@ -1204,7 +1216,7 @@ def test_mission_control_projection_matches_checkpoint(board):
 def test_crash_during_checkpoint_write_preserves_prior_checkpoint(board):
     _write_task(board, title="candidate")
     first_supervisor = _supervisor(board)
-    first = first_supervisor.run_once()
+    first = _run_once(first_supervisor)
     original = first_supervisor.store.checkpoint_path.read_bytes()
 
     def crash(phase, path):
@@ -1213,7 +1225,7 @@ def test_crash_during_checkpoint_write_preserves_prior_checkpoint(board):
 
     crashing = _supervisor(board, crash_injector=crash)
     with pytest.raises(RuntimeError, match="injected checkpoint crash"):
-        crashing.run_once()
+        _run_once(crashing)
 
     assert crashing.store.checkpoint_path.read_bytes() == original
     assert crashing.health()["healthy"] is False
@@ -1225,10 +1237,10 @@ def test_crash_during_checkpoint_write_preserves_prior_checkpoint(board):
 
 def test_reboot_style_restart_uses_new_run_and_same_restart_point(board):
     _write_task(board, title="candidate")
-    first = _supervisor(board).run_once()
+    first = _run_once(_supervisor(board))
     board["clock"].value += 5
     rebooted = _supervisor(board)
-    second = rebooted.run_once()
+    second = _run_once(rebooted)
 
     assert second["run_id"] != first["run_id"]
     assert second["previous_run_id"] == first["run_id"]
@@ -1267,7 +1279,7 @@ def test_cycle_does_not_mutate_kanban_repository_or_runtime(board, tmp_path):
         str(path): path.read_bytes() for path in queue_artifacts if path.exists()
     }
 
-    checkpoint = _supervisor(board).run_once()
+    checkpoint = _run_once(_supervisor(board))
 
     conn = sqlite3.connect(board["db_path"])
     try:
@@ -1289,6 +1301,18 @@ def test_cycle_does_not_mutate_kanban_repository_or_runtime(board, tmp_path):
         checkpoint["selected_candidates"][0]["bounded_goal"]["launch_authorized"]
         is False
     )
+    assert (
+        checkpoint["selected_candidates"][0]["bounded_goal"]["authority_consumed"]
+        is False
+    )
+    assert checkpoint["active_leases_observed"] == []
+    assert all(item["sent"] is False for item in _outbox(_supervisor(board)))
+    projection = json.loads(
+        (board["state"] / "projections" / "mission-control.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert projection["authoritative"] is False
     assert not list(repository.glob(".git/worktrees/*"))
 
 
@@ -1304,7 +1328,7 @@ def test_run_once_is_bounded_and_never_sleeps(board):
         sleeper=no_sleep,
         stage_hook=stages.append,
     )
-    checkpoint = supervisor.run_once()
+    checkpoint = _run_once(supervisor)
 
     assert checkpoint["completed_cycles"] == 1
     assert stages == [
@@ -1318,20 +1342,173 @@ def test_run_once_is_bounded_and_never_sleeps(board):
     ]
 
 
-def test_run_once_keeps_legacy_optional_token_estimate_behavior(board):
+def test_run_once_zero_budgets_require_explicit_task_estimates(board):
     metadata = json.loads(_metadata(board["clock"]))
     metadata.pop("estimated_tokens")
     task_id = _write_task(
         board,
-        title="legacy run-once candidate",
+        title="unknown token estimate",
         body=json.dumps(metadata),
     )
 
-    checkpoint = _supervisor(board).run_once()
+    checkpoint = _run_once(_supervisor(board))
+
+    assert not checkpoint["selected_candidates"]
+    blocked = next(
+        item for item in checkpoint["blocked_candidates"] if item["task_id"] == task_id
+    )
+    assert "cycle_tokens_unknown" in _reason_codes(blocked)
+    assert checkpoint["cycle_limits"] == {
+        "max_estimated_cost_usd": "0",
+        "max_estimated_tokens": 0,
+        "resource_estimates_required": True,
+    }
+    assert "short_soak" not in checkpoint
+
+
+def test_run_once_zero_budgets_rank_zero_estimate_task(board):
+    task_id = _write_task(board, title="strictly observational candidate")
+
+    checkpoint = _run_once(_supervisor(board))
+
+    assert [item["task_id"] for item in checkpoint["selected_candidates"]] == [task_id]
+    assert checkpoint["queue"]["authority"] == "hermes_kanban"
+    assert checkpoint["queue"]["board"] == "olympus"
+    assert checkpoint["cycle_estimated_cost_usd"] == "0"
+    assert checkpoint["cycle_estimated_tokens"] == 0
+    assert "short_soak" not in checkpoint
+
+
+def test_run_once_zero_budgets_block_nonzero_cost_and_tokens(board):
+    cost_task = _write_task(
+        board,
+        title="nonzero cost",
+        body=_metadata(board["clock"], estimated_cost_usd=1, estimated_tokens=0),
+        priority=2,
+    )
+    token_task = _write_task(
+        board,
+        title="nonzero tokens",
+        body=_metadata(board["clock"], estimated_cost_usd=0, estimated_tokens=1),
+        priority=1,
+    )
+    settings = _settings(
+        max_task_estimated_cost_usd=10,
+        max_cycle_estimated_cost_usd=10,
+        max_cycle_estimated_tokens=100,
+    )
+
+    checkpoint = _run_once(
+        _supervisor(board, settings=settings),
+        max_cycle_cost_usd=0,
+        max_cycle_tokens=0,
+    )
+    blocked = {
+        item["task_id"]: _reason_codes(item)
+        for item in checkpoint["blocked_candidates"]
+    }
+
+    assert not checkpoint["selected_candidates"]
+    assert "cycle_spending_limit" in blocked[cost_task]
+    assert "cycle_token_limit" in blocked[token_task]
+
+
+def test_run_once_budgets_reach_cycle_configuration(board):
+    task_id = _write_task(
+        board,
+        title="within explicit limits",
+        body=_metadata(
+            board["clock"],
+            estimated_cost_usd=0.5,
+            estimated_tokens=20,
+        ),
+    )
+    settings = _settings(
+        max_task_estimated_cost_usd=10,
+        max_cycle_estimated_cost_usd=10,
+        max_cycle_estimated_tokens=100,
+    )
+
+    checkpoint = _run_once(
+        _supervisor(board, settings=settings),
+        max_cycle_cost_usd="1.25",
+        max_cycle_tokens=50,
+    )
 
     assert checkpoint["selected_candidates"][0]["task_id"] == task_id
-    assert checkpoint["selected_candidates"][0]["estimated_tokens"] is None
-    assert "short_soak" not in checkpoint
+    assert checkpoint["cycle_limits"] == {
+        "max_estimated_cost_usd": "1.25",
+        "max_estimated_tokens": 50,
+        "resource_estimates_required": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("max_cycle_cost_usd", "max_cycle_tokens", "message"),
+    [
+        (None, 0, "requires explicit"),
+        (0, None, "requires explicit"),
+        (-1, 0, "finite non-negative"),
+        ("nan", 0, "finite non-negative"),
+        ("inf", 0, "finite non-negative"),
+        ("not-a-number", 0, "finite non-negative"),
+        (True, 0, "finite non-negative"),
+        ("true", 0, "finite non-negative"),
+        (0, -1, "integer between"),
+        (0, 1.5, "integer between"),
+        (0, True, "integer between"),
+        (0, "false", "integer between"),
+    ],
+)
+def test_run_once_rejects_missing_malformed_and_negative_budgets(
+    board,
+    max_cycle_cost_usd,
+    max_cycle_tokens,
+    message,
+):
+    supervisor = _supervisor(board)
+
+    with pytest.raises(OlympusSupervisorError, match=message):
+        supervisor.run_once(
+            max_cycle_cost_usd=max_cycle_cost_usd,
+            max_cycle_tokens=max_cycle_tokens,
+        )
+
+    assert not supervisor.store.root.exists()
+
+
+@pytest.mark.parametrize(
+    ("max_cycle_cost_usd", "max_cycle_tokens", "message"),
+    [
+        (11, 0, "configured max_cycle_estimated_cost_usd"),
+        (0, 101, "configured max_cycle_estimated_tokens"),
+        (0, 1_000_000_001, "integer between"),
+    ],
+)
+def test_run_once_rejects_budgets_outside_safe_bounds(
+    board,
+    max_cycle_cost_usd,
+    max_cycle_tokens,
+    message,
+):
+    settings = _settings(
+        max_cycle_estimated_cost_usd=10,
+        max_cycle_estimated_tokens=1_000_000_000,
+    )
+    if max_cycle_tokens == 101:
+        settings = _settings(
+            max_cycle_estimated_cost_usd=10,
+            max_cycle_estimated_tokens=100,
+        )
+    supervisor = _supervisor(board, settings=settings)
+
+    with pytest.raises(OlympusSupervisorError, match=message):
+        supervisor.run_once(
+            max_cycle_cost_usd=max_cycle_cost_usd,
+            max_cycle_tokens=max_cycle_tokens,
+        )
+
+    assert not supervisor.store.root.exists()
 
 
 def test_missing_max_cycles_is_refused_without_starting_a_cycle(board, capsys):
@@ -1577,9 +1754,81 @@ def test_parser_wires_all_phase_a_commands():
         argv = ["olympus-supervisor", action]
         if action == "run":
             argv.extend(["--max-cycles", "20"])
+        elif action == "run-once":
+            argv.extend([
+                "--max-cycle-cost-usd",
+                "0",
+                "--max-cycle-tokens",
+                "0",
+            ])
         namespace = parser.parse_args(argv)
         assert namespace.func is handler
         assert namespace.olympus_supervisor_action == action
+
+
+def test_run_once_help_exposes_required_budget_options(capsys):
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_olympus_supervisor_parser(
+        subparsers,
+        cmd_olympus_supervisor=lambda args: args,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["olympus-supervisor", "run-once", "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--max-cycle-cost-usd" in output
+    assert "--max-cycle-tokens" in output
+
+
+@pytest.mark.parametrize(
+    "budget_args",
+    [
+        [],
+        ["--max-cycle-cost-usd", "0"],
+        ["--max-cycle-tokens", "0"],
+    ],
+)
+def test_run_once_parser_requires_both_budget_options(budget_args):
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_olympus_supervisor_parser(
+        subparsers,
+        cmd_olympus_supervisor=lambda args: args,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["olympus-supervisor", "run-once", *budget_args])
+
+    assert exc_info.value.code == 2
+
+
+def test_run_once_parser_accepts_documented_zero_budget_order():
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_olympus_supervisor_parser(
+        subparsers,
+        cmd_olympus_supervisor=lambda args: args,
+    )
+
+    namespace = parser.parse_args([
+        "olympus-supervisor",
+        "--board",
+        "olympus",
+        "run-once",
+        "--max-cycle-cost-usd",
+        "0",
+        "--max-cycle-tokens",
+        "0",
+        "--json",
+    ])
+
+    assert namespace.board == "olympus"
+    assert namespace.max_cycle_cost_usd == "0"
+    assert namespace.max_cycle_tokens == 0
+    assert namespace.json is True
 
 
 def test_parser_requires_bound_and_accepts_documented_short_soak_order():
@@ -1620,9 +1869,49 @@ def test_cli_run_once_smoke_uses_injected_supervisor(board, capsys):
         json=False,
         board=None,
         state_dir=None,
+        max_cycle_cost_usd="0",
+        max_cycle_tokens=0,
     )
 
     assert olympus_supervisor_command(args, supervisor=supervisor) == 0
     output = capsys.readouterr().out
     assert "cycle complete" in output
     assert "prepared only, not launched" in output
+
+
+def test_cli_run_once_missing_budgets_returns_valid_blocked_json(board, capsys):
+    supervisor = _supervisor(board)
+    args = SimpleNamespace(
+        olympus_supervisor_action="run-once",
+        json=True,
+        board=None,
+        max_cycle_cost_usd=None,
+        max_cycle_tokens=None,
+    )
+
+    assert olympus_supervisor_command(args, supervisor=supervisor) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "BLOCKED"
+    assert payload["code"] == "invalid_argument"
+    assert not supervisor.store.root.exists()
+
+
+def test_cli_run_once_json_output_contains_effective_budgets(board, capsys):
+    _write_task(board, title="candidate")
+    supervisor = _supervisor(board)
+    args = SimpleNamespace(
+        olympus_supervisor_action="run-once",
+        json=True,
+        board=None,
+        max_cycle_cost_usd="0",
+        max_cycle_tokens=0,
+    )
+
+    assert olympus_supervisor_command(args, supervisor=supervisor) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["completed_cycles"] == 1
+    assert payload["cycle_limits"] == {
+        "max_estimated_cost_usd": "0",
+        "max_estimated_tokens": 0,
+        "resource_estimates_required": True,
+    }

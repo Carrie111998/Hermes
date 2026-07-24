@@ -14,6 +14,27 @@ def _add_json_flag(parser) -> None:
     )
 
 
+def _add_cycle_budget_flags(parser, *, required: bool) -> None:
+    qualifier = "Required explicit" if required else "Optional stricter"
+    parser.add_argument(
+        "--max-cycle-cost-usd",
+        required=required,
+        help=(
+            f"{qualifier} cycle cost ceiling; must be a finite non-negative "
+            "number no greater than the configured ceiling"
+        ),
+    )
+    parser.add_argument(
+        "--max-cycle-tokens",
+        type=int,
+        required=required,
+        help=(
+            f"{qualifier} cycle token ceiling; must be an integer from 0 "
+            "through 1000000000 and no greater than the configured ceiling"
+        ),
+    )
+
+
 def build_olympus_supervisor_parser(
     subparsers,
     *,
@@ -46,26 +67,18 @@ def build_olympus_supervisor_parser(
         required=True,
         help="Required successful-cycle bound (1-100)",
     )
-    run.add_argument(
-        "--max-cycle-cost-usd",
-        help=(
-            "Optional stricter short-soak cycle cost ceiling; defaults to the "
-            "configured bounded ceiling"
-        ),
-    )
-    run.add_argument(
-        "--max-cycle-tokens",
-        type=int,
-        help=(
-            "Optional stricter short-soak cycle token ceiling; defaults to the "
-            "configured bounded ceiling"
-        ),
-    )
+    _add_cycle_budget_flags(run, required=False)
     _add_json_flag(run)
 
     run_once = actions.add_parser(
         "run-once", help="Run exactly one bounded observe-only cycle"
     )
+    run_once.add_argument(
+        "--board",
+        default=argparse.SUPPRESS,
+        help="Kanban board slug (also accepted before the run-once action)",
+    )
+    _add_cycle_budget_flags(run_once, required=True)
     _add_json_flag(run_once)
 
     inspect = actions.add_parser(

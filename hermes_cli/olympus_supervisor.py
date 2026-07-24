@@ -2079,17 +2079,17 @@ def _evaluate_queue(
     now: float,
     settings: SupervisorSettings,
     previous: Mapping[str, Any] | None,
-    short_soak: Mapping[str, Any] | None = None,
+    cycle_limits: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    strict_resource_estimates = short_soak is not None
+    strict_resource_estimates = cycle_limits is not None
     cycle_cost_limit = (
-        Decimal(str(short_soak["max_cycle_estimated_cost_usd"]))
-        if short_soak is not None
+        Decimal(str(cycle_limits["max_cycle_estimated_cost_usd"]))
+        if cycle_limits is not None
         else settings.max_cycle_estimated_cost_usd
     )
     cycle_token_limit = (
-        int(short_soak["max_cycle_estimated_tokens"])
-        if short_soak is not None
+        int(cycle_limits["max_cycle_estimated_tokens"])
+        if cycle_limits is not None
         else None
     )
     occupied = reconciliation["occupied"]
@@ -2667,39 +2667,40 @@ def _build_checkpoint(
     return checkpoint
 
 
-def _short_soak_limits(
+def _cycle_budget_limits(
     settings: SupervisorSettings,
     *,
-    max_cycles: int | None,
     max_cycle_cost_usd: Any = None,
     max_cycle_tokens: Any = None,
+    require_explicit: bool,
 ) -> dict[str, Any]:
-    if (
-        isinstance(max_cycles, bool)
-        or not isinstance(max_cycles, int)
-        or not 1 <= max_cycles <= _MAX_SHORT_SOAK_CYCLES
-    ):
+    if require_explicit and (max_cycle_cost_usd is None or max_cycle_tokens is None):
         raise OlympusSupervisorError(
             "invalid_argument",
-            "--max-cycles is required and must be an integer between 1 and "
-            f"{_MAX_SHORT_SOAK_CYCLES}",
+            "run-once requires explicit --max-cycle-cost-usd and "
+            "--max-cycle-tokens values",
         )
     raw_cost = (
         settings.max_cycle_estimated_cost_usd
         if max_cycle_cost_usd is None
         else max_cycle_cost_usd
     )
+    if isinstance(raw_cost, bool):
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycle-cost-usd must be a finite non-negative number",
+        )
     try:
         cost = Decimal(str(raw_cost))
     except (InvalidOperation, ValueError) as exc:
         raise OlympusSupervisorError(
             "invalid_argument",
-            "--max-cycle-cost-usd must be a non-negative number",
+            "--max-cycle-cost-usd must be a finite non-negative number",
         ) from exc
     if not cost.is_finite() or cost < 0:
         raise OlympusSupervisorError(
             "invalid_argument",
-            "--max-cycle-cost-usd must be a non-negative number",
+            "--max-cycle-cost-usd must be a finite non-negative number",
         )
     if cost > settings.max_cycle_estimated_cost_usd:
         raise OlympusSupervisorError(
@@ -2729,10 +2730,38 @@ def _short_soak_limits(
             "max_cycle_estimated_tokens",
         )
     return {
-        "target_cycles": max_cycles,
-        "max_consecutive_cycle_failures": (settings.max_consecutive_cycle_failures),
         "max_cycle_estimated_cost_usd": str(cost),
         "max_cycle_estimated_tokens": tokens,
+    }
+
+
+def _short_soak_limits(
+    settings: SupervisorSettings,
+    *,
+    max_cycles: int | None,
+    max_cycle_cost_usd: Any = None,
+    max_cycle_tokens: Any = None,
+) -> dict[str, Any]:
+    if (
+        isinstance(max_cycles, bool)
+        or not isinstance(max_cycles, int)
+        or not 1 <= max_cycles <= _MAX_SHORT_SOAK_CYCLES
+    ):
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycles is required and must be an integer between 1 and "
+            f"{_MAX_SHORT_SOAK_CYCLES}",
+        )
+    budgets = _cycle_budget_limits(
+        settings,
+        max_cycle_cost_usd=max_cycle_cost_usd,
+        max_cycle_tokens=max_cycle_tokens,
+        require_explicit=False,
+    )
+    return {
+        "target_cycles": max_cycles,
+        "max_consecutive_cycle_failures": settings.max_consecutive_cycle_failures,
+        **budgets,
     }
 
 
@@ -3426,6 +3455,7 @@ class OlympusSupervisor:
         lease: SupervisorLease,
         *,
         short_soak: Mapping[str, Any] | None = None,
+        cycle_limits: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         previous = self.store.load_checkpoint()
         completed_before = int((previous or {}).get("completed_cycles") or 0)
@@ -3448,7 +3478,7 @@ class OlympusSupervisor:
             now=now,
             settings=self.settings,
             previous=previous,
-            short_soak=short_soak,
+            cycle_limits=short_soak if short_soak is not None else cycle_limits,
         )
         self._stage("after_selection")
         second = self.reader.load(now=self.clock())
@@ -3514,11 +3544,22 @@ class OlympusSupervisor:
         )
         return checkpoint
 
-    def run_once(self) -> dict[str, Any]:
+    def run_once(
+        self,
+        *,
+        max_cycle_cost_usd: Any = None,
+        max_cycle_tokens: Any = None,
+    ) -> dict[str, Any]:
+        cycle_limits = _cycle_budget_limits(
+            self.settings,
+            max_cycle_cost_usd=max_cycle_cost_usd,
+            max_cycle_tokens=max_cycle_tokens,
+            require_explicit=True,
+        )
         self._stage("before_cycle")
         with self._lease() as lease:
             try:
-                return self._cycle(lease)
+                return self._cycle(lease, cycle_limits=cycle_limits)
             except StopRequested:
                 previous = self.store.load_checkpoint()
                 self._record_heartbeat(
@@ -4087,7 +4128,10 @@ def olympus_supervisor_command(
                 "short_soak": (checkpoint or {}).get("short_soak"),
             }
         elif action == "run-once":
-            value = selected.run_once()
+            value = selected.run_once(
+                max_cycle_cost_usd=getattr(args, "max_cycle_cost_usd", None),
+                max_cycle_tokens=getattr(args, "max_cycle_tokens", None),
+            )
         elif action == "inspect":
             value = {
                 "checkpoint": selected.store.load_checkpoint(),
