@@ -160,6 +160,15 @@ class FleetStore:
         uri = f"{self.path.resolve().as_uri()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=5)
         connection.row_factory = sqlite3.Row
+        schema_ready = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type='table' AND name='audit_events'
+            """
+        ).fetchone()
+        if schema_ready is None:
+            connection.close()
+            return None
         return connection
 
     @staticmethod

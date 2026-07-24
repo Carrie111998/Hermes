@@ -29,6 +29,19 @@ from hermes_cli.fleet.types import (
 NOW = datetime(2026, 7, 24, tzinfo=timezone.utc)
 
 
+def test_readers_treat_pre_schema_database_as_not_ready(tmp_path):
+    path = tmp_path / "fleet" / "state.db"
+    path.parent.mkdir(parents=True)
+    path.touch()
+    store = FleetStore(path)
+
+    assert store.cooldown("chatgpt_codex", now=NOW) is None
+    assert store.pin_state_summary() == {
+        "task_worker": {"total": 0, "by_lane": {}, "by_status": {}},
+        "desktop_parent": {"total": 0, "by_lane": {}, "by_status": {}},
+    }
+
+
 def _candidate(
     lane_id: str = "chatgpt_codex",
     *,
