@@ -2865,6 +2865,12 @@ def record_delegation_receipt(
     terminal_status: str,
     result: dict[str, Any],
     task_id: str,
+    expected_run_id: Optional[int] = None,
+    expected_claim_token: Optional[str] = None,
+    expected_workflow_id: Optional[str] = None,
+    expected_step_key: Optional[str] = None,
+    expected_lane: Optional[str] = None,
+    allow_legacy_running_task: bool = False,
 ) -> dict[str, Any]:
     """Create or validate one receipt/event/continuation atomic unit."""
     key_bytes = logical_key.encode("utf-8")
@@ -2876,8 +2882,36 @@ def record_delegation_receipt(
         result_digest, terminal_status, result_json, task_id, continuation_id,
     )
     with write_txn(conn):
-        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
-            return {"status": "conflict", "reason": "target task does not exist"}
+        if allow_legacy_running_task:
+            authority = conn.execute(
+                "SELECT id FROM tasks WHERE id=? AND status IN ('ready','running')",
+                (task_id,),
+            ).fetchone()
+        elif expected_run_id is None or not expected_claim_token:
+            return {"status": "conflict", "reason": "worker authority is required"}
+        else:
+            authority = conn.execute(
+                """SELECT t.id
+                     FROM tasks AS t
+                     JOIN task_runs AS r
+                       ON r.id=t.current_run_id AND r.task_id=t.id
+                    WHERE t.id=? AND t.status='running'
+                      AND t.current_run_id=? AND t.claim_lock=?
+                      AND r.status='running' AND r.ended_at IS NULL
+                      AND r.claim_lock=?
+                      AND (? IS NULL OR t.workflow_template_id=?)
+                      AND (? IS NULL OR t.current_step_key=?)
+                      AND (? IS NULL OR t.assignee=?)""",
+                (
+                    task_id, int(expected_run_id), expected_claim_token,
+                    expected_claim_token,
+                    expected_workflow_id, expected_workflow_id,
+                    expected_step_key, expected_step_key,
+                    expected_lane, expected_lane,
+                ),
+            ).fetchone()
+        if authority is None:
+            return {"status": "conflict", "reason": "worker authority is stale or mismatched"}
         row = conn.execute(
             """SELECT receipt_id, logical_key, input_digest, delegation_id,
                       execution_id, result_digest, terminal_status, result_json,

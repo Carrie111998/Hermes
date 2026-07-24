@@ -2438,6 +2438,7 @@ def delegate_task(
     background: Optional[bool] = None,
     logical_dispatch_key: Optional[str] = None,
     logical_input_digest: Optional[str] = None,
+    bridge_authority_context: Any = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2562,6 +2563,25 @@ def delegate_task(
     # but before transcript IDs, child sessions, or execution identities exist.
     _logical_bridge = None
     if is_truthy_value(cfg.get("workflow_bridge_enabled", False)):
+        if bridge_authority_context is not None:
+            from tools.async_delegation import (
+                canonical_json_digest,
+                canonical_logical_key,
+            )
+
+            logical_dispatch_key = canonical_logical_key(bridge_authority_context)
+            logical_input_digest = canonical_json_digest(
+                {
+                    "tasks": [
+                        {
+                            "goal": task["goal"],
+                            "context": task.get("context"),
+                            "role": _normalize_role(task.get("role") or top_role),
+                        }
+                        for task in task_list
+                    ]
+                }
+            )
         if bool(logical_dispatch_key) != bool(logical_input_digest):
             return tool_error(
                 "logical_dispatch_key and logical_input_digest must be provided together."
@@ -2581,6 +2601,7 @@ def delegate_task(
                 model=creds["model"],
                 session_key="",
                 parent_session_id=getattr(parent_agent, "session_id", None),
+                authority_context=bridge_authority_context,
             )
             if _logical_bridge.get("status") != "reserved":
                 return json.dumps(_logical_bridge, ensure_ascii=False)
@@ -2935,6 +2956,11 @@ def delegate_task(
         update_manifest_statuses(live_deleg_id, results)
 
         combined: Dict[str, Any] = {
+            "status": (
+                "PASS"
+                if results and all(entry.get("status") == "completed" for entry in results)
+                else "FAILED"
+            ),
             "results": results,
             "total_duration_seconds": total_duration,
         }
@@ -3746,6 +3772,89 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
 
+def _kernel_bridge_authority_context(parent_agent=None):
+    """Capture immutable bridge authority from the dispatcher-owned worker scope."""
+    worker_marker_present = (
+        "KANBAN_WORKER" in os.environ or "HERMES_KANBAN_TASK" in os.environ
+    )
+    if not worker_marker_present:
+        return None
+    if "KANBAN_WORKER" in os.environ and os.environ["KANBAN_WORKER"] != "1":
+        raise ValueError("delegate bridge requires KANBAN_WORKER=1")
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id or task_id != task_id.strip():
+        raise ValueError("delegate bridge requires an exact worker task scope")
+
+    def _identity(canonical: str, compatibility: str, label: str) -> Optional[str]:
+        canonical_present = canonical in os.environ
+        compatibility_present = compatibility in os.environ
+        if (
+            canonical_present
+            and compatibility_present
+            and os.environ[canonical] != os.environ[compatibility]
+        ):
+            raise ValueError(f"delegate bridge {label} aliases conflict")
+        return (
+            os.environ[canonical]
+            if canonical_present
+            else os.environ.get(compatibility)
+        )
+
+    raw_run_id = _identity("KANBAN_TASK_RUN_ID", "HERMES_KANBAN_RUN_ID", "run id")
+    claim_token = _identity("KANBAN_CLAIM_TOKEN", "HERMES_KANBAN_CLAIM_LOCK", "claim")
+    if not raw_run_id or not raw_run_id.isascii() or not raw_run_id.isdecimal():
+        raise ValueError("delegate bridge requires a valid worker run id")
+    run_id = int(raw_run_id)
+    if run_id <= 0 or run_id > 0x7FFF_FFFF_FFFF_FFFF:
+        raise ValueError("delegate bridge requires a positive worker run id")
+    if (
+        not claim_token
+        or claim_token != claim_token.strip()
+        or not claim_token.isprintable()
+        or len(claim_token.encode("utf-8")) > 512
+    ):
+        raise ValueError("delegate bridge requires a valid worker claim token")
+
+    from hermes_cli import kanban_db as kb
+    from tools.async_delegation import BridgeAuthorityContext
+
+    db_path = kb.kanban_db_path().expanduser().resolve()
+    with kb.connect_closing(db_path) as conn:
+        row = conn.execute(
+            """SELECT t.workflow_template_id, t.current_step_key, t.assignee,
+                      t.model_override
+                 FROM tasks AS t
+                 JOIN task_runs AS r
+                   ON r.id=t.current_run_id AND r.task_id=t.id
+                WHERE t.id=? AND t.status='running' AND t.current_run_id=?
+                  AND t.claim_lock=? AND r.status='running'
+                  AND r.ended_at IS NULL AND r.claim_lock=?""",
+            (task_id, run_id, claim_token, claim_token),
+        ).fetchone()
+    if row is None:
+        raise ValueError("delegate bridge worker authority is stale or mismatched")
+    workflow_id = row["workflow_template_id"]
+    step_key = row["current_step_key"]
+    if not workflow_id or not step_key:
+        return None
+    lane = row["assignee"] or os.environ.get("HERMES_PROFILE", "")
+    route = row["model_override"] or str(getattr(parent_agent, "model", "") or "")
+    owner_id = str(getattr(parent_agent, "session_id", "") or "")
+    return BridgeAuthorityContext(
+        kanban_db_path=str(db_path),
+        workflow_id=workflow_id,
+        step_key=step_key,
+        step_attempt_id=f"{workflow_id}/{step_key}/{run_id}",
+        task_id=task_id,
+        run_id=run_id,
+        claim_token=claim_token,
+        lane=lane,
+        route=route,
+        owner_id=owner_id,
+    )
+
+
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     if not isinstance(tasks, list):
         return tasks
@@ -3776,6 +3885,9 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        bridge_authority_context=_kernel_bridge_authority_context(
+            kw.get("parent_agent")
+        ),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

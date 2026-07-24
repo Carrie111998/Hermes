@@ -6498,6 +6498,7 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _kernel_bridge_authority_context,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -6520,6 +6521,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            bridge_authority_context=_kernel_bridge_authority_context(self),
             parent_agent=self,
         )
 

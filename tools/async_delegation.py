@@ -45,6 +45,8 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -57,6 +59,45 @@ logger = logging.getLogger(__name__)
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
 # can share it. Existing imports of ``_DaemonThreadPoolExecutor`` keep working.
 _DaemonThreadPoolExecutor = DaemonThreadPoolExecutor
+
+
+@dataclass(frozen=True)
+class BridgeAuthorityContext:
+    """Immutable worker authority captured before a logical dispatch starts."""
+
+    kanban_db_path: str
+    workflow_id: str
+    step_key: str
+    step_attempt_id: str
+    task_id: str
+    run_id: int
+    claim_token: str
+    lane: str
+    route: str
+    owner_id: str
+
+    def __post_init__(self) -> None:
+        if not self.task_id or not self.claim_token or int(self.run_id) <= 0:
+            raise ValueError("bridge authority requires task, run, and claim identity")
+        object.__setattr__(
+            self,
+            "kanban_db_path",
+            str(Path(self.kanban_db_path).expanduser().resolve()),
+        )
+
+
+def canonical_logical_key(authority: BridgeAuthorityContext) -> str:
+    identity = {
+        "workflow_id": authority.workflow_id,
+        "step_key": authority.step_key,
+        "step_attempt_id": authority.step_attempt_id,
+        "task_id": authority.task_id,
+        "run_id": int(authority.run_id),
+        "lane": authority.lane,
+        "route": authority.route,
+        "owner_id": authority.owner_id,
+    }
+    return "kanban:v1:" + canonical_json_digest(identity).removeprefix("sha256:")
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +201,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             source_acknowledged_at REAL,
             source_ack_count INTEGER NOT NULL DEFAULT 0,
             quarantine_reason TEXT,
-            observed_digest TEXT
+            observed_digest TEXT,
+            authority_json TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -178,6 +220,23 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS protect_pending_async_delegation_evidence
+           BEFORE DELETE ON async_delegations
+           WHEN OLD.delivery_state='pending'
+             AND OLD.state NOT IN ('running','finalizing')
+           BEGIN
+             SELECT RAISE(
+               ABORT,
+               'pending delegation evidence requires a compatible Hermes writer'
+             );
+           END"""
+    )
+    logical_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(logical_delegations)")
+    }
+    if "authority_json" not in logical_columns:
+        conn.execute("ALTER TABLE logical_delegations ADD COLUMN authority_json TEXT")
 
 
 @contextmanager
@@ -567,7 +626,7 @@ _LOGICAL_COLUMNS = (
     "updated_at", "terminal_status", "result_json", "result_digest",
     "receipt_id", "kanban_db_path", "task_id", "continuation_id",
     "source_acknowledged_at", "source_ack_count", "quarantine_reason",
-    "observed_digest",
+    "observed_digest", "authority_json",
 )
 
 
@@ -578,9 +637,11 @@ def _logical_record(row) -> Optional[Dict[str, Any]]:
     context_json = record.pop("context_json")
     toolsets_json = record.pop("toolsets_json")
     result_json = record.pop("result_json")
+    authority_json = record.pop("authority_json")
     record["context"] = json.loads(context_json) if context_json else None
     record["toolsets"] = json.loads(toolsets_json) if toolsets_json else None
     record["result"] = json.loads(result_json) if result_json else None
+    record["authority"] = json.loads(authority_json) if authority_json else None
     return record
 
 
@@ -595,6 +656,10 @@ def get_logical_delegation(logical_key: str) -> Optional[Dict[str, Any]]:
     """Read committed logical-dispatch evidence from source state.db."""
     with _DB_LOCK, _connect() as conn:
         return _logical_record(_select_logical(conn, logical_key))
+
+
+def _logical_capacity_reached(protected: int, limit: int) -> bool:
+    return protected >= max(0, int(limit))
 
 
 def _quarantine_logical(
@@ -626,12 +691,13 @@ def _quarantine_logical_in_conn(
     }
 
 
-def reserve_logical_delegation(
+def _reserve_logical_delegation_legacy(
     *, logical_key: str, input_digest: str, goal: str,
     context: Optional[str], toolsets: Optional[List[str]], role: str,
     model: Optional[str], session_key: str = "",
     parent_session_id: Optional[str] = None,
     max_pending_records: int = _MAX_DURABLE_PENDING,
+    authority_json: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Reserve K→D identity without launching; used at delegate_task's seam."""
     logical_key = str(logical_key or "").strip()
@@ -659,7 +725,7 @@ def reserve_logical_delegation(
         protected = conn.execute(
             "SELECT COUNT(*) FROM logical_delegations WHERE state != 'acknowledged'"
         ).fetchone()[0]
-        if protected >= max_pending_records:
+        if _logical_capacity_reached(protected, max_pending_records):
             return {"status": "backpressure", "state": "backpressure", "protected": protected}
         delegation_id = _new_delegation_id()
         execution_id = "exec_" + uuid.uuid4().hex
@@ -667,13 +733,14 @@ def reserve_logical_delegation(
             """INSERT INTO logical_delegations
                (logical_key, input_digest, delegation_id, execution_id, state,
                 goal, context_json, toolsets_json, role, model, session_key,
-                parent_session_id, reserved_at, updated_at)
-               VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                parent_session_id, reserved_at, updated_at, authority_json)
+               VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 logical_key, input_digest, delegation_id, execution_id, goal,
                 json.dumps(context) if context is not None else None,
                 json.dumps(list(toolsets)) if toolsets else None,
                 role, model, session_key, parent_session_id, now, now,
+                authority_json,
             ),
         )
         return {
@@ -681,6 +748,39 @@ def reserve_logical_delegation(
             "input_digest": input_digest, "delegation_id": delegation_id,
             "execution_id": execution_id,
         }
+
+
+def reserve_logical_delegation(
+    *, logical_key: str, input_digest: str, goal: str,
+    context: Optional[str], toolsets: Optional[List[str]], role: str,
+    model: Optional[str], session_key: str = "",
+    parent_session_id: Optional[str] = None,
+    max_pending_records: int = _MAX_DURABLE_PENDING,
+    authority_context: Optional[BridgeAuthorityContext] = None,
+) -> Dict[str, Any]:
+    """Reserve a logical dispatch and bind immutable worker authority to it."""
+    authority_json = None
+    if authority_context is not None:
+        if logical_key != canonical_logical_key(authority_context):
+            return {"status": "rejected", "error": "logical_key is not canonical for authority"}
+        if not str(input_digest).startswith("sha256:"):
+            return {"status": "rejected", "error": "input_digest must use sha256"}
+        authority_json = json.dumps(
+            asdict(authority_context), sort_keys=True, separators=(",", ":")
+        )
+    return _reserve_logical_delegation_legacy(
+        logical_key=logical_key,
+        input_digest=input_digest,
+        goal=goal,
+        context=context,
+        toolsets=toolsets,
+        role=role,
+        model=model,
+        session_key=session_key,
+        parent_session_id=parent_session_id,
+        max_pending_records=max_pending_records,
+        authority_json=authority_json,
+    )
 
 
 def claim_logical_delegation_launch(logical_key: str, input_digest: str) -> bool:
@@ -768,7 +868,7 @@ def dispatch_logical_delegation(
         protected = conn.execute(
             "SELECT COUNT(*) FROM logical_delegations WHERE state != 'acknowledged'"
         ).fetchone()[0]
-        if protected >= max_pending_records:
+        if _logical_capacity_reached(protected, max_pending_records):
             return {
                 "status": "backpressure", "state": "backpressure",
                 "protected": protected,
@@ -780,13 +880,14 @@ def dispatch_logical_delegation(
             """INSERT INTO logical_delegations
                (logical_key, input_digest, delegation_id, execution_id, state,
                 goal, context_json, toolsets_json, role, model, session_key,
-                parent_session_id, reserved_at, updated_at)
-               VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                parent_session_id, reserved_at, updated_at, authority_json)
+               VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 logical_key, input_digest, delegation_id, execution_id, goal,
                 json.dumps(context) if context is not None else None,
                 json.dumps(list(toolsets)) if toolsets else None,
                 role, model, session_key, parent_session_id, now, now,
+                '{"compatibility_mode":"direct_dispatch"}',
             ),
         )
 
@@ -809,13 +910,11 @@ def dispatch_logical_delegation(
                 logical_key, "async execution capacity changed after reservation"
             )
         _records[delegation_id] = record
-    started = time.time()
-    with _DB_LOCK, _connect() as conn:
-        conn.execute(
-            """UPDATE logical_delegations SET state='running', started_at=?, updated_at=?
-               WHERE logical_key=? AND state='reserved'""",
-            (started, started, logical_key),
-        )
+    if not claim_logical_delegation_launch(logical_key, input_digest):
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        current = get_logical_delegation(logical_key) or {}
+        return {**current, "status": current.get("state", "quarantined")}
 
     def _worker() -> None:
         try:
@@ -931,10 +1030,34 @@ def attach_logical_dispatch_receipt(
         return {"status": "missing", "logical_key": logical_key}
     if record["state"] == "quarantined":
         return {**record, "status": "quarantined"}
+    authority = record.get("authority")
+    compatibility_mode = (authority or {}).get("compatibility_mode")
+    if not authority:
+        quarantined = _quarantine_logical(
+            logical_key, "logical dispatch lacks kernel worker authority"
+        )
+        return {**quarantined, "status": "conflict"}
+    canonical_board_path = str(Path(kanban_db_path).expanduser().resolve())
+    if not compatibility_mode and (
+        authority.get("kanban_db_path") != canonical_board_path
+        or authority.get("task_id") != task_id
+    ):
+        quarantined = _quarantine_logical(
+            logical_key, "Kanban target conflicts with immutable worker authority"
+        )
+        return {**quarantined, "status": "conflict"}
     if record.get("task_id") and record["task_id"] != task_id:
         return _quarantine_logical(logical_key, "Kanban target task conflict")
     if not record.get("result") or not record.get("result_digest"):
         return _quarantine_logical(logical_key, "source terminal result is not committed")
+    computed_result_digest = canonical_json_digest(record["result"])
+    if computed_result_digest != record["result_digest"]:
+        quarantined = _quarantine_logical(
+            logical_key,
+            "source result digest does not match committed result",
+            computed_result_digest,
+        )
+        return {**quarantined, "status": "conflict"}
     allowed = {
         "terminal_unattached", "terminal_pending_receipt",
         "receipted_unacknowledged", "acknowledged",
@@ -944,35 +1067,57 @@ def attach_logical_dispatch_receipt(
             **record, "status": "not_terminal",
             "error": f"logical dispatch is in {record['state']}",
         }
-    if prepare_only:
-        if record["state"] == "terminal_unattached":
-            now = time.time()
-            with _DB_LOCK, _connect() as conn:
-                conn.execute(
-                    """UPDATE logical_delegations
-                       SET state='terminal_pending_receipt', kanban_db_path=?,
-                           task_id=?, updated_at=?
-                       WHERE logical_key=? AND state='terminal_unattached'""",
-                    (str(kanban_db_path), task_id, now, logical_key),
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        pinned = _logical_record(_select_logical(conn, logical_key)) or {}
+        if pinned.get("state") == "terminal_unattached":
+            cur = conn.execute(
+                """UPDATE logical_delegations
+                   SET state='terminal_pending_receipt', kanban_db_path=?,
+                       task_id=?, updated_at=?
+                   WHERE logical_key=? AND state='terminal_unattached'
+                     AND kanban_db_path IS NULL AND task_id IS NULL
+                     AND delegation_id=? AND execution_id=? AND result_digest=?""",
+                (
+                    canonical_board_path, task_id, now, logical_key,
+                    record["delegation_id"], record["execution_id"],
+                    record["result_digest"],
+                ),
+            )
+            if cur.rowcount != 1:
+                return _quarantine_logical_in_conn(
+                    conn, logical_key, "Kanban target pin CAS failed"
                 )
+        elif (
+            pinned.get("kanban_db_path") != canonical_board_path
+            or pinned.get("task_id") != task_id
+        ):
+            quarantined = _quarantine_logical_in_conn(
+                conn, logical_key, "Kanban target conflicts with pinned target"
+            )
+            return {**quarantined, "status": "conflict"}
+
+    if prepare_only:
         return {
             **(get_logical_delegation(logical_key) or record),
             "status": "prepared",
         }
 
-    if record["state"] in {"terminal_unattached", "terminal_pending_receipt"}:
-        now = time.time()
-        with _DB_LOCK, _connect() as conn:
-            conn.execute(
-                """UPDATE logical_delegations
-                   SET state='terminal_pending_receipt', kanban_db_path=?,
-                       task_id=?, updated_at=?
-                   WHERE logical_key=? AND state IN
-                       ('terminal_unattached','terminal_pending_receipt')""",
-                (str(kanban_db_path), task_id, now, logical_key),
-            )
-
+    from agent.redact import redact_sensitive_text
     from hermes_cli import kanban_db as kb
+    raw_summary = record["result"].get("summary")
+    if raw_summary is None:
+        raw_summary = record["result"].get("error") or record["terminal_status"]
+    summary = redact_sensitive_text(
+        str(raw_summary), force=True, file_read=True, redact_url_credentials=True
+    )[:4096]
+    receipt_projection = {
+        "terminal_status": record["terminal_status"],
+        "summary": summary,
+        "source_pointer": f"state.db:logical_delegations/{logical_key}",
+        "result_digest": record["result_digest"],
+    }
     with kb.connect_closing(kanban_db_path) as conn:
         receipt = kb.record_delegation_receipt(
             conn,
@@ -982,13 +1127,24 @@ def attach_logical_dispatch_receipt(
             execution_id=record["execution_id"],
             result_digest=record["result_digest"],
             terminal_status=record["terminal_status"],
-            result=record["result"],
+            result=receipt_projection,
             task_id=task_id,
+            expected_run_id=(
+                int(authority["run_id"]) if not compatibility_mode else None
+            ),
+            expected_claim_token=(
+                authority["claim_token"] if not compatibility_mode else None
+            ),
+            expected_workflow_id=authority.get("workflow_id"),
+            expected_step_key=authority.get("step_key"),
+            expected_lane=authority.get("lane"),
+            allow_legacy_running_task=bool(compatibility_mode),
         )
     if receipt["status"] == "conflict":
-        return _quarantine_logical(
+        quarantined = _quarantine_logical(
             logical_key, f"Kanban receipt conflict: {receipt.get('reason', 'unknown')}"
         )
+        return {**quarantined, "status": "conflict"}
     if fault_after == "kanban_commit":
         raise LogicalDispatchBridgeFault("fault after kanban_commit")
 
@@ -1043,7 +1199,8 @@ def prune_logical_delegations(
             )
         status = (
             "backpressure"
-            if protected > max_pending_records or protected > max_records
+            if _logical_capacity_reached(protected, max_pending_records)
+            or _logical_capacity_reached(protected, max_records)
             else "ok"
         )
         return {
