@@ -21,6 +21,8 @@ Hermes --X-Api-Key: shieldnode_...--> proxy.shieldnode.app/{path} --real key--> 
 
 The user can leave a key **disabled** by default. Your call then triggers a push notification on their phone, they approve it for a bounded window, and the call goes through.
 
+**The key format is the signal.** Any value starting with `shieldnode_` is not a provider key and must not be sent to a provider. It goes in the `X-Api-Key` header against `proxy.shieldnode.app`, and this skill applies. The user pasting one into the chat is all the setup you need to get started.
+
 ## When to Use
 
 - The user hands you a value starting with `shieldnode_`
@@ -74,6 +76,8 @@ curl -sS -H "X-Api-Key: $SHIELDNODE_KEY" \
 ```
 
 That gives you the upstream, the configured `base_url` (which fixes your path convention) and whether the next call goes straight through (`active: true`) or triggers an approval push. whoami never returns credentials, is never forwarded upstream, and fires no push.
+
+**Then write the service doc, without being asked.** If there is no `services/<slug>.md` for the service whoami just named, create one from the template in `references/service-docs.md`. No command and no question to the user: whoami already gave you the service, the base URL and the auth shape. Later sessions read that file instead of deriving it again.
 
 Then call the API, always identifying yourself:
 
@@ -153,7 +157,7 @@ curl -sS -X POST "https://proxy.shieldnode.app/_shieldnode/config-request" \
           "agent_name":"Hermes","reason":"creating invoices for the user"}'
 ```
 
-Fill `base_url` and `detected_auth_method` from what you know about the API, or from its docs. Poll `/_shieldnode/config-request/<request_id>` until `approved`, then ask the user for a virtual key on the new service.
+Fill `base_url` and `detected_auth_method` from what you know about the API, or from its docs. Poll `/_shieldnode/config-request/<request_id>` until `approved`, then ask the user for a virtual key on the new service and **write its `services/<slug>.md` at that point** (`references/service-docs.md`): you already know the name, base URL and auth method, since you proposed them.
 
 **Never put the user's upstream API key in this request.** You propose the non-secret shape only.
 
@@ -179,7 +183,7 @@ More in `references/troubleshooting.md`.
 
 ### Behaviour rules
 
-- Never print a virtual key back to the user, and never ask them to paste one into the chat. They put it in `~/.hermes/.env` themselves.
+- Never print a virtual key back to the user. Them pasting one to you is fine and expected: a virtual key is not a real credential, it is revocable in one tap and often disabled until approved. Take it, resolve it with whoami, and carry on. Suggest `~/.hermes/.env` when the work is recurring, not as a precondition to helping them.
 - Tell the user **once** that an approval is pending, then poll silently. A message every 30 seconds feels like spyware.
 - Never retry after an explicit decline, and never retry past the timeout. Ask the user instead.
 - Do not fire parallel calls to force an approval. Pushes are debounced to one per 30s per key, and parallel calls wait on the same approval anyway.
