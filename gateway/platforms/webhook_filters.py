@@ -225,12 +225,14 @@ class WebhookRouteProcessor:
             for spec in filters
         )
 
-    def run_route_script(self, script_value: Any, payload: dict) -> tuple[bool, Optional[dict]]:
-        """Run a route script and return (should_continue, transformed_payload)."""
+    def run_route_script(
+        self, script_value: Any, payload: dict
+    ) -> tuple[bool, Optional[dict], bool]:
+        """Return (should_continue, transformed_payload, consume_delivery)."""
         path, error = _resolve_script_path(script_value)
         if error or path is None:
             logger.warning("[webhook] script ignored webhook: %s", error)
-            return False, None
+            return False, None, False
 
         suffix = path.suffix.lower()
         if suffix in {".sh", ".bash"}:
@@ -239,7 +241,7 @@ class WebhookRouteProcessor:
             )
             if bash is None:
                 logger.warning("[webhook] script ignored webhook: bash not found")
-                return False, None
+                return False, None, False
             argv = [bash, str(path)]
         else:
             argv = [sys.executable, str(path)]
@@ -260,10 +262,10 @@ class WebhookRouteProcessor:
             )
         except subprocess.TimeoutExpired:
             logger.warning("[webhook] script timed out: %s", path)
-            return False, None
+            return False, None, False
         except Exception as exc:
             logger.warning("[webhook] script execution failed: %s", exc)
-            return False, None
+            return False, None, False
 
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -283,9 +285,9 @@ class WebhookRouteProcessor:
                 result.returncode,
                 stderr[:200],
             )
-            return False, None
+            return False, None, True
         if not stdout or stdout == "[SILENT]":
-            return False, None
+            return False, None, True
 
         try:
             transformed = json.loads(stdout)
@@ -293,10 +295,10 @@ class WebhookRouteProcessor:
             transformed = {**payload, "script_output": stdout}
         if not isinstance(transformed, dict):
             logger.warning("[webhook] script stdout must be a JSON object or text")
-            return False, None
+            return False, None, False
         if (
             transformed.get("[SILENT]") is True
             or transformed.get("__hermes_ignore__") is True
         ):
-            return False, None
-        return True, transformed
+            return False, None, True
+        return True, transformed, True

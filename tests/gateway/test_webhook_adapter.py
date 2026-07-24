@@ -68,6 +68,10 @@ def _make_adapter(routes=None, **kwargs):
     return WebhookAdapter(config)
 
 
+def _delivery_key(route_name: str, delivery_id: str, profile: str = ""):
+    return (profile, route_name, delivery_id)
+
+
 def _create_app(adapter: WebhookAdapter) -> web.Application:
     """Build the aiohttp Application from the adapter (without starting a full server)."""
     # Mirror connect(): client_max_size enforces the cap on chunked bodies.
@@ -120,6 +124,22 @@ def _svix_signature(body: bytes, secret: str, msg_id: str, timestamp: str) -> st
     signed = msg_id.encode() + b"." + timestamp.encode() + b"." + body
     digest = hmac.new(key, signed, hashlib.sha256).digest()
     return "v1," + base64.b64encode(digest).decode()
+
+
+def _write_silent_counter_script(tmp_path):
+    """Create a real route script that records each invocation and stays silent."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir(exist_ok=True)
+    counter = scripts / "calls.jsonl"
+    (scripts / "count_calls.py").write_text(
+        "import json, pathlib, sys, time\n"
+        "payload = json.load(sys.stdin)\n"
+        "with pathlib.Path('calls.jsonl').open('a', encoding='utf-8') as output:\n"
+        "    output.write(str(payload['event_id']) + '\\n')\n"
+        "time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    return counter
 
 
 # ===================================================================
@@ -591,7 +611,7 @@ class TestEventFilter:
 
     @pytest.mark.asyncio
     async def test_event_filter_rejects_non_matching(self):
-        """Non-matching event type returns 200 with status=ignored."""
+        """A filtered event does not poison a later admissible delivery ID."""
         routes = {
             "gh": {
                 "secret": _INSECURE_NO_AUTH,
@@ -600,17 +620,31 @@ class TestEventFilter:
             }
         }
         adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
+            headers = {
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "event-filter-1",
+            }
             resp = await cli.post(
                 "/webhooks/gh",
                 json={"action": "opened"},
-                headers={"X-GitHub-Event": "push"},
+                headers=headers,
             )
             assert resp.status == 200
             data = await resp.json()
             assert data["status"] == "ignored"
+            assert _delivery_key("gh", "event-filter-1") not in adapter._seen_deliveries
+
+            headers["X-GitHub-Event"] = "pull_request"
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "opened"},
+                headers=headers,
+            )
+            assert resp.status == 202
 
     @pytest.mark.asyncio
     async def test_event_filter_empty_allows_all(self):
@@ -665,7 +699,7 @@ class TestPayloadFilters:
 
     @pytest.mark.asyncio
     async def test_filter_rejects_before_agent_dispatch(self):
-        """A non-matching filter returns ignored and never starts the agent."""
+        """A non-matching filter does not poison a later admissible delivery."""
         routes = {
             "todoist": {
                 "secret": _INSECURE_NO_AUTH,
@@ -692,7 +726,16 @@ class TestPayloadFilters:
             }
 
         adapter.handle_message.assert_not_called()
-        assert "filter-skip-1" not in adapter._seen_deliveries
+        assert _delivery_key("todoist", "filter-skip-1") not in adapter._seen_deliveries
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/todoist",
+                json={"payload": {"label": "urgent", "content": "Buy milk"}},
+                headers={"X-GitHub-Delivery": "filter-skip-1"},
+            )
+            assert resp.status == 202
 
     @pytest.mark.asyncio
     async def test_filter_accepts_nested_any_and_in_file(self, tmp_path, monkeypatch):
@@ -864,8 +907,8 @@ class TestPayloadFilters:
         assert captured[0].text == "Task: profile-safe"
 
     @pytest.mark.asyncio
-    async def test_script_silent_stdout_ignores_without_idempotency_hit(self, tmp_path, monkeypatch):
-        """Empty or [SILENT] script stdout filters the webhook out."""
+    async def test_script_silent_stdout_ignores_first_delivery_and_deduplicates_retry(self, tmp_path, monkeypatch):
+        """A silent script ignores the admitted delivery; its retry is duplicate."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         scripts = tmp_path / "scripts"
         scripts.mkdir()
@@ -895,8 +938,19 @@ class TestPayloadFilters:
                 "route": "todoist",
             }
 
+            retry = await cli.post(
+                "/webhooks/todoist",
+                json={"body": "ignore me"},
+                headers={"X-GitHub-Delivery": "script-silent-1"},
+            )
+            assert retry.status == 200
+            assert await retry.json() == {
+                "status": "duplicate",
+                "delivery_id": "script-silent-1",
+            }
+
         adapter.handle_message.assert_not_called()
-        assert "script-silent-1" not in adapter._seen_deliveries
+        assert _delivery_key("todoist", "script-silent-1") in adapter._seen_deliveries
 
     @pytest.mark.asyncio
     async def test_script_nonzero_exit_ignores_webhook(self, tmp_path, monkeypatch):
@@ -931,7 +985,7 @@ class TestPayloadFilters:
             assert data["reason"] == "script"
 
         adapter.handle_message.assert_not_called()
-        assert "script-nonzero-1" not in adapter._seen_deliveries
+        assert _delivery_key("todoist", "script-nonzero-1") in adapter._seen_deliveries
 
 
 # ===================================================================
@@ -1039,6 +1093,302 @@ class TestHTTPHandling:
 class TestIdempotency:
 
     @pytest.mark.asyncio
+    async def test_request_id_duplicate_is_admitted_before_silent_route_script(
+        self, tmp_path, monkeypatch
+    ):
+        """Different V2-signed bodies sharing one request ID run the script once."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        counter = _write_silent_counter_script(tmp_path)
+        secret = "generic-v2-secret"
+        routes = {
+            "scripted": {
+                "secret": secret,
+                "script": "count_calls.py",
+                "prompt": "Event: {event_id}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        timestamp = str(int(time.time()))
+
+        async with TestClient(TestServer(app)) as cli:
+            responses = []
+            for event_id in ("event-1", "event-2"):
+                body = json.dumps({"event_id": event_id}).encode()
+                responses.append(
+                    await cli.post(
+                        "/webhooks/scripted",
+                        data=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Webhook-Signature-V2": _generic_v2_signature(
+                                body, secret, timestamp
+                            ),
+                            "X-Webhook-Timestamp": timestamp,
+                            "X-Request-ID": "canonical-request-1",
+                        },
+                    )
+                )
+
+            assert await responses[0].json() == {
+                "status": "ignored",
+                "reason": "script",
+                "route": "scripted",
+            }
+            assert await responses[1].json() == {
+                "status": "duplicate",
+                "delivery_id": "canonical-request-1",
+            }
+
+        assert counter.read_text(encoding="utf-8").splitlines() == ["event-1"]
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_body_duplicate_runs_route_script_once(
+        self, tmp_path, monkeypatch
+    ):
+        """Concurrent aiohttp handlers atomically admit one delivery before await."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        counter = _write_silent_counter_script(tmp_path)
+        secret = "generic-v2-secret"
+        routes = {
+            "scripted": {
+                "secret": secret,
+                "script": "count_calls.py",
+                "prompt": "Event: {event_id}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        body = json.dumps({"event_id": "same-body"}).encode()
+        timestamp = str(int(time.time()))
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Signature-V2": _generic_v2_signature(
+                body, secret, timestamp
+            ),
+            "X-Webhook-Timestamp": timestamp,
+            "X-Request-ID": "concurrent-request-1",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            first, second = await asyncio.gather(
+                cli.post("/webhooks/scripted", data=body, headers=headers),
+                cli.post("/webhooks/scripted", data=body, headers=headers),
+            )
+            statuses = sorted([
+                (await first.json())["status"],
+                (await second.json())["status"],
+            ])
+
+        assert statuses == ["duplicate", "ignored"]
+        assert counter.read_text(encoding="utf-8").splitlines() == ["same-body"]
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_and_expired_v2_signatures_do_not_poison_script_delivery(
+        self, tmp_path, monkeypatch
+    ):
+        """Rejected signatures cannot invoke the script or reserve a delivery ID."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        counter = _write_silent_counter_script(tmp_path)
+        secret = "generic-v2-secret"
+        routes = {
+            "scripted": {
+                "secret": secret,
+                "script": "count_calls.py",
+                "prompt": "Event: {event_id}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        app = _create_app(adapter)
+        delivery_id = "signature-order-1"
+
+        async with TestClient(TestServer(app)) as cli:
+            invalid_body = json.dumps({"event_id": "invalid"}).encode()
+            invalid = await cli.post(
+                "/webhooks/scripted",
+                data=invalid_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Webhook-Signature-V2": "invalid",
+                    "X-Webhook-Timestamp": str(int(time.time())),
+                    "X-Request-ID": delivery_id,
+                },
+            )
+            assert invalid.status == 401
+
+            expired_body = json.dumps({"event_id": "expired"}).encode()
+            expired_timestamp = str(int(time.time()) - 301)
+            expired = await cli.post(
+                "/webhooks/scripted",
+                data=expired_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Webhook-Signature-V2": _generic_v2_signature(
+                        expired_body, secret, expired_timestamp
+                    ),
+                    "X-Webhook-Timestamp": expired_timestamp,
+                    "X-Request-ID": delivery_id,
+                },
+            )
+            assert expired.status == 401
+            assert _delivery_key("scripted", delivery_id) not in adapter._seen_deliveries
+
+            accepted_body = json.dumps({"event_id": "accepted"}).encode()
+            accepted_timestamp = str(int(time.time()))
+            accepted = await cli.post(
+                "/webhooks/scripted",
+                data=accepted_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Webhook-Signature-V2": _generic_v2_signature(
+                        accepted_body, secret, accepted_timestamp
+                    ),
+                    "X-Webhook-Timestamp": accepted_timestamp,
+                    "X-Request-ID": delivery_id,
+                },
+            )
+            assert accepted.status == 200
+            assert (await accepted.json())["reason"] == "script"
+
+        assert counter.read_text(encoding="utf-8").splitlines() == ["accepted"]
+        assert _delivery_key("scripted", delivery_id) in adapter._seen_deliveries
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_headerless_requests_receive_distinct_delivery_ids(self, monkeypatch):
+        """The generated fallback must not deduplicate unrelated requests."""
+        clock = MagicMock()
+        clock.time.return_value = 1234.567
+        monkeypatch.setattr("gateway.platforms.webhook.time", clock)
+        routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first, second = await asyncio.gather(
+                cli.post("/webhooks/idem", json={"request": 1}),
+                cli.post("/webhooks/idem", json={"request": 2}),
+            )
+            responses = [await first.json(), await second.json()]
+
+        assert [response["status"] for response in responses] == [
+            "accepted",
+            "accepted",
+        ]
+        assert len({response["delivery_id"] for response in responses}) == 2
+
+    @pytest.mark.asyncio
+    async def test_delivery_id_is_scoped_to_route(self, tmp_path, monkeypatch):
+        """One route's side effect must not suppress another route's delivery."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        counter = _write_silent_counter_script(tmp_path)
+        routes = {
+            route: {
+                "secret": _INSECURE_NO_AUTH,
+                "script": "count_calls.py",
+                "prompt": "test",
+            }
+            for route in ("first", "second")
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        headers = {"X-Request-ID": "shared-provider-id"}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/webhooks/first",
+                json={"event_id": "first"},
+                headers=headers,
+            )
+            first_data = await first.json()
+            second = await cli.post(
+                "/webhooks/second",
+                json={"event_id": "second"},
+                headers=headers,
+            )
+            second_data = await second.json()
+            retry = await cli.post(
+                "/webhooks/first",
+                json={"event_id": "first-retry"},
+                headers=headers,
+            )
+            retry_data = await retry.json()
+
+        assert first_data["status"] == "ignored"
+        assert second_data["status"] == "ignored"
+        assert retry_data["status"] == "duplicate"
+        assert counter.read_text(encoding="utf-8").splitlines() == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_script_setup_failure_does_not_reserve_delivery_id(
+        self, tmp_path, monkeypatch
+    ):
+        """A corrected script setup can retry the same provider delivery."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        routes = {
+            "scripted": {
+                "secret": _INSECURE_NO_AUTH,
+                "script": "missing.py",
+                "prompt": "test",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        headers = {"X-Request-ID": "retry-script-setup"}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/scripted", json={}, headers=headers)
+            first_data = await first.json()
+            second = await cli.post("/webhooks/scripted", json={}, headers=headers)
+            second_data = await second.json()
+
+        assert first_data["status"] == "ignored"
+        assert second_data["status"] == "ignored"
+        assert (
+            _delivery_key("scripted", "retry-script-setup")
+            not in adapter._seen_deliveries
+        )
+
+    @pytest.mark.asyncio
+    async def test_delivery_metadata_uses_fresh_post_admission_timestamp(
+        self, monkeypatch
+    ):
+        """Script/processing time must not consume delivery metadata's TTL."""
+        clock = iter([100.0, 200.0, 300.0])
+        time_module = MagicMock()
+        time_module.time.side_effect = lambda: next(clock)
+        monkeypatch.setattr("gateway.platforms.webhook.time", time_module)
+        routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/webhooks/idem",
+                json={"request": 1},
+                headers={"X-Request-ID": "fresh-metadata-timestamp"},
+            )
+            assert response.status == 202
+
+        session_chat_id = "webhook:idem:fresh-metadata-timestamp"
+        assert (
+            adapter._seen_deliveries[
+                _delivery_key("idem", "fresh-metadata-timestamp")
+            ]
+            == 200.0
+        )
+        assert adapter._delivery_info_created[session_chat_id] == 300.0
+
+    @pytest.mark.asyncio
     async def test_duplicate_delivery_id_returns_200(self):
         """Second request with same delivery ID returns 200 duplicate."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
@@ -1072,7 +1422,9 @@ class TestIdempotency:
             assert resp1.status == 202
 
             # Backdate the cache entry so it appears expired
-            adapter._seen_deliveries["delivery-456"] = time.time() - 3700
+            adapter._seen_deliveries[
+                _delivery_key("idem", "delivery-456")
+            ] = time.time() - 3700
 
             resp2 = await cli.post("/webhooks/idem", json={"x": 1}, headers=headers)
             assert resp2.status == 202  # re-accepted
@@ -1170,18 +1522,21 @@ class TestRateLimiting:
         """Expired delivery IDs can reprocess even when stale siblings remain."""
         adapter = _make_adapter(rate_limit=1)
         adapter._idempotency_ttl = 60
+        expired_target = _delivery_key("route", "expired-target")
+        expired_sibling = _delivery_key("route", "expired-sibling")
+        fresh_sibling = _delivery_key("route", "fresh-sibling")
         adapter._seen_deliveries = {
-            "expired-target": 100.0,
-            "expired-sibling": 101.0,
-            "fresh-sibling": 155.0,
+            expired_target: 100.0,
+            expired_sibling: 101.0,
+            fresh_sibling: 155.0,
         }
 
         now = 200.0
-        assert adapter._record_delivery_id("expired-target", now) is True
+        assert adapter._record_delivery_id(expired_target, now) is True
 
-        assert adapter._seen_deliveries["expired-target"] == now
-        assert "expired-sibling" in adapter._seen_deliveries
-        assert "fresh-sibling" in adapter._seen_deliveries
+        assert adapter._seen_deliveries[expired_target] == now
+        assert expired_sibling in adapter._seen_deliveries
+        assert fresh_sibling in adapter._seen_deliveries
 
 
 # ===================================================================

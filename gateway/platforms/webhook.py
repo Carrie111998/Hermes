@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
@@ -187,9 +188,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
 
-        # Idempotency: TTL cache of recently processed delivery IDs.
-        # Prevents duplicate agent runs when webhook providers retry.
-        self._seen_deliveries: Dict[str, float] = {}
+        # Idempotency: TTL cache of recently processed delivery IDs, scoped by
+        # profile and route so unrelated providers cannot suppress each other.
+        self._seen_deliveries: Dict[tuple[str, str, str], float] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
 
@@ -412,14 +413,16 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
-    def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
+    def _record_delivery_id(
+        self, delivery_key: tuple[str, str, str], now: float
+    ) -> bool:
         """Return True when this delivery should be processed."""
-        seen_at = self._seen_deliveries.get(delivery_id)
+        seen_at = self._seen_deliveries.get(delivery_key)
         if seen_at is not None and now - seen_at < self._idempotency_ttl:
             return False
         if seen_at is not None:
-            self._seen_deliveries.pop(delivery_id, None)
-        self._seen_deliveries[delivery_id] = now
+            self._seen_deliveries.pop(delivery_key, None)
+        self._seen_deliveries[delivery_key] = now
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
         return True
@@ -661,15 +664,39 @@ class WebhookAdapter(BasePlatformAdapter):
                 }
             )
 
+        # Build and admit the delivery ID after auth/rate/filter admission but
+        # before any route script.  Route scripts may perform side effects and
+        # intentionally return empty stdout, so retries must be deduplicated
+        # before the handler yields to script execution.
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", uuid.uuid4().hex),
+            ),
+        )
+        delivery_cache_key = (profile or "", route_name, delivery_id)
+        admitted_at = time.time()
+        if not self._record_delivery_id(delivery_cache_key, admitted_at):
+            logger.info(
+                "[webhook] Skipping duplicate delivery %s", delivery_id
+            )
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
-            keep, transformed_payload = await asyncio.to_thread(
+            should_continue, transformed_payload, consume_delivery = await asyncio.to_thread(
                 self._route_processor.run_route_script,
                 route_config.get("script"),
                 payload,
             )
-            if not keep:
+            if not should_continue:
+                if not consume_delivery:
+                    self._seen_deliveries.pop(delivery_cache_key, None)
                 logger.info(
                     "[webhook] script ignored event=%s route=%s",
                     event_type,
@@ -718,27 +745,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
-        now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -801,6 +807,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        now = time.time()
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
