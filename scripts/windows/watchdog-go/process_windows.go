@@ -132,6 +132,65 @@ func testBackendStatus(port int) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// testBackendAuth verifies the session token unlocks a gated API.
+// /api/status is public, so LISTEN+status-OK can still be token-drift.
+func testBackendAuth(port int, token string) bool {
+	if port <= 0 || strings.TrimSpace(token) == "" {
+		return false
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port), nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("X-Hermes-Session-Token", token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// stopListenersOnPort kills process trees holding LocalPort==port.
+func stopListenersOnPort(port int, logger *Logger) int {
+	if port <= 0 {
+		return 0
+	}
+	candidates, err := getDesktopBackendCandidates()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	seen := map[uint32]struct{}{}
+	for _, proc := range candidates {
+		if _, ok := seen[proc.ProcessID]; ok {
+			continue
+		}
+		ports, perr := getListeningPorts(proc.ProcessID)
+		if perr != nil {
+			continue
+		}
+		holds := false
+		for _, p := range ports {
+			if p == port {
+				holds = true
+				break
+			}
+		}
+		if !holds {
+			continue
+		}
+		seen[proc.ProcessID] = struct{}{}
+		if logger != nil {
+			logger.Infof("killing token-drift backend pid=%d on port %d", proc.ProcessID, port)
+		}
+		stopProcessPID(proc.ProcessID)
+		n++
+	}
+	return n
+}
+
 type backendInfo struct {
 	PID  uint32 `json:"pid"`
 	Port int    `json:"port"`

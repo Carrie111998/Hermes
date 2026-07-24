@@ -245,8 +245,21 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 		return nil, fmt.Errorf("hermes root not configured")
 	}
 	if existing := bm.currentHealthy(); existing != nil {
-		_ = bm.publishManifestLocked(existing.Port, int(existing.PID))
-		return existing, nil
+		if bm.token == "" {
+			if manifest, err := bm.readManifest(); err == nil && manifest.Token != "" {
+				bm.token = manifest.Token
+			}
+		}
+		if bm.token != "" && testBackendAuth(existing.Port, bm.token) {
+			_ = bm.publishManifestLocked(existing.Port, int(existing.PID))
+			return existing, nil
+		}
+		// In-memory backend looks healthy but token drifted — fall through to replace.
+		bm.logger.Infof("in-memory backend auth drift on port %d; replacing", existing.Port)
+		bm.mu.Lock()
+		bm.stopLocked()
+		bm.mu.Unlock()
+		_ = stopListenersOnPort(existing.Port, bm.logger)
 	}
 
 	bm.mu.Lock()
@@ -270,16 +283,18 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 		if manifest, err := bm.readManifest(); err == nil && manifest.Token != "" {
 			bm.token = manifest.Token
 		}
-		if bm.token == "" {
-			token, terr := generateSessionToken()
-			if terr != nil {
-				return nil, terr
-			}
-			bm.token = token
+		// Only reuse when token unlocks gated APIs. Otherwise we'd publish a
+		// fresh token while the live serve still expects the old one (Desktop 401).
+		if bm.token != "" && testBackendAuth(port, bm.token) {
+			_ = bm.publishManifestLocked(port, 0)
+			bm.logger.Infof("reusing healthy managed backend on port %d (auth ok)", port)
+			return &backendInfo{Port: port, Cmd: "existing serve on managed port"}, nil
 		}
-		_ = bm.publishManifestLocked(port, 0)
-		bm.logger.Infof("reusing healthy managed backend on port %d", port)
-		return &backendInfo{Port: port, Cmd: "existing serve on managed port"}, nil
+		bm.logger.Infof("managed port %d is up but session token drifted; replacing occupant", port)
+		_ = stopListenersOnPort(port, bm.logger)
+		time.Sleep(1 * time.Second)
+		bm.port = 0
+		bm.token = ""
 	}
 
 	cmd, token, port, err := buildServeCommand(bm.cfg)
@@ -323,6 +338,15 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 	}
 	bm.port = port
 	bm.token = token
+
+	// Refuse to publish a token that does not authenticate (squatter race).
+	if !testBackendAuth(port, token) {
+		bm.logger.Infof("managed backend status-ready but auth failed on port %d; refusing drifted manifest", port)
+		bm.stopLocked()
+		_ = stopListenersOnPort(port, bm.logger)
+		bm.clearManifest()
+		return nil, fmt.Errorf("managed backend on port %d failed session-token auth", port)
+	}
 
 	if err := bm.publishManifestLocked(port, bm.pid); err != nil {
 		bm.logger.Infof("manifest write failed: %v", err)
