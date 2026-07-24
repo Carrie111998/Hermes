@@ -25,6 +25,8 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_state import SessionDB
 
 from agent.turn_context import build_turn_context
@@ -289,3 +291,57 @@ def test_idle_compaction_disabled_by_default(tmp_path: Path) -> None:
     agent.context_compressor.compress.assert_not_called()
     assert agent.session_id == sid
     assert len(ctx.messages) == len(_history()) + 1
+
+
+def test_idle_compaction_uses_configured_ratio_for_plugin_engine(
+    tmp_path: Path,
+) -> None:
+    """Plugin engines need not expose ContextCompressor-only ratio fields."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_PLUGIN_ENGINE"
+    db.create_session(sid, source="cli")
+    agent = _prep_idle_agent(db, sid)
+    agent.compression_summary_target_ratio = 0.35
+    agent.context_compressor = types.SimpleNamespace(
+        threshold_tokens=100_000,
+        protect_first_n=2,
+        protect_last_n=2,
+        get_active_compression_failure_cooldown=lambda: None,
+    )
+
+    with patch(
+        "agent.turn_context._should_idle_compact", return_value=False
+    ) as should_idle:
+        _run_prologue(agent, _history())
+
+    assert should_idle.call_args.kwargs["floor_tokens"] == 35_000
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (None, 0),
+        ("never", 0),
+        (True, 0),
+        (12.5, 0),
+        (-60, 0),
+        (60.0, 60),
+        ("120", 120),
+    ],
+)
+def test_idle_compaction_config_is_tolerant(
+    monkeypatch,
+    tmp_path: Path,
+    raw_value,
+    expected: int,
+) -> None:
+    """Invalid YAML values disable idle compaction instead of startup."""
+    from tests.agent.test_proactive_prune_config import _make_agent
+
+    agent = _make_agent(
+        monkeypatch,
+        tmp_path,
+        idle_compact_after_seconds=raw_value,
+    )
+
+    assert agent.compression_idle_compact_after_seconds == expected

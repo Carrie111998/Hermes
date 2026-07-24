@@ -18,6 +18,8 @@ from __future__ import annotations
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.context_engine import ContextEngine
 from agent.conversation_loop import (
     _apply_context_engine_selection,
@@ -183,6 +185,37 @@ def test_exception_fails_open():
     )
     assert out is REQUEST
     assert logger.warning.called
+
+
+@pytest.mark.parametrize("outcome", ["none", "raise", "invalid"])
+def test_mutating_request_copy_cannot_corrupt_fail_open_request(outcome):
+    """A failed hook may mutate its copy, never the live provider request."""
+    request = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+    snapshot = [dict(message) for message in request]
+
+    class _Engine(_MinimalEngine):
+        def select_context(self, request_messages, **kwargs):
+            request_messages[0]["content"] = "TAMPERED"
+            request_messages.append({"role": "user", "content": "INJECTED"})
+            if outcome == "raise":
+                raise RuntimeError("backend offline after mutation")
+            if outcome == "invalid":
+                return ["not a message dict"]
+            return None
+
+    out = _apply_context_engine_selection(
+        _agent_with(_Engine()),
+        request,
+        HISTORY,
+        HISTORY[-1],
+        logger=MagicMock(),
+    )
+
+    assert out is request
+    assert request == snapshot
 
 
 def test_non_list_return_is_ignored():

@@ -1869,7 +1869,7 @@ def init_agent(
         compression_max_attempts = 3
     compression_max_attempts = min(compression_max_attempts, 10)
 
-    def _parse_prune_int(raw, default):
+    def _parse_config_int(raw, default):
         # Same parser semantics as compression.max_attempts above: reject
         # booleans (bool subclasses int — YAML `true` would coerce to 1),
         # reject fractional floats rather than truncating them, accept
@@ -1890,14 +1890,14 @@ def init_agent(
     # default, so an unset key is behavior-neutral).  Negative values are
     # treated as disabled rather than erroring.
     compression_proactive_prune_tokens = max(
-        0, _parse_prune_int(_compression_cfg.get("proactive_prune_tokens", 0), 0)
+        0, _parse_config_int(_compression_cfg.get("proactive_prune_tokens", 0), 0)
     )
-    compression_proactive_prune_min_chars = _parse_prune_int(
+    compression_proactive_prune_min_chars = _parse_config_int(
         _compression_cfg.get("proactive_prune_min_result_chars", 8000), 8000
     )
     compression_proactive_prune_min_reclaim = max(
         0,
-        _parse_prune_int(
+        _parse_config_int(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
@@ -1958,7 +1958,10 @@ def init_agent(
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
     compression_idle_compact_after_seconds = max(
-        0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
+        0,
+        _parse_config_int(
+            _compression_cfg.get("idle_compact_after_seconds", 0), 0
+        ),
     )
 
     # Read optional explicit context_length override for the auxiliary
@@ -2390,6 +2393,7 @@ def init_agent(
     agent.compression_in_place = compression_in_place
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.max_compression_attempts = compression_max_attempts
+    agent.compression_summary_target_ratio = compression_target_ratio
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )

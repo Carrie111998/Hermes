@@ -642,9 +642,17 @@ def build_turn_context(
             )
             # Post-compression target size: don't summarise a thread already
             # below what compaction would reduce it to.
-            _idle_floor = int(
-                _compressor.threshold_tokens * _compressor.summary_target_ratio
+            _configured_idle_ratio = getattr(
+                agent, "compression_summary_target_ratio", 0.20
             )
+            _idle_ratio = getattr(
+                _compressor, "summary_target_ratio", _configured_idle_ratio
+            )
+            if isinstance(_idle_ratio, bool) or not isinstance(
+                _idle_ratio, (int, float)
+            ):
+                _idle_ratio = _configured_idle_ratio
+            _idle_floor = int(_compressor.threshold_tokens * _idle_ratio)
             _idle_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
             )()
