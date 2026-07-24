@@ -1759,9 +1759,8 @@ def dump_api_response_debug(
 ) -> Optional[Path]:
     """Write API response debug payload for post-mortem (e.g. terminal rejection)."""
     try:
-        from agent.redact import redact_sensitive_text
-        from agent.utils import atomic_json_write
-        from agent.env_var import env_var_enabled
+        from agent.redact import redact_sensitive_text as redact_sensitive_text
+        from utils import atomic_json_write, env_var_enabled
 
         # 1. Prepare payload
         if error:
