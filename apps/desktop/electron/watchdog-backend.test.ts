@@ -32,7 +32,7 @@ describe('resolveWatchdogPrewarmedBackend', () => {
     assert.equal(await resolveWatchdogPrewarmedBackend({ platform: 'win32' }), null)
   })
 
-  test('returns connection when manifest probes healthy', async () => {
+  test('returns connection when authenticated sessions probe succeeds', async () => {
     const manifestDir = path.join(tmpDir, 'HermesWatchdog')
     fs.mkdirSync(manifestDir, { recursive: true })
     fs.writeFileSync(
@@ -46,10 +46,13 @@ describe('resolveWatchdogPrewarmedBackend', () => {
       })
     )
 
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => ({ ok: true }))
-    )
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      assert.match(url, /\/api\/sessions$/)
+      assert.equal((init?.headers as Record<string, string>)?.Authorization, 'Bearer abc')
+      return { ok: true }
+    })
+    vi.stubGlobal('fetch', fetchMock)
 
     const got = await resolveWatchdogPrewarmedBackend({
       hermesRoot: 'C:\\repo',
@@ -60,6 +63,33 @@ describe('resolveWatchdogPrewarmedBackend', () => {
     assert.equal(got?.baseUrl, 'http://127.0.0.1:54321')
     assert.equal(got?.token, 'abc')
     assert.equal(got?.source, 'watchdog')
+    assert.equal(fetchMock.mock.calls.length, 1)
+  })
+
+  test('rejects when only public status would succeed but sessions auth fails', async () => {
+    const manifestDir = path.join(tmpDir, 'HermesWatchdog')
+    fs.mkdirSync(manifestDir, { recursive: true })
+    fs.writeFileSync(
+      path.join(manifestDir, 'desktop-backend.json'),
+      JSON.stringify({
+        baseUrl: 'http://127.0.0.1:54321',
+        token: 'stale-token',
+        port: 54321
+      })
+    )
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.endsWith('/api/status')) {
+          return { ok: true }
+        }
+        return { ok: false, status: 401 }
+      })
+    )
+
+    assert.equal(await resolveWatchdogPrewarmedBackend({ platform: 'win32' }), null)
   })
 
   test('rejects manifest when hermes root mismatches explicit override', async () => {

@@ -24,9 +24,22 @@ type win32Process struct {
 }
 
 func getDesktopProcesses() ([]win32Process, error) {
-	var procs []win32Process
-	err := wmi.Query("SELECT ProcessId, Name, CommandLine FROM Win32_Process WHERE Name = 'Hermes.exe'", &procs)
-	return procs, err
+	type result struct {
+		procs []win32Process
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		var procs []win32Process
+		err := wmi.Query("SELECT ProcessId, Name, CommandLine FROM Win32_Process WHERE Name = 'Hermes.exe'", &procs)
+		ch <- result{procs, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.procs, r.err
+	case <-time.After(8 * time.Second):
+		return nil, fmt.Errorf("WMI Hermes.exe scan timed out after 8s")
+	}
 }
 
 // reservedOpsPorts are stack-owned listeners — never treat as Desktop's ephemeral hermes serve.
@@ -70,17 +83,76 @@ func isDesktopBackendCommandLine(cl string) bool {
 }
 
 func getDesktopBackendCandidates() ([]win32Process, error) {
-	var all []win32Process
-	if err := wmi.Query("SELECT ProcessId, Name, CommandLine FROM Win32_Process", &all); err != nil {
-		return nil, err
+	type result struct {
+		procs []win32Process
+		err   error
 	}
-	out := make([]win32Process, 0, 4)
-	for _, p := range all {
-		if isDesktopBackendCommandLine(p.CommandLine) {
-			out = append(out, p)
+	ch := make(chan result, 1)
+	go func() {
+		var all []win32Process
+		// Full Win32_Process+CommandLine can hang when a process is wedged.
+		err := wmi.Query("SELECT ProcessId, Name, CommandLine FROM Win32_Process", &all)
+		if err != nil {
+			ch <- result{nil, err}
+			return
 		}
+		out := make([]win32Process, 0, 4)
+		for _, p := range all {
+			if isDesktopBackendCommandLine(p.CommandLine) {
+				out = append(out, p)
+			}
+		}
+		ch <- result{out, nil}
+	}()
+	select {
+	case r := <-ch:
+		return r.procs, r.err
+	case <-time.After(8 * time.Second):
+		return nil, fmt.Errorf("WMI process scan timed out after 8s")
 	}
-	return out, nil
+}
+
+func listeningPIDsOnPort(port int) []uint32 {
+	if port <= 0 {
+		return nil
+	}
+	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	if err != nil {
+		return nil
+	}
+	needle := fmt.Sprintf(":%d", port)
+	seen := map[uint32]struct{}{}
+	var pids []uint32
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "LISTENING") || !strings.Contains(line, needle) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		hostPort := fields[1]
+		idx := strings.LastIndex(hostPort, ":")
+		if idx < 0 {
+			continue
+		}
+		p, convErr := strconv.Atoi(hostPort[idx+1:])
+		if convErr != nil || p != port {
+			continue
+		}
+		pid64, convErr := strconv.ParseUint(fields[len(fields)-1], 10, 32)
+		if convErr != nil || pid64 == 0 {
+			continue
+		}
+		pid := uint32(pid64)
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		pids = append(pids, pid)
+	}
+	return pids
 }
 
 func getListeningPorts(pid uint32) ([]int, error) {
@@ -123,7 +195,7 @@ func appendUniqueInt(list []int, v int) []int {
 }
 
 func testBackendStatus(port int) bool {
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", port))
 	if err != nil {
 		return false
@@ -138,7 +210,7 @@ func testBackendAuth(port int, token string) bool {
 	if port <= 0 || strings.TrimSpace(token) == "" {
 		return false
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/sessions", port), nil)
 	if err != nil {
 		return false
@@ -157,12 +229,12 @@ func stopListenersOnPort(port int, logger *Logger) int {
 	if port <= 0 {
 		return 0
 	}
-	candidates, err := getDesktopBackendCandidates()
-	if err != nil {
-		return 0
-	}
 	n := 0
 	seen := map[uint32]struct{}{}
+	candidates, err := getDesktopBackendCandidates()
+	if err != nil && logger != nil {
+		logger.Infof("WMI backend candidate scan failed: %v; falling back to netstat", err)
+	}
 	for _, proc := range candidates {
 		if _, ok := seen[proc.ProcessID]; ok {
 			continue
@@ -186,6 +258,18 @@ func stopListenersOnPort(port int, logger *Logger) int {
 			logger.Infof("killing token-drift backend pid=%d on port %d", proc.ProcessID, port)
 		}
 		stopProcessPID(proc.ProcessID)
+		n++
+	}
+	// WMI full-scan can time out while a wedged occupant still holds the port.
+	for _, pid := range listeningPIDsOnPort(port) {
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		if logger != nil {
+			logger.Infof("killing netstat listener pid=%d on port %d", pid, port)
+		}
+		stopProcessPID(pid)
 		n++
 	}
 	return n
@@ -226,7 +310,19 @@ func findHealthyDesktopBackend() *backendInfo {
 func stopProcessPID(pid uint32) {
 	// /T reaps the process tree. Plain /F leaves Electron grandchildren and
 	// desktop-spawned hermes serve orphans (before-quit never runs on force kill).
-	_ = exec.Command("taskkill", "/PID", fmt.Sprintf("%d", pid), "/T", "/F").Run()
+	// Bound taskkill: a wedged target can hang the watchdog probe loop forever.
+	cmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", pid), "/T", "/F")
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+		return
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+	}
 }
 
 func stopAllDesktopProcessTrees(logger *Logger) {

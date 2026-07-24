@@ -36,9 +36,20 @@ function readManifest(): Record<string, unknown> | null {
   }
 }
 
-async function probePublicStatus(baseUrl: string, timeoutMs: number) {
-  const url = `${String(baseUrl || '').replace(/\/+$/, '')}/api/status`
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+/**
+ * Public /api/status alone is not enough: a drifted occupant can answer 200
+ * while the manifest token returns 401 on gated routes. Require token-backed
+ * /api/sessions (same gate Desktop uses after "backend ready").
+ */
+async function probeAuthenticatedSessions(baseUrl: string, token: string, timeoutMs: number) {
+  const url = `${String(baseUrl || '').replace(/\/+$/, '')}/api/sessions`
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'X-Hermes-Session-Token': token
+    },
+    signal: AbortSignal.timeout(timeoutMs)
+  })
 
   return res.ok
 }
@@ -88,7 +99,7 @@ async function resolveWatchdogPrewarmedBackend(
   const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS
 
   try {
-    if (!(await probePublicStatus(baseUrl, timeoutMs))) {
+    if (!(await probeAuthenticatedSessions(baseUrl, token, timeoutMs))) {
       return null
     }
   } catch {
@@ -105,4 +116,9 @@ async function resolveWatchdogPrewarmedBackend(
   }
 }
 
-export { DEFAULT_PROBE_TIMEOUT_MS, resolveWatchdogPrewarmedBackend, watchdogManifestPath }
+export {
+  DEFAULT_PROBE_TIMEOUT_MS,
+  probeAuthenticatedSessions,
+  resolveWatchdogPrewarmedBackend,
+  watchdogManifestPath
+}

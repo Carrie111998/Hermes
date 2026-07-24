@@ -357,6 +357,11 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 }
 
 func (bm *BackendManager) publishManifestLocked(port, pid int) error {
+	if pid <= 0 {
+		if listeners := listeningPIDsOnPort(port); len(listeners) > 0 {
+			pid = int(listeners[0])
+		}
+	}
 	manifest := DesktopBackendManifest{
 		BaseURL:    fmt.Sprintf("http://127.0.0.1:%d", port),
 		Token:      bm.token,
