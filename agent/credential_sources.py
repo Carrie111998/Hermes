@@ -332,6 +332,15 @@ def _remove_qwen_cli(provider: str, removed) -> RemovalResult:
     ])
 
 
+def _remove_kimi_code_oauth(provider: str, removed) -> RemovalResult:
+    """~/.kimi-code/credentials/kimi-code.json is owned by the Kimi Code CLI."""
+    return RemovalResult(hints=[
+        "Suppressed kimi-code credential - it will not be re-seeded.",
+        "Note: Kimi Code CLI credentials still live in ~/.kimi-code/credentials/kimi-code.json",
+        "Run `hermes auth add kimi-oauth` to re-enable if needed.",
+    ])
+
+
 def _remove_copilot_gh(provider: str, removed) -> RemovalResult:
     """Copilot token comes from `gh auth token` or COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN.
 
@@ -426,6 +435,11 @@ def _register_all_sources() -> None:
         provider="qwen-oauth", source_id="qwen-cli",
         remove_fn=_remove_qwen_cli,
         description="~/.qwen/oauth_creds.json",
+    ))
+    register(RemovalStep(
+        provider="kimi-oauth", source_id="kimi-code",
+        remove_fn=_remove_kimi_code_oauth,
+        description="~/.kimi-code/credentials/kimi-code.json",
     ))
     register(RemovalStep(
         provider="minimax-oauth", source_id="oauth",

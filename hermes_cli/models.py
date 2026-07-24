@@ -367,6 +367,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2.7",
         "MiniMax-M2.7-highspeed",
     ],
+    "kimi-oauth": [
+        "k3",
+        "k2.7-coding",
+        "k2.7-coding-highspeed",
+        "k2.6-coding",
+        "k3-256k",
+    ],
     "minimax-cn": [
         "MiniMax-M3",
         "MiniMax-M2.7",
@@ -1115,6 +1122,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("bedrock",        "AWS Bedrock",              "AWS Bedrock (Claude, Nova, Llama, DeepSeek; IAM or API key)"),
     ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)"),
     ProviderEntry("qwen-oauth",     "Qwen OAuth (Portal)",      "Qwen OAuth (Reuses local Qwen CLI login)"),
+    ProviderEntry("kimi-oauth",     "Kimi Code (OAuth)",        "Kimi Code via OAuth tokens (Reuses Kimi Code CLI login)"),
 ]
 
 # Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
@@ -1164,7 +1172,7 @@ _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named prov
 # Member order is the order shown inside the group submenu.
 # ---------------------------------------------------------------------------
 PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
-    "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
+    "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn", "kimi-oauth"]),
     "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
     "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),

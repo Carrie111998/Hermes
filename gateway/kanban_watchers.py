@@ -164,7 +164,8 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = ("completed", "blocked", "waiting", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "unwaited", "block_loop_detected")
+        TERMINAL_KINDS = ("completed", "blocked", "waiting", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "unwaited")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -594,7 +595,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "waiting")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 

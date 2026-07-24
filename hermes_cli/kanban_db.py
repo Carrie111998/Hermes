@@ -4016,11 +4016,18 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'waiting', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if cur_status == "waiting":
+                # Human-time wait — never auto-promote. Only an explicit
+                # unwait_task / promote_task / unblock_task moves a waiting
+                # task back to the work pool. Without this guard a waiting
+                # task — which is TTL-exempt and sits in the dispatch
+                # queue silently — would never loop on itself.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -5470,7 +5477,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``running``/``ready`` → ``blocked``/``waiting``/``todo``/``triage``.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -5480,22 +5487,22 @@ def block_task(
       sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
       ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
       promotes it automatically once its parents finish. No human, no cron, no
-      retry storm. This is Dale's "Type 2 — dependency blocked".
+      retry storm.
 
-    * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
-      "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
-      is re-blocked for the SAME kind after having been unblocked, the
-      unblock-loop counter (``block_recurrences``) increments. When it reaches
-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
-      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
+    * ``needs_input`` / ``capability`` — human-time waits. Land in ``waiting``
+      (TTL-exempt, never auto-promoted) so the dispatcher never reclaims them.
+      An explicit ``unwait_task`` / ``unblock_task`` / ``promote_task`` is
+      required to return them to the work pool.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
+    * ``transient`` / ``None`` — agent-time blocks. Land in ``blocked``
+      (TTL-reclaimable, auto-promotable for circuit-breaker conditions).
+      A transient failure may clear on retry; the loop breaker routes
+      the task to ``triage`` after :data:`BLOCK_RECURRENCE_LIMIT` unblock↔
+      re-block cycles.
 
-    Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    Returns True on any successful transition (to ``blocked``, ``waiting``,
+    ``todo``, or ``triage``), False when the task wasn't in a blockable
+    state.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -5614,11 +5621,14 @@ def block_task(
             )
             routed_to = "triage"
         else:
+            # Human-time kinds (needs_input, capability) → waiting (TTL-exempt)
+            # Agent-time kinds (transient, None) → blocked (reclaimable)
+            new_status = "waiting" if kind in ("needs_input", "capability") else "blocked"
             if expected_run_id is None:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = '{new_status}',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -5631,9 +5641,9 @@ def block_task(
                 )
             else:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = '{new_status}',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -5649,7 +5659,7 @@ def block_task(
                 return False
             run_id = _end_run(
                 conn, task_id,
-                outcome="blocked", status="blocked",
+                outcome=new_status, status=new_status,
                 summary=reason,
             )
             # Synthesize a run when blocking a never-claimed task so the
@@ -5657,11 +5667,11 @@ def block_task(
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id,
-                    outcome="blocked",
+                    outcome=new_status,
                     summary=reason,
                 )
             _append_event(
-                conn, task_id, "blocked",
+                conn, task_id, new_status,
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
@@ -5678,6 +5688,148 @@ def block_task(
 
 
 
+def wait_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Transition ``running``/``ready`` → ``waiting`` for a human-time block.
+
+    A ``waiting`` task is blocked on **a human** (not a transient system
+    condition). Unlike ``blocked`` (agent-time), ``waiting`` tasks are
+    TTL-exempt — ``release_stale_claims`` never reclaims them because
+    the dispatcher only considers ``status='running'`` tasks for
+    reclaim. They also skip auto-promotion in ``recompute_ready``:
+    only an explicit ``unwait_task`` or ``promote_task`` moves them
+    back to ``ready``/``todo``.
+
+    ``kind`` is optional metadata (one of ``VALID_BLOCK_KINDS``) so
+    workers can signal *why* they are waiting for a human without
+    landing in the ``blocked`` bucket. Common kinds for human waits:
+
+    * ``needs_input`` — needs a human decision/answer it cannot derive.
+    * ``capability`` — hit a hard wall (no access, missing creds).
+
+    ``dependency`` and ``transient`` still route to ``todo`` / ``blocked``
+    respectively (via ``block_task``); ``wait_task`` refuses those kinds.
+
+    Returns True on success, False when the task wasn't in a waitable
+    state.
+    """
+    if kind is not None and kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            f"wait kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    if kind == "dependency":
+        raise ValueError(
+            "use block_task(kind='dependency') for dependency waits"
+        )
+    if kind == "transient":
+        raise ValueError(
+            "use block_task(kind='transient') for transient/agent-time blocks"
+        )
+    with write_txn(conn):
+        conditions = "status IN ('running', 'ready')"
+        params: list[Any] = [task_id]
+        if expected_run_id is not None:
+            conditions += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(
+            f"""
+            UPDATE tasks
+               SET status        = 'waiting',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = ?
+             WHERE id = ?
+               AND {conditions}
+            """,
+            (kind, *params),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id,
+            outcome="waiting", status="waiting",
+            summary=reason,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="waiting", summary=reason,
+            )
+        _append_event(
+            conn, task_id, "waiting",
+            {"reason": reason, "kind": kind},
+            run_id=run_id,
+        )
+    _waiting_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_waiting",
+        task_id,
+        board=get_current_board(),
+        assignee=_waiting_task.assignee if _waiting_task else None,
+        run_id=run_id,
+        reason=reason,
+    )
+    return True
+
+
+def unwait_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Transition ``waiting`` → ``ready`` or ``todo`` (human has responded).
+
+    Mirrors ``unblock_task`` for the ``waiting`` state. Defensively closes
+    any stale ``current_run_id`` pointer before flipping status. Re-gates
+    on parent completion: if parents are still open the task lands in
+    ``todo`` instead of ``ready``.
+
+    Returns True on success, False if the task is not in ``waiting``.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        stale = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'waiting'",
+            (task_id,),
+        ).fetchone()
+        if stale is None:
+            return False
+        if stale and stale["current_run_id"]:
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'reclaimed', outcome = 'reclaimed',
+                       summary = COALESCE(summary, 'invariant recovery on unwait'),
+                       ended_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND ended_at IS NULL
+                """,
+                (now, int(stale["current_run_id"])),
+            )
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'waiting'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "unwaited",
+            {"status": new_status} if new_status != "ready" else None,
+        )
+        return True
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5687,7 +5839,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `waiting`, or `blocked` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -5704,10 +5856,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "waiting", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'waiting', or 'blocked'"
         )
 
     if not force:
@@ -5733,7 +5885,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'waiting', 'blocked')",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -5749,10 +5901,10 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition ``blocked``/``scheduled``/``waiting`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
-    status. In the common path (``block_task`` closed the run already) this
+    status. In the common path (``block_task``/``wait_task`` closed the run already) this
     is a no-op. If a future or external write left the pointer dangling,
     the leaked run is closed as ``reclaimed`` inside the same txn so the
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
@@ -5761,7 +5913,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled', 'waiting')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -5802,7 +5954,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'waiting')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:

@@ -110,6 +110,26 @@ export interface ConfigDisplayConfig {
   tui_theme?: string
 }
 
+  /**
+   * Welcome banner section configuration.
+   *
+   * Controls which accordion sections appear in the TUI welcome panel, their
+   * default open/closed state, and custom plugin-provided sections.
+   *
+   * Sections omitted from config use their built-in defaults (tools=open,
+   * skills=closed, system_prompt=closed, mcp_servers=closed). Set
+   * `enabled: false` to hide a section entirely.
+   *
+   * `plugin_sections` renders custom Accordion sections after the built-in
+   * ones. Data for plugin sections is expected on SessionInfo under the
+   * matching key (future - currently renders a placeholder label).
+   */
+  welcome_banner?: {
+    sections?: Record<string, { default_open?: boolean; enabled?: boolean }>
+    plugin_sections?: Array<{ id: string; title: string; default_open?: boolean }>
+  }
+}
+
 export interface ConfigVoiceConfig {
   // Raw `yaml.safe_load()` value from config; may be non-string if hand-edited.
   // Callers must normalize/validate at runtime (parseVoiceRecordKey()).

@@ -2638,6 +2638,239 @@ def get_qwen_auth_status() -> Dict[str, Any]:
         }
 
 
+
+def _kimi_code_auth_path() -> Path:
+    """Return path to the Kimi Code CLI OAuth credential file."""
+    return Path.home() / ".kimi-code" / "credentials" / "kimi-code.json"
+
+
+def _read_kimi_code_tokens() -> Dict[str, Any]:
+    """Read Kimi Code CLI OAuth tokens from disk."""
+    auth_path = _kimi_code_auth_path()
+    if not auth_path.exists():
+        raise AuthError(
+            "Kimi Code CLI credentials not found.  Run the Kimi Code CLI "
+            "first (it creates ~/.kimi-code/credentials/kimi-code.json).",
+            provider="kimi-oauth",
+            code="kimi_auth_missing",
+        )
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AuthError(
+            f"Cannot parse Kimi Code CLI credentials at {auth_path}: {exc}",
+            provider="kimi-oauth",
+            code="kimi_auth_unreadable",
+        ) from exc
+    if not isinstance(data, dict):
+        raise AuthError(
+            f"Invalid Kimi Code CLI credentials in {auth_path} - expected a JSON object.",
+            provider="kimi-oauth",
+            code="kimi_auth_invalid",
+        )
+    return data
+
+
+def _kimi_access_token_is_expiring(
+    expires_at: Any,
+    skew_seconds: int = KIMI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+) -> bool:
+    try:
+        expiry = int(expires_at)
+    except (TypeError, ValueError):
+        return True
+    return expiry <= (time.time() + max(0, int(skew_seconds)))
+
+
+def resolve_kimi_oauth_runtime_credentials(
+    *,
+    force_refresh: bool = False,
+    refresh_if_expiring: bool = True,
+    refresh_skew_seconds: int = KIMI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    """Resolve usable Kimi OAuth credentials from the Kimi Code CLI token file."""
+    tokens = _read_kimi_code_tokens()
+    access_token = str(tokens.get("access_token", "") or "").strip()
+    should_refresh = bool(force_refresh)
+    if not should_refresh and refresh_if_expiring:
+        should_refresh = _kimi_access_token_is_expiring(
+            tokens.get("expires_at"), refresh_skew_seconds,
+        )
+    if should_refresh:
+        try:
+            tokens = _refresh_kimi_code_tokens(tokens)
+            access_token = str(tokens.get("access_token", "") or "").strip()
+        except Exception as exc:
+            logger.debug("Kimi OAuth token refresh failed: %s", exc)
+            if not access_token:
+                raise AuthError(
+                    "Kimi OAuth access token expired and refresh failed. "
+                    "Re-run the Kimi Code CLI to re-authenticate.",
+                    provider="kimi-oauth",
+                    code="kimi_refresh_failed",
+                ) from exc
+
+    if not access_token:
+        raise AuthError(
+            "Kimi OAuth access token missing.  Re-run the Kimi Code CLI.",
+            provider="kimi-oauth",
+            code="kimi_access_token_missing",
+        )
+
+    base_url = (
+        os.getenv("KIMI_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_KIMI_OAUTH_BASE_URL
+    )
+    expires_at_raw = tokens.get("expires_at") or tokens.get("expires_in")
+    expires_at_ms = None
+    if expires_at_raw:
+        try:
+            expires_at_ms = int(int(expires_at_raw) * 1000)
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "provider": "kimi-oauth",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "kimi-code",
+        "expires_at_ms": expires_at_ms,
+        "auth_file": str(_kimi_code_auth_path()),
+    }
+
+
+def _refresh_kimi_code_tokens(tokens: Dict[str, Any]) -> Dict[str, Any]:
+    """Refresh an expired Kimi Code access token using the refresh token."""
+    refresh_token = str(tokens.get("refresh_token", "") or "").strip()
+    if not refresh_token:
+        raise AuthError(
+            "Kimi OAuth refresh token missing - cannot refresh without it. "
+            "Re-run the Kimi Code CLI.",
+            provider="kimi-oauth",
+            code="kimi_no_refresh_token",
+        )
+
+    oauth_host = (
+        os.getenv("KIMI_CODE_OAUTH_HOST")
+        or os.getenv("KIMI_OAUTH_HOST")
+        or "https://auth.kimi.com"
+    )
+    token_url = f"{oauth_host.rstrip('/')}/oauth/token"
+
+    payload = {
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+        "client_id": "kimi-code",
+    }
+
+    try:
+        response = httpx.post(
+            token_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,
+        )
+    except Exception as exc:
+        raise AuthError(
+            f"Kimi OAuth refresh request failed: {exc}",
+            provider="kimi-oauth",
+            code="kimi_refresh_network_error",
+        ) from exc
+
+    if response.status_code >= 400:
+        body = response.text.strip()
+        raise AuthError(
+            "Kimi OAuth refresh failed. Re-run the Kimi Code CLI to re-authenticate."
+            + (f" Response: {body}" if body else ""),
+            provider="kimi-oauth",
+            code="kimi_refresh_failed",
+        )
+
+    try:
+        payload_body = response.json()
+    except Exception as exc:
+        raise AuthError(
+            f"Kimi OAuth refresh returned invalid JSON: {exc}",
+            provider="kimi-oauth",
+            code="kimi_refresh_invalid_json",
+        ) from exc
+
+    if not isinstance(payload_body, dict) or not str(
+        payload_body.get("access_token", "") or ""
+    ).strip():
+        raise AuthError(
+            "Kimi OAuth refresh response missing access_token.",
+            provider="kimi-oauth",
+            code="kimi_refresh_invalid_response",
+        )
+
+    access_token = str(payload_body.get("access_token", "") or "").strip()
+    new_refresh_token = str(payload_body.get("refresh_token", refresh_token) or refresh_token).strip()
+    expires_in = payload_body.get("expires_in")
+    try:
+        expires_in_seconds = int(expires_in)
+    except Exception:
+        expires_in_seconds = 900
+
+    refreshed = {
+        "access_token": access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": str(payload_body.get("token_type", tokens.get("token_type", "Bearer")) or "Bearer").strip() or "Bearer",
+        "scope": str(payload_body.get("scope", tokens.get("scope", "kimi-code")) or "kimi-code").strip(),
+        "expires_in": expires_in_seconds,
+        "expires_at": int(time.time()) + expires_in_seconds,
+    }
+    _save_kimi_code_tokens(refreshed)
+    return refreshed
+
+
+def _save_kimi_code_tokens(tokens: Dict[str, Any]) -> Path:
+    """Write updated OAuth tokens back to the Kimi Code CLI credential file."""
+    import stat as _stat
+    auth_path = _kimi_code_auth_path()
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(auth_path)
+    tmp_path = auth_path.with_name(
+        f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        _stat.S_IRUSR | _stat.S_IWUSR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(tokens, f, indent=2)
+        atomic_replace(tmp_path, auth_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return auth_path
+
+
+def get_kimi_oauth_auth_status() -> Dict[str, Any]:
+    """Check whether the user has valid Kimi Code CLI OAuth credentials."""
+    auth_path = _kimi_code_auth_path()
+    try:
+        creds = resolve_kimi_oauth_runtime_credentials(refresh_if_expiring=True)
+        return {
+            "logged_in": True,
+            "auth_file": str(auth_path),
+            "source": creds.get("source"),
+            "api_key": creds.get("api_key"),
+            "expires_at_ms": creds.get("expires_at_ms"),
+        }
+    except AuthError as exc:
+        return {
+            "logged_in": False,
+            "auth_file": str(auth_path),
+            "error": str(exc),
+        }
+
+
 # =============================================================================
 # Spotify auth — PKCE tokens stored in ~/.hermes/auth.json
 # =============================================================================

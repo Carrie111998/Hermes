@@ -203,11 +203,13 @@ def show_status(args):
         codex_status = get_codex_auth_status()
         qwen_status = get_qwen_auth_status()
         minimax_status = get_minimax_oauth_auth_status()
+        kimi_status = get_kimi_oauth_auth_status()
     except Exception:
         nous_status = {}
         codex_status = {}
         qwen_status = {}
         minimax_status = {}
+        kimi_status = {}
 
     nous_account_info = None
     if (
@@ -304,6 +306,23 @@ def show_status(args):
         print(f"    Access exp: {minimax_exp}")
     if minimax_status.get("error") and not minimax_logged_in:
         print(f"    Error:      {minimax_status.get('error')}")
+
+    # Kimi OAuth
+    kimi_logged_in = bool(kimi_status.get("logged_in"))
+    print(
+        f"  {'Kimi OAuth':<12}  {check_mark(kimi_logged_in)} "
+        f"{'logged in' if kimi_logged_in else 'not logged in (run: kimi-code CLI first)'}"
+    )
+    kimi_auth_file = kimi_status.get("auth_file")
+    if kimi_auth_file:
+        print(f"    Auth file:  {kimi_auth_file}")
+    kimi_exp = kimi_status.get("expires_at_ms")
+    if kimi_exp:
+        from datetime import datetime, timezone
+        print(f"    Access exp: {datetime.fromtimestamp(int(kimi_exp) / 1000, tz=timezone.utc).isoformat()}")
+    if kimi_status.get("error") and not kimi_logged_in:
+        print(f"    Error:      {kimi_status.get('error')}")
+
 
     # xAI OAuth — separate try/except so an import failure here cannot
     # disrupt the already-printed Nous/Codex/Qwen/MiniMax rows above.

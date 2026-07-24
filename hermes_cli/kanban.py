@@ -38,6 +38,7 @@ _STATUS_ICONS = {
     "ready":    "▶",
     "running":  "●",
     "scheduled":"⏱",
+    "waiting":  "⏳",
     "blocked":  "⊘",
     "done":     "✓",
     "archived": "—",
@@ -623,7 +624,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
-    p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
+    p_block = sub.add_parser("block", help="Mark one or more tasks blocked (agent-time) or waiting (human-time)")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
@@ -647,7 +648,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_unblock = sub.add_parser(
         "unblock",
-        help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
+        help="Return blocked/waiting/scheduled tasks to ready, or todo while parents remain open",
     )
     p_unblock.add_argument(
         "--reason",
@@ -658,7 +659,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+        help="Manually move one or more todo/waiting/blocked tasks to ready (recovery path)",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(

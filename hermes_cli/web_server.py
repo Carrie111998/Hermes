@@ -10186,6 +10186,16 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": raw.get("expires_at"),
                 "has_refresh_token": bool(raw.get("has_refresh_token")),
             }
+        if provider_id == "kimi-oauth":
+            raw = hauth.get_kimi_oauth_auth_status()
+            return {
+                "logged_in": bool(raw.get("logged_in")),
+                "source": "kimi_code",
+                "source_label": raw.get("auth_file") or "Kimi Code CLI",
+                "token_preview": _truncate_token(raw.get("api_key")),
+                "expires_at": raw.get("expires_at_ms"),
+                "has_refresh_token": True,
+            }
         if provider_id == "minimax-oauth":
             raw = hauth.get_minimax_oauth_auth_status()
             return {

@@ -4,7 +4,7 @@ import { MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
 import { bootTheme } from '../lib/themeBoot.js'
 import { DEFAULT_THEME } from '../theme.js'
-
+import { WELCOME_BANNER_DEFAULTS } from '../types.js'
 import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 
 const buildUiState = (): UiState => ({
@@ -34,7 +34,8 @@ const buildUiState = (): UiState => ({
   // Last session's resolved theme paints frame one (flash-free boot, like
   // the desktop's hermes-boot-* keys); DEFAULT_THEME only on first launch.
   theme: bootTheme ?? DEFAULT_THEME,
-  usage: ZERO
+  usage: ZERO,
+  welcomeBanner: { sections: { ...WELCOME_BANNER_DEFAULTS }, plugin_sections: [] }
 })
 
 export const $uiState = atom<UiState>(buildUiState())

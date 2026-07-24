@@ -1,7 +1,7 @@
 import type { MouseTrackingMode } from '@hermes/ink'
 import { useEffect, useRef } from 'react'
 
-import { resolveDetailsMode, resolveSections } from '../domain/details.js'
+import { resolveDetailsMode, resolveSections, resolveWelcomeBanner } from '../domain/details.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { ConfigFullResponse, ConfigMtimeResponse, ReloadMcpResponse } from '../gatewayTypes.js'
 import { DEFAULT_VOICE_RECORD_KEY, type ParsedVoiceRecordKey, parseVoiceRecordKey } from '../lib/platform.js'
@@ -283,7 +283,8 @@ export const applyDisplay = (
     sections: resolveSections(d.sections),
     showReasoning: !!d.show_reasoning,
     statusBar: normalizeStatusBar(d.tui_statusbar),
-    streaming: d.streaming !== false
+    streaming: d.streaming !== false,
+    welcomeBanner: resolveWelcomeBanner(d.welcome_banner)
   })
 }
 

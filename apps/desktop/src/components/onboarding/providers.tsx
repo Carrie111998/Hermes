@@ -8,7 +8,8 @@ const PROVIDER_DISPLAY: Record<string, { order: number; title: string }> = {
   'openai-codex': { order: 1, title: 'OpenAI OAuth (ChatGPT)' },
   'minimax-oauth': { order: 2, title: 'MiniMax' },
   'qwen-oauth': { order: 3, title: 'Qwen Code' },
-  'xai-oauth': { order: 4, title: 'xAI Grok' },
+  'kimi-oauth': { order: 4, title: 'Kimi Code' },
+  'xai-oauth': { order: 5, title: 'xAI Grok'},
   // Both Anthropic entries sit at the bottom: the API-key path first, then
   // the subscription OAuth path (only works with extra usage credits).
   anthropic: { order: 5, title: 'Anthropic API Key' },

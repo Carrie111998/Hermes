@@ -6,7 +6,7 @@ import { artWidth, caduceus, CADUCEUS_WIDTH, logo, LOGO_WIDTH } from '../banner.
 import { mix } from '../lib/color.js'
 import { flat } from '../lib/text.js'
 import type { Theme } from '../theme.js'
-import type { PanelSection, SessionInfo } from '../types.js'
+import type { PanelSection, SessionInfo, WelcomeBannerConfig } from '../types.js'
 
 import { Accordion } from './accordion.js'
 import { ShimmerRows } from './loaders.js'
@@ -209,7 +209,7 @@ const SKELETON_ROWS: readonly (readonly [number, number])[] = [
 const SKILLS_MAX = 8
 const TOOLSETS_MAX = 8
 
-export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+export function SessionPanel({ info, maxWidth, sid, t, welcomeBanner }: SessionPanelProps) {
   const term = useStdout().stdout?.columns ?? 100
   const cols = Math.max(20, Math.min(term, maxWidth ?? term))
   const heroLines = caduceus(t.color, t.bannerHero || undefined)
@@ -225,11 +225,17 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   // wrong — surface-relative blends go invisible when text is already pale.
   const listFade = mix(t.color.muted, t.color.text, 0.5)
 
-  // ── Local collapse state for each section ──
-  const [toolsOpen, setToolsOpen] = useState(true)
-  const [skillsOpen, setSkillsOpen] = useState(false)
-  const [systemOpen, setSystemOpen] = useState(false)
-  const [mcpOpen, setMcpOpen] = useState(false)
+  // ── Collapse state for each section, driven by config defaults ──
+  const [toolsOpen, setToolsOpen] = useState(welcomeBanner.sections.tools?.default_open ?? true)
+  const [skillsOpen, setSkillsOpen] = useState(welcomeBanner.sections.skills?.default_open ?? false)
+  const [systemOpen, setSystemOpen] = useState(welcomeBanner.sections.system_prompt?.default_open ?? false)
+  const [mcpOpen, setMcpOpen] = useState(welcomeBanner.sections.mcp_servers?.default_open ?? false)
+  // Dynamic state for plugin sections
+  const [pluginOpen, setPluginOpen] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(
+      welcomeBanner.plugin_sections.map(s => [s.id, s.default_open])
+    )
+  )
 
   const truncLine = (pfx: string, items: string[]) => {
     let line = ''
@@ -401,15 +407,18 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         </Box>
       )}
 
-      {/* ── Tools (expanded by default) ── */}
-      <Box flexDirection="column" marginTop={1}>
+      {/* ── Tools (default: expanded) ── */}
+      {welcomeBanner.sections.tools?.enabled !== false && (
+        <Box flexDirection="column" marginTop={1}>
         <Accordion onToggle={() => setToolsOpen(v => !v)} open={toolsOpen} t={t} title="Available Tools">
           {toolsBody()}
         </Accordion>
       </Box>
+      )}
 
-      {/* ── Skills (collapsed by default) ── */}
-      <Box flexDirection="column" marginTop={1}>
+      {/* ── Skills (default: collapsed) ── */}
+      {welcomeBanner.sections.skills?.enabled !== false && (
+        <Box flexDirection="column" marginTop={1}>
         <Accordion
           count={skillsTotal}
           onToggle={() => setSkillsOpen(v => !v)}
@@ -421,37 +430,55 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
           {skillsBody()}
         </Accordion>
       </Box>
-
-      {/* ── System Prompt (collapsed by default) ── */}
-      {sysPromptLen > 0 && (
-        <Box flexDirection="column" marginTop={1}>
-          <Accordion
-            onToggle={() => setSystemOpen(v => !v)}
-            open={systemOpen}
-            suffix={`— ${sysPromptLen.toLocaleString()} chars`}
-            t={t}
-            title="System Prompt"
-          >
-            {systemBody()}
-          </Accordion>
-        </Box>
       )}
 
-      {/* ── MCP Servers (collapsed by default) ── */}
-      {mcpServers.length > 0 && (
+      {/* ── System Prompt (default: collapsed) ── */}
+      {sysPromptLen > 0 && welcomeBanner.sections.system_prompt?.enabled !== false && (
         <Box flexDirection="column" marginTop={1}>
-          <Accordion
-            count={mcpConnected}
-            onToggle={() => setMcpOpen(v => !v)}
-            open={mcpOpen}
-            suffix="connected"
-            t={t}
-            title="MCP Servers"
-          >
-            {mcpBody()}
-          </Accordion>
-        </Box>
+        <Accordion
+          onToggle={() => setSystemOpen(v => !v)}
+          open={systemOpen}
+          suffix={`— ${sysPromptLen.toLocaleString()} chars`}
+          t={t}
+          title="System Prompt"
+        >
+          {systemBody()}
+        </Accordion>
+      </Box>
       )}
+
+      {/* ── MCP Servers (default: collapsed) ── */}
+      {mcpServers.length > 0 && welcomeBanner.sections.mcp_servers?.enabled !== false && (
+        <Box flexDirection="column" marginTop={1}>
+        <Accordion
+          count={mcpConnected}
+          onToggle={() => setMcpOpen(v => !v)}
+          open={mcpOpen}
+          suffix="connected"
+          t={t}
+          title="MCP Servers"
+        >
+          {mcpBody()}
+        </Accordion>
+      </Box>
+      )}
+
+      {/* ── Plugin sections ── */}
+      {welcomeBanner.plugin_sections.map(ps => {
+        const isOpen = pluginOpen[ps.id] ?? ps.default_open
+        const toggle = () => setPluginOpen(p => ({ ...p, [ps.id]: !(p[ps.id] ?? ps.default_open) }))
+        return (
+          <Box flexDirection="column" key={ps.id} marginTop={1}>
+            <Accordion onToggle={toggle} open={isOpen} t={t} title={ps.title}>
+              <Text color={t.color.muted}>
+                Plugin section — data binding for &ldquo;{ps.title}&rdquo; is
+                not yet wired on the gateway side.
+              </Text>
+            </Accordion>
+          </Box>
+        )
+      })}
+
 
       <Text />
 
@@ -559,4 +586,5 @@ interface SessionPanelProps {
   maxWidth?: number
   sid?: string | null
   t: Theme
+  welcomeBanner: WelcomeBannerConfig
 }

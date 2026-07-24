@@ -1345,6 +1345,41 @@ display:
   # timestamps: false
 
   # ───────────────────────────────────────────────────────────────────────────
+  # TUI Welcome Banner Sections
+  # ───────────────────────────────────────────────────────────────────────────
+  # Configure which accordion sections appear in the TUI welcome panel and their
+  # default open/closed state. Sections omitted from config use built-in defaults
+  # (tools=open, skills=closed, system_prompt=closed, mcp_servers=closed).
+  #
+  # Each section supports:
+  #   default_open: true|false - initial collapse state
+  #   enabled: true|false     - show or hide the section entirely
+  #
+  # Plugin sections render custom Accordion entries after the built-in sections.
+  # Data binding for plugin section content is a future extension (currently
+  # shows a placeholder label).
+  #
+  # Example:
+  #   welcome_banner:
+  #     sections:
+  #       tools:
+  #         default_open: true
+  #         enabled: true
+  #       skills:
+  #         default_open: false
+  #         enabled: true
+  #       system_prompt:
+  #         default_open: false
+  #         enabled: true
+  #       mcp_servers:
+  #         default_open: false
+  #         enabled: true
+  #     plugin_sections:
+  #       - id: my_custom_data
+  #         title: "Custom Data"
+  #         default_open: false
+
+  # ───────────────────────────────────────────────────────────────────────────
   # Skin / Theme
   # ───────────────────────────────────────────────────────────────────────────
   # Customize CLI visual appearance — banner colors, spinner faces, tool prefix,

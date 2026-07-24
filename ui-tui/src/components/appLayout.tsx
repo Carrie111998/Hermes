@@ -213,6 +213,7 @@ const TranscriptPane = memo(function TranscriptPane({
                       maxWidth={Math.max(1, composer.cols - 2)}
                       sid={ui.sid}
                       t={ui.theme}
+                      welcomeBanner={ui.welcomeBanner}
                     />
                   )}
                 </Box>

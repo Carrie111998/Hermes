@@ -796,6 +796,54 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_wait(args: dict, **kw) -> str:
+    """Transition the task to 'waiting' for a human response."""
+    delegated_err = _reject_delegated_child_mutation("kanban_wait")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error("reason is required — explain what input you need from the human")
+    reason = redact_sensitive_text(str(reason), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.wait_task(
+                conn, tid,
+                reason=reason,
+                kind="needs_input",
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not wait {tid} (unknown id or not in "
+                    f"running/ready)"
+                )
+            run = kb.latest_run(conn, tid)
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=landed.status if landed else "waiting",
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_wait: {e}")
+    except Exception as e:
+        logger.exception("kanban_wait failed")
+        return tool_error(f"kanban_wait: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1627,7 +1675,7 @@ KANBAN_BLOCK_SCHEMA = {
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "needed), 'needs_input' (you need a human decision/answer — goes to 'waiting', TTL-exempt), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
@@ -2084,6 +2132,15 @@ registry.register(
     handler=_handle_heartbeat,
     check_fn=_check_kanban_mode,
     emoji="💓",
+)
+
+registry.register(
+    name="kanban_wait",
+    toolset="kanban",
+    schema=KANBAN_WAIT_SCHEMA,
+    handler=_handle_wait,
+    check_fn=_check_kanban_mode,
+    emoji="⏳",
 )
 
 registry.register(

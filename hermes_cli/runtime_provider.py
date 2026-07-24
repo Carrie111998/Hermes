@@ -23,6 +23,7 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     DEFAULT_QWEN_BASE_URL,
+    DEFAULT_KIMI_OAUTH_BASE_URL,
     DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY,
     _agent_key_is_usable,
@@ -435,6 +436,9 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "qwen-oauth":
         api_mode = "chat_completions"
         base_url = base_url or DEFAULT_QWEN_BASE_URL
+    elif provider == "kimi-oauth":
+        api_mode = "chat_completions"
+        base_url = base_url or DEFAULT_KIMI_OAUTH_BASE_URL
     elif provider == "minimax-oauth":
         # MiniMax OAuth tokens are valid only against the Anthropic Messages
         # compatible endpoint. Do not honor stale model.api_mode values from a
@@ -1965,6 +1969,24 @@ def resolve_runtime_provider(
             if requested_provider != "auto":
                 raise
             logger.info("Qwen OAuth credentials failed; "
+                        "falling through to next provider.")
+
+    if provider == "kimi-oauth":
+        try:
+            from hermes_cli.auth import resolve_kimi_oauth_runtime_credentials
+            creds = resolve_kimi_oauth_runtime_credentials()
+            return {
+                "provider": "kimi-oauth",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", "").rstrip("/"),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "kimi-code"),
+                "requested_provider": requested_provider,
+            }
+        except Exception:
+            if requested_provider != "auto":
+                raise
+            logger.info("Kimi OAuth credentials failed; "
                         "falling through to next provider.")
 
     if provider == "minimax-oauth":
