@@ -222,6 +222,7 @@ export const zh: Translations = {
       'nav.commandPalette': '打开命令面板',
       'nav.commandCenter': '打开命令中心',
       'nav.settings': '打开设置',
+      'nav.backToChat': '返回对话',
       'nav.profiles': '打开配置',
       'nav.skills': '打开技能',
       'nav.messaging': '打开消息',

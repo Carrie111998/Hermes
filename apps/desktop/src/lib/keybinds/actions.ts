@@ -90,6 +90,9 @@ export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
   { id: 'nav.commandPalette', category: 'navigation', defaults: ['mod+k', 'mod+p'] },
   { id: 'nav.commandCenter', category: 'navigation', defaults: ['mod+.'] },
   { id: 'nav.settings', category: 'navigation', defaults: ['mod+,'] },
+  // Esc returns to chat from settings (and any other overlay that traps you).
+  // Skipped on non-overlay routes via the handler's route guard.
+  { id: 'nav.backToChat', category: 'navigation', defaults: ['escape'] },
   { id: 'nav.profiles', category: 'navigation', defaults: [] },
   { id: 'nav.skills', category: 'navigation', defaults: [] },
   { id: 'nav.messaging', category: 'navigation', defaults: [] },

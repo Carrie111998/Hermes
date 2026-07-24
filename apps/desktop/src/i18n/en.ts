@@ -227,6 +227,7 @@ export const en: Translations = {
       'nav.commandPalette': 'Open command palette',
       'nav.commandCenter': 'Open command center',
       'nav.settings': 'Open settings',
+      'nav.backToChat': 'Back to chat',
       'nav.profiles': 'Open profiles',
       'nav.skills': 'Open skills',
       'nav.messaging': 'Open messaging',

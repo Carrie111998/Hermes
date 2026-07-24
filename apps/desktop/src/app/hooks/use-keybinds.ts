@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
@@ -56,10 +56,13 @@ import { requestComposerFocus, requestVoiceToggle } from '../chat/composer/focus
 import { openSession } from '../open-session'
 import {
   AGENTS_ROUTE,
+  appViewForPath,
   ARTIFACTS_ROUTE,
   CRON_ROUTE,
+  isOverlayView,
   MESSAGING_ROUTE,
   navigateToWorkspacePage,
+  NEW_CHAT_ROUTE,
   PROFILES_ROUTE,
   sessionRoute,
   SETTINGS_ROUTE,
@@ -84,6 +87,7 @@ type HandlerMap = Record<string, () => void>
 // mode is active (edit overlay / panel rebind) — records the pressed combo.
 export function useKeybinds(deps: KeybindRuntimeDeps): void {
   const navigate = useNavigate()
+  const location = useLocation()
   const { resolvedMode, setMode } = useTheme()
 
   // Keep the latest closures without re-subscribing the listener.
@@ -140,6 +144,16 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'nav.commandPalette': toggleCommandPalette,
     'nav.commandCenter': deps.toggleCommandCenter,
     'nav.settings': () => navigate(SETTINGS_ROUTE),
+    'nav.backToChat': () => {
+      // Only meaningful when an overlay route is open. Outside overlays, Esc is
+      // reserved for capture mode + the session switcher (handled earlier in the
+      // keydown listener), so bail out to leave those flows alone.
+      if (!isOverlayView(appViewForPath(location.pathname))) {
+        return
+      }
+
+      navigate(NEW_CHAT_ROUTE)
+    },
     'nav.profiles': () => navigate(PROFILES_ROUTE),
     'nav.skills': () => navigateToWorkspacePage(navigate, SKILLS_ROUTE),
     'nav.messaging': () => navigateToWorkspacePage(navigate, MESSAGING_ROUTE),
