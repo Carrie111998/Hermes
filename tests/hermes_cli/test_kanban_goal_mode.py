@@ -228,8 +228,9 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
     _patch_judge(monkeypatch, ["continue"] * 10)
     blocked = {}
 
-    def _block(reason):
+    def _block(reason, kind=None):
         blocked["reason"] = reason
+        blocked["kind"] = kind
 
     res = goals.run_kanban_goal_loop(
         task_id="t3",
