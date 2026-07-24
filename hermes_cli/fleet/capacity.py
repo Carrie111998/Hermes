@@ -266,6 +266,9 @@ class BridgeUsageAdapter:
             freshness = Freshness.STALE if stale else Freshness.FRESH
             confidence = Confidence.LOW if missing_row_time else Confidence.HIGH
             digest = hashlib.sha256(raw).hexdigest()
+            overage_raw = matched.get("overage_disabled")
+            if overage_raw is not None and not isinstance(overage_raw, bool):
+                raise ValueError("overage_disabled must be a boolean when set")
             snapshot = CapacitySnapshot(
                 lane_id=lane_id,
                 used_pct=used,
@@ -282,7 +285,7 @@ class BridgeUsageAdapter:
                 freshness=freshness,
                 confidence=confidence,
                 schema_version="plans-1",
-                overage_disabled=None,
+                overage_disabled=overage_raw,
                 comparability_group=_optional_identifier(
                     matched.get("comparability_group"), "comparability_group"
                 ),
