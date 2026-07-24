@@ -2,14 +2,18 @@
 
 ## Local (macOS)
 
-- Focused battery: `17 passed, 5 skipped` (`local-focused-tests-final.txt`). The five skips are the real Linux/user-namespace jail cases; macOS has no `unshare`.
-- Relevant Hermes suites: `90 passed, 5 skipped` (`local-relevant-tests-clean.txt`): sandbox tool, toolset exposure, toolset distributions, and registry.
-- Static/deployment gates (`local-static-gates-clean.txt`): Ruff clean, plane lint strict clean with zero new findings, runtime slots regenerated, deployment spec valid, and `git diff --check` clean.
+- Relevant Hermes suites: `91 passed, 8 skipped` (`local-relevant-tests-final.txt`): sandbox tool, toolset exposure/distributions, and registry. The eight skips are the real Linux user-namespace E2Es; macOS has no `unshare`.
+- Static/deployment gates (`local-static-gates-clean.txt` plus final rerun): Ruff clean, runtime slots regenerated, deployment spec valid, and `git diff --check` clean.
+- Plane fence: zero branch-added violations, zero baseline changes, zero client-token hits in the shared tool (`plane-lint-delta-final.md`). Upstream main itself is globally baseline-red after a concurrent scanner/baseline split; the branch and upstream violation sets are identical.
 - Bundle assembly dry-run: success, tool included (`bundle-dry-run.txt`). This was read-only; no deployment was performed.
 
 ## Linux jailed E2E
 
-The dedicated `Python sandbox` GitHub Actions job runs the complete focused file on Ubuntu after enabling unprivileged user namespaces. It covers the five cases skipped locally: 600-row reconciliation, empty network namespace, filesystem escape prevention, timeout/orphan cleanup, and distinct OOM handling. Green run: https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30132405057 (`linux-jailed-e2e.txt`), `22 passed` with all five jailed cases executed.
+The dedicated `Python sandbox` GitHub Actions job runs unit tests plus exactly eight jailed E2Es on Ubuntu and fails on any skip. Green run: https://github.com/teren-papercutlabs/hermes-pcl/actions/runs/30133978023 (`linux-jailed-e2e-final.txt`). Coverage includes the 600-row reconciliation fixture, empty network namespace, plain-write and mount-remount escape attempts, host-path absence, timeout/orphan cleanup, distinct OOM and CPU-limit statuses, real NPROC/EAGAIN enforcement, and a hard total scratch-space cap.
+
+## Independent review
+
+Claude/Opus cross-provider security review progressed BLOCKED → BLOCKED → `CLEAR`. Final verdict and grounding are in `cross-provider-review-v3.md`; the prior verdicts are retained as remediation evidence.
 
 ## Deployment boundary
 
