@@ -47,3 +47,7 @@ optional_env:
     description: "If set, the bot only responds in these channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
     password: false
+  - name: MATTERMOST_AUTO_TITLE
+    description: "On /new in a DM, post a flat banner as the new thread root and auto-title it from the first exchange (default true)."
+    prompt: "Enable session-banner auto-title? (true/false)"
+    password: false
