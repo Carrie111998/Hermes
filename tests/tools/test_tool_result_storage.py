@@ -14,6 +14,7 @@ from tools.tool_result_storage import (
     PERSISTED_OUTPUT_CLOSING_TAG,
     STORAGE_DIR,
     _build_persisted_message,
+    _head_tail_truncation,
     _heredoc_marker,
     _resolve_storage_dir,
     _safe_result_filename,
@@ -63,6 +64,61 @@ class TestGeneratePreview:
         preview, has_more = generate_preview(text)
         assert preview == text
         assert has_more is False
+
+
+# ── _head_tail_truncation ─────────────────────────────────────────────
+
+class TestHeadTailTruncation:
+    def test_short_content_no_tail(self):
+        text = "short content"
+        head, tail, omitted = _head_tail_truncation(text)
+        assert head == text
+        assert tail == ""
+        assert omitted == 0
+
+    def test_long_content_has_head_and_tail(self):
+        text = "AAAA" * 500 + "BBBB" * 500  # 4000 chars, well over 1500
+        head, tail, omitted = _head_tail_truncation(text)
+        assert len(head) > 0
+        assert len(tail) > 0
+        assert omitted > 0
+        # Head should be from the beginning
+        assert head.startswith("AAAA")
+        # Tail should be from the end
+        assert tail.endswith("BBBB")
+        # Combined should equal omitted + head + tail
+        assert omitted + len(head) + len(tail) == len(text)
+
+    def test_omitted_count_accuracy(self):
+        text = "x" * 5000
+        head, tail, omitted = _head_tail_truncation(text, max_chars=2000)
+        # 2000 // 2 = 1000 each for head and tail
+        # Head might be trimmed at newline; no newlines here so it's exactly 1000
+        assert len(head) == 1000
+        assert len(tail) == 1000
+        assert omitted == 3000
+
+    def test_tail_contains_newest_content(self):
+        """The tail should contain the very last characters of content."""
+        text = "BEGIN_MARKER" + "x" * 90_000 + "END_MARKER"
+        head, tail, omitted = _head_tail_truncation(text, max_chars=2000)
+        # Tail should preserve the end marker (newest content)
+        assert "END_MARKER" in tail
+        # Head should preserve the begin marker
+        assert "BEGIN_MARKER" in head
+
+    def test_empty_content(self):
+        head, tail, omitted = _head_tail_truncation("")
+        assert head == ""
+        assert tail == ""
+        assert omitted == 0
+
+    def test_exact_boundary(self):
+        text = "x" * DEFAULT_PREVIEW_SIZE_CHARS
+        head, tail, omitted = _head_tail_truncation(text)
+        assert head == text
+        assert tail == ""
+        assert omitted == 0
 
 
 # ── _heredoc_marker ───────────────────────────────────────────────────
@@ -306,6 +362,25 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert "Truncated" in result
+
+    def test_fallback_contains_head_and_tail(self):
+        """When persistence fails, the fallback must preserve the tail (newest output)."""
+        content = "AAA_BEGIN" + "x" * 60_000 + "ZZZ_END"
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_ht",
+            env=None,
+            threshold=30_000,
+        )
+        assert "Truncated" in result
+        # Head should be preserved
+        assert "AAA_BEGIN" in result
+        # Tail (newest output) should be preserved
+        assert "ZZZ_END" in result
+        # Should have the omitted-middle marker
+        assert "... omitted" in result
+        assert "head + tail only" in result
 
     def test_read_file_never_persisted(self):
         """read_file has threshold=inf, should never be persisted."""

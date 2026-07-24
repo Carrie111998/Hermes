@@ -90,6 +90,38 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
     return truncated, True
 
 
+def _head_tail_truncation(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, str, int]:
+    """Split oversized content into head + tail preview, returning (head, tail, omitted_count).
+
+    Head gets roughly half the budget, tail gets the other half, so the
+    newest/output (tail) is always preserved. The caller wraps these with an
+    omitted-middle marker.
+    """
+    if len(content) <= max_chars:
+        return content, "", 0
+
+    half = max_chars // 2
+    head = content[:half]
+    # Try to break head at a newline boundary
+    head_nl = head.rfind("\n")
+    if head_nl > half // 2:
+        head = head[: head_nl + 1]
+    else:
+        # No good newline break; use the raw half boundary
+        head = content[:half]
+
+    tail = content[-half:]
+    # Try to break tail at a newline boundary (prefer the first newline in tail)
+    tail_nl = tail.find("\n")
+    if 0 <= tail_nl < half // 2:
+        tail = tail[tail_nl + 1 :]
+    else:
+        tail = content[-half:]
+
+    omitted = len(content) - len(head) - len(tail)
+    return head, tail, omitted
+
+
 def _heredoc_marker(content: str) -> str:
     """Return a heredoc delimiter that doesn't collide with content."""
     if HEREDOC_MARKER not in content:
@@ -193,6 +225,19 @@ def maybe_persist_tool_result(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
         tool_name, len(content),
     )
+    # Preserve head + tail so the model can read the newest output even
+    # when persistence is unavailable (#70949).
+    head, tail, omitted = _head_tail_truncation(content, max_chars=config.preview_size)
+    if tail:
+        return (
+            f"{head}\n\n"
+            f"[... omitted {omitted:,} chars ...]\n\n"
+            f"{tail}\n\n"
+            f"[Truncated: tool response was {len(content):,} chars. "
+            f"Full output could not be saved to sandbox. "
+            f"Showing head + tail only; middle omitted ({omitted:,} chars).]"
+        )
+    # Fallback: head-only if content was small enough to fit in preview
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
