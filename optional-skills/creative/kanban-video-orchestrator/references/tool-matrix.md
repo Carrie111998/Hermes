@@ -52,10 +52,11 @@ called from the terminal toolset; they don't appear in `always_load`.
 
 ### Kanban infrastructure
 
-The kanban plugin auto-injects baseline orchestration guidance into every
-worker's system prompt — the `kanban_create` fan-out pattern, claim/handoff
-lifecycle, and the "decompose, don't execute" rule for orchestrators. There is
-no kanban skill to load; the guidance is always present for kanban workers.
+The kanban plugin auto-injects the worker lifecycle and handoff guidance into
+every worker's system prompt. Foreground/orchestrator sessions receive the
+`kanban_create` fan-out contract separately; workers only report findings and
+suggest follow-up work in comments. There is no kanban skill to load; the
+worker guidance is always present for kanban workers.
 
 ## External tools (called from terminal toolset)
 
