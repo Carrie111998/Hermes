@@ -25,6 +25,9 @@ const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial
 
 const session = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
 
+const chatText = (message: ChatMessage): string =>
+  message.parts.map(part => ('text' in part ? part.text : '')).join('')
+
 describe('applyRuntimeInfo approval mode', () => {
   beforeEach(() => {
     $approvalModes.set({})
@@ -698,5 +701,75 @@ describe('appendLiveSessionProjection', () => {
     const stored = [msg('stored-user', 'user', 'earlier')]
 
     expect(appendLiveSessionProjection(stored, { session_id: 'runtime-1' })).toBe(stored)
+  })
+
+  // The inflight row has an already-persisted guard; the queued row had none,
+  // so once the gateway persisted a drained queue entry while still reporting
+  // it as queued, the same prompt rendered twice — and again on every
+  // re-render/refocus, because the projected ids differ from the stored row's.
+  it('does not duplicate a queued prompt the gateway has already persisted', () => {
+    const stored = [
+      msg('stored-user-1', 'user', 'earlier'),
+      msg('stored-assistant-1', 'assistant', 'earlier answer'),
+      msg('stored-user-2', 'user', 'drained queue prompt')
+    ]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      queued: { user: 'drained queue prompt' }
+    })
+
+    expect(restored.map(message => chatText(message))).toEqual([
+      'earlier',
+      'earlier answer',
+      'drained queue prompt'
+    ])
+  })
+
+  it('does not duplicate a queued prompt already covered by the inflight projection', () => {
+    const stored = [msg('stored-user-1', 'user', 'earlier')]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      inflight: { user: 'same prompt', assistant: '', streaming: true },
+      queued: { user: 'same prompt' }
+    })
+
+    const users = restored.filter(message => message.role === 'user').map(message => chatText(message))
+
+    expect(users).toEqual(['earlier', 'same prompt'])
+  })
+
+  // SAFETY: the guard must never swallow a genuinely new queued turn. Joel
+  // legitimately re-sends the same short text ("what's next?"), so suppressing
+  // on any historical match would lose a real prompt — far worse than a
+  // cosmetic duplicate.
+  it('still projects a queued prompt that repeats an OLDER (non-latest) turn', () => {
+    const stored = [
+      msg('stored-user-1', 'user', "what's next?"),
+      msg('stored-assistant-1', 'assistant', 'here is what is next'),
+      msg('stored-user-2', 'user', 'different prompt'),
+      msg('stored-assistant-2', 'assistant', 'another answer')
+    ]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      queued: { user: "what's next?" }
+    })
+
+    expect(restored).toHaveLength(5)
+    expect(chatText(restored[4]!)).toBe("what's next?")
+    expect(restored[4]).toMatchObject({ id: 'user-queued-runtime-1' })
+  })
+
+  it('still projects a queued prompt when nothing matches it', () => {
+    const stored = [msg('stored-user-1', 'user', 'earlier')]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      queued: { user: 'brand new prompt' }
+    })
+
+    expect(restored.map(message => chatText(message))).toEqual(['earlier', 'brand new prompt'])
   })
 })

@@ -524,7 +524,24 @@ export function appendLiveSessionProjection(
     })
   }
 
-  if (queuedUser) {
+  // Same already-persisted guard as the inflight row above, and for the same
+  // reason: once the gateway persists a drained queue entry while still
+  // reporting it as `queued`, projecting it again renders the prompt twice --
+  // and the projected id (`user-queued-…`) differs from the stored row's, so
+  // React keys cannot collapse them and the copies accumulate on every
+  // re-render or refocus until the app restarts.
+  //
+  // Compared against the newest user row *including anything just projected*,
+  // so an inflight row covering the same turn also suppresses it. Scoped to
+  // the LATEST user turn only -- an older identical prompt must never hide a
+  // newly accepted repeat, because re-sending the same short text ("what's
+  // next?") is normal and swallowing a real prompt is far worse than showing
+  // a duplicate.
+  const latestProjectedUser = [...projected].reverse().find(message => message.role === 'user')
+  const newestUser = latestProjectedUser ?? latestUser
+  const queuedAlreadyPresent = newestUser && chatMessageText(newestUser).trim() === queuedUser
+
+  if (queuedUser && !queuedAlreadyPresent) {
     projected.push({
       id: `user-queued-${sessionId}`,
       role: 'user',
