@@ -2819,7 +2819,7 @@ class TestThemeBootstrapCSS:
 
 
     @staticmethod
-    def _mount_spa_client(tmp_path, monkeypatch):
+    def _mount_spa_client(tmp_path, monkeypatch, auth_required=None):
         from fastapi import FastAPI
         from starlette.testclient import TestClient
         import hermes_cli.web_server as ws
@@ -2832,6 +2832,12 @@ class TestThemeBootstrapCSS:
         )
         monkeypatch.setattr(ws, "WEB_DIST", dist)
         spa_app = FastAPI()
+        # NOTE: `mount_spa(application)` takes an app argument, but
+        # `_serve_index` reads gating from the MODULE-LEVEL `web_server.app`
+        # (same object in production, where mount_spa(app) is called with it).
+        # Set gating there so these tests exercise the real seam.
+        if auth_required is not None:
+            monkeypatch.setattr(ws.app.state, "auth_required", auth_required, raising=False)
         ws.mount_spa(spa_app)
         return TestClient(spa_app)
 
@@ -2851,6 +2857,59 @@ class TestThemeBootstrapCSS:
         head = resp.text.split("</head>")[0]
         assert "hermes-theme-bootstrap" in head
 
+    def test_gated_spa_html_never_carries_the_long_lived_session_token(
+        self, tmp_path, monkeypatch
+    ):
+        """SECURITY INVARIANT for remote/phone access.
+
+        Putting the dashboard behind a public reverse proxy is only safe
+        because gated mode serves the SPA WITHOUT the long-lived
+        ``_SESSION_TOKEN`` in the HTML - the browser authenticates with a
+        cookie session instead (see ``_serve_index``). If this ever
+        regresses, every operator running the documented proxy setup ships a
+        long-lived dashboard credential to the public internet in plain HTML,
+        and a phone-handoff QR becomes a full-privilege token leak.
+
+        Pinned here because nothing else asserts it: the existing
+        ``_serve_index`` tests only cover theme bootstrap.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "load_config", lambda: {"dashboard": {"theme": "default"}})
+        monkeypatch.setattr(ws, "_SESSION_TOKEN", "super-secret-long-lived-token")
+
+        client = self._mount_spa_client(tmp_path, monkeypatch, auth_required=True)
+
+        resp = client.get("/chat")
+
+        assert resp.status_code == 200
+        assert "super-secret-long-lived-token" not in resp.text
+        assert "__HERMES_SESSION_TOKEN__" not in resp.text
+        # The SPA still needs to know which auth scheme to use for /api/pty
+        # and /api/ws (cookie ticket rather than token).
+        assert "window.__HERMES_AUTH_REQUIRED__=true" in resp.text
+
+    def test_ungated_spa_html_still_carries_the_token_for_loopback(
+        self, tmp_path, monkeypatch
+    ):
+        """Complement of the invariant above: on a trusted loopback bind the
+        token IS injected (that is how the desktop shell and local dashboard
+        authenticate). Pinning both directions means a future change cannot
+        silently flip which mode gets the credential."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "load_config", lambda: {"dashboard": {"theme": "default"}})
+        monkeypatch.setattr(ws, "_SESSION_TOKEN", "loopback-token")
+
+        client = self._mount_spa_client(tmp_path, monkeypatch, auth_required=False)
+
+        resp = client.get("/chat")
+
+        assert resp.status_code == 200
+        assert "loopback-token" in resp.text
+        assert "window.__HERMES_AUTH_REQUIRED__=false" in resp.text
 
 
 
