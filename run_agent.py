@@ -1319,6 +1319,13 @@ class AIAgent:
         Responses API) or a legacy ``messages`` list.  Context-size scaling
         applies the same way to both shapes via
         :func:`agent.chat_completion_helpers.estimate_request_context_tokens`.
+
+        The result is capped at the configured ``timeout_seconds`` /
+        ``request_timeout_seconds`` (if set) so the stale detector never
+        waits longer than the HTTP request timeout.  Without this cap the
+        context-size scaling for large payloads (>100k tokens) raises the
+        stale timeout to 240s while the HTTP timeout remains 60s, allowing
+        repeated HTTP-timeout retries before the stale detector acts.
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
@@ -1328,10 +1335,23 @@ class AIAgent:
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)
         if est_tokens > 100_000:
-            return max(stale_base, 240.0)
-        if est_tokens > 50_000:
-            return max(stale_base, 150.0)
-        return stale_base
+            result = max(stale_base, 240.0)
+        elif est_tokens > 50_000:
+            result = max(stale_base, 150.0)
+        else:
+            result = stale_base
+
+        # Cap at the configured request timeout so the stale detector never
+        # out-lasts the HTTP-level timeout.  This ensures that for providers
+        # with a short timeout_seconds (e.g. 60s for deepseek-v4-flash) the
+        # stale detector fires before the HTTP read timeout expires, giving
+        # the retry loop a clean kill + diagnostics instead of a raw
+        # httpx.ReadTimeout that retries silently.
+        request_cap = self._resolved_api_call_timeout()
+        if request_cap < result:
+            result = request_cap
+
+        return result
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
         """Return an actionable hint when this request matches a known

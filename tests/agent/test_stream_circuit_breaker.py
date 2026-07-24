@@ -127,9 +127,11 @@ class TestStreamCircuitBreaker:
             record_stream_failure(agent, "opencode-go", "deepseek-v4-flash", "err")
         state = get_circuit_state("opencode-go", "deepseek-v4-flash")
         assert state is not None
-        # After trip, the counter resets to 0
-        assert state["failure_count"] == 0
-        assert state["tripped"] is False
+        # After trip, state is OPEN and cooldown is active
+        assert state["state"] == "OPEN"
+        assert state["tripped"] is True
+        assert state["cooldown_remaining_s"] > 0
+        assert state["cooldown_remaining_s"] <= 900.0
 
     def test_case_insensitive_provider(self, agent):
         """Provider name casing is normalized."""

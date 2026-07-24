@@ -806,6 +806,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
+            # Also count it in the global (provider, model) circuit breaker
+            # so non-streaming stale kills trip the breaker just like
+            # streaming failures do.
+            _record_stream_failure(
+                agent,
+                getattr(agent, "provider", ""),
+                getattr(agent, "model", ""),
+                f"stale_non_stream: {int(_elapsed)}s",
+            )
             agent._touch_activity(
                 f"stale non-streaming call killed after {int(_elapsed)}s"
             )
@@ -877,6 +886,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        # Also reset the global (provider, model) circuit breaker so a
+        # subsequent non-streaming success clears any stale failure count.
+        try:
+            _record_stream_success(agent, agent.provider, agent.model)
+        except Exception:
+            pass
     return result["response"]
 
 
