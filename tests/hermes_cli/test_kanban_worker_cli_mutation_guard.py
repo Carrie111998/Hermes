@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from argparse import Namespace
 from contextlib import nullcontext
-
-import pytest
+from pathlib import Path
+import subprocess
+import sys
 
 from hermes_cli import kanban
-from hermes_cli import main as hermes_main
 from hermes_cli.kanban import _is_kanban_worker_cli_mutation
 
 
@@ -33,13 +34,26 @@ def test_worker_command_dispatch_blocks_set_model_before_handler(monkeypatch, ca
     assert "cannot mutate board state through the CLI" in capsys.readouterr().err
 
 
-def test_top_level_kanban_command_propagates_a_rejected_exit_status(monkeypatch):
-    monkeypatch.setattr(kanban, "kanban_command", lambda _args: 1)
+def test_top_level_cli_propagates_worker_guard_rejection_without_mutation(tmp_path):
+    env = os.environ.copy()
+    env["HERMES_KANBAN_TASK"] = "t_parent"
+    env["HERMES_KANBAN_RUN_ID"] = "42"
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    env["HERMES_HOME"] = str(tmp_path / "hermes-home")
+    env["HOME"] = str(tmp_path / "user-home")
 
-    with pytest.raises(SystemExit) as exc_info:
-        hermes_main.cmd_kanban(Namespace())
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "complete", "t_target"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
-    assert exc_info.value.code == 1
+    assert result.returncode == 1
+    assert "cannot mutate board state through the CLI" in result.stderr
+    assert not (Path(env["HERMES_HOME"]) / "kanban.db").exists()
 
 
 def test_running_kanban_worker_can_use_read_only_cli(monkeypatch):
