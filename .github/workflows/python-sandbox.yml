@@ -5,6 +5,9 @@ on:
     paths:
       - ".github/workflows/python-sandbox.yml"
       - "tools/python_sandbox_tool.py"
+      - "toolsets.py"
+      - "pyproject.toml"
+      - "uv.lock"
       - "tests/test_python_sandbox_tool.py"
       - "tests/fixtures/python_sandbox/**"
   workflow_dispatch:
@@ -30,5 +33,5 @@ jobs:
         run: |
           set -euo pipefail
           uv run pytest -q -m sandbox_e2e tests/test_python_sandbox_tool.py | tee /tmp/sandbox-e2e.txt
-          grep -Eq '^7 passed in ' /tmp/sandbox-e2e.txt
+          grep -Eq '^8 passed in ' /tmp/sandbox-e2e.txt
           ! grep -q skipped /tmp/sandbox-e2e.txt

@@ -186,14 +186,17 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
     assert "--rbind" in script
     assert 'findmnt -Rrn -o TARGET "$dst"' in script
     assert 'remount,bind,ro "$target"' in script
-    assert 'mount -o remount,bind,rw "$JAIL/work"' in script
+    assert 'tmpfs "$JAIL/work"' in script
+    assert 'mount -o remount,bind,ro "$JAIL/export"' in script
+    assert "mount -o remount,bind,rw /export" in script
     assert script.count("remount,bind,rw") == 1
     assert "$HOME" not in script
     assert "HERMES_HOME" not in script
     assert '/usr/sbin/pivot_root "$JAIL"' in script
     assert 'mount -o remount,bind,ro "$JAIL"' in script
-    assert "exec /usr/bin/unshare --user --map-user=65534" in script
+    assert "/usr/bin/unshare --user --map-user=65534" in script
     assert "resource.setrlimit(resource.RLIMIT_NPROC" in script
+    assert "cd /work" in script
     assert 'mkdir -p "$JAIL/opt/python/3.13"' in script
     assert 'ro_dir /opt/python/3.13 "$JAIL/opt/python/3.13"' in script
 
@@ -573,19 +576,16 @@ def test_jailed_process_count_is_bounded(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox, "_load_config", lambda: config)
     monkeypatch.setattr(sandbox, "get_hermes_home", lambda: tmp_path / "home")
     code = r'''
-import json, os, subprocess
+import errno, json, os, subprocess
 children = []
-errors = 0
+errors = []
 for _ in range(40):
     try:
         children.append(subprocess.Popen(
             ["/venv/bin/python", "-c", "import time; time.sleep(5)"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
         ))
-    except OSError:
-        errors += 1
+    except OSError as exc:
+        errors.append(exc.errno)
 for child in children:
     child.terminate()
 for child in children:
@@ -596,8 +596,57 @@ open(os.environ["RESULT_PATH"], "w").write(json.dumps(
 '''
     response = json.loads(sandbox.python_sandbox(code, timeout_seconds=20))
     assert response["status"] == "success", response
-    assert response["result"]["spawned"] < 40
-    assert response["result"]["errors"] > 0
+    assert 1 <= response["result"]["spawned"] <= 15
+    assert errno.EAGAIN in response["result"]["errors"]
+
+
+@pytest.mark.skipif(not _can_run_jail(), reason="kernel user namespaces unavailable")
+@pytest.mark.sandbox_e2e
+def test_jailed_scratch_total_is_bounded(tmp_path, monkeypatch):
+    source, csv = tmp_path / "records.db", tmp_path / "input.csv"
+    _db(source)
+    _csv(csv)
+    home = tmp_path / "home"
+    config = _config(
+        source,
+        csv,
+        wall_seconds=20,
+        max_wall_seconds=20,
+        file_size_mb=4,
+        scratch_mb=4,
+    )
+    monkeypatch.setattr(sandbox, "_load_config", lambda: config)
+    monkeypatch.setattr(sandbox, "get_hermes_home", lambda: home)
+    code = r'''
+import errno, json, os
+written = []
+error = None
+for index in range(8):
+    path = f"/work/chunk-{index}.bin"
+    try:
+        with open(path, "wb") as handle:
+            handle.write(b"x" * (1024 * 1024))
+        written.append(path)
+    except OSError as exc:
+        error = exc.errno
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        break
+if written:
+    os.unlink(written.pop())
+open(os.environ["RESULT_PATH"], "w").write(json.dumps(
+    {"written": len(written), "error": error}
+))
+'''
+    response = json.loads(sandbox.python_sandbox(code, timeout_seconds=20))
+    assert response["status"] == "success", response
+    assert response["result"]["error"] == errno.ENOSPC
+    run_work = home / "sandbox_runs" / response["run_id"] / "work"
+    assert sum(path.stat().st_size for path in run_work.rglob("*") if path.is_file()) <= (
+        4 * 1024 * 1024
+    )
 
 
 def test_prune_removes_expired_and_excess_runs(tmp_path):

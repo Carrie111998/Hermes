@@ -62,6 +62,10 @@ PYTHON_SANDBOX_BLOCK = (
     "    max_wall_seconds: 300\n"
     "    cpu_seconds: 60\n"
     "    memory_mb: 1024\n"
+    "    file_size_mb: 64\n"
+    "    scratch_mb: 64\n"
+    "    max_processes: 64\n"
+    "    max_open_files: 256\n"
     "    max_snapshot_mb: 512\n"
     "  artifact_ttl_days: 7\n"
     "  max_runs_kept: 40\n"
@@ -532,6 +536,10 @@ def _validate(
             "max_wall_seconds": 300,
             "cpu_seconds": 60,
             "memory_mb": 1024,
+            "file_size_mb": 64,
+            "scratch_mb": 64,
+            "max_processes": 64,
+            "max_open_files": 256,
             "max_snapshot_mb": 512,
         },
         "artifact_ttl_days": 7,

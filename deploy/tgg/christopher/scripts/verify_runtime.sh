@@ -33,7 +33,8 @@ print("true" if (config.get("python_sandbox") or {}).get("enabled") is True else
 PY2
 )"
 if [[ "$sandbox_enabled" == "true" ]]; then
-  runuser -u pclaw -- unshare --user --map-root-user --net --mount --pid --fork --kill-child true
+  runuser -u pclaw -- unshare --user --map-root-user --net --mount --pid --fork --kill-child \
+    /bin/sh -c 'unshare --user --map-user=65534 --map-group=65534 true'
   "$APP_ROOT/.venv/bin/python" - "$HERMES_HOME/config.yaml" <<'PY2'
 import pathlib, sys, yaml
 config = yaml.safe_load(open(sys.argv[1])) or {}

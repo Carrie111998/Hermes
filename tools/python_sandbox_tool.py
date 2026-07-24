@@ -36,6 +36,7 @@ DEFAULTS = {
     "cpu_seconds": 60,
     "memory_mb": 1024,
     "file_size_mb": 64,
+    "scratch_mb": 64,
     "max_processes": 64,
     "max_open_files": 256,
     "max_snapshot_mb": 512,
@@ -232,6 +233,7 @@ def _generate_init_script(
     base_prefix: Path | None = None,
     max_processes: int = 64,
     cpu_seconds: int = 60,
+    scratch_mb: int = 64,
 ) -> str:
     """Generate the mount plan executed as namespace-root."""
     jail = run_dir / "jail"
@@ -242,7 +244,7 @@ def _generate_init_script(
         'mkdir -p "$JAIL"',
         f'mount -t tmpfs -o size={int(tmpfs_mb)}m,nosuid,nodev tmpfs "$JAIL"',
         'mkdir -p "$JAIL/usr" "$JAIL/bin" "$JAIL/lib" "$JAIL/lib64" '
-        '"$JAIL/venv" "$JAIL/etc" "$JAIL/inputs" "$JAIL/work" '
+        '"$JAIL/venv" "$JAIL/etc" "$JAIL/inputs" "$JAIL/work" "$JAIL/export" '
         '"$JAIL/proc" "$JAIL/.oldroot"',
         'ro_dir() { src=$1; dst=$2; [ -e "$src" ] || return 0; '
         'mount --rbind "$src" "$dst"; mount --make-rslave "$dst"; '
@@ -287,8 +289,10 @@ def _generate_init_script(
         )
     lines.extend(
         [
-            f'mount --bind {_q(run_dir / "work")} "$JAIL/work"',
-            'mount -o remount,bind,rw "$JAIL/work"',
+            f'mount -t tmpfs -o size={int(scratch_mb)}m,nosuid,nodev,noexec '
+            'tmpfs "$JAIL/work"',
+            f'mount --bind {_q(run_dir / "work")} "$JAIL/export"',
+            'mount -o remount,bind,ro "$JAIL/export"',
             'mount -t proc -o nosuid,nodev,noexec proc "$JAIL/proc"',
             # Assembly is complete. Freeze the tmpfs root before pivot;
             # nested /work stays a separate writable bind mount.
@@ -296,7 +300,9 @@ def _generate_init_script(
             '/usr/sbin/pivot_root "$JAIL" "$JAIL/.oldroot"',
             "cd /",
             "umount -l /.oldroot",
-            "exec /usr/bin/unshare --user --map-user=65534 --map-group=65534 "
+            "cd /work",
+            "set +e",
+            "/usr/bin/unshare --user --map-user=65534 --map-group=65534 "
             "/venv/bin/python -I -c "
             + _q(
                 "import os,resource;"
@@ -306,6 +312,11 @@ def _generate_init_script(
                 f"{int(max_processes)}));"
                 "os.execv('/venv/bin/python', ['/venv/bin/python','-I','/script.py'])"
             ),
+            "rc=$?",
+            "set -e",
+            "mount -o remount,bind,rw /export",
+            "cp -a /work/. /export/",
+            'exit "$rc"',
             "",
         ]
     )
@@ -632,6 +643,7 @@ def python_sandbox(
             Path(sys.base_prefix),
             limits["max_processes"],
             limits["cpu_seconds"],
+            limits["scratch_mb"],
         ),
         encoding="utf-8",
     )
@@ -717,14 +729,14 @@ def python_sandbox(
             status = "timeout"
         elif returncode == 0:
             status = "success"
+        elif interrupted_requested:
+            status = "error"
         elif _cpu_limit_exhausted(returncode, stderr):
             status = "error"
             stderr += (
                 f"\nCPU limit ({limits['cpu_seconds']}s) exhausted — "
                 "simplify the algorithm"
             )
-        elif interrupted_requested:
-            status = "interrupted"
         elif returncode in (-signal.SIGKILL, 137):
             status = "oom"
             stderr += (
