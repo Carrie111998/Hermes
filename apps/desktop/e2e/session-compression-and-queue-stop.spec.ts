@@ -94,15 +94,26 @@ test.describe('session compression in progress', () => {
   let fixture: MockBackendFixture
 
   test.beforeAll(async () => {
+    // Pin a tiny toolset so schema overhead cannot alone cross the
+    // compression threshold. With the default CLI/desktop tool surface
+    // (~20k+ rough tokens of schemas), threshold_tokens: 22000 fired on
+    // the first short turn and the test hung waiting for MOCK_REPLY while
+    // summarization was held. Keep context_length at the Hermes minimum
+    // (64k), ignore AGENTS.md/skills injection noise, and use an absolute
+    // cap the large trigger paste can actually cross after two short turns.
     fixture = await setupMockBackend({
       modelContextLength: 64_000,
+      extraEnv: {
+        HERMES_TUI_TOOLSETS: 'terminal,file',
+        HERMES_IGNORE_RULES: '1',
+      },
       extraConfig: `compression:
-  threshold_tokens: 22000
+  threshold_tokens: 8000
   protect_first_n: 0
   protect_last_n: 1
 auxiliary:
   compression:
-    provider: custom
+    provider: mock
     model: mock-model`,
       mockServer: {
         holdFirstCompletionContaining: 'You are a summarization agent creating a context checkpoint.',
@@ -119,14 +130,14 @@ auxiliary:
     const { page } = fixture
     const queued = 'E2E_QUEUED_DURING_COMPACTION'
 
-    // A normal message crosses the tiny configured context budget. The mock
-    // blocks only the resulting summary request, so these assertions run
-    // during automatic compaction rather than a slash-command path.
+    // A large paste crosses the pinned absolute threshold after two short
+    // exchanges. The mock blocks only the resulting summary request, so these
+    // assertions run during automatic compaction rather than a slash-command path.
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_ONE '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
     await pasteAndSend(page, 'E2E_COMPACTION_HISTORY_TWO '.repeat(5))
     await waitForTranscript(page, MOCK_REPLY)
-    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(500))
+    await pasteAndSend(page, 'E2E_TRIGGER_AUTOMATIC_COMPACTION '.repeat(2000))
     await fixture.mock.waitForHeldCompletion()
     await expect(page.getByRole('status', { name: 'Summarizing thread' }).last()).toBeVisible()
 

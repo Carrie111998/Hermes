@@ -350,6 +350,14 @@ export interface MockBackendOptions {
   extraConfig?: string
   /** Override the mock model's context window for compression scenarios. */
   modelContextLength?: number
+  /** Optional mock-server hold / stream controls for mid-turn scenarios. */
+  mockServer?: MockServerOptions
+  /**
+   * Extra process env for the Electron + backend spawn. Used by scenarios that
+   * must pin toolsets (e.g. automatic compaction) so schema overhead cannot
+   * trip the compression threshold before the test's trigger message.
+   */
+  extraEnv?: Record<string, string>
 }
 
 /**
@@ -359,10 +367,6 @@ export interface MockBackendOptions {
  *   3. Launch the desktop app
  *   4. Return handles for test interaction
  */
-export interface MockBackendOptions {
-  mockServer?: MockServerOptions
-}
-
 export async function setupMockBackend(options: MockBackendOptions = {}): Promise<MockBackendFixture> {
   // 1. Start mock server
   const mock = await startMockServer(options.mockServer)
@@ -379,7 +383,7 @@ export async function setupMockBackend(options: MockBackendOptions = {}): Promis
   writeEnvFile(sandbox.hermesHome)
 
   // 3. Build env + launch
-  const env = buildAppEnv(sandbox)
+  const env = buildAppEnv(sandbox, options.extraEnv)
   const { app, page } = await launchDesktop(env)
 
   return {
