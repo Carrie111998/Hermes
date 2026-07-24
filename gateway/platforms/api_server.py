@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
+- GET  /api/sessions/search        — owner-scoped full-text message search
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -40,10 +41,14 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
+import html
 import json
+import unicodedata
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -51,11 +56,12 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -91,8 +97,47 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from hermes_state import SessionSearchUnavailable
+from gateway.session_execution_lease import (
+    SessionExecutionConflict,
+    SessionExecutionLease,
+)
+from gateway.platforms.session_turns import (
+    MAX_INLINE_IMAGE_TOTAL_BYTES,
+    MAX_INPUT_TEXT_LENGTH,
+    SESSION_TURN_CAPABILITIES,
+    SessionTurnService,
+)
 
 logger = logging.getLogger(__name__)
+
+OCC_CAPABILITY_REVISION = "occ.conversation_gateway.h1-h2-h3.v2"
+
+
+def _capability_build_id() -> str:
+    """Return the immutable source/image revision advertised to OCC."""
+    try:
+        from hermes_cli.build_info import get_build_sha
+
+        baked = get_build_sha(short=40)
+        if baked:
+            return baked
+    except Exception:
+        pass
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+class SessionHistoryReadError(RuntimeError):
+    """Canonical persisted history could not be read safely."""
 
 
 def _hermes_version() -> str:
@@ -123,7 +168,18 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+# The transport cap must truthfully carry the advertised durable-turn payload:
+# the 10 MiB decoded inline-image budget grows by 4/3 as base64 on the wire,
+# plus the 64 KiB text cap at up to 6 bytes per JSON-escaped character, plus
+# JSON framing. 16 MiB bounds that envelope with headroom and still keeps a
+# hard, safe ceiling; long agent conversations with tool calls also fit.
+_TURN_WIRE_ENVELOPE_BYTES = (
+    ((MAX_INLINE_IMAGE_TOTAL_BYTES + 2) // 3) * 4  # base64 of decoded budget
+    + 6 * MAX_INPUT_TEXT_LENGTH                    # worst-case escaped text
+    + 64 * 1024                                    # JSON framing / headers slack
+)
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+assert _TURN_WIRE_ENVELOPE_BYTES <= MAX_REQUEST_BYTES
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -1078,6 +1134,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Durable OCC/browser turns live in a focused edge service. Keeping
+        # orchestration out of this already-large adapter also ensures no new
+        # model tool/schema is introduced.
+        self._session_turn_service = SessionTurnService(self)
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1563,6 +1623,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
+            # Static route must precede /api/sessions/{session_id}.
+            ("GET", "/api/sessions/search", self._handle_session_search),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
@@ -1570,6 +1632,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            ("POST", "/api/sessions/{session_id}/turns", self._handle_session_turn_submit),
+            ("GET", "/api/sessions/{session_id}/turns/{turn_id}", self._handle_session_turn_status),
+            ("GET", "/api/sessions/{session_id}/turns/{turn_id}/events", self._handle_session_turn_events),
+            ("POST", "/api/sessions/{session_id}/turns/{turn_id}/stop", self._handle_session_turn_stop),
+            ("POST", "/api/sessions/{session_id}/turns/{turn_id}/deliver", self._handle_session_turn_deliver),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -1610,6 +1677,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+    _MAX_OWNER_USER_ID_LEN = 256
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -2081,9 +2149,30 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        session_db = await self._ensure_session_db_async()
+        session_search_available = bool(
+            self._search_cursor_signing_key()
+            and session_db
+            and await asyncio.to_thread(session_db.session_search_available)
+        )
+        session_search_endpoint = {
+            "method": "GET",
+            "path": "/api/sessions/search",
+            "owner_scope": ["user_id", "source"],
+            "pagination": {
+                "type": "cursor",
+                "parameter": "cursor",
+                "ordering": ["timestamp_desc", "message_id_desc"],
+                "snapshot": "message_id_high_water",
+                "cursor": "hmac_authenticated_v2",
+            },
+        }
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
+            "revision": OCC_CAPABILITY_REVISION,
+            "build_id": _capability_build_id(),
             "model": self._model_name,
             "auth": {
                 "type": "bearer",
@@ -2112,9 +2201,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
+                "session_create_owner_bound": True,
+                "session_search": session_search_available,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_fork_anchored_preserve_source": True,
+                "session_fork_anchor_field": "anchor_message_id",
+                "session_fork_user_message_anchor": True,
+                "durable_session_turns": True,
+                "conversation_turn_contract": "h1",
+                "durable_turn_idempotency": True,
+                "durable_turn_status": True,
+                "durable_turn_resumable_events": True,
+                "durable_turn_stop": True,
+                "durable_turn_manual_delivery": True,
+                "conversation_turn_slack_delivery": True,
+                "conversation_turn_image_input": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2139,7 +2242,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
-                "session_create": {"method": "POST", "path": "/api/sessions"},
+                **(
+                    {"session_search": session_search_endpoint}
+                    if session_search_available
+                    else {}
+                ),
+                "session_create": {
+                    "method": "POST",
+                    "path": "/api/sessions",
+                    "owner_field": "user_id",
+                    "owner_max_chars": self._MAX_OWNER_USER_ID_LEN,
+                    "source": "api_server",
+                },
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
@@ -2147,6 +2261,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_turn_submit": {"method": "POST", "path": "/api/sessions/{session_id}/turns"},
+                "session_turn_status": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}"},
+                "session_turn_events": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}/events"},
+                "session_turn_stop": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/stop"},
+                "session_turn_deliver": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/deliver"},
+                "conversation_turn_create": {"method": "POST", "path": "/api/sessions/{session_id}/turns"},
+                "conversation_turn_status": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}"},
+                "conversation_turn_events": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}/events"},
+                "conversation_turn_stop": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/stop"},
+                "conversation_turn_deliver": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/deliver"},
+            },
+            "session_turns": {
+                **SESSION_TURN_CAPABILITIES,
+                "transport": {"max_request_bytes": MAX_REQUEST_BYTES},
             },
         })
 
@@ -2260,9 +2388,23 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "_lineage_root_id", "branch_point_message_id",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
+        if "branch_point_message_id" not in payload:
+            raw_config = session.get("model_config")
+            try:
+                model_config = (
+                    json.loads(raw_config)
+                    if isinstance(raw_config, str)
+                    else raw_config
+                )
+            except (json.JSONDecodeError, TypeError):
+                model_config = None
+            if isinstance(model_config, dict):
+                branch_point = model_config.get("_branch_point_message_id")
+                if isinstance(branch_point, int) and not isinstance(branch_point, bool):
+                    payload["branch_point_message_id"] = branch_point
         # Avoid exposing full system prompts/model_config through the client API;
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
@@ -2303,12 +2445,30 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
         if db is None:
-            return []
+            raise SessionHistoryReadError("session database unavailable")
         try:
             return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
         except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
-            return []
+            logger.warning("Failed to load session history for %s", session_id)
+            raise SessionHistoryReadError("session history unavailable") from exc
+
+    async def _acquire_session_execution_lease(
+        self,
+        session_id: str,
+        *,
+        owner_prefix: str,
+        on_lost: Optional[Callable[[], None]] = None,
+    ) -> SessionExecutionLease:
+        db = await self._ensure_session_db_async()
+        if db is None:
+            raise SessionHistoryReadError("session database unavailable")
+        return await SessionExecutionLease.acquire(
+            db,
+            session_id,
+            owner_prefix=owner_prefix,
+            wait_timeout=0.0,
+            on_lost=on_lost,
+        )
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -2339,6 +2499,340 @@ class APIServerAdapter(BasePlatformAdapter):
             "has_more": len(sessions) == limit,
         })
 
+    _SEARCH_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+        r"(?i)(?<![A-Za-z0-9_.-])"
+        r"(?P<key>[A-Za-z0-9_.-]{0,64}"
+        r"(?:api[_. -]?key|access[_. -]?token|refresh[_. -]?token|token|secret|"
+        r"password|passwd|credential|authorization|auth)"
+        r"[A-Za-z0-9_.-]{0,64})"
+        r"(?P<sep>\s*(?:=|:)\s*)"
+        r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
+    )
+    _SEARCH_AUTHORIZATION_RE = re.compile(
+        r"(?i)((?:proxy-)?authorization\s*:\s*)"
+        r"(?:(?:bearer|basic|token|digest)\s+)?[^\s,;]+"
+    )
+    _SEARCH_BEARER_RE = re.compile(
+        r"(?i)(?<![A-Za-z0-9_-])(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"
+    )
+    _SEARCH_JWT_RE = re.compile(
+        r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}"
+    )
+    _SEARCH_REDACTED_SENTINEL_RE = re.compile(r"«redacted(?::[^»]*)?»")
+    _SEARCH_CURSOR_VERSION = 2
+    _SEARCH_CURSOR_TTL_SECONDS = 900
+
+    @classmethod
+    def _redact_search_content(cls, value: Any) -> str:
+        """Completely remove credential values before any snippet slicing."""
+        text = str(value or "")
+        text = cls._SEARCH_AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
+        text = cls._SEARCH_BEARER_RE.sub(r"\1[REDACTED]", text)
+        text = cls._SEARCH_JWT_RE.sub("[REDACTED]", text)
+        text = cls._SEARCH_CREDENTIAL_ASSIGNMENT_RE.sub(
+            lambda match: f"{match.group('key')}{match.group('sep')}[REDACTED]",
+            text,
+        )
+        redacted = redact_sensitive_text(
+            text,
+            force=True,
+            file_read=True,
+            redact_url_credentials=True,
+        )
+        return cls._SEARCH_REDACTED_SENTINEL_RE.sub("[REDACTED]", redacted)
+
+    @classmethod
+    def _bounded_search_snippet(cls, value: Any, maximum: int = 480) -> str:
+        """Return one globally redacted, query-independent prefix per message."""
+        redacted = " ".join(cls._redact_search_content(value).split())
+        if not redacted or maximum < 2:
+            return "…"
+
+        # Never return a complete body, even when it is shorter than the bound.
+        excerpt = redacted[:192]
+        if len(excerpt) == len(redacted):
+            excerpt = excerpt[:-1]
+        if not excerpt:
+            return "…"
+
+        output: List[str] = []
+        used = 0
+        for character in excerpt:
+            escaped = html.escape(character, quote=True)
+            if used + len(escaped) > maximum - 1:
+                break
+            output.append(escaped)
+            used += len(escaped)
+        return "".join(output) + "…"
+
+    @staticmethod
+    def _search_cursor_scope_hash(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_search_query(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).split())
+
+    def _search_cursor_signing_key(self) -> Optional[bytes]:
+        if not self._api_key:
+            return None
+        return hmac.new(
+            self._api_key.encode("utf-8"),
+            b"hermes-session-search-cursor:v2",
+            hashlib.sha256,
+        ).digest()
+
+    def _encode_search_cursor(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        source: str,
+        snapshot_message_id: int,
+        boundary: Dict[str, Any],
+    ) -> str:
+        signing_key = self._search_cursor_signing_key()
+        if signing_key is None:
+            raise SessionSearchUnavailable("Session search cursor signing unavailable")
+        now = int(time.time())
+        payload = {
+            "v": self._SEARCH_CURSOR_VERSION,
+            "q": self._search_cursor_scope_hash(self._normalize_search_query(query)),
+            "u": self._search_cursor_scope_hash(user_id),
+            "s": self._search_cursor_scope_hash(source),
+            "h": snapshot_message_id,
+            "t": boundary["timestamp"],
+            "i": int(boundary["message_id"]),
+            "e": now + self._SEARCH_CURSOR_TTL_SECONDS,
+        }
+        encoded_payload = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).rstrip(b"=")
+        signature = base64.urlsafe_b64encode(
+            hmac.new(signing_key, encoded_payload, hashlib.sha256).digest()
+        ).rstrip(b"=")
+        return f"{encoded_payload.decode('ascii')}.{signature.decode('ascii')}"
+
+    def _decode_search_cursor(
+        self,
+        value: str,
+        *,
+        query: str,
+        user_id: str,
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        signing_key = self._search_cursor_signing_key()
+        if (
+            signing_key is None
+            or not value
+            or len(value) > 2_048
+            or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
+        ):
+            return None
+        try:
+            encoded_payload, encoded_signature = value.split(".", 1)
+            signature = base64.b64decode(
+                encoded_signature + "=" * (-len(encoded_signature) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            expected_signature = hmac.new(
+                signing_key, encoded_payload.encode("ascii"), hashlib.sha256
+            ).digest()
+            if not hmac.compare_digest(signature, expected_signature):
+                return None
+            payload_bytes = base64.b64decode(
+                encoded_payload + "=" * (-len(encoded_payload) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            payload = json.loads(payload_bytes)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"v", "q", "u", "s", "h", "t", "i", "e"}
+                or payload.get("v") != self._SEARCH_CURSOR_VERSION
+            ):
+                return None
+            expected = (
+                self._search_cursor_scope_hash(self._normalize_search_query(query)),
+                self._search_cursor_scope_hash(user_id),
+                self._search_cursor_scope_hash(source),
+            )
+            actual = (payload.get("q"), payload.get("u"), payload.get("s"))
+            if any(
+                not isinstance(left, str)
+                or not isinstance(right, str)
+                or not hmac.compare_digest(left, right)
+                for left, right in zip(actual, expected)
+            ):
+                return None
+            high_water = int(payload["h"])
+            message_id = int(payload["i"])
+            timestamp = payload["t"]
+            expires_at = int(payload["e"])
+            if (
+                high_water < 0
+                or message_id <= 0
+                or not isinstance(timestamp, (int, float))
+                or timestamp < 0
+                or expires_at < int(time.time())
+            ):
+                return None
+            return {
+                "snapshot_message_id": high_water,
+                "after": (timestamp, message_id),
+            }
+        except (
+            binascii.Error,
+            KeyError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    async def _handle_session_search(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/search — safe exact-owner FTS search."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = request.rel_url.query
+        allowed = {"q", "user_id", "source", "limit", "cursor"}
+        if any(key not in allowed for key in query):
+            return web.json_response(
+                _openai_error("Invalid search query parameters", code="invalid_query"),
+                status=400,
+            )
+        for key in allowed:
+            if len(query.getall(key, [])) > 1:
+                return web.json_response(
+                    _openai_error("Duplicate search query parameter", code="invalid_query"),
+                    status=400,
+                )
+
+        q = (query.get("q") or "").strip()
+        user_id = (query.get("user_id") or "").strip()
+        source = (query.get("source") or "").strip()
+        if (
+            not q
+            or not user_id
+            or not source
+            or len(q) > 256
+            or len(user_id) > 256
+            or len(source) > 64
+            or any(
+                "\x00" in value or "\r" in value or "\n" in value
+                for value in (q, user_id, source)
+            )
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Invalid or missing owner-scoped search query",
+                    code="invalid_query",
+                ),
+                status=400,
+            )
+
+        raw_limit = query.get("limit")
+        if raw_limit is None:
+            limit = 20
+        elif re.fullmatch(r"[0-9]+", raw_limit):
+            limit = int(raw_limit)
+        else:
+            limit = 0
+        if not 1 <= limit <= 50:
+            return web.json_response(
+                _openai_error("Invalid search pagination", code="invalid_query"),
+                status=400,
+            )
+
+        cursor_value = query.get("cursor")
+        cursor = None
+        if cursor_value is not None:
+            cursor = self._decode_search_cursor(
+                cursor_value,
+                query=q,
+                user_id=user_id,
+                source=source,
+            )
+            if cursor is None:
+                return web.json_response(
+                    _openai_error("Invalid search cursor", code="invalid_query"),
+                    status=400,
+                )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session search unavailable", code="session_search_unavailable"
+                ),
+                status=503,
+            )
+        try:
+            if self._search_cursor_signing_key() is None:
+                raise SessionSearchUnavailable(
+                    "Session search cursor signing unavailable"
+                )
+            if not await asyncio.to_thread(db.session_search_available):
+                raise SessionSearchUnavailable("Session full-text search is unavailable")
+            rows, snapshot_message_id = await asyncio.to_thread(
+                db.search_messages_scoped,
+                q,
+                user_id=user_id,
+                source=source,
+                limit=limit + 1,
+                snapshot_message_id=(
+                    cursor["snapshot_message_id"] if cursor is not None else None
+                ),
+                after=cursor["after"] if cursor is not None else None,
+            )
+        except SessionSearchUnavailable:
+            logger.warning("Owner-scoped session search unavailable", exc_info=True)
+            return web.json_response(
+                _openai_error(
+                    "Session search unavailable", code="session_search_unavailable"
+                ),
+                status=503,
+            )
+        except Exception:
+            logger.exception("Owner-scoped session search failed")
+            return web.json_response(
+                _openai_error("Session search failed", err_type="server_error"),
+                status=500,
+            )
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        data = [
+            {
+                "session_id": row["session_id"],
+                "message_id": row["message_id"],
+                "role": row["role"],
+                "timestamp": row["timestamp"],
+                "snippet": self._bounded_search_snippet(row.get("content")),
+            }
+            for row in page_rows
+        ]
+        next_cursor = None
+        if has_more and page_rows:
+            next_cursor = self._encode_search_cursor(
+                query=q,
+                user_id=user_id,
+                source=source,
+                snapshot_message_id=snapshot_message_id,
+                boundary=page_rows[-1],
+            )
+        return web.json_response({
+            "object": "list",
+            "data": data,
+            "limit": limit,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        })
+
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions -- create an empty Hermes session row.
 
@@ -2367,6 +2861,24 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
+        user_id = body.get("user_id")
+        if user_id is not None:
+            if not isinstance(user_id, str):
+                return web.json_response(
+                    _openai_error("user_id must be a string", code="invalid_user_id"),
+                    status=400,
+                )
+            user_id = user_id.strip()
+            if (
+                not user_id
+                or len(user_id) > self._MAX_OWNER_USER_ID_LEN
+                or re.search(r'[\x00-\x1f\x7f]', user_id)
+            ):
+                return web.json_response(
+                    _openai_error("Invalid user_id", code="invalid_user_id"),
+                    status=400,
+                )
+
         model = body.get("model") or self._model_name
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
@@ -2388,11 +2900,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?)""",
+                       id, source, user_id, model, system_prompt, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         "api_server",
+                        user_id,
                         str(model) if model else None,
                         system_prompt,
                         _time.time(),
@@ -2419,7 +2932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ).fetchone()
                 return (dict(session_row) if session_row else {
                     "id": session_id, "source": "api_server",
-                    "model": model, "title": title,
+                    "user_id": user_id, "model": model, "title": title,
                 }), None
             return db._execute_write(_atomic)
 
@@ -2500,51 +3013,193 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+        """POST /api/sessions/{session_id}/fork — exact, non-mutating branch."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
+        _, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
         if err:
             return err
-        db = await self._ensure_session_db_async()
-        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
-            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
-        if await asyncio.to_thread(db.get_session, fork_id):
-            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
-        )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        if body.get("preserve_source") is not True:
+            return web.json_response(
+                _openai_error(
+                    "preserve_source must be true for an anchored fork",
+                    code="preserve_source_required",
+                ),
+                status=400,
+            )
+
+        has_canonical_anchor = "anchor_message_id" in body
+        has_legacy_anchor = "from_message_id" in body
+        canonical_anchor = body.get("anchor_message_id")
+        legacy_anchor = body.get("from_message_id")
+        if (
+            not has_canonical_anchor
+            and not has_legacy_anchor
+            or has_canonical_anchor
+            and has_legacy_anchor
+            and canonical_anchor != legacy_anchor
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Supply anchor_message_id, or compatible from_message_id, but not conflicting values",
+                    code="invalid_anchor",
+                ),
+                status=400,
+            )
+        anchor_message_id = canonical_anchor if has_canonical_anchor else legacy_anchor
+        if (
+            not isinstance(anchor_message_id, int)
+            or isinstance(anchor_message_id, bool)
+            or anchor_message_id <= 0
+        ):
+            return web.json_response(
+                _openai_error(
+                    "anchor_message_id must be a positive integer",
+                    code="invalid_anchor",
+                ),
+                status=400,
+            )
+
+        idempotency_key = body.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key must be a non-empty string",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+        idempotency_key = idempotency_key.strip()
+        if len(idempotency_key) > 255:
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key is too long (max 255 characters)",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+
         title = body.get("title")
-        if title is None:
-            base = source.get("title") or "fork"
-            try:
-                title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
-            except Exception:
-                title = f"{base} fork"
+        if title is not None and not isinstance(title, str):
+            return web.json_response(
+                _openai_error("title must be a string", code="invalid_title"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
         try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
+            clean_title = db.sanitize_title(title)
         except ValueError as exc:
-            return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_title"), status=400
+            )
+
+        raw_fork_id = body.get("id") or body.get("session_id")
+        requested_fork_id = str(raw_fork_id).strip() if raw_fork_id else None
+        fork_id = requested_fork_id or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        from gateway.session import _is_path_unsafe
+        if (
+            not fork_id
+            or re.search(r'[\r\n\x00]', fork_id)
+            or _is_path_unsafe(fork_id)
+            or len(fork_id) > self._MAX_SESSION_HEADER_LEN
+        ):
+            return web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+
+        try:
+            result, fork = await asyncio.to_thread(
+                db.fork_session_at_message,
+                source_id,
+                fork_id,
+                anchor_message_id,
+                idempotency_key,
+                title=clean_title,
+                requested_child_session_id=requested_fork_id,
+            )
+        except Exception:
+            logger.exception("Atomic anchored fork failed for source %s", source_id)
+            return web.json_response(
+                _openai_error("Failed to fork session", code="session_fork_failed"),
+                status=500,
+            )
+
+        if result == "source_missing":
+            return web.json_response(
+                _openai_error(
+                    f"Session not found: {source_id}", code="session_not_found"
+                ),
+                status=404,
+            )
+        if result == "invalid_anchor":
+            return web.json_response(
+                _openai_error(
+                    "anchor_message_id does not belong to the source session",
+                    code="invalid_anchor",
+                ),
+                status=400,
+            )
+        if result == "unsafe_anchor":
+            return web.json_response(
+                _openai_error(
+                    "anchor_message_id is not a canonical user message or "
+                    "completed assistant response safe for continuation",
+                    code="unsafe_anchor",
+                ),
+                status=400,
+            )
+        if result == "session_exists":
+            return web.json_response(
+                _openai_error(
+                    f"Session already exists: {fork_id}", code="session_exists"
+                ),
+                status=409,
+            )
+        if result == "invalid_title":
+            return web.json_response(
+                _openai_error("Title already in use", code="invalid_title"),
+                status=400,
+            )
+        if result == "idempotency_stale":
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key refers to a fork whose child no longer exists",
+                    code="idempotency_stale",
+                ),
+                status=409,
+            )
+        if result == "idempotency_conflict":
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key was already used for a different fork request",
+                    code="idempotency_conflict",
+                ),
+                status=409,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.session",
+                "session": self._session_response(fork),
+                "idempotent_replay": result == "replayed",
+            },
+            status=200 if result == "replayed" else 201,
+        )
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
@@ -2565,14 +3220,35 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-        )
+        try:
+            lease = await self._acquire_session_execution_lease(
+                session_id, owner_prefix="api:session-chat"
+            )
+        except SessionExecutionConflict:
+            return web.json_response(
+                _openai_error("Session already has an active execution", code="active_session_execution"),
+                status=409,
+            )
+        except SessionHistoryReadError:
+            return web.json_response(
+                _openai_error("Session history unavailable", code="session_history_unavailable"),
+                status=503,
+            )
+        async with lease:
+            try:
+                history = await self._conversation_history_for_session(session_id)
+            except SessionHistoryReadError:
+                return web.json_response(
+                    _openai_error("Session history unavailable", code="session_history_unavailable"),
+                    status=503,
+                )
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -2649,10 +3325,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         async def _run_and_signal() -> None:
+            lease = None
             try:
+                lease = await self._acquire_session_execution_lease(
+                    session_id, owner_prefix="api:session-chat-stream"
+                )
+                history = await self._conversation_history_for_session(session_id)
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -2680,10 +3360,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+            except SessionExecutionConflict:
+                await queue.put(_event_payload("error", {"message": "Session already has an active execution", "code": "active_session_execution"}))
+            except SessionHistoryReadError:
+                await queue.put(_event_payload("error", {"message": "Session history unavailable", "code": "session_history_unavailable"}))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                if lease is not None:
+                    await lease.release()
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
@@ -2726,6 +3412,24 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    # Durable/replayable session-turn API. All behavior and persistence live
+    # in session_turns.py; these methods intentionally stay as thin route seams.
+    @_admit_api_agent_request
+    async def _handle_session_turn_submit(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.submit(request)
+
+    async def _handle_session_turn_status(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.status(request)
+
+    async def _handle_session_turn_events(self, request: "web.Request") -> "web.StreamResponse":
+        return await self._session_turn_service.events(request)
+
+    async def _handle_session_turn_stop(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.stop(request)
+
+    async def _handle_session_turn_deliver(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.deliver(request)
 
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -2837,9 +3541,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 db = await self._ensure_session_db_async()
                 if db is not None:
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
+            except Exception:
+                logger.warning("Failed to load canonical session history for %s", session_id)
+                return web.json_response(
+                    _openai_error(
+                        "Session history unavailable",
+                        code="session_history_unavailable",
+                    ),
+                    status=503,
+                )
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -5559,6 +6269,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Reconcile crash-uncertain durable turns before accepting traffic.
+            # This never resumes work; it terminalizes it as interrupted.
+            await self._session_turn_service.reconcile_startup()
             mws = [
                 mw
                 for mw in (

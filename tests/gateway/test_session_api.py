@@ -1,5 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
+import json
+import sqlite3
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -7,8 +9,81 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    MAX_REQUEST_BYTES,
+    _TURN_WIRE_ENVELOPE_BYTES,
+    body_limit_middleware,
+)
 from hermes_state import SessionDB
+
+
+def _append_completed_turn(
+    session_db,
+    session_id,
+    user="question",
+    assistant="answer",
+    *,
+    finish_reason="stop",
+):
+    session_db.append_message(session_id, "user", user)
+    return session_db.append_message(
+        session_id, "assistant", assistant, finish_reason=finish_reason
+    )
+
+
+def _tool_call(call_id, name="test_tool"):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
+
+
+def _responses_tool_call(call_id, name="test_tool"):
+    return {
+        "call_id": call_id,
+        "type": "function_call",
+        "name": name,
+        "arguments": {},
+    }
+
+
+def _anthropic_tool_call(call_id, name="test_tool"):
+    return {
+        "id": call_id,
+        "type": "tool_use",
+        "name": name,
+        "input": {},
+    }
+
+
+def _assert_valid_for_next_user_turn(messages):
+    """Strict provider-neutral role/tool shape accepted before a new user turn."""
+    expect = "user"
+    pending_tool_calls = set()
+    for message in messages:
+        role = message["role"]
+        if expect == "user":
+            assert role == "user"
+            expect = "assistant"
+        elif expect == "assistant":
+            assert role == "assistant"
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                pending_tool_calls = {call["id"] for call in tool_calls}
+                assert len(pending_tool_calls) == len(tool_calls)
+                expect = "tool"
+            else:
+                expect = "user"
+        else:
+            assert role == "tool"
+            assert message.get("tool_call_id") in pending_tool_calls
+            pending_tool_calls.remove(message["tool_call_id"])
+            if not pending_tool_calls:
+                expect = "assistant"
+    assert expect == "user"
+    assert not pending_tool_calls
 
 
 @pytest.fixture
@@ -59,11 +134,20 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         assert resp.status == 200
         data = await resp.json()
 
+    assert data["object"] == "hermes.api_server.capabilities"
+    assert data["platform"] == "hermes-agent"
+    assert data["revision"] == "occ.conversation_gateway.h1-h2-h3.v2"
+    assert len(data["build_id"]) == 40
+    assert int(data["build_id"], 16) >= 0
     features = data["features"]
     assert features["session_resources"] is True
+    assert features["session_create_owner_bound"] is True
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_fork_anchored_preserve_source"] is True
+    assert features["session_fork_anchor_field"] == "anchor_message_id"
+    assert features["session_fork_user_message_anchor"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -73,6 +157,50 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
     }
+    assert data["endpoints"]["session_create"] == {
+        "method": "POST",
+        "path": "/api/sessions",
+        "owner_field": "user_id",
+        "owner_max_chars": 256,
+        "source": "api_server",
+    }
+    assert data["session_turns"]["input_text"]["max_chars"] == 65_536
+    assert data["session_turns"]["inline_images"]["max_frames"] == 256
+    assert data["session_turns"]["transport"]["max_request_bytes"] == 16 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_transport_accepts_near_limit_and_rejects_over_limit():
+    assert MAX_REQUEST_BYTES == 16 * 1024 * 1024
+    assert _TURN_WIRE_ENVELOPE_BYTES <= MAX_REQUEST_BYTES
+
+    async def consume(request):
+        payload = await request.read()
+        return web.json_response({"size": len(payload)})
+
+    app = web.Application(
+        middlewares=[body_limit_middleware],
+        client_max_size=MAX_REQUEST_BYTES,
+    )
+    app.router.add_post("/consume", consume)
+    async with TestClient(TestServer(app)) as cli:
+        near = await cli.post(
+            "/consume",
+            data=b"x" * (MAX_REQUEST_BYTES - 1),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert near.status == 200, await near.text()
+        assert (await near.json())["size"] == MAX_REQUEST_BYTES - 1
+
+        over = await cli.post(
+            "/consume",
+            data=b"x" * (MAX_REQUEST_BYTES + 1),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        over_payload = await over.json()
+
+    assert over.status == 413
+    assert over_payload["error"]["code"] == "body_too_large"
 
 
 @pytest.mark.asyncio
@@ -170,6 +298,75 @@ async def test_session_crud_and_message_history(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_authenticated_session_create_persists_owner_atomically_and_fixes_source(
+    auth_adapter, session_db
+):
+    app = _create_session_app(auth_adapter)
+    headers = {"Authorization": "Bearer sk-test"}
+    owner = "owner-" + "x" * 250
+    assert len(owner) == auth_adapter._MAX_OWNER_USER_ID_LEN
+    async with TestClient(TestServer(app)) as cli:
+        unauthenticated = await cli.post(
+            "/api/sessions",
+            json={"id": "owner-session", "user_id": owner},
+        )
+        assert unauthenticated.status == 401
+
+        created = await cli.post(
+            "/api/sessions",
+            json={
+                "id": "owner-session",
+                "user_id": f"  {owner}  ",
+                "source": "slack",
+                "title": "Owned API session",
+            },
+            headers=headers,
+        )
+        assert created.status == 201, await created.text()
+        payload = await created.json()
+
+        compatible = await cli.post(
+            "/api/sessions",
+            json={"id": "legacy-owner-omitted"},
+            headers=headers,
+        )
+        assert compatible.status == 201
+        compatible_payload = await compatible.json()
+
+    stored = session_db.get_session("owner-session")
+    assert payload["session"]["user_id"] == owner
+    assert payload["session"]["source"] == "api_server"
+    assert stored["user_id"] == owner
+    assert stored["source"] == "api_server"
+    assert stored["title"] == "Owned API session"
+    assert compatible_payload["session"]["user_id"] is None
+    assert session_db.get_session("legacy-owner-omitted")["user_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_id",
+    ["", "   ", 42, "bad\nowner", "x" * 257],
+)
+async def test_session_create_rejects_invalid_owner_without_partial_row(
+    auth_adapter, session_db, user_id
+):
+    session_id = f"invalid-owner-{abs(hash(str(user_id)))}"
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/sessions",
+            json={"id": session_id, "user_id": user_id, "title": "must rollback"},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_user_id"
+    assert session_db.get_session(session_id) is None
+
+
+@pytest.mark.asyncio
 async def test_session_messages_follow_compression_tip(adapter, session_db):
     source_id = session_db.create_session("source-session", "api_server")
     session_db.append_message(source_id, "user", "before compression")
@@ -190,25 +387,1027 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
 
 
 @pytest.mark.asyncio
-async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db):
-    source_id = session_db.create_session("source-session", "api_server", model="test-model")
+async def test_session_fork_is_authenticated_anchored_and_source_exactly_immutable(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session(
+        "source-session",
+        "slack",
+        model="test-model",
+        model_config={"provider": "openrouter", "route": "safe-route"},
+        system_prompt="stable prompt",
+        user_id="owner-42",
+        cwd="/tmp/project",
+    )
+    session_db._conn.execute(
+        """UPDATE sessions
+           SET git_branch = ?, git_repo_root = ?, billing_provider = ?,
+               billing_base_url = ?, billing_mode = ?, profile_name = ?,
+               pricing_version = ?
+           WHERE id = ?""",
+        (
+            "talos/issue-159",
+            "/tmp/project",
+            "openrouter",
+            "https://provider.invalid/v1",
+            "api",
+            "talos",
+            "2026-07",
+            source_id,
+        ),
+    )
+    session_db.record_gateway_session_peer(
+        source_id,
+        source="slack",
+        user_id="owner-42",
+        session_key="slack:owner-42:C1:T1",
+        chat_id="C1",
+        chat_type="channel",
+        thread_id="T1",
+        display_name="Owner thread",
+        origin_json='{"platform":"slack","chat_id":"C1"}',
+    )
     session_db.set_session_title(source_id, "Original")
     session_db.append_message(source_id, "user", "first path")
-    session_db.append_message(source_id, "assistant", "answer")
+    session_db.append_message(
+        source_id, "assistant", "answer", finish_reason="stop"
+    )
+    session_db.append_message(source_id, "user", "later turn")
+    anchor_id = session_db.get_messages(source_id)[1]["id"]
 
-    app = _create_session_app(adapter)
+    source_row_before = session_db.get_session(source_id)
+    source_messages_before = session_db.get_messages(source_id, include_inactive=True)
+    active_head_before = session_db.find_latest_gateway_session_for_peer(
+        source="slack",
+        user_id="owner-42",
+        session_key="slack:owner-42:C1:T1",
+        chat_id="C1",
+        chat_type="channel",
+        thread_id="T1",
+    )
+
+    app = _create_session_app(auth_adapter)
+    request_body = {
+        "id": "anchored-child",
+        "title": "Alternative",
+        "anchor_message_id": anchor_id,
+        "preserve_source": True,
+        "idempotency_key": "fork-request-1",
+    }
     async with TestClient(TestServer(app)) as cli:
-        resp = await cli.post(f"/api/sessions/{source_id}/fork", json={"title": "Alternative"})
-        assert resp.status == 201
+        unauthenticated = await cli.post(
+            f"/api/sessions/{source_id}/fork", json=request_body
+        )
+        assert unauthenticated.status == 401
+
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json=request_body,
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 201, await resp.text()
         payload = await resp.json()
+
+        get_resp = await cli.get(
+            "/api/sessions/anchored-child",
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert get_resp.status == 200
+        fetched = await get_resp.json()
 
     fork = payload["session"]
     assert payload["object"] == "hermes.session"
-    assert fork["id"] != source_id
+    assert payload["idempotent_replay"] is False
+    assert fork["id"] == "anchored-child"
     assert fork["parent_session_id"] == source_id
+    assert fork["branch_point_message_id"] == anchor_id
     assert fork["title"] == "Alternative"
-    assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
-    assert session_db.get_session(source_id)["end_reason"] == "branched"
+    assert fork["source"] == "slack"
+    assert fork["user_id"] == "owner-42"
+    assert fork["model"] == "test-model"
+    assert fetched["session"]["branch_point_message_id"] == anchor_id
+    assert "model_config" not in fork
+    assert "system_prompt" not in fork
+    assert "idempotency_key" not in json.dumps(payload)
+
+    child_row = session_db.get_session(fork["id"])
+    child_config = json.loads(child_row["model_config"])
+    assert child_config["provider"] == "openrouter"
+    assert child_config["route"] == "safe-route"
+    assert child_config["_branched_from"] == source_id
+    assert child_config["_branch_point_message_id"] == anchor_id
+    assert child_row["system_prompt"] == "stable prompt"
+    assert child_row["cwd"] == "/tmp/project"
+    assert child_row["git_branch"] == "talos/issue-159"
+    assert child_row["git_repo_root"] == "/tmp/project"
+    assert child_row["billing_provider"] == "openrouter"
+    assert child_row["billing_base_url"] == "https://provider.invalid/v1"
+    assert child_row["billing_mode"] == "api"
+    assert child_row["profile_name"] == "talos"
+    assert child_row["pricing_version"] == "2026-07"
+    assert child_row["session_key"] is None
+    assert child_row["chat_id"] is None
+    assert child_row["thread_id"] is None
+    assert child_row["display_name"] is None
+    assert child_row["origin_json"] is None
+    assert child_row["ended_at"] is None
+    assert child_row["end_reason"] is None
+    assert [m["content"] for m in session_db.get_messages(fork["id"])] == [
+        "first path",
+        "answer",
+    ]
+
+    assert session_db.get_session(source_id) == source_row_before
+    assert (
+        session_db.get_messages(source_id, include_inactive=True)
+        == source_messages_before
+    )
+    active_head_after = session_db.find_latest_gateway_session_for_peer(
+        source="slack",
+        user_id="owner-42",
+        session_key="slack:owner-42:C1:T1",
+        chat_id="C1",
+        chat_type="channel",
+        thread_id="T1",
+    )
+    assert active_head_before["id"] == source_id
+    assert active_head_after["id"] == source_id
+
+
+@pytest.mark.asyncio
+async def test_session_fork_slices_only_active_rows_through_exact_anchor(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("active-only-source", "api_server")
+    inactive_user = session_db.append_message(source_id, "user", "abandoned")
+    inactive_assistant = session_db.append_message(
+        source_id, "assistant", "abandoned answer", finish_reason="stop"
+    )
+    session_db._conn.execute(
+        "UPDATE messages SET active = 0 WHERE id IN (?, ?)",
+        (inactive_user, inactive_assistant),
+    )
+    session_db.append_message(source_id, "user", "canonical")
+    anchor_id = session_db.append_message(
+        source_id, "assistant", "canonical answer", finish_reason="stop"
+    )
+    source_before = session_db.get_messages(source_id, include_inactive=True)
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "active-only-child",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": "active-only-key",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        response_text = await response.text()
+
+    assert response.status == 201, response_text
+    child = session_db.get_messages("active-only-child", include_inactive=True)
+    assert [message["content"] for message in child] == [
+        "canonical",
+        "canonical answer",
+    ]
+    assert all(message["active"] for message in child)
+    assert session_db.get_messages(source_id, include_inactive=True) == source_before
+
+
+@pytest.mark.asyncio
+async def test_session_fork_idempotent_replay_and_conflicting_reuse(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    anchor_id = _append_completed_turn(session_db, source_id)
+    app = _create_session_app(auth_adapter)
+    body = {
+        "anchor_message_id": anchor_id,
+        "preserve_source": True,
+        "idempotency_key": "stable-key",
+    }
+    headers = {"Authorization": "Bearer sk-test"}
+
+    async with TestClient(TestServer(app)) as cli:
+        created = await cli.post(
+            f"/api/sessions/{source_id}/fork", json=body, headers=headers
+        )
+        assert created.status == 201
+        first = await created.json()
+
+        replay = await cli.post(
+            f"/api/sessions/{source_id}/fork", json=body, headers=headers
+        )
+        assert replay.status == 200
+        second = await replay.json()
+
+        conflict = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={**body, "title": "different request"},
+            headers=headers,
+        )
+        assert conflict.status == 409
+        conflict_payload = await conflict.json()
+
+    assert second["idempotent_replay"] is True
+    assert second["session"]["id"] == first["session"]["id"]
+    assert conflict_payload["error"]["code"] == "idempotency_conflict"
+    children = session_db._conn.execute(
+        "SELECT id FROM sessions WHERE parent_session_id = ?", (source_id,)
+    ).fetchall()
+    assert [row["id"] for row in children] == [first["session"]["id"]]
+
+
+@pytest.mark.asyncio
+async def test_session_fork_rejects_foreign_anchor_without_creating_child(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    session_db.append_message(source_id, "user", "source message")
+    other_id = session_db.create_session("other-session", "api_server")
+    session_db.append_message(other_id, "user", "foreign message")
+    foreign_anchor = session_db.get_messages(other_id)[0]["id"]
+    source_before = session_db.get_session(source_id)
+    messages_before = session_db.get_messages(source_id, include_inactive=True)
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "must-not-exist",
+                "from_message_id": foreign_anchor,
+                "preserve_source": True,
+                "idempotency_key": "invalid-anchor-key",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 400
+        payload = await resp.json()
+
+    assert payload["error"]["code"] == "invalid_anchor"
+    assert session_db.get_session("must-not-exist") is None
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id, include_inactive=True) == messages_before
+    assert session_db._conn.execute(
+        "SELECT 1 FROM session_fork_requests WHERE idempotency_key = ?",
+        ("invalid-anchor-key",),
+    ).fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_session_fork_failure_rolls_back_child_messages_and_idempotency(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    anchor_id = _append_completed_turn(session_db, source_id)
+    source_before = session_db.get_session(source_id)
+    messages_before = session_db.get_messages(source_id, include_inactive=True)
+    session_db._conn.executescript(
+        """
+        CREATE TRIGGER fail_anchored_child_copy
+        BEFORE INSERT ON messages
+        WHEN NEW.session_id = 'rollback-child'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected child copy failure');
+        END;
+        """
+    )
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "rollback-child",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": "rollback-key",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 500
+        payload = await resp.json()
+
+    assert payload["error"]["code"] == "session_fork_failed"
+    assert session_db.get_session("rollback-child") is None
+    assert session_db._conn.execute(
+        "SELECT 1 FROM messages WHERE session_id = 'rollback-child'"
+    ).fetchone() is None
+    assert session_db._conn.execute(
+        "SELECT 1 FROM session_fork_requests WHERE idempotency_key = 'rollback-key'"
+    ).fetchone() is None
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id, include_inactive=True) == messages_before
+
+
+@pytest.mark.asyncio
+async def test_session_fork_requires_preserve_source_and_bounded_fields(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    anchor_id = _append_completed_turn(session_db, source_id)
+    headers = {"Authorization": "Bearer sk-test"}
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        missing_preserve = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "anchor_message_id": anchor_id,
+                "idempotency_key": "missing-preserve",
+            },
+            headers=headers,
+        )
+        assert missing_preserve.status == 400
+        assert (await missing_preserve.json())["error"]["code"] == "preserve_source_required"
+
+        long_title = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": "long-title",
+                "title": "x" * (SessionDB.MAX_TITLE_LENGTH + 1),
+            },
+            headers=headers,
+        )
+        assert long_title.status == 400
+        assert (await long_title.json())["error"]["code"] == "invalid_title"
+
+        long_key = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": "k" * 256,
+            },
+            headers=headers,
+        )
+        assert long_key.status == 400
+        assert (await long_key.json())["error"]["code"] == "invalid_idempotency_key"
+
+    assert session_db._conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE parent_session_id = ?", (source_id,)
+    ).fetchone()["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_fork_anchor_contract_accepts_canonical_and_compatible_alias(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    anchor_id = _append_completed_turn(session_db, source_id)
+    headers = {"Authorization": "Bearer sk-test"}
+    app = _create_session_app(auth_adapter)
+
+    requests = [
+        ({"anchor_message_id": anchor_id}, "canonical-child", "canonical-key"),
+        ({"from_message_id": anchor_id}, "legacy-child", "legacy-key"),
+        (
+            {"anchor_message_id": anchor_id, "from_message_id": anchor_id},
+            "equal-fields-child",
+            "equal-fields-key",
+        ),
+    ]
+    async with TestClient(TestServer(app)) as cli:
+        for anchor_fields, child_id, key in requests:
+            response = await cli.post(
+                f"/api/sessions/{source_id}/fork",
+                json={
+                    **anchor_fields,
+                    "id": child_id,
+                    "preserve_source": True,
+                    "idempotency_key": key,
+                },
+                headers=headers,
+            )
+            assert response.status == 201, await response.text()
+            assert (await response.json())["session"]["branch_point_message_id"] == anchor_id
+
+        mismatched = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "anchor_message_id": anchor_id,
+                "from_message_id": anchor_id + 1,
+                "id": "mismatch-child",
+                "preserve_source": True,
+                "idempotency_key": "mismatch-key",
+            },
+            headers=headers,
+        )
+        missing = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "missing-child",
+                "preserve_source": True,
+                "idempotency_key": "missing-key",
+            },
+            headers=headers,
+        )
+        mismatched_payload = await mismatched.json()
+        missing_payload = await missing.json()
+
+    assert mismatched.status == 400
+    assert mismatched_payload["error"]["code"] == "invalid_anchor"
+    assert missing.status == 400
+    assert missing_payload["error"]["code"] == "invalid_anchor"
+    assert session_db.get_session("mismatch-child") is None
+    assert session_db.get_session("missing-child") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prefix_kind",
+    [
+        "assistant-tool-request-anchor",
+        "partial-multi-tool-results",
+        "complete-multi-tool-results-tool-anchor",
+        "assistant-native-tool-use-block",
+        "system-anchor",
+        "developer-anchor",
+        "consecutive-users-before-final",
+        "orphan-tool-result",
+    ],
+)
+async def test_session_fork_rejects_prefixes_unsafe_for_a_new_user_turn(
+    auth_adapter, session_db, prefix_kind
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    if prefix_kind in {"system-anchor", "developer-anchor"}:
+        anchor_id = session_db.append_message(source_id, prefix_kind.split("-")[0], "policy")
+    else:
+        anchor_id = session_db.append_message(source_id, "user", "first")
+        if prefix_kind == "assistant-tool-request-anchor":
+            anchor_id = session_db.append_message(
+                source_id, "assistant", "calling", tool_calls=[_tool_call("call-1")]
+            )
+        elif prefix_kind in {
+            "partial-multi-tool-results",
+            "complete-multi-tool-results-tool-anchor",
+        }:
+            session_db.append_message(
+                source_id,
+                "assistant",
+                "calling",
+                tool_calls=[_tool_call("call-1"), _tool_call("call-2")],
+            )
+            anchor_id = session_db.append_message(
+                source_id, "tool", "one", tool_call_id="call-1", tool_name="test_tool"
+            )
+            if prefix_kind == "complete-multi-tool-results-tool-anchor":
+                anchor_id = session_db.append_message(
+                    source_id, "tool", "two", tool_call_id="call-2", tool_name="test_tool"
+                )
+        elif prefix_kind == "assistant-native-tool-use-block":
+            anchor_id = session_db.append_message(
+                source_id,
+                "assistant",
+                [{"type": "tool_use", "id": "native-1", "name": "test_tool"}],
+            )
+        elif prefix_kind == "consecutive-users-before-final":
+            session_db.append_message(source_id, "user", "second")
+            anchor_id = session_db.append_message(source_id, "assistant", "answer")
+        elif prefix_kind == "orphan-tool-result":
+            anchor_id = session_db.append_message(
+                source_id, "tool", "orphan", tool_call_id="unknown", tool_name="test_tool"
+            )
+    source_before = session_db.get_session(source_id)
+    messages_before = session_db.get_messages(source_id, include_inactive=True)
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "unsafe-child",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": f"unsafe-{prefix_kind}",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        response_payload = await response.json()
+
+    assert response.status == 400
+    assert response_payload["error"]["code"] == "unsafe_anchor"
+    assert session_db.get_session("unsafe-child") is None
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id, include_inactive=True) == messages_before
+
+
+@pytest.mark.asyncio
+async def test_session_fork_accepts_canonical_user_anchor_and_still_rejects_truncated_assistant(
+    auth_adapter, session_db
+):
+    """Or7 #159: a canonical user message is a valid exact-message fork anchor.
+
+    The child transcript ends with that user message (the next agent run
+    answers it); assistant anchors remain restricted to fully completed
+    terminal boundaries.
+    """
+    source_id = session_db.create_session("user-anchor-source", "api_server")
+    first_user = session_db.append_message(source_id, "user", "first question")
+    session_db.append_message(
+        source_id, "assistant", "first answer", finish_reason="stop"
+    )
+    tail_user = session_db.append_message(source_id, "user", "edited question")
+    truncated_assistant = session_db.append_message(
+        source_id, "assistant", "cut off", finish_reason="length"
+    )
+    source_before = session_db.get_session(source_id)
+    messages_before = session_db.get_messages(source_id, include_inactive=True)
+    headers = {"Authorization": "Bearer sk-test"}
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        tail_fork = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "user-tail-child",
+                "anchor_message_id": tail_user,
+                "preserve_source": True,
+                "idempotency_key": "user-tail-key",
+            },
+            headers=headers,
+        )
+        assert tail_fork.status == 201, await tail_fork.text()
+        tail_payload = await tail_fork.json()
+
+        replay = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "user-tail-child",
+                "anchor_message_id": tail_user,
+                "preserve_source": True,
+                "idempotency_key": "user-tail-key",
+            },
+            headers=headers,
+        )
+        assert replay.status == 200
+        assert (await replay.json())["idempotent_replay"] is True
+
+        mid_fork = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "user-mid-child",
+                "anchor_message_id": first_user,
+                "preserve_source": True,
+                "idempotency_key": "user-mid-key",
+            },
+            headers=headers,
+        )
+        assert mid_fork.status == 201, await mid_fork.text()
+
+        truncated = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "truncated-child",
+                "anchor_message_id": truncated_assistant,
+                "preserve_source": True,
+                "idempotency_key": "truncated-key",
+            },
+            headers=headers,
+        )
+        truncated_payload = await truncated.json()
+
+    assert tail_payload["session"]["branch_point_message_id"] == tail_user
+    assert [m["content"] for m in session_db.get_messages("user-tail-child")] == [
+        "first question",
+        "first answer",
+        "edited question",
+    ]
+    assert [m["role"] for m in session_db.get_messages("user-tail-child")] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert [m["content"] for m in session_db.get_messages("user-mid-child")] == [
+        "first question"
+    ]
+    assert truncated.status == 400
+    assert truncated_payload["error"]["code"] == "unsafe_anchor"
+    assert session_db.get_session("truncated-child") is None
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id, include_inactive=True) == messages_before
+
+
+@pytest.mark.asyncio
+async def test_session_fork_accepts_first_completed_response_and_exact_multi_tool_prefix(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("source-session", "api_server")
+    first_anchor = _append_completed_turn(
+        session_db,
+        source_id,
+        "first",
+        "first answer",
+        finish_reason="stop",
+    )
+    session_db.append_message(source_id, "user", "use tools")
+    session_db.append_message(
+        source_id,
+        "assistant",
+        "working",
+        tool_calls=[_tool_call("call-1", "alpha"), _tool_call("call-2", "beta")],
+        finish_reason="tool_calls",
+        api_content="working exactly",
+    )
+    session_db.append_message(
+        source_id, "tool", "alpha result", tool_call_id="call-1", tool_name="alpha"
+    )
+    session_db.append_message(
+        source_id, "tool", "beta result", tool_call_id="call-2", tool_name="beta"
+    )
+    final_anchor = session_db.append_message(
+        source_id, "assistant", "complete", finish_reason="stop"
+    )
+    source_before = session_db.get_session(source_id)
+    source_messages_before = session_db.get_messages(source_id, include_inactive=True)
+    app = _create_session_app(auth_adapter)
+    headers = {"Authorization": "Bearer sk-test"}
+
+    async with TestClient(TestServer(app)) as cli:
+        first = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "first-valid-child",
+                "anchor_message_id": first_anchor,
+                "preserve_source": True,
+                "idempotency_key": "first-valid",
+            },
+            headers=headers,
+        )
+        assert first.status == 201, await first.text()
+
+        complete = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "complete-tool-child",
+                "anchor_message_id": final_anchor,
+                "preserve_source": True,
+                "idempotency_key": "complete-tool",
+            },
+            headers=headers,
+        )
+        assert complete.status == 201, await complete.text()
+
+    child_messages = session_db.get_messages("complete-tool-child", include_inactive=True)
+    source_prefix = [m for m in source_messages_before if m["id"] <= final_anchor]
+    immutable_columns = [
+        "role",
+        "content",
+        "tool_call_id",
+        "tool_calls",
+        "tool_name",
+        "finish_reason",
+        "api_content",
+        "reasoning",
+        "reasoning_content",
+        "active",
+    ]
+    assert [
+        {key: message.get(key) for key in immutable_columns} for message in child_messages
+    ] == [
+        {key: message.get(key) for key in immutable_columns} for message in source_prefix
+    ]
+    assert len(child_messages) == len(source_prefix)
+    assert session_db.get_session(source_id) == source_before
+    assert session_db.get_messages(source_id, include_inactive=True) == source_messages_before
+
+    provider_history = session_db.get_messages_as_conversation("complete-tool-child")
+    _assert_valid_for_next_user_turn(provider_history)
+    assert [message["role"] for message in provider_history] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "assistant",
+    ]
+
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "continued", "session_id": "complete-tool-child"},
+            {"total_tokens": 1},
+        )
+    )
+    with (
+        patch.object(auth_adapter, "_run_agent", mock_run),
+        patch("agent.agent_runtime_helpers.repair_message_sequence") as repair_sequence,
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/api/sessions/complete-tool-child/chat",
+                json={"message": "continue"},
+                headers=headers,
+            )
+            assert response.status == 200, await response.text()
+
+    repair_sequence.assert_not_called()
+    assert mock_run.await_args is not None
+    first_post_fork_history = mock_run.await_args.kwargs["conversation_history"]
+    assert first_post_fork_history == provider_history
+    _assert_valid_for_next_user_turn(first_post_fork_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_reason",
+    [
+        "length",
+        "max_tokens",
+        "content_filter",
+        "interrupted",
+        "cancelled",
+        "tool_calls",
+        "unknown_nonterminal_reason",
+        None,
+    ],
+)
+async def test_session_fork_rejects_modern_anchor_without_recognized_completion(
+    auth_adapter, session_db, finish_reason
+):
+    source_id = session_db.create_session(
+        f"finish-source-{finish_reason}", "api_server"
+    )
+    session_db.append_message(source_id, "user", "known completed turn")
+    session_db.append_message(
+        source_id, "assistant", "complete", finish_reason="stop"
+    )
+    session_db.append_message(source_id, "user", "candidate turn")
+    anchor_id = session_db.append_message(
+        source_id,
+        "assistant",
+        "possibly partial",
+        finish_reason=finish_reason,
+    )
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": f"finish-child-{anchor_id}",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": f"finish-key-{anchor_id}",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "unsafe_anchor"
+    assert session_db.get_session(f"finish-child-{anchor_id}") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["user", "assistant"])
+async def test_session_fork_rejects_reasoning_boundary_anchor(
+    auth_adapter, session_db, role
+):
+    source_id = session_db.create_session(f"reasoning-{role}-source", "api_server")
+    if role == "assistant":
+        session_db.append_message(source_id, "user", "question")
+        anchor_id = session_db.append_message(
+            source_id,
+            "assistant",
+            "final-looking answer",
+            finish_reason="stop",
+            reasoning="private reasoning boundary",
+        )
+    else:
+        anchor_id = session_db.append_message(
+            source_id,
+            "user",
+            "question",
+            reasoning_content="private reasoning boundary",
+        )
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": f"reasoning-{role}-child",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": f"reasoning-{role}-key",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "unsafe_anchor"
+    assert session_db.get_session(f"reasoning-{role}-child") is None
+
+
+@pytest.mark.asyncio
+async def test_session_fork_accepts_terminal_reason_and_rejects_missing_finish_reason(
+    auth_adapter, session_db
+):
+    modern_id = session_db.create_session("modern-finish-source", "api_server")
+    session_db.append_message(modern_id, "user", "modern")
+    modern_anchor = session_db.append_message(
+        modern_id, "assistant", "done", finish_reason="stop"
+    )
+    legacy_id = session_db.create_session("legacy-finish-source", "api_server")
+    session_db.append_message(legacy_id, "user", "legacy")
+    legacy_anchor = session_db.append_message(legacy_id, "assistant", "done")
+
+    app = _create_session_app(auth_adapter)
+    headers = {"Authorization": "Bearer sk-test"}
+    async with TestClient(TestServer(app)) as cli:
+        modern = await cli.post(
+            f"/api/sessions/{modern_id}/fork",
+            json={
+                "id": "modern-finish-child",
+                "anchor_message_id": modern_anchor,
+                "preserve_source": True,
+                "idempotency_key": "modern-finish-key",
+            },
+            headers=headers,
+        )
+        modern_text = await modern.text()
+        legacy = await cli.post(
+            f"/api/sessions/{legacy_id}/fork",
+            json={
+                "id": "legacy-finish-child",
+                "anchor_message_id": legacy_anchor,
+                "preserve_source": True,
+                "idempotency_key": "legacy-finish-key",
+            },
+            headers=headers,
+        )
+        legacy_payload = await legacy.json()
+
+    assert modern.status == 201, modern_text
+    assert legacy.status == 400
+    assert legacy_payload["error"]["code"] == "unsafe_anchor"
+    assert session_db.get_session("legacy-finish-child") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_calls,tool_result_ids",
+    [
+        ([{"id": "id-only"}], ["id-only"]),
+        ([_tool_call("empty-name", "")], ["empty-name"]),
+        (
+            [{
+                "id": "bad-args",
+                "type": "function",
+                "function": {"name": "test_tool", "arguments": "{not-json"},
+            }],
+            ["bad-args"],
+        ),
+        ([_tool_call("duplicate"), _tool_call("duplicate")], ["duplicate"]),
+        ([_tool_call("expected")], ["orphan"]),
+        ([_tool_call("twice")], ["twice", "twice"]),
+    ],
+)
+async def test_session_fork_rejects_malformed_or_unmatched_tool_call_groups(
+    auth_adapter, session_db, tool_calls, tool_result_ids
+):
+    first_call_id = (
+        tool_calls[0].get("id")
+        or tool_calls[0].get("call_id")
+        or "missing"
+    )
+    source_id = session_db.create_session(
+        f"malformed-tool-source-{first_call_id}-{len(tool_result_ids)}",
+        "api_server",
+    )
+    session_db.append_message(source_id, "user", "use a tool")
+    session_db.append_message(
+        source_id,
+        "assistant",
+        "calling",
+        tool_calls=tool_calls,
+        finish_reason="tool_calls",
+    )
+    for result_id in tool_result_ids:
+        session_db.append_message(
+            source_id,
+            "tool",
+            "result",
+            tool_call_id=result_id,
+            tool_name="test_tool",
+        )
+    anchor_id = session_db.append_message(
+        source_id, "assistant", "final", finish_reason="stop"
+    )
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": f"malformed-tool-child-{anchor_id}",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": f"malformed-tool-key-{anchor_id}",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "unsafe_anchor"
+
+
+@pytest.mark.asyncio
+async def test_session_fork_accepts_complete_provider_neutral_tool_call_shapes(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("provider-neutral-tools", "api_server")
+    shapes = [
+        _tool_call("openai-call", "openai_tool"),
+        _responses_tool_call("responses-call", "responses_tool"),
+        _anthropic_tool_call("anthropic-call", "anthropic_tool"),
+    ]
+    for index, call in enumerate(shapes):
+        session_db.append_message(source_id, "user", f"turn {index}")
+        session_db.append_message(
+            source_id,
+            "assistant",
+            "calling",
+            tool_calls=[call],
+            finish_reason="tool_calls",
+        )
+        call_id = call.get("call_id") or call["id"]
+        session_db.append_message(
+            source_id,
+            "tool",
+            "result",
+            tool_call_id=call_id,
+            tool_name=(call.get("function") or {}).get("name") or call.get("name"),
+        )
+        anchor_id = session_db.append_message(
+            source_id, "assistant", "done", finish_reason="stop"
+        )
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={
+                "id": "provider-neutral-child",
+                "anchor_message_id": anchor_id,
+                "preserve_source": True,
+                "idempotency_key": "provider-neutral-key",
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        response_text = await response.text()
+
+    assert response.status == 201, response_text
+    assert len(session_db.get_messages("provider-neutral-child")) == 12
+
+
+@pytest.mark.asyncio
+async def test_consumed_fork_key_survives_child_delete_and_cannot_create_again(
+    auth_adapter, session_db
+):
+    source_id = session_db.create_session("delete-reuse-source", "api_server")
+    session_db.append_message(source_id, "user", "branch")
+    anchor_id = session_db.append_message(
+        source_id, "assistant", "done", finish_reason="stop"
+    )
+    body = {
+        "id": "delete-reuse-child",
+        "anchor_message_id": anchor_id,
+        "preserve_source": True,
+        "idempotency_key": "delete-reuse-key",
+    }
+    headers = {"Authorization": "Bearer sk-test"}
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        created = await cli.post(
+            f"/api/sessions/{source_id}/fork", json=body, headers=headers
+        )
+        assert created.status == 201, await created.text()
+        assert session_db.delete_session("delete-reuse-child") is True
+        reservation = session_db._conn.execute(
+            "SELECT child_session_id FROM session_fork_requests WHERE idempotency_key = ?",
+            ("delete-reuse-key",),
+        ).fetchone()
+        assert reservation["child_session_id"] == "delete-reuse-child"
+
+        stale = await cli.post(
+            f"/api/sessions/{source_id}/fork", json=body, headers=headers
+        )
+        stale_payload = await stale.json()
+
+    assert stale.status == 409
+    assert stale_payload["error"]["code"] == "idempotency_stale"
+    assert session_db.get_session("delete-reuse-child") is None
 
 
 @pytest.mark.asyncio
@@ -249,6 +1448,70 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
         {"role": "user", "content": "earlier"},
         {"role": "assistant", "content": "prior answer"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_fails_closed_on_history_error_before_model(auth_adapter, session_db):
+    session_id = session_db.create_session("chat-history-fail", "api_server")
+    mock_run = AsyncMock()
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run), patch.object(
+        session_db, "get_messages_as_conversation", side_effect=sqlite3.DatabaseError("secret db path")
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "next"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            payload = await resp.json()
+    assert resp.status == 503
+    assert payload["error"]["code"] == "session_history_unavailable"
+    assert "secret" not in json.dumps(payload)
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_fails_closed_on_history_error_before_model(adapter, session_db):
+    session_id = session_db.create_session("stream-history-fail", "api_server")
+    mock_run = AsyncMock()
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run), patch.object(
+        session_db, "get_messages_as_conversation", side_effect=sqlite3.DatabaseError("secret db path")
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream", json={"message": "next"}
+            )
+            body = await resp.text()
+
+    assert resp.status == 200
+    assert "session_history_unavailable" in body
+    assert "secret db path" not in body
+    assert "event: run.started" not in body
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_conflicts_with_canonical_durable_owner(auth_adapter, session_db):
+    session_id = session_db.create_session("chat-lease-conflict", "api_server")
+    assert session_db.acquire_session_execution_lease(session_id, "gateway-owner") is True
+    mock_run = AsyncMock()
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            unauthorized = await cli.post(
+                f"/api/sessions/{session_id}/chat", json={"message": "next"}
+            )
+            conflict = await cli.post(
+                f"/api/sessions/{session_id}/chat", json={"message": "next"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            conflict_payload = await conflict.json()
+    assert unauthorized.status == 401
+    assert conflict.status == 409
+    assert conflict_payload["error"]["code"] == "active_session_execution"
+    mock_run.assert_not_awaited()
 
 
 @pytest.mark.asyncio

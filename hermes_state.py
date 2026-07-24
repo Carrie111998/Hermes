@@ -38,6 +38,11 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 
 logger = logging.getLogger(__name__)
 
+
+class SessionSearchUnavailable(RuntimeError):
+    """The authoritative FTS index cannot safely serve session search."""
+
+
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
@@ -210,7 +215,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1171,6 +1176,30 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS session_fork_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    source_session_id TEXT NOT NULL,
+    anchor_message_id INTEGER NOT NULL,
+    preserve_source INTEGER NOT NULL,
+    requested_title TEXT,
+    requested_session_id TEXT,
+    child_session_id TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_execution_leases (
+    session_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_host TEXT NOT NULL,
+    owner_boot_id TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    heartbeat_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_execution_leases_expires
+    ON session_execution_leases(expires_at);
 
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
@@ -2929,6 +2958,71 @@ class SessionDB:
 
         cursor.executescript(SCHEMA_SQL)
 
+        # v24 fork reservations are durable tombstones, not child-owned rows.
+        # Early review builds declared child_session_id with ON DELETE CASCADE,
+        # which silently made a consumed key reusable after child cleanup. Heal
+        # that pre-release shape by rebuilding the table without the foreign key
+        # while preserving every reservation. This is intentionally structural,
+        # not version-gated: an early build may already have stamped v24.
+        fork_request_fks = cursor.execute(
+            "PRAGMA foreign_key_list(session_fork_requests)"
+        ).fetchall()
+        if any(row["from"] == "child_session_id" for row in fork_request_fks):
+            cursor.executescript(
+                """
+                ALTER TABLE session_fork_requests
+                    RENAME TO session_fork_requests_child_owned;
+                CREATE TABLE session_fork_requests (
+                    idempotency_key TEXT PRIMARY KEY,
+                    source_session_id TEXT NOT NULL,
+                    anchor_message_id INTEGER NOT NULL,
+                    preserve_source INTEGER NOT NULL,
+                    requested_title TEXT,
+                    requested_session_id TEXT,
+                    child_session_id TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                INSERT INTO session_fork_requests (
+                    idempotency_key, source_session_id, anchor_message_id,
+                    preserve_source, requested_title, requested_session_id,
+                    child_session_id, created_at
+                )
+                SELECT idempotency_key, source_session_id, anchor_message_id,
+                       preserve_source, requested_title, requested_session_id,
+                       child_session_id, created_at
+                FROM session_fork_requests_child_owned;
+                DROP TABLE session_fork_requests_child_owned;
+                """
+            )
+
+        # Early H1 builds tied execution leases to sessions with a foreign key.
+        # Gateway admission and synthetic recovery can legitimately acquire the
+        # exclusivity fence before a session row is materialized, so rebuild
+        # that metadata-only table once without weakening its PRIMARY KEY.
+        if cursor.execute(
+            "PRAGMA foreign_key_list(session_execution_leases)"
+        ).fetchall():
+            cursor.executescript(
+                """
+                ALTER TABLE session_execution_leases RENAME TO session_execution_leases_with_fk;
+                CREATE TABLE session_execution_leases (
+                    session_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    owner_pid INTEGER NOT NULL,
+                    owner_host TEXT NOT NULL,
+                    owner_boot_id TEXT NOT NULL,
+                    acquired_at REAL NOT NULL,
+                    heartbeat_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                INSERT INTO session_execution_leases
+                    SELECT * FROM session_execution_leases_with_fk;
+                DROP TABLE session_execution_leases_with_fk;
+                CREATE INDEX IF NOT EXISTS idx_session_execution_leases_expires
+                    ON session_execution_leases(expires_at);
+                """
+            )
+
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
@@ -3501,6 +3595,495 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def fork_session_at_message(
+        self,
+        source_session_id: str,
+        child_session_id: str,
+        anchor_message_id: int,
+        idempotency_key: str,
+        *,
+        title: Optional[str] = None,
+        requested_child_session_id: Optional[str] = None,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Atomically create a non-mutating child through an exact message.
+
+        The source row and all of its messages are read-only in this transaction.
+        The child row, copied transcript, lineage markers, title, and idempotency
+        record commit together or are all rolled back. The return status is one
+        of ``created``, ``replayed``, ``source_missing``, ``invalid_anchor``,
+        ``unsafe_anchor``, ``session_exists``, ``invalid_title``,
+        ``idempotency_stale``, or ``idempotency_conflict``.
+
+        Idempotency reservations intentionally outlive their child session. A
+        consumed key can therefore never create a second child after cleanup;
+        replay against a deleted child returns ``idempotency_stale``.
+
+        Gateway peer identifiers are intentionally not copied. Reusing the
+        source's ``session_key``/chat/thread tuple would make the newer child the
+        gateway's active head. The stable owner and execution routing snapshots
+        (source, user, model/model_config, billing route, prompt, cwd/profile)
+        are safe to inherit; delivery can resolve messaging targets through the
+        parent lineage without stealing the live source lane.
+        """
+
+        def _do(conn):
+            prior = conn.execute(
+                "SELECT * FROM session_fork_requests WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if prior is not None:
+                same_request = (
+                    prior["source_session_id"] == source_session_id
+                    and int(prior["anchor_message_id"]) == anchor_message_id
+                    and int(prior["preserve_source"]) == 1
+                    and prior["requested_title"] == title
+                    and prior["requested_session_id"] == requested_child_session_id
+                )
+                if not same_request:
+                    return "idempotency_conflict", None
+                child = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (prior["child_session_id"],),
+                ).fetchone()
+                if child is None:
+                    # The durable reservation is a tombstone: a consumed key
+                    # never becomes reusable merely because cleanup removed the
+                    # child session.
+                    return "idempotency_stale", None
+                result = dict(child)
+                result["branch_point_message_id"] = int(prior["anchor_message_id"])
+                return "replayed", result
+
+            source = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (source_session_id,)
+            ).fetchone()
+            if source is None:
+                return "source_missing", None
+
+            prefix = conn.execute(
+                "SELECT id, role, content, api_content, tool_call_id, tool_calls, "
+                "finish_reason, reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id",
+                (source_session_id, anchor_message_id),
+            ).fetchall()
+            if not prefix or int(prefix[-1]["id"]) != anchor_message_id:
+                return "invalid_anchor", None
+
+            def _contains_tool_block(value: Any) -> bool:
+                if isinstance(value, list):
+                    return any(_contains_tool_block(item) for item in value)
+                if not isinstance(value, dict):
+                    return False
+                if value.get("type") in {
+                    "tool_use",
+                    "tool_result",
+                    "function_call",
+                    "function_call_output",
+                }:
+                    return True
+                return any(_contains_tool_block(item) for item in value.values())
+
+            def _contains_reasoning_block(value: Any) -> bool:
+                if isinstance(value, list):
+                    return any(_contains_reasoning_block(item) for item in value)
+                if not isinstance(value, dict):
+                    return False
+                if value.get("type") in {"reasoning", "thinking", "redacted_thinking"}:
+                    return True
+                return any(
+                    (
+                        key in {"reasoning", "reasoning_content", "thinking"}
+                        and item not in (None, "", [], {})
+                    )
+                    or _contains_reasoning_block(item)
+                    for key, item in value.items()
+                )
+
+            def _normalized_finish_reason(value: Any) -> Optional[str]:
+                if not isinstance(value, str) or not value.strip():
+                    return None
+                return value.strip().lower().replace("-", "_")
+
+            complete_finish_reasons = {
+                "stop",
+                "completed",
+                "complete",
+                "end_turn",
+                "endturn",
+            }
+            tool_finish_reasons = {
+                "tool_calls",
+                "tool_call",
+                "tool_use",
+                "tooluse",
+                "function_call",
+                "function_calls",
+            }
+            def _parse_arguments(value: Any) -> bool:
+                if isinstance(value, dict):
+                    return True
+                if not isinstance(value, str) or not value.strip():
+                    return False
+                try:
+                    return isinstance(json.loads(value), dict)
+                except (json.JSONDecodeError, TypeError):
+                    return False
+
+            def _validated_tool_call(call: Any) -> Optional[str]:
+                if not isinstance(call, dict):
+                    return None
+                call_type = call.get("type")
+                if call_type == "function":
+                    call_id = call.get("id")
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        return None
+                    name = function.get("name")
+                    arguments = function.get("arguments")
+                elif call_type == "function_call":
+                    call_id = call.get("call_id")
+                    name = call.get("name")
+                    arguments = call.get("arguments")
+                elif call_type == "tool_use":
+                    call_id = call.get("id")
+                    name = call.get("name")
+                    arguments = call.get("input")
+                else:
+                    return None
+                if not isinstance(call_id, str) or not call_id.strip():
+                    return None
+                if not isinstance(name, str) or not name.strip():
+                    return None
+                if not _parse_arguments(arguments):
+                    return None
+                return call_id
+
+            expected = "user"
+            pending_call_ids: set[str] = set()
+            for row in prefix:
+                role = row["role"]
+                try:
+                    tool_calls = json.loads(row["tool_calls"]) if row["tool_calls"] else []
+                except (json.JSONDecodeError, TypeError):
+                    return "unsafe_anchor", None
+                content = self._decode_content(row["content"])
+                if _contains_tool_block(content) or _contains_tool_block(row["api_content"]):
+                    return "unsafe_anchor", None
+
+                if expected == "user":
+                    if role != "user" or tool_calls or row["tool_call_id"]:
+                        return "unsafe_anchor", None
+                    expected = "assistant"
+                    continue
+
+                if expected == "assistant":
+                    if role != "assistant" or row["tool_call_id"]:
+                        return "unsafe_anchor", None
+                    finish_reason = _normalized_finish_reason(row["finish_reason"])
+                    if not isinstance(tool_calls, list):
+                        return "unsafe_anchor", None
+                    if not tool_calls:
+                        if finish_reason not in complete_finish_reasons:
+                            return "unsafe_anchor", None
+                        expected = "user"
+                        continue
+                    if finish_reason not in tool_finish_reasons:
+                        return "unsafe_anchor", None
+                    validated_ids = [_validated_tool_call(call) for call in tool_calls]
+                    if any(call_id is None for call_id in validated_ids):
+                        return "unsafe_anchor", None
+                    pending_call_ids = {call_id for call_id in validated_ids if call_id}
+                    if len(pending_call_ids) != len(validated_ids):
+                        return "unsafe_anchor", None
+                    expected = "tool"
+                    continue
+
+                if role != "tool" or tool_calls:
+                    return "unsafe_anchor", None
+                call_id = row["tool_call_id"]
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or call_id not in pending_call_ids
+                ):
+                    return "unsafe_anchor", None
+                pending_call_ids.remove(call_id)
+                if not pending_call_ids:
+                    expected = "assistant"
+
+            # Two anchor shapes are continuation-safe: a fully completed final
+            # assistant response (the walk expects a new user turn next), or a
+            # canonical user message the child will answer next (the walk
+            # expects an assistant turn and the anchor row itself is that user
+            # message). A tool row, partial/truncated assistant, or unresolved
+            # tool group can never be repaired after the fork — when the walk
+            # ends expecting "assistant" after a resolved tool group, the
+            # anchor row is a tool result, so the role check rejects it.
+            if pending_call_ids:
+                return "unsafe_anchor", None
+            anchor_is_completed_assistant = expected == "user"
+            anchor_is_canonical_user = (
+                expected == "assistant" and prefix[-1]["role"] == "user"
+            )
+            anchor = prefix[-1]
+            if anchor_is_canonical_user:
+                anchor_content = self._decode_content(anchor["content"])
+                if anchor_content in (None, "", [], {}):
+                    return "unsafe_anchor", None
+            reasoning_values = (
+                anchor["reasoning"],
+                anchor["reasoning_content"],
+                anchor["reasoning_details"],
+                anchor["codex_reasoning_items"],
+            )
+            if (
+                any(
+                    value not in (None, "", "[]", "{}")
+                    for value in reasoning_values
+                )
+                or _contains_reasoning_block(
+                    self._decode_content(anchor["content"])
+                )
+            ):
+                return "unsafe_anchor", None
+            if not (anchor_is_completed_assistant or anchor_is_canonical_user):
+                return "unsafe_anchor", None
+
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (child_session_id,)
+            ).fetchone():
+                return "session_exists", None
+            if title and conn.execute(
+                "SELECT 1 FROM sessions WHERE title = ?", (title,)
+            ).fetchone():
+                return "invalid_title", None
+
+            source_config = source["model_config"]
+            try:
+                model_config = json.loads(source_config) if source_config else {}
+            except (json.JSONDecodeError, TypeError):
+                model_config = {}
+            if not isinstance(model_config, dict):
+                model_config = {}
+            model_config = dict(model_config)
+            model_config["_branched_from"] = source_session_id
+            model_config["_branch_point_message_id"] = anchor_message_id
+
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, model, model_config, system_prompt,
+                   parent_session_id, started_at, cwd, git_branch, git_repo_root,
+                   billing_provider, billing_base_url, billing_mode, profile_name,
+                   pricing_version, title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    source["source"],
+                    source["user_id"],
+                    source["model"],
+                    json.dumps(model_config),
+                    source["system_prompt"],
+                    source_session_id,
+                    time.time(),
+                    source["cwd"],
+                    source["git_branch"],
+                    source["git_repo_root"],
+                    source["billing_provider"],
+                    source["billing_base_url"],
+                    source["billing_mode"],
+                    source["profile_name"],
+                    source["pricing_version"],
+                    title,
+                ),
+            )
+
+            message_columns = (
+                "role, content, tool_call_id, tool_calls, tool_name, "
+                "effect_disposition, timestamp, token_count, finish_reason, "
+                "reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items, codex_message_items, "
+                "platform_message_id, observed, active, compacted, api_content, "
+                "display_kind, display_metadata"
+            )
+            conn.execute(
+                f"INSERT INTO messages (session_id, {message_columns}) "
+                f"SELECT ?, {message_columns} FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id",
+                (child_session_id, source_session_id, anchor_message_id),
+            )
+
+            copied = conn.execute(
+                "SELECT tool_calls FROM messages WHERE session_id = ? ORDER BY id",
+                (child_session_id,),
+            ).fetchall()
+            tool_call_count = 0
+            for row in copied:
+                raw_tool_calls = row["tool_calls"]
+                if not raw_tool_calls:
+                    continue
+                try:
+                    parsed = json.loads(raw_tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = raw_tool_calls
+                tool_call_count += len(parsed) if isinstance(parsed, list) else 1
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (len(copied), tool_call_count, child_session_id),
+            )
+            conn.execute(
+                """INSERT INTO session_fork_requests (
+                   idempotency_key, source_session_id, anchor_message_id,
+                   preserve_source, requested_title, requested_session_id,
+                   child_session_id, created_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)""",
+                (
+                    idempotency_key,
+                    source_session_id,
+                    anchor_message_id,
+                    title,
+                    requested_child_session_id,
+                    child_session_id,
+                    time.time(),
+                ),
+            )
+            child = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (child_session_id,)
+            ).fetchone()
+            result = dict(child)
+            result["branch_point_message_id"] = anchor_message_id
+            return "created", result
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _execution_lease_process_identity() -> tuple[int, str, str]:
+        """Return PID, host and Linux boot id used for safe stale-owner checks."""
+        pid = os.getpid()
+        try:
+            host = os.uname().nodename
+        except AttributeError:  # pragma: no cover - Windows
+            import socket
+            host = socket.gethostname()
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError:
+            boot_id = "unavailable"
+        return pid, host, boot_id
+
+    @classmethod
+    def _execution_lease_owner_is_alive(cls, row: Any) -> bool:
+        """Return whether a same-host/same-boot owner PID is still alive."""
+        pid, host, boot_id = cls._execution_lease_process_identity()
+        if str(row["owner_host"]) != host or str(row["owner_boot_id"]) != boot_id:
+            return False
+        owner_pid = int(row["owner_pid"])
+        if owner_pid == pid:
+            return True
+        try:
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return True
+
+    @classmethod
+    def session_execution_lease_owner_state(cls, row: Any, *, now: Optional[float] = None) -> str:
+        """Classify durable ownership as ``live``, ``dead``, or ``stale``.
+
+        A local PID is directly verifiable. Remote-host or prior-boot owners are
+        preserved only through their unexpired heartbeat window; once expired,
+        they are deterministically stale and may be fenced.
+        """
+        current_pid, host, boot_id = cls._execution_lease_process_identity()
+        same_host_boot = (
+            str(row["owner_host"]) == host
+            and str(row["owner_boot_id"]) == boot_id
+        )
+        if same_host_boot:
+            if int(row["owner_pid"]) == current_pid:
+                return "live"
+            return "live" if cls._execution_lease_owner_is_alive(row) else "dead"
+        current_time = time.time() if now is None else float(now)
+        return "live" if float(row["expires_at"]) > current_time else "stale"
+
+    def get_session_execution_lease(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            assert self._conn is not None
+            row = self._conn.execute(
+                "SELECT * FROM session_execution_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def acquire_session_execution_lease(
+        self, session_id: str, owner_id: str, *, ttl_seconds: float = 60.0
+    ) -> bool:
+        """Atomically acquire/renew the canonical cross-process session lease.
+
+        A same-host/same-boot lease is never stolen from a live PID and may be
+        reconciled as soon as that PID is provably dead. A remote-host or
+        prior-boot owner is preserved through its heartbeat expiry, then
+        classified stale so a crashed process cannot wedge the session.
+        """
+        if not session_id or not owner_id:
+            return False
+        now = time.time()
+        ttl = max(5.0, float(ttl_seconds))
+        pid, host, boot_id = self._execution_lease_process_identity()
+
+        def _acquire(conn):
+            row = conn.execute(
+                "SELECT * FROM session_execution_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row is not None and row["owner_id"] != owner_id:
+                if self.session_execution_lease_owner_state(row, now=now) == "live":
+                    return False
+            conn.execute(
+                """INSERT INTO session_execution_leases
+                   (session_id, owner_id, owner_pid, owner_host, owner_boot_id,
+                    acquired_at, heartbeat_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     owner_id=excluded.owner_id, owner_pid=excluded.owner_pid,
+                     owner_host=excluded.owner_host, owner_boot_id=excluded.owner_boot_id,
+                     acquired_at=CASE WHEN session_execution_leases.owner_id=excluded.owner_id
+                                      THEN session_execution_leases.acquired_at
+                                      ELSE excluded.acquired_at END,
+                     heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at""",
+                (session_id, owner_id, pid, host, boot_id, now, now, now + ttl),
+            )
+            return True
+
+        return bool(self._execute_write(_acquire))
+
+    def heartbeat_session_execution_lease(
+        self, session_id: str, owner_id: str, *, ttl_seconds: float = 60.0
+    ) -> bool:
+        now = time.time()
+
+        def _heartbeat(conn):
+            cursor = conn.execute(
+                "UPDATE session_execution_leases SET heartbeat_at=?, expires_at=? "
+                "WHERE session_id=? AND owner_id=?",
+                (now, now + max(5.0, float(ttl_seconds)), session_id, owner_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_heartbeat))
+
+    def release_session_execution_lease(self, session_id: str, owner_id: str) -> bool:
+        """Release only the caller's exact owner token; idempotent and fenced."""
+        def _release(conn):
+            cursor = conn.execute(
+                "DELETE FROM session_execution_leases WHERE session_id=? AND owner_id=?",
+                (session_id, owner_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_release))
 
     def record_gateway_session_peer(
         self,
@@ -7228,6 +7811,135 @@ class SessionDB:
                     len(rows) if rows is not None else "err",
                     query[:200],
                 )
+
+    def session_search_available(self) -> bool:
+        """Execute a harmless scoped MATCH probe against the production query shape."""
+        if not self._fts_enabled or self._conn is None:
+            return False
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    SELECT m.id, m.timestamp, s.user_id, s.source
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                      AND s.user_id = ?
+                      AND s.source = ?
+                      AND m.role IN ('user', 'assistant')
+                    ORDER BY m.timestamp DESC, m.id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        '"__hermes_session_search_readiness_probe_7f31c9__"',
+                        "__readiness_owner__",
+                        "__readiness_source__",
+                    ),
+                ).fetchall()
+            return True
+        except (sqlite3.DatabaseError, TypeError, ValueError):
+            return False
+
+    def search_messages_scoped(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        source: str,
+        limit: int = 20,
+        snapshot_message_id: Optional[int] = None,
+        after: Optional[Tuple[Any, int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Return a minimal exact-owner FTS page using immutable keyset order.
+
+        Results are ordered only by message timestamp and id. BM25 rank is mutable
+        when the FTS corpus changes and therefore must never participate in a
+        cross-request cursor boundary. ``snapshot_message_id`` excludes later
+        inserts while ``after`` advances over the fixed immutable sort tuple.
+        """
+        if not self.session_search_available():
+            raise SessionSearchUnavailable("Session full-text search is unavailable")
+        if not user_id or not source:
+            return [], 0
+        if not query or not query.strip() or limit <= 0:
+            return [], 0
+
+        fts_query = self._sanitize_fts5_query(query)
+        if not fts_query:
+            return [], 0
+
+        assert self._conn is not None
+        try:
+            with self._lock:
+                if snapshot_message_id is None:
+                    snapshot_row = self._conn.execute(
+                        """
+                        SELECT COALESCE(MAX(m.id), 0)
+                        FROM messages m
+                        JOIN sessions s ON s.id = m.session_id
+                        WHERE (m.active = 1 OR m.compacted = 1)
+                          AND s.user_id = ?
+                          AND s.source = ?
+                          AND m.role IN ('user', 'assistant')
+                        """,
+                        (user_id, source),
+                    ).fetchone()
+                    snapshot_message_id = int(snapshot_row[0] or 0)
+
+                params: List[Any] = [
+                    fts_query,
+                    user_id,
+                    source,
+                    snapshot_message_id,
+                ]
+                keyset_clause = ""
+                if after is not None:
+                    after_timestamp, after_message_id = after
+                    keyset_clause = """
+                      AND (
+                            m.timestamp < ?
+                         OR (m.timestamp = ? AND m.id < ?)
+                      )
+                    """
+                    params.extend([after_timestamp, after_timestamp, after_message_id])
+
+                params.append(limit)
+                sql = f"""
+                    SELECT
+                        m.id AS message_id,
+                        m.session_id,
+                        m.role,
+                        m.timestamp,
+                        m.content
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                      AND (m.active = 1 OR m.compacted = 1)
+                      AND s.user_id = ?
+                      AND s.source = ?
+                      AND m.role IN ('user', 'assistant')
+                      AND m.id <= ?
+                    {keyset_clause}
+                    ORDER BY m.timestamp DESC, m.id DESC
+                    LIMIT ?
+                """
+                rows = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+                return rows, snapshot_message_id
+        except sqlite3.DatabaseError as exc:
+            if self._try_runtime_fts_rebuild(exc):
+                return self.search_messages_scoped(
+                    query,
+                    user_id=user_id,
+                    source=source,
+                    limit=limit,
+                    snapshot_message_id=snapshot_message_id,
+                    after=after,
+                )
+            raise SessionSearchUnavailable(
+                "Session full-text search is operationally unavailable"
+            ) from exc
 
     def _describe_search_path(self, query: str) -> str:
         """Best-effort name of the routing path a query takes (log-only)."""
