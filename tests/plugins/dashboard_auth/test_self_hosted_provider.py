@@ -940,6 +940,17 @@ class TestVerifySession:
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
 
+    def test_non_jwt_token_returns_none(self, provider):
+        """Non-JWT token (e.g. from a different provider) returns None, not a ProviderError."""
+        # Make get_signing_key_from_jwt raise DecodeError (subclass of InvalidTokenError)
+        # as it would for a non-JWT token that can't even be parsed.
+        bad_client = MagicMock()
+        bad_client.get_signing_key_from_jwt.side_effect = jwt.DecodeError(
+            "Not enough segments"
+        )
+        provider._jwks_client = bad_client
+        assert provider.verify_session(access_token="not-a-valid-jwt-token") is None
+
 
 # ---------------------------------------------------------------------------
 # refresh_session + revoke_session
