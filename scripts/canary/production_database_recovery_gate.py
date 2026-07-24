@@ -2397,7 +2397,13 @@ def run_for_owner(
     """Run the sole production boundary with no caller-controlled target."""
 
     revision = _release(release_revision)
-    transport = FixedDatabaseRecoveryIapTransport(owner_identity)
+    transport = FixedDatabaseRecoveryIapTransport(
+        owner_identity,
+        gcloud_executable=owner_transport.TrustedGcloudExecutable(
+            release_sha=revision,
+        ),
+        gcloud_configuration=owner_identity.gcloud_configuration,
+    )
     probe = FixedPrivateReadOnlyProbe(
         revision,
         transport=transport,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from typing import Any, Mapping
+from unittest.mock import Mock
 
 import pytest
 
@@ -209,6 +210,73 @@ class Provider:
             "source_instance": cutover.PRODUCTION_SQL_INSTANCE,
             "readback_sha256": "8" * 64,
         }
+
+
+def test_run_for_owner_release_binds_transport_and_owner_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    configuration = object()
+    executable = object()
+    transport = object()
+    probe = Mock()
+    secret_accessor = object()
+    client = object()
+    provider = object()
+
+    class OwnerIdentity:
+        gcloud_configuration = configuration
+
+        def __init__(self) -> None:
+            self.bind_approved_subject = Mock()
+
+    identity = OwnerIdentity()
+    executable_factory = Mock(return_value=executable)
+    transport_factory = Mock(return_value=transport)
+    probe_factory = Mock(return_value=probe)
+    secret_factory = Mock(return_value=secret_accessor)
+    client_factory = Mock(return_value=client)
+    provider_factory = Mock(return_value=provider)
+    execute_gate = Mock(return_value={"ok": True})
+    monkeypatch.setattr(
+        recovery.owner_transport,
+        "TrustedGcloudExecutable",
+        executable_factory,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "FixedDatabaseRecoveryIapTransport",
+        transport_factory,
+    )
+    monkeypatch.setattr(recovery, "FixedPrivateReadOnlyProbe", probe_factory)
+    monkeypatch.setattr(recovery, "FixedSecretManagerAccess", secret_factory)
+    monkeypatch.setattr(recovery.owner_transport, "GoogleRestClient", client_factory)
+    monkeypatch.setattr(recovery, "CloudSqlRecoveryProvider", provider_factory)
+    monkeypatch.setattr(recovery, "_journal_root", lambda _revision: tmp_path)
+    monkeypatch.setattr(recovery, "_execute_gate", execute_gate)
+
+    result = recovery.run_for_owner(REVISION, identity, "f" * 64)
+
+    assert result == {"ok": True}
+    executable_factory.assert_called_once_with(release_sha=REVISION)
+    transport_factory.assert_called_once_with(
+        identity,
+        gcloud_executable=executable,
+        gcloud_configuration=configuration,
+    )
+    probe_factory.assert_called_once_with(
+        REVISION,
+        transport=transport,
+        secret_accessor=secret_accessor,
+    )
+    probe.require_available.assert_called_once_with()
+    identity.bind_approved_subject.assert_called_once_with("f" * 64)
+    execute_gate.assert_called_once_with(
+        release_revision=REVISION,
+        provider=provider,
+        probe=probe,
+        journal_root=tmp_path,
+    )
 
 
 def test_fixed_gate_restores_probes_deletes_only_scratch_and_retains_backup(
