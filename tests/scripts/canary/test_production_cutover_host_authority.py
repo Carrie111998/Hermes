@@ -8,6 +8,7 @@ import os
 import stat
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -63,6 +64,38 @@ _RELEASE_TRUST_KEY = Ed25519PrivateKey.from_private_bytes(b"\x29" * 32)
 _RELEASE_TRUST_KEY_ID = hashlib.sha256(
     _RELEASE_TRUST_KEY.public_key().public_bytes_raw()
 ).hexdigest()
+
+
+def test_boot_id_accepts_procfs_zero_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = b"01234567-89ab-cdef-0123-456789abcdef\n"
+    metadata = SimpleNamespace(
+        st_dev=1,
+        st_ino=2,
+        st_mode=stat.S_IFREG | 0o444,
+        st_nlink=1,
+        st_size=0,
+        st_mtime_ns=3,
+        st_ctime_ns=4,
+    )
+
+    class ProcfsBootId:
+        def lstat(self) -> object:
+            return metadata
+
+    monkeypatch.setattr(host_authority.os, "open", lambda *_args: 7)
+    monkeypatch.setattr(host_authority.os, "fstat", lambda _descriptor: metadata)
+    monkeypatch.setattr(
+        host_authority.os,
+        "read",
+        lambda _descriptor, _size: raw,
+    )
+    monkeypatch.setattr(host_authority.os, "close", lambda _descriptor: None)
+
+    assert host_authority._boot_id(ProcfsBootId()) == hashlib.sha256(
+        raw.strip()
+    ).hexdigest()
 
 
 @pytest.fixture(autouse=True)
