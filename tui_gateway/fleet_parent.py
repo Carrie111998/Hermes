@@ -83,12 +83,27 @@ def parent_route_metadata(pin: ParentPin) -> dict[str, Any]:
 
     if pin.purpose is not RoutePurpose.DESKTOP_PARENT:
         raise ValueError("fleet pin is not a Desktop parent route")
-    if pin.adapter_kind is not AdapterKind.NATIVE_PROVIDER:
-        raise ValueError("external worker routes cannot construct a native parent")
-    if pin.provider_id not in _EXACT_BASE_URLS:
-        raise ValueError("unsupported native fleet parent provider")
     if pin.fast_mode:
         raise ValueError("fleet parent priority mode must be disabled")
+    if pin.adapter_kind is AdapterKind.NATIVE_PROVIDER:
+        if pin.provider_id not in _EXACT_BASE_URLS:
+            raise ValueError("unsupported native fleet parent provider")
+        display_label = {
+            "anthropic": "Claude · Fleet",
+            "openai-codex": "Codex · Fleet",
+            "xai-oauth": "Grok · Fleet",
+        }[pin.provider_id]
+    elif (
+        pin.adapter_kind is AdapterKind.EXTERNAL_CLI
+        and pin.lane_id == "antigravity"
+        and pin.provider_id == "antigravity-subscription"
+        and pin.model_id == "gemini-3.1-pro-high"
+    ):
+        display_label = (
+            "Antigravity · Gemini 3.1 Pro High · external CLI"
+        )
+    else:
+        raise ValueError("unsupported external fleet parent")
     return {
         "model_source": "fleet_auto",
         "fleet_profile_id": pin.profile_id,
@@ -103,11 +118,7 @@ def parent_route_metadata(pin: ParentPin) -> dict[str, Any]:
         "provider": pin.provider_id,
         "reasoning_effort": pin.effort,
         "fast": False,
-        "display_label": {
-            "anthropic": "Claude · Fleet",
-            "openai-codex": "Codex · Fleet",
-            "xai-oauth": "Grok · Fleet",
-        }[pin.provider_id],
+        "display_label": display_label,
     }
 
 

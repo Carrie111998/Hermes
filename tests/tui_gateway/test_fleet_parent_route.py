@@ -628,17 +628,118 @@ def test_native_claude_parent_route_has_truthful_fleet_label():
     assert route["display_label"] == "Claude · Fleet"
 
 
-def test_external_antigravity_and_kimi_routes_cannot_be_native_parents():
-    for lane_id, provider_id in (
-        ("antigravity", "antigravity-subscription"),
-        ("kimi", "kimi-subscription"),
-    ):
-        pin = _pin(lane_id=lane_id, provider_id=provider_id, model_id="external")
-        pin = ParentPin(
-            **{
-                **pin.__dict__,
-                "adapter_kind": AdapterKind.EXTERNAL_CLI,
-            }
-        )
-        with pytest.raises(ValueError, match="external worker"):
-            fleet_parent.parent_route_metadata(pin)
+def test_external_antigravity_parent_has_truthful_route_label():
+    pin = _pin(
+        lane_id="antigravity",
+        provider_id="antigravity-subscription",
+        model_id="gemini-3.1-pro-high",
+    )
+    pin = ParentPin(
+        **{
+            **pin.__dict__,
+            "adapter_kind": AdapterKind.EXTERNAL_CLI,
+        }
+    )
+
+    route = fleet_parent.parent_route_metadata(pin)
+
+    assert route["provider"] == "antigravity-subscription"
+    assert route["fleet_adapter_kind"] == "external_cli"
+    assert (
+        route["display_label"]
+        == "Antigravity · Gemini 3.1 Pro High · external CLI"
+    )
+
+
+def test_external_antigravity_label_survives_the_session_info_api(monkeypatch):
+    pin = _pin(
+        lane_id="antigravity",
+        provider_id="antigravity-subscription",
+        model_id="gemini-3.1-pro-high",
+    )
+    pin = ParentPin(
+        **{
+            **pin.__dict__,
+            "adapter_kind": AdapterKind.EXTERNAL_CLI,
+        }
+    )
+    route = fleet_parent.parent_route_metadata(pin)
+    agent = types.SimpleNamespace(
+        model="gemini-3.1-pro-high",
+        provider="antigravity-subscription",
+        reasoning_config={"enabled": True, "effort": "max"},
+        service_tier=None,
+        session_id="stored-root",
+        tools=[],
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    info = server._session_info(
+        agent,
+        {
+            "session_key": "stored-root",
+            "fleet_parent_route": route,
+            "running": False,
+        },
+    )
+
+    assert (
+        info["display_label"]
+        == "Antigravity · Gemini 3.1 Pro High · external CLI"
+    )
+    assert info["model_source"] == "fleet_auto"
+    assert info["fleet_adapter_kind"] == "external_cli"
+
+
+def test_external_kimi_route_remains_parent_ineligible():
+    pin = _pin(
+        lane_id="kimi",
+        provider_id="kimi-subscription",
+        model_id="external",
+    )
+    pin = ParentPin(
+        **{
+            **pin.__dict__,
+            "adapter_kind": AdapterKind.EXTERNAL_CLI,
+        }
+    )
+
+    with pytest.raises(ValueError, match="unsupported external fleet parent"):
+        fleet_parent.parent_route_metadata(pin)
+
+
+def test_make_agent_uses_distinct_external_parent_driver(monkeypatch, tmp_path):
+    expected = object()
+    route = {
+        "model_source": "fleet_auto",
+        "fleet_profile_id": "default",
+        "fleet_lineage_root_id": "lineage-antigravity",
+        "fleet_lane_id": "antigravity",
+        "fleet_adapter_kind": "external_cli",
+        "fleet_route_purpose": "desktop_parent",
+        "fleet_route_identity": "sha256:route",
+        "model": "gemini-3.1-pro-high",
+        "provider": "antigravity-subscription",
+        "reasoning_effort": "medium",
+        "display_label": "Antigravity · Gemini 3.1 Pro High · external CLI",
+    }
+    build = lambda **kwargs: expected
+    monkeypatch.setattr(
+        "tui_gateway.external_parent.build_external_parent_driver",
+        build,
+    )
+
+    agent = server._make_agent(
+        "live-id",
+        "stored-id",
+        session_id="stored-id",
+        session_db=object(),
+        model_override={
+            "model": "gemini-3.1-pro-high",
+            "provider": "antigravity-subscription",
+        },
+        exact_route=route,
+        cwd_override=str(tmp_path),
+    )
+
+    assert agent is expected

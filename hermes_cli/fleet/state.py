@@ -89,6 +89,15 @@ CREATE TABLE IF NOT EXISTS parent_leases(
   FOREIGN KEY(profile_id, lineage_root_id)
     REFERENCES parent_sessions(profile_id, lineage_root_id)
 );
+CREATE TABLE IF NOT EXISTS external_parent_sessions(
+  profile_id TEXT NOT NULL,
+  lineage_root_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(profile_id, lineage_root_id)
+);
 CREATE TABLE IF NOT EXISTS lane_state(
   lane_id TEXT PRIMARY KEY,
   rotation_selected_at TEXT,
@@ -270,6 +279,90 @@ class FleetStore:
                 (profile_id, lineage_root_id),
             ).fetchone()
             return self._parent_pin(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def read_external_parent_conversation(
+        self,
+        profile_id: str,
+        lineage_root_id: str,
+    ) -> str | None:
+        """Read the external CLI identity bound to one Hermes lineage."""
+
+        connection = self._connect_existing()
+        if connection is None:
+            return None
+        try:
+            if not self._table_exists(connection, "external_parent_sessions"):
+                return None
+            row = connection.execute(
+                """
+                SELECT conversation_id FROM external_parent_sessions
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (profile_id, lineage_root_id),
+            ).fetchone()
+            return str(row["conversation_id"]) if row is not None else None
+        finally:
+            connection.close()
+
+    def bind_external_parent_conversation(
+        self,
+        *,
+        profile_id: str,
+        lineage_root_id: str,
+        lane_id: str,
+        conversation_id: str,
+        now: datetime | None = None,
+    ) -> str:
+        """Bind once and reject every attempted external identity migration."""
+
+        values = (profile_id, lineage_root_id, lane_id, conversation_id)
+        if any(not str(value).strip() for value in values):
+            raise ValueError("external parent identity fields must be non-empty")
+        at = _iso(now or datetime.now(timezone.utc))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT lane_id,conversation_id FROM external_parent_sessions
+                WHERE profile_id=? AND lineage_root_id=?
+                """,
+                (profile_id, lineage_root_id),
+            ).fetchone()
+            if row is not None:
+                if (
+                    row["lane_id"] != lane_id
+                    or row["conversation_id"] != conversation_id
+                ):
+                    raise RuntimeError(
+                        "external parent conversation identity migration rejected"
+                    )
+                connection.execute("COMMIT")
+                return str(row["conversation_id"])
+            connection.execute(
+                """
+                INSERT INTO external_parent_sessions(
+                  profile_id,lineage_root_id,lane_id,conversation_id,
+                  created_at,updated_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    profile_id,
+                    lineage_root_id,
+                    lane_id,
+                    conversation_id,
+                    at,
+                    at,
+                ),
+            )
+            connection.execute("COMMIT")
+            return conversation_id
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
         finally:
             connection.close()
 

@@ -142,7 +142,7 @@ describe('ModelPill per-surface model label', () => {
       $messages: atom([]),
       $messagesEmpty: atom(true),
       $model: atom('gemini-3.1-pro-high'),
-      $modelDisplayLabel: atom('Antigravity · external CLI'),
+      $modelDisplayLabel: atom('Antigravity · Gemini 3.1 Pro High · external CLI'),
       $modelSource: atom('fleet_auto'),
       $provider: atom('antigravity-subscription'),
       $reasoningEffort: atom('high'),
@@ -156,7 +156,7 @@ describe('ModelPill per-surface model label', () => {
       </SessionViewProvider>
     )
 
-    expect(screen.getByText('Antigravity · external CLI')).toBeTruthy()
+    expect(screen.getByText('Antigravity · Gemini 3.1 Pro High · external CLI')).toBeTruthy()
     expect(screen.getByTestId('fleet-route-badge').textContent).toBe('external CLI')
   })
 })

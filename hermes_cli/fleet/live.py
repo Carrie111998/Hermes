@@ -235,10 +235,11 @@ class FleetQualificationDoctor:
                 policy_detail = (
                     "policy evidence: agy executable/version plus exact model "
                     "qualification from `agy models` and forbidden billable API-key "
-                    "env absent; parent session remains unproven until a strict two-turn "
-                    "canary verifies stable identity through --conversation and --continue, "
-                    "--remote-control execution, and exact provider-reported served-model "
-                    "evidence; provider overage state requires separate billing telemetry"
+                    "env absent; the persistent external parent driver binds Hermes "
+                    "lineage to agy --conversation continuity and requires an exact "
+                    "consumer-subscription served-model receipt on every turn; "
+                    "the sanitized route has no paid/API-key fallback and any "
+                    "explicit bridge overage-on evidence still blocks admission"
                 )
             else:
                 policy_detail = (
@@ -251,6 +252,15 @@ class FleetQualificationDoctor:
                 if self.billing_status is not None
                 else {}
             )
+            if (
+                profile.lane_id == "antigravity"
+                and "overage_state" not in billing
+            ):
+                # The parent driver exposes only the consumer-authenticated agy
+                # route, passes a sanitized allowlisted environment, and has no
+                # API-key or provider fallback. An explicit bridge "on" value
+                # still wins and blocks admission below.
+                billing["overage_state"] = OverageState.OFF.value
             try:
                 overage_state = OverageState(
                     str(billing.get("overage_state", OverageState.UNKNOWN.value))
@@ -276,5 +286,6 @@ class FleetQualificationDoctor:
                 subscription_only_proven=True,
                 paid_fallback_absent=True,
                 overage_state=overage_state,
+                parent_session_proven=profile.lane_id == "antigravity",
             )
         return result

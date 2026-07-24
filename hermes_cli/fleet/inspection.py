@@ -22,6 +22,7 @@ from .service import FleetService
 from .state import FleetStore
 from .types import (
     CapacitySnapshot,
+    Freshness,
     LaneEvaluation,
     ReasonCode,
     RoutePurpose,
@@ -54,7 +55,29 @@ def build_fleet_service(
         load_config_readonly() if config_data is None else config_data
     )
     profiles = ordered_profiles()
-    qualifications = (doctor or FleetQualificationDoctor()).qualify(profiles)
+    capacity_source = BridgeUsageAdapter(config.bridge_usage_file)
+
+    def antigravity_billing_status(lane_id: str) -> Mapping[str, object]:
+        if lane_id != "antigravity":
+            return {}
+        read_at = now() if now is not None else None
+        snapshot = capacity_source.read(lane_id, now=read_at).snapshot
+        if (
+            snapshot is None
+            or snapshot.freshness is not Freshness.FRESH
+            or snapshot.overage_disabled is None
+        ):
+            return {}
+        return {
+            "overage_state": (
+                "off" if snapshot.overage_disabled else "on"
+            )
+        }
+
+    live_doctor = doctor or FleetQualificationDoctor(
+        billing_status=antigravity_billing_status
+    )
+    qualifications = live_doctor.qualify(profiles)
     return FleetService(
         config=config,
         store=FleetStore(store_path or (get_hermes_home() / "fleet" / "state.db")),
@@ -65,7 +88,7 @@ def build_fleet_service(
             if adapters is None
             else adapters
         ),
-        capacity_source=BridgeUsageAdapter(config.bridge_usage_file),
+        capacity_source=capacity_source,
         now=now,
     )
 

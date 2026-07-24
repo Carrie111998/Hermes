@@ -1690,6 +1690,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["service_tier_override"] = tier
                 if exact_route := current.get("fleet_parent_route"):
                     kw["exact_route"] = exact_route
+                    kw["cwd_override"] = current.get("cwd")
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -3951,6 +3952,8 @@ def _probe_credentials(agent) -> str:
     warn when the key is genuinely missing.
     """
     try:
+        if getattr(agent, "external_subscription", False):
+            return ""
         key = getattr(agent, "api_key", "") or ""
         provider = getattr(agent, "provider", "") or ""
         if not key:
@@ -5359,6 +5362,7 @@ def _make_agent(
     service_tier_override: str | None = None,
     platform_override: str | None = None,
     exact_route: dict | None = None,
+    cwd_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5368,6 +5372,38 @@ def _make_agent(
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
         return synthetic
+
+    if (
+        exact_route is not None
+        and exact_route.get("fleet_adapter_kind") == "external_cli"
+    ):
+        route_model = str(exact_route.get("model") or "").strip()
+        route_provider = str(exact_route.get("provider") or "").strip()
+        override_model = (
+            str(model_override.get("model") or "").strip()
+            if isinstance(model_override, dict)
+            else ""
+        )
+        override_provider = (
+            str(model_override.get("provider") or "").strip()
+            if isinstance(model_override, dict)
+            else ""
+        )
+        if (
+            route_model != "gemini-3.1-pro-high"
+            or route_provider != "antigravity-subscription"
+            or override_model != route_model
+            or override_provider != route_provider
+        ):
+            raise RuntimeError("external fleet parent override does not match its pin")
+        from tui_gateway.external_parent import build_external_parent_driver
+
+        return build_external_parent_driver(
+            route=exact_route,
+            cwd=Path(cwd_override or _default_session_cwd()),
+            session_id=session_id or key,
+            session_db=session_db if session_db is not None else _get_db(),
+        )
 
     from run_agent import AIAgent
 
@@ -7056,6 +7092,7 @@ def _(rid, params: dict) -> dict:
                 session_db=db,
                 platform_override=source,
                 exact_route=fleet_parent_route,
+                cwd_override=cwd,
                 **stored_runtime_overrides,
             )
         finally:

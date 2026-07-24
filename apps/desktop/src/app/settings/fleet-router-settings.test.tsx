@@ -110,7 +110,7 @@ function fleetPayload(patch: Partial<FleetStatusResponse> = {}): FleetStatusResp
       reasons: ['ROTATION_WITHOUT_FRESH_CAPACITY', 'CAPACITY_STALE'],
       route_purpose: 'task_worker',
       selectable: true,
-      supports_parent_session: false,
+      supports_parent_session: true,
       supports_task_worker: true
     }),
     lane('kimi', {
@@ -125,11 +125,11 @@ function fleetPayload(patch: Partial<FleetStatusResponse> = {}): FleetStatusResp
     item.lane_id === 'antigravity'
       ? {
           ...item,
-          eligible: false,
+          eligible: true,
           fallback_eligible: false,
-          reasons: ['PARENT_SESSION_UNSUPPORTED', 'PARENT_SESSION_UNPROVEN'],
+          reasons: ['ROTATION_WITHOUT_FRESH_CAPACITY', 'CAPACITY_STALE'],
           route_purpose: 'desktop_parent' as const,
-          selectable: false
+          selectable: true
         }
       : { ...item, route_purpose: 'desktop_parent' as const }
   )
@@ -209,7 +209,8 @@ describe('FleetRouterSettings', () => {
     expect(antigravity.getByText('Gemini 3.1 Pro (High)')).toBeTruthy()
 
     const antigravityParent = within(screen.getByRole('article', { name: 'Antigravity · Parent' }))
-    expect(antigravityParent.getByText('PARENT_SESSION_UNSUPPORTED')).toBeTruthy()
+    expect(antigravityParent.getByText('Selectable')).toBeTruthy()
+    expect(antigravityParent.getByText('Gemini 3.1 Pro (High)')).toBeTruthy()
     expect(antigravityParent.getByText(/External CLI/)).toBeTruthy()
   })
 

@@ -51,13 +51,14 @@ gates pass. The Claude route reads the live Claude Code OAuth credential
 through the existing Anthropic adapter; it never substitutes
 `ANTHROPIC_API_KEY`.
 
-Antigravity remains an external `task_worker` and is parent-ineligible until a
-real persistent driver proves all of the following: two-turn continuity through
-`agy --conversation` and `agy --continue`, remote-control operation, and
-provider-reported served-model evidence for Gemini 3.1 Pro (High). The existing
-one-shot receipt is not parent-session proof. Fleet never uses
-`GOOGLE_API_KEY` or `GEMINI_API_KEY` for this route. Kimi remains disabled for
-both surfaces.
+Antigravity is a distinct external parent driver, never a native `AIAgent`.
+Hermes binds its `agy` conversation ID to the immutable Hermes lineage,
+verifies a newly created conversation on the first turn, continues later turns
+through `agy --conversation`, and requires consumer-subscription, Antigravity
+Cloud Code, and exact served-model receipts for Gemini 3.1 Pro (High) on every
+turn. Raw logs are reduced to secret-free evidence receipts. Fleet never passes
+`GOOGLE_API_KEY`, `GEMINI_API_KEY`, or any other API-key environment variable
+to this route. Kimi remains disabled for both surfaces.
 
 Desktop settings show task-worker and parent matrices separately. A fresh
 Fleet Auto draft displays selection as pending; after `session.create`, the

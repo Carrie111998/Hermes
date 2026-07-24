@@ -451,6 +451,7 @@ class ComputeHost:
                 platform_override=frame.get("source"),
                 session_db=session_db,
                 exact_route=frame.get("fleet_parent_route"),
+                cwd_override=str(frame.get("cwd") or ""),
             )
         finally:
             if home_token is not None:

@@ -66,7 +66,7 @@ def ordered_profiles() -> tuple[LaneProfile, ...]:
             executable="agy",
             implemented=True,
             fast_off_verifiable=True,
-            supports_parent_session=False,
+            supports_parent_session=True,
         ),
         LaneProfile(
             lane_id="kimi",

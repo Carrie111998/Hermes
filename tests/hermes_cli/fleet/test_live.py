@@ -88,10 +88,11 @@ def test_live_doctor_qualifies_exact_subscription_routes_from_receipts():
     assert qualifications["antigravity"].models == ("gemini-3.1-pro-high",)
     assert qualifications["antigravity"].efforts == ("low", "medium", "high")
     assert qualifications["antigravity"].qualified
+    assert qualifications["antigravity"].parent_session_proven is True
     assert not any(Path(command[0]).stem == "claude" for command in commands)
     assert any(command[1:] == ("models",) for command in commands)
     assert not any(Path(command[0]).stem == "agy" and "auth" in command for command in commands)
-    assert "provider-reported served-model" in qualifications["antigravity"].detail
+    assert "served-model receipt" in qualifications["antigravity"].detail
 
 
 def test_live_doctor_requires_exact_agy_model_list_qualification():
