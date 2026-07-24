@@ -553,7 +553,7 @@ export const ar = defineLocale({
       'tts.xai.language': 'لغة xAI',
       'tts.xai.speed': 'سرعة تشغيل xAI',
       'tts.xai.autoSpeechTags': 'وسوم الكلام التلقائية في xAI',
-      'tts.xai.optimizeStreamingLatency': 'تحسين مهلة البث في xAI',
+      'tts.xai.optimizeStreamingLatency': 'تحسين كمون البث في xAI',
       'tts.xai.sampleRate': 'معدل أخذ العينات في xAI',
       'tts.xai.bitRate': 'معدل البت في xAI',
       'tts.minimax.model': 'نموذج MiniMax TTS',
@@ -567,7 +567,7 @@ export const ar = defineLocale({
       'tts.kittentts.model': 'نموذج KittenTTS',
       'tts.kittentts.voice': 'صوت KittenTTS',
       'tts.piper.voice': 'صوت Piper',
-      'tts.deepinfra.model': 'نموذج DeepInfra الصوتي',
+      'tts.deepinfra.model': 'نموذج DeepInfra TTS',
       'tts.deepinfra.voice': 'صوت DeepInfra',
       'memory.memoryEnabled': 'الذاكرة المستمرة',
       'memory.userProfileEnabled': 'ملف المستخدم',
@@ -619,11 +619,11 @@ export const ar = defineLocale({
       'voice.autoTts': 'ينطق ردود المساعد تلقائياً.',
       'tts.xai.voiceId': 'معرف صوت xAI مثل eve أو معرف صوت مخصص.',
       'tts.xai.language': 'رمز لغة النطق، مثل en.',
-      'tts.xai.speed': 'سرعة التشغيل؛ أقل من واحد أبطأ، وواحد طبيعية، وأكثر من واحد أسرع.',
-      'tts.xai.autoSpeechTags': 'يسمح لنموذج بإضافة وسوم صوتية تعبيرية إلى النص قبل توليد الكلام.',
-      'tts.xai.optimizeStreamingLatency': 'موازنة المهلة والجودة؛ الصفر لأفضل جودة والاثنان لأقل مهلة.',
+      'tts.xai.speed': 'سرعة التشغيل؛ 0.7 أبطأ، و1.0 طبيعية، و1.5 أسرع.',
+      'tts.xai.autoSpeechTags': 'يسمح لنموذج بإضافة وسوم صوتية تعبيرية إلى النص قبل توليد الكلام، مثل [laughing] و[sighs].',
+      'tts.xai.optimizeStreamingLatency': 'موازنة الكمون والجودة؛ 0 لأفضل جودة و2 لأقل كمون.',
       'tts.xai.sampleRate': 'معدل أخذ عينات الصوت بالهرتز؛ الأعلى أجود لكنه ينتج ملفات أكبر.',
-      'tts.xai.bitRate': 'معدل بت الصوت، ويُستخدم فقط مع ترميز إم بي ثري.',
+      'tts.xai.bitRate': 'معدل بت MP3 بوحدة bps، ويُستخدم فقط مع ذلك الترميز.',
       'tts.neutts.device': 'جهاز الاستدلال المحلي لـ NeuTTS.',
       'stt.enabled': 'يفعل التفريغ الصوتي المحلي أو عبر مزود.',
       'stt.echoTranscripts': 'يعيد نشر النص الخام للرسالة الصوتية في المحادثة.',
@@ -655,7 +655,7 @@ export const ar = defineLocale({
         teacher: 'معلم',
         kawaii: 'كاواي',
         catgirl: 'فتاة القطط',
-        pirate: 'القرصان',
+        pirate: 'قرصان',
         shakespeare: 'شكسبير',
         surfer: 'راكب أمواج',
         noir: 'نوار',
@@ -791,7 +791,7 @@ export const ar = defineLocale({
       cloudLoadingAgents: 'جار تحميل وكلائك...',
       cloudNoAgents: {
         before: 'لا وكلاء في هذا الحساب. أنشئ واحدًا في ',
-        linkText: 'Nous Portal',
+        linkText: 'Nous portal',
         after: '، ثم حدّث.'
       },
       cloudRefresh: 'تحديث',
@@ -856,10 +856,10 @@ export const ar = defineLocale({
         'يُشغَّل Hermes على الجهاز البعيد عبر SSH ويُنشأ نفق إلى هذا التطبيق، فلا تحتاج إلى تشغيل خدمة أو كشف منفذ بنفسك. يلزم وصول يعمل بمفتاح SSH إلى المضيف.',
       sshTrustHint: 'يُوثق أول مفتاح مضيف يظهر ويُثبّت، وأي تغيير لاحق يوقف الاتصال احترازيًا.',
       sshHostTitle: 'المضيف',
-      sshHostDesc: 'user@host، أو اسم مضيف من ~/.ssh/config.',
+      sshHostDesc: 'user@host، أو اسم Host مستعار من ~/.ssh/config.',
       sshHostPick: 'اختر مضيفًا...',
       sshHostPickTitle: 'المضيف',
-      sshHostPickDesc: 'اسم مضيف من ~/.ssh/config، أو "مخصص" لكتابته يدويا.',
+      sshHostPickDesc: 'اسم Host مستعار من ~/.ssh/config، أو "مخصص" لكتابته يدويا.',
       sshHostCustom: 'مخصص (إدخال يدوي)...',
       sshUserTitle: 'المستخدم',
       sshUserDesc: 'اتركه فارغا لاستخدام ~/.ssh/config أو مستخدمك الحالي.',
@@ -869,7 +869,7 @@ export const ar = defineLocale({
       sshKeyTitle: 'ملف الهوية',
       sshKeyDesc: 'مسار المفتاح الخاص. اتركه فارغا لاستخدام ssh-agent أو ~/.ssh/config.',
       sshHermesPathTitle: 'مسار Hermes (اختياري)',
-      sshHermesPathDesc: 'المسار الكامل لأمر Hermes على الجهاز البعيد. اتركه فارغًا للاكتشاف التلقائي.',
+      sshHermesPathDesc: 'المسار الكامل للملف التنفيذي hermes على الجهاز البعيد. اتركه فارغًا للاكتشاف التلقائي.',
       sshHermesPathPlaceholder: 'اكتشاف تلقائي',
       sshTestConnection: 'اختبار SSH',
       sshConnect: 'اتصال',
@@ -950,15 +950,24 @@ export const ar = defineLocale({
       catalogInstallFailed: name => `فشل تثبيت ${name}`,
       catalogEnvPrompt: name => `يتطلب ${name} بيانات اعتماد`,
       catalogEnvRequired: 'املأ القيم المطلوبة قبل التثبيت.',
-      capabilitySummary: (tools, prompts, resources) =>
-        `${[`${tools} أداة`, ...(prompts ? [`${prompts} موجّه`] : []), ...(resources ? [`${resources} مورد`] : [])].join('، ')} مفعّلة`,
+      capabilitySummary: (tools, prompts, resources) => {
+        const seg = (n: number, one: string, two: string, few: string, many: string) =>
+          n === 1 ? one : n === 2 ? two : n <= 10 ? `${n} ${few}` : `${n} ${many}`
+
+        return `المفعّل: ${[
+          seg(tools, 'أداة واحدة', 'أداتان', 'أدوات', 'أداة'),
+          ...(prompts ? [seg(prompts, 'موجّه واحد', 'موجّهان', 'موجّهات', 'موجّه')] : []),
+          ...(resources ? [seg(resources, 'مورد واحد', 'موردان', 'موارد', 'مورد')] : [])
+        ].join('، ')}`
+      },
       statusConnecting: 'جار الاتصال...',
       statusNeedsAuth: 'يحتاج مصادقة',
       statusError: 'خطأ',
       statusOff: 'متوقف',
       allServers: 'جميع الخوادم',
       authenticatedTitle: 'تمت المصادقة',
-      authenticatedMessage: (server, count) => `${server}: ${count} أداة`,
+      authenticatedMessage: (server, count) =>
+        `${server}: ${count === 1 ? 'أداة واحدة' : count === 2 ? 'أداتان' : count <= 10 ? `${count} أدوات` : `${count} أداة`}`,
       waitingForBrowser: 'في انتظار المتصفح...',
       authenticate: 'مصادقة',
       unsavedConnect: 'غير محفوظ — احفظ mcp.json للاتصال.',
@@ -1210,9 +1219,9 @@ export const ar = defineLocale({
       bundled: 'مدمجة',
       hub: 'المركز'
     },
-    emptyNoneFound: noun => `لم يُعثر على ${noun}`,
+    emptyNoneFound: noun => (noun === 'skills' ? 'لم يُعثر على مهارات' : noun === 'tools' ? 'لم يُعثر على أدوات' : `لم يُعثر على ${noun}`),
     emptyNothingMatches: query => `لا شيء يطابق “${query}”.`,
-    emptyNoneAvailable: noun => `لا ${noun} متاحة بعد.`,
+    emptyNoneAvailable: noun => (noun === 'skills' ? 'لا مهارات متاحة بعد.' : noun === 'tools' ? 'لا أدوات متاحة بعد.' : `لا ${noun} متاحة بعد.`),
     changesApplyNewSessions: 'تُطبق التغييرات على الجلسات الجديدة.',
     skillUpdated: 'حُدّثت المهارة',
     edit: 'تحرير',
@@ -1283,7 +1292,7 @@ export const ar = defineLocale({
         clusters === 1
           ? 'فئة واحدة'
           : clusters === 2
-            ? 'فئتان'
+            ? 'فئتين'
             : clusters <= 10
               ? `${clusters} فئات`
               : `${clusters} فئة`
@@ -1548,7 +1557,7 @@ export const ar = defineLocale({
       empty: 'فارغ',
       resetMemory: 'تصفير الذاكرة',
       resetUser: 'تصفير الملف الشخصي',
-      resetAll: 'تصفير الاثنين',
+      resetAll: 'تصفير كليهما',
       resetConfirm: target => `حذف ${target}؟ لا يمكن التراجع عن هذا.`,
       resetDone: files => `حُذف ${files}.`,
       resetFailed: 'فشل تصفير الذاكرة',
@@ -1732,7 +1741,7 @@ export const ar = defineLocale({
     platformIntro: {}
   },
   webhooks: {
-    search: 'بحث',
+    search: 'البحث في الويب هوك...',
     loading: 'جار التحميل...',
     loadFailed: 'فشل تحميل الويب هوك',
     subscriptions: count => `الاشتراكات (${count})`,
@@ -1777,7 +1786,7 @@ export const ar = defineLocale({
     fieldEventsPlaceholder: 'مفصولة بفواصل، اتركه فارغا للكل',
     fieldSkills: 'المهارات',
     fieldSkillsPlaceholder: 'أسماء مهارات مفصولة بفواصل (اختياري)',
-    fieldDeliver: 'التسليم',
+    fieldDeliver: 'التسليم إلى',
     fieldDeliverOnly: 'تسليم الحمولة فقط',
     fieldPrompt: 'الموجّه',
     fieldPromptPlaceholder: 'تعليمات للوكيل عند إطلاق هذا الويب هوك (اختياري)',
@@ -2236,7 +2245,7 @@ export const ar = defineLocale({
     urlPlaceholder: 'https://example.com',
     urlHintPre: 'سيقرأ Hermes الرابط ضمن السياق.',
     attach: 'إرفاق',
-    queued: count => `${count} في الطابور`,
+    queued: count => `${count} في الانتظار`,
     queuedPaused: count => `${count} في الانتظار، متوقفة`,
     attachmentOnly: 'إرفاق فقط',
     emptyTurn: 'اكتب رسالة أو أرفق ملفا.',
@@ -2634,7 +2643,7 @@ export const ar = defineLocale({
       manualDescription: 'السؤال قبل الإجراءات التي تتطلب موافقة',
       smart: 'ذكي',
       smartDescription: 'تقييم الإجراءات تلقائيًا والسؤال عند الحاجة',
-      off: 'دون موافقة',
+      off: 'معطل',
       offDescription: 'التشغيل دون مطالبات بالموافقة'
     },
     statusbar: {

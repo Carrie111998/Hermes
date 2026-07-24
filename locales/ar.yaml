@@ -81,7 +81,7 @@ gateway:
     create_failed:         "فشل إنشاء الفرع: {error}"
     switch_failed:         "أُنشئ الفرع لكن تعذّر التبديل إليه."
     branched_one:          "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
-    branched_many:         "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
+    branched_many:         "⑂ تم التفريع إلى **{title}** (نُسخت {count} من الرسائل)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
 
   commands:
     usage:                 "الاستخدام: `/commands [page]`"
@@ -267,7 +267,7 @@ gateway:
     already_on:            "📌 أنت بالفعل على الجلسة **{name}**."
     switch_failed:         "فشل تبديل الجلسة."
     resumed_one:           "↻ استُؤنفت الجلسة **{title}** ({count} رسالة). استُعيدت المحادثة."
-    resumed_many:          "↻ استُؤنفت الجلسة **{title}** ({count} رسالة). استُعيدت المحادثة."
+    resumed_many:          "↻ استُؤنفت الجلسة **{title}** ({count} من الرسائل). استُعيدت المحادثة."
     resumed_no_count:      "↻ استُؤنفت الجلسة **{title}**. استُعيدت المحادثة."
 
   retry:
