@@ -91,5 +91,54 @@ class TestWriteAllowed:
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
+        for name in ["config.yaml"]:
             assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+
+
+class TestWriteDenyCredentialStore:
+    """auth.json is the provider credential store (OAuth refresh tokens, API
+    keys, the whole credential_pool). It was already read-denied via
+    get_read_block_error()'s credential_file_names tuple, but missing from
+    build_write_denied_paths() meant write_file/patch/delete/move could
+    destroy it with no read-based warning first (#70942)."""
+
+    def test_auth_json_denied(self):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "auth.json"
+        assert _is_write_denied(str(path)) is True
+
+    def test_auth_lock_denied(self):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "auth.lock"
+        assert _is_write_denied(str(path)) is True
+
+    def test_google_oauth_json_denied(self):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "auth" / "google_oauth.json"
+        assert _is_write_denied(str(path)) is True
+
+    def test_webhook_subscriptions_json_denied(self):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "webhook_subscriptions.json"
+        assert _is_write_denied(str(path)) is True
+
+    def test_auth_json_denied_at_root_when_running_under_profile(self, tmp_path, monkeypatch):
+        """Top-level <root>/auth.json stays write-denied even when running
+        under a profile, mirroring the existing .env root-widening (#15981)."""
+        root = tmp_path / "hermes_root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        global_auth = root / "auth.json"
+        global_auth.write_text('{"anthropic-oauth": {"refresh_token": "rt-real"}}\n')
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from hermes_constants import get_hermes_home, get_default_hermes_root
+        assert get_hermes_home() == profile_home
+        assert get_default_hermes_root() == root
+
+        assert _is_write_denied(str(global_auth)) is True
