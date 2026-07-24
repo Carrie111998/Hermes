@@ -326,7 +326,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Fleet admission is a once-per-new-task workflow, not a per-call model
     # router. Build this instruction once with the cached session prefix.
     # Fleet workers are explicitly excluded to prevent recursive delegation.
-    if (agent.platform or "").lower().strip() != "subagent":
+    if (agent.platform or "").lower().strip() == "subagent":
+        stable_parts.append(
+            "This worker is already admitted and pinned by its parent workflow. "
+            "Execute the assigned task directly. Do not load the "
+            "fleet-balanced-router skill, do not call `hermes fleet`, and do not "
+            "delegate the task back into the fleet."
+        )
+    else:
         try:
             from hermes_cli.config import load_config_readonly
 

@@ -104,6 +104,27 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+class TestFleetWorkerGuard:
+    def test_subagent_executes_directly_without_fleet_readmission(self):
+        agent = _make_agent(platform="subagent")
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={"fleet": {"enabled": True}}):
+            stable = _stable_prompt(agent)
+
+        assert "already admitted and pinned" in stable
+        assert "Do not load the fleet-balanced-router skill" in stable
+        assert "Fleet default workflow is enabled" not in stable
+
+    def test_primary_session_keeps_default_fleet_admission(self):
+        agent = _make_agent(platform="cli")
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={"fleet": {"enabled": True}}):
+            stable = _stable_prompt(agent)
+
+        assert "Fleet default workflow is enabled" in stable
+        assert "already admitted and pinned" not in stable
+
+
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 
