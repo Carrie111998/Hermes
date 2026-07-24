@@ -881,6 +881,16 @@ DANGEROUS_PATTERNS = [
     (rf'\bln\b[^;|&\n]*(?:^|\s)--(?:force|backup)\b[^;|&\n]*\s["\']?{_SYSTEM_CONFIG_PATH}[^\s"\']*["\']?{_COMMAND_TAIL}', "force-link into system config path (long flag)"),
     (rf'\bln\b[^;|&\n]*(?:^|\s)-(?!-)[^\s]*f[^;|&\n]*\s["\']?(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})["\']?{_COMMAND_TAIL}', "force-link into Hermes config/env"),
     (rf'\bln\b[^;|&\n]*(?:^|\s)--(?:force|backup)\b[^;|&\n]*\s["\']?(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})["\']?{_COMMAND_TAIL}', "force-link into Hermes config/env (long flag)"),
+    # rsync to sensitive write targets. rsync's destination is the last argument,
+    # same semantics as cp/mv/install. Reading FROM a sensitive path is safe
+    # (`rsync ~/.ssh/config /tmp/backup`); writing TO is gated. The command-tail
+    # anchor ensures only the destination triggers the deny. Hermes-specific
+    # patterns must come BEFORE the generic project pattern since _PROJECT_CONFIG_PATH
+    # matches any config.yaml (including ~/.hermes/config.yaml).
+    (rf'\brsync\b.*\s{_SYSTEM_CONFIG_PATH}[^\s"\']*{_COMMAND_TAIL}', "rsync to system config path"),
+    (rf'\brsync\b.*\s["\']?(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})["\']?{_COMMAND_TAIL}', "rsync to Hermes config/env path"),
+    (rf'\brsync\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "rsync to sensitive credential/SSH/shell-rc path"),
+    (rf'\brsync\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "rsync to project env/config file"),
     # In-place edits mutate the target file directly, bypassing redirection,
     # tee, and copy/move/install coverage. Gate the same user-controlled
     # startup/credential files so `sed -i ... ~/.bashrc` and `perl -i ...

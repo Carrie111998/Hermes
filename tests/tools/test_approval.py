@@ -510,6 +510,48 @@ class TestSensitiveCopyMovePattern:
             dangerous, key, desc = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 
+    def test_rsync_to_ssh_authorized_keys(self):
+        """rsync to ~/.ssh/authorized_keys is dangerous (key implant)."""
+        dangerous, key, desc = detect_dangerous_command("rsync /tmp/evil ~/.ssh/authorized_keys")
+        assert dangerous is True
+        assert key is not None
+        assert "rsync" in desc.lower()
+
+    def test_rsync_to_system_hosts(self):
+        """rsync to /etc/hosts is dangerous (system config)."""
+        dangerous, key, desc = detect_dangerous_command("rsync /tmp/hosts /etc/hosts")
+        assert dangerous is True
+        assert key is not None
+        assert "rsync" in desc.lower() and "system" in desc.lower()
+
+    def test_rsync_to_netrc(self):
+        """rsync to ~/.netrc is dangerous (credential file)."""
+        dangerous, key, desc = detect_dangerous_command("rsync /tmp/creds ~/.netrc")
+        assert dangerous is True
+        assert key is not None
+        assert "rsync" in desc.lower()
+
+    def test_rsync_to_hermes_config(self):
+        """rsync to ~/.hermes/config.yaml is dangerous (security policy file)."""
+        dangerous, key, desc = detect_dangerous_command("rsync /tmp/evil.yaml ~/.hermes/config.yaml")
+        assert dangerous is True
+        assert key is not None
+        assert "rsync" in desc.lower() and "hermes" in desc.lower()
+
+    def test_rsync_from_ssh_is_safe(self):
+        """rsync reading SSH config into a temporary backup is safe."""
+        dangerous, key, desc = detect_dangerous_command("rsync ~/.ssh/config /tmp/backup")
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+    def test_rsync_unrelated_safe(self):
+        """rsync between two temporary paths is safe."""
+        dangerous, key, desc = detect_dangerous_command("rsync -av /tmp/source/ /tmp/dest/")
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
 
 class TestSensitiveInPlaceEditPattern:
     """Detect in-place edits to user startup and credential files."""
