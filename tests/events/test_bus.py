@@ -649,3 +649,94 @@ class TestCheckpointModes:
         bus.emit(EventType.GATEWAY_STARTED, "test", {})
         result = bus.checkpoint()
         assert result is not None and len(result) == 3
+
+
+class TestAnalyze:
+    """Planner statistics refresh (R61 — the bus ran with no sqlite_stat1)."""
+
+    def test_analyze_creates_statistics(self, bus):
+        for i in range(20):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            assert conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'"
+            ).fetchone()[0] == 0, "fixture should start without statistics"
+
+            assert bus.analyze() is True
+
+            stats = conn.execute(
+                "SELECT idx FROM sqlite_stat1 WHERE tbl = 'events'"
+            ).fetchall()
+            assert stats, "ANALYZE produced no statistics for the events table"
+        finally:
+            conn.close()
+
+    def test_analyze_keeps_the_escalation_query_on_the_covering_index(self, bus):
+        """Stats must not un-pick the covering index the watchdog depends on.
+
+        ANALYZE changes plan SELECTION, so it can in principle move a query off
+        the index that was added for it. This is the same property pinned in
+        the watchdog's own suite, asserted here at the source of the schema.
+
+        Asserting the INDEX NAME, not merely "SEARCH": on a small fixture table
+        SQLite happily skip-scans idx_events_type_status_ts and still reports
+        SEARCH, so a bare SEARCH assertion passes even with this index dropped
+        entirely — verified vacuous, then tightened.
+        """
+        for i in range(20):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i},
+                     priority=Priority.HIGH)
+        assert bus.analyze() is True
+
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            plan = " ".join(
+                row[3] for row in conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM events "
+                    "WHERE timestamp > ? AND priority IN ('high','critical')",
+                    ("2026-01-01",),
+                )
+            )
+        finally:
+            conn.close()
+        assert "SEARCH" in plan, f"expected an index seek, got: {plan}"
+        assert "SCAN" not in plan, f"scan reintroduced after ANALYZE: {plan}"
+        assert "idx_events_priority_ts" in plan, (
+            f"ANALYZE moved the escalation query off its covering index: {plan}")
+
+    def test_analyze_refreshes_stats_as_the_table_grows(self, bus):
+        """The whole point of running it on a schedule — stats must not freeze.
+
+        PRAGMA optimize was measured NOT to refresh here across a 15% row
+        increase, which is why analyze() runs ANALYZE outright.
+        """
+        for i in range(20):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+        bus.analyze()
+
+        conn = sqlite3.connect(str(bus.db_path))
+        try:
+            before = conn.execute(
+                "SELECT stat FROM sqlite_stat1 WHERE tbl = 'events' LIMIT 1"
+            ).fetchone()[0]
+
+            for i in range(400):
+                bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+            bus.analyze()
+
+            after = conn.execute(
+                "SELECT stat FROM sqlite_stat1 WHERE tbl = 'events' LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert after != before, (
+            f"statistics froze across a 20x row increase: {before!r} -> {after!r}")
+
+    def test_analyze_survives_a_closed_database(self, tmp_path):
+        """Failure returns False rather than taking down the daily hook."""
+        bus = EventBus(tmp_path / "bus.db")
+        bus.emit(EventType.GATEWAY_STARTED, "test", {})
+        bus._get_conn().close()  # leave a dead handle behind
+
+        assert bus.analyze() is False

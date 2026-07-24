@@ -38,6 +38,15 @@ CREATE INDEX IF NOT EXISTS idx_events_source
 CREATE INDEX IF NOT EXISTS idx_events_correlation
     ON events (correlation_id)
     WHERE correlation_id IS NOT NULL;
+-- Every other index here is keyed on created_at, but the watchdog's daily
+-- escalation count filters `timestamp` AND `priority`, so none of them could
+-- seek and it degraded to a full SCAN of the whole table (594k VDBE steps on
+-- the 395 MB / 193k-row bus; 13.9 s cold). Leading with priority makes this a
+-- COVERING index for that predicate -- 4k steps -- because priority and
+-- timestamp are the only columns the query touches. high+critical is ~6% of
+-- rows, so the leading column stays selective.
+CREATE INDEX IF NOT EXISTS idx_events_priority_ts
+    ON events (priority, timestamp);
 
 CREATE TABLE IF NOT EXISTS subscriber_cursors (
     subscriber_id TEXT PRIMARY KEY,
@@ -404,6 +413,43 @@ class EventBus:
             except sqlite3.Error as e:
                 logger.warning("WAL checkpoint(%s) failed: %s", mode, e)
                 return None
+
+    def analyze(self, analysis_limit: int = 400) -> bool:
+        """Refresh query-planner statistics. Returns True on success.
+
+        Without a sqlite_stat1 table SQLite plans from hard-coded guesses. The
+        live bus ran without one until 2026-07-23, which is part of why the
+        watchdog's escalation count degraded to a full SCAN (R61).
+
+        ``analysis_limit`` caps how many index entries ANALYZE samples per
+        index, which is what makes this cheap enough to run on a schedule: on
+        the 395 MB / 193k-row bus a full ANALYZE takes ~4.7s and blocks
+        writers, while analysis_limit=400 takes ~0.010s — 470x less — and
+        still tracked table growth correctly across a +40k-row insert. The
+        resulting row estimates are approximate by design (SQLite documents
+        this trade-off); every plan that matters here was verified to stay
+        SEARCH under them.
+
+        NB ``PRAGMA optimize`` is the usual recommendation for this job but was
+        measured NOT to refresh at all here — it left stats untouched across a
+        15% row increase — so this deliberately runs ANALYZE outright.
+
+        Statistics are only read when a connection loads its schema, so
+        existing long-lived connections keep planning from whatever they
+        already cached until they reconnect.
+        """
+        with self._lock:
+            try:
+                conn = self._get_conn()
+                # Must precede ANALYZE on the SAME connection: analysis_limit
+                # is a connection-scoped setting the next ANALYZE reads.
+                conn.execute(f"PRAGMA analysis_limit={int(analysis_limit)}")
+                conn.execute("ANALYZE")
+                conn.commit()
+                return True
+            except sqlite3.Error as e:
+                logger.warning("EventBus ANALYZE failed: %s", e)
+                return False
 
     def close(self) -> None:
         """Close the thread-local SQLite connection."""
