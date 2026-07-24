@@ -60,6 +60,30 @@ Reports live under:
 They contain commit ids and verification outcomes, never credentials or
 customer data. Repeated identical results are marked as duplicates.
 
+## Daily Discord Summary
+
+A separate daily reporting automation reads the previous 24 hours of private
+structured reports and sends one bounded Bulgarian summary to the explicitly
+configured internal Discord target. It uses:
+
+```bash
+python3 scripts/skyai_v2_upstream_sync_daily_report.py
+```
+
+The formatter is deterministic and transport-agnostic. It never reads a
+Discord token, customer data, logs, source files, or model output. Delivery is
+performed by the existing `hermes send` CLI, so the bot credential remains in
+the normal Hermes secret store and is never copied into source, scheduler
+prompts, reports, or command output.
+
+The daily summary includes the aggregate PASS/PARTIAL/BLOCKED state, run count,
+latest source/upstream commits, ahead/behind counts, the latest complete
+verification result, blockers, and a candidate PR URL when present. Missing
+reports are shown as `NO DATA` instead of being misreported as a sync failure.
+
+Daily reporting has no authority to run the sync, create a candidate, merge,
+deploy, change runtime state, or retry failed delivery.
+
 ## PASS / PARTIAL / BLOCKED
 
 - `PASS / up_to_date`: canonical SkyAI already contains current upstream.
