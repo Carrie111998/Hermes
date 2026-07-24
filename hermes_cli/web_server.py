@@ -267,6 +267,55 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+def _no_live_gateway(lock_path: Optional[Path] = None) -> bool:
+    """#66629 dispatch gate for the desktop cron ticker.
+
+    Return True (dispatch) only when no live gateway owns the gateway runtime
+    lock at ``lock_path`` (defaults to this PROCESS's own HERMES_HOME lock —
+    the single-home desktop ticker's case). When a gateway is live, return
+    False so the tick is left for it: the gateway has live platform adapters
+    and renders Feishu interactive cards, whereas the desktop standalone path
+    silently degrades them to plain text. Fails open (dispatch) on an
+    indeterminate probe so a desktop-only cron is never stalled, logging a
+    warning for observability.
+    """
+    try:
+        from gateway.status import probe_gateway_runtime_lock
+
+        state = probe_gateway_runtime_lock(lock_path)
+    except Exception:
+        _log.warning(
+            "Desktop cron: gateway runtime lock probe raised unexpectedly; "
+            "dispatching locally (#66629).",
+            exc_info=True,
+        )
+        return True
+    if state == "held":
+        return False
+    if state == "unknown":
+        _log.warning(
+            "Desktop cron: gateway runtime lock probe was indeterminate; "
+            "dispatching locally. If a gateway is in fact live, interactive-card "
+            "jobs may degrade to plain text (#66629)."
+        )
+    return True
+
+
+def _no_live_gateway_for_home(home: "str | Path") -> bool:
+    """Per-profile variant of :func:`_no_live_gateway` for the multiplex ticker.
+
+    The zero-arg probe only ever checks THIS process's own HERMES_HOME lock
+    (``gateway/status.py``'s ``_get_process_hermes_home`` deliberately skips
+    per-session overrides). Reusing it as a single global gate across every
+    profile in ``profile_homes`` would defer ALL of them whenever any one
+    profile has a live gateway — regressing d9a48f656a (sleeping profiles keep
+    firing) for every sibling profile that has no live gateway of its own.
+    Probing each profile's own ``<home>/gateway.lock`` instead lets a profile
+    with its own live gateway defer while the rest keep ticking normally.
+    """
+    return _no_live_gateway(Path(home) / "gateway.lock")
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -317,6 +366,30 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
 
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
+    # #66629: only dispatch when no live gateway owns the relevant HERMES_HOME,
+    # so cron delivery uses the gateway's live adapters (which render Feishu
+    # interactive cards) instead of the desktop standalone path (which
+    # silently degrades cards to plain text). Pass the gate only to providers
+    # that accept it — the built-in in-process scheduler does; an external
+    # provider may not.
+    #
+    # ``_no_live_gateway`` probes this PROCESS's own HERMES_HOME lock — fine
+    # for the single-home path, wrong for multiplex: gating every profile's
+    # tick on ONE lock would defer sleeping profiles whenever any sibling
+    # profile happens to have a live gateway, regressing #69377/the
+    # multiplex-tick fix above (a profile with no live gateway of its own must
+    # keep ticking). When ``profile_homes`` is set, gate PER PROFILE instead
+    # via ``per_home_can_dispatch`` so only the profile whose own gateway is
+    # live defers.
+    try:
+        start_params = inspect.signature(provider.start).parameters
+    except (TypeError, ValueError):
+        start_params = {}
+    if "profile_homes" in start_kwargs:
+        if "per_home_can_dispatch" in start_params:
+            start_kwargs["per_home_can_dispatch"] = _no_live_gateway_for_home
+    elif "can_dispatch" in start_params:
+        start_kwargs["can_dispatch"] = _no_live_gateway
     provider.start(stop_event, **start_kwargs)
 
 

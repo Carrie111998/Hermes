@@ -542,7 +542,13 @@ class InProcessCronScheduler(CronScheduler):
     to the pre-refactor ``_start_cron_ticker`` core loop. The caller runs it in
     a daemon thread. ``can_dispatch`` is an optional synchronous gate supplied
     by GatewayRunner during external drain; skipped ticks leave due jobs intact
-    for the next allowed tick.
+    for the next allowed tick. It applies globally — every profile in
+    ``profile_homes`` is skipped together — which is correct for a drain gate
+    (the whole process is pausing) but wrong for a per-profile gate.
+    ``per_home_can_dispatch``, if given, is called with each profile's home
+    (only in the ``profile_homes`` multiplex path) and skips just THAT
+    profile's tick, so e.g. the desktop ticker's #66629 "defer to a live
+    gateway" gate can defer one profile without stalling its siblings.
     """
 
     @property
@@ -560,6 +566,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
         profile_adapters=None,
         default_profile=None,
+        per_home_can_dispatch=None,
     ):
         import logging
         from cron.scheduler import CronTickYielded
@@ -590,6 +597,7 @@ class InProcessCronScheduler(CronScheduler):
                 can_dispatch=can_dispatch,
                 profile_adapters=profile_adapters,
                 default_profile=default_profile,
+                per_home_can_dispatch=per_home_can_dispatch,
             )
             return
 
@@ -670,6 +678,7 @@ class InProcessCronScheduler(CronScheduler):
         can_dispatch=None,
         profile_adapters=None,
         default_profile=None,
+        per_home_can_dispatch=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -678,6 +687,12 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``can_dispatch`` (if given) gates the WHOLE cycle — every profile is
+        skipped together — appropriate for a process-wide drain gate.
+        ``per_home_can_dispatch`` (if given) is called per profile inside the
+        loop and skips only that profile's tick, so one profile with its own
+        live gateway can defer without stalling siblings that have none.
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -729,6 +744,17 @@ class InProcessCronScheduler(CronScheduler):
                     for entry in _existing_profile_homes(profile_homes):
                         _pname = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        if per_home_can_dispatch is not None and not per_home_can_dispatch(home):
+                            # This profile's own gate (e.g. #66629's "defer to
+                            # a live gateway" probe) says skip — leave its due
+                            # jobs intact for the next tick and move on to the
+                            # next profile rather than stalling the whole
+                            # cycle (that would regress d9a48f656a).
+                            logger.debug(
+                                "Cron dispatch deferred for profile at %s (per-home gate)",
+                                home,
+                            )
+                            continue
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
