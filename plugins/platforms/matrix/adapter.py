@@ -2066,6 +2066,7 @@ class MatrixAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        source: str = "",
     ) -> SendResult:
         """Send a reaction-based exec approval prompt for Matrix."""
         if not self._client:
@@ -2088,8 +2089,11 @@ class MatrixAdapter(BasePlatformAdapter):
             if allow_permanent:
                 reaction_legend_parts.append("♾️ = approve always")
         reaction_legend_parts.append("❎ = deny")
+        heading = "⚠️ **Dangerous command requires approval**"
+        if source:
+            heading = f"🤖 [{source}] {heading}"
         text = (
-            "⚠️ **Dangerous command requires approval**\n"
+            f"{heading}\n"
             f"```\n{cmd_preview}\n```\n"
             f"Reason: {description}\n\n"
             f"{scope_choices}Reply `!approve` to execute once, or `!deny` to cancel.\n\n"
