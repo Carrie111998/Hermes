@@ -497,7 +497,8 @@ def _notify_workflow_complete(task_id: str):
 
     When a final-layer card completes, reads the state file for session info
     and writes a JSON marker that the polling daemon picks up and injects
-    into the correct session.
+    into the correct session.  The message body is produced by the workflow
+    analyst auxiliary so the report is actionable — not a hardcoded string.
     """
     try:
         result = _find_state_for_card(task_id)
@@ -521,11 +522,77 @@ def _notify_workflow_complete(task_id: str):
         if not all_final_done:
             return
 
-        # All done — write completion marker
+        # All done — produce analyst report, then write marker
         workflow_name = state.get("workflow_name", "unknown")
+        board = state.get("kanban_board", "unknown")
         session_key = session_info.get("session_key", "")
 
+        # Build a structured node summary for the message
         import json
+        all_nodes = []
+        for layer_nids in layers:
+            for nid in layer_nids:
+                ns = state.get("states", {}).get(nid, {})
+                all_nodes.append({
+                    "node": nid,
+                    "agent": ns.get("agent", ""),
+                    "status": ns.get("status", "unknown"),
+                })
+
+        # Count stats
+        done_count = sum(1 for n in all_nodes if n["status"] == "done")
+        failed_count = sum(1 for n in all_nodes if n["status"] in ("failed", "timed_out"))
+        total = len(all_nodes)
+
+        # Try to get analyst-generated report
+        message = ""
+        try:
+            from plugins.workflow.analyst import analyze_status
+            state_json = json.dumps(state, indent=2, default=str)
+            outcome = analyze_status(
+                pipeline_name=workflow_name,
+                state_json=state_json,
+                timeout=30,
+            )
+            if outcome.success and outcome.result:
+                # The analyst returns structured JSON — format into readable
+                r = outcome.result
+                parts = []
+                # Layer summary
+                for layer_info in r.get("layer_summary", []):
+                    for node_info in layer_info.get("nodes", []):
+                        status_icon = {
+                            "done": "✅", "running": "⏳", "pending": "⬜",
+                            "failed": "❌", "blocked": "🚫", "timed_out": "⏰",
+                        }.get(node_info.get("status", ""), "❓")
+                        agent = node_info.get("agent", "")
+                        node_name = node_info.get("node", "")
+                        parts.append(f"  {status_icon} {node_name} ({agent})")
+                # Attention needed
+                attention = r.get("attention_needed", [])
+                if attention:
+                    parts.append("")
+                    parts.append("⚠️ Attention:")
+                    for a in attention:
+                        parts.append(f"  • {a}")
+                message = "\n".join(parts)
+        except Exception:
+            pass  # Fall through to basic message
+
+        # Fallback to basic message if analyst didn't produce one
+        if not message:
+            lines = []
+            for n in all_nodes:
+                icon = "✅" if n["status"] == "done" else "❌"
+                lines.append(f"  {icon} {n['node']} ({n['agent']})")
+            message = "\n".join(lines)
+
+        # Build the full notification
+        heading = f"✅ Workflow '{workflow_name}' completed on board '{board}' — {done_count}/{total} nodes succeeded"
+        if failed_count:
+            heading += f" ({failed_count} failed)"
+        full_message = f"{heading}\n\nNodes:\n{message}"
+
         from datetime import datetime, timezone
         marker = {
             "session_key": session_key,
@@ -535,8 +602,9 @@ def _notify_workflow_complete(task_id: str):
             "user_id": session_info.get("user_id"),
             "profile": session_info.get("profile"),
             "workflow_name": workflow_name,
+            "board": board,
             "status": "completed",
-            "message": f"✅ Workflow '{workflow_name}' completed — all {len(layers)} layers done",
+            "message": full_message,
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
         marker_path = Path(f"/tmp/wf-complete-{ts}.json")
