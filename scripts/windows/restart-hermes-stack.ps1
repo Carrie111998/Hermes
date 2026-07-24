@@ -105,8 +105,14 @@ if ($StartLlama) {
 }
 
 if ($StartLlama) {
-    Write-Step "Starting llama secretary on :8080 (H: HF cache)"
-    & (Join-Path $PSScriptRoot "start-llama-secretary.ps1") -WaitSeconds $WaitModelsSeconds
+    $hotswapScript = Join-Path $PSScriptRoot "start-llama-hotswap.ps1"
+    if (Test-Path -LiteralPath $hotswapScript) {
+        Write-Step "Starting llama hot-swap router on :8080 (primary + gemma4-coding-Q8)"
+        & $hotswapScript -WaitSeconds $WaitModelsSeconds
+    } else {
+        Write-Step "Starting llama secretary on :8080 (H: HF cache)"
+        & (Join-Path $PSScriptRoot "start-llama-secretary.ps1") -WaitSeconds $WaitModelsSeconds
+    }
 
     $modelsOk = $false
     $deadline = (Get-Date).AddSeconds($WaitModelsSeconds)
@@ -115,9 +121,14 @@ if ($StartLlama) {
             $models = Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/models" -TimeoutSec 8
             $ids = @($models.data | ForEach-Object { $_.id })
             Write-Step ("8080 models: {0}" -f ($ids -join ", "))
-            if ($ids -contains $DesiredModel) {
-                $modelsOk = $true
-                break
+            $hasPrimary = ($ids -contains $DesiredModel)
+            $hasSecondary = ($ids -contains "gemma4-coding-Q8")
+            if ($hasPrimary -or ($ids.Count -gt 0 -and (Test-Path -LiteralPath $hotswapScript))) {
+                # Router lists presets before/while primary loads; accept either listed id.
+                if ($hasPrimary -or $hasSecondary -or $ids.Count -ge 1) {
+                    $modelsOk = $true
+                    break
+                }
             }
             if ($ids.Count -gt 0) {
                 Write-Warning "Desired model not listed yet; continuing to wait"
