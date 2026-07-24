@@ -642,3 +642,65 @@ class TestMasterCredentialStoresAreNeverMountable:
             assert cf.get_credential_file_mounts() == []
         rec = next(r for r in caplog.records if "read guard raised" in r.message)
         assert rec.exc_info is not None, "traceback must be attached (logger.exception)"
+
+
+class TestRegisterCacheDir:
+    """register_cache_dir() lets out-of-tree plugins mirror a cache subdir
+    into remote backends via the same machinery core cache dirs use."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_cache_dirs(self):
+        import tools.credential_files as cf
+        original = list(cf._CACHE_DIRS)
+        yield
+        cf._CACHE_DIRS[:] = original
+
+    def test_registered_dir_appears_in_mounts_and_translation(self, tmp_path):
+        import tools.credential_files as cf
+
+        home = tmp_path / ".hermes"
+        cache_dir = home / "cache" / "myplugin" / "blobs"
+        cache_dir.mkdir(parents=True)
+        f = cache_dir / "abc123"
+        f.write_text("cached original")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+            # Not visible before registration.
+            assert cf.map_cache_path_to_container(str(f)) is None
+            cf.register_cache_dir("cache/myplugin/blobs")
+
+            mounts = cf.get_cache_directory_mounts()
+            assert any(m["host_path"] == str(cache_dir) for m in mounts)
+
+            translated = cf.map_cache_path_to_container(str(f))
+            assert translated == "/root/.hermes/cache/myplugin/blobs/abc123"
+
+            synced = cf.iter_cache_files()
+            assert any(e["host_path"] == str(f) for e in synced)
+
+    def test_idempotent(self):
+        import tools.credential_files as cf
+
+        before = len(cf._CACHE_DIRS)
+        cf.register_cache_dir("cache/dupe")
+        cf.register_cache_dir("cache/dupe")
+        added = [d for d in cf._CACHE_DIRS if d[0] == "cache/dupe"]
+        assert len(added) == 1
+        assert len(cf._CACHE_DIRS) == before + 1
+
+    def test_none_old_name_never_reaches_get_hermes_dir(self, tmp_path):
+        import tools.credential_files as cf
+
+        home = tmp_path / ".hermes"
+        (home / "cache" / "noleg").mkdir(parents=True)
+        with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+            cf.register_cache_dir("cache/noleg")  # old_name defaults to new
+            # Would raise TypeError inside get_hermes_dir if old_name were None.
+            mounts = cf.get_cache_directory_mounts()
+            assert any(m["container_path"].endswith("cache/noleg") for m in mounts)
+
+    def test_empty_subpath_rejected(self):
+        import tools.credential_files as cf
+
+        with pytest.raises(ValueError):
+            cf.register_cache_dir("   ")
