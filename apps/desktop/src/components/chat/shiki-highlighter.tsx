@@ -2,7 +2,7 @@
 
 import type { SyntaxHighlighterProps } from '@assistant-ui/react-streamdown'
 import { type FC, useMemo } from 'react'
-import ShikiHighlighter from 'react-shiki'
+import { ShikiHighlighter } from 'react-shiki/core'
 
 import {
   CodeCard,
@@ -16,6 +16,7 @@ import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
 import { codiconForLanguage, isLikelyProseCodeBlock, sanitizeLanguageTag } from '@/lib/markdown-code'
+import { normalizeShikiLang, useCuratedHighlighter } from '@/lib/shiki-core'
 
 /**
  * Streamdown's code adapter renders header + body as inline siblings, so we
@@ -122,6 +123,7 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
   defer = false
 }) => {
   const { t } = useI18n()
+  const highlighter = useCuratedHighlighter()
   const trimmed = (code ?? '').replace(/^\n+/, '').trimEnd()
 
   // Streaming may hand us empty/incomplete fences — render nothing rather
@@ -136,7 +138,9 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
 
   const cleanLanguage = sanitizeLanguageTag(language || '')
   const label = cleanLanguage && cleanLanguage !== 'unknown' ? cleanLanguage : ''
-  const plain = defer || exceedsHighlightBudget(trimmed)
+  // `!highlighter`: the curated core hasn't resolved yet — show plain text until
+  // it does (the same plain→highlighted transition react-shiki's async init had).
+  const plain = defer || exceedsHighlightBudget(trimmed) || !highlighter
 
   return (
     <CodeCard data-streaming={defer ? 'true' : undefined}>
@@ -167,7 +171,8 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
                 colorReplacements={SHIKI_COLOR_REPLACEMENTS}
                 defaultColor="light-dark()"
                 delay={120}
-                language={language || 'text'}
+                highlighter={highlighter ?? undefined}
+                language={normalizeShikiLang(language)}
                 showLanguage={false}
                 theme={SHIKI_THEME}
               >
