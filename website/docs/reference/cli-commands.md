@@ -84,6 +84,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes sessions` | Browse, export, prune, rename, and delete sessions. |
 | `hermes insights` | Show token/cost/activity analytics. |
 | `hermes jobs` | Inspect long-job timing, blockers, and safe resume state. |
+| `hermes olympus-supervisor` | Run or inspect the observe-only Olympus Kanban supervisor. See [Olympus supervisor](../user-guide/features/olympus-supervisor.md). |
 | `hermes claw` | OpenClaw migration helpers. |
 | `hermes dashboard` | Launch the web dashboard for managing config, API keys, and sessions. |
 | `hermes desktop` (alias `gui`) | Build and launch the native Electron desktop app. |

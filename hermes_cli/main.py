@@ -300,6 +300,9 @@ from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
 from hermes_cli.subcommands.jobs import build_jobs_parser
+from hermes_cli.subcommands.olympus_supervisor import (
+    build_olympus_supervisor_parser,
+)
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -12191,6 +12194,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights", "jobs",
+        "olympus-supervisor",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -12634,6 +12638,16 @@ def cmd_jobs(args):
     from hermes_cli.job_diagnostics import jobs_command
 
     return jobs_command(args)
+
+
+def cmd_olympus_supervisor(args):
+    """Run or inspect the Phase A observe-only Olympus supervisor."""
+    from hermes_cli.olympus_supervisor import olympus_supervisor_command
+
+    code = olympus_supervisor_command(args)
+    if code:
+        raise SystemExit(code)
+    return code
 
 
 def cmd_skills(args):
@@ -13725,6 +13739,14 @@ def main():
     # jobs command  (read-only long-job diagnostics)
     # =========================================================================
     build_jobs_parser(subparsers, cmd_jobs=cmd_jobs)
+
+    # =========================================================================
+    # olympus-supervisor command  (observe-only canonical Kanban loop)
+    # =========================================================================
+    build_olympus_supervisor_parser(
+        subparsers,
+        cmd_olympus_supervisor=cmd_olympus_supervisor,
+    )
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)

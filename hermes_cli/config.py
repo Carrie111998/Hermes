@@ -1101,6 +1101,36 @@ DEFAULT_CONFIG = {
         "heartbeat_repeat_seconds": 540,
     },
 
+    # Phase A Olympus supervisor. Hermes Kanban is the only authoritative
+    # queue; every output below is a profile-scoped checkpoint/projection/draft.
+    # The supervisor is observe-only and contains no provider launch path.
+    "olympus_supervisor": {
+        "board": "olympus",
+        "tenant": "olympus",
+        "heartbeat_interval_seconds": 60,
+        "stale_supervisor_seconds": 180,
+        "stale_task_seconds": 86400,
+        "stale_job_seconds": 900,
+        "cycle_interval_seconds": 60,
+        "idle_backoff_initial_seconds": 60,
+        "idle_backoff_max_seconds": 600,
+        "idle_backoff_factor": 2,
+        "stop_poll_seconds": 5,
+        "notification_repeat_seconds": 3600,
+        "max_selected_candidates": 6,
+        "max_risk": "medium",
+        # Phase A never spends. A task must explicitly declare a zero estimate
+        # unless the operator raises these proposal-only planning limits.
+        "max_task_estimated_cost_usd": 0,
+        "max_cycle_estimated_cost_usd": 0,
+        "providers": {
+            "codex": {"capacity": 2, "available": True},
+            "claude": {"capacity": 2, "available": True},
+            "grok": {"capacity": 1, "available": True},
+            "hermes": {"capacity": 1, "available": True},
+        },
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",

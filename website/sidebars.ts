@@ -90,6 +90,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/kanban-worker-lanes',
             'user-guide/features/goals',
             'user-guide/features/job-diagnostics',
+            'user-guide/features/olympus-supervisor',
             'user-guide/features/code-execution',
             'user-guide/features/hooks',
             'user-guide/features/batch-processing',

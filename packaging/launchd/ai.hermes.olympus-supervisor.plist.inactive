@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.olympus-supervisor</string>
+
+  <!-- Replace placeholders during an explicitly authorized install. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HERMES_EXECUTABLE__</string>
+    <string>olympus-supervisor</string>
+    <string>run</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>__HERMES_HOME__</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>__HERMES_AGENT_REPOSITORY__</string>
+  <key>StandardOutPath</key>
+  <string>__HERMES_HOME__/logs/olympus-supervisor.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HERMES_HOME__/logs/olympus-supervisor.error.log</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <!-- Restart crashes, but do not restart a clean global-stop exit. -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- The checked-in definition is intentionally inactive. -->
+  <key>Disabled</key>
+  <true/>
+</dict>
+</plist>

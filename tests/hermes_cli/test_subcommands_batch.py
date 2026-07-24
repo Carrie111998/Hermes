@@ -28,6 +28,9 @@ from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.jobs import build_jobs_parser
 from hermes_cli.subcommands.model import build_model_parser
+from hermes_cli.subcommands.olympus_supervisor import (
+    build_olympus_supervisor_parser,
+)
 from hermes_cli.subcommands.postinstall import build_postinstall_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
 from hermes_cli.subcommands.security import build_security_parser
@@ -74,6 +77,12 @@ SINGLE_HANDLER_CASES = [
     ("gui", build_gui_parser, "cmd_gui", ["gui"]),
     ("logs", build_logs_parser, "cmd_logs", ["logs"]),
     ("jobs", build_jobs_parser, "cmd_jobs", ["jobs"]),
+    (
+        "olympus-supervisor",
+        build_olympus_supervisor_parser,
+        "cmd_olympus_supervisor",
+        ["olympus-supervisor"],
+    ),
     ("prompt-size", build_prompt_size_parser, "cmd_prompt_size", ["prompt-size"]),
 ]
 
