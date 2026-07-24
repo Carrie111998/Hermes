@@ -1,0 +1,54 @@
+{
+  "generated_at": 2000000000.0,
+  "generated_at_iso": "2033-05-18T03:33:20Z",
+  "issues": [],
+  "jobs": [
+    {
+      "schema_version": "hermes-job-diagnostics/1",
+      "job_id": "customer-report",
+      "title": "Non-Olympus provider consumer",
+      "status": "working",
+      "created_at": 1999999900.0,
+      "updated_at": 2000000000.0,
+      "started_at": 1999999901.0,
+      "completed_at": null,
+      "lanes": {
+        "analysis": {
+          "lane_id": "analysis",
+          "title": "Customer analysis",
+          "status": "working",
+          "effective_status": "working",
+          "status_since": 1999999901.0,
+          "started_at": 1999999901.0,
+          "updated_at": 2000000000.0,
+          "completed_at": null,
+          "current_step": "model call",
+          "last_meaningful_output": "working",
+          "last_meaningful_output_at": 2000000000.0,
+          "heartbeat_at": 2000000000.0,
+          "retry_count": 0,
+          "blocker": null,
+          "next_expected_action": "await provider",
+          "provider": "claude",
+          "model": "claude-opus",
+          "process": {
+            "pid": 41002,
+            "hostname": "fixture-host",
+            "start_token": "customer-start-token"
+          },
+          "session_id": "customer-session",
+          "task_id": "",
+          "platform": "cli",
+          "read_only": false,
+          "depends_on": [],
+          "resources": [],
+          "timing": {
+            "total_elapsed": 99.0,
+            "model_wait": 90.0
+          }
+        }
+      },
+      "spans": []
+    }
+  ]
+}

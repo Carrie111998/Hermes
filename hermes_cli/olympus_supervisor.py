@@ -56,6 +56,7 @@ STOP_SCHEMA = "olympus-supervisor-stop/1"
 LEASE_SCHEMA = "olympus-supervisor-lease/1"
 HEARTBEAT_SCHEMA = "olympus-supervisor-heartbeat/1"
 FAILURE_SCHEMA = "olympus-supervisor-failure/1"
+SHORT_SOAK_SCHEMA = "olympus-short-soak/1"
 
 PROVIDER_ORDER = ("codex", "claude", "grok", "hermes")
 PROVIDER_ALIASES = {
@@ -91,6 +92,25 @@ _SLOT_RE = re.compile(r"^(codex|claude|grok|hermes):([1-9][0-9]*)$")
 _MAX_OBJECTIVE_CHARS = 4000
 _MAX_LIST_ITEMS = 64
 _MAX_LIST_ITEM_CHARS = 1000
+_MAX_SHORT_SOAK_CYCLES = 100
+_MAX_CONSECUTIVE_CYCLE_FAILURES = 20
+_MAX_ESTIMATED_TOKENS = 1_000_000_000
+_OPERATIONAL_TASK_FIELDS = {
+    "claim_lock",
+    "claim_expires",
+    "worker_pid",
+    "last_heartbeat_at",
+    "started_at",
+    "ended_at",
+}
+_OPERATIONAL_RUN_FIELDS = {
+    "claim_lock",
+    "claim_expires",
+    "worker_pid",
+    "last_heartbeat_at",
+    "started_at",
+    "ended_at",
+}
 
 
 class OlympusSupervisorError(RuntimeError):
@@ -380,11 +400,23 @@ def _parse_task_metadata(body: Any, task_id: str) -> dict[str, Any]:
     else:
         assigned_slot = None
 
+    estimated_cost_known = "estimated_cost_usd" in value
     estimated_cost = _as_decimal(
         value.get("estimated_cost_usd", 0),
         field="estimated_cost_usd",
         task_id=task_id,
     )
+    estimated_tokens = value.get("estimated_tokens")
+    if estimated_tokens is not None and (
+        isinstance(estimated_tokens, bool)
+        or not isinstance(estimated_tokens, int)
+        or not 0 <= estimated_tokens <= _MAX_ESTIMATED_TOKENS
+    ):
+        raise QueueValidationError(
+            "malformed_task",
+            f"{task_id}: estimated_tokens must be an integer between 0 and "
+            f"{_MAX_ESTIMATED_TOKENS}",
+        )
     return {
         "schema_version": TASK_SCHEMA,
         "enabled": value["enabled"],
@@ -393,6 +425,8 @@ def _parse_task_metadata(body: Any, task_id: str) -> dict[str, Any]:
         "assigned_provider": assigned_provider,
         "assigned_slot": assigned_slot,
         "estimated_cost_usd": str(estimated_cost),
+        "estimated_cost_known": estimated_cost_known,
+        "estimated_tokens": estimated_tokens,
         "authority": {
             "status": authority_status,
             "recommendation_allowed": recommendation_allowed,
@@ -452,6 +486,8 @@ class SupervisorSettings:
     max_risk: str
     max_task_estimated_cost_usd: Decimal
     max_cycle_estimated_cost_usd: Decimal
+    max_cycle_estimated_tokens: int
+    max_consecutive_cycle_failures: int
     provider_limits: dict[str, ProviderLimit]
 
     @classmethod
@@ -503,6 +539,28 @@ class SupervisorSettings:
         ):
             raise OlympusSupervisorError(
                 "invalid_config", "max_selected_candidates must be a positive integer"
+            )
+        max_consecutive_failures = raw.get("max_consecutive_cycle_failures", 3)
+        if (
+            isinstance(max_consecutive_failures, bool)
+            or not isinstance(max_consecutive_failures, int)
+            or not 1 <= max_consecutive_failures <= _MAX_CONSECUTIVE_CYCLE_FAILURES
+        ):
+            raise OlympusSupervisorError(
+                "invalid_config",
+                "max_consecutive_cycle_failures must be an integer between 1 and "
+                f"{_MAX_CONSECUTIVE_CYCLE_FAILURES}",
+            )
+        max_cycle_tokens = raw.get("max_cycle_estimated_tokens", 0)
+        if (
+            isinstance(max_cycle_tokens, bool)
+            or not isinstance(max_cycle_tokens, int)
+            or not 0 <= max_cycle_tokens <= _MAX_ESTIMATED_TOKENS
+        ):
+            raise OlympusSupervisorError(
+                "invalid_config",
+                "max_cycle_estimated_tokens must be an integer between 0 and "
+                f"{_MAX_ESTIMATED_TOKENS}",
             )
 
         limits_raw = raw.get("providers") or {}
@@ -574,6 +632,8 @@ class SupervisorSettings:
             max_risk=max_risk,
             max_task_estimated_cost_usd=money("max_task_estimated_cost_usd", "0"),
             max_cycle_estimated_cost_usd=money("max_cycle_estimated_cost_usd", "0"),
+            max_cycle_estimated_tokens=max_cycle_tokens,
+            max_consecutive_cycle_failures=max_consecutive_failures,
             provider_limits=provider_limits,
         )
 
@@ -767,6 +827,115 @@ def _checkpoint_payload(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _validate_short_soak(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CheckpointDriftError("checkpoint_drift", "short_soak must be an object")
+    required = {
+        "schema_version",
+        "soak_id",
+        "status",
+        "target_cycles",
+        "successful_cycles",
+        "remaining_cycles",
+        "consecutive_cycle_failures",
+        "max_consecutive_cycle_failures",
+        "max_cycle_estimated_cost_usd",
+        "max_cycle_estimated_tokens",
+        "started_at",
+        "updated_at",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise CheckpointDriftError(
+            "checkpoint_drift", f"short_soak is missing fields: {missing}"
+        )
+    if value.get("schema_version") != SHORT_SOAK_SCHEMA:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            f"unsupported short_soak schema {value.get('schema_version')!r}",
+        )
+    if not isinstance(value.get("soak_id"), str) or not value["soak_id"]:
+        raise CheckpointDriftError(
+            "checkpoint_drift", "short_soak.soak_id must be a non-empty string"
+        )
+    if value.get("status") not in {
+        "running",
+        "completed",
+        "failure_ceiling_reached",
+    }:
+        raise CheckpointDriftError("checkpoint_drift", "short_soak.status is invalid")
+    for field, minimum, maximum in (
+        ("target_cycles", 1, _MAX_SHORT_SOAK_CYCLES),
+        ("successful_cycles", 0, _MAX_SHORT_SOAK_CYCLES),
+        ("remaining_cycles", 0, _MAX_SHORT_SOAK_CYCLES),
+        (
+            "consecutive_cycle_failures",
+            0,
+            _MAX_CONSECUTIVE_CYCLE_FAILURES,
+        ),
+        (
+            "max_consecutive_cycle_failures",
+            1,
+            _MAX_CONSECUTIVE_CYCLE_FAILURES,
+        ),
+        ("max_cycle_estimated_tokens", 0, _MAX_ESTIMATED_TOKENS),
+    ):
+        item = value.get(field)
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or not minimum <= item <= maximum
+        ):
+            raise CheckpointDriftError(
+                "checkpoint_drift",
+                f"short_soak.{field} must be an integer between "
+                f"{minimum} and {maximum}",
+            )
+    target = int(value["target_cycles"])
+    successful = int(value["successful_cycles"])
+    if successful > target or value["remaining_cycles"] != target - successful:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "short_soak cycle progress is inconsistent",
+        )
+    failures = int(value["consecutive_cycle_failures"])
+    ceiling = int(value["max_consecutive_cycle_failures"])
+    if failures > ceiling:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "short_soak consecutive failures exceed the configured ceiling",
+        )
+    if value["status"] == "completed" and successful != target:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "completed short_soak has remaining cycles",
+        )
+    if value["status"] == "failure_ceiling_reached" and failures != ceiling:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "short_soak failure status does not match its ceiling",
+        )
+    try:
+        cost_limit = Decimal(str(value["max_cycle_estimated_cost_usd"]))
+    except (InvalidOperation, ValueError) as exc:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "short_soak.max_cycle_estimated_cost_usd must be non-negative",
+        ) from exc
+    if not cost_limit.is_finite() or cost_limit < 0:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "short_soak.max_cycle_estimated_cost_usd must be non-negative",
+        )
+    for field in ("started_at", "updated_at"):
+        item = value.get(field)
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise CheckpointDriftError(
+                "checkpoint_drift", f"short_soak.{field} must be a number"
+            )
+    return dict(value)
+
+
 def validate_checkpoint(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CheckpointDriftError(
@@ -811,7 +980,7 @@ def validate_checkpoint(value: Any) -> dict[str, Any]:
         raise CheckpointDriftError(
             "checkpoint_drift", "checkpoint run_id must be a non-empty string"
         )
-    for field, minimum in (("generation", 1), ("completed_cycles", 1)):
+    for field, minimum in (("generation", 1), ("completed_cycles", 0)):
         item = value.get(field)
         if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
             raise CheckpointDriftError(
@@ -827,6 +996,22 @@ def validate_checkpoint(value: Any) -> dict[str, Any]:
         raise CheckpointDriftError(
             "checkpoint_drift",
             "queue_snapshot_identity must be a sha256 identity",
+        )
+    semantic_identity = value.get("semantic_queue_identity")
+    if semantic_identity is not None and semantic_identity != queue_identity:
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "semantic_queue_identity must match queue_snapshot_identity",
+        )
+    occupancy_identity = value.get("operational_occupancy_identity")
+    if occupancy_identity is not None and (
+        not isinstance(occupancy_identity, str)
+        or not occupancy_identity.startswith("sha256:")
+        or len(occupancy_identity) != 71
+    ):
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "operational_occupancy_identity must be a sha256 identity",
         )
     if (
         not isinstance(value.get("queue"), dict)
@@ -866,11 +1051,37 @@ def validate_checkpoint(value: Any) -> dict[str, Any]:
                 "checkpoint_drift",
                 f"checkpoint {field} must be an array of objects",
             )
+    if "provider_occupancy_issues" in value:
+        issues = value["provider_occupancy_issues"]
+        if not isinstance(issues, list) or any(
+            not isinstance(item, dict) for item in issues
+        ):
+            raise CheckpointDriftError(
+                "checkpoint_drift",
+                "checkpoint provider_occupancy_issues must be an array of objects",
+            )
     if not isinstance(value.get("provider_availability"), dict):
         raise CheckpointDriftError(
             "checkpoint_drift",
             "checkpoint provider_availability must be an object",
         )
+    failure_count = value.get("consecutive_cycle_failures", 0)
+    if (
+        isinstance(failure_count, bool)
+        or not isinstance(failure_count, int)
+        or not 0 <= failure_count <= _MAX_CONSECUTIVE_CYCLE_FAILURES
+    ):
+        raise CheckpointDriftError(
+            "checkpoint_drift",
+            "checkpoint consecutive_cycle_failures is invalid",
+        )
+    if "short_soak" in value:
+        soak = _validate_short_soak(value["short_soak"])
+        if soak["consecutive_cycle_failures"] != failure_count:
+            raise CheckpointDriftError(
+                "checkpoint_drift",
+                "short_soak failure count disagrees with checkpoint",
+            )
     if not isinstance(value.get("backoff"), dict):
         raise CheckpointDriftError(
             "checkpoint_drift", "checkpoint backoff must be an object"
@@ -1389,30 +1600,78 @@ class KanbanQueueReader:
                 tasks.append(task)
 
             stat = self.db_path.stat()
-            identity_payload = {
+            semantic_tasks = []
+            operational_tasks = []
+            for task_id in sorted(relevant_ids):
+                row = by_id[task_id]
+                semantic = {
+                    key: value
+                    for key, value in row.items()
+                    if key not in _OPERATIONAL_TASK_FIELDS
+                }
+                semantic["claim_active"] = bool(row.get("claim_lock"))
+                semantic_tasks.append(semantic)
+                operational_tasks.append({
+                    "id": task_id,
+                    **{key: row.get(key) for key in sorted(_OPERATIONAL_TASK_FIELDS)},
+                })
+            relevant_runs = sorted(
+                [row for row in run_rows if str(row["task_id"]) in relevant_ids],
+                key=lambda row: (str(row["task_id"]), int(row["id"])),
+            )
+            semantic_runs = []
+            operational_runs = []
+            for row in relevant_runs:
+                semantic = {
+                    key: value
+                    for key, value in row.items()
+                    if key not in _OPERATIONAL_RUN_FIELDS
+                }
+                semantic["claim_active"] = bool(row.get("claim_lock"))
+                semantic_runs.append(semantic)
+                operational_runs.append({
+                    "id": row.get("id"),
+                    "task_id": row.get("task_id"),
+                    **{key: row.get(key) for key in sorted(_OPERATIONAL_RUN_FIELDS)},
+                })
+            semantic_identity_payload = {
                 "board": self.board,
                 "tenant": self.tenant,
-                "db_file": {
-                    "device": stat.st_dev,
-                    "inode": stat.st_ino,
-                },
                 "schema_version": schema_version,
                 "user_version": user_version,
                 "task_columns": sorted(task_columns),
                 "run_columns": sorted(run_columns),
-                "tasks": [by_id[task_id] for task_id in sorted(relevant_ids)],
+                "tasks": semantic_tasks,
                 "links": sorted(relevant_links),
-                "runs": sorted(
-                    [row for row in run_rows if str(row["task_id"]) in relevant_ids],
-                    key=lambda row: (str(row["task_id"]), int(row["id"])),
-                ),
+                "runs": semantic_runs,
             }
-            identity = "sha256:" + _digest(identity_payload)
+            operational_occupancy_payload = {
+                "board": self.board,
+                "tenant": self.tenant,
+                "tasks": operational_tasks,
+                "runs": operational_runs,
+            }
+            identity = "sha256:" + _digest(semantic_identity_payload)
+            operational_occupancy_identity = "sha256:" + _digest(
+                operational_occupancy_payload
+            )
             return {
                 "board": self.board,
                 "tenant": self.tenant,
                 "db_path": str(self.db_path),
                 "identity": identity,
+                "semantic_identity": identity,
+                "operational_occupancy_identity": operational_occupancy_identity,
+                "identity_model": {
+                    "semantic_queue_identity": (
+                        "task definitions, dependencies, status, authority, priority, "
+                        "provider routing, and active ownership"
+                    ),
+                    "operational_occupancy_snapshot": (
+                        "claim tokens, lease expiry, worker pid, heartbeat, and "
+                        "run start/end timestamps"
+                    ),
+                },
                 "schema_version": schema_version,
                 "user_version": user_version,
                 "observed_at": now,
@@ -1466,9 +1725,12 @@ def _diagnostic_reconciliation(
     blocked_jobs: list[dict[str, Any]] = []
     resumable_jobs: list[dict[str, Any]] = []
     stale_tasks: list[dict[str, Any]] = []
+    provider_occupancy_issues: list[dict[str, str]] = []
+    ambiguous_providers: set[str] = set()
 
     occupied: dict[str, dict[str, Any]] = {
-        provider: {"slots": {}, "tasks": []} for provider in PROVIDER_ORDER
+        provider: {"slots": {}, "tasks": [], "external_consumers": []}
+        for provider in PROVIDER_ORDER
     }
     for task_id, task in sorted(tasks.items()):
         metadata = task.get("olympus_metadata") or {}
@@ -1549,70 +1811,140 @@ def _diagnostic_reconciliation(
                 "reason": "task has not reached an active lease",
             })
 
-    diag = diagnostics_provider(
-        now=now,
-        idle_after=DEFAULT_IDLE_AFTER_SECONDS,
-        stale_after=settings.stale_job_seconds,
-    )
+    try:
+        diag = diagnostics_provider(
+            now=now,
+            idle_after=DEFAULT_IDLE_AFTER_SECONDS,
+            stale_after=settings.stale_job_seconds,
+        )
+    except Exception as exc:
+        raise QueueValidationError(
+            "diagnostics_parse_failure",
+            f"job diagnostics snapshot failed: {exc}",
+        ) from exc
     if not isinstance(diag, dict):
         raise QueueValidationError(
-            "provider_occupancy_ambiguous",
+            "diagnostics_parse_failure",
             "job diagnostics provider returned a non-object",
         )
-    diagnostic_issues = diag.get("issues") or []
-    jobs = diag.get("jobs") or []
-    if not isinstance(diagnostic_issues, list) or not isinstance(jobs, list):
+    if not {"generated_at", "jobs", "issues"} <= set(diag):
         raise QueueValidationError(
-            "provider_occupancy_ambiguous",
-            "job diagnostics provider returned malformed jobs/issues",
+            "diagnostics_parse_failure",
+            "job diagnostics snapshot is missing generated_at, jobs, or issues",
         )
+    generated_at = diag.get("generated_at")
+    diagnostic_issues = diag.get("issues")
+    jobs = diag.get("jobs")
+    if (
+        isinstance(generated_at, bool)
+        or not isinstance(generated_at, (int, float))
+        or not isinstance(diagnostic_issues, list)
+        or any(not isinstance(item, dict) for item in diagnostic_issues)
+        or not isinstance(jobs, list)
+    ):
+        raise QueueValidationError(
+            "diagnostics_parse_failure",
+            "job diagnostics provider returned malformed generated_at/jobs/issues",
+        )
+    if diagnostic_issues:
+        ambiguous_providers.update(PROVIDER_ORDER)
+        provider_occupancy_issues.append({
+            "code": "diagnostics_incomplete",
+            "detail": (
+                f"{len(diagnostic_issues)} diagnostics record(s) were unreadable; "
+                "non-Olympus provider occupancy is ambiguous"
+            ),
+        })
     diagnostic_active_by_task: dict[str, str] = {}
     for job in jobs:
         if not isinstance(job, dict):
             raise QueueValidationError(
-                "provider_occupancy_ambiguous",
+                "diagnostics_parse_failure",
                 "job diagnostics contains a non-object job",
             )
         job_id = str(job.get("job_id") or "")
-        lanes = job.get("lanes") or {}
+        if not job_id or "lanes" not in job:
+            raise QueueValidationError(
+                "diagnostics_parse_failure",
+                "job diagnostics contains a job with missing job_id or lanes",
+            )
+        lanes = job.get("lanes")
         if not isinstance(lanes, Mapping):
             raise QueueValidationError(
-                "provider_occupancy_ambiguous",
-                f"job diagnostics {job_id or '<unknown>'} has malformed lanes",
+                "diagnostics_parse_failure",
+                f"job diagnostics {job_id} has malformed lanes",
             )
         for lane in lanes.values():
             if not isinstance(lane, dict):
                 raise QueueValidationError(
-                    "provider_occupancy_ambiguous",
-                    f"job diagnostics {job_id or '<unknown>'} has a malformed lane",
+                    "diagnostics_parse_failure",
+                    f"job diagnostics {job_id} has a malformed lane",
                 )
             lane_id = str(lane.get("lane_id") or "")
-            if not job_id or not lane_id:
+            status = str(
+                lane.get("effective_status") or lane.get("status") or ""
+            ).strip()
+            if not lane_id or status not in {item.value for item in LaneStatus}:
                 raise QueueValidationError(
-                    "provider_occupancy_ambiguous",
-                    "job diagnostics has a missing job_id or lane_id",
+                    "diagnostics_parse_failure",
+                    f"job diagnostics {job_id} has a lane with missing or invalid "
+                    "lane_id/status",
                 )
             task_id = str(lane.get("task_id") or "")
-            status = str(lane.get("effective_status") or lane.get("status") or "")
             scoped = task_id in olympus_ids
             explicitly_olympus = (
                 job_id.lower().startswith("olympus")
                 or str(lane.get("platform") or "").lower() == "olympus"
             )
-            if not scoped and not explicitly_olympus:
-                continue
             if not scoped and status in ACTIVE_DIAGNOSTIC_STATUSES:
-                raise QueueValidationError(
-                    "provider_occupancy_ambiguous",
-                    f"active Olympus diagnostic {job_id}/{lane_id} "
-                    "does not reference a canonical Kanban task",
-                )
+                if explicitly_olympus:
+                    raise QueueValidationError(
+                        "provider_occupancy_ambiguous",
+                        f"active Olympus diagnostic {job_id}/{lane_id} "
+                        "does not reference a canonical Kanban task",
+                    )
             provider_value = lane.get("provider")
             provider = None
             if provider_value:
-                provider = _normalize_provider(
-                    provider_value, task_id=task_id or job_id
-                )
+                try:
+                    provider = _normalize_provider(
+                        provider_value, task_id=task_id or job_id
+                    )
+                except QueueValidationError:
+                    if status in ACTIVE_DIAGNOSTIC_STATUSES and not scoped:
+                        ambiguous_providers.update(PROVIDER_ORDER)
+                        provider_occupancy_issues.append({
+                            "code": "provider_occupancy_ambiguous",
+                            "detail": (
+                                f"{job_id}/{lane_id}: active non-Olympus consumer "
+                                f"has unsupported provider {provider_value!r}"
+                            ),
+                        })
+                    elif scoped or explicitly_olympus:
+                        raise
+            if status in ACTIVE_DIAGNOSTIC_STATUSES and not scoped:
+                if provider is None:
+                    ambiguous_providers.update(PROVIDER_ORDER)
+                    provider_occupancy_issues.append({
+                        "code": "provider_occupancy_ambiguous",
+                        "detail": (
+                            f"{job_id}/{lane_id}: active non-Olympus consumer "
+                            "does not identify its provider"
+                        ),
+                    })
+                else:
+                    consumer = {
+                        "job_id": job_id,
+                        "lane_id": lane_id,
+                        "task_id": task_id or None,
+                        "provider": provider,
+                        "status": status,
+                        "platform": str(lane.get("platform") or "") or None,
+                    }
+                    occupied[provider]["external_consumers"].append(consumer)
+                continue
+            if not scoped and not explicitly_olympus:
+                continue
             if status in ACTIVE_DIAGNOSTIC_STATUSES:
                 task = tasks[task_id]
                 metadata = task.get("olympus_metadata") or {}
@@ -1715,6 +2047,13 @@ def _diagnostic_reconciliation(
             str(item.get("lane_id") or ""),
         )
     )
+    for provider in PROVIDER_ORDER:
+        occupied[provider]["external_consumers"].sort(
+            key=lambda item: (
+                str(item.get("job_id") or ""),
+                str(item.get("lane_id") or ""),
+            )
+        )
     return {
         "active_leases": active_leases,
         "occupied": occupied,
@@ -1724,6 +2063,8 @@ def _diagnostic_reconciliation(
         "resumable_jobs": resumable_jobs,
         "stale_tasks": stale_tasks,
         "diagnostic_issues": list(diagnostic_issues),
+        "provider_occupancy_issues": provider_occupancy_issues,
+        "ambiguous_providers": sorted(ambiguous_providers),
     }
 
 
@@ -1738,13 +2079,27 @@ def _evaluate_queue(
     now: float,
     settings: SupervisorSettings,
     previous: Mapping[str, Any] | None,
+    short_soak: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    strict_resource_estimates = short_soak is not None
+    cycle_cost_limit = (
+        Decimal(str(short_soak["max_cycle_estimated_cost_usd"]))
+        if short_soak is not None
+        else settings.max_cycle_estimated_cost_usd
+    )
+    cycle_token_limit = (
+        int(short_soak["max_cycle_estimated_tokens"])
+        if short_soak is not None
+        else None
+    )
     occupied = reconciliation["occupied"]
+    ambiguous_providers = set(reconciliation.get("ambiguous_providers") or [])
     provider_availability: dict[str, dict[str, Any]] = {}
     available_slots: dict[str, list[str]] = {}
     for provider in PROVIDER_ORDER:
         limit = settings.provider_limits[provider]
         occupied_slots = sorted(occupied[provider]["slots"])
+        external_consumers = list(occupied[provider]["external_consumers"])
         for slot in occupied_slots:
             match = _SLOT_RE.match(slot)
             if not match or int(match.group(2)) > limit.capacity:
@@ -1752,23 +2107,35 @@ def _evaluate_queue(
                     "provider_occupancy_ambiguous",
                     f"observed slot {slot!r} exceeds configured {provider} capacity",
                 )
-        if len(occupied_slots) > limit.capacity:
-            raise QueueValidationError(
-                "provider_occupancy_ambiguous",
-                f"{provider} occupancy exceeds configured capacity",
-            )
+        occupied_count = len(occupied_slots) + len(external_consumers)
+        if occupied_count > limit.capacity:
+            ambiguous_providers.add(provider)
         all_slots = [f"{provider}:{index}" for index in range(1, limit.capacity + 1)]
         free = [slot for slot in all_slots if slot not in occupied[provider]["slots"]]
-        if not limit.available:
+        if external_consumers:
+            free = free[len(external_consumers) :]
+        occupancy_ambiguous = provider in ambiguous_providers
+        if not limit.available or occupancy_ambiguous:
             free = []
         available_slots[provider] = free
+        if occupancy_ambiguous:
+            state = "ambiguous"
+        elif not limit.available:
+            state = "unavailable"
+        elif not free:
+            state = "full"
+        else:
+            state = "available"
         provider_availability[provider] = {
             "capacity": limit.capacity,
-            "available": limit.available,
-            "occupied": len(occupied_slots),
-            "free": len(free),
+            "configured_available": limit.available,
+            "available": state == "available",
+            "occupancy_state": state,
+            "occupied": occupied_count,
+            "free": None if occupancy_ambiguous else len(free),
             "occupied_slots": occupied_slots,
             "observed_task_ids": sorted(occupied[provider]["tasks"]),
+            "external_consumers": external_consumers,
         }
 
     olympus_ids = set(snapshot.get("olympus_task_ids") or [])
@@ -1861,6 +2228,23 @@ def _evaluate_queue(
                 )
             )
         estimated_cost = Decimal(metadata["estimated_cost_usd"])
+        estimated_tokens = metadata.get("estimated_tokens")
+        if strict_resource_estimates and not metadata["estimated_cost_known"]:
+            reasons.append(
+                _task_reason(
+                    "cycle_cost_unknown",
+                    "short-soak mode requires an explicit estimated_cost_usd",
+                    category="spending",
+                )
+            )
+        if strict_resource_estimates and estimated_tokens is None:
+            reasons.append(
+                _task_reason(
+                    "cycle_tokens_unknown",
+                    "short-soak mode requires explicit estimated_tokens",
+                    category="spending",
+                )
+            )
         if estimated_cost > settings.max_task_estimated_cost_usd:
             reasons.append(
                 _task_reason(
@@ -1900,6 +2284,7 @@ def _evaluate_queue(
             "compatible_providers": compatible,
             "provider_headroom": provider_headroom,
             "estimated_cost_usd": str(estimated_cost),
+            "estimated_tokens": estimated_tokens,
             "ranking_key": list(ranking_key),
             "ranking_explanation": (
                 "priority desc; unresolved dependencies asc; risk asc; "
@@ -1915,6 +2300,7 @@ def _evaluate_queue(
     blocked: list[dict[str, Any]] = []
     pending_decisions: list[dict[str, Any]] = []
     cycle_cost = Decimal("0")
+    cycle_tokens = 0
     previous_action_ids = {
         str(item.get("action_id"))
         for item in (previous or {}).get("selected_candidates", [])
@@ -1934,14 +2320,26 @@ def _evaluate_queue(
                     )
                 )
             estimated_cost = Decimal(row["estimated_cost_usd"])
-            if (
-                not reasons
-                and cycle_cost + estimated_cost > settings.max_cycle_estimated_cost_usd
-            ):
+            if not reasons and cycle_cost + estimated_cost > cycle_cost_limit:
                 reasons.append(
                     _task_reason(
                         "cycle_spending_limit",
-                        "cycle estimated spending limit is exhausted",
+                        f"cycle estimated spending limit ${cycle_cost_limit} "
+                        "would be exceeded",
+                        category="spending",
+                    )
+                )
+            estimated_tokens = row.get("estimated_tokens")
+            if (
+                not reasons
+                and cycle_token_limit is not None
+                and isinstance(estimated_tokens, int)
+                and cycle_tokens + estimated_tokens > cycle_token_limit
+            ):
+                reasons.append(
+                    _task_reason(
+                        "cycle_token_limit",
+                        f"cycle token limit {cycle_token_limit} would be exceeded",
                         category="spending",
                     )
                 )
@@ -1963,15 +2361,31 @@ def _evaluate_queue(
                     chosen_provider = choices[0]
                     chosen_slot = available_slots[chosen_provider].pop(0)
                 else:
+                    ambiguous = sorted(
+                        provider
+                        for provider in row["compatible_providers"]
+                        if provider in ambiguous_providers
+                    )
+                    code = (
+                        "provider_occupancy_ambiguous"
+                        if ambiguous
+                        else "provider_unavailable"
+                    )
+                    detail = (
+                        "provider occupancy is ambiguous for " + ", ".join(ambiguous)
+                        if ambiguous
+                        else "no compatible provider slot is available"
+                    )
                     reasons.append(
                         _task_reason(
-                            "provider_unavailable",
-                            "no compatible provider slot is available",
+                            code,
+                            detail,
                             category="capacity",
                         )
                     )
             if not reasons and chosen_provider and chosen_slot:
                 cycle_cost += estimated_cost
+                cycle_tokens += int(estimated_tokens or 0)
                 action_payload = {
                     "task_id": row["task_id"],
                     "provider": chosen_provider,
@@ -1994,6 +2408,7 @@ def _evaluate_queue(
                         "max_turns": metadata["goal"]["max_turns"],
                         "timeout_seconds": metadata["goal"]["timeout_seconds"],
                         "estimated_cost_usd": row["estimated_cost_usd"],
+                        "estimated_tokens": estimated_tokens,
                         "allowed_paths": metadata["goal"]["allowed_paths"],
                         "forbidden_actions": metadata["goal"]["forbidden_actions"],
                         "deliverables": metadata["goal"]["deliverables"],
@@ -2066,7 +2481,9 @@ def _evaluate_queue(
             key: value for key, value in item.items() if key not in {"bounded_goal"}
         })
 
-    if (
+    if reconciliation.get("provider_occupancy_issues"):
+        status = "blocked"
+    elif (
         reconciliation.get("stale_jobs")
         or reconciliation.get("dead_jobs")
         or reconciliation.get("blocked_jobs")
@@ -2095,6 +2512,12 @@ def _evaluate_queue(
         "provider_availability": provider_availability,
         "pending_operator_decisions": pending_decisions,
         "cycle_estimated_cost_usd": str(cycle_cost),
+        "cycle_estimated_tokens": cycle_tokens,
+        "cycle_limits": {
+            "max_estimated_cost_usd": str(cycle_cost_limit),
+            "max_estimated_tokens": cycle_token_limit,
+            "resource_estimates_required": strict_resource_estimates,
+        },
     }
 
 
@@ -2127,6 +2550,25 @@ def _next_backoff(
     )
 
 
+def _advance_short_soak(
+    value: Mapping[str, Any],
+    *,
+    now: float,
+) -> dict[str, Any]:
+    soak = _validate_short_soak(value)
+    successful = int(soak["successful_cycles"]) + 1
+    target = int(soak["target_cycles"])
+    soak.update({
+        "status": "completed" if successful == target else "running",
+        "successful_cycles": successful,
+        "remaining_cycles": target - successful,
+        "consecutive_cycle_failures": 0,
+        "updated_at": now,
+        "updated_at_iso": _iso_utc(now),
+    })
+    return _validate_short_soak(soak)
+
+
 def _build_checkpoint(
     *,
     run_id: str,
@@ -2136,6 +2578,7 @@ def _build_checkpoint(
     previous: Mapping[str, Any] | None,
     now: float,
     settings: SupervisorSettings,
+    short_soak: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     queue_changed = (
         previous is None
@@ -2161,6 +2604,8 @@ def _build_checkpoint(
         ),
         "generation": generation,
         "queue_snapshot_identity": snapshot["identity"],
+        "semantic_queue_identity": snapshot["semantic_identity"],
+        "operational_occupancy_identity": snapshot["operational_occupancy_identity"],
         "queue": {
             "authority": "hermes_kanban",
             "board": snapshot["board"],
@@ -2170,8 +2615,14 @@ def _build_checkpoint(
             "user_version": snapshot["user_version"],
             "observed_at": snapshot["observed_at"],
             "file_identity": snapshot["file_identity"],
+            "semantic_identity": snapshot["semantic_identity"],
+            "operational_occupancy_identity": snapshot[
+                "operational_occupancy_identity"
+            ],
+            "identity_model": snapshot["identity_model"],
         },
         "completed_cycles": completed_cycles,
+        "consecutive_cycle_failures": 0,
         "status": evaluation["status"],
         "ranked_queue": evaluation["ranked_queue"],
         "selected_candidates": evaluation["selected_candidates"],
@@ -2184,12 +2635,15 @@ def _build_checkpoint(
         "stale_tasks": reconciliation["stale_tasks"],
         "resumable_jobs": reconciliation["resumable_jobs"],
         "diagnostic_issues": reconciliation["diagnostic_issues"],
+        "provider_occupancy_issues": reconciliation["provider_occupancy_issues"],
         "last_heartbeat": now,
         "last_heartbeat_iso": _iso_utc(now),
         "last_successful_reconciliation": now,
         "last_successful_reconciliation_iso": _iso_utc(now),
         "pending_operator_decisions": evaluation["pending_operator_decisions"],
         "cycle_estimated_cost_usd": evaluation["cycle_estimated_cost_usd"],
+        "cycle_estimated_tokens": evaluation["cycle_estimated_tokens"],
+        "cycle_limits": evaluation["cycle_limits"],
         "backoff": {
             "current_seconds": backoff,
             "maximum_seconds": settings.idle_backoff_max_seconds,
@@ -2205,8 +2659,282 @@ def _build_checkpoint(
             "created_at_iso": _iso_utc(now),
         },
     }
+    if short_soak is not None:
+        checkpoint["short_soak"] = _advance_short_soak(short_soak, now=now)
+    if previous and previous.get("last_failure"):
+        checkpoint["last_failure"] = previous["last_failure"]
     checkpoint["checkpoint_digest"] = _digest(_checkpoint_payload(checkpoint))
     return checkpoint
+
+
+def _short_soak_limits(
+    settings: SupervisorSettings,
+    *,
+    max_cycles: int | None,
+    max_cycle_cost_usd: Any = None,
+    max_cycle_tokens: Any = None,
+) -> dict[str, Any]:
+    if (
+        isinstance(max_cycles, bool)
+        or not isinstance(max_cycles, int)
+        or not 1 <= max_cycles <= _MAX_SHORT_SOAK_CYCLES
+    ):
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycles is required and must be an integer between 1 and "
+            f"{_MAX_SHORT_SOAK_CYCLES}",
+        )
+    raw_cost = (
+        settings.max_cycle_estimated_cost_usd
+        if max_cycle_cost_usd is None
+        else max_cycle_cost_usd
+    )
+    try:
+        cost = Decimal(str(raw_cost))
+    except (InvalidOperation, ValueError) as exc:
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycle-cost-usd must be a non-negative number",
+        ) from exc
+    if not cost.is_finite() or cost < 0:
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycle-cost-usd must be a non-negative number",
+        )
+    if cost > settings.max_cycle_estimated_cost_usd:
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycle-cost-usd cannot exceed the configured "
+            "max_cycle_estimated_cost_usd",
+        )
+    tokens = (
+        settings.max_cycle_estimated_tokens
+        if max_cycle_tokens is None
+        else max_cycle_tokens
+    )
+    if (
+        isinstance(tokens, bool)
+        or not isinstance(tokens, int)
+        or not 0 <= tokens <= _MAX_ESTIMATED_TOKENS
+    ):
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycle-tokens must be an integer between 0 and "
+            f"{_MAX_ESTIMATED_TOKENS}",
+        )
+    if tokens > settings.max_cycle_estimated_tokens:
+        raise OlympusSupervisorError(
+            "invalid_argument",
+            "--max-cycle-tokens cannot exceed the configured "
+            "max_cycle_estimated_tokens",
+        )
+    return {
+        "target_cycles": max_cycles,
+        "max_consecutive_cycle_failures": (settings.max_consecutive_cycle_failures),
+        "max_cycle_estimated_cost_usd": str(cost),
+        "max_cycle_estimated_tokens": tokens,
+    }
+
+
+def _prepare_short_soak(
+    previous: Mapping[str, Any] | None,
+    *,
+    limits: Mapping[str, Any],
+    now: float,
+) -> dict[str, Any]:
+    prior = (previous or {}).get("short_soak")
+    if prior is not None:
+        soak = _validate_short_soak(prior)
+        expected = {
+            key: limits[key]
+            for key in (
+                "target_cycles",
+                "max_consecutive_cycle_failures",
+                "max_cycle_estimated_cost_usd",
+                "max_cycle_estimated_tokens",
+            )
+        }
+        observed = {key: soak.get(key) for key in expected}
+        if soak["status"] != "completed":
+            if observed != expected:
+                raise OlympusSupervisorError(
+                    "soak_checkpoint_mismatch",
+                    "an unfinished short soak exists with different bounds",
+                )
+            if soak["status"] == "failure_ceiling_reached":
+                raise OlympusSupervisorError(
+                    "cycle_failure_ceiling_reached",
+                    "the persisted consecutive cycle-failure ceiling is already "
+                    "reached; complete one successful run-once cycle after remediation "
+                    "before starting another soak",
+                )
+            return soak
+        if observed == expected:
+            # Idempotent completion is the crash-safe acknowledgement path: if
+            # a process dies after the final checkpoint commit, reissuing the
+            # same bounded command must not execute the target cycles again.
+            return soak
+    value = {
+        "schema_version": SHORT_SOAK_SCHEMA,
+        "soak_id": "soak_" + uuid.uuid4().hex,
+        "status": "running",
+        **dict(limits),
+        "successful_cycles": 0,
+        "remaining_cycles": int(limits["target_cycles"]),
+        "consecutive_cycle_failures": 0,
+        "started_at": now,
+        "started_at_iso": _iso_utc(now),
+        "updated_at": now,
+        "updated_at_iso": _iso_utc(now),
+    }
+    return _validate_short_soak(value)
+
+
+def _failure_checkpoint(
+    *,
+    previous: Mapping[str, Any] | None,
+    short_soak: Mapping[str, Any],
+    error: OlympusSupervisorError | Exception,
+    run_id: str,
+    board: str,
+    tenant: str,
+    db_path: Path,
+    now: float,
+    settings: SupervisorSettings,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    code = (
+        error.code
+        if isinstance(error, OlympusSupervisorError)
+        else "unexpected_failure"
+    )
+    detail = error.detail if isinstance(error, OlympusSupervisorError) else str(error)
+    soak = _validate_short_soak(short_soak)
+    failures = int(soak["consecutive_cycle_failures"]) + 1
+    ceiling = int(soak["max_consecutive_cycle_failures"])
+    soak.update({
+        "status": ("failure_ceiling_reached" if failures >= ceiling else "running"),
+        "consecutive_cycle_failures": failures,
+        "updated_at": now,
+        "updated_at_iso": _iso_utc(now),
+    })
+    failure = {
+        "schema_version": FAILURE_SCHEMA,
+        "run_id": run_id,
+        "state": "failed",
+        "code": code,
+        "detail": detail,
+        "completed_cycles": int((previous or {}).get("completed_cycles") or 0),
+        "consecutive_cycle_failures": failures,
+        "max_consecutive_cycle_failures": ceiling,
+        "retry_will_continue": failures < ceiling,
+        "at": now,
+        "at_iso": _iso_utc(now),
+    }
+    if previous is None:
+        semantic_identity = "sha256:" + _digest({
+            "board": board,
+            "tenant": tenant,
+            "state": "queue_not_yet_observed",
+        })
+        occupancy_identity = "sha256:" + _digest({
+            "board": board,
+            "tenant": tenant,
+            "state": "occupancy_not_yet_observed",
+        })
+        checkpoint: dict[str, Any] = {
+            "schema_version": SUPERVISOR_SCHEMA,
+            "run_id": run_id,
+            "previous_run_id": None,
+            "generation": 1,
+            "queue_snapshot_identity": semantic_identity,
+            "semantic_queue_identity": semantic_identity,
+            "operational_occupancy_identity": occupancy_identity,
+            "queue": {
+                "authority": "hermes_kanban",
+                "board": board,
+                "tenant": tenant,
+                "db_path": str(db_path),
+                "semantic_identity": semantic_identity,
+                "operational_occupancy_identity": occupancy_identity,
+                "identity_model": {
+                    "semantic_queue_identity": "queue not yet observed",
+                    "operational_occupancy_snapshot": "occupancy not yet observed",
+                },
+            },
+            "completed_cycles": 0,
+            "ranked_queue": [],
+            "selected_candidates": [],
+            "blocked_candidates": [],
+            "provider_availability": {
+                provider: {
+                    "capacity": settings.provider_limits[provider].capacity,
+                    "configured_available": settings.provider_limits[
+                        provider
+                    ].available,
+                    "available": False,
+                    "occupancy_state": "ambiguous",
+                    "occupied": None,
+                    "free": None,
+                    "occupied_slots": [],
+                    "observed_task_ids": [],
+                    "external_consumers": [],
+                }
+                for provider in PROVIDER_ORDER
+            },
+            "active_leases_observed": [],
+            "stale_jobs": [],
+            "dead_jobs": [],
+            "blocked_jobs": [],
+            "stale_tasks": [],
+            "resumable_jobs": [],
+            "diagnostic_issues": [{"code": code, "detail": detail}],
+            "provider_occupancy_issues": [{"code": code, "detail": detail}],
+            "last_successful_reconciliation": 0.0,
+            "last_successful_reconciliation_iso": _iso_utc(0.0),
+            "pending_operator_decisions": [],
+            "cycle_estimated_cost_usd": "0",
+            "cycle_estimated_tokens": 0,
+            "cycle_limits": {
+                "max_estimated_cost_usd": soak["max_cycle_estimated_cost_usd"],
+                "max_estimated_tokens": soak["max_cycle_estimated_tokens"],
+                "resource_estimates_required": True,
+            },
+        }
+    else:
+        checkpoint = json.loads(json.dumps(previous))
+        checkpoint["previous_run_id"] = (
+            previous.get("run_id")
+            if previous.get("run_id") != run_id
+            else previous.get("previous_run_id")
+        )
+        checkpoint["run_id"] = run_id
+    checkpoint.update({
+        "status": "failed",
+        "consecutive_cycle_failures": failures,
+        "short_soak": soak,
+        "last_failure": failure,
+        "last_heartbeat": now,
+        "last_heartbeat_iso": _iso_utc(now),
+        "backoff": {
+            "current_seconds": settings.idle_backoff_initial_seconds,
+            "maximum_seconds": settings.idle_backoff_max_seconds,
+            "next_cycle_not_before": now + settings.idle_backoff_initial_seconds,
+            "next_cycle_not_before_iso": _iso_utc(
+                now + settings.idle_backoff_initial_seconds
+            ),
+        },
+    })
+    checkpoint["restart_checkpoint"] = {
+        "run_id": run_id,
+        "generation": checkpoint["generation"],
+        "queue_snapshot_identity": checkpoint["queue_snapshot_identity"],
+        "completed_cycles": checkpoint["completed_cycles"],
+        "created_at": now,
+        "created_at_iso": _iso_utc(now),
+    }
+    checkpoint.pop("checkpoint_digest", None)
+    checkpoint["checkpoint_digest"] = _digest(_checkpoint_payload(checkpoint))
+    return validate_checkpoint(checkpoint), failure
 
 
 def mission_control_projection(
@@ -2222,12 +2950,23 @@ def mission_control_projection(
             "kind": "hermes_kanban",
             "board": (checkpoint.get("queue") or {}).get("board"),
             "queue_snapshot_identity": checkpoint.get("queue_snapshot_identity"),
+            "semantic_queue_identity": checkpoint.get(
+                "semantic_queue_identity",
+                checkpoint.get("queue_snapshot_identity"),
+            ),
+            "operational_occupancy_identity": checkpoint.get(
+                "operational_occupancy_identity"
+            ),
         },
         "supervisor": {
             "run_id": checkpoint.get("run_id"),
             "generation": checkpoint.get("generation"),
             "state": checkpoint.get("status"),
             "completed_cycles": checkpoint.get("completed_cycles"),
+            "consecutive_cycle_failures": checkpoint.get(
+                "consecutive_cycle_failures", 0
+            ),
+            "short_soak": checkpoint.get("short_soak"),
             "last_heartbeat": checkpoint.get("last_heartbeat"),
             "last_heartbeat_iso": checkpoint.get("last_heartbeat_iso"),
             "source_checkpoint_digest": checkpoint.get("checkpoint_digest"),
@@ -2245,12 +2984,17 @@ def mission_control_projection(
                 "occupied": data.get("occupied"),
                 "free": data.get("free"),
                 "available": data.get("available"),
+                "occupancy_state": data.get("occupancy_state"),
+                "external_consumers": data.get("external_consumers") or [],
             }
             for provider, data in availability.items()
         },
         "stale_jobs": checkpoint.get("stale_jobs") or [],
         "dead_jobs": checkpoint.get("dead_jobs") or [],
         "blocked_jobs": checkpoint.get("blocked_jobs") or [],
+        "provider_occupancy_issues": (
+            checkpoint.get("provider_occupancy_issues") or []
+        ),
         "pending_approvals": [
             item
             for item in checkpoint.get("pending_operator_decisions") or []
@@ -2332,6 +3076,21 @@ def _telegram_text(
             f"{(stop or {}).get('reason') or 'operator stop requested'}. "
             "Checkpoint preserved; no new cycle will start."
         )
+    if message_type == "cycle_failure":
+        failure = cp.get("last_failure") or {}
+        count = failure.get("consecutive_cycle_failures")
+        ceiling = failure.get("max_consecutive_cycle_failures")
+        retry_text = (
+            f" Consecutive failures: {count}/{ceiling}."
+            if count is not None and ceiling is not None
+            else ""
+        )
+        return (
+            "Olympus supervisor failed closed "
+            f"[{failure.get('code') or 'unknown_failure'}]: "
+            f"{failure.get('detail') or 'cycle failed'}."
+            f"{retry_text} No provider was launched and no live message was sent."
+        )
     if message_type == "daily_summary":
         return (
             f"Olympus daily summary: {len(selected)} recommendation(s), "
@@ -2357,6 +3116,7 @@ def telegram_templates(
             "blocked_state",
             "stale_provider_job",
             "emergency_stop",
+            "cycle_failure",
             "daily_summary",
         )
     }
@@ -2598,7 +3358,8 @@ class OlympusSupervisor:
         error: OlympusSupervisorError | Exception,
         *,
         completed_cycles: int,
-    ) -> None:
+        failure_record: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         now = self.clock()
         code = (
             error.code
@@ -2608,9 +3369,10 @@ class OlympusSupervisor:
         detail = (
             error.detail if isinstance(error, OlympusSupervisorError) else str(error)
         )
-        self.store.write_json(
-            self.store.failure_path,
-            {
+        failure = (
+            dict(failure_record)
+            if failure_record is not None
+            else {
                 "schema_version": FAILURE_SCHEMA,
                 "run_id": self.run_id,
                 "state": "failed",
@@ -2619,15 +3381,52 @@ class OlympusSupervisor:
                 "completed_cycles": completed_cycles,
                 "at": now,
                 "at_iso": _iso_utc(now),
-            },
+            }
         )
+        self.store.write_json(self.store.failure_path, failure)
+        try:
+            count = failure.get("consecutive_cycle_failures")
+            ceiling = failure.get("max_consecutive_cycle_failures")
+            retry_text = (
+                f" Consecutive failures: {count}/{ceiling}."
+                if count is not None and ceiling is not None
+                else ""
+            )
+            self.store.append_drafts([
+                _draft(
+                    "cycle_failure",
+                    (
+                        f"Olympus supervisor failed closed [{code}]: {detail}."
+                        f"{retry_text} No provider was launched and no live "
+                        "Telegram message was sent."
+                    ),
+                    signature={
+                        "code": code,
+                        "detail": detail,
+                        "consecutive_cycle_failures": count,
+                        "max_consecutive_cycle_failures": ceiling,
+                    },
+                    now=float(failure.get("at") or now),
+                )
+            ])
+        except Exception:
+            # The durable failure record is authoritative. A broken draft sink
+            # must not hide the original cycle failure or trigger an unbounded
+            # retry loop.
+            pass
         self._record_heartbeat(
             "failed",
             completed_cycles=completed_cycles,
             detail=f"{code}: {detail}",
         )
+        return failure
 
-    def _cycle(self, lease: SupervisorLease) -> dict[str, Any]:
+    def _cycle(
+        self,
+        lease: SupervisorLease,
+        *,
+        short_soak: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         previous = self.store.load_checkpoint()
         completed_before = int((previous or {}).get("completed_cycles") or 0)
         self._stage("before_snapshot")
@@ -2649,6 +3448,7 @@ class OlympusSupervisor:
             now=now,
             settings=self.settings,
             previous=previous,
+            short_soak=short_soak,
         )
         self._stage("after_selection")
         second = self.reader.load(now=self.clock())
@@ -2665,6 +3465,7 @@ class OlympusSupervisor:
             previous=previous,
             now=self.clock(),
             settings=self.settings,
+            short_soak=short_soak,
         )
         self._stage("before_checkpoint")
 
@@ -2766,7 +3567,26 @@ class OlympusSupervisor:
                 lease.refresh(state, completed_cycles=completed_cycles)
                 last_heartbeat = self.clock()
 
-    def run_forever(self, *, max_cycles: int | None = None) -> int:
+    def run_forever(
+        self,
+        *,
+        max_cycles: int | None = None,
+        max_cycle_cost_usd: Any = None,
+        max_cycle_tokens: Any = None,
+    ) -> int:
+        limits = _short_soak_limits(
+            self.settings,
+            max_cycles=max_cycles,
+            max_cycle_cost_usd=max_cycle_cost_usd,
+            max_cycle_tokens=max_cycle_tokens,
+        )
+        short_soak = _prepare_short_soak(
+            self.store.load_checkpoint(),
+            limits=limits,
+            now=self.clock(),
+        )
+        if short_soak["status"] == "completed":
+            return int(short_soak["successful_cycles"])
         try:
             self._stage("before_cycle")
         except StopRequested:
@@ -2776,14 +3596,15 @@ class OlympusSupervisor:
                 completed_cycles=int((previous or {}).get("completed_cycles") or 0),
                 detail="global stop control is active",
             )
-            return 0
-        cycles = 0
+            return int(short_soak["successful_cycles"])
         with self._lease() as lease:
-            while max_cycles is None or cycles < max_cycles:
+            while int(short_soak["successful_cycles"]) < int(
+                short_soak["target_cycles"]
+            ):
                 try:
-                    checkpoint = self._cycle(lease)
-                    cycles += 1
-                    if max_cycles is not None and cycles >= max_cycles:
+                    checkpoint = self._cycle(lease, short_soak=short_soak)
+                    short_soak = _validate_short_soak(checkpoint["short_soak"])
+                    if short_soak["status"] == "completed":
                         break
                     self._wait_responsive(
                         float(checkpoint["backoff"]["current_seconds"]),
@@ -2800,22 +3621,54 @@ class OlympusSupervisor:
                         ),
                         detail="global stop control is active",
                     )
-                    return cycles
+                    return int(short_soak["successful_cycles"])
                 except DuplicateSupervisorError:
                     raise
                 except Exception as exc:
                     previous = self.store.load_checkpoint()
                     completed = int((previous or {}).get("completed_cycles") or 0)
-                    self._record_failure(exc, completed_cycles=completed)
-                    if max_cycles is not None:
-                        raise
-                    self._wait_responsive(
-                        self.settings.idle_backoff_initial_seconds,
-                        lease=lease,
-                        completed_cycles=completed,
-                        state="failed",
+                    checkpoint, failure = _failure_checkpoint(
+                        previous=previous,
+                        short_soak=short_soak,
+                        error=exc,
+                        run_id=self.run_id,
+                        board=self.settings.board,
+                        tenant=self.settings.tenant,
+                        db_path=self.reader.db_path,
+                        now=self.clock(),
+                        settings=self.settings,
                     )
-        return cycles
+                    self.store.write_checkpoint(checkpoint)
+                    short_soak = _validate_short_soak(checkpoint["short_soak"])
+                    self._record_failure(
+                        exc,
+                        completed_cycles=completed,
+                        failure_record=failure,
+                    )
+                    lease.refresh("failed", completed_cycles=completed)
+                    if short_soak["status"] == "failure_ceiling_reached":
+                        raise OlympusSupervisorError(
+                            "cycle_failure_ceiling_reached",
+                            f"{failure['code']}: {failure['detail']} "
+                            f"({failure['consecutive_cycle_failures']}/"
+                            f"{failure['max_consecutive_cycle_failures']} "
+                            "consecutive cycle failures)",
+                        ) from exc
+                    try:
+                        self._wait_responsive(
+                            self.settings.idle_backoff_initial_seconds,
+                            lease=lease,
+                            completed_cycles=completed,
+                            state="failed",
+                        )
+                    except StopRequested:
+                        self._record_heartbeat(
+                            "stopped",
+                            completed_cycles=completed,
+                            detail="global stop control is active",
+                        )
+                        return int(short_soak["successful_cycles"])
+        return int(short_soak["successful_cycles"])
 
     def read_queue(self) -> dict[str, Any]:
         """Fresh read-only queue/evaluation without checkpoint or lease writes."""
@@ -2839,6 +3692,11 @@ class OlympusSupervisor:
                 "authority": "hermes_kanban",
                 "board": snapshot["board"],
                 "identity": snapshot["identity"],
+                "semantic_identity": snapshot["semantic_identity"],
+                "operational_occupancy_identity": snapshot[
+                    "operational_occupancy_identity"
+                ],
+                "identity_model": snapshot["identity_model"],
                 "observed_at": snapshot["observed_at"],
             },
             "status": evaluation["status"],
@@ -2856,6 +3714,7 @@ class OlympusSupervisor:
                     "resumable_jobs",
                     "stale_tasks",
                     "diagnostic_issues",
+                    "provider_occupancy_issues",
                 )
             },
         }
@@ -2943,6 +3802,16 @@ class OlympusSupervisor:
                     else heartbeat.get("detail") or "supervisor cycle failed"
                 ),
                 "code": (failure.get("code") if isinstance(failure, dict) else None),
+                "consecutive_cycle_failures": (
+                    failure.get("consecutive_cycle_failures")
+                    if isinstance(failure, dict)
+                    else None
+                ),
+                "max_consecutive_cycle_failures": (
+                    failure.get("max_consecutive_cycle_failures")
+                    if isinstance(failure, dict)
+                    else None
+                ),
                 "heartbeat_age_seconds": round(age, 3),
             }
         if isinstance(failure, dict) and float(failure.get("at") or 0) > float(
@@ -2965,6 +3834,10 @@ class OlympusSupervisor:
             "heartbeat_age_seconds": round(age, 3),
             "run_id": heartbeat.get("run_id"),
             "completed_cycles": heartbeat.get("completed_cycles"),
+            "consecutive_cycle_failures": (
+                checkpoint.get("consecutive_cycle_failures", 0) if checkpoint else 0
+            ),
+            "short_soak": checkpoint.get("short_soak") if checkpoint else None,
             "queue_snapshot_identity": (
                 checkpoint.get("queue_snapshot_identity") if checkpoint else None
             ),
@@ -3201,15 +4074,17 @@ def olympus_supervisor_command(
 
         if action == "run":
             max_cycles = getattr(args, "max_cycles", None)
-            if max_cycles is not None and max_cycles < 1:
-                raise OlympusSupervisorError(
-                    "invalid_argument", "--max-cycles must be positive"
-                )
-            cycles = selected.run_forever(max_cycles=max_cycles)
+            cycles = selected.run_forever(
+                max_cycles=max_cycles,
+                max_cycle_cost_usd=getattr(args, "max_cycle_cost_usd", None),
+                max_cycle_tokens=getattr(args, "max_cycle_tokens", None),
+            )
+            checkpoint = selected.store.load_checkpoint()
             value: dict[str, Any] = {
                 "cycles": cycles,
                 "stopped": selected.store.stop_reason() is not None,
-                "checkpoint": selected.store.load_checkpoint(),
+                "checkpoint": checkpoint,
+                "short_soak": (checkpoint or {}).get("short_soak"),
             }
         elif action == "run-once":
             value = selected.run_once()

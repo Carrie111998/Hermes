@@ -1118,11 +1118,16 @@ DEFAULT_CONFIG = {
         "stop_poll_seconds": 5,
         "notification_repeat_seconds": 3600,
         "max_selected_candidates": 6,
+        # A bounded run stops after this many consecutive failed cycle attempts.
+        "max_consecutive_cycle_failures": 3,
         "max_risk": "medium",
         # Phase A never spends. A task must explicitly declare a zero estimate
         # unless the operator raises these proposal-only planning limits.
         "max_task_estimated_cost_usd": 0,
         "max_cycle_estimated_cost_usd": 0,
+        # Short-soak recommendations also require explicit per-task token
+        # estimates and remain within this mandatory cycle ceiling.
+        "max_cycle_estimated_tokens": 0,
         "providers": {
             "codex": {"capacity": 2, "available": True},
             "claude": {"capacity": 2, "available": True},

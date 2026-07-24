@@ -1,0 +1,57 @@
+{
+  "generated_at": 2000000000.0,
+  "generated_at_iso": "2033-05-18T03:33:20Z",
+  "issues": [],
+  "jobs": [
+    {
+      "schema_version": "hermes-job-diagnostics/1",
+      "job_id": "olympus-fixture",
+      "title": "Production-shaped Olympus diagnostic",
+      "status": "completed",
+      "created_at": 1999999900.0,
+      "updated_at": 1999999999.0,
+      "started_at": 1999999901.0,
+      "completed_at": 1999999999.0,
+      "lanes": {
+        "provider": {
+          "lane_id": "provider",
+          "title": "Provider lane",
+          "status": "completed",
+          "effective_status": "completed",
+          "status_since": 1999999999.0,
+          "started_at": 1999999901.0,
+          "updated_at": 1999999999.0,
+          "completed_at": 1999999999.0,
+          "current_step": "complete",
+          "last_meaningful_output": "fixture complete",
+          "last_meaningful_output_at": 1999999999.0,
+          "heartbeat_at": 1999999999.0,
+          "retry_count": 0,
+          "blocker": null,
+          "next_expected_action": "",
+          "provider": "codex",
+          "model": "gpt-5",
+          "process": {
+            "pid": 41001,
+            "hostname": "fixture-host",
+            "start_token": "fixture-start-token"
+          },
+          "session_id": "fixture-session",
+          "task_id": "__TASK_ID__",
+          "platform": "olympus",
+          "read_only": true,
+          "depends_on": [],
+          "resources": [],
+          "timing": {
+            "total_elapsed": 98.0,
+            "model_wait": 40.0,
+            "tool_execution": 20.0,
+            "test": 30.0,
+            "review": 8.0
+          }
+        }
+      },
+      "spans": []
+    }
+  ]
+}

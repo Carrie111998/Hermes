@@ -12,6 +12,12 @@
     <string>__HERMES_EXECUTABLE__</string>
     <string>olympus-supervisor</string>
     <string>run</string>
+    <string>--max-cycles</string>
+    <string>__MAX_CYCLES__</string>
+    <string>--max-cycle-cost-usd</string>
+    <string>__MAX_CYCLE_COST_USD__</string>
+    <string>--max-cycle-tokens</string>
+    <string>__MAX_CYCLE_TOKENS__</string>
   </array>
 
   <key>EnvironmentVariables</key>
@@ -30,11 +36,8 @@
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <!-- Restart crashes, but do not restart a clean global-stop exit. -->
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <!-- A bounded soak must never be externally restarted into a retry loop. -->
+  <false/>
   <key>ProcessType</key>
   <string>Background</string>
   <key>Umask</key>

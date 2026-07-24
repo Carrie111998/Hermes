@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 
 
@@ -33,11 +34,32 @@ def build_olympus_supervisor_parser(
     )
     actions = parser.add_subparsers(dest="olympus_supervisor_action")
 
-    run = actions.add_parser("run", help="Run continuous observe-only cycles")
+    run = actions.add_parser("run", help="Run a bounded observe-only short soak")
+    run.add_argument(
+        "--board",
+        default=argparse.SUPPRESS,
+        help="Kanban board slug (also accepted before the run action)",
+    )
     run.add_argument(
         "--max-cycles",
         type=int,
-        help="Stop after this many cycles (primarily for supervised validation)",
+        required=True,
+        help="Required successful-cycle bound (1-100)",
+    )
+    run.add_argument(
+        "--max-cycle-cost-usd",
+        help=(
+            "Optional stricter short-soak cycle cost ceiling; defaults to the "
+            "configured bounded ceiling"
+        ),
+    )
+    run.add_argument(
+        "--max-cycle-tokens",
+        type=int,
+        help=(
+            "Optional stricter short-soak cycle token ceiling; defaults to the "
+            "configured bounded ceiling"
+        ),
     )
     _add_json_flag(run)
 

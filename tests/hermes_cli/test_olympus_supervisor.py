@@ -27,6 +27,10 @@ from hermes_cli.subcommands.olympus_supervisor import (
     build_olympus_supervisor_parser,
 )
 
+DIAGNOSTICS_FIXTURES = (
+    Path(__file__).parents[1] / "fixtures" / "olympus_supervisor" / "diagnostics"
+)
+
 
 class FakeClock:
     def __init__(self, value: float = 2_000_000_000.0):
@@ -41,6 +45,11 @@ class FakeClock:
 
 def _empty_diagnostics(**_kwargs):
     return {"generated_at": 0, "jobs": [], "issues": []}
+
+
+def _diagnostics_fixture(name: str, *, task_id: str = "") -> dict:
+    raw = (DIAGNOSTICS_FIXTURES / name).read_text(encoding="utf-8")
+    return json.loads(raw.replace("__TASK_ID__", task_id))
 
 
 def _settings(**overrides) -> SupervisorSettings:
@@ -58,9 +67,11 @@ def _settings(**overrides) -> SupervisorSettings:
         "stop_poll_seconds": 5,
         "notification_repeat_seconds": 86400,
         "max_selected_candidates": 6,
+        "max_consecutive_cycle_failures": 3,
         "max_risk": "medium",
         "max_task_estimated_cost_usd": 0,
         "max_cycle_estimated_cost_usd": 0,
+        "max_cycle_estimated_tokens": 0,
         "providers": {
             "codex": {"capacity": 2, "available": True},
             "claude": {"capacity": 2, "available": True},
@@ -91,6 +102,7 @@ def _metadata(
     assigned_slot: str | None = None,
     objective: str = "Produce the bounded Olympus deliverable.",
     estimated_cost_usd: float = 0,
+    estimated_tokens: int | None = 0,
 ) -> str:
     value = {
         "schema_version": "olympus-kanban-task/1",
@@ -123,6 +135,8 @@ def _metadata(
             "deliverables": ["result.md"],
         },
     }
+    if estimated_tokens is not None:
+        value["estimated_tokens"] = estimated_tokens
     if assigned_provider is not None:
         value["assigned_provider"] = assigned_provider
     if assigned_slot is not None:
@@ -420,6 +434,7 @@ def test_unleased_active_diagnostic_makes_provider_occupancy_ambiguous(board, st
 
     def diagnostics(**_kwargs):
         return {
+            "generated_at": board["clock"](),
             "jobs": [
                 {
                     "job_id": "olympus-test",
@@ -440,17 +455,117 @@ def test_unleased_active_diagnostic_makes_provider_occupancy_ambiguous(board, st
         _supervisor(board, diagnostics_provider=diagnostics).read_queue()
 
 
+def test_production_shaped_diagnostics_fixture_reconciles(board):
+    task_id = _write_task(board, title="fixture candidate")
+
+    value = _supervisor(
+        board,
+        diagnostics_provider=lambda **_kwargs: _diagnostics_fixture(
+            "real_diagnostics.json", task_id=task_id
+        ),
+    ).read_queue()
+
+    assert value["status"] == "working"
+    assert value["reconciliation"]["diagnostic_issues"] == []
+    assert value["provider_availability"]["codex"]["occupancy_state"] == "available"
+
+
+def test_stale_process_fixture_is_reported_without_consuming_capacity(board):
+    task_id = _write_task(board, title="stale fixture candidate")
+
+    value = _supervisor(
+        board,
+        diagnostics_provider=lambda **_kwargs: _diagnostics_fixture(
+            "stale_process_data.json", task_id=task_id
+        ),
+    ).read_queue()
+
+    assert value["reconciliation"]["dead_jobs"][0]["task_id"] == task_id
+    assert value["provider_availability"]["codex"]["occupied"] == 0
+
+
+def test_non_olympus_provider_consumers_reduce_known_capacity(board):
+    _write_task(
+        board, title="candidate", body=_metadata(board["clock"], providers=["claude"])
+    )
+    value = _supervisor(
+        board,
+        diagnostics_provider=lambda **_kwargs: _diagnostics_fixture(
+            "non_olympus_provider_consumers.json"
+        ),
+    ).read_queue()
+    availability = value["provider_availability"]["claude"]
+
+    assert availability["occupied"] == 1
+    assert availability["free"] == 1
+    assert availability["occupancy_state"] == "available"
+    assert availability["external_consumers"][0]["job_id"] == "customer-report"
+    assert value["selected_candidates"][0]["proposed_slot"] == "claude:2"
+
+
+def test_ambiguous_non_olympus_occupancy_is_never_reported_available(board):
+    _write_task(board, title="candidate")
+    value = _supervisor(
+        board,
+        diagnostics_provider=lambda **_kwargs: _diagnostics_fixture(
+            "ambiguous_provider_occupancy.json"
+        ),
+    ).read_queue()
+
+    assert value["status"] == "blocked"
+    assert not value["selected_candidates"]
+    assert all(
+        item["occupancy_state"] == "ambiguous"
+        and item["available"] is False
+        and item["free"] is None
+        for item in value["provider_availability"].values()
+    )
+    assert value["reconciliation"]["provider_occupancy_issues"]
+
+
 def test_malformed_queue_refuses_selection(board):
     _write_task(board, title="bad", body="{not-json")
     supervisor = _supervisor(board)
 
     with pytest.raises(QueueValidationError, match="malformed_task"):
         supervisor.read_queue()
-    with pytest.raises(QueueValidationError, match="malformed_task"):
+    with pytest.raises(OlympusSupervisorError, match="malformed_task"):
         supervisor.run_forever(max_cycles=1)
     assert (
         supervisor.store.read_json(supervisor.store.failure_path)["state"] == "failed"
     )
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["malformed_diagnostics.json", "missing_fields.json"],
+)
+def test_diagnostics_parse_failure_is_bounded_and_fail_closed(board, fixture_name):
+    _write_task(board, title="candidate")
+    calls = 0
+
+    def diagnostics(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return _diagnostics_fixture(fixture_name)
+
+    supervisor = _supervisor(
+        board,
+        settings=_settings(max_consecutive_cycle_failures=2),
+        diagnostics_provider=diagnostics,
+    )
+    with pytest.raises(OlympusSupervisorError, match="cycle_failure_ceiling_reached"):
+        supervisor.run_forever(max_cycles=1)
+
+    checkpoint = supervisor.store.load_checkpoint()
+    failure = supervisor.store.read_json(supervisor.store.failure_path)
+    assert calls == 2
+    assert checkpoint["consecutive_cycle_failures"] == 2
+    assert checkpoint["short_soak"]["status"] == "failure_ceiling_reached"
+    assert failure["code"] == "diagnostics_parse_failure"
+    assert failure["retry_will_continue"] is False
+    assert _outbox(supervisor)[-1]["type"] == "cycle_failure"
+    assert _outbox(supervisor)[-1]["sent"] is False
 
 
 def test_conflicting_lease_refuses_selection(board):
@@ -535,6 +650,8 @@ def test_duplicate_supervisor_is_refused_even_without_live_lock(board):
 
     with pytest.raises(DuplicateSupervisorError):
         supervisor.run_once()
+    with pytest.raises(DuplicateSupervisorError):
+        supervisor.run_forever(max_cycles=1)
 
 
 def test_malformed_supervisor_lease_fails_closed(board):
@@ -564,6 +681,94 @@ def test_restart_from_checkpoint_preserves_generation_and_suppresses_action(boar
         == first["selected_candidates"][0]["action_id"]
     )
     assert second["selected_candidates"][0]["new_recommendation"] is False
+
+
+def test_consecutive_cycle_failure_ceiling_stops_retry_loop(board):
+    calls = 0
+
+    def broken_diagnostics(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("persistent diagnostics failure")
+
+    supervisor = _supervisor(
+        board,
+        settings=_settings(max_consecutive_cycle_failures=2),
+        diagnostics_provider=broken_diagnostics,
+    )
+    with pytest.raises(OlympusSupervisorError, match="cycle_failure_ceiling_reached"):
+        supervisor.run_forever(max_cycles=20)
+
+    failure = supervisor.store.read_json(supervisor.store.failure_path)
+    assert calls == 2
+    assert failure["consecutive_cycle_failures"] == 2
+    assert failure["max_consecutive_cycle_failures"] == 2
+    assert failure["retry_will_continue"] is False
+
+
+def test_consecutive_failure_count_persists_across_restart(board):
+    _write_task(board, title="candidate")
+    settings = _settings(max_consecutive_cycle_failures=2)
+
+    def broken_diagnostics(**_kwargs):
+        raise ValueError("fixture diagnostics failure")
+
+    first = _supervisor(
+        board,
+        settings=settings,
+        diagnostics_provider=broken_diagnostics,
+    )
+
+    def stop_after_failure(seconds):
+        board["clock"].sleep(seconds)
+        first.store.request_stop("restart after first failure")
+
+    first.sleeper = stop_after_failure
+    assert first.run_forever(max_cycles=1) == 0
+    assert first.store.load_checkpoint()["consecutive_cycle_failures"] == 1
+    first.store.clear_stop()
+
+    second = _supervisor(
+        board,
+        settings=settings,
+        diagnostics_provider=broken_diagnostics,
+    )
+    with pytest.raises(OlympusSupervisorError, match="cycle_failure_ceiling_reached"):
+        second.run_forever(max_cycles=1)
+
+    checkpoint = second.store.load_checkpoint()
+    assert checkpoint["consecutive_cycle_failures"] == 2
+    assert checkpoint["short_soak"]["status"] == "failure_ceiling_reached"
+
+
+def test_successful_cycle_resets_persisted_failure_count(board):
+    _write_task(board, title="candidate")
+    settings = _settings(max_consecutive_cycle_failures=2)
+
+    def broken_diagnostics(**_kwargs):
+        raise ValueError("fixture diagnostics failure")
+
+    first = _supervisor(
+        board,
+        settings=settings,
+        diagnostics_provider=broken_diagnostics,
+    )
+
+    def stop_after_failure(seconds):
+        board["clock"].sleep(seconds)
+        first.store.request_stop("repair diagnostics")
+
+    first.sleeper = stop_after_failure
+    assert first.run_forever(max_cycles=1) == 0
+    assert first.store.load_checkpoint()["consecutive_cycle_failures"] == 1
+    first.store.clear_stop()
+
+    resumed = _supervisor(board, settings=settings)
+    assert resumed.run_forever(max_cycles=1) == 1
+    checkpoint = resumed.store.load_checkpoint()
+    assert checkpoint["consecutive_cycle_failures"] == 0
+    assert checkpoint["short_soak"]["status"] == "completed"
+    assert "fixture diagnostics failure" in checkpoint["last_failure"]["detail"]
 
 
 def test_checkpoint_drift_is_refused(board):
@@ -597,6 +802,88 @@ def test_queue_drift_during_cycle_refuses_checkpoint(board):
     with pytest.raises(QueueDriftError):
         supervisor.run_once()
     assert not supervisor.store.checkpoint_path.exists()
+
+
+def test_semantic_queue_identity_is_stable_under_operational_churn(board):
+    active_id = _write_task(
+        board,
+        title="active",
+        body=_metadata(
+            board["clock"],
+            assigned_provider="codex",
+            assigned_slot="codex:1",
+        ),
+    )
+    ended_id = _write_task(
+        board,
+        title="ended",
+        body=_metadata(
+            board["clock"],
+            assigned_provider="claude",
+            assigned_slot="claude:1",
+        ),
+    )
+    _claim(board, active_id)
+    _claim(board, ended_id)
+    conn = kb.connect(board["db_path"])
+    try:
+        assert kb.complete_task(conn, ended_id, result="fixture complete")
+    finally:
+        conn.close()
+
+    supervisor = _supervisor(board)
+    first = supervisor.reader.load(now=board["clock"]())
+    conn = kb.connect(board["db_path"])
+    try:
+        active_run = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (active_id,)
+        ).fetchone()[0]
+        ended_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (ended_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = claim_expires + 10, "
+            "worker_pid = ?, last_heartbeat_at = last_heartbeat_at + 10, "
+            "started_at = started_at + 10 WHERE id = ?",
+            ("replacement-claim", 4242, active_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_lock = ?, claim_expires = claim_expires + 10, "
+            "worker_pid = ?, last_heartbeat_at = last_heartbeat_at + 10, "
+            "started_at = started_at + 10 WHERE id = ?",
+            ("replacement-claim", 4242, active_run),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at + 10, "
+            "ended_at = ended_at + 10 WHERE id = ?",
+            (ended_run,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    second = supervisor.reader.load(now=board["clock"]())
+
+    assert second["semantic_identity"] == first["semantic_identity"]
+    assert (
+        second["operational_occupancy_identity"]
+        != first["operational_occupancy_identity"]
+    )
+
+
+def test_semantic_queue_identity_changes_on_real_queue_mutation(board):
+    task_id = _write_task(board, title="candidate", priority=1)
+    first = _supervisor(board).run_once()
+    conn = kb.connect(board["db_path"])
+    try:
+        conn.execute("UPDATE tasks SET priority = 9 WHERE id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    second = _supervisor(board).run_once()
+
+    assert second["semantic_queue_identity"] != first["semantic_queue_identity"]
+    assert second["generation"] == first["generation"] + 1
 
 
 def test_duplicate_action_and_telegram_recommendation_are_suppressed(board):
@@ -688,6 +975,7 @@ def test_stale_job_telegram_draft_ignores_changing_age(board):
 def test_dead_job_reuses_why_slow_and_resume_plan_surfaces(board):
     def diagnostics(**_kwargs):
         return {
+            "generated_at": board["clock"](),
             "jobs": [
                 {
                     "job_id": "olympus-dead",
@@ -735,6 +1023,7 @@ def test_blocked_job_is_persisted_and_drives_blocked_state(board):
 
     def diagnostics(**_kwargs):
         return {
+            "generated_at": board["clock"](),
             "jobs": [
                 {
                     "job_id": "olympus-blocked",
@@ -820,7 +1109,7 @@ def test_continuous_loop_exits_cleanly_when_stop_is_already_active(board):
     supervisor = _supervisor(board)
     supervisor.request_stop("maintenance")
 
-    assert supervisor.run_forever() == 0
+    assert supervisor.run_forever(max_cycles=1) == 0
     heartbeat = supervisor.store.read_json(supervisor.store.heartbeat_path)
     assert heartbeat["state"] == "stopped"
     assert heartbeat["detail"] == "global stop control is active"
@@ -1029,6 +1318,209 @@ def test_run_once_is_bounded_and_never_sleeps(board):
     ]
 
 
+def test_run_once_keeps_legacy_optional_token_estimate_behavior(board):
+    metadata = json.loads(_metadata(board["clock"]))
+    metadata.pop("estimated_tokens")
+    task_id = _write_task(
+        board,
+        title="legacy run-once candidate",
+        body=json.dumps(metadata),
+    )
+
+    checkpoint = _supervisor(board).run_once()
+
+    assert checkpoint["selected_candidates"][0]["task_id"] == task_id
+    assert checkpoint["selected_candidates"][0]["estimated_tokens"] is None
+    assert "short_soak" not in checkpoint
+
+
+def test_missing_max_cycles_is_refused_without_starting_a_cycle(board, capsys):
+    supervisor = _supervisor(board)
+    args = SimpleNamespace(
+        olympus_supervisor_action="run",
+        json=True,
+        max_cycles=None,
+        max_cycle_cost_usd=None,
+        max_cycle_tokens=None,
+    )
+
+    assert olympus_supervisor_command(args, supervisor=supervisor) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "invalid_argument"
+    assert "--max-cycles is required" in payload["error"]
+    assert not supervisor.store.checkpoint_path.exists()
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, 101, True])
+def test_invalid_cycle_bounds_are_refused(board, value):
+    supervisor = _supervisor(board)
+
+    with pytest.raises(OlympusSupervisorError, match="--max-cycles is required"):
+        supervisor.run_forever(max_cycles=value)
+
+    assert not supervisor.store.checkpoint_path.exists()
+
+
+def test_short_soak_enforces_bounded_cost_and_token_limits(board):
+    _write_task(
+        board,
+        title="cost heavy",
+        body=_metadata(
+            board["clock"],
+            estimated_cost_usd=2,
+            estimated_tokens=0,
+        ),
+    )
+    _write_task(
+        board,
+        title="token heavy",
+        body=_metadata(
+            board["clock"],
+            estimated_cost_usd=0,
+            estimated_tokens=100,
+        ),
+    )
+    settings = _settings(
+        max_task_estimated_cost_usd=10,
+        max_cycle_estimated_cost_usd=10,
+        max_cycle_estimated_tokens=1000,
+    )
+    supervisor = _supervisor(board, settings=settings)
+
+    assert (
+        supervisor.run_forever(
+            max_cycles=1,
+            max_cycle_cost_usd=1,
+            max_cycle_tokens=50,
+        )
+        == 1
+    )
+    checkpoint = supervisor.store.load_checkpoint()
+    reason_codes = {
+        reason["code"]
+        for item in checkpoint["blocked_candidates"]
+        for reason in item["reasons"]
+    }
+    assert not checkpoint["selected_candidates"]
+    assert {"cycle_spending_limit", "cycle_token_limit"} <= reason_codes
+    assert checkpoint["cycle_limits"] == {
+        "max_estimated_cost_usd": "1",
+        "max_estimated_tokens": 50,
+        "resource_estimates_required": True,
+    }
+    assert checkpoint["short_soak"]["max_cycle_estimated_cost_usd"] == "1"
+    assert checkpoint["short_soak"]["max_cycle_estimated_tokens"] == 50
+
+
+def test_short_soak_limits_cannot_exceed_configured_ceilings(board):
+    supervisor = _supervisor(board)
+
+    with pytest.raises(OlympusSupervisorError, match="configured"):
+        supervisor.run_forever(max_cycles=1, max_cycle_cost_usd=1)
+    with pytest.raises(OlympusSupervisorError, match="configured"):
+        supervisor.run_forever(max_cycles=1, max_cycle_tokens=1)
+
+    assert not supervisor.store.checkpoint_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "reason_code"),
+    [
+        ("estimated_cost_usd", "cycle_cost_unknown"),
+        ("estimated_tokens", "cycle_tokens_unknown"),
+    ],
+)
+def test_short_soak_fails_closed_when_resource_estimate_is_unknown(
+    board, missing_field, reason_code
+):
+    metadata = json.loads(_metadata(board["clock"]))
+    metadata.pop(missing_field)
+    _write_task(
+        board,
+        title="unknown resource estimate",
+        body=json.dumps(metadata),
+    )
+    supervisor = _supervisor(board)
+
+    assert supervisor.run_forever(max_cycles=1) == 1
+    checkpoint = supervisor.store.load_checkpoint()
+    assert not checkpoint["selected_candidates"]
+    assert reason_code in _reason_codes(checkpoint["blocked_candidates"][0])
+
+
+def test_stop_during_bounded_run_preserves_remaining_soak_cycles(board):
+    attempts = 0
+    supervisor = None
+
+    def stop_before_third_cycle(stage):
+        nonlocal attempts
+        if stage != "before_snapshot":
+            return
+        attempts += 1
+        if attempts == 3:
+            supervisor.store.request_stop("bounded stop fixture")
+
+    supervisor = _supervisor(board, stage_hook=stop_before_third_cycle)
+
+    assert supervisor.run_forever(max_cycles=5) == 2
+    checkpoint = supervisor.store.load_checkpoint()
+    assert checkpoint["short_soak"]["successful_cycles"] == 2
+    assert checkpoint["short_soak"]["remaining_cycles"] == 3
+    assert checkpoint["short_soak"]["status"] == "running"
+    assert supervisor.store.stop_reason()["reason"] == "bounded stop fixture"
+
+
+def test_crash_and_resume_finishes_only_remaining_bounded_cycles(board):
+    checkpoint_writes = 0
+
+    def crash_on_second_checkpoint(phase, path):
+        nonlocal checkpoint_writes
+        if phase != "before_replace" or path.name != "checkpoint.json":
+            return
+        checkpoint_writes += 1
+        if checkpoint_writes == 2:
+            raise KeyboardInterrupt("simulated process crash")
+
+    first = _supervisor(board, crash_injector=crash_on_second_checkpoint)
+    with pytest.raises(KeyboardInterrupt, match="simulated process crash"):
+        first.run_forever(max_cycles=3)
+    preserved = first.store.load_checkpoint()
+    soak_id = preserved["short_soak"]["soak_id"]
+    assert preserved["short_soak"]["successful_cycles"] == 1
+
+    resumed = _supervisor(board)
+    assert resumed.run_forever(max_cycles=3) == 3
+    checkpoint = resumed.store.load_checkpoint()
+    assert checkpoint["short_soak"]["soak_id"] == soak_id
+    assert checkpoint["short_soak"]["successful_cycles"] == 3
+    assert checkpoint["short_soak"]["remaining_cycles"] == 0
+    assert checkpoint["completed_cycles"] == 3
+
+
+def test_exactly_20_simulated_short_soak_cycles(board):
+    snapshots = 0
+
+    def count_snapshots(stage):
+        nonlocal snapshots
+        if stage == "before_snapshot":
+            snapshots += 1
+
+    supervisor = _supervisor(board, stage_hook=count_snapshots)
+
+    assert supervisor.run_forever(max_cycles=20) == 20
+    checkpoint = supervisor.store.load_checkpoint()
+    assert snapshots == 20
+    assert checkpoint["short_soak"]["target_cycles"] == 20
+    assert checkpoint["short_soak"]["successful_cycles"] == 20
+    assert checkpoint["short_soak"]["status"] == "completed"
+    assert checkpoint["completed_cycles"] == 20
+    digest = checkpoint["checkpoint_digest"]
+
+    assert supervisor.run_forever(max_cycles=20) == 20
+    assert snapshots == 20
+    assert supervisor.store.load_checkpoint()["checkpoint_digest"] == digest
+
+
 def test_24_hour_accelerated_loop_remains_idle_and_suppresses_noise(board):
     clock = board["clock"]
     settings = _settings(
@@ -1082,9 +1574,42 @@ def test_parser_wires_all_phase_a_commands():
         "telegram-preview",
     )
     for action in actions:
-        namespace = parser.parse_args(["olympus-supervisor", action])
+        argv = ["olympus-supervisor", action]
+        if action == "run":
+            argv.extend(["--max-cycles", "20"])
+        namespace = parser.parse_args(argv)
         assert namespace.func is handler
         assert namespace.olympus_supervisor_action == action
+
+
+def test_parser_requires_bound_and_accepts_documented_short_soak_order():
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_olympus_supervisor_parser(
+        subparsers,
+        cmd_olympus_supervisor=lambda args: args,
+    )
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["olympus-supervisor", "run"])
+    namespace = parser.parse_args([
+        "olympus-supervisor",
+        "run",
+        "--board",
+        "olympus",
+        "--max-cycles",
+        "20",
+        "--max-cycle-cost-usd",
+        "0",
+        "--max-cycle-tokens",
+        "0",
+        "--json",
+    ])
+    assert namespace.board == "olympus"
+    assert namespace.max_cycles == 20
+    assert namespace.max_cycle_cost_usd == "0"
+    assert namespace.max_cycle_tokens == 0
+    assert namespace.json is True
 
 
 def test_cli_run_once_smoke_uses_injected_supervisor(board, capsys):

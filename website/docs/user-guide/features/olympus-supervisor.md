@@ -27,6 +27,7 @@ Dependencies use normal Kanban `task_links`. The task body is strict JSON:
   "risk": "medium",
   "providers": ["codex", "claude"],
   "estimated_cost_usd": 0,
+  "estimated_tokens": 0,
   "authority": {
     "status": "active",
     "recommendation_allowed": true,
@@ -76,11 +77,17 @@ prohibitions. `launch_authorized` and `authority_consumed` are always false.
 Default proposal capacity is two Codex slots, two Claude slots, one Grok slot,
 and one Hermes-orchestration slot. Capacity and provider availability are
 configured under `olympus_supervisor.providers`; they account for
-recommendations only and never authorize a launch.
+recommendations only and never authorize a launch. Active provider consumers
+from job diagnostics count even when they are not Olympus jobs. If diagnostics
+cannot identify non-Olympus occupancy, affected capacity is reported as
+`ambiguous`, never available.
 
 Supervisor states are `working`, `idle`, `waiting`, `blocked`, `stopped`, and
 `failed`. Idle/waiting cycles use bounded exponential backoff while checking
-the stop control, queue file, and heartbeat on short intervals.
+the stop control, queue file, and heartbeat on short intervals. A configurable
+`max_consecutive_cycle_failures` (default `3`) persists in the checkpoint.
+Only a fully successful cycle resets it; reaching the ceiling stops fail-closed
+with a durable failure record and a Telegram draft that is never sent.
 
 Reconciliation reads the existing Hermes job-diagnostics snapshot. Stale,
 dead, and blocked lanes are reported explicitly and retain their
@@ -90,7 +97,7 @@ never executes a resume plan.
 ## CLI
 
 ```bash
-hermes olympus-supervisor run
+hermes olympus-supervisor run --board olympus --max-cycles 20 --max-cycle-cost-usd 0 --max-cycle-tokens 0 --json
 hermes olympus-supervisor run-once
 hermes olympus-supervisor inspect
 hermes olympus-supervisor queue
@@ -103,16 +110,54 @@ hermes olympus-supervisor render-mission-control
 hermes olympus-supervisor telegram-preview
 ```
 
+`run` is the bounded short-soak surface. `--max-cycles` is mandatory and must
+be between 1 and 100; Phase A has no authorized unbounded production mode. The
+command completes exactly that many successful cycles unless STOP, duplicate
+ownership, or the persisted failure ceiling ends it. A restart with the same
+bounds resumes the unfinished soak instead of starting the requested cycle
+count again. Reissuing the same bounds after the completed checkpoint is
+idempotent, which prevents a crash after the final checkpoint from duplicating
+the soak.
+
+Short-soak mode requires explicit task `estimated_cost_usd` and
+`estimated_tokens` values. The effective per-cycle ceilings come from
+`olympus_supervisor.max_cycle_estimated_cost_usd` and
+`olympus_supervisor.max_cycle_estimated_tokens`; the optional CLI values can
+only make those configured ceilings stricter. Both defaults are zero. The
+shorter command below is therefore equivalent when those reviewed defaults
+remain in force:
+
+```bash
+hermes olympus-supervisor run --board olympus --max-cycles 20 --json
+```
+
 `queue` and `explain-next` are fresh read-only evaluations. `resume` only
 clears the stop control; it does not start a cycle. Every action supports
 `--json`.
+
+## Queue identity
+
+The checkpoint keeps two independently verifiable identities:
+
+- **Semantic queue identity** drives generation, backoff, recommendation
+  identity, and in-cycle drift refusal. It covers task definitions,
+  dependencies, status, authority, priority, provider routing, and active
+  ownership.
+- **Operational occupancy snapshot** records volatile claim tokens, lease
+  expiry, worker PIDs, heartbeats, and run start/end timestamps. Changes to
+  those fields alone do not churn the semantic generation.
+
+Every snapshot still validates task/run lease agreement, active ownership, and
+slot conflicts before either identity is accepted. Semantic mutations or
+conflicting ownership fail closed.
 
 ## Persistent paths
 
 The default state root is profile-safe:
 `$HERMES_HOME/olympus-supervisor/`.
 
-- `checkpoint.json`: atomic restart checkpoint and queue generation.
+- `checkpoint.json`: atomic restart checkpoint, semantic queue generation,
+  operational occupancy identity, short-soak progress, and retry count.
 - `heartbeat.json`: current supervisor health.
 - `supervisor-lease.json` and `supervisor.lock`: duplicate prevention.
 - `STOP.json`: explicit global stop.
@@ -128,13 +173,15 @@ through this file. Telegram delivery is deliberately absent in Phase A.
 
 The repository ships
 `packaging/launchd/ai.hermes.olympus-supervisor.plist.inactive`. It contains
-placeholders and `Disabled=true`; this file is not loaded or installed by
-Hermes.
+bounded-cycle/cost/token placeholders and `Disabled=true`; this file is not
+loaded or installed by Hermes. It cannot silently start an unbounded loop, and
+`KeepAlive=false` prevents launchd from defeating the retry ceiling.
 
 For a separately authorized installation:
 
-1. replace `__HERMES_EXECUTABLE__`, `__HERMES_HOME__`, and
-   `__HERMES_AGENT_REPOSITORY__`;
+1. replace `__HERMES_EXECUTABLE__`, `__HERMES_HOME__`,
+   `__HERMES_AGENT_REPOSITORY__`, `__MAX_CYCLES__`,
+   `__MAX_CYCLE_COST_USD__`, and `__MAX_CYCLE_TOKENS__`;
 2. remove the `Disabled` key from the installed copy;
 3. install it at
    `~/Library/LaunchAgents/ai.hermes.olympus-supervisor.plist`;

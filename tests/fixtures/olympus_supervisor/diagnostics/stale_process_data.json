@@ -1,0 +1,54 @@
+{
+  "generated_at": 2000000000.0,
+  "generated_at_iso": "2033-05-18T03:33:20Z",
+  "issues": [],
+  "jobs": [
+    {
+      "schema_version": "hermes-job-diagnostics/1",
+      "job_id": "olympus-stale-fixture",
+      "title": "Stale process fixture",
+      "status": "failed",
+      "created_at": 1999990000.0,
+      "updated_at": 1999990100.0,
+      "started_at": 1999990001.0,
+      "completed_at": null,
+      "lanes": {
+        "provider": {
+          "lane_id": "provider",
+          "title": "Expired provider process",
+          "status": "working",
+          "effective_status": "dead",
+          "status_since": 1999990001.0,
+          "started_at": 1999990001.0,
+          "updated_at": 1999990100.0,
+          "completed_at": null,
+          "current_step": "provider response",
+          "last_meaningful_output": "",
+          "last_meaningful_output_at": 1999990001.0,
+          "heartbeat_at": 1999990100.0,
+          "retry_count": 1,
+          "blocker": null,
+          "next_expected_action": "inspect before resume",
+          "provider": "codex",
+          "model": "gpt-5",
+          "process": {
+            "pid": 999999,
+            "hostname": "fixture-host",
+            "start_token": "stale-start-token"
+          },
+          "session_id": "stale-session",
+          "task_id": "__TASK_ID__",
+          "platform": "olympus",
+          "read_only": true,
+          "depends_on": [],
+          "resources": [],
+          "timing": {
+            "total_elapsed": 9900.0,
+            "model_wait": 9800.0
+          }
+        }
+      },
+      "spans": []
+    }
+  ]
+}
