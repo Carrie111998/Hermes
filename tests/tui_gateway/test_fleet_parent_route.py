@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 import types
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -322,6 +323,122 @@ def test_resume_rebuilds_route_from_authoritative_lineage_pin():
     assert route["model"] == "grok-4.5"
     assert route["provider"] == "xai-oauth"
     assert route["fleet_lineage_root_id"] == "stored-root"
+
+
+def test_compression_tip_resume_resolves_original_lineage_pin():
+    pin = _pin()
+    reads: list[tuple[str, str]] = []
+
+    class FakeStore:
+        def read_parent_pin(self, profile_id, lineage_root_id):
+            reads.append((profile_id, lineage_root_id))
+            return pin
+
+    route = fleet_parent.restore_parent_route(
+        {
+            "id": "compressed-tip",
+            "model_config": {
+                "model_source": "fleet_auto",
+                "fleet_lineage_root_id": "stored-root",
+                "fleet_route_identity": "sha256:route",
+            },
+        },
+        profile_id="default",
+        store=FakeStore(),
+    )
+
+    assert reads == [("default", "stored-root")]
+    assert route is not None
+    assert route["fleet_lineage_root_id"] == "stored-root"
+    assert route["fleet_route_identity"] == "sha256:route"
+    assert route["model"] == "grok-4.5"
+
+
+def test_session_info_event_uses_owning_transport_with_route_truth(monkeypatch):
+    frames: list[dict] = []
+
+    class CaptureTransport:
+        def write(self, frame):
+            frames.append(frame)
+            return True
+
+        def close(self):
+            return None
+
+    route = {
+        **fleet_parent.parent_route_metadata(_pin()),
+        "fleet_profile_id": "default",
+    }
+    session = {
+        "agent": None,
+        "fleet_parent_route": route,
+        "model_source": "fleet_auto",
+        "session_key": "stored-root",
+        "transport": CaptureTransport(),
+    }
+    server._sessions["transport-route"] = session
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    agent = types.SimpleNamespace(
+        model="grok-4.5",
+        provider="xai-oauth",
+        reasoning_config={"enabled": True, "effort": "max"},
+        service_tier=None,
+        session_id="stored-root",
+        tools=[],
+    )
+    server._emit(
+        "session.info",
+        "transport-route",
+        server._session_info(agent, session),
+    )
+
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame["params"]["session_id"] == "transport-route"
+    assert frame["params"]["payload"]["model_source"] == "fleet_auto"
+    assert frame["params"]["payload"]["fleet_lane_id"] == "grok"
+    assert frame["params"]["payload"]["fleet_route_identity"] == "sha256:route"
+    assert frame["params"]["payload"]["display_label"] == "Grok · Fleet"
+
+
+def test_compute_host_turn_frame_carries_exact_parent_route():
+    route = {
+        **fleet_parent.parent_route_metadata(_pin()),
+        "fleet_profile_id": "default",
+    }
+    session = {
+        "history_lock": threading.Lock(),
+        "history": [],
+        "history_version": 0,
+        "attached_images": [],
+        "session_key": "stored-root",
+        "cols": 80,
+        "cwd": str(Path.cwd()),
+        "profile_home": "",
+        "model_override": {
+            "model": "grok-4.5",
+            "provider": "xai-oauth",
+        },
+        "create_reasoning_override": {"enabled": True, "effort": "max"},
+        "create_service_tier_override": "",
+        "fleet_parent_route": route,
+        "source": "desktop",
+    }
+
+    frame = server._compute_host_turn_frame(
+        "request-transport",
+        "runtime-sid",
+        session,
+        "hello",
+    )
+
+    assert frame["fleet_parent_route"] == route
+    assert frame["model_override"] == {
+        "model": "grok-4.5",
+        "provider": "xai-oauth",
+    }
+    assert frame["service_tier_override"] == ""
 
 
 def test_parent_turn_guard_releases_lease_and_cools_future_admissions_on_failure():

@@ -368,4 +368,29 @@ def test_inspection_serializes_parent_and_worker_eligibility_separately(
     assert capacity["comparability_group"] == "subscription-weekly"
     assert capacity["quota_window_id"] == "2026-W30"
     assert capacity["measurement_kind"] == "measured"
+    assert payload["pin_state"] == {
+        "task_worker": {"total": 0, "by_lane": {}, "by_status": {}},
+        "desktop_parent": {"total": 0, "by_lane": {}, "by_status": {}},
+    }
     assert not service.store.path.exists()
+
+
+def test_inspection_reports_redacted_parent_pin_state(tmp_path):
+    service = _service(tmp_path)
+    admission = service.admit_parent(
+        profile_id="default",
+        lineage_root_id="lineage-status",
+        session_id="session-status",
+        task=_task("session-status"),
+    )
+    assert admission.pin is not None
+
+    payload = build_inspection_payload(service, command="status")
+
+    assert payload["pin_state"]["desktop_parent"] == {
+        "total": 1,
+        "by_lane": {"chatgpt_codex": 1},
+        "by_status": {"pinned": 1},
+    }
+    assert payload["pin_state"]["task_worker"]["total"] == 0
+    assert "lineage-status" not in str(payload["pin_state"])

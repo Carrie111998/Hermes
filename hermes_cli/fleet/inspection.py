@@ -191,6 +191,13 @@ def build_inspection_payload(
         and service.config.parent_desktop_enabled
         and any(item.eligible for item in visible_parent)
     )
+    try:
+        pin_state = service.store.pin_state_summary()
+    except (AttributeError, OSError):
+        pin_state = {
+            "task_worker": {"total": 0, "by_lane": {}, "by_status": {}},
+            "desktop_parent": {"total": 0, "by_lane": {}, "by_status": {}},
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "command": command,
@@ -200,6 +207,7 @@ def build_inspection_payload(
             ReasonCode.MET.value if has_route else ReasonCode.NO_ELIGIBLE_LANE.value
         ),
         "evaluations": serialize_evaluations(visible),
+        "pin_state": pin_state,
         "purposes": {
             RoutePurpose.TASK_WORKER.value: {
                 "route_purpose": RoutePurpose.TASK_WORKER.value,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,35 @@ def test_help_exposes_only_the_bounded_v1_surface(capsys):
     for command in ("doctor", "plan", "run", "status", "audit", "release"):
         assert command in output
     assert "continue" not in output
+
+
+def test_real_main_parser_keeps_fleet_registered(
+    tmp_path, capsys, monkeypatch
+):
+    import hermes_cli.main as main_module
+    import hermes_cli.subcommands.fleet as fleet_subcommand
+
+    service, _, _ = _service(tmp_path)
+    monkeypatch.setattr(main_module, "_set_process_title", lambda: None)
+    monkeypatch.setattr(main_module, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(
+        main_module,
+        "_recover_from_interrupted_install",
+        lambda: None,
+    )
+    monkeypatch.setattr(fleet_subcommand, "_default_service", lambda: service)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "fleet", "status", "--json"],
+    )
+
+    main_module.main()
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command"] == "status"
+    assert set(payload["purposes"]) == {"task_worker", "desktop_parent"}
+    assert "fleet" in main_module._BUILTIN_SUBCOMMANDS
 
 
 def test_plan_json_is_stable_provenance_rich_and_read_only(tmp_path, capsys):
@@ -141,6 +171,45 @@ def test_status_is_read_only_even_when_no_lane_is_eligible(tmp_path, capsys):
     assert code == 0
     assert payload["reason"] == "NO_ELIGIBLE_LANE"
     assert not service.store.path.exists()
+
+
+def test_human_status_names_parent_and_worker_matrices(tmp_path, capsys):
+    service, _, _ = _service(tmp_path)
+    args = _parser().parse_args(["fleet", "status"])
+
+    assert fleet_command(args, service=service) == 0
+
+    output = capsys.readouterr().out
+    assert "[task_worker]" in output
+    assert "[desktop_parent]" in output
+    assert "adapter=native_provider" in output
+    assert "model=" in output
+    assert "pins task_worker=0 desktop_parent=0" in output
+    assert not service.store.path.exists()
+
+
+def test_skill_and_user_docs_distinguish_parent_from_worker_routes():
+    root = Path(__file__).parents[3]
+    skill = (
+        root
+        / "skills"
+        / "autonomous-ai-agents"
+        / "fleet-balanced-router"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    docs = (
+        root / "docs" / "user-guide" / "features" / "fleet-balanced-router.md"
+    ).read_text(encoding="utf-8")
+
+    assert "do not call `hermes fleet run` to readmit or replace it" in skill
+    assert "`task_worker`" in skill
+    assert "`desktop_parent`" in skill
+    assert "Claude Code OAuth" in docs
+    assert "Claude Opus 4.8" in docs
+    assert "Antigravity" in docs
+    assert "parent-ineligible" in docs
+    assert "GOOGLE_API_KEY" in docs
+    assert "GEMINI_API_KEY" in docs
 
 
 def test_run_and_filtered_jsonl_audit_use_real_store(tmp_path, capsys):

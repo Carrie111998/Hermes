@@ -17,6 +17,15 @@ substantive bounded task. Explicit fleet requests also activate it. Do not
 admit casual conversation, status questions, tiny edits, or a continuation as
 a new task.
 
+First determine which admission surface owns the work:
+
+- A Desktop session whose authoritative runtime metadata reports
+  `model_source=fleet_auto` and `fleet_route_purpose=desktop_parent` is already
+  admitted and pinned as a `desktop_parent`. Execute that conversation
+  normally; do not call `hermes fleet run` to readmit or replace it.
+- The CLI workflow below creates a separate `task_worker` for a bounded child
+  task. It never changes or substitutes the active parent session.
+
 1. Save a self-contained UTF-8 task file and pass an explicit workspace with
    `hermes fleet plan --task-file <path> --cwd <workspace> --json`.
 2. Treat `NO_ELIGIBLE_LANE` as final for this attempt. Never bypass failed
@@ -33,5 +42,7 @@ a new task.
 `status`, `doctor`, `plan`, and `audit` are read-only. Do not edit credentials,
 capacity evidence, or fleet state to manufacture eligibility.
 
-Fleet admission happens once per new substantive task. It does not wrap every
-LLM call, alter the current conversation model, or reroute an active task.
+Parent admission happens before Desktop agent construction. Child admission
+happens once per new substantive bounded task. Neither path wraps every LLM
+call or reroutes an active session; resume and compression continuations retain
+the original lineage pin.

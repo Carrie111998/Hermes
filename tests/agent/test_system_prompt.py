@@ -122,7 +122,34 @@ class TestFleetWorkerGuard:
             stable = _stable_prompt(agent)
 
         assert "Fleet default workflow is enabled" in stable
+        assert (
+            "Desktop Fleet Auto may admit and pin this parent before agent "
+            "construction" in stable
+        )
+        assert "No active session migrates" in stable
+        assert (
+            "Do not call `hermes fleet run` to readmit or replace this parent"
+            in stable
+        )
+        assert "separate child only" not in stable
         assert "already admitted and pinned" not in stable
+
+    def test_primary_fleet_instruction_is_byte_stable_for_agent_lifetime(self):
+        agent = _make_agent(platform="desktop")
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={
+                "fleet": {
+                    "enabled": True,
+                    "parent_desktop_enabled": True,
+                }
+            },
+        ):
+            first = _stable_prompt(agent)
+            second = _stable_prompt(agent)
+
+        assert first == second
 
 
 class TestTelegramRichMessagesHint:

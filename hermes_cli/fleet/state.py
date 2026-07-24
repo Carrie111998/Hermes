@@ -264,6 +264,45 @@ class FleetStore:
         finally:
             connection.close()
 
+    def pin_state_summary(self) -> dict[str, dict]:
+        """Return redacted read-only pin counts without creating fleet state."""
+
+        empty = {
+            "task_worker": {"total": 0, "by_lane": {}, "by_status": {}},
+            "desktop_parent": {"total": 0, "by_lane": {}, "by_status": {}},
+        }
+        connection = self._connect_existing()
+        if connection is None:
+            return empty
+        try:
+            for purpose, table in (
+                ("task_worker", "tasks"),
+                ("desktop_parent", "parent_sessions"),
+            ):
+                if not self._table_exists(connection, table):
+                    continue
+                rows = connection.execute(
+                    f"""
+                    SELECT lane_id,status,COUNT(*) AS total
+                    FROM {table}
+                    GROUP BY lane_id,status
+                    ORDER BY lane_id,status
+                    """
+                ).fetchall()
+                target = empty[purpose]
+                for row in rows:
+                    count = int(row["total"])
+                    target["total"] += count
+                    target["by_lane"][row["lane_id"]] = (
+                        target["by_lane"].get(row["lane_id"], 0) + count
+                    )
+                    target["by_status"][row["status"]] = (
+                        target["by_status"].get(row["status"], 0) + count
+                    )
+            return empty
+        finally:
+            connection.close()
+
     @staticmethod
     def _audit(
         connection: sqlite3.Connection,

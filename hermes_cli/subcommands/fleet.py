@@ -150,14 +150,51 @@ def _emit(payload: dict[str, Any], *, json_output: bool) -> None:
             f"{capacity.get('freshness', 'unknown')}, "
             f"{capacity.get('confidence', 'unknown')})"
         )
-    for item in payload.get("evaluations", []):
-        capacity = item.get("capacity") or {}
+    purposes = payload.get("purposes")
+    matrices = (
+        [
+            (purpose, purposes[purpose])
+            for purpose in ("task_worker", "desktop_parent")
+            if purpose in purposes
+        ]
+        if isinstance(purposes, dict)
+        else [(None, {"evaluations": payload.get("evaluations", [])})]
+    )
+    for purpose, matrix in matrices:
+        if purpose is not None:
+            print(
+                f"[{purpose}] enabled={str(bool(matrix.get('enabled'))).lower()} "
+                f"eligible={str(bool(matrix.get('eligible'))).lower()}"
+            )
+        for item in matrix.get("evaluations", []):
+            capacity = item.get("capacity") or {}
+            comparability = "/".join(
+                str(value)
+                for value in (
+                    capacity.get("comparability_group"),
+                    capacity.get("quota_window_id"),
+                )
+                if value
+            )
+            print(
+                f"{item['lane_id']}: {','.join(item['reasons'])} "
+                f"adapter={item['adapter_kind']} "
+                f"model={item.get('model_id') or 'none'} "
+                f"effort={item.get('effort') or 'none'} "
+                f"capacity={capacity.get('source_kind', 'none')} "
+                f"hash={capacity.get('source_hash', 'none')} "
+                f"captured={capacity.get('captured_at', 'unknown')} "
+                f"freshness={capacity.get('freshness', 'unknown')} "
+                f"confidence={capacity.get('confidence', 'unknown')} "
+                f"comparability={comparability or 'none'}"
+            )
+    pin_state = payload.get("pin_state")
+    if isinstance(pin_state, dict):
+        worker_total = (pin_state.get("task_worker") or {}).get("total", 0)
+        parent_total = (pin_state.get("desktop_parent") or {}).get("total", 0)
         print(
-            f"{item['lane_id']}: {','.join(item['reasons'])} "
-            f"adapter={item['adapter_kind']} "
-            f"capacity={capacity.get('source_kind', 'none')} "
-            f"freshness={capacity.get('freshness', 'unknown')} "
-            f"confidence={capacity.get('confidence', 'unknown')}"
+            f"pins task_worker={worker_total} "
+            f"desktop_parent={parent_total}"
         )
     if payload.get("task_id"):
         print(f"task_id={payload['task_id']}")

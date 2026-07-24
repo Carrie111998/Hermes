@@ -1,12 +1,23 @@
 # Fleet-balanced task router
 
-`hermes fleet` is an opt-in CLI edge feature for routing a bounded task to one
-qualified subscription-backed worker. It adds no model tool and does not change
-the provider or model of an existing Hermes conversation.
+Fleet has two explicit admission surfaces backed by one deterministic policy
+and state engine:
+
+- `desktop_parent` selects a qualified native subscription route before a new
+  Desktop agent is constructed. The selected route is durably pinned to that
+  conversation lineage.
+- `task_worker` is the `hermes fleet plan/run` CLI workflow for a separate
+  bounded child task.
+
+Fleet adds no model tool, never intercepts an individual LLM call, and never
+migrates an active conversation.
 
 ## Safety contract
 
 - Fleet is disabled by default under `fleet.enabled` in `config.yaml`.
+- Desktop parent admission has a separate default-off gate at
+  `fleet.parent_desktop_enabled`. Changing either gate affects new sessions;
+  it does not rewrite an existing pin.
 - Credential-shaped fleet config is rejected. API keys, unknown auth sources,
   pay-as-you-go/overage, and incomplete qualification all make a lane
   ineligible.
@@ -25,8 +36,33 @@ the provider or model of an existing Hermes conversation.
   advance rotation.
 - `run` selects once for a new task ID, then pins that task to its lane.
   Reusing `--task-id` never migrates the task to another lane.
+- Desktop Fleet Auto admits exactly once before parent construction. Every
+  turn, resume, and compression continuation resolves the original lineage
+  pin. Provider failure is reported; it cannot silently select a replacement.
 - The optional `C:/HermesBridge/usage-weekly.json` source is opened read-only.
   It is capacity evidence only, never authentication evidence.
+
+## Parent route truth
+
+Codex (`openai-codex`), Claude Opus 4.8 (`anthropic`), and Grok 4.5
+(`xai-oauth`) are native-parent candidates only when their exact
+subscription-only, no-paid-fallback, capability, model, effort, and fast-off
+gates pass. The Claude route reads the live Claude Code OAuth credential
+through the existing Anthropic adapter; it never substitutes
+`ANTHROPIC_API_KEY`.
+
+Antigravity remains an external `task_worker` and is parent-ineligible until a
+real persistent driver proves all of the following: two-turn continuity through
+`agy --conversation` and `agy --continue`, remote-control operation, and
+provider-reported served-model evidence for Gemini 3.1 Pro (High). The existing
+one-shot receipt is not parent-session proof. Fleet never uses
+`GOOGLE_API_KEY` or `GEMINI_API_KEY` for this route. Kimi remains disabled for
+both surfaces.
+
+Desktop settings show task-worker and parent matrices separately. A fresh
+Fleet Auto draft displays selection as pending; after `session.create`, the
+backend-provided lane, adapter kind, provider, and model label are
+authoritative. Manual pre-session model selection bypasses Fleet Auto.
 
 ## Commands
 
@@ -47,10 +83,10 @@ JSON output includes reason codes and, when available, the lane, adapter kind,
 model/effort, bridge SHA-256 identity, capture/read/expiry timestamps,
 freshness, confidence, and effective remaining capacity.
 
-## V1 limitation
+## Qualification limitation
 
 The bundled CLI does not infer subscription qualification from the mere
 presence of a credential or executable. Unless current, attributable auth,
 billing, capability, and fast-off evidence has been supplied by a reviewed
 integration, `doctor` and `plan` report the failed gates and `run` starts no
-child process. Kimi remains explicitly deferred.
+child process. Parent admission fails closed without constructing a session.

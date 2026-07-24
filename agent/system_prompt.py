@@ -340,14 +340,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _fleet = load_config_readonly().get("fleet") or {}
             if isinstance(_fleet, dict) and _fleet.get("enabled") is True:
                 stable_parts.append(
-                    "Fleet default workflow is enabled. For each new substantive "
-                    "bounded task, load the fleet-balanced-router skill and use "
-                    "its plan/run workflow before doing that task locally. Do not "
-                    "route casual conversation, status questions, tiny edits, or "
-                    "continuations as new tasks. Reuse the existing task_id for "
-                    "continuations so lane pinning is preserved. Fleet selects a "
-                    "separate child only; never change this conversation's active "
-                    "provider/model and never intercept individual LLM calls."
+                    "Fleet default workflow is enabled. Desktop Fleet Auto may "
+                    "admit and pin this parent before agent construction. If this "
+                    "parent was pre-admitted, execute the conversation normally. "
+                    "Do not call `hermes fleet run` to readmit or replace this "
+                    "parent. For a separate new substantive bounded child task, "
+                    "load the fleet-balanced-router skill and use its plan/run "
+                    "workflow. Do not route casual conversation, status questions, "
+                    "tiny edits, or continuations as new tasks. Reuse the existing "
+                    "task_id for child-task continuations so lane pinning is "
+                    "preserved. No active session migrates, and Fleet never "
+                    "intercepts individual LLM calls."
                 )
         except Exception:
             pass
