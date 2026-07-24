@@ -104,6 +104,7 @@ def _capture_session_for_engine() -> None:
                 "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or None,
                 "user_id": get_session_env("HERMES_SESSION_USER_ID", "") or None,
                 "profile": get_session_env("HERMES_SESSION_PROFILE", "") or os.environ.get("HERMES_PROFILE"),
+                "session_key": get_session_env("HERMES_SESSION_KEY", ""),
             }
             # Write to both /tmp and the engine state dir for reliability
             for path in ["/tmp/wfe-session.json",

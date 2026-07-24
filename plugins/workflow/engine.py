@@ -634,31 +634,6 @@ class WorkflowEngine:
             logger.debug("os.environ session lookup failed: %s", _exc)
         return {}
 
-    def _subscribe_final_cards(self, card_ids: list[str],
-                                session_info: dict = None) -> None:
-        """Subscribe the originating session to final-layer cards."""
-        if not card_ids:
-            return
-        try:
-            from hermes_cli import kanban_db as _kb
-            # Merge live ContextVars with persisted session_info from state file.
-            info = {**self._get_session_info(), **(session_info or {})}
-            platform = info.get("platform", "")
-            chat_id = info.get("chat_id", "")
-            if platform and chat_id:
-                with _kb.connect(board=self.kanban_board) as _conn:
-                    for cid in card_ids:
-                        _kb.add_notify_sub(
-                            _conn, task_id=cid,
-                            platform=platform, chat_id=chat_id,
-                            thread_id=info.get("thread_id"),
-                            user_id=info.get("user_id"),
-                            notifier_profile=info.get("profile"),
-                        )
-                print(f"   🔔 subscribed {len(card_ids)} final card(s) for notifications")
-        except Exception:
-            print("   ⚠ failed to subscribe final-layer cards for notifications")
-
     def _spawn_supervisor(self, workflow_name: str, run_id: str) -> None:
         """Spawn a detached subprocess to supervise loop zones.
 
@@ -2320,10 +2295,6 @@ class WorkflowEngine:
                             results[nid] = "failed"
                             print(f"   ✗ {nid} → failed: {e}")
 
-                # Subscribe final-layer cards
-                if last_layer_card_ids:
-                    self._subscribe_final_cards(last_layer_card_ids, session_info=_session_info)
-
                 self._save_state(workflow_name, states, results, len(layers) - 1, layers,
                                 run_id=workflow.run_id, context=context,
                                 session_info=_session_info)
@@ -2476,24 +2447,6 @@ class WorkflowEngine:
                     except Exception:
                         pass  # Non-fatal: heartbeat sweep has created_at fallback
                     print(f"   ✓ {nid} → card {card_id}")
-                    # Subscribe final-layer cards immediately after dispatch
-                    # so the notification subscription exists before the card
-                    # completes (avoids race with notifier removing terminal subs).
-                    if layer_idx == len(layers) - 1 and _session_info:
-                        try:
-                            from hermes_cli import kanban_db as _skb
-                            _board = self.kanban_board
-                            with _skb.connect(board=_board) as _sconn:
-                                _skb.add_notify_sub(
-                                    _sconn, task_id=card_id,
-                                    platform=_session_info.get("platform", ""),
-                                    chat_id=_session_info.get("chat_id", ""),
-                                    thread_id=_session_info.get("thread_id"),
-                                    user_id=_session_info.get("user_id"),
-                                    notifier_profile=_session_info.get("profile"),
-                                )
-                        except Exception:
-                            pass
                 except Exception as e:
                     state.status = "failed"
                     state.error = str(e)
@@ -2503,31 +2456,6 @@ class WorkflowEngine:
             # Save state after dispatching layer
             self._save_state(workflow_name, states, results, layer_idx, layers,
                             run_id=workflow.run_id, context=context)
-
-            # Subscribe final-layer cards for notification. Must happen
-            # BEFORE monitoring so subscriptions exist before cards complete
-            # (the notifier removes subs for terminal tasks).
-            if layer_idx == len(layers) - 1 and _session_info:
-                final_card_ids = [
-                    states[nid].kanban_card_id for nid in layer
-                    if states[nid].kanban_card_id
-                ]
-                if final_card_ids:
-                    try:
-                        from hermes_cli import kanban_db as _skb
-                        with _skb.connect(board=self.kanban_board) as _sconn:
-                            for _cid in final_card_ids:
-                                _skb.add_notify_sub(
-                                    _sconn, task_id=_cid,
-                                    platform=_session_info.get("platform", ""),
-                                    chat_id=_session_info.get("chat_id", ""),
-                                    thread_id=_session_info.get("thread_id"),
-                                    user_id=_session_info.get("user_id"),
-                                    notifier_profile=_session_info.get("profile"),
-                                )
-                        print(f"   📬 Subscribed {len(final_card_ids)} final-layer card(s)")
-                    except Exception:
-                        pass
 
             # Monitor completion for this layer. Synthetic nodes were
             # auto-completed in the dispatch loop above (state.status
@@ -2705,15 +2633,6 @@ class WorkflowEngine:
         final_status = "failed" if failed > 0 else "completed"
         self._update_execution(workflow.run_id, status=final_status,
                               current_layer=layer_idx)
-
-        # Subscribe final-layer cards for notification.
-        # The notifier pushes terminal events back to the calling session.
-        if layers:
-            final_nids = layers[-1]
-            final_card_ids = [states[nid].kanban_card_id for nid in final_nids
-                              if states[nid].kanban_card_id]
-            if final_card_ids:
-                self._subscribe_final_cards(final_card_ids)
 
         self._clear_state(workflow_name, run_id=workflow.run_id)
 

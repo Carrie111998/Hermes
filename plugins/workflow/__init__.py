@@ -138,72 +138,17 @@ def register(ctx):
     ctx.register_hook("kanban_task_completed", _on_kanban_task_completed)
     ctx.register_hook("kanban_task_blocked", _on_kanban_task_blocked)
 
-
-def _check_final_layer_subscription(task_id: str):
-    """Subscribe final-layer cards for notification.
-
-    Runs after every card completion. Handles two cases:
-    1. Card is in a state file — check if all final-layer nodes are done
-    2. Card is NOT in any state file — match card title to final-layer nodes
-    """
-    try:
-        result = _find_state_for_card(task_id)
-        if result is not None:
-            state, _ = result
-            layers = state.get("layers", [])
-            if layers:
-                final_layer_nids = layers[-1]
-                all_final_done = all(
-                    state.get("states", {}).get(nid, {}).get("status") == "done"
-                    for nid in final_layer_nids
-                )
-                if all_final_done and state.get("session_info"):
-                    _subscribe_final_layer(state, len(layers) - 1, layers)
-        else:
-            # Card not in any state file — find state with session_info
-            # and match card title to final-layer nodes
-            import json as _j
-            from pathlib import Path as _P
-            state_dir = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state"
-            for sf in sorted(state_dir.glob("*_state.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                try:
-                    state2 = _j.loads(sf.read_text())
-                    if not state2.get("session_info"):
-                        continue
-                    layers2 = state2.get("layers", [])
-                    if not layers2:
-                        continue
-                    final_layer_nids = layers2[-1]
-                    from hermes_cli import kanban_db as kb
-                    board = state2.get("kanban_board")
-                    if not board:
-                        continue
-                    conn = kb.connect(board=board)
-                    try:
-                        card = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
-                        if card:
-                            title = card[0] if isinstance(card, tuple) else card["title"]
-                            for nid in final_layer_nids:
-                                if f"[{nid}]" in title:
-                                    _subscribe_final_layer(state2, len(layers2) - 1, layers2)
-                                    break
-                    finally:
-                        conn.close()
-                    break
-                except Exception:
-                    continue
-    except Exception:
-        pass
+    # Register pre_gateway_dispatch hook to capture gateway reference
+    # for the workflow completion watcher thread
+    ctx.register_hook("pre_gateway_dispatch", _capture_gateway)
 
 
 def _on_kanban_task_completed(*, task_id: str, **kwargs):
     """Update the job log DB when a workflow node card completes."""
     _update_node_card_db(task_id, "done")
     _handle_workflow_node_event(task_id, "done")
-    # Always check final-layer subscriptions — the handler may return
-    # early if the card isn't in a state file, but the card could still
-    # be a final-layer card that needs a subscription for notification.
-    _check_final_layer_subscription(task_id)
+    # Check if this completed card is a final-layer card and notify
+    _notify_workflow_complete(task_id)
 
 
 def _on_kanban_task_blocked(*, task_id: str, reason: str = None, **kwargs):
@@ -468,9 +413,6 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
                     _save_state_file(state_path, state)
                     print(f"   ✓ Layer {current_layer} complete — advancing to {current_layer + 1}")
 
-                    # Subscribe final-layer cards for notification
-                    _subscribe_final_layer(state, current_layer, layers)
-
                     # Spawn supervisor to create next layer's cards
                     _spawn_supervisor_for_next_layer(state, state_path)
             finally:
@@ -478,60 +420,6 @@ def _handle_workflow_node_event(task_id: str, status: str, reason: str = None):
 
     except Exception as e:
         print(f"   ⚠  Workflow event handler error: {e}")
-
-    # Always check if final-layer cards need subscribing — the hook above
-    # may return early if current_layer is already advanced past the end,
-    # but the final-layer cards still need a subscription for notification.
-    # Also handles cards not in any state file (created by a supervisor
-    # that already exited).
-    try:
-        result2 = _find_state_for_card(task_id)
-        if result2 is not None:
-            state2, _ = result2
-            layers2 = state2.get("layers", [])
-            if layers2:
-                final_layer_nids = layers2[-1]
-                all_final_done = all(
-                    state2.get("states", {}).get(nid, {}).get("status") == "done"
-                    for nid in final_layer_nids
-                )
-                if all_final_done and state2.get("session_info"):
-                    _subscribe_final_layer(state2, len(layers2) - 1, layers2)
-        else:
-            # Card not in any state file — find state with session_info and
-            # match card title to final-layer nodes
-            import json as _j
-            from pathlib import Path as _P
-            state_dir = _P(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines" / ".engine-state"
-            for sf in sorted(state_dir.glob("*_state.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                try:
-                    state2 = _j.loads(sf.read_text())
-                    if not state2.get("session_info"):
-                        continue
-                    layers2 = state2.get("layers", [])
-                    if not layers2:
-                        continue
-                    final_layer_nids = layers2[-1]
-                    from hermes_cli import kanban_db as kb
-                    board = state2.get("kanban_board")
-                    if not board:
-                        continue
-                    conn = kb.connect(board=board)
-                    try:
-                        card = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
-                        if card:
-                            title = card[0] if isinstance(card, tuple) else card["title"]
-                            for nid in final_layer_nids:
-                                if f"[{nid}]" in title:
-                                    _subscribe_final_layer(state2, len(layers2) - 1, layers2)
-                                    break
-                    finally:
-                        conn.close()
-                    break
-                except Exception:
-                    continue
-    except Exception:
-        pass
 
 
 def _save_state_file(path, state):
@@ -551,69 +439,6 @@ def _save_state_file(path, state):
         except Exception:
             pass
     Path(path).write_text(json.dumps(state, indent=2, default=str))
-
-
-def _subscribe_final_layer(state, completed_layer_idx, layers):
-    """Subscribe final-layer cards for notification when the last layer completes."""
-    # Only subscribe when the completed layer is the last one
-    if completed_layer_idx + 1 < len(layers):
-        return
-    session_info = state.get("session_info", {})
-    if not session_info.get("platform") or not session_info.get("chat_id"):
-        return
-    # Find card IDs for the final layer
-    final_layer = layers[-1]
-    states = state.get("states", {})
-    card_ids = []
-    for nid in final_layer:
-        ns = states.get(nid, {})
-        card_id = ns.get("kanban_card_id")
-        if card_id:
-            card_ids.append(card_id)
-    # If state file doesn't have card_ids (supervisor created them but
-    # state was overwritten), query kanban DB by title pattern
-    if not card_ids:
-        try:
-            from hermes_cli import kanban_db as kb
-            board = state.get("kanban_board")
-            if board:
-                conn = kb.connect(board=board)
-                try:
-                    for nid in final_layer:
-                        rows = conn.execute(
-                            "SELECT id FROM tasks WHERE title LIKE ? AND status != 'deleted' ORDER BY created_at DESC LIMIT 1",
-                            (f"%{nid}%",)
-                        ).fetchall()
-                        if rows:
-                            card_ids.append(rows[0][0])
-                finally:
-                    conn.close()
-        except Exception:
-            pass
-    if not card_ids:
-        return
-    # Create subscriptions
-    try:
-        from hermes_cli import kanban_db as kb
-        board = state.get("kanban_board")
-        if not board:
-            return
-        conn = kb.connect(board=board)
-        try:
-            for cid in card_ids:
-                kb.add_notify_sub(
-                    conn, task_id=cid,
-                    platform=session_info["platform"],
-                    chat_id=session_info["chat_id"],
-                    thread_id=session_info.get("thread_id"),
-                    user_id=session_info.get("user_id"),
-                    notifier_profile=session_info.get("profile"),
-                )
-            print(f"   📬 Subscribed {len(card_ids)} final-layer card(s) to session")
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f"   ⚠  Failed to subscribe final-layer cards: {e}")
 
 
 def _spawn_supervisor_for_next_layer(state, state_path):
@@ -660,3 +485,207 @@ def _spawn_supervisor_for_next_layer(state, state_path):
         print(f"   👤 supervisor spawned for layer {current_layer}")
     except Exception as e:
         print(f"   ⚠  Failed to spawn supervisor: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Direct session injection — completion notification via /tmp markers
+# ---------------------------------------------------------------------------
+
+
+def _notify_workflow_complete(task_id: str):
+    """Write a completion marker to /tmp for the watcher thread to inject.
+
+    When a final-layer card completes, reads the state file for session info
+    and writes a JSON marker that the polling daemon picks up and injects
+    into the correct session.
+    """
+    try:
+        result = _find_state_for_card(task_id)
+        if result is None:
+            return
+        state, _ = result
+        session_info = state.get("session_info", {})
+        if not session_info.get("platform") or not session_info.get("chat_id"):
+            return
+
+        layers = state.get("layers", [])
+        if not layers:
+            return
+
+        final_layer_nids = layers[-1]
+        # Check if all final-layer nodes are done
+        all_final_done = all(
+            state.get("states", {}).get(nid, {}).get("status") == "done"
+            for nid in final_layer_nids
+        )
+        if not all_final_done:
+            return
+
+        # All done — write completion marker
+        workflow_name = state.get("workflow_name", "unknown")
+        session_key = session_info.get("session_key", "")
+
+        import json
+        from datetime import datetime, timezone
+        marker = {
+            "session_key": session_key,
+            "platform": session_info.get("platform", ""),
+            "chat_id": session_info.get("chat_id", ""),
+            "thread_id": session_info.get("thread_id"),
+            "user_id": session_info.get("user_id"),
+            "profile": session_info.get("profile"),
+            "workflow_name": workflow_name,
+            "status": "completed",
+            "message": f"✅ Workflow '{workflow_name}' completed — all {len(layers)} layers done",
+        }
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
+        marker_path = Path(f"/tmp/wf-complete-{ts}.json")
+        marker_path.write_text(json.dumps(marker, indent=2, default=str))
+        print(f"   📨 Workflow completion marker written: {marker_path.name}")
+    except Exception as e:
+        print(f"   ⚠  Failed to write completion marker: {e}")
+
+
+# Module-level gateway reference, captured via pre_gateway_dispatch hook
+_gateway_ref = None
+_watcher_started = False
+
+
+def _capture_gateway(**kwargs):
+    """Hook callback to capture the gateway instance for the watcher thread."""
+    global _gateway_ref, _watcher_started
+    gw = kwargs.get("gateway")
+    if gw is not None:
+        _gateway_ref = gw
+        if not _watcher_started:
+            _watcher_started = True
+            _start_completion_watcher()
+    return None  # Don't interfere with the dispatch flow
+
+
+def _start_completion_watcher():
+    """Start a daemon thread that polls /tmp for workflow completion markers.
+
+    When a marker is found, builds a synthetic MessageEvent with the correct
+    session key (including chat_type="thread" for Discord threads) and injects
+    it into the gateway.
+    """
+    import threading
+
+    def _watcher_loop():
+        import glob
+        import time
+        import json
+
+        while True:
+            time.sleep(2)
+            try:
+                markers = sorted(glob.glob("/tmp/wf-complete-*.json"))
+                for marker_path_str in markers:
+                    try:
+                        marker_path = Path(marker_path_str)
+                        data = json.loads(marker_path.read_text())
+
+                        platform_str = data.get("platform", "")
+                        chat_id = data.get("chat_id", "")
+                        thread_id = data.get("thread_id")
+                        user_id = data.get("user_id")
+                        profile = data.get("profile")
+                        message = data.get("message", "Workflow completed")
+
+                        if not platform_str or not chat_id:
+                            marker_path.unlink(missing_ok=True)
+                            continue
+
+                        # Derive correct chat_type from thread_id
+                        chat_type = "thread" if thread_id else "group"
+
+                        # Build session key if not already captured
+                        session_key = data.get("session_key", "")
+
+                        gw = _gateway_ref
+                        if gw is None:
+                            continue
+
+                        # Import gateway types
+                        from gateway.session import SessionSource, build_session_key
+                        from gateway.platforms.base import MessageEvent, MessageType
+                        from gateway.config import Platform
+
+                        # Resolve platform enum
+                        try:
+                            platform = Platform(platform_str)
+                        except ValueError:
+                            platform = Platform(platform_str)
+
+                        # Build the source with correct chat_type
+                        source = SessionSource(
+                            platform=platform,
+                            chat_id=chat_id,
+                            chat_type=chat_type,
+                            thread_id=thread_id,
+                            user_id=user_id,
+                            profile=profile,
+                        )
+
+                        # If no session_key was captured, build one
+                        if not session_key:
+                            session_key = build_session_key(source, profile=profile)
+
+                        # Create synthetic message event
+                        synth_event = MessageEvent(
+                            text=message,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            internal=True,
+                        )
+
+                        # Find the adapter and inject
+                        adapter = gw.adapters.get(platform)
+                        if adapter is None:
+                            logger.warning(
+                                "wf-completion watcher: no adapter for platform %s",
+                                platform_str,
+                            )
+                            marker_path.unlink(missing_ok=True)
+                            continue
+
+                        import asyncio
+                        # Get the gateway's running event loop from the
+                        # captured gateway reference and schedule the
+                        # coroutine on it from this daemon thread.
+                        loop = getattr(gw, "_gateway_loop", None)
+                        if loop and loop.is_running():
+                            fut = asyncio.run_coroutine_threadsafe(
+                                adapter.handle_message(synth_event), loop,
+                            )
+                            fut.result(timeout=10)
+                        elif loop:
+                            loop.run_until_complete(adapter.handle_message(synth_event))
+                        else:
+                            logger.warning(
+                                "wf-completion watcher: no event loop on gateway",
+                            )
+
+                        logger.info(
+                            "wf-completion watcher: injected notification into %s/%s profile=%s",
+                            platform_str, chat_id, profile or "default",
+                        )
+                        marker_path.unlink(missing_ok=True)
+
+                    except Exception as _proc_exc:
+                        logger.warning(
+                            "wf-completion watcher: failed to process %s: %s",
+                            marker_path_str, _proc_exc,
+                        )
+                        # Clean up marker on error
+                        try:
+                            Path(marker_path_str).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # Non-fatal: next poll cycle will retry
+
+    t = threading.Thread(target=_watcher_loop, daemon=True, name="wf-completion-watcher")
+    t.start()
+    print("   👁  Workflow completion watcher started")
