@@ -1,18 +1,19 @@
-"""Tests for agent.transports.acp_approval — generic core ACP approval bridge.
+"""Tests for agent.transports.acp_approval — core ACP approval bridge.
 
-The core bridge is **generic** — no kind classification.  Tests verify:
+Tests verify:
 
-1. CLI callback returned directly (passthrough).
+1. CLI callback used as the underlying channel (passthrough for non-execute).
 2. Gateway context with notify → request_tool_approval bridge.
 3. Gateway context without notify → fail-closed.
 4. Neither CLI nor gateway → fail-closed.
 5. Import failure → fail-closed.
-6. Gateway bridge escalates all kinds identically.
+6. Gateway bridge escalates non-execute kinds; execute → command guards.
 7. Fail-closed always returns "deny".
-8. Dynamic approval-bypass wrapper (yolo / mode:off honored on every path).
-
-Kind-aware routing tests (read/execute/write matrix) live in the plugin's
-test suite (claude-code-acp/tests/test_approval.py).
+8. Dynamic approval-bypass wrapper (yolo / mode:off honored on every path,
+   outermost — wins over the command guards).
+9. Execute routing: kind="execute" with a command goes through
+   check_all_command_guards (approved → "once", denied → "deny", guard
+   failure → channel); other kinds and empty commands go to the channel.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from agent.transports.acp_approval import (
     make_acp_approval_callback,
     _make_fail_closed_callback,
     _wrap_with_bypass_check,
+    _wrap_with_execute_command_guards,
 )
 
 
@@ -56,11 +58,12 @@ class TestCLICallbackPassthrough:
     """When a CLI thread-local callback is registered, it is returned directly."""
 
     def test_cli_callback_wrapped_and_delegates(self):
-        """CLI callback is wrapped in the bypass check but delegates to it.
+        """CLI callback is wrapped but non-execute kinds still delegate to it.
 
-        The generic bridge still does no kind-aware routing — the wrapper only
-        adds the dynamic bypass check.  With bypass off (the fixture default),
-        calling the returned callback forwards to the CLI callback verbatim.
+        With bypass off (the fixture default) and a non-execute kind, calling
+        the returned callback forwards to the CLI callback verbatim.
+        (kind="execute" with a command is intercepted by the command guards —
+        see TestExecuteCommandGuards.)
         """
         fake_cli_cb = MagicMock(return_value="once")
 
@@ -70,12 +73,12 @@ class TestCLICallbackPassthrough:
         ):
             result = make_acp_approval_callback()
 
-        # Wrapped (bypass check), not returned raw…
+        # Wrapped (bypass check + execute guards), not returned raw…
         assert result is not fake_cli_cb
-        # …but delegates to the CLI callback when bypass is inactive.
-        assert result("cmd", "desc", kind="execute") == "once"
+        # …but delegates to the CLI callback for non-execute kinds.
+        assert result("cmd", "desc", kind="read") == "once"
         fake_cli_cb.assert_called_once_with(
-            "cmd", "desc", allow_permanent=False, kind="execute"
+            "cmd", "desc", allow_permanent=False, kind="read"
         )
 
     def test_cli_callback_bypassed_when_active(self):
@@ -138,8 +141,9 @@ def _setup_gateway_env(*, approved=True, request_exc=None):
 class TestGatewayContextIntegration:
     """Integration: make_acp_approval_callback in a gateway context."""
 
-    def test_gateway_callback_escalates_all_kinds(self):
-        """All kinds go through request_tool_approval — no classification."""
+    def test_gateway_escalates_non_execute_kinds(self):
+        """Non-execute kinds go through request_tool_approval; execute is
+        decided by the native command guards, not the gateway channel."""
         mod, req_fn = _setup_gateway_env(approved=True)
 
         with patch("tools.terminal_tool._get_approval_callback", return_value=None):
@@ -154,12 +158,19 @@ class TestGatewayContextIntegration:
                 else:
                     del sys.modules["tools.approval"]
 
-        # All kinds go to request_tool_approval
-        assert cb("read_file", "desc", kind="read") == "once"
-        assert cb("ls -la", "desc", kind="execute") == "once"
-        assert cb("write_file", "desc", kind="write") == "once"
-        assert cb("mystery", "desc", kind="frobnicate") == "once"
-        assert req_fn.call_count == 4
+        with patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": True, "message": None},
+        ) as guards:
+            # Non-execute kinds escalate to request_tool_approval.
+            assert cb("read_file", "desc", kind="read") == "once"
+            assert cb("write_file", "desc", kind="write") == "once"
+            assert cb("mystery", "desc", kind="frobnicate") == "once"
+            assert req_fn.call_count == 3
+            # Execute is decided by the command guards instead.
+            assert cb("ls -la", "desc", kind="execute") == "once"
+            guards.assert_called_once()
+            assert req_fn.call_count == 3
 
     def test_gateway_approved_returns_once(self):
         mod, req_fn = _setup_gateway_env(approved=True)
@@ -233,7 +244,8 @@ class TestGatewayContextIntegration:
                 else:
                     del sys.modules["tools.approval"]
 
-        assert result("tool", "desc", kind="execute") == "deny"
+        # Non-execute kind: nothing can answer, so fail-closed deny.
+        assert result("tool", "desc", kind="read") == "deny"
         mod.request_tool_approval.assert_not_called()
 
 
@@ -256,7 +268,7 @@ class TestFailClosed:
             result = make_acp_approval_callback()
 
         assert result is not None
-        assert result("any", "desc", kind="execute") == "deny"
+        assert result("any", "desc", kind="read") == "deny"
 
     def test_fail_closed_always_deny(self):
         cb = _make_fail_closed_callback("test reason")
@@ -265,7 +277,12 @@ class TestFailClosed:
         assert cb("", "", kind="") == "deny"
 
     def test_fail_closed_for_all_kinds(self):
-        """Fail-closed returns deny regardless of kind."""
+        """Fail-closed returns deny regardless of kind.
+
+        The execute case is pinned to a denied guard result so the assertion
+        is deterministic (an unpatched guard would auto-approve in a
+        non-interactive test environment).
+        """
         with patch(
             "tools.terminal_tool._get_approval_callback",
             return_value=None,
@@ -275,10 +292,14 @@ class TestFailClosed:
         ):
             cb = make_acp_approval_callback()
 
-        assert cb("tool", "desc", kind="read") == "deny"
-        assert cb("tool", "desc", kind="execute") == "deny"
-        assert cb("tool", "desc", kind="write") == "deny"
-        assert cb("tool", "desc", kind="frobnicate") == "deny"
+        with patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": False, "message": "BLOCKED"},
+        ):
+            assert cb("tool", "desc", kind="read") == "deny"
+            assert cb("tool", "desc", kind="execute") == "deny"
+            assert cb("tool", "desc", kind="write") == "deny"
+            assert cb("tool", "desc", kind="frobnicate") == "deny"
 
 
 # --------------------------------------------------------------------------- #
@@ -375,12 +396,16 @@ class TestBypassWrapper:
             cb = make_acp_approval_callback()
 
         # Bypass toggled AFTER the callback was created — must still be honored
-        # (the check is dynamic, evaluated per invocation).
+        # (the check is dynamic, evaluated per invocation).  The bypass wrapper
+        # is outermost, so the execute command guards never run.
         with patch(
             "tools.approval.is_approval_bypass_active",
             return_value=True,
-        ):
+        ), patch(
+            "tools.approval.check_all_command_guards",
+        ) as guards:
             assert cb("rm -rf /", "dangerous", kind="execute") == "once"
+        guards.assert_not_called()
 
     # --- (b) bypass inactive -> inner called normally --- #
 
@@ -400,7 +425,7 @@ class TestBypassWrapper:
         )
 
     def test_bypass_inactive_fail_closed_path_denies(self):
-        """With bypass off, the fail-closed path still denies end-to-end."""
+        """With bypass off, a guard-denied execute still denies end-to-end."""
         with patch(
             "tools.terminal_tool._get_approval_callback",
             return_value=None,
@@ -410,6 +435,9 @@ class TestBypassWrapper:
         ), patch(
             "tools.approval.is_approval_bypass_active",
             return_value=False,
+        ), patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": False, "message": "BLOCKED"},
         ):
             cb = make_acp_approval_callback()
             assert cb("rm -rf /", "dangerous", kind="execute") == "deny"
@@ -440,6 +468,9 @@ class TestBypassWrapper:
         ), patch(
             "tools.approval.is_approval_bypass_active",
             side_effect=RuntimeError("boom"),
+        ), patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": False, "message": "BLOCKED"},
         ):
             cb = make_acp_approval_callback()
             assert cb("rm -rf /", "dangerous", kind="execute") == "deny"
@@ -465,4 +496,154 @@ class TestBypassWrapper:
             assert cb("cmd", "desc", kind="execute") == "once"
         # inner was NOT called a second time — bypass short-circuited it.
         assert inner.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Test 6: Execute routing — kind="execute" → native command guards
+# --------------------------------------------------------------------------- #
+
+
+class TestExecuteCommandGuards:
+    """kind="execute" with a command is decided by check_all_command_guards;
+    other kinds, empty commands, and guard failures fall through to the
+    underlying channel.
+
+    The wrapper is tested directly (precise inner/guard call assertions) and
+    end-to-end through the factory.
+    """
+
+    # --- direct wrapper behavior --- #
+
+    def test_execute_approved_returns_once_without_inner(self):
+        inner = MagicMock(return_value="deny")
+        cb = _wrap_with_execute_command_guards(inner)
+
+        with patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": True, "message": None},
+        ) as guards:
+            assert cb("ls -la", "list files", kind="execute") == "once"
+
+        # Guard received the raw command and the optional CLI callback kwarg.
+        (command, _env_type), kwargs = guards.call_args
+        assert command == "ls -la"
+        assert "approval_callback" in kwargs
+        inner.assert_not_called()
+
+    def test_execute_denied_returns_deny_without_inner(self):
+        inner = MagicMock(return_value="once")
+        cb = _wrap_with_execute_command_guards(inner)
+
+        with patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": False, "message": "BLOCKED"},
+        ):
+            assert cb("rm -rf /", "wipe", kind="execute") == "deny"
+
+        inner.assert_not_called()
+
+    def test_execute_kind_match_is_case_insensitive(self):
+        inner = MagicMock(return_value="deny")
+        cb = _wrap_with_execute_command_guards(inner)
+
+        with patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": True, "message": None},
+        ):
+            assert cb("ls", "", kind="Execute") == "once"
+            assert cb("ls", "", kind="EXECUTE") == "once"
+
+        inner.assert_not_called()
+
+    def test_non_execute_kinds_skip_guards_and_call_inner(self):
+        inner = MagicMock(return_value="session")
+        cb = _wrap_with_execute_command_guards(inner)
+
+        with patch("tools.approval.check_all_command_guards") as guards:
+            for kind in ("read", "edit", "write", "delete", "frobnicate", ""):
+                assert cb("cmd", "desc", kind=kind) == "session"
+
+        guards.assert_not_called()
+        assert inner.call_count == 6
+
+    def test_execute_empty_command_falls_through_to_inner(self):
+        """No command text → nothing to guard → the channel decides."""
+        inner = MagicMock(return_value="always")
+        cb = _wrap_with_execute_command_guards(inner)
+
+        with patch("tools.approval.check_all_command_guards") as guards:
+            assert cb("", "desc", kind="execute") == "always"
+            assert cb("   ", "desc", kind="execute") == "always"
+
+        guards.assert_not_called()
+        assert inner.call_count == 2
+
+    def test_execute_guard_exception_falls_through_to_inner(self):
+        """Unexpected guard failure → channel decides (fail-safe fall-through)."""
+        inner = MagicMock(return_value="deny")
+        cb = _wrap_with_execute_command_guards(inner)
+
+        with patch(
+            "tools.approval.check_all_command_guards",
+            side_effect=RuntimeError("boom"),
+        ):
+            assert cb("ls", "desc", kind="execute") == "deny"
+
+        inner.assert_called_once()
+
+    # --- end-to-end through the factory --- #
+
+    def test_execute_uses_guards_not_fail_closed_channel(self):
+        """An approved guard result wins over the fail-closed channel."""
+        with patch(
+            "tools.terminal_tool._get_approval_callback",
+            return_value=None,
+        ), patch(
+            "tools.approval._is_gateway_approval_context",
+            return_value=False,
+        ), patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": True, "message": None},
+        ) as guards:
+            cb = make_acp_approval_callback()
+            assert cb("git status", "show status", kind="execute") == "once"
+            # A non-execute kind on the same callback still fails closed.
+            assert cb("read_file", "desc", kind="read") == "deny"
+
+        guards.assert_called_once()
+
+    def test_execute_guards_run_before_cli_callback(self):
+        """A safe execute command auto-approves without the CLI callback."""
+        fake_cli_cb = MagicMock(return_value="deny")
+
+        with patch(
+            "tools.terminal_tool._get_approval_callback",
+            return_value=fake_cli_cb,
+        ), patch(
+            "tools.approval.check_all_command_guards",
+            return_value={"approved": True, "message": None},
+        ):
+            cb = make_acp_approval_callback()
+            assert cb("ls -la", "list", kind="execute") == "once"
+
+        fake_cli_cb.assert_not_called()
+
+    def test_bypass_wins_over_guards_end_to_end(self):
+        """yolo / mode=off short-circuits before the guards ever run."""
+        with patch(
+            "tools.terminal_tool._get_approval_callback",
+            return_value=None,
+        ), patch(
+            "tools.approval._is_gateway_approval_context",
+            return_value=False,
+        ), patch(
+            "tools.approval.check_all_command_guards",
+        ) as guards, patch(
+            "tools.approval.is_approval_bypass_active",
+            return_value=True,
+        ):
+            cb = make_acp_approval_callback()
+            assert cb("rm -rf /", "dangerous", kind="execute") == "once"
+
+        guards.assert_not_called()
 

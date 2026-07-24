@@ -5,31 +5,36 @@ a callback suitable for ``ACPClientSession.approval_callback``.  It bridges
 the ACP agent's ``session/request_permission`` to Hermes' standard approval
 gate.
 
-**Core bridge only — no kind classification.**
-
-The generic bridge connects ACP permission requests to the best available
-approval channel:
+The bridge connects ACP permission requests to the best available approval
+channel:
 
 1. **CLI thread-local callback** — if ``tools.terminal_tool._get_approval_callback()``
-   returns one, it is passed through directly (or in a minimal wrapper).  The
-   callback itself decides approve/deny; no kind-based routing is done here.
+   returns one, it is used as the underlying channel.
 2. **Gateway context** — if ``_is_gateway_approval_context()`` is True and a
-   gateway notify callback is registered, escalate **all** permission requests
-   to ``request_tool_approval()`` (human must approve).  No kind-based
-   classification — every request gets the same treatment.
+   gateway notify callback is registered, escalate permission requests to
+   ``request_tool_approval()`` (human must approve).
 3. **Neither** — return a fail-closed callback that always returns ``"deny"``.
 
-Kind-aware strategies (read → once, execute → guard, write → escalate) are
-**plugin-owned**.  Plugins that need kind routing (e.g. claude-code-acp)
-implement their own approval callback factory and do not use this generic
-bridge for kind routing.  See ``claude_code_acp/approval.py`` for the
-Claude-specific implementation.
+**Execute routing.**  One kind gets special treatment on every channel:
+``kind="execute"`` requests whose ``command_label`` carries a non-empty
+command (for ACP the ``toolCall.title`` is the raw shell command) are routed
+through ``tools.approval.check_all_command_guards()`` — the exact pipeline
+the native terminal tool uses (hardline blocks, user deny rules, yolo /
+mode=off, permanent allowlist, tirith + dangerous-pattern detection, smart
+approval, and interactive prompting when a channel is available).  The guard
+decision is authoritative (approved → ``"once"``, otherwise ``"deny"``); the
+underlying channel is not consulted for those requests, so the user is
+prompted at most once.  All other kinds (read/edit/write/…) keep the channel
+behavior above: CLI passthrough, gateway ``request_tool_approval``, or
+fail-closed deny.
 
 **Dynamic approval-bypass wrapper.**  Whichever channel is resolved above,
 ``make_acp_approval_callback()`` wraps the returned callback in a bypass-aware
 wrapper that checks ``is_approval_bypass_active()`` (yolo / ``approvals.mode:
-off``) on **every** invocation — before any gateway round-trip or fail-closed
-deny.  When bypass is active the wrapper returns ``"once"`` immediately and
+off``) on **every** invocation — before the execute command guards, any
+gateway round-trip, or fail-closed deny.  The bypass wrapper stays
+outermost so yolo / mode=off short-circuits everything.  When bypass is
+active the wrapper returns ``"once"`` immediately and
 skips the underlying channel.  This closes the gap where the fail-closed paths
 (gateway-without-notify and neither-channel) would deny even though the user
 had enabled yolo/bypass: those paths never reach ``_run_approval_gate``, which
@@ -45,6 +50,7 @@ to the underlying callback so the approval flow is never broken by the check).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -59,24 +65,29 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
 
     and returns one of ``"once"``, ``"session"``, ``"always"``, or ``"deny"``.
 
-    This is the **generic** bridge — no kind-based routing.  All permission
-    kinds are treated identically: the best available approval channel is used,
-    or fail-closed if none is available.
+    The best available approval channel is used, or fail-closed if none is
+    available.  ``kind="execute"`` requests carrying a non-empty command are
+    routed through the native command-guard pipeline
+    (``tools.approval.check_all_command_guards()``) instead of the channel —
+    safe commands auto-approve and dangerous ones go through the same
+    detection / smart-approval / prompt flow as the native terminal tool.
+    All other kinds are escalated to the channel unchanged.
 
     Resolution order:
 
-    1. **CLI thread-local callback** — returned directly (or in a minimal
-       wrapper that forwards the decision).
+    1. **CLI thread-local callback** — used as the underlying channel.
     2. **Gateway context with notify** — escalate to ``request_tool_approval()``.
     3. **Neither** — fail-closed ``"deny"``.
 
     Whichever channel is resolved, the returned callback is wrapped by
-    ``_wrap_with_bypass_check()`` so that ``is_approval_bypass_active()``
-    (yolo / ``approvals.mode: off``) is consulted on every invocation before
-    any gateway round-trip or fail-closed deny.  When bypass is active the
-    wrapper returns ``"once"`` immediately without invoking the underlying
-    channel; if the bypass check itself raises, it falls through to the
-    underlying channel (fail-safe).
+    ``_wrap_channel()``: ``_wrap_with_execute_command_guards()`` sits directly
+    on the channel (execute → guards, other kinds → channel), and
+    ``_wrap_with_bypass_check()`` stays outermost so that
+    ``is_approval_bypass_active()`` (yolo / ``approvals.mode: off``) is
+    consulted on every invocation before the guards, any gateway round-trip,
+    or fail-closed deny.  When bypass is active the wrapper returns ``"once"``
+    immediately without invoking anything underneath; if the bypass check
+    itself raises, it falls through to the underlying stack (fail-safe).
 
     Returns ``None`` only when the core approval module itself is unavailable
     (import failure), so the caller falls back to the session's built-in
@@ -96,7 +107,7 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
             "ACP approval: tools.approval import failed; "
             "returning fail-closed callback"
         )
-        return _wrap_with_bypass_check(
+        return _wrap_channel(
             _make_fail_closed_callback("approval module unavailable")
         )
 
@@ -110,7 +121,7 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
 
     if cli_cb is not None:
         logger.debug("ACP approval: using CLI callback (passthrough)")
-        return _wrap_with_bypass_check(cli_cb)
+        return _wrap_channel(cli_cb)
 
     # --- 2. Gateway context ---
     is_gateway = _is_gateway_approval_context()
@@ -130,7 +141,7 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
                 "(session=%s) — using request_tool_approval bridge",
                 session_key[:16] if session_key else "?",
             )
-            return _wrap_with_bypass_check(
+            return _wrap_channel(
                 _make_gateway_request_callback(
                     request_fn=request_tool_approval,
                 )
@@ -141,7 +152,7 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
                 "(session=%s) — fail-closed",
                 session_key[:16] if session_key else "?",
             )
-            return _wrap_with_bypass_check(
+            return _wrap_channel(
                 _make_fail_closed_callback(
                     "gateway session has no approval notify channel"
                 )
@@ -152,7 +163,7 @@ def make_acp_approval_callback() -> Optional[Callable[..., str]]:
         "ACP approval: no CLI callback and not a gateway context — "
         "fail-closed"
     )
-    return _wrap_with_bypass_check(
+    return _wrap_channel(
         _make_fail_closed_callback(
             "no interactive CLI or gateway approval channel available"
         )
@@ -216,7 +227,99 @@ def _wrap_with_bypass_check(inner: Callable[..., str]) -> Callable[..., str]:
 
 
 # --------------------------------------------------------------------------- #
-# Internal: gateway request callback (generic, no kind routing)
+# Internal: execute-kind command guards
+# --------------------------------------------------------------------------- #
+
+
+def _wrap_with_execute_command_guards(
+    inner: Callable[..., str],
+) -> Callable[..., str]:
+    """Route ``kind="execute"`` through the native command-guard pipeline.
+
+    For execute requests whose ``command_label`` carries a non-empty command
+    (the ACP ``toolCall.title`` is the raw shell command), run
+    ``tools.approval.check_all_command_guards()`` — the same pipeline the
+    native terminal tool uses (hardline blocks, user deny rules, yolo /
+    mode=off, permanent allowlist, tirith + dangerous-pattern detection,
+    smart approval, and interactive prompting when a channel is available).
+
+    The guard decision is authoritative: approved → ``"once"``, otherwise
+    ``"deny"``.  ``inner`` is NOT consulted for those requests, so the user
+    is never prompted twice for the same command.
+
+    Everything else falls through to ``inner`` unchanged:
+
+    * non-execute kinds (read / edit / write / …) keep the channel behavior
+      (CLI passthrough, gateway ``request_tool_approval``, fail-closed deny);
+    * execute requests with an empty ``command_label`` (nothing to guard);
+    * unexpected guard failures (logged; the resolved channel still gets to
+      decide, preserving fail-closed semantics on fail-closed channels).
+    """
+
+    def _execute_guard_callback(
+        command_label: str,
+        description: str,
+        *,
+        allow_permanent: bool = False,
+        kind: str = "",
+        **kwargs,
+    ) -> str:
+        if (kind or "").lower() == "execute" and command_label and command_label.strip():
+            try:
+                from tools.approval import (
+                    check_all_command_guards,
+                )
+
+                # Pass the CLI approval callback (if one is registered on this
+                # thread) so a nested interactive prompt works exactly like the
+                # native terminal tool.  Absent on headless / ACP threads.
+                approval_cb = None
+                try:
+                    from tools.terminal_tool import _get_approval_callback
+
+                    approval_cb = _get_approval_callback()
+                except Exception:
+                    approval_cb = None
+
+                result = check_all_command_guards(
+                    command_label.strip(),
+                    os.getenv("TERMINAL_ENV", "local"),
+                    approval_callback=approval_cb,
+                    source="claude-code-acp",
+                )
+                if isinstance(result, dict) and result.get("approved"):
+                    return "once"
+                return "deny"
+            except Exception:
+                logger.warning(
+                    "ACP approval: execute command guards failed; "
+                    "falling through to channel",
+                    exc_info=True,
+                )
+        return inner(
+            command_label,
+            description,
+            allow_permanent=allow_permanent,
+            kind=kind,
+            **kwargs,
+        )
+
+    return _execute_guard_callback
+
+
+def _wrap_channel(inner: Callable[..., str]) -> Callable[..., str]:
+    """Stack the standard wrappers onto a resolved approval channel.
+
+    Order matters: ``_wrap_with_execute_command_guards()`` sits directly on
+    the channel (execute → native command guards, other kinds → channel), and
+    ``_wrap_with_bypass_check()`` stays outermost so yolo / ``approvals.mode:
+    off`` short-circuits everything — including the command guards.
+    """
+    return _wrap_with_bypass_check(_wrap_with_execute_command_guards(inner))
+
+
+# --------------------------------------------------------------------------- #
+# Internal: gateway request callback (non-execute kinds)
 # --------------------------------------------------------------------------- #
 
 
@@ -225,9 +328,11 @@ def _make_gateway_request_callback(
 ) -> Callable[..., str]:
     """Build a generic gateway approval callback.
 
-    Escalates **all** permission requests to ``request_tool_approval()``.
-    No kind-based routing — the callback does not classify read/execute/write.
-    Plugins that need kind routing implement their own callback factory.
+    Escalates permission requests to ``request_tool_approval()`` without
+    classifying them.  ``kind="execute"`` requests carrying a command never
+    reach this callback — they are decided by the outer
+    ``_wrap_with_execute_command_guards()`` wrapper; everything else
+    (read/edit/write/…) is escalated to a human here.
     """
 
     def _callback(
@@ -247,6 +352,7 @@ def _make_gateway_request_callback(
             result = request_fn(
                 tool_name=tool_name,
                 reason=reason,
+                source="claude-code-acp",
             )
         except Exception:
             logger.warning(
