@@ -4511,7 +4511,10 @@ def cmd_kanban(args):
     """Multi-profile collaboration board."""
     from hermes_cli.kanban import kanban_command
 
-    return kanban_command(args)
+    status = kanban_command(args)
+    if isinstance(status, int) and status != 0:
+        raise SystemExit(status)
+    return status
 
 
 def cmd_project(args):

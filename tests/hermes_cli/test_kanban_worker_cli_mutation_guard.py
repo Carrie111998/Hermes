@@ -3,7 +3,10 @@ from __future__ import annotations
 from argparse import Namespace
 from contextlib import nullcontext
 
+import pytest
+
 from hermes_cli import kanban
+from hermes_cli import main as hermes_main
 from hermes_cli.kanban import _is_kanban_worker_cli_mutation
 
 
@@ -28,6 +31,15 @@ def test_worker_command_dispatch_blocks_set_model_before_handler(monkeypatch, ca
     assert kanban.kanban_command(Namespace(kanban_action="set-model")) == 1
     assert called == []
     assert "cannot mutate board state through the CLI" in capsys.readouterr().err
+
+
+def test_top_level_kanban_command_propagates_a_rejected_exit_status(monkeypatch):
+    monkeypatch.setattr(kanban, "kanban_command", lambda _args: 1)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_kanban(Namespace())
+
+    assert exc_info.value.code == 1
 
 
 def test_running_kanban_worker_can_use_read_only_cli(monkeypatch):
