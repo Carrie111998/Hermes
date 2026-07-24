@@ -55,6 +55,35 @@ def has_clipboard_image() -> bool:
     return _xclip_has_image()
 
 
+def read_clipboard_text() -> str:
+    """Read text content from the system clipboard.
+
+    Returns the text if any is available, or an empty string if the clipboard
+    holds no text (or only images / file drops / etc.). Tries the same
+    backends as ``save_clipboard_image``: WSL → Wayland → X11 → macOS →
+    native Windows. Never raises — failed backends return ''.
+
+    Added so ``tui_gateway`` ``clipboard.paste`` can fall back to text when
+    the clipboard holds no image (which used to surface as a confusing
+    "No image found in clipboard" message every time the user pressed
+    Ctrl+Shift+V with text in the clipboard).
+    """
+    if sys.platform == "darwin":
+        return _macos_read_text()
+    if sys.platform == "win32":
+        return _windows_read_text()
+    # Linux — match _linux_save fallthrough order: WSL → Wayland → X11
+    if _is_wsl():
+        text = _wsl_read_text()
+        if text:
+            return text
+    if os.environ.get("WAYLAND_DISPLAY"):
+        text = _wayland_read_text()
+        if text:
+            return text
+    return _xclip_read_text()
+
+
 # ── macOS ────────────────────────────────────────────────────────────────
 
 def _macos_save(dest: Path) -> bool:
@@ -116,6 +145,22 @@ def _macos_osascript(dest: Path) -> bool:
     except Exception as e:
         logger.debug("osascript clipboard extract failed: %s", e)
     return False
+
+
+def _macos_read_text() -> str:
+    """Read text from the macOS clipboard via pbpaste."""
+    try:
+        r = subprocess.run(
+            ["pbpaste"],
+            capture_output=True, timeout=3,
+        )
+        if r.returncode == 0:
+            return r.stdout.decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        logger.debug("pbpaste not found — macOS clipboard text unavailable")
+    except Exception as e:
+        logger.debug("pbpaste failed: %s", e)
+    return ""
 
 
 # ── Shared PowerShell scripts (native Windows + WSL2) ─────────────────────
@@ -194,6 +239,17 @@ _POWERSHELL_EXTRACT_IMAGE_SCRIPTS = (
     _PS_EXTRACT_IMAGE,
     _PS_EXTRACT_IMAGE_GET_CLIPBOARD,
     _PS_EXTRACT_FILEDROP_IMAGE,
+)
+
+
+# Text extraction — uses Get-Clipboard (PowerShell 5.1+) which returns text
+# directly. Works on both native Windows (powershell/pwsh) and WSL2
+# (powershell.exe → Windows clipboard).
+_PS_READ_TEXT = (
+    "try { "
+    "$txt = Get-Clipboard -Raw -ErrorAction Stop; "
+    "if ($null -eq $txt) { '' } else { [Console]::Out.Write($txt) } "
+    "} catch { '' }"
 )
 
 
@@ -297,6 +353,23 @@ def _windows_save(dest: Path) -> bool:
     return _powershell_save_image(ps, dest, timeout=15, label="Windows")
 
 
+def _windows_read_text() -> str:
+    """Read text from the Windows clipboard via PowerShell `Get-Clipboard -Raw`."""
+    ps = _get_ps_exe()
+    if ps is None:
+        return ""
+    try:
+        r = _run_powershell(ps, _PS_READ_TEXT, timeout=5)
+        if r.returncode == 0:
+            # PowerShell adds a trailing newline to its stdout pipeline output,
+            # even when Get-Clipboard returned an empty string. Strip the single
+            # trailing newline so an empty clipboard reads as '' not '\n'.
+            return r.stdout.rstrip("\n").rstrip("\r")
+    except Exception as e:
+        logger.debug("Windows clipboard text read failed: %s", e)
+    return ""
+
+
 # ── Linux ────────────────────────────────────────────────────────────────
 
 def _linux_save(dest: Path) -> bool:
@@ -324,6 +397,21 @@ def _wsl_has_image() -> bool:
 def _wsl_save(dest: Path) -> bool:
     """Extract clipboard image via powershell.exe → base64 → decode to PNG."""
     return _powershell_save_image("powershell.exe", dest, timeout=15, label="WSL")
+
+
+def _wsl_read_text() -> str:
+    """Read text from the Windows clipboard via powershell.exe (WSL2 path)."""
+    try:
+        r = _run_powershell("powershell.exe", _PS_READ_TEXT, timeout=8)
+        if r.returncode == 0:
+            # Same trailing-newline quirk as native Windows — see
+            # _windows_read_text() for the rationale.
+            return r.stdout.rstrip("\n").rstrip("\r")
+    except FileNotFoundError:
+        logger.debug("powershell.exe not found — WSL clipboard text unavailable")
+    except Exception as e:
+        logger.debug("WSL clipboard text read failed: %s", e)
+    return ""
 
 
 # ── Wayland (wl-paste) ──────────────────────────────────────────────────
@@ -395,6 +483,26 @@ def _wayland_save(dest: Path) -> bool:
         logger.debug("wl-paste clipboard extraction failed: %s", e)
         dest.unlink(missing_ok=True)
     return False
+
+
+def _wayland_read_text() -> str:
+    """Read text from the Wayland clipboard via `wl-paste --no-newline`."""
+    try:
+        # wl-paste adds a trailing newline by default; --no-newline preserves
+        # the original text exactly as it was copied. We still rstrip() to be
+        # safe against misbehaving clipboard managers.
+        r = subprocess.run(
+            ["wl-paste", "--no-newline"],
+            capture_output=True, timeout=3,
+        )
+        if r.returncode == 0:
+            text = r.stdout.decode("utf-8", errors="replace")
+            return text.rstrip("\n")
+    except FileNotFoundError:
+        logger.debug("wl-paste not installed — Wayland clipboard text unavailable")
+    except Exception as e:
+        logger.debug("wl-paste text read failed: %s", e)
+    return ""
 
 
 def _convert_to_png(path: Path) -> bool:
@@ -492,3 +600,24 @@ def _xclip_save(dest: Path) -> bool:
         logger.debug("xclip image extraction failed: %s", e)
         dest.unlink(missing_ok=True)
     return False
+
+
+def _xclip_read_text() -> str:
+    """Read text from the X11 clipboard via `xclip -selection clipboard -o`.
+
+    Reads the CLIPBOARD selection (Ctrl+C / Ctrl+V) rather than PRIMARY
+    (mouse middle-click). Returns '' if xclip is missing, the clipboard has
+    no text (e.g. only an image), or any backend error occurs.
+    """
+    try:
+        r = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o"],
+            capture_output=True, timeout=3,
+        )
+        if r.returncode == 0:
+            return r.stdout.decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        logger.debug("xclip not installed — X11 clipboard text unavailable")
+    except Exception as e:
+        logger.debug("xclip text read failed: %s", e)
+    return ""

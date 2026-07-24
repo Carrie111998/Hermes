@@ -719,11 +719,21 @@ export function useMainApp(gw: GatewayClient) {
           return sys(`📎 Image #${r.count} attached from clipboard${meta ? ` · ${meta}` : ''}`)
         }
 
+        // Text fallback — clipboard.paste now returns {kind: "text", text}
+        // when the clipboard holds text instead of an image. Insert the text
+        // directly into the composer input so Ctrl+Shift+V (documented as
+        // "paste text") actually pastes text, matching the hotkeys hint:
+        //   paste + '+V / /paste', 'paste text; /paste attaches clipboard image'
+        if (r.kind === 'text' && r.text) {
+          composerActions.setInput(prev => prev + r.text)
+          return
+        }
+
         if (!quiet) {
-          sys(r.message || 'No image found in clipboard')
+          sys(r.message || 'No image or text found in clipboard')
         }
       }),
-    [rpc, sys]
+    [rpc, sys, composerActions]
   )
 
   clipboardPasteRef.current = paste

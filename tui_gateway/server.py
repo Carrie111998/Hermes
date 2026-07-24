@@ -4338,6 +4338,19 @@ def _get_usage(agent) -> dict:
                 usage["dev_credits_spent_micros"] = int(spent)
         except Exception:
             pass
+    # Local usage ledger (5h / 7d / 24h rolling windows). Provider-agnostic —
+    # works for any provider that returns a `usage` object (Anthropic-compat
+    # endpoints including MiniMax). Records the per-request totals into
+    # ~/.hermes/usage_log.jsonl and reads back the rolling aggregates.
+    try:
+        from agent.usage_ledger import record as _ledger_record, snapshot as _ledger_snapshot, _load_limits_from_config
+        _ledger_record(usage)
+        _limits = _load_limits_from_config(_load_cfg() or {})
+        _snap = _ledger_snapshot(usage, limits=_limits)
+        usage["ledger"] = _snap.to_payload()
+    except Exception:
+        # Never let ledger I/O break a chat response.
+        pass
     return usage
 
 
@@ -12534,10 +12547,16 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
+        from hermes_cli.clipboard import (
+            has_clipboard_image,
+            save_clipboard_image,
+            read_clipboard_text,
+        )
     except Exception as e:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
 
+    # Image-first path (preserves original /paste semantics for /paste slash
+    # command and any caller that wants the image attachment).
     session["image_counter"] = session.get("image_counter", 0) + 1
     img_dir = _hermes_home / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -12549,18 +12568,42 @@ def _(rid, params: dict) -> dict:
     # Save-first: mirrors CLI keybinding path; more robust than has_image() precheck
     if not save_clipboard_image(img_path):
         session["image_counter"] = max(0, session["image_counter"] - 1)
+        # No image → try text fallback so Ctrl+Shift+V (which is documented as
+        # "paste text") actually pastes text instead of barking an error.
+        # The TUI consumer checks `kind == "text"` and `text` to insert into
+        # the composer; older clients that only look at `attached` / `message`
+        # still get a sensible message.
+        text = ""
+        try:
+            text = read_clipboard_text()
+        except Exception as e:
+            logger.debug("clipboard text fallback failed: %s", e)
+        if text:
+            preview = text if len(text) <= 60 else text[:57] + "..."
+            return _ok(
+                rid,
+                {
+                    "attached": False,
+                    "kind": "text",
+                    "text": text,
+                    "length": len(text),
+                    "message": f"Pasted {len(text)} chars from clipboard: {preview!r}",
+                },
+            )
+        # Truly empty clipboard (neither image nor text).
         msg = (
             "Clipboard has image but extraction failed"
             if has_clipboard_image()
-            else "No image found in clipboard"
+            else "No image or text found in clipboard"
         )
-        return _ok(rid, {"attached": False, "message": msg})
+        return _ok(rid, {"attached": False, "kind": "empty", "message": msg})
 
     session.setdefault("attached_images", []).append(str(img_path))
     return _ok(
         rid,
         {
             "attached": True,
+            "kind": "image",
             "path": str(img_path),
             "count": len(session["attached_images"]),
             **_image_meta(img_path),

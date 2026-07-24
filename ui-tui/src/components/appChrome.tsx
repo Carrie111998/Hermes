@@ -532,6 +532,28 @@ export function StatusRule({
   const sessionCountText = liveSessionCount > 0 ? statusSessionCountLabel(liveSessionCount) : ''
   const compressions = typeof usage.compressions === 'number' ? usage.compressions : 0
 
+  const costText = typeof usage.cost_usd === 'number' ? `$${usage.cost_usd.toFixed(4)}` : ''
+  // 5h / 7d rolling-window readouts from the local usage ledger. Each
+  // segment self-hides if the ledger has no data, and tints to warn/error
+  // as the configured limit fills up. Without a limit the segment renders
+  // an absolute token/cost total (no %), so it's still useful.
+  const ledger = usage.ledger
+  const ledger5h = ledger?.five_h
+  const ledger7d = ledger?.seven_d
+  const ledger5hText = ledger5h?.available ? ledger5h.display : ''
+  const ledger7dText = ledger7d?.available ? ledger7d.display : ''
+  // Color thresholds: <60% muted, 60-85% warn, >=85% error. When no limit
+  // is set the segment stays muted (just an absolute number, nothing to
+  // warn about).
+  const ledgerPctColor = (pct: number | null | undefined) => {
+    if (pct == null) return t.color.muted
+    if (pct >= 85) return t.color.error
+    if (pct >= 60) return t.color.warn
+    return t.color.muted
+  }
+  const ledger5hColor = ledgerPctColor(ledger5h?.used_percent)
+  const ledger7dColor = ledgerPctColor(ledger7d?.used_percent)
+
   // Dev-only readout (HERMES_DEV_CREDITS). The server omits the key entirely unless the
   // flag is on, so this segment self-hides for normal users. micros→cents is allowed money
   // math (display formatting) — never parseFloat a *_usd. Signed: a mid-session top-up that
@@ -568,6 +590,14 @@ export function StatusRule({
 
   const showResumeHint = !busy && subagentCount > 0 && fits(SEP + stringWidth(resumeHintText))
   // Dev-gated readout (HERMES_DEV_CREDITS), lowest priority,
+
+const showCostSeg = segs.cost && showCost && !!costText && fits(SEP + stringWidth(costText))
+  // Ledger segments (5h / 7d) — same low-priority tier as cost, drop first
+  // on narrow terminals. Self-hide when no data.
+  const showLedger5h = !!ledger5hText && fits(SEP + stringWidth(ledger5hText))
+  const showLedger7d = !!ledger7dText && fits(SEP + stringWidth(ledger7dText))
+  // No segs flag / no showCost coupling — it's a server-gated dev readout, lowest priority,
+
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
 
@@ -699,6 +729,18 @@ export function StatusRule({
           <Text color={t.color.muted} dim wrap="truncate-end">
             {' │ '}
             {resumeHintText}
+          </Text>
+        ) : null}
+        {showLedger5h ? (
+          <Text color={ledger5hColor} wrap="truncate-end">
+            {' │ '}
+            {ledger5hText}
+          </Text>
+        ) : null}
+        {showLedger7d ? (
+          <Text color={ledger7dColor} wrap="truncate-end">
+            {' │ '}
+            {ledger7dText}
           </Text>
         ) : null}
         {showDevCredits ? (

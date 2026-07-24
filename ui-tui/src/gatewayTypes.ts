@@ -1,7 +1,8 @@
 import type { BillingBlock, UsageModelData } from '@hermes/shared/billing'
 import type { HermesSkin } from '@hermes/shared/skin'
 
-import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
+import type { LedgerSnapshot, SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
+
 
 /** The cross-surface skin contract (canonical shape in `@hermes/shared`).
  *  Includes the paired light_colors/dark_colors overlays from #20379. */
@@ -271,9 +272,7 @@ export interface SessionUsageResponse {
   model?: string
   output?: number
   total?: number
-  // Shared dollar usage model (two-bar view) so /usage renders the same bars
-  // as /subscription. Dollars only — never "credits".
-  usage?: UsageModelData
+  ledger?: LedgerSnapshot
 }
 
 export interface SessionStatusResponse {

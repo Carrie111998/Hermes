@@ -182,6 +182,36 @@ export interface SessionInfo {
   version?: string
 }
 
+export interface LedgerWindow {
+  label: string
+  seconds: number
+  available: boolean
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  cost_usd: number
+  request_count: number
+  limit?: number | null
+  limit_kind?: 'tokens' | 'usd' | null
+  used_percent?: number | null
+  resets_in_s?: number | null
+  oldest_ts?: number | null
+  display: string
+}
+
+export interface LedgerSnapshot {
+  fetched_at: number
+  session: {
+    tokens: number
+    input: number
+    output: number
+    cost_usd: number
+  }
+  five_h: LedgerWindow
+  seven_d: LedgerWindow
+  twenty_four_h: LedgerWindow
+}
+
 export interface Usage {
   active_subagents?: number
   calls: number
@@ -196,6 +226,7 @@ export interface Usage {
   output: number
   reasoning?: number
   total: number
+  ledger?: LedgerSnapshot
 }
 
 export interface SudoReq {
