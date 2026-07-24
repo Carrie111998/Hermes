@@ -11,8 +11,15 @@ See ``plugins/workflow/analyst.py`` for the auxiliary module.
 
 from __future__ import annotations
 
+import asyncio
+import glob as _glob
+import json
 import logging
 import os
+import tempfile
+import time
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -492,7 +499,7 @@ def _spawn_supervisor_for_next_layer(state, state_path):
 # ---------------------------------------------------------------------------
 
 
-def _notify_workflow_complete(task_id: str):
+def _notify_workflow_complete(task_id: str, state=None):
     """Write a completion marker to /tmp for the watcher thread to inject.
 
     When a final-layer card completes, reads the state file for session info
@@ -501,10 +508,11 @@ def _notify_workflow_complete(task_id: str):
     analyst auxiliary so the report is actionable — not a hardcoded string.
     """
     try:
-        result = _find_state_for_card(task_id)
-        if result is None:
-            return
-        state, _ = result
+        if state is None:
+            result = _find_state_for_card(task_id)
+            if result is None:
+                return
+            state, _ = result
         session_info = state.get("session_info", {})
         if not session_info.get("platform") or not session_info.get("chat_id"):
             return
@@ -527,8 +535,6 @@ def _notify_workflow_complete(task_id: str):
         board = state.get("kanban_board", "unknown")
         session_key = session_info.get("session_key", "")
 
-        # Build a structured node summary for the message
-        import json
         all_nodes = []
         for layer_nids in layers:
             for nid in layer_nids:
@@ -576,8 +582,8 @@ def _notify_workflow_complete(task_id: str):
                     for a in attention:
                         parts.append(f"  • {a}")
                 message = "\n".join(parts)
-        except Exception:
-            pass  # Fall through to basic message
+        except Exception as _analyst_exc:
+            logger.debug("workflow analyst unavailable for completion report: %s", _analyst_exc)
 
         # Fallback to basic message if analyst didn't produce one
         if not message:
@@ -593,7 +599,6 @@ def _notify_workflow_complete(task_id: str):
             heading += f" ({failed_count} failed)"
         full_message = f"{heading}\n\nNodes:\n{message}"
 
-        from datetime import datetime, timezone
         marker = {
             "session_key": session_key,
             "platform": session_info.get("platform", ""),
@@ -608,7 +613,15 @@ def _notify_workflow_complete(task_id: str):
         }
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
         marker_path = Path(f"/tmp/wf-complete-{ts}.json")
-        marker_path.write_text(json.dumps(marker, indent=2, default=str))
+        # Atomic write: temp file → rename (prevents TOCTOU reads of partial JSON)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="wf-complete-", suffix=".json")
+        try:
+            with os.fdopen(tmp_fd, "w") as tmp_f:
+                json.dump(marker, tmp_f, indent=2, default=str)
+            os.rename(tmp_path, str(marker_path))
+        except Exception:
+            os.unlink(tmp_path)
+            raise
         print(f"   📨 Workflow completion marker written: {marker_path.name}")
     except Exception as e:
         print(f"   ⚠  Failed to write completion marker: {e}")
@@ -620,8 +633,13 @@ _watcher_started = False
 
 
 def _capture_gateway(**kwargs):
-    """Hook callback to capture the gateway instance for the watcher thread."""
     global _gateway_ref, _watcher_started
+    if _watcher_started:
+        return None
+
+
+
+
     gw = kwargs.get("gateway")
     if gw is not None:
         _gateway_ref = gw
@@ -641,14 +659,14 @@ def _start_completion_watcher():
     import threading
 
     def _watcher_loop():
-        import glob
-        import time
-        import json
 
         while True:
             time.sleep(2)
             try:
-                markers = sorted(glob.glob("/tmp/wf-complete-*.json"))
+                markers = sorted(_glob.glob("/tmp/wf-complete-*.json"))
+                # Skip stale markers older than 10 minutes
+                now = time.time()
+                markers = [m for m in markers if now - os.path.getmtime(m) < 600]
                 for marker_path_str in markers:
                     try:
                         marker_path = Path(marker_path_str)
@@ -684,7 +702,12 @@ def _start_completion_watcher():
                         try:
                             platform = Platform(platform_str)
                         except ValueError:
-                            platform = Platform(platform_str)
+                            logger.warning(
+                                "wf-completion watcher: unknown platform %s, skipping marker",
+                                platform_str,
+                            )
+                            marker_path.unlink(missing_ok=True)
+                            continue
 
                         # Build the source with correct chat_type
                         source = SessionSource(
@@ -708,8 +731,13 @@ def _start_completion_watcher():
                             internal=True,
                         )
 
-                        # Find the adapter and inject
-                        adapter = gw.adapters.get(platform)
+                        # Find the adapter and inject (use .value comparison
+                        # like the gateway's own _inject_watch_notification)
+                        adapter = None
+                        for _p, _a in gw.adapters.items():
+                            if _p.value == platform.value:
+                                adapter = _a
+                                break
                         if adapter is None:
                             logger.warning(
                                 "wf-completion watcher: no adapter for platform %s",
@@ -718,22 +746,23 @@ def _start_completion_watcher():
                             marker_path.unlink(missing_ok=True)
                             continue
 
-                        import asyncio
-                        # Get the gateway's running event loop from the
-                        # captured gateway reference and schedule the
-                        # coroutine on it from this daemon thread.
+                        from agent.async_utils import safe_schedule_threadsafe
                         loop = getattr(gw, "_gateway_loop", None)
-                        if loop and loop.is_running():
-                            fut = asyncio.run_coroutine_threadsafe(
-                                adapter.handle_message(synth_event), loop,
-                            )
-                            fut.result(timeout=10)
-                        elif loop:
-                            loop.run_until_complete(adapter.handle_message(synth_event))
-                        else:
-                            logger.warning(
-                                "wf-completion watcher: no event loop on gateway",
-                            )
+                        fut = safe_schedule_threadsafe(
+                            adapter.handle_message(synth_event), loop,
+                            logger=logger,
+                            log_message="wf-completion watcher: failed to schedule injection",
+                        )
+                        if fut is not None:
+                            try:
+                                fut.result(timeout=10)
+                            except Exception as _fut_exc:
+                                logger.warning(
+                                    "wf-completion watcher: injection timed out or failed: %s",
+                                    _fut_exc,
+                                )
+                                marker_path.unlink(missing_ok=True)
+                                continue
 
                         logger.info(
                             "wf-completion watcher: injected notification into %s/%s profile=%s",
