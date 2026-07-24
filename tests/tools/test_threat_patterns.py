@@ -217,9 +217,9 @@ class TestFalsePositives:
         text = "Each worker should register as a node in the swarm cluster."
         findings = scan_for_threats(text, scope="context")
         # This DOES match c2_node_registration — that's intentional,
-        # the scanner WARNS, the context-file scanner blocks (rare in
-        # legit AGENTS.md), the tool-result wrapper doesn't even use
-        # patterns.
+        # the scanner WARNS, the prompt_builder now redacts only the
+        # matching line (not the entire file), so the rest of the
+        # legitimate content survives.
         assert "c2_node_registration" in findings
         # Pin: but it should NOT match identity_override, forced_action,
         # or any other higher-signal pattern unless those are also

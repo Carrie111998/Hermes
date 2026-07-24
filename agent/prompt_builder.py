@@ -47,16 +47,35 @@ logger = logging.getLogger(__name__)
 from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
-def _scan_context_content(content: str, filename: str) -> str:
+def _scan_context_content(content: str, filename: str, scope: str = "context") -> str:
     """Scan context file content for injection. Returns sanitized content.
 
     Uses the "context" scope from the shared threat-pattern library, which
     covers classic injection + promptware/C2 patterns + role-play hijack.
     Strict-scope patterns (SSH backdoor, persistence, exfil-URL) are NOT
     applied here — those are too aggressive for a context file in a
-    cloned repo (security research, infra docs).  Content matching is
-    BLOCKED at this layer because the file would otherwise enter the
-    system prompt verbatim and the user has no chance to intervene.
+    cloned repo (security research, infra docs).
+
+    Unlike the previous behavior (replacing the ENTIRE file with a
+    [BLOCKED] stub on any match), this function now redacts only the
+    specific lines that matched a threat pattern.  The rest of the file
+    — including the operator's persona instructions, safety rules, and
+    workflow guidance — survives intact.  This prevents silent degradation
+    where a single false-positive heuristic (e.g. "check-in to the
+    interaction log" matching the C2 heartbeat pattern) strips the
+    operator's entire SOUL.md without them knowing.
+
+    Operators can permanently suppress known false positives by adding
+    pattern IDs to ``config.yaml`` under ``context_scan.allow_patterns``::
+
+        context_scan:
+          allow_patterns:
+            - c2_heartbeat
+
+    On match:
+    - Matched lines are replaced with ``<!-- REDACTED: <pattern_id> -->``
+    - A note is prepended explaining what was redacted and why
+    - The log is promoted from WARNING to ERROR for better monitoring
     """
     # Editors (Windows Notepad, PowerShell Out-File without -Encoding
     # utf8NoBOM, some VS Code profiles) prefix a UTF-8 BOM as an encoding
@@ -66,12 +85,101 @@ def _scan_context_content(content: str, filename: str) -> str:
     if content.startswith("\ufeff"):
         content = content[1:]
 
-    findings = _scan_for_threats(content, scope="context")
-    if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+    findings = _scan_for_threats(content, scope=scope)
 
-    return content
+    # Check config-based allowlist so operators can permanently suppress
+    # reviewed false positives without rewording prose.
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        allowed = set(config.get("context_scan", {}).get("allow_patterns", []))
+    except Exception:
+        allowed = set()
+
+    # Filter out operator-allowed patterns
+    active_findings = [f for f in findings if f not in allowed]
+    allowed_match = [f for f in findings if f in allowed]
+
+    if allowed_match:
+        logger.info(
+            "Context file %s had allowed patterns (suppressed via config): %s",
+            filename, ", ".join(allowed_match),
+        )
+
+    if not active_findings:
+        return content
+
+    logger.error(
+        "Context file %s has %d threat match(es): %s; redacting matching lines",
+        filename, len(active_findings), ", ".join(active_findings),
+    )
+
+    # Granular redaction: replace matching lines with a marker, keeping
+    # the rest of the file intact.  This prevents false-positive heuristics
+    # from silently destroying the operator's entire persona file.
+    redacted = _redact_matching_lines(content, active_findings, scope=scope)
+
+    # Prepend a note so the model sees what was redacted and why.
+    note = (
+        f"[NOTE: {filename} contained {len(active_findings)} potential prompt injection"
+        f" match(es) ({', '.join(active_findings)}). "
+        "The matching lines were redacted below. "
+        "The rest of the file was loaded as-is.]\n\n"
+    )
+    return note + redacted
+
+
+def _redact_matching_lines(content: str, findings: list[str], scope: str = "context") -> str:
+    """Redact individual lines in *content* that match any of the given pattern IDs.
+
+    For each matching line, replaces the matched text span with
+    ``<!-- REDACTED: <pattern_id> -->``.  Non-matching lines are left
+    entirely intact, so the bulk of the operator's file survives.
+
+    Uses the compiled pattern sets from ``tools/threat_patterns``, matching
+    the same scope used in ``_scan_context_content``.
+    """
+    import re
+    from tools.threat_patterns import INVISIBLE_CHARS, _PATTERNS
+
+    # Build a mapping from pattern_id -> list of compiled regexes for the findings we care about.
+    # Multiple patterns can share the same ID (e.g. c2_heartbeat is now split into
+    # heartbeat/beacon and check-in variants for tighter matching).
+    target_regexes: dict[str, list[re.Pattern]] = {}
+    for pattern_str, pid, pattern_scope in _PATTERNS:
+        if pid in findings:
+            target_regexes.setdefault(pid, []).append(
+                re.compile(pattern_str, re.IGNORECASE)
+            )
+
+    # Separate invisible-unicode findings — these come from the character-set
+    # check in scan_for_threats, not from regex patterns.
+    invisible_findings = [f for f in findings if f.startswith("invisible_unicode_")]
+
+    lines = content.splitlines(keepends=True)
+    redacted_lines: list[str] = []
+
+    for line in lines:
+        matched_pids = []
+        for pid, regexes in target_regexes.items():
+            for compiled in regexes:
+                if compiled.search(line):
+                    matched_pids.append(pid)
+                    break  # One match per pid is enough
+        # Check invisible unicode on each line separately
+        char_set = set(line)
+        invisible_hits = char_set & INVISIBLE_CHARS
+        for ch in invisible_hits:
+            pid = f"invisible_unicode_U+{ord(ch):04X}"
+            if pid in invisible_findings and pid not in matched_pids:
+                matched_pids.append(pid)
+        if matched_pids:
+            replacement = f"<!-- REDACTED: {', '.join(matched_pids)} -->\n"
+            redacted_lines.append(replacement)
+        else:
+            redacted_lines.append(line)
+
+    return "".join(redacted_lines)
 
 
 def _find_git_root(start: Path) -> Optional[Path]:

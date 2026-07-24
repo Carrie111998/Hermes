@@ -90,7 +90,13 @@ _PATTERNS: List[Tuple[str, str, str]] = [
     # researcher reading the Brainworm post in a webpage doesn't break their
     # session.
     (r'register\s+(as\s+)?a?\s*node', "c2_node_registration", "context"),
-    (r'(heartbeat|beacon|check[\s\-]?in)\s+(to|with)\s+', "c2_heartbeat", "context"),
+    # "heartbeat to" and "beacon with" are distinctive C2 vocabulary.
+    # "check-in to" / "check in with" is common English ("check-in to the
+    # interaction log", "check in with the team"), so we require it to be
+    # followed by C2-relevant vocabulary to avoid false positives on
+    # ordinary operator workflow language.
+    (r'(heartbeat|beacon)\s+(to|with)\s+', "c2_heartbeat", "context"),
+    (r'check[\s\-]?in\s+(to|with)\s+(?:the\s+)?(?:c2|beacon|network|server|channel|controller|orchestrator|command)\b', "c2_heartbeat", "context"),
     (r'pull\s+(down\s+)?(?:new\s+)?task(?:ing|s)?\b', "c2_task_pull", "context"),
     (r'connect\s+to\s+the\s+network\b', "c2_network_connect", "context"),
     # Verb-anchored "you must register/connect/report/beacon" — the verbs
