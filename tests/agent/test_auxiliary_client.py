@@ -422,6 +422,55 @@ class TestResolveTaskProviderModel:
         assert resolved_provider == "anthropic"
         assert model == "claude-haiku-4-5-20251001"
 
+    def test_explicit_model_auto_sentinel_is_normalized(self):
+        """MoA slots (agent/moa_loop.py's _slot_runtime) forward a preset's
+        `model:` field as the explicit `model` kwarg here, not through
+        auxiliary.<task> config. Only cfg_model was normalized before, so a
+        MoA reference/aggregator slot configured with `model: auto` sent the
+        literal string "auto" to the wire as a model id."""
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="anthropic",
+            model="auto",
+        )
+
+        assert resolved_provider == "anthropic"
+        assert model is None
+
+    def test_explicit_model_auto_sentinel_case_insensitive(self):
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="anthropic",
+            model="AUTO",
+        )
+
+        assert model is None
+
+    def test_explicit_model_auto_falls_back_to_cfg_model(self, monkeypatch):
+        """When the explicit model is the "auto" sentinel, it must not shadow
+        a real configured task model — the `model or cfg_model` fallback
+        chain should still reach cfg_model exactly as if model had been
+        omitted entirely."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda _task: {"provider": "openai", "model": "gpt-real-model"},
+        )
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            task="moa_reference",
+            model="auto",
+        )
+
+        assert model == "gpt-real-model"
+
+    def test_non_auto_model_is_unaffected(self):
+        """Regression guard: a real model name must not be touched by the
+        sentinel normalization."""
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="openai",
+            model="gpt-4o-mini",
+        )
+
+        assert model == "gpt-4o-mini"
+
 
 class TestMoaAggregatorSharedResolution:
     """The shared MoA→aggregator helper and the layers that consume it.
@@ -638,6 +687,174 @@ class TestBuildCallKwargsMaxTokens:
             base_url="https://integrate.api.nvidia.com/v1",
         )
         assert kwargs["max_tokens"] == 4096
+
+    # ── MoA task should honor max_tokens on ALL providers (#reference_max_tokens) ──
+
+    @pytest.mark.parametrize(
+        "provider,model,base_url,expected_key",
+        [
+            ("zai", "glm-5.2", "https://api.z.ai/api/coding/paas/v4", "max_tokens"),
+            ("openrouter", "deepseek/deepseek-v4-flash:nitro", "https://openrouter.ai/api/v1", "max_tokens"),
+            ("copilot", "gpt-5.5", "https://api.githubcopilot.com", "max_completion_tokens"),
+            ("nous", "hermes-4", "https://inference-api.nousresearch.com/v1", "max_tokens"),
+        ],
+    )
+    def test_moa_task_sends_max_tokens_on_openai_compatible(self, provider, model, base_url, expected_key):
+        """MoA reference tasks must honor max_tokens regardless of provider.
+
+        The ``reference_max_tokens`` config option (PR #56756) caps advisor output
+        to reduce turn latency.  Before the fix, ``_build_call_kwargs`` silently
+        dropped the value for OpenAI-compatible providers (PR #34845), so the cap
+        never reached the API.  With the ``task`` parameter threaded through,
+        ``task == "moa_reference"`` includes the output cap in kwargs.
+
+        Models that require ``max_completion_tokens`` (GPT-5 family, Copilot)
+        get the correct parameter name via ``auxiliary_max_tokens_param()``.
+        """
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider=provider,
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=800,
+            base_url=base_url,
+            task="moa_reference",
+        )
+        assert kwargs[expected_key] == 800
+
+    def test_moa_task_sends_max_tokens_on_anthropic_wire(self):
+        """MoA reference tasks on Anthropic-compat endpoints keep max_tokens (unchanged behavior)."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="minimax",
+            model="minimax-m2",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=600,
+            base_url="https://api.minimax.io/v1",
+            task="moa_reference",
+        )
+        assert kwargs["max_tokens"] == 600
+
+    def test_moa_aggregator_does_not_get_max_tokens_on_openai_compat(self):
+        """``reference_max_tokens`` is an advisors-only contract (#56756).
+
+        The aggregator is the acting model — it must NOT be capped by the
+        reference token budget.  Only ``task == "moa_reference"`` triggers
+        the exception in ``_build_call_kwargs``.
+        """
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="zai",
+            model="glm-5.2",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=800,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            task="moa_aggregator",
+        )
+        assert "max_tokens" not in kwargs
+        assert "max_completion_tokens" not in kwargs
+
+    def test_non_moa_tasks_still_omit_max_tokens(self):
+        """Regression guard: compression/titles/vision keep PR #34845 behavior."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        for task in ("compression", "vision", "title_generation", None, ""):
+            kwargs = _build_call_kwargs(
+                provider="openrouter",
+                model="deepseek/deepseek-v4-flash:nitro",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=800,
+                base_url="https://openrouter.ai/api/v1",
+                task=task,
+            )
+            assert "max_tokens" not in kwargs, f"max_tokens should be dropped for task={task!r}"
+
+    def test_moa_task_exact_match(self):
+        """Only task == "moa_reference" triggers the cap — not the aggregator,
+        not arbitrary 'moa_' prefixed tasks."""
+        from agent.auxiliary_client import _build_call_kwargs
+
+        # 'moa_reference' → honored
+        kw = _build_call_kwargs(
+            provider="zai", model="glm-5.2",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=500,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            task="moa_reference",
+        )
+        assert kw["max_tokens"] == 500
+
+        # 'moa_aggregator' → dropped (aggregator is the acting model, not an advisor)
+        kw2 = _build_call_kwargs(
+            provider="zai", model="glm-5.2",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=500,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            task="moa_aggregator",
+        )
+        assert "max_tokens" not in kw2
+
+        # 'moa_custom_future' → dropped (only moa_reference is whitelisted)
+        kw3 = _build_call_kwargs(
+            provider="zai", model="glm-5.2",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=500,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            task="moa_custom_future",
+        )
+        assert "max_tokens" not in kw3
+
+    @pytest.mark.parametrize(
+        "provider,model,base_url",
+        [
+            ("gemini", "gemini-2.5-pro", None),
+            ("google", "gemini-2.5-flash", None),
+            (
+                "custom",
+                "gemini-2.5-pro",
+                "https://generativelanguage.googleapis.com/v1beta",
+            ),
+        ],
+    )
+    def test_keeps_max_tokens_for_gemini_native(self, provider, model, base_url):
+        # Native generateContent maps max_tokens → maxOutputTokens; when it is
+        # omitted Gemini applies a fixed 65,535-token ceiling, which silently
+        # turned MoA's reference_max_tokens into a no-op for gemini advisors.
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider=provider,
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=600,
+            base_url=base_url,
+        )
+        assert kwargs["max_tokens"] == 600
+        assert "max_completion_tokens" not in kwargs
+
+    def test_omits_max_tokens_for_gemini_model_on_openai_compatible_endpoint(self):
+        # Control: the gemini branch keys on provider/base_url, never the model
+        # name. A gemini model served through an OpenAI-compatible endpoint
+        # keeps the default omission behavior (#34530), including Gemini's own
+        # /openai compatibility endpoint.
+        from agent.auxiliary_client import _build_call_kwargs
+
+        for provider, base_url in [
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            ("custom", "https://generativelanguage.googleapis.com/v1beta/openai"),
+        ]:
+            kwargs = _build_call_kwargs(
+                provider=provider,
+                model="google/gemini-2.5-pro",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=600,
+                base_url=base_url,
+            )
+            assert "max_tokens" not in kwargs
+            assert "max_completion_tokens" not in kwargs
 
 
 class TestNousTagsScoping:

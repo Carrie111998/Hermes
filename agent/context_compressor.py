@@ -303,6 +303,20 @@ _SUMMARY_RATIO = 0.20
 # itself a context-pressure source and slows every compaction.
 _SUMMARY_TOKENS_CEILING = 10_000
 
+# Aggregate cap on the serialized turn block fed to the summarizer prompt
+# (chars). Per-message truncation (_CONTENT_MAX / _TOOL_ARGS_MAX) alone is
+# not enough: a compression window with hundreds of already-truncated turns
+# can still produce a multi-hundred-KB prompt that blows past slow auxiliary
+# backends' context limits or timeouts (Codex Responses fallback paths
+# especially). 160K chars ≈ 40K tokens — comfortably inside every supported
+# aux model's window while leaving room for the template + previous summary.
+# Applied AFTER per-message truncation, with head+tail retention and an
+# explicit omitted-middle marker (see _bound_summary_input). This is a
+# prompt-side bound only — NEVER add a max_tokens wire cap on the summary
+# call (see the no-wire-cap contract test in
+# test_compression_small_ctx_threshold_floor.py).
+_SUMMARY_INPUT_MAX_CHARS = 160_000
+
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
@@ -1629,6 +1643,9 @@ class ContextCompressor(ContextEngine):
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
+        proactive_prune_tokens: int = 0,
+        proactive_prune_min_result_chars: int = 8000,
+        proactive_prune_min_reclaim_tokens: int = 4096,
     ):
         self.model = model
         self.base_url = base_url
@@ -1658,6 +1675,31 @@ class ContextCompressor(ContextEngine):
         )
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        # Proactive tool-result pruning (cost-oriented; runs INDEPENDENTLY of the
+        # full-compression trigger, via prune_tool_results_only()). 0 = disabled.
+        self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
+        # Floor the summarize threshold at 200 chars (matching
+        # _prune_old_tool_results' dedup floor). Below ~200 a generated summary
+        # can be longer than the floor it replaces, so Pass 2 would re-summarize
+        # its own output every turn (corrupting it and never converging); a
+        # negative value would strip every non-tail tool result outright. A
+        # configured 0 keeps the 8000 default via `or`. Keep the floor well above
+        # typical summary length (default 8000) to stay idempotent.
+        self.proactive_prune_min_result_chars = max(
+            200, int(proactive_prune_min_result_chars or 8000)
+        )
+        # Minimum estimated token reclaim before a proactive prune COMMITS.
+        # Every commit rewrites messages the provider has already seen, which
+        # invalidates the prompt-cache prefix from the earliest rewritten
+        # message forward. Without this gate a busy tool loop would re-fire
+        # the prune nearly every iteration (each new tool pair ages an old one
+        # out of the protected tail), breaking the cache per turn. Requiring a
+        # meaningful batch of reclaimable tokens makes fires episodic and
+        # amortized — the same way full compression is the one sanctioned
+        # cache break. 0 disables the gate (commit any non-zero prune).
+        self.proactive_prune_min_reclaim_tokens = max(
+            0, int(proactive_prune_min_reclaim_tokens or 0)
+        )
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
@@ -1856,6 +1898,16 @@ class ContextCompressor(ContextEngine):
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
 
+    def snapshot_preflight_display_tokens(self) -> int:
+        """Capture the display token count before a speculative preflight seed."""
+        return self.last_prompt_tokens
+
+    def rollback_interrupted_preflight_display_tokens(self, snapshot: int) -> None:
+        """Restore a speculative display seed without touching compaction state."""
+        if self.awaiting_real_usage_after_compression and self.last_prompt_tokens == -1:
+            return
+        self.last_prompt_tokens = snapshot
+
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 
@@ -1901,14 +1953,72 @@ class ContextCompressor(ContextEngine):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
 
+        Returns ``True`` when compression should run now. For the caller-facing
+        *reason* (e.g. why compression is skipped while still over threshold),
+        see :meth:`should_compress_info`, which returns a ``(bool, reason)``
+        tuple without changing the decision logic here.
+
+        Includes anti-thrashing protection: if the last two compressions
+        each saved less than 10%, skip compression to avoid infinite loops
+        where each pass removes only 1-2 messages.
+        """
+        decision, _reason = self.should_compress_info(prompt_tokens)
+        return decision
+
+    def should_compress_info(
+        self, prompt_tokens: int = None
+    ) -> "tuple[bool, str | None]":
+        """Check if context exceeds the compression threshold.
+
+        Returns a ``(should_compress, reason)`` tuple instead of a bare bool so
+        callers can tell *why* compression is skipped when it is skipped while
+        the context is already over threshold. ``reason`` is ``None`` unless
+        compression is needed but blocked:
+
+        * ``"cooldown:<seconds>"`` — the summary LLM is recovering from a
+          recent 429/transient failure; compression is deferred to avoid the
+          freeze loop described in #11529.
+        * ``"ineffective"`` — anti-thrashing has backed off because the last
+          two compressions each saved <10%.
+
+        When ``reason`` is non-``None`` the session is over its compression
+        threshold yet cannot shrink — callers should surface a warning so the
+        user knows the model may silently stop answering (the context keeps
+        growing until it hits the hard provider limit). Without this signal an
+        over-threshold session fails opaquely.
+
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
-            return False
-        return not self._automatic_compression_blocked()
+            return False, None
+        if self._automatic_compression_blocked():
+            return False, self._compression_block_reason() or "blocked"
+        return True, None
+
+    def _compression_block_reason(self) -> "str | None":
+        """Return a human-readable reason for the current automatic-compaction
+        block, derived from the same in-memory state that
+        :meth:`_automatic_compression_blocked_locally` evaluates.
+
+        * ``"cooldown:<seconds>"`` — the summary LLM is recovering from a
+          recent 429/transient failure; compression is deferred to avoid the
+          freeze loop described in #11529.
+        * ``"ineffective"`` — anti-thrashing has backed off (the last two
+          compressions each saved <10%, or the fallback streak tripped).
+        * ``None`` — no block active.
+        """
+        _cooldown_remaining = self._summary_failure_cooldown_until - time.monotonic()
+        if _cooldown_remaining > 0:
+            return f"cooldown:{_cooldown_remaining:.0f}"
+        if (
+            self._ineffective_compression_count >= 2
+            or self._fallback_compression_streak >= 2
+        ):
+            return "ineffective"
+        return None
 
     def _refresh_durable_guards(self) -> None:
         """Re-read durable cooldown + breaker state from the DB.
@@ -1991,6 +2101,7 @@ class ContextCompressor(ContextEngine):
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
+        min_prune_chars: int = 200,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -2133,7 +2244,9 @@ class ContextCompressor(ContextEngine):
                 return False
             if content.startswith("[screenshot removed"):
                 return False
-            if len(content) <= 200:
+            # Only prune if the content is substantial (default >200 chars; the
+            # proactive path raises this floor via min_prune_chars).
+            if len(content) <= min_prune_chars:
                 return False
             call_id = msg.get("tool_call_id", "")
             tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
@@ -2249,6 +2362,75 @@ class ContextCompressor(ContextEngine):
 
         return result, pruned
 
+    def prune_tool_results_only(
+        self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Deterministic, no-LLM tool-result prune for the cost-oriented path.
+
+        Runs the Phase-1 prune (``_prune_old_tool_results``) WITHOUT the
+        compression summary phase, gated on ``proactive_prune_tokens`` rather
+        than the (much higher) full-compression threshold. On large-window
+        models ``should_compress()`` (≈50% of the window) rarely fires, so old
+        tool outputs otherwise ride in history and are re-sent verbatim on every
+        subsequent turn; this reclaims them early with no quality-risky LLM
+        summarization.
+
+        Protects the recent tail by message COUNT (``protect_last_n``), never by
+        ``tail_token_budget`` — the latter is derived from the 50% compression
+        threshold (≈100K tokens on a 1M window) and would protect the entire
+        session, pruning nothing.
+
+        ``_prune_old_tool_results`` runs all three deterministic passes:
+        (1) dedup byte-identical tool results — keeps the newest full copy and
+        back-references older exact duplicates ANYWHERE in the list (including
+        the protected tail), so no unique content is ever lost; (2) summarize
+        non-tail tool results larger than ``min_prune_chars``; (3) truncate
+        oversized tool_call arguments on non-tail assistant messages. Only
+        pass (2)'s floor is raised by ``proactive_prune_min_result_chars``;
+        passes (1) and (3) keep their own fixed floors. The recent-tail
+        protection applies to passes (2) and (3); pass (1) is tail-agnostic by
+        design because dedup is lossless.
+
+        PROMPT-CACHE CONTRACT: a committed prune rewrites message bodies the
+        provider has already seen, invalidating the cached prefix from the
+        earliest rewritten message forward — exactly like a compression
+        boundary. To keep that break episodic rather than per-turn, the prune
+        only COMMITS when the estimated reclaim meets
+        ``proactive_prune_min_reclaim_tokens`` (measured on the actual pruned
+        output, not guessed up front). Below the gate the INPUT list object is
+        returned unchanged — the standard no-op caller contract (callers gate
+        bookkeeping on ``result is not input``).
+
+        Returns ``(messages, 0)`` — the input object — when disabled, below
+        the trigger, or when the reclaim gate rejects the commit.
+        """
+        if self.proactive_prune_tokens <= 0:
+            return messages, 0
+        if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
+            return messages, 0
+        # Nothing to reclaim until there are messages outside the protected tail.
+        if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+            return messages, 0
+        pruned_msgs, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=None,
+            min_prune_chars=self.proactive_prune_min_result_chars,
+        )
+        if not pruned_count:
+            # Standard no-op contract: hand back the INPUT object so callers
+            # can gate bookkeeping on `result is not input`.
+            return messages, 0
+        # Measured-savings gate (prompt-cache hysteresis): only commit when
+        # the prune reclaims a meaningful batch of tokens. Estimated on the
+        # real before/after messages so dedup + arg truncation count too.
+        if self.proactive_prune_min_reclaim_tokens > 0:
+            before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+            after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+            if (before - after) < self.proactive_prune_min_reclaim_tokens:
+                return messages, 0
+        return pruned_msgs, pruned_count
+
     # ------------------------------------------------------------------
     # Summarization
     # ------------------------------------------------------------------
@@ -2272,6 +2454,10 @@ class ContextCompressor(ContextEngine):
     _CONTENT_TAIL = 1500      # chars kept from the end
     _TOOL_ARGS_MAX = 1500     # tool call argument chars
     _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
+    # Aggregate cap over the whole serialized block, applied AFTER the
+    # per-message limits above. Alias of the module-level constant (which
+    # carries the full rationale) so subclasses/tests can override per-class.
+    _SUMMARY_INPUT_MAX_CHARS = _SUMMARY_INPUT_MAX_CHARS
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """Serialize conversation turns into labeled text for the summarizer.
@@ -2567,6 +2753,39 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
         return summary
 
+    @classmethod
+    def _bound_summary_input(cls, content: str) -> str:
+        """Cap total summarizer input while preserving beginning and recent tail.
+
+        Per-message truncation alone is not enough for very long sessions: a
+        compression window with hundreds of messages can still produce a huge
+        single prompt that slow auxiliary backends time out on. Keep both edges
+        because the beginning often has task setup and the tail has the most
+        recent state; explicitly mark the omitted middle so the summarizer knows
+        context was intentionally compressed before it saw the prompt.
+        """
+        if len(content) <= cls._SUMMARY_INPUT_MAX_CHARS:
+            return content
+
+        marker_template = (
+            "\n\n...[summary input truncated: omitted "
+            "{omitted:,} chars from the middle to keep compression prompt bounded]...\n\n"
+        )
+        # Estimate once, then rebuild with the exact omitted span after the
+        # head/tail split is known. The second marker can differ by a few chars
+        # if the comma-formatted number changes width, so recompute once.
+        marker = marker_template.format(omitted=len(content))
+        remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
+        head_chars = int(remaining * 0.45)
+        tail_chars = remaining - head_chars
+        omitted = max(len(content) - head_chars - tail_chars, 0)
+        marker = marker_template.format(omitted=omitted)
+        remaining = max(cls._SUMMARY_INPUT_MAX_CHARS - len(marker), 0)
+        head_chars = int(remaining * 0.45)
+        tail_chars = remaining - head_chars
+        tail = content[-tail_chars:].lstrip() if tail_chars else ""
+        return content[:head_chars].rstrip() + marker + tail
+
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
 
@@ -2639,7 +2858,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._previous_summary = _redact_compaction_text(self._previous_summary)
 
         summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        content_to_summarize = self._bound_summary_input(
+            self._serialize_for_summary(turns_to_summarize)
+        )
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
             _sanitized_memory_context,
@@ -2836,13 +3057,22 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 Write only the summary body. Do not include any preamble or prefix."""
 
         if self._previous_summary:
-            # Iterative update: preserve existing info, add new progress
+            # Iterative update: preserve existing info, add new progress.
+            # Bound the previous-summary block with the same aggregate cap as
+            # the serialized new turns: a normal summary is far below the cap
+            # (the output side is held to a ~10K-token ceiling), but a
+            # pathological handoff rehydrated from a persisted session can be
+            # arbitrarily large — the iterative prompt (previous summary +
+            # new turns) must stay bounded too.
+            _bounded_previous_summary = self._bound_summary_input(
+                self._previous_summary
+            )
             prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
 PREVIOUS SUMMARY:
-{self._previous_summary}
+{_bounded_previous_summary}
 
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
@@ -4462,6 +4692,39 @@ This compaction should PRIORITISE preserving all information related to the focu
             tail_messages=messages[compress_end:],
         )
         telemetry["chunk_count"] = 1 if turns_to_summarize else 0
+
+        if not turns_to_summarize:
+            # The newest handoff summary consumed the entire compressible
+            # window (every window row was a standalone handoff that strips
+            # to None, and nothing follows it before compress_end) — there
+            # is nothing new to summarize.  Skip the summary call entirely:
+            # without this guard the empty window still reached
+            # _generate_summary, wasting an aux LLM call that aborts
+            # noisily on empty input (#59496).  Mirrors the sibling
+            # "no compressable window" guard above (#40803): record an
+            # ineffective strike through the durable write-through helper
+            # so the anti-thrash breaker in should_compress() can stop the
+            # loop — this shape cannot shrink, so every subsequent turn
+            # would otherwise re-fire the same no-op.  The rehydrated
+            # _previous_summary is deliberately KEPT (not rolled back as
+            # the summary-abort path does for #57835): it came from a
+            # handoff genuinely present in this transcript, which is
+            # returned unchanged.
+            telemetry["failure_class"] = "empty_post_handoff_window"
+            self._record_ineffective_compression_verdict(
+                self._ineffective_compression_count + 1,
+            )
+            self._last_compression_savings_pct = 0.0
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression skipped: latest context summary leaves no "
+                    "new turns to summarize in window %d-%d. "
+                    "ineffective_compression_count=%d",
+                    compress_start,
+                    compress_end,
+                    self._ineffective_compression_count,
+                )
+            return messages
 
         if not self.quiet_mode:
             logger.info(

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import os
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -482,12 +483,59 @@ class TestMediaUpload:
             await adapter._download_remote_bytes("https://example.com/file.bin", max_bytes=4)
 
     @pytest.mark.asyncio
+    async def test_download_remote_bytes_blocks_connect_time_rebind(self, monkeypatch):
+        import httpcore
+        from httpcore._backends.auto import AutoBackend
+        from plugins.platforms.wecom.adapter import WeComAdapter
+        from tools.url_safety import SSRFConnectionBlocked
+
+        for proxy_var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            monkeypatch.delenv(proxy_var, raising=False)
+
+        answers = iter(("93.184.216.34", "169.254.169.254"))
+
+        def fake_getaddrinfo(_host, port, *_args, **_kwargs):
+            ip = next(answers)
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))
+            ]
+
+        connect_attempts = []
+
+        async def fake_connect_tcp(
+            _self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            connect_attempts.append((host, port))
+            raise httpcore.ConnectError("stop before network")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(AutoBackend, "connect_tcp", fake_connect_tcp)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        with pytest.raises(SSRFConnectionBlocked):
+            await adapter._download_remote_bytes(
+                "http://rebind.example/file.bin", max_bytes=1024
+            )
+
+        assert connect_attempts == []
     @patch(
         "tools.url_safety.async_is_safe_url",
         side_effect=lambda url: not str(url).startswith("http://169.254.169.254"),
     )
     async def test_download_remote_bytes_blocks_unsafe_redirect_target(self, _mock_safe):
-        from gateway.platforms.wecom import WeComAdapter
+        from plugins.platforms.wecom.adapter import WeComAdapter
 
         consumed = False
 
@@ -525,7 +573,7 @@ class TestMediaUpload:
         side_effect=lambda url: not str(url).startswith("http://169.254.169.254"),
     )
     async def test_download_remote_bytes_blocks_unsafe_final_response_url_before_body_read(self, _mock_safe):
-        from gateway.platforms.wecom import WeComAdapter
+        from plugins.platforms.wecom.adapter import WeComAdapter
 
         consumed = False
 
@@ -649,7 +697,7 @@ class TestSend:
         side_effect=lambda url: not str(url).startswith("http://169.254.169.254"),
     )
     async def test_send_image_blocks_unsafe_remote_redirect_before_upload(self, _mock_safe):
-        from gateway.platforms.wecom import WeComAdapter
+        from plugins.platforms.wecom.adapter import WeComAdapter
 
         class FakeResponse:
             is_redirect = True

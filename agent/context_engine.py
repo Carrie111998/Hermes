@@ -146,6 +146,19 @@ class ContextEngine(ABC):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Return True if compaction should fire this turn."""
 
+    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+        """Return ``(should_compress, reason)``.
+
+        The base implementation is backward-compatible: engines that only
+        implement ``should_compress`` get ``(should_compress(prompt_tokens),
+        None)``. Concrete engines with richer block reasons (e.g. a
+        summary-LLM cooldown or an anti-thrashing guard) override this to
+        surface a human-readable reason so callers can warn the user instead
+        of silently skipping compression. Added for the silent-overflow
+        warning fix (#62625) so plugin engines don't raise AttributeError.
+        """
+        return self.should_compress(prompt_tokens), None
+
     @abstractmethod
     def compress(
         self,
@@ -175,6 +188,27 @@ class ContextEngine(ABC):
                 their handoff prompt. Older engines may omit this parameter; the
                 host filters unsupported optional arguments by signature.
         """
+
+    # -- Optional: proactive tool-result prune -----------------------------
+
+    def prune_tool_results_only(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Deterministically trim old tool-result payloads without an LLM call.
+
+        Runs on a low, cost-oriented trigger independent of ``should_compress``
+        so large-window engines can reclaim re-sent tool output long before full
+        compaction would fire. Returns ``(messages, n_pruned)``.
+
+        Default is a safe no-op: the list is returned unchanged with ``0``
+        pruned. Engines that don't implement a cheap prune — and any engine that
+        predates this hook — inherit this default, so the agent loop's
+        post-tool-call prune path never raises ``AttributeError`` on them. The
+        built-in ContextCompressor overrides this with the real implementation.
+        """
+        return messages, 0
 
     # -- Optional: pre-flight check ----------------------------------------
 
