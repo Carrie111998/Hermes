@@ -18,17 +18,19 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 Push-Location -LiteralPath $GoDir
 try {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-Progress -Activity "Build Hermes Go Watchdog" -Status "go mod tidy" -PercentComplete 10
-    Write-Host "[1/3] go mod tidy"
-    go mod tidy
-    if ($LASTEXITCODE -ne 0) { throw "go mod tidy failed" }
-
     if (-not $SkipTest) {
+        Write-Progress -Activity "Build Hermes Go Watchdog" -Status "go mod tidy" -PercentComplete 10
+        Write-Host "[1/3] go mod tidy"
+        go mod tidy
+        if ($LASTEXITCODE -ne 0) { throw "go mod tidy failed" }
+
         Write-Progress -Activity "Build Hermes Go Watchdog" -Status "go test" -PercentComplete 45
         Write-Host "[2/3] go test ./..."
         go test ./... -count=1
         if ($LASTEXITCODE -ne 0) { throw "go test failed" }
     } else {
+        # Operator / restart path: avoid network-bound tidy and tests that hang stacks.
+        Write-Host "[1/3] go mod tidy skipped (SkipTest; use existing go.mod/go.sum)"
         Write-Host "[2/3] go test skipped"
     }
 

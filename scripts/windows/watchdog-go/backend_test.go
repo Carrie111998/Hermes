@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +23,34 @@ func TestParseReadyPortLine(t *testing.T) {
 		if ok != tc.ok || got != tc.want {
 			t.Fatalf("line %q => (%d,%v) want (%d,%v)", tc.line, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+func TestBuildServeCommandIncludesSkipBuild(t *testing.T) {
+	dir := t.TempDir()
+	venvPy := filepath.Join(dir, ".venv", "Scripts")
+	if err := os.MkdirAll(venvPy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pyPath := filepath.Join(venvPy, "python.exe")
+	if err := os.WriteFile(pyPath, []byte("stub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		HermesRoot:         dir,
+		HermesHome:         dir,
+		ManagedBackendPort: DefaultManagedBackendPort,
+	}
+	cmd, token, port, err := buildServeCommand(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || port != DefaultManagedBackendPort {
+		t.Fatalf("unexpected token/port: %q %d", token, port)
+	}
+	joined := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joined, "serve") || !strings.Contains(joined, "--skip-build") {
+		t.Fatalf("expected serve --skip-build in args, got %v", cmd.Args)
 	}
 }
 

@@ -12,11 +12,19 @@
 | Port | Service |
 |------|---------|
 | 8787 | Messaging gateway |
-| 9119 | `hermes serve` (headless backend) |
+| 9118 | Go watchdog managed prewarm `hermes serve` (not Desktop's default) |
+| 9119 | Desktop / `hermes serve` (headless backend) |
 | 9120 | `hermes dashboard` |
+| 9920 | Go watchdog HTTP control plane (`127.0.0.1` only) |
 | 8080 / 8081 | llama.cpp / proxy (optional; restart only with `-StartLlama`) |
 | 8646 | LINE ngrok/webhook helper |
 | 3001 | FreeLLMAPI local proxy |
+
+## Go watchdog restart notes
+
+- `restart-hermes-stack.ps1 -StartGoWatchdog` reuses `watchdog-go/dist/hermes-watchdog.exe` when present (no rebuild).
+- Missing exe → bounded `BuildIfMissing` (SkipTest, 180s timeout); failure skips watchdog instead of hanging the stack.
+- Managed serve is launched with `--skip-build`; prewarm runs asynchronously so the control plane is not blocked.
 
 ## Tailscale
 

@@ -1456,19 +1456,22 @@ signal to do the extraction, not to regex around it.
 ## Learned User Preferences
 
 - On Windows Hermes stack restarts, include Desktop by default; keep llama excluded unless the operator explicitly asks for it.
+- When a restart explicitly requests llama, use `restart-hermes-stack.ps1 -StartLlama` with existing Turboquant / RTX 5060 Ti scripts (e.g. `scripts/windows/start-hermes-llama-fallback-rtx5060ti.ps1`); do not invent new non-secret `HERMES_*` env vars.
 - Prefer a Desktop `.lnk` shortcut that reuses the Hermes icon over a `.ps1` launcher.
 - After stack restarts, keep Desktop↔backend mutual monitoring (watchdog) running so a dead side is recovered.
 - Prefer the Go watchdog alone for Desktop↔backend mutual monitoring; avoid running the PowerShell desktop-backend watchdog in parallel (dual watchdogs proliferate Hermes/Node processes).
 - Operator watchdog / control-plane HTTP services (Go + Tailscale) must not be controllable from Hermes-agent AI tools or agent sessions.
 - On stack restarts, bring up needed Hermes services without leaving duplicate Desktop, backend, or watchdog processes; use `-SkipTunnels` on `restart-hermes-stack.ps1` when memory-graph/tunnels hang.
 - When merging upstream while the live checkout must stay up, work on a separate branch or worktree; if upstream and fork features are equivalent, take upstream and reapply fork advantages via the Python merge tooling (`scripts/sync_all.py` / `scripts/merge_tools/`).
+- Across upstream merges, preserve fork `self_evolution` wiring (`ai_scientist_research` / `shinka_run` and the existing Hermes API-key credential bridge) via overlay replay — do not let sync wipe those toolsets.
+- For upstream security/fix contributions: branch from NousResearch (exclude `_docs`/fork-only noise), write PRs in King's English, skip if already fixed upstream; when a prior fix is incomplete, salvage and send a PR rather than opening a duplicate; harden env-leak / path-traversal / agent-runaway paths without gutting agent capability.
 - When adding new agent-facing folders (especially harness docs), create `AGENTS.md` and `README` so Hermes AI can follow them.
 
 ## Learned Workspace Facts
 
 - Packaged Desktop binary is typically at `%LOCALAPPDATA%\hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe` (fallback: repo `apps/desktop/release/win-unpacked/Hermes.exe`); the Desktop shortcut launches that packaged exe, so after Desktop code changes rebuild with `hermes desktop --build-only --force-build` and sync into LocalAppData.
-- Go watchdog lives under `scripts/windows/watchdog-go/` (started via `scripts/windows/Start-HermesGoWatchdog.ps1`, default listen `127.0.0.1:9920`, optional Tailscale tsnet); it may prewarm Desktop-compatible `hermes serve` on `127.0.0.1:9118`. Paths with spaces (e.g. `New project`) need separate argv for `-hermes-root` — never PowerShell `$args`; `detectRepoRoot` must find `pyproject.toml` and must not stop at a `\scripts` parent. Mutual monitoring uses `%LOCALAPPDATA%\HermesWatchdog\desktop-backend.json` plus `HERMES_DESKTOP_REMOTE_*`. Standalone mirror: https://github.com/zapabob/HermesDesktopwatchdog.
+- Go watchdog lives under `scripts/windows/watchdog-go/` (started via `scripts/windows/Start-HermesGoWatchdog.ps1`, default listen `127.0.0.1:9920`, optional Tailscale tsnet); it may prewarm `hermes serve` on `127.0.0.1:9118`, while Desktop normally expects announcement on `:9119` — a 9118/9119 mismatch (or unready serve) surfaces as `Timed out waiting for Hermes backend port announcement (90000ms)` and Desktop exit; prefer a healthy `:9119` (or matching `HERMES_DESKTOP_REMOTE_*`) before launching Desktop. Paths with spaces (e.g. `New project`) need separate argv for `-hermes-root` — never PowerShell `$args`; `detectRepoRoot` must find `pyproject.toml` and must not stop at a `\scripts` parent. Mutual monitoring uses `%LOCALAPPDATA%\HermesWatchdog\desktop-backend.json` plus `HERMES_DESKTOP_REMOTE_*`. Standalone mirror: https://github.com/zapabob/HermesDesktopwatchdog.
 - Legacy PowerShell mutual watchdog script remains at `scripts/windows/Start-HermesDesktopBackendWatchdog.ps1` (prefer Go-only in normal ops).
-- Local Windows port map for ops is in `fork/operations/AGENTS.md` (gateway 8787, `hermes serve` 9119, dashboard 9120); reserved ops ports must not be treated as the Desktop backend or reaped by the watchdog.
+- Local Windows port map for ops is in `fork/operations/AGENTS.md` (gateway 8787, watchdog prewarm serve 9118, Desktop `hermes serve` 9119, dashboard 9120; llama often 8080/8081, harness 18794); reserved ops ports must not be treated as the Desktop backend or reaped by the watchdog.
 - Worktrees that cannot check out `main` publish with `git push origin HEAD:main`.
-- For Hermes Agent with local llama.cpp, keep context length at least 65536 (operator target often ~100k).
+- For Hermes Agent with local llama.cpp, keep context length at least 65536 (operator target often ~100k); local GPU ops target RTX 5060 Ti 16GB with Turboquant-oriented start scripts under `scripts/windows/`.

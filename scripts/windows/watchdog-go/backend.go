@@ -148,12 +148,15 @@ func buildServeCommand(cfg Config) (*exec.Cmd, string, int, error) {
 	if webDist == "" {
 		webDist = resolveWebDist(cfg.HermesRoot)
 	}
+	// --skip-build: headless serve already skips SPA build, but keep the flag
+	// so callers/re-exec paths never fall into npm/web build hangs on cold start.
 	cmd := exec.Command(
 		python,
 		"-m", "hermes_cli.main",
 		"serve",
 		"--host", "127.0.0.1",
 		"--port", fmt.Sprintf("%d", port),
+		"--skip-build",
 	)
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(),

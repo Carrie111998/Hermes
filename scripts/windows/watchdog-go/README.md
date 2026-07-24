@@ -63,11 +63,11 @@ Admin 認証: `Authorization: Bearer <token>` または `X-Admin-Token: <token>`
 
 ## 監視ロジック
 
-1. **起動時 prewarm** — リポジトリ `.venv` で `hermes serve --port 0` を先に立ち上げ、`%LOCALAPPDATA%\HermesWatchdog\desktop-backend.json` に URL/token/port を公開
+1. **起動時 prewarm（非同期）** — HTTP / RunLoop 起動後に goroutine で managed `hermes serve --skip-build`（既定 `:9118`）を立ち上げ、`%LOCALAPPDATA%\HermesWatchdog\desktop-backend.json` に URL/token/port を公開。cold start で制御プレーンをブロックしない
 2. `Hermes.exe` 不在 → 管理 backend は reaping しない → Desktop 起動（manifest があれば `HERMES_DESKTOP_REMOTE_*` も注入）
 3. Desktop 生存 + backend 不在 → **Electron 再起動の前に** managed serve を起動/復旧
 4. 連続失敗が `-FailThreshold` 以上 → Desktop 強制再起動
-5. 予約 ops ポート (9120/8787/…) は backend 判定・reap 対象外（従来どおり）
+5. 予約 ops ポート (9120/8787/9119/…) は backend 判定・reap 対象外（従来どおり）
 
 ### Desktop ショートカット
 
@@ -93,4 +93,5 @@ Admin 認証: `Authorization: Bearer <token>` または `X-Admin-Token: <token>`
 ## スタック再起動との関係
 
 `restart-hermes-stack.ps1 -StartGoWatchdog` で**明示指定時のみ**起動（既定 OFF）。  
+既存 `dist/hermes-watchdog.exe` があれば rebuild しない。欠落時のみ `BuildIfMissing`（SkipTest・180s タイムアウト）。失敗時はスタック全体を止めず watchdog 起動をスキップ。  
 Hermes Agent からは到達不可。

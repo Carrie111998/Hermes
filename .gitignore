@@ -213,6 +213,8 @@ native/fts5_cjk/*.so
 # Go watchdog build artifacts
 scripts/windows/watchdog-go/dist/
 
+# SpecStory local IDE telemetry (never publish)
+.specstory/
 
 # Local merge/ops scratch (do not publish)
 _fork_assets_backup/

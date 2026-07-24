@@ -178,9 +178,24 @@ if (Test-Path -LiteralPath $WebUiScript) {
 
 if ($StartGoWatchdog) {
     $GoWd = Join-Path $PSScriptRoot "Start-HermesGoWatchdog.ps1"
+    $GoExe = Join-Path $PSScriptRoot "watchdog-go\dist\hermes-watchdog.exe"
     if (Test-Path -LiteralPath $GoWd) {
         Write-Step "Starting Go Desktop/backend watchdog (operator-only)"
-        & $GoWd -HermesRoot $ProjectRoot -HermesHome $HermesHome -BuildIfMissing -ForceRestart
+        # Prefer an existing exe — never block the stack restart on go mod tidy/test.
+        # If missing, BuildIfMissing is time-bounded inside Start-HermesGoWatchdog.ps1.
+        $goArgs = @{
+            HermesRoot = $ProjectRoot
+            HermesHome = $HermesHome
+            ForceRestart = $true
+            BuildTimeoutSec = 180
+        }
+        if (-not (Test-Path -LiteralPath $GoExe)) {
+            Write-Step "Go watchdog exe missing - bounded BuildIfMissing (SkipTest, 180s)"
+            $goArgs.BuildIfMissing = $true
+        } else {
+            Write-Step "Using existing Go watchdog exe (skip rebuild)"
+        }
+        & $GoWd @goArgs
     } else {
         Write-Warning "Missing Go watchdog script: $GoWd"
     }

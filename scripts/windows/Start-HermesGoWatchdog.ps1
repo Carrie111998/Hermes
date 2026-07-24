@@ -9,7 +9,11 @@ param(
     [string]$HermesRoot = "",
     [string]$HermesHome = "",
     [switch]$BuildIfMissing,
-    [switch]$ForceRestart
+    [switch]$ForceRestart,
+    # Bound go build so restart-hermes-stack never hangs on go mod tidy / network.
+    [int]$BuildTimeoutSec = 180,
+    # Default skip go test for operator start path (full test via Build-HermesGoWatchdog.ps1).
+    [switch]$RunBuildTests
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,9 +22,54 @@ $RepoRoot = if ($HermesRoot) { $HermesRoot } else { (Resolve-Path (Join-Path $Sc
 if (-not $HermesHome) { $HermesHome = Join-Path $env:USERPROFILE ".hermes" }
 
 $Exe = Join-Path $ScriptDir "watchdog-go\dist\hermes-watchdog.exe"
+
+function Invoke-GoWatchdogBuildBounded {
+    param(
+        [string]$BuildScript,
+        [int]$TimeoutSec,
+        [switch]$SkipTest
+    )
+    $argList = @()
+    if ($SkipTest) { $argList += "-SkipTest" }
+    Write-Host ("Building Go watchdog (timeout={0}s, SkipTest={1})..." -f $TimeoutSec, [bool]$SkipTest)
+    $proc = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList (@("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $BuildScript) + $argList) `
+        -WorkingDirectory $ScriptDir `
+        -PassThru `
+        -WindowStyle Hidden
+    if (-not $proc) {
+        throw "Failed to start Build-HermesGoWatchdog.ps1"
+    }
+    $finished = $proc.WaitForExit($TimeoutSec * 1000)
+    if (-not $finished) {
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+        # Also kill orphaned go children from the timed-out build.
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -and $_.CommandLine -match 'watchdog-go' -and $_.Name -match '^(go|compile|link)\.exe$'
+        } | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        throw "Go watchdog build timed out after ${TimeoutSec}s"
+    }
+    if ($proc.ExitCode -ne 0) {
+        throw "Go watchdog build failed (exit $($proc.ExitCode))"
+    }
+}
+
 if (-not (Test-Path -LiteralPath $Exe)) {
     if ($BuildIfMissing) {
-        & (Join-Path $ScriptDir "Build-HermesGoWatchdog.ps1")
+        $buildScript = Join-Path $ScriptDir "Build-HermesGoWatchdog.ps1"
+        try {
+            Invoke-GoWatchdogBuildBounded -BuildScript $buildScript -TimeoutSec $BuildTimeoutSec -SkipTest:(-not $RunBuildTests)
+        } catch {
+            Write-Warning $_.Exception.Message
+            Write-Warning "Skipping Go watchdog start — run Build-HermesGoWatchdog.ps1 manually when ready."
+            exit 0
+        }
+        if (-not (Test-Path -LiteralPath $Exe)) {
+            Write-Warning "Build finished but missing $Exe — skipping Go watchdog start."
+            exit 0
+        }
     } else {
         throw "Missing $Exe — run Build-HermesGoWatchdog.ps1 first or pass -BuildIfMissing"
     }
