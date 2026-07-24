@@ -127,3 +127,23 @@ def test_non_retryable_failure_error_is_summarized_not_raw_html():
     # The original page was tens of kilobytes; a summary is short.
     assert len(error) < 500
     assert len(error) < len(_CLOUDFLARE_CHALLENGE_HTML)
+
+
+def test_cloudflare_challenge_skips_credential_pool_and_uses_fallback():
+    from tests.run_agent.test_run_agent import _mock_response
+
+    agent = _make_agent()
+    agent._credential_pool = pool = MagicMock(provider="openai")
+    agent._fallback_chain = [{"provider": "openrouter", "model": "openai/gpt-4o"}]
+    agent.client.chat.completions.create.side_effect = _make_403_html_error()
+    fallback = MagicMock(api_key="fallback-key", base_url="https://openrouter.ai/api/v1")
+    fallback.chat.completions.create.return_value = _mock_response(content="Recovered on fallback.", finish_reason="stop")
+
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(fallback, None)), \
+         patch("agent.credential_pool.load_pool", return_value=None), \
+         patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"), \
+         patch.object(agent, "_cleanup_task_resources"):
+        result = agent.run_conversation("daily briefing please")
+
+    assert not pool.try_refresh_matching.called and not pool.mark_exhausted_and_rotate.called
+    assert (agent.provider, result["final_response"]) == ("openrouter", "Recovered on fallback.")
