@@ -221,3 +221,7 @@ _fork_assets_backup/
 nul
 
 .venv312/
+
+# Local scratch / misgenerated Electron bundle (never publish)
+_tmp/
+/electron-main.mjs
