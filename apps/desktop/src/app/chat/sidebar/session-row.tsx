@@ -139,6 +139,47 @@ function SidebarSessionRowImpl({
   // switched on, and a PR keeps its place (and its click) unless it IS the last
   // thing. Chips used to render in the body instead, which left them stranded
   // to the left of the kebab's own column: never flush right, never swapping.
+  const sessionMiddleClickHandlers = middleClickHandlers(() => {
+    triggerHaptic('selection')
+    openSession(session.id, () => undefined, 'tab')
+  })
+
+  const handleSessionClick = (event: React.MouseEvent<HTMLElement>) => {
+    const mod = event.metaKey || event.ctrlKey
+
+    // ⇧⌘-click → pop into its own window (needs standalone windows).
+    if (mod && event.shiftKey) {
+      event.preventDefault()
+      event.stopPropagation()
+      triggerHaptic('selection')
+      openSession(session.id, () => undefined, 'window')
+
+      return
+    }
+
+    // ⌘/⌃-click → open in a new tab (stack into main).
+    if (mod) {
+      event.preventDefault()
+      event.stopPropagation()
+      triggerHaptic('selection')
+      openSession(session.id, () => undefined, 'tab')
+
+      return
+    }
+
+    // ⇧-click → pin.
+    if (event.shiftKey) {
+      event.preventDefault()
+      event.stopPropagation()
+      triggerHaptic('selection')
+      onPin()
+
+      return
+    }
+
+    onResume()
+  }
+
   const trailing: { key: string; node: React.ReactNode }[] = []
 
   if ((showProfile || pinnedProfile) && hasProfileTag) {
@@ -166,6 +207,8 @@ function SidebarSessionRowImpl({
                   aria-label={`${age}, ${absoluteAge}`}
                   className="pointer-events-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring"
                   dateTime={timestampDate.toISOString()}
+                  {...sessionMiddleClickHandlers}
+                  onClick={handleSessionClick}
                   tabIndex={0}
                 >
                   {age}
@@ -303,46 +346,8 @@ function SidebarSessionRowImpl({
           // measures — so the title needs a gap from it and nothing else. Hover
           // changes what you can see in that slot, never how wide it is.
           className={cn('z-0 pr-2', branchStem && 'pl-3.5')}
-          // Middle-click = open in a new tab (browser muscle memory).
-          {...middleClickHandlers(() => {
-            triggerHaptic('selection')
-            openSession(session.id, () => undefined, 'tab')
-          })}
-          onClick={event => {
-            const mod = event.metaKey || event.ctrlKey
-
-            // ⇧⌘-click → pop into its own window (needs standalone windows).
-            if (mod && event.shiftKey) {
-              event.preventDefault()
-              event.stopPropagation()
-              triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'window')
-
-              return
-            }
-
-            // ⌘/⌃-click → open in a new tab (stack into main).
-            if (mod) {
-              event.preventDefault()
-              event.stopPropagation()
-              triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'tab')
-
-              return
-            }
-
-            // ⇧-click → pin.
-            if (event.shiftKey) {
-              event.preventDefault()
-              event.stopPropagation()
-              triggerHaptic('selection')
-              onPin()
-
-              return
-            }
-
-            onResume()
-          }}
+          {...sessionMiddleClickHandlers}
+          onClick={handleSessionClick}
         >
           {reorderable ? (
             <SidebarRowGrab ariaLabel={handleLabel} dragging={dragging} dragHandleProps={dragHandleProps}>

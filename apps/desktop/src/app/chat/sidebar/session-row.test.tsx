@@ -1,13 +1,15 @@
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { openSession } from '@/app/open-session'
 import type { SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
+import { $sidebarRowMeta } from '@/store/layout'
 import type * as SessionStore from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
@@ -15,7 +17,11 @@ import type * as WindowsStore from '@/store/windows'
 
 import { SidebarSessionRow } from './session-row'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+  $sidebarRowMeta.set(['updated'])
+})
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -45,6 +51,7 @@ vi.mock('@/i18n', () => ({
 
 vi.mock('@/app/chat/profile-tag', () => ({ ProfileTag: () => null }))
 vi.mock('@/app/chat/session-drag', () => ({ startSessionDrag: vi.fn() }))
+vi.mock('@/app/open-session', () => ({ openSession: vi.fn() }))
 // PlatformAvatar is intentionally NOT mocked (do not reintroduce this — see
 // #67500, Gille's third pass): it's a forwardRef component that spreads its
 // props onto the rendered span, and mocking it with a stand-in that spreads
@@ -236,7 +243,7 @@ describe('SidebarSessionRow', () => {
     expect(tipTrigger(kebab)).toBeNull()
   })
 
-  it('exposes the exact session time through a focusable Tip trigger', () => {
+  it('exposes the exact session time through a focusable Tip trigger', async () => {
     const startedAt = Math.floor(Date.now() / 1000) - 5 * 60
 
     render(
@@ -258,6 +265,156 @@ describe('SidebarSessionRow', () => {
     expect(age.getAttribute('tabindex')).toBe('0')
     expect(age.getAttribute('title')).toBeNull()
     expect(tipTrigger(age)).toBeTruthy()
+
+    fireEvent.pointerMove(age, { pointerType: 'mouse' })
+    expect((await screen.findByRole('tooltip')).textContent).toMatch(/^Today at /)
+  })
+
+  it('keeps the session row action when the timestamp is clicked', () => {
+    const onResume = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        session={makeSession({
+          started_at: Math.floor(Date.now() / 1000) - 5 * 60,
+          title: 'Timestamped session'
+        })}
+      />
+    )
+
+    fireEvent.click(screen.getByText('5m'))
+
+    expect(onResume).toHaveBeenCalledOnce()
+    expect(openSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps the session pin action when the timestamp is shift-clicked', () => {
+    const onPin = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={onPin}
+        onResume={noop}
+        session={makeSession({
+          started_at: Math.floor(Date.now() / 1000) - 5 * 60,
+          title: 'Timestamped session'
+        })}
+      />
+    )
+
+    fireEvent.click(screen.getByText('5m'), { shiftKey: true })
+
+    expect(onPin).toHaveBeenCalledOnce()
+    expect(openSession).not.toHaveBeenCalled()
+  })
+
+  it('hides the timestamp when updated metadata is disabled', () => {
+    $sidebarRowMeta.set([])
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        session={makeSession({
+          started_at: Math.floor(Date.now() / 1000) - 5 * 60,
+          title: 'Timestamped session'
+        })}
+      />
+    )
+
+    expect(screen.queryByText('5m')).toBeNull()
+  })
+
+  it('opens the timestamp target in a tab for a modifier click', () => {
+    const onResume = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        session={makeSession({
+          started_at: Math.floor(Date.now() / 1000) - 5 * 60,
+          title: 'Timestamped session'
+        })}
+      />
+    )
+
+    fireEvent.click(screen.getByText('5m'), { metaKey: true })
+
+    expect(openSession).toHaveBeenCalledOnce()
+    expect(openSession).toHaveBeenCalledWith('s1', expect.any(Function), 'tab')
+    expect(onResume).not.toHaveBeenCalled()
+  })
+
+  it('opens the timestamp target in a window for a shifted modifier click', () => {
+    const onResume = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        session={makeSession({
+          started_at: Math.floor(Date.now() / 1000) - 5 * 60,
+          title: 'Timestamped session'
+        })}
+      />
+    )
+
+    fireEvent.click(screen.getByText('5m'), { ctrlKey: true, shiftKey: true })
+
+    expect(openSession).toHaveBeenCalledOnce()
+    expect(openSession).toHaveBeenCalledWith('s1', expect.any(Function), 'window')
+    expect(onResume).not.toHaveBeenCalled()
+  })
+
+  it('opens the timestamp target in a tab for a middle click', () => {
+    const onResume = vi.fn()
+
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        session={makeSession({
+          started_at: Math.floor(Date.now() / 1000) - 5 * 60,
+          title: 'Timestamped session'
+        })}
+      />
+    )
+
+    const age = screen.getByText('5m')
+    fireEvent.mouseDown(age, { button: 1 })
+    fireEvent.pointerDown(age, { button: 1 })
+    fireEvent.pointerUp(age, { button: 1 })
+
+    expect(openSession).toHaveBeenCalledOnce()
+    expect(openSession).toHaveBeenCalledWith('s1', expect.any(Function), 'tab')
+    expect(onResume).not.toHaveBeenCalled()
   })
 
   it('does not render a handoff avatar for a locally-started session', () => {
