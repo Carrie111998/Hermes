@@ -748,6 +748,9 @@ def test_reference_guidance_appended_at_end_in_tool_loop():
     # The reference block is appended as a new trailing turn, not merged upstream.
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "REFERENCE BLOCK"
+    assert messages[-1]["_moa_reference_guidance_appended"] == {
+        "shape": "standalone"
+    }
     assert len(messages) == 5
 
 
@@ -828,6 +831,48 @@ def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
     )
 
     assert captured["reasoning_config"] == expected_reasoning
+
+
+def test_prepared_aggregator_keeps_replay_origin_until_route_selection(monkeypatch):
+    from agent import moa_loop
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return _response("aggregator acted")
+
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+    )
+    prepared = {
+        "messages": [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1"}],
+                "reasoning_content": "scratchpad",
+                "_reasoning_replay_origin": "internal-route-fingerprint",
+            },
+        ],
+        "aggregator": {"provider": "openrouter", "model": "aggregator"},
+        "aggregator_temperature": None,
+    }
+
+    facade = moa_loop.MoAChatCompletions("review")
+    facade._call_prepared_aggregator(prepared, {})
+
+    assert captured["messages"][1]["_reasoning_replay_origin"] == (
+        "internal-route-fingerprint"
+    )
+    assert captured["messages"][1]["reasoning_content"] == "scratchpad"
+    assert prepared["messages"][1]["_reasoning_replay_origin"] == (
+        "internal-route-fingerprint"
+    )
 
 
 

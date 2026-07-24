@@ -819,6 +819,13 @@ class ChatCompletionsTransport(ProviderTransport):
         provider_data: Dict[str, Any] = {}
         if reasoning_content is not None:
             provider_data["reasoning_content"] = reasoning_content
+        reasoning_content_is_native = getattr(
+            msg, "_reasoning_content_is_native", None
+        )
+        if reasoning_content_is_native is not None:
+            provider_data["_reasoning_content_is_native"] = bool(
+                reasoning_content_is_native
+            )
         rd = getattr(msg, "reasoning_details", None)
         if rd:
             provider_data["reasoning_details"] = rd

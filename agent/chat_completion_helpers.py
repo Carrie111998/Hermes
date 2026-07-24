@@ -36,6 +36,7 @@ from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
+    _preserves_gemma4_reasoning_replay,
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
@@ -1742,6 +1743,26 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     if "reasoning_content" not in msg and reasoning_text:
         msg["reasoning_content"] = reasoning_text
 
+    # Capture the producing route at the response boundary. This underscore
+    # marker is internal-only and stripped before the wire/persistence, but it
+    # lets active-turn Gemma 4 continuations distinguish same-named models on
+    # different providers or endpoints after a fallback.
+    native_reasoning_content = bool(
+        raw_reasoning_content is not None
+        and getattr(assistant_message, "_reasoning_content_is_native", True)
+    )
+    if (
+        assistant_tool_calls
+        and native_reasoning_content
+        and isinstance(raw_reasoning_content, str)
+        and raw_reasoning_content.strip()
+    ):
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+
+        replay_model, replay_origin = _reasoning_replay_route(agent)
+        if _preserves_gemma4_reasoning_replay(replay_model):
+            msg["_reasoning_replay_origin"] = replay_origin
+
     if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
         # Pass reasoning_details back unmodified so providers (OpenRouter,
         # Anthropic, OpenAI) can maintain reasoning continuity across turns.
@@ -2377,11 +2398,25 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     try:
         # Build API messages, stripping internal-only fields
         # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
+        from agent.conversation_compression import _is_real_user_message
+
+        current_turn_user_idx = max(
+            (i for i, msg in enumerate(messages) if _is_real_user_message(msg)),
+            default=-1,
+        )
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
-        for msg in messages:
+        for idx, msg in enumerate(messages):
             api_msg = msg.copy()
-            agent._copy_reasoning_content_for_api(msg, api_msg)
+            agent._copy_reasoning_content_for_api(
+                msg,
+                api_msg,
+                preserve_explicit_reasoning=(
+                    current_turn_user_idx >= 0
+                    and idx > current_turn_user_idx
+                    and bool(msg.get("tool_calls"))
+                ),
+            )
             for internal_field in ("reasoning", "finish_reason"):
                 api_msg.pop(internal_field, None)
             # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go,
@@ -2444,10 +2479,23 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
         # Strip all remaining underscore-prefixed scaffolding keys before the
         # wire. The summary path calls chat.completions.create() directly,
-        # bypassing the transport's universal underscore-key sweeper.
+        # bypassing the transport's universal underscore-key sweeper. MoA is
+        # the exception: its auxiliary client still has to select the concrete
+        # aggregator/fallback route, so replay provenance must survive until
+        # _build_call_kwargs compares and strips it for that exact candidate.
+        _summary_internal_allowlist = (
+            {"_reasoning_replay_origin"} if agent.provider == "moa" else set()
+        )
         for api_msg in api_messages:
             if isinstance(api_msg, dict):
-                for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
+                for internal_key in [
+                    k for k in api_msg
+                    if (
+                        isinstance(k, str)
+                        and k.startswith("_")
+                        and k not in _summary_internal_allowlist
+                    )
+                ]:
                     api_msg.pop(internal_key, None)
 
         summary_extra_body = {}
@@ -2728,7 +2776,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 def _build_partial_stream_stub(
     role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None,
+    dropped_tool_names=None, reasoning_content_is_native=False,
 ):
     """Build a partial-stream-stub response for mid-stream drop scenarios.
 
@@ -2743,6 +2791,7 @@ def _build_partial_stream_stub(
         content=full_content,
         tool_calls=None,
         reasoning_content=full_reasoning,
+        _reasoning_content_is_native=reasoning_content_is_native,
     )
     mock_choice = SimpleNamespace(
         index=0,
@@ -3362,6 +3411,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         model_name = None
         role = "assistant"
         reasoning_parts: list = []
+        # Gemma replay may trust the combined stream only when every reasoning
+        # segment came from the provider-native reasoning_content field.
+        reasoning_content_is_native = True
         usage_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -3442,6 +3494,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "role": role,
                             "content": "".join(content_parts) or None,
                             "reasoning_content": "".join(reasoning_parts) or None,
+                            "_reasoning_content_is_native": reasoning_content_is_native,
                             "tool_calls": tool_calls or None,
                         },
                         "finish_reason": finish_reason or "stop",
@@ -3544,8 +3597,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 model_name = chunk.model
 
             # Accumulate reasoning content
-            reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            native_reasoning_delta = getattr(delta, "reasoning_content", None)
+            reasoning_text = native_reasoning_delta or getattr(delta, "reasoning", None)
             if reasoning_text:
+                reasoning_content_is_native = (
+                    reasoning_content_is_native and bool(native_reasoning_delta)
+                )
                 # Summary-part models (gpt-5.x and other Responses relays) send
                 # one complete markdown block per delta with no separator, so
                 # the parts glue into a single unreadable run. Only the tail of
@@ -3809,6 +3866,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
                 dropped_tool_names=_dropped_names or None,
+                reasoning_content_is_native=reasoning_content_is_native,
             )
 
         # Text-only stream drop: the upstream closed the connection (or the
@@ -3830,6 +3888,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
+                reasoning_content_is_native=reasoning_content_is_native,
             )
 
         effective_finish_reason = finish_reason or "stop"
@@ -3842,6 +3901,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             content=full_content,
             tool_calls=mock_tool_calls,
             reasoning_content=full_reasoning,
+            _reasoning_content_is_native=reasoning_content_is_native,
         )
         mock_choice = SimpleNamespace(
             index=0,

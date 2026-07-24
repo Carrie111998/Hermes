@@ -12,12 +12,15 @@ from types import SimpleNamespace
 import pytest
 
 from agent.message_sanitization import (
+    _MOA_REFERENCE_GUIDANCE_METADATA_KEY,
     apply_reasoning_content_policy,
     coalesce_tool_call_id,
     deterministic_call_id,
     matches_reasoning_echo_family,
     needs_reasoning_echo,
+    prepare_reasoning_replay_messages_for_route,
     reapply_reasoning_echo,
+    reasoning_replay_route_fingerprint,
     reasoning_echo_family,
     uniquify_tool_call_ids,
 )
@@ -233,12 +236,51 @@ class TestApplyReasoningContentPolicy:
             {"role": "assistant", "content": "x", "reasoning_content": " "}, api, False)
         assert "reasoning_content" not in api
 
+    @pytest.mark.parametrize(
+        ("same_tool_turn", "reasoning_content", "expected"),
+        [(True, "native thought", "native thought"), (False, "completed thought", None), (True, " ", None)],
+    )
+    def test_gemma4_only_preserves_explicit_current_tool_turn_reasoning(
+        self, same_tool_turn, reasoning_content, expected
+    ):
+        api = {"role": "assistant", "reasoning_content": reasoning_content}
+        origin = "route-primary"
+        api["_reasoning_replay_origin"] = origin
+        apply_reasoning_content_policy(dict(api), api, False, model="google/gemma-4-31b-it",
+                                       preserve_explicit_reasoning=same_tool_turn,
+                                       replay_origin=origin)
+        if expected is None:
+            assert "reasoning_content" not in api
+        else:
+            assert api["reasoning_content"] == expected
+
     def test_cross_provider_poisoned_history_pads_with_space(self):
         src = {"role": "assistant", "content": "x", "reasoning": "other-provider CoT",
                "tool_calls": [{"id": "c", "function": {"name": "t", "arguments": "{}"}}]}
         api = {"role": "assistant", "content": "x"}
         apply_reasoning_content_policy(src, api, True)
         assert api["reasoning_content"] == " "  # pad, never the foreign CoT
+
+    def test_require_side_fallback_pads_foreign_marked_scratchpad(self):
+        src = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "private Gemma scratchpad",
+            "_reasoning_replay_origin": "gemma-route",
+        }
+        api = dict(src)
+
+        apply_reasoning_content_policy(
+            src,
+            api,
+            True,
+            model="deepseek-reasoner",
+            preserve_explicit_reasoning=True,
+            replay_origin="deepseek-route",
+        )
+
+        assert api["reasoning_content"] == " "
+        assert "_reasoning_replay_origin" not in api
 
     def test_reasoning_promoted_only_on_require_side(self):
         src = {"role": "assistant", "content": "x", "reasoning": "healthy"}
@@ -286,6 +328,431 @@ class TestReapplyReasoningEcho:
         msgs = copy.deepcopy(self.MSGS)
         assert reapply_reasoning_echo(msgs, False) == 1
         assert all("reasoning_content" not in m for m in msgs)
+
+    def test_gemma4_reapply_keeps_only_current_tool_turn_reasoning(self):
+        current = {"role": "assistant", "tool_calls": [{}], "reasoning_content": "current"}
+        current["_reasoning_replay_origin"] = "route-primary"
+        apply_reasoning_content_policy(
+            current,
+            current,
+            False,
+            model="gemma4:31b",
+            preserve_explicit_reasoning=True,
+            replay_origin="route-primary",
+        )
+        msgs = [
+            {"role": "assistant", "tool_calls": [{}], "reasoning_content": "old"},
+            {"role": "user", "content": "current"},
+            current,
+            {"role": "assistant", "tool_calls": [{}], "reasoning_content": " "},
+        ]
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 2
+        assert "reasoning_content" not in msgs[0]
+        assert msgs[2]["reasoning_content"] == "current"
+        assert "reasoning_content" not in msgs[3]
+
+    @pytest.mark.parametrize(
+        "synthetic_flag",
+        ["_empty_recovery_synthetic", "_kanban_stop_synthetic"],
+    )
+    def test_synthetic_user_nudge_does_not_end_gemma_tool_turn(self, synthetic_flag):
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "current",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        msgs = [
+            {"role": "user", "content": "current task"},
+            current,
+            {
+                "role": "user",
+                "content": "Continue processing after the empty response.",
+                synthetic_flag: True,
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 0
+        assert current["reasoning_content"] == "current"
+        assert current["_reasoning_replay_origin"] == "route-primary"
+
+    def test_moa_reference_guidance_does_not_end_gemma_tool_turn(self):
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "current",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        msgs = [
+            {"role": "user", "content": "current task"},
+            current,
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {
+                "role": "user",
+                "content": "[Mixture of Agents reference context]\nAdvice body.",
+                _MOA_REFERENCE_GUIDANCE_METADATA_KEY: {"shape": "standalone"},
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 0
+        assert current["reasoning_content"] == "current"
+        assert current["_reasoning_replay_origin"] == "route-primary"
+
+    @pytest.mark.parametrize(
+        "nudge_name",
+        [
+            "_LENGTH_CONTINUATION_OUTPUT_LIMIT",
+            "_CODEX_INCOMPLETE_NUDGE",
+            "_CODEX_ACK_CONTINUATION_NUDGE",
+            "_EMPTY_TOOL_RESPONSE_NUDGE",
+        ],
+    )
+    def test_moa_guidance_merged_into_synthetic_nudge_keeps_tool_turn_reasoning(
+        self, nudge_name
+    ):
+        import agent.conversation_loop as conversation_loop
+
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "current",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        nudge = getattr(conversation_loop, nudge_name)
+        msgs = [
+            {"role": "user", "content": "current task"},
+            current,
+            {
+                "role": "user",
+                "content": (
+                    nudge
+                    + "\n\n[Mixture of Agents reference context]\nAdvice body."
+                ),
+                _MOA_REFERENCE_GUIDANCE_METADATA_KEY: {
+                    "shape": "string",
+                    "boundary": len(nudge),
+                },
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 0
+        assert current["reasoning_content"] == "current"
+        assert current["_reasoning_replay_origin"] == "route-primary"
+
+    def test_length_continuation_flag_survives_changed_content(self):
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "current",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        msgs = [
+            {"role": "user", "content": "current task"},
+            current,
+            {
+                "role": "user",
+                "content": "runtime-decorated continuation text",
+                "_length_continuation_nudge": True,
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 0
+        assert current["reasoning_content"] == "current"
+
+    def test_moa_guidance_keeps_image_only_user_turn_as_real_boundary(self):
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "must be old after a real user turn",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        msgs = [
+            current,
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+                    {
+                        "type": "text",
+                        "text": (
+                            "\n\n[Mixture of Agents reference context]\nAdvice body."
+                        ),
+                    },
+                ],
+                _MOA_REFERENCE_GUIDANCE_METADATA_KEY: {
+                    "shape": "list",
+                    "boundary": 1,
+                },
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 1
+        assert "reasoning_content" not in current
+
+    def test_repeated_header_inside_guidance_does_not_create_user_boundary(self):
+        from agent.moa_loop import _attach_reference_guidance
+
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "current",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        msgs = [
+            {"role": "user", "content": "current task"},
+            current,
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+        _attach_reference_guidance(
+            msgs,
+            (
+                "[Mixture of Agents reference context]\nAdvice quotes this:\n"
+                "[Mixture of Agents reference context]\nNested example."
+            ),
+        )
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 0
+        assert current["reasoning_content"] == "current"
+
+    def test_user_authored_moa_header_remains_a_real_boundary(self):
+        current = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "belongs to the previous turn",
+            "_reasoning_replay_origin": "route-primary",
+        }
+        msgs = [
+            {"role": "user", "content": "previous task"},
+            current,
+            {
+                "role": "user",
+                "content": "[Mixture of Agents reference context]\nPlease explain this block.",
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-primary",
+        ) == 1
+        assert "reasoning_content" not in current
+
+    def test_fallback_to_gemma4_strips_foreign_reasoning(self):
+        msgs = [
+            {"role": "user", "content": "current"},
+            {"role": "assistant", "tool_calls": [{}], "reasoning_content": "foreign"},
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            False,
+            model="gemma4:31b",
+            replay_origin="route-fallback",
+        ) == 1
+        assert "reasoning_content" not in msgs[1]
+
+    def test_require_side_fallback_replaces_foreign_gemma_reasoning(self):
+        msgs = [
+            {"role": "user", "content": "current"},
+            {
+                "role": "assistant",
+                "tool_calls": [{}],
+                "reasoning": "normalized copy must not cross routes",
+                "reasoning_content": "gemma scratchpad",
+                "_reasoning_replay_origin": "route-gemma",
+            },
+        ]
+
+        assert reapply_reasoning_echo(
+            msgs,
+            True,
+            model="deepseek-v4",
+            replay_origin="route-deepseek",
+        ) == 1
+        assert msgs[1]["reasoning_content"] == " "
+        assert "_reasoning_replay_origin" not in msgs[1]
+
+    def test_same_model_different_endpoint_does_not_match_origin(self):
+        source = {
+            "role": "assistant",
+            "tool_calls": [{}],
+            "reasoning_content": "primary secret",
+            "_reasoning_replay_origin": "route-TenantA",
+        }
+        api = dict(source)
+
+        apply_reasoning_content_policy(
+            source,
+            api,
+            False,
+            model="Gemma4:Custom",
+            preserve_explicit_reasoning=True,
+            replay_origin="route-tenanta",
+        )
+
+        assert "reasoning_content" not in api
+        assert "_reasoning_replay_origin" not in api
+
+    def test_moa_uses_resolved_gemma4_aggregator_model(self):
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        agent = SimpleNamespace(
+            provider="moa", model="closed",
+            base_url="",
+            client=SimpleNamespace(last_aggregator_slot={
+                "provider": "custom",
+                "base_url": "https://gemma.test/v1",
+                "model": "google/gemma-4-31b-it",
+            }),
+            _needs_thinking_reasoning_pad=lambda: False,
+        )
+        source = {"role": "assistant", "tool_calls": [{}], "reasoning_content": "thought"}
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+        _, source["_reasoning_replay_origin"] = _reasoning_replay_route(agent)
+        current = dict(source)
+        from agent.agent_runtime_helpers import copy_reasoning_content_for_api
+        copy_reasoning_content_for_api(
+            agent, source, current, preserve_explicit_reasoning=True
+        )
+        msgs = [{"role": "user", "content": "current"}, current]
+
+        assert reapply_reasoning_echo_for_provider(agent, msgs) == 0
+        assert msgs[1]["reasoning_content"] == "thought"
+
+    def test_moa_uses_actual_successful_fallback_route(self):
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+
+        fallback_route = {
+            "provider": "openai",
+            "base_url": "https://fallback.test/v1",
+            "model": "fallback-model",
+        }
+        moa_agent = SimpleNamespace(
+            provider="moa",
+            model="closed",
+            base_url="",
+            client=SimpleNamespace(
+                last_aggregator_slot={
+                    "provider": "custom",
+                    "base_url": "https://gemma.test/v1",
+                    "model": "google/gemma-4-31b-it",
+                },
+                last_aggregator_runtime=fallback_route,
+            ),
+        )
+        direct_agent = SimpleNamespace(**fallback_route)
+
+        model, fingerprint = _reasoning_replay_route(moa_agent)
+        _, expected_fingerprint = _reasoning_replay_route(direct_agent)
+
+        assert model == "fallback-model"
+        assert fingerprint == expected_fingerprint
+
+    def test_auxiliary_wire_shapes_marked_reasoning_for_concrete_route(self):
+        gemma_route = {
+            "provider": "openrouter",
+            "base_url": "https://gemma.test/v1",
+            "model": "google/gemma-4-31b-it",
+        }
+        origin = reasoning_replay_route_fingerprint(**gemma_route)
+        source = [
+            {"role": "user", "content": "current"},
+            {
+                "role": "assistant",
+                "tool_calls": [{}],
+                "reasoning_content": "private scratchpad",
+                "_reasoning_replay_origin": origin,
+            },
+        ]
+
+        same_route = prepare_reasoning_replay_messages_for_route(
+            source, **gemma_route
+        )
+        strict_route = prepare_reasoning_replay_messages_for_route(
+            source,
+            provider="openai",
+            base_url="https://strict.test/v1",
+            model="strict-model",
+        )
+        require_side_route = prepare_reasoning_replay_messages_for_route(
+            source,
+            provider="deepseek",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-reasoner",
+        )
+
+        assert same_route[1]["reasoning_content"] == "private scratchpad"
+        assert "reasoning_content" not in strict_route[1]
+        assert require_side_route[1]["reasoning_content"] == " "
+        assert all("_reasoning_replay_origin" not in rows[1] for rows in (
+            same_route, strict_route, require_side_route
+        ))
+        assert source[1]["_reasoning_replay_origin"] == origin
+
+    def test_auxiliary_wire_strips_moa_guidance_provenance(self):
+        source = [
+            {
+                "role": "user",
+                "content": "task\n\n[Mixture of Agents reference context]\nAdvice.",
+                _MOA_REFERENCE_GUIDANCE_METADATA_KEY: {
+                    "shape": "string",
+                    "boundary": len("task"),
+                },
+            },
+        ]
+
+        for route in (
+            {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "model": "google/gemma-4-31b-it",
+            },
+            {
+                "provider": "deepseek",
+                "base_url": "https://api.deepseek.com/v1",
+                "model": "deepseek-reasoner",
+            },
+        ):
+            wire = prepare_reasoning_replay_messages_for_route(source, **route)
+            assert _MOA_REFERENCE_GUIDANCE_METADATA_KEY not in wire[0]
+            assert "reasoning_content" not in wire[0]
+        assert source[0][_MOA_REFERENCE_GUIDANCE_METADATA_KEY]["shape"] == "string"
 
     def test_idempotent(self):
         import copy

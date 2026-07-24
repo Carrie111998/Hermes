@@ -3218,11 +3218,13 @@ def _record_route_info(
     route_info: Optional[Dict[str, str]],
     provider: Optional[str],
     model: Optional[str],
+    base_url: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
         route_info["provider"] = provider or "auto"
         route_info["model"] = model or "default"
+        route_info["base_url"] = str(base_url or "")
 
 
 def _relay_auxiliary_metadata(
@@ -4591,6 +4593,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -4618,6 +4621,12 @@ def _retry_same_provider_sync(
         )
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    _record_route_info(
+        route_info,
+        _fallback_provider_from_label(effective_provider or resolved_provider),
+        retry_model or final_model,
+        retry_base or resolved_base_url,
+    )
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider,
         retry_model or final_model,
@@ -4666,6 +4675,7 @@ async def _retry_same_provider_async(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
         effective_provider, retry_client, retry_model = resolve_vision_provider_client(
@@ -4693,6 +4703,12 @@ async def _retry_same_provider_async(
         )
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    _record_route_info(
+        route_info,
+        _fallback_provider_from_label(effective_provider or resolved_provider),
+        retry_model or final_model,
+        retry_base or resolved_base_url,
+    )
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider,
         retry_model or final_model,
@@ -5003,6 +5019,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    route_info: Optional[Dict[str, str]] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5033,6 +5050,12 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    _record_route_info(
+        route_info,
+        destination.provider,
+        destination.model,
+        destination.base_url,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5074,6 +5097,12 @@ def _call_fallback_candidate_sync(
                     or str(getattr(retry_client, "base_url", "") or ""),
                     destination.api_mode,
                     retry_model or destination.model,
+                )
+                _record_route_info(
+                    route_info,
+                    retry_destination.provider,
+                    retry_destination.model,
+                    retry_destination.base_url,
                 )
                 retry_messages, retry_tools = _replan_synchronous_cache_sections(
                     messages,
@@ -5128,6 +5157,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    route_info: Optional[Dict[str, str]] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -5139,6 +5169,12 @@ async def _call_fallback_candidate_async(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    _record_route_info(
+        route_info,
+        destination.provider,
+        destination.model,
+        destination.base_url,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5181,6 +5217,12 @@ async def _call_fallback_candidate_async(
                     or str(getattr(retry_client, "base_url", "") or ""),
                     destination.api_mode,
                     retry_model or destination.model,
+                )
+                _record_route_info(
+                    route_info,
+                    retry_destination.provider,
+                    retry_destination.model,
+                    retry_destination.base_url,
                 )
                 retry_messages, retry_tools = _replan_synchronous_cache_sections(
                     messages,
@@ -8253,6 +8295,23 @@ def _build_call_kwargs(
     task: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
+    # Replay provenance must survive until the concrete auxiliary destination
+    # is selected. In particular, call_llm may replace a configured MoA
+    # aggregator with a different fallback route after a 402/429. Shape the
+    # scratchpad for this exact candidate and strip the internal marker here,
+    # at the last shared request-construction boundary.
+    from agent.message_sanitization import prepare_reasoning_replay_messages_for_route
+
+    route_provider = _fallback_provider_from_label(provider)
+    route_base_url = base_url or (
+        _current_custom_base_url() if route_provider == "custom" else ""
+    )
+    messages = prepare_reasoning_replay_messages_for_route(
+        messages,
+        provider=route_provider,
+        model=model,
+        base_url=route_base_url,
+    )
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -8367,9 +8426,7 @@ def _build_call_kwargs(
     # ``extra_body.reasoning``. Profiles are the source of truth for those wire
     # shapes. Providers without a reasoning-aware profile retain the generic
     # ``extra_body.reasoning`` fallback used by Codex-compatible adapters.
-    effective_base = base_url or (
-        _current_custom_base_url() if provider == "custom" else ""
-    )
+    effective_base = route_base_url
     profile_body: Dict[str, Any] = {}
     profile_reasoning_extra: Dict[str, Any] = {}
     profile_top_level: Dict[str, Any] = {}
@@ -9190,7 +9247,10 @@ def _call_llm_impl(
         resolved_api_mode,
     )
     _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
+        route_info,
+        _fallback_provider_from_label(request_provider),
+        final_model,
+        str(getattr(client, "base_url", resolved_base_url) or ""),
     )
 
     # Log what we're about to do — makes auxiliary operations visible
@@ -9209,6 +9269,7 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
+    rejected_compat_options: set[str] = set()
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -9216,6 +9277,48 @@ def _call_llm_impl(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    def _retarget_sync_attempt(route_client: Any, route_model: str) -> dict[str, Any]:
+        """Rebuild request projection and route ledger for a recovered route."""
+        route_provider = (
+            _effective_provider_for_client(route_client, request_provider)
+            or request_provider
+        )
+        route_base = str(getattr(route_client, "base_url", "") or "")
+        rebuilt = _build_call_kwargs(
+            route_provider,
+            route_model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=effective_timeout,
+            extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+            base_url=route_base or resolved_base_url,
+            task=task,
+        )
+        if extra_headers:
+            rebuilt["extra_headers"] = dict(extra_headers)
+        # Preserve only omissions established by an actual compatibility 400.
+        # Ordinary absence is model-specific (notably max_tokens versus
+        # max_completion_tokens) and must not erase the rebuilt route's cap.
+        if "temperature" in rejected_compat_options:
+            rebuilt.pop("temperature", None)
+        if "token_limit" in rejected_compat_options:
+            rebuilt.pop("max_tokens", None)
+            rebuilt.pop("max_completion_tokens", None)
+        if _is_anthropic_compat_endpoint(route_provider, route_base):
+            rebuilt["messages"] = _convert_openai_images_to_anthropic(
+                rebuilt["messages"]
+            )
+        _record_route_info(
+            route_info,
+            _fallback_provider_from_label(route_provider),
+            route_model,
+            route_base or resolved_base_url,
+        )
+        return rebuilt
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
@@ -9338,6 +9441,7 @@ def _call_llm_impl(
             raise _last_transient
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
+            rejected_compat_options.add("temperature")
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
             logger.info(
@@ -9381,10 +9485,13 @@ def _call_llm_impl(
         )
         if max_tokens is not None and (
             "max_tokens" in err_str
+            or "max_completion_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_unsupported_parameter_error(first_err, "max_completion_tokens")
             or _is_zai_param_error
         ):
+            rejected_compat_options.add("token_limit")
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
@@ -9421,7 +9528,7 @@ def _call_llm_impl(
                     "retrying with refreshed recommendation %r",
                     task or "call", kwargs.get("model"), healed_model,
                 )
-                kwargs["model"] = healed_model
+                kwargs = _retarget_sync_attempt(client, healed_model)
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -9458,8 +9565,10 @@ def _call_llm_impl(
                     "Auxiliary %s: refreshed Nous runtime credentials after paid account check, retrying",
                     task or "call",
                 )
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                kwargs = _retarget_sync_attempt(
+                    refreshed_client,
+                    refreshed_model or str(kwargs.get("model") or final_model or ""),
+                )
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -9492,8 +9601,10 @@ def _call_llm_impl(
             if refreshed_client is not None:
                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                kwargs = _retarget_sync_attempt(
+                    refreshed_client,
+                    refreshed_model or str(kwargs.get("model") or final_model or ""),
+                )
                 return _validate_llm_response(
                     _relay_sync_completion(
                         refreshed_client,
@@ -9534,6 +9645,7 @@ def _call_llm_impl(
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
                     extra_headers=extra_headers,
+                    route_info=route_info,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -9583,6 +9695,7 @@ def _call_llm_impl(
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
                         extra_headers=extra_headers,
+                        route_info=route_info,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -9712,7 +9825,10 @@ def _call_llm_impl(
 
             if fb_client is not None:
                 _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
+                    route_info,
+                    _fallback_provider_from_label(fb_label),
+                    fb_model,
+                    str(getattr(fb_client, "base_url", "") or ""),
                 )
                 fb_resp = _call_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
@@ -9720,7 +9836,8 @@ def _call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    route_info=route_info)
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
@@ -9730,7 +9847,10 @@ def _call_llm_impl(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     _record_route_info(
-                        route_info, _fallback_provider_from_label(fb_label), fb_model
+                        route_info,
+                        _fallback_provider_from_label(fb_label),
+                        fb_model,
+                        str(getattr(fb_client, "base_url", "") or ""),
                     )
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
@@ -9738,7 +9858,8 @@ def _call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        route_info=route_info)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
@@ -9976,7 +10097,10 @@ async def _async_call_llm_impl(
         resolved_api_mode,
     )
     _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
+        route_info,
+        _fallback_provider_from_label(request_provider),
+        final_model,
+        str(getattr(client, "base_url", resolved_base_url) or ""),
     )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
@@ -9989,10 +10113,50 @@ async def _async_call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
+    rejected_compat_options: set[str] = set()
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    def _retarget_async_attempt(route_client: Any, route_model: str) -> dict[str, Any]:
+        """Async-path mirror of recovered-route request projection."""
+        route_provider = (
+            _effective_provider_for_client(route_client, request_provider)
+            or request_provider
+        )
+        route_base = str(getattr(route_client, "base_url", "") or "")
+        rebuilt = _build_call_kwargs(
+            route_provider,
+            route_model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            timeout=effective_timeout,
+            extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+            base_url=route_base or resolved_base_url,
+            task=task,
+        )
+        # Preserve only compatibility omissions proved by a provider error;
+        # allow a recovered model to select the other token-limit spelling.
+        if "temperature" in rejected_compat_options:
+            rebuilt.pop("temperature", None)
+        if "token_limit" in rejected_compat_options:
+            rebuilt.pop("max_tokens", None)
+            rebuilt.pop("max_completion_tokens", None)
+        if _is_anthropic_compat_endpoint(route_provider, route_base):
+            rebuilt["messages"] = _convert_openai_images_to_anthropic(
+                rebuilt["messages"]
+            )
+        _record_route_info(
+            route_info,
+            _fallback_provider_from_label(route_provider),
+            route_model,
+            route_base or resolved_base_url,
+        )
+        return rebuilt
 
     try:
         # Retry ONCE on the same provider for a transient transport blip
@@ -10054,6 +10218,7 @@ async def _async_call_llm_impl(
                 task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
+            rejected_compat_options.add("temperature")
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
             logger.info(
@@ -10093,10 +10258,13 @@ async def _async_call_llm_impl(
         )
         if max_tokens is not None and (
             "max_tokens" in err_str
+            or "max_completion_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_unsupported_parameter_error(first_err, "max_completion_tokens")
             or _is_zai_param_error
         ):
+            rejected_compat_options.add("token_limit")
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
@@ -10132,7 +10300,7 @@ async def _async_call_llm_impl(
                     "retrying with refreshed recommendation %r",
                     task or "call", kwargs.get("model"), healed_model,
                 )
-                kwargs["model"] = healed_model
+                kwargs = _retarget_async_attempt(client, healed_model)
                 try:
                     return _validate_llm_response(
                         await _relay_async_completion(
@@ -10168,8 +10336,10 @@ async def _async_call_llm_impl(
                     "Auxiliary %s (async): refreshed Nous runtime credentials after paid account check, retrying",
                     task or "call",
                 )
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                kwargs = _retarget_async_attempt(
+                    refreshed_client,
+                    refreshed_model or str(kwargs.get("model") or final_model or ""),
+                )
                 try:
                     return _validate_llm_response(
                         await _relay_async_completion(
@@ -10201,8 +10371,10 @@ async def _async_call_llm_impl(
             if refreshed_client is not None:
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
                             task or "call")
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
+                kwargs = _retarget_async_attempt(
+                    refreshed_client,
+                    refreshed_model or str(kwargs.get("model") or final_model or ""),
+                )
                 return _validate_llm_response(
                     await _relay_async_completion(
                         refreshed_client,
@@ -10241,6 +10413,7 @@ async def _async_call_llm_impl(
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
+                    route_info=route_info,
                 )
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
@@ -10284,6 +10457,7 @@ async def _async_call_llm_impl(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
+                        route_info=route_info,
                     )
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
@@ -10383,6 +10557,7 @@ async def _async_call_llm_impl(
                     route_info,
                     _fallback_provider_from_label(fb_label),
                     async_fb_model or fb_model,
+                    str(getattr(async_fb, "base_url", "") or ""),
                 )
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,
@@ -10390,7 +10565,8 @@ async def _async_call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    route_info=route_info)
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
@@ -10405,6 +10581,7 @@ async def _async_call_llm_impl(
                         route_info,
                         _fallback_provider_from_label(fb_label),
                         async_fb_model or fb_model,
+                        str(getattr(async_fb, "base_url", "") or ""),
                     )
                     fb_resp = await _call_fallback_candidate_async(
                         async_fb, async_fb_model or fb_model, fb_label,
@@ -10412,7 +10589,8 @@ async def _async_call_llm_impl(
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                        route_info=route_info)
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)

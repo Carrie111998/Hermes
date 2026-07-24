@@ -22,6 +22,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Request-local provenance set by the MoA facade when it appends private
+# reference guidance to a user-role row. It is stripped at the concrete
+# auxiliary wire boundary and must never be inferred from user-controlled text.
+_MOA_REFERENCE_GUIDANCE_METADATA_KEY = "_moa_reference_guidance_appended"
+
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
 # below as well as by run_agent and the CLI for paste-from-clipboard
@@ -709,16 +714,151 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
     return reasoning_echo_family(provider, model, base_url) is not None
 
 
+def _preserves_gemma4_reasoning_replay(model: Any) -> bool:
+    """True for Gemma 4 model ids that replay explicit reasoning content."""
+    model_lower = str(model or "").strip().lower()
+    return bool(re.search(r"(?:^|[/_.:-])gemma[-_.]?4(?:$|[/_.:-])", model_lower))
+
+
+_REASONING_REPLAY_ORIGIN_KEY = "_reasoning_replay_origin"
+
+
+def reasoning_replay_route_fingerprint(
+    provider: Any, base_url: Any, model: Any
+) -> str:
+    """Return the non-reversible identity for one concrete model route."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(str(base_url or "").strip())
+    userinfo, at, hostport = parsed.netloc.rpartition("@")
+    authority_prefix = f"{userinfo}@" if at else ""
+    if hostport.startswith("["):
+        closing_bracket = hostport.find("]")
+        if closing_bracket >= 0:
+            normalized_hostport = (
+                f"[{hostport[1:closing_bracket].lower()}]"
+                f"{hostport[closing_bracket + 1:]}"
+            )
+        else:
+            normalized_hostport = hostport.lower()
+    else:
+        hostname, colon, port = hostport.partition(":")
+        normalized_hostport = hostname.lower() + (f":{port}" if colon else "")
+    normalized_base_url = urlunsplit(
+        (
+            parsed.scheme.lower(),
+            authority_prefix + normalized_hostport,
+            parsed.path[:-1] if parsed.path.endswith("/") else parsed.path,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+    route = (
+        str(provider or "").strip().lower(),
+        normalized_base_url,
+        str(model or "").strip(),
+    )
+    return hashlib.sha256(
+        "\0".join(route).encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def prepare_reasoning_replay_messages_for_route(
+    messages: list[dict], *, provider: Any, model: Any, base_url: Any
+) -> list[dict]:
+    """Shape marked Gemma reasoning for one selected auxiliary destination.
+
+    Auxiliary fallback selection happens after the caller builds its message
+    list. Keep provenance in that source list, then copy, compare, pad/strip,
+    and remove the internal marker only after a concrete route is known.
+    """
+    replay_origin = reasoning_replay_route_fingerprint(provider, base_url, model)
+    needs_thinking_pad = needs_reasoning_echo(provider, model, base_url)
+    prepared: list[dict] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            prepared.append(message)
+            continue
+        has_replay_origin = _REASONING_REPLAY_ORIGIN_KEY in message
+        has_guidance_marker = _MOA_REFERENCE_GUIDANCE_METADATA_KEY in message
+        if not has_replay_origin and not has_guidance_marker:
+            prepared.append(message)
+            continue
+        wire_message = dict(message)
+        wire_message.pop(_MOA_REFERENCE_GUIDANCE_METADATA_KEY, None)
+        source_origin = wire_message.pop(_REASONING_REPLAY_ORIGIN_KEY, None)
+        # Guidance provenance can live on user-role rows. Its only wire action
+        # is marker removal; reasoning_content is an assistant-only replay
+        # field and must never be synthesized on user/tool/system messages.
+        if not has_replay_origin or wire_message.get("role") != "assistant":
+            prepared.append(wire_message)
+            continue
+        existing = wire_message.get("reasoning_content")
+        keep_explicit = bool(
+            _preserves_gemma4_reasoning_replay(model)
+            and source_origin == replay_origin
+            and isinstance(existing, str)
+            and existing.strip()
+        )
+        if not keep_explicit:
+            if needs_thinking_pad:
+                wire_message["reasoning_content"] = " "
+            else:
+                wire_message.pop("reasoning_content", None)
+        prepared.append(wire_message)
+    return prepared
+
+
+def _has_matching_reasoning_replay_origin(api_msg: dict, replay_origin: Any) -> bool:
+    """Whether reasoning originated from this provider/endpoint/model route."""
+    return bool(
+        replay_origin
+        and api_msg.get(_REASONING_REPLAY_ORIGIN_KEY) == replay_origin
+    )
+
+
 def apply_reasoning_content_policy(
-    source_msg: dict, api_msg: dict, needs_thinking_pad: bool
+    source_msg: dict,
+    api_msg: dict,
+    needs_thinking_pad: bool,
+    model: Any = None,
+    preserve_explicit_reasoning: bool = False,
+    replay_origin: Any = None,
 ) -> None:
     """Copy provider-facing reasoning fields onto an API replay message.
 
     ``needs_thinking_pad`` is the require-side flag (see
     ``needs_reasoning_echo`` / the agent's cached
-    ``_needs_thinking_reasoning_pad``). Mutates ``api_msg`` in place.
+    ``_needs_thinking_reasoning_pad``). Gemma 4 keeps explicit non-whitespace
+    content only inside the active tool turn, without synthesizing a pad.
     """
     if source_msg.get("role") != "assistant":
+        return
+
+    # Ephemeral provenance lives only on the request copy. Chat transports and
+    # the direct-summary path strip underscore-prefixed keys before the wire.
+    source_origin = source_msg.get(_REASONING_REPLAY_ORIGIN_KEY)
+    api_msg.pop(_REASONING_REPLAY_ORIGIN_KEY, None)
+
+    # A marked scratchpad is valid only for the exact producing route and the
+    # active Gemma tool turn. Resolve that trust decision before the legacy
+    # explicit-content branches: require-side fallbacks must receive their
+    # schema pad, never another provider's private reasoning.
+    if source_origin:
+        existing = source_msg.get("reasoning_content")
+        if (
+            preserve_explicit_reasoning
+            and _preserves_gemma4_reasoning_replay(model)
+            and source_origin == replay_origin
+            and isinstance(existing, str)
+            and existing.strip()
+        ):
+            api_msg["reasoning_content"] = existing
+            api_msg[_REASONING_REPLAY_ORIGIN_KEY] = source_origin
+        elif needs_thinking_pad:
+            api_msg["reasoning_content"] = " "
+        else:
+            api_msg.pop("reasoning_content", None)
         return
 
     # 1. Explicit reasoning_content already set.
@@ -800,7 +940,12 @@ def apply_reasoning_content_policy(
     api_msg.pop("reasoning_content", None)
 
 
-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+def reapply_reasoning_echo(
+    api_messages: list,
+    needs_thinking_pad: bool,
+    model: Any = None,
+    replay_origin: Any = None,
+) -> int:
     """Re-pad (or strip) assistant turns' reasoning_content for the active provider.
 
     ``api_messages`` is built once, before the retry loop, while the *primary*
@@ -829,16 +974,49 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
     Returns the number of assistant turns whose reasoning_content was added or
     removed.
     """
+    from agent.conversation_compression import _is_real_user_message
+
+    last_user_idx = max(
+        (i for i, msg in enumerate(api_messages) if _is_real_user_message(msg)),
+        default=-1,
+    )
     changed = 0
-    for api_msg in api_messages:
+    for idx, api_msg in enumerate(api_messages):
         if api_msg.get("role") != "assistant":
             continue
         if needs_thinking_pad:
-            if api_msg.get("reasoning_content"):
+            existing = api_msg.get("reasoning_content")
+            has_replay_origin = _REASONING_REPLAY_ORIGIN_KEY in api_msg
+            if existing and (
+                not has_replay_origin
+                or _has_matching_reasoning_replay_origin(api_msg, replay_origin)
+            ):
                 continue
+            # Never pass a marked Gemma scratchpad across a fallback route;
+            # let the normal policy synthesize the target provider's pad.
+            before = existing
+            if has_replay_origin:
+                api_msg.pop("reasoning_content", None)
+                api_msg.pop(_REASONING_REPLAY_ORIGIN_KEY, None)
             apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad)
-            if api_msg.get("reasoning_content"):
+            if api_msg.get("reasoning_content") != before:
                 changed += 1
+        elif (
+            _preserves_gemma4_reasoning_replay(model)
+            and idx > last_user_idx
+            and api_msg.get("tool_calls")
+        ):
+            existing = api_msg.get("reasoning_content")
+            if (
+                isinstance(existing, str)
+                and existing.strip()
+                and _has_matching_reasoning_replay_origin(api_msg, replay_origin)
+            ):
+                continue
+            if "reasoning_content" in api_msg:
+                api_msg.pop("reasoning_content", None)
+                changed += 1
+            api_msg.pop(_REASONING_REPLAY_ORIGIN_KEY, None)
         else:
             # Strict provider — strip any stale reasoning_content pad left
             # over from a reasoning primary so the fallback request doesn't
@@ -846,6 +1024,7 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
             if "reasoning_content" in api_msg:
                 api_msg.pop("reasoning_content", None)
                 changed += 1
+            api_msg.pop(_REASONING_REPLAY_ORIGIN_KEY, None)
     return changed
 
 

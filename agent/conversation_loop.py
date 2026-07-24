@@ -1876,6 +1876,13 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Repair/compression can replace rows and stale the prologue index.
+        # Re-anchor before selecting this turn's replayable reasoning.
+        current_turn_user_idx = reanchor_current_turn_user_idx(
+            messages, user_message
+        )
+        agent._persist_user_message_idx = current_turn_user_idx
+
         api_messages = []
         for idx, msg in enumerate(messages):
 
@@ -1947,7 +1954,15 @@ def run_conversation(
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
+            agent._copy_reasoning_content_for_api(
+                msg,
+                api_msg,
+                preserve_explicit_reasoning=(
+                    current_turn_user_idx >= 0
+                    and idx > current_turn_user_idx
+                    and bool(msg.get("tool_calls"))
+                ),
+            )
 
             # Remove 'reasoning' field - it's for trajectory storage only
             # We've copied it to 'reasoning_content' for the API above

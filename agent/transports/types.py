@@ -117,6 +117,11 @@ class NormalizedResponse:
         return pd.get("reasoning_content")
 
     @property
+    def _reasoning_content_is_native(self) -> bool:
+        pd = self.provider_data or {}
+        return bool(pd.get("_reasoning_content_is_native", True))
+
+    @property
     def reasoning_details(self):
         pd = self.provider_data or {}
         return pd.get("reasoning_details")
