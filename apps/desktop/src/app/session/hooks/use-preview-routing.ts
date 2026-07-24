@@ -111,14 +111,25 @@ export function usePreviewRouting({
         // browser so URLs, localhost, and file paths all resolve correctly.
         const { url, label } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
-        const intendedSessionId = event.session_id || activeSessionIdRef.current
+        const intendedRuntimeSessionId = event.session_id || activeSessionIdRef.current
 
-        if (target && intendedSessionId && intendedSessionId === activeSessionIdRef.current) {
+        const intendedPreviewSessionId = activePreviewSessionId(
+          activeSessionIdRef,
+          routedSessionId,
+          selectedStoredSessionId
+        )
+
+        if (
+          target &&
+          intendedRuntimeSessionId &&
+          intendedPreviewSessionId &&
+          intendedRuntimeSessionId === activeSessionIdRef.current
+        ) {
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(resolved => {
-            if (resolved && intendedSessionId === activeSessionIdRef.current) {
+            if (resolved && intendedRuntimeSessionId === activeSessionIdRef.current) {
               const trimmedLabel = typeof label === 'string' ? label.trim() : ''
               setSessionPreviewTarget(
-                intendedSessionId,
+                intendedPreviewSessionId,
                 trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved,
                 'tool-result',
                 target
@@ -155,7 +166,7 @@ export function usePreviewRouting({
         requestPreviewReload()
       }
     },
-    [activeSessionIdRef, baseHandleGatewayEvent, currentCwd]
+    [activeSessionIdRef, baseHandleGatewayEvent, currentCwd, routedSessionId, selectedStoredSessionId]
   )
 
   return { handleDesktopGatewayEvent, restartPreviewServer }

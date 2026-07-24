@@ -37,6 +37,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from hermes_constants import find_packaged_data_dir
+
 logger = logging.getLogger(__name__)
 
 SUPPORTED_LANGUAGES: tuple[str, ...] = (
@@ -93,6 +95,7 @@ def _locales_dir() -> Path:
        sealed-packaging system) to point at the installed catalog directory.
     2. ``<repo-root>/locales`` -- source checkouts and editable installs,
        where the working tree sits next to ``agent/``.
+    3. The interpreter data scheme -- regular wheel installs.
 
     Falling through to the source-style path (even when missing) keeps
     ``_load_catalog`` error messages informative -- it logs the path it
@@ -111,6 +114,11 @@ def _locales_dir() -> Path:
 
     # agent/i18n.py -> agent/ -> repo root (source checkout, editable install)
     source_dir = Path(__file__).resolve().parent.parent / "locales"
+    if source_dir.is_dir():
+        return source_dir
+    packaged_dir = find_packaged_data_dir("locales")
+    if packaged_dir is not None:
+        return packaged_dir
     return source_dir
 
 

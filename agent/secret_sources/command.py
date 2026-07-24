@@ -43,7 +43,7 @@ from typing import Dict, Optional
 
 # Reuse the exact result shape the bitwarden source returns so
 # hermes_cli.env_loader can consume both providers identically.
-from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import ErrorKind, SecretSource, source_environ
 from agent.secret_sources.bitwarden import FetchResult
 
 __all__ = [
@@ -179,7 +179,7 @@ def _run_helper(
         )
         return None
 
-    env = os.environ.copy()
+    env = dict(source_environ())
     env["HERMES_SECRET_KEY"] = secret_key
 
     try:

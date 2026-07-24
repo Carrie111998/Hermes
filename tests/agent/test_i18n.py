@@ -193,6 +193,25 @@ def test_locales_dir_env_override_ignored_when_missing(tmp_path, monkeypatch):
     assert result.name == "locales"
 
 
+def test_locales_dir_uses_installed_data_scheme_when_source_tree_is_absent(
+    tmp_path, monkeypatch
+):
+    """A wheel's ``data-files`` locales live under the interpreter data root."""
+    fake_module = tmp_path / "site-packages" / "agent" / "i18n.py"
+    installed = tmp_path / "prefix" / "locales"
+    installed.mkdir(parents=True)
+    monkeypatch.delenv("HERMES_BUNDLED_LOCALES", raising=False)
+    monkeypatch.setattr(i18n, "__file__", str(fake_module))
+    monkeypatch.setattr(
+        i18n,
+        "find_packaged_data_dir",
+        lambda name: installed if name == "locales" else None,
+        raising=False,
+    )
+
+    assert i18n._locales_dir() == installed
+
+
 def test_t_resolves_real_string_in_source_checkout():
     """Sanity: in the test environment (a source checkout) t() must return a
     human string, never the bare key path. Guards against catalog-load

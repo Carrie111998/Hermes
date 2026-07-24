@@ -6,6 +6,7 @@ import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
 import {
   $previewTarget,
   clearSessionPreviewRegistry,
+  getSessionPreviewRecord,
   type PreviewTarget,
   registerSessionPreview
 } from '@/store/preview'
@@ -39,10 +40,14 @@ let handleEvent: (event: RpcEvent) => void = () => undefined
 
 function PreviewRoutingHarness({
   activeSessionIdRef: providedActiveSessionIdRef,
-  onEvent
+  onEvent,
+  routedSessionId = 'session-1',
+  selectedStoredSessionId = null
 }: {
   activeSessionIdRef?: MutableRefObject<string | null>
   onEvent: (handler: (event: RpcEvent) => void) => void
+  routedSessionId?: string | null
+  selectedStoredSessionId?: string | null
 }) {
   const defaultActiveSessionIdRef = useRef<string | null>('session-1')
   const activeSessionIdRef = providedActiveSessionIdRef ?? defaultActiveSessionIdRef
@@ -53,8 +58,8 @@ function PreviewRoutingHarness({
     currentCwd: '/work',
     currentView: 'chat',
     requestGateway: vi.fn(),
-    routedSessionId: 'session-1',
-    selectedStoredSessionId: null
+    routedSessionId,
+    selectedStoredSessionId
   })
 
   useEffect(() => {
@@ -147,6 +152,38 @@ describe('usePreviewRouting', () => {
     await waitFor(() => {
       expect($previewTarget.get()).toMatchObject({ kind: 'url', label: 'CNN', url: 'https://www.cnn.com' })
     })
+  })
+
+  it('records preview.open under the durable stored session id', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-A' }
+
+    render(
+      <PreviewRoutingHarness
+        activeSessionIdRef={activeSessionIdRef}
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+        routedSessionId="stored-A"
+        selectedStoredSessionId="stored-A"
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com', label: 'CNN' },
+        session_id: 'runtime-A',
+        type: 'preview.open'
+      })
+    )
+
+    await waitFor(() => {
+      expect(getSessionPreviewRecord('stored-A')?.normalized).toMatchObject({
+        kind: 'url',
+        label: 'CNN',
+        url: 'https://www.cnn.com'
+      })
+    })
+    expect(getSessionPreviewRecord('runtime-A')).toBeNull()
   })
 
   it('ignores a preview.open event for a background session', async () => {

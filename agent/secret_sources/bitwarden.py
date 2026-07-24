@@ -57,7 +57,7 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name as _is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import ErrorKind, SecretSource, source_environ
 
 logger = logging.getLogger(__name__)
 
@@ -667,7 +667,7 @@ def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
+    env = dict(source_environ())
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
     env.setdefault("NO_COLOR", "1")
@@ -773,7 +773,7 @@ def apply_bitwarden_secrets(
     if not enabled:
         return result
 
-    access_token = os.environ.get(access_token_env, "").strip()
+    access_token = source_environ().get(access_token_env, "").strip()
     if not access_token:
         result.error = (
             f"secrets.bitwarden.enabled is true but {access_token_env} is "
@@ -905,7 +905,7 @@ class BitwardenSource(SecretSource):
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
+        access_token = source_environ().get(access_token_env, "").strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "

@@ -37,6 +37,7 @@ def test_nix_wheel_metadata_includes_runtime_assets():
     }.issubset(package_data["hermes_cli"])
     assert {
         "*/dashboard/manifest.json",
+        "*/dashboard/plugin_api.py",
         "*/dashboard/dist/*",
         "*/dashboard/dist/**/*",
         "**/plugin.yaml",

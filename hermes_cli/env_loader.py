@@ -7,6 +7,7 @@ import io
 import os
 import sys
 from pathlib import Path
+from typing import MutableMapping
 
 from dotenv import load_dotenv
 from utils import atomic_replace, fast_safe_load
@@ -48,6 +49,26 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+# Homes fetched into an isolated profile mapping rather than ``os.environ``.
+# Kept separate from _APPLIED_HOMES so a later single-profile startup may
+# still perform its normal process-global apply.
+_SCOPED_SOURCE_HOMES: set[str] = set()
+
+_PROFILE_SOURCE_ENV_KEYS = frozenset({
+    "PATH",
+    "HOME",
+    "USER",
+    "USERPROFILE",
+    "SYSTEMROOT",
+    "TMPDIR",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "OP_ACCOUNT",
+    "OP_CONNECT_HOST",
+})
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -71,6 +92,57 @@ def get_secret_source_values(
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
 
 
+def load_profile_secret_source_values(
+    hermes_home: str | os.PathLike,
+    profile_env: dict[str, str],
+) -> dict[str, str]:
+    """Fetch a profile's external sources without mutating ``os.environ``.
+
+    Multiplexed gateways call this while building a secondary profile scope.
+    Only non-secret process basics and that profile's own ``.env`` values are
+    visible to source backends, so another profile's credentials cannot affect
+    precedence or leak into helper subprocesses.
+    """
+    home_path = Path(hermes_home)
+    home_key = str(home_path.resolve())
+    existing = get_secret_source_values(home_path)
+    if existing:
+        return existing
+    if home_key in _APPLIED_HOMES or home_key in _SCOPED_SOURCE_HOMES:
+        return {}
+
+    try:
+        cfg = _load_secrets_config(home_path)
+    except Exception:  # noqa: BLE001 — profile startup must remain fail-open
+        return {}
+    if not cfg:
+        return {}
+
+    try:
+        from agent.secret_sources.registry import apply_all
+    except ImportError:
+        return {}
+
+    isolated_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _PROFILE_SOURCE_ENV_KEYS or key.startswith("OP_SESSION_")
+    }
+    isolated_env.update(profile_env)
+
+    try:
+        report = apply_all(cfg, home_path, environ=isolated_env)
+    except Exception:  # noqa: BLE001 — source failures never block profile use
+        return {}
+    if not report.sources:
+        return {}
+
+    _SCOPED_SOURCE_HOMES.add(home_key)
+    _record_external_secret_values(home_key, report, isolated_env)
+    _emit_external_secret_report(report, cfg)
+    return get_secret_source_values(home_path)
+
+
 def reset_secret_source_cache() -> None:
     """Forget which HERMES_HOME paths have already had external secrets applied.
 
@@ -82,6 +154,7 @@ def reset_secret_source_cache() -> None:
     that want to refresh after a config change.
     """
     _APPLIED_HOMES.clear()
+    _SCOPED_SOURCE_HOMES.clear()
     _SECRET_SOURCES.clear()
     _SECRET_SOURCE_VALUES_BY_HOME.clear()
 
@@ -128,11 +201,10 @@ def _format_offending_chars(value: str, limit: int = 3) -> str:
     return ", ".join(seen)
 
 
-def _sanitize_loaded_credentials() -> None:
-    """Strip non-ASCII characters from credential env vars in os.environ.
+def _sanitize_credentials_in(environ: MutableMapping[str, str]) -> None:
+    """Strip non-ASCII characters from credential vars in ``environ``.
 
-    Called after dotenv loads so the rest of the codebase never sees
-    non-ASCII API keys.  Only touches env vars whose names end with
+    Only touches env vars whose names end with
     known credential suffixes (``_API_KEY``, ``_TOKEN``, etc.).
 
     Emits a one-line warning to stderr when characters are stripped.
@@ -140,7 +212,7 @@ def _sanitize_loaded_credentials() -> None:
     glyphs from PDFs / rich-text editors, ZWSP from web pages) as opaque
     provider-side "invalid API key" errors (see #6843).
     """
-    for key, value in list(os.environ.items()):
+    for key, value in list(environ.items()):
         if not any(key.endswith(suffix) for suffix in _CREDENTIAL_SUFFIXES):
             continue
         try:
@@ -149,7 +221,7 @@ def _sanitize_loaded_credentials() -> None:
         except UnicodeEncodeError:
             pass
         cleaned = value.encode("ascii", errors="ignore").decode("ascii")
-        os.environ[key] = cleaned
+        environ[key] = cleaned
         if key in _WARNED_KEYS:
             continue
         _WARNED_KEYS.add(key)
@@ -170,6 +242,11 @@ def _sanitize_loaded_credentials() -> None:
             ".env file in a plain-text editor).",
             file=sys.stderr,
         )
+
+
+def _sanitize_loaded_credentials() -> None:
+    """Strip non-ASCII characters from credential vars in ``os.environ``."""
+    _sanitize_credentials_in(os.environ)
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
@@ -447,22 +524,29 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     # see #40597) is what lets the earlier failure paths stay retryable.
     _APPLIED_HOMES.add(home_key)
 
-    if report.applied_any:
-        # Re-run the ASCII sanitization pass: vault values are
-        # user-supplied and might have the same copy-paste corruption as
-        # a manually edited .env (see #6843).
-        _sanitize_loaded_credentials()
-        # Remember where each var came from so setup / `hermes model`
-        # flows can label detected credentials with "(from Bitwarden)" /
-        # "(from 1Password)" — otherwise users see "credentials ✓" with
-        # no hint the value came from a vault rather than .env.
-        values: dict[str, str] = {}
-        for name, applied in report.provenance.items():
-            _SECRET_SOURCES[name] = applied.source
-            if name in os.environ:
-                values[name] = os.environ[name]
-        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+    _record_external_secret_values(home_key, report, os.environ)
+    _emit_external_secret_report(report, cfg)
 
+
+def _record_external_secret_values(
+    home_key: str,
+    report,
+    environ: MutableMapping[str, str],
+) -> None:
+    """Sanitize and snapshot values applied by one source orchestration pass."""
+    if not report.applied_any:
+        return
+    _sanitize_credentials_in(environ)
+    values: dict[str, str] = {}
+    for name, applied in report.provenance.items():
+        _SECRET_SOURCES[name] = applied.source
+        if name in environ:
+            values[name] = environ[name]
+    _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+
+
+def _emit_external_secret_report(report, cfg: dict) -> None:
+    """Emit the existing source status and remediation lines."""
     for src in report.sources:
         if src.applied:
             print(

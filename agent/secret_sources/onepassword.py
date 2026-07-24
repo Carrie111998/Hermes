@@ -55,7 +55,7 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import ErrorKind, SecretSource, source_environ
 
 logger = logging.getLogger(__name__)
 
@@ -183,15 +183,16 @@ def _auth_fingerprint(token_env: str) -> str:
     previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
+    environ = source_environ()
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
-        f"account={os.environ.get('OP_ACCOUNT', '')}",
-        f"connect_host={os.environ.get('OP_CONNECT_HOST', '')}",
-        f"connect_token={os.environ.get('OP_CONNECT_TOKEN', '')}",
+        f"token={environ.get(token_env, '')}",
+        f"account={environ.get('OP_ACCOUNT', '')}",
+        f"connect_host={environ.get('OP_CONNECT_HOST', '')}",
+        f"connect_token={environ.get('OP_CONNECT_TOKEN', '')}",
     ]
-    for key in sorted(os.environ):
+    for key in sorted(environ):
         if key.startswith("OP_SESSION_"):
-            parts.append(f"{key}={os.environ[key]}")
+            parts.append(f"{key}={environ[key]}")
     material = "\n".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -236,13 +237,14 @@ def _scrub(text: str) -> str:
 
 def _op_child_env(token_value: str) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
+    source_env = source_environ()
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
-        val = os.environ.get(key)
+        val = source_env.get(key)
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
-    for key, val in os.environ.items():
+    for key, val in source_env.items():
         if key.startswith("OP_SESSION_"):
             env[key] = val
     # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user
@@ -338,7 +340,7 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    token_value = source_environ().get(token_env, "").strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",

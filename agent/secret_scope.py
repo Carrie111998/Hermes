@@ -222,8 +222,14 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     secrets = load_env_file(home / ".env")
 
     try:
-        from hermes_cli.env_loader import get_secret_source_values
-        external_secrets = get_secret_source_values(home)
+        from hermes_cli.env_loader import load_profile_secret_source_values
+
+        # 1Password service-account bootstrap material may live in .op.env;
+        # expose it only to the isolated source fetch. User .env wins when the
+        # same key exists in both, matching load_hermes_dotenv().
+        source_env = load_env_file(home / ".op.env")
+        source_env.update(secrets)
+        external_secrets = load_profile_secret_source_values(home, source_env)
     except Exception:
         external_secrets = {}
 

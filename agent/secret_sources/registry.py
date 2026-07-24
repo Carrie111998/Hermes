@@ -40,6 +40,7 @@ from agent.secret_sources.base import (
     FetchResult,
     SecretSource,
     is_valid_env_name,
+    use_source_environ,
 )
 
 logger = logging.getLogger(__name__)
@@ -196,7 +197,10 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path
+    source: SecretSource,
+    cfg: dict,
+    home_path: Path,
+    environ: Optional[Dict[str, str]] = None,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
 
@@ -210,8 +214,15 @@ def _fetch_with_timeout(
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
+
+    def _fetch():
+        if environ is None:
+            return source.fetch(cfg, home_path)
+        with use_source_environ(environ):
+            return source.fetch(cfg, home_path)
+
     try:
-        future = executor.submit(source.fetch, cfg, home_path)
+        future = executor.submit(_fetch)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -376,7 +387,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path)
+        result = _fetch_with_timeout(source, cfg, home_path, env)
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

@@ -27,6 +27,7 @@ from agent.secret_sources.base import (  # noqa: E402
     is_valid_env_name,
     run_secret_cli,
     scrub_ansi,
+    source_environ,
 )
 from agent.secret_sources import registry as reg  # noqa: E402
 from agent.secret_sources.bitwarden import BitwardenSource  # noqa: E402
@@ -151,6 +152,24 @@ class TestApplyAll:
         assert report.provenance["API_KEY"].source == "dummy"
         assert report.provenance["API_KEY"].shape == "mapped"
         assert report.provenance["API_KEY"].overrode_env is False
+
+    def test_fetch_reads_the_injected_environment_not_process_global(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PROFILE_BOOT_TOKEN", "wrong-global")
+
+        def _fetch(_cfg, _home):
+            return FetchResult(
+                secrets={
+                    "FETCH_SAW": source_environ().get("PROFILE_BOOT_TOKEN", "")
+                }
+            )
+
+        reg.register_source(_make_source(fetch_fn=_fetch))
+        env = {"PROFILE_BOOT_TOKEN": "isolated-profile"}
+        reg.apply_all({"dummy": {"enabled": True}}, tmp_path, environ=env)
+
+        assert env["FETCH_SAW"] == "isolated-profile"
 
     def test_existing_env_wins_without_override(self, tmp_path):
         reg.register_source(_make_source(secrets={"API_KEY": "vault"}))

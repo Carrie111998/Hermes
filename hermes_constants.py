@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import sys
+import sysconfig
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -190,6 +191,30 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+def find_packaged_data_dir(name: str) -> Path | None:
+    """Find an installed top-level data directory across Python schemes.
+
+    Setuptools ``data-files`` may land under the interpreter's data prefix
+    rather than beside the importable package. Search every relevant scheme,
+    de-duplicating paths, and return only a directory that actually exists.
+    """
+    seen: set[Path] = set()
+    for scheme_key in ("data", "purelib", "platlib"):
+        try:
+            scheme_root = sysconfig.get_path(scheme_key)
+        except (KeyError, TypeError):
+            continue
+        if not scheme_root:
+            continue
+        candidate = Path(scheme_root) / name
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 
@@ -199,6 +224,11 @@ def get_optional_skills_dir(default: Path | None = None) -> Path:
     override = os.getenv("HERMES_OPTIONAL_SKILLS", "").strip()
     if override:
         return Path(override)
+    if default is not None and default.is_dir():
+        return default
+    packaged = find_packaged_data_dir("optional-skills")
+    if packaged is not None:
+        return packaged
     if default is not None:
         return default
     return get_hermes_home() / "optional-skills"
@@ -215,6 +245,11 @@ def get_optional_mcps_dir(default: Path | None = None) -> Path:
     override = os.getenv("HERMES_OPTIONAL_MCPS", "").strip()
     if override:
         return Path(override)
+    if default is not None and default.is_dir():
+        return default
+    packaged = find_packaged_data_dir("optional-mcps")
+    if packaged is not None:
+        return packaged
     if default is not None:
         return default
     return get_hermes_home() / "optional-mcps"
@@ -225,12 +260,19 @@ def get_bundled_skills_dir(default: Path | None = None) -> Path:
 
     Resolution order:
         1. ``HERMES_BUNDLED_SKILLS`` env var (Nix wrapper / explicit override)
-        2. Caller-supplied ``default`` (typically the source-checkout path)
-        3. ``<HERMES_HOME>/skills`` last-resort
+        2. Existing caller-supplied source-checkout path
+        3. Installed Python data scheme
+        4. Missing caller-supplied path (kept for useful diagnostics)
+        5. ``<HERMES_HOME>/skills`` last-resort
     """
     override = os.getenv("HERMES_BUNDLED_SKILLS", "").strip()
     if override:
         return Path(override)
+    if default is not None and default.is_dir():
+        return default
+    packaged = find_packaged_data_dir("skills")
+    if packaged is not None:
+        return packaged
     if default is not None:
         return default
     return get_hermes_home() / "skills"
