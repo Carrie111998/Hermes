@@ -106,21 +106,11 @@ def _alternatives(
 BUILTIN_PLATFORM_SPECS: dict[str, PlatformConfigurationSpec] = {
     "telegram": _one(_e("token", "extra.token", env=("TELEGRAM_BOT_TOKEN",))),
     "discord": _one(_e("token", env=("DISCORD_BOT_TOKEN",))),
-    "whatsapp": PlatformConfigurationSpec(
-        any_of=(
-            (
-                _e(
-                    "extra.session_credentials",
-                    files=(
-                        "platforms/whatsapp/session/creds.json",
-                        "whatsapp/session/creds.json",
-                    ),
-                ),
-            ),
-        ),
-        implicit_enable=False,
-        enable_env_var="WHATSAPP_ENABLED",
-    ),
+    # WhatsApp's historical enrollment decision belongs to its bundled
+    # callback (enabled-with-extras or WHATSAPP_ENABLED). There is no complete
+    # declarative equivalent for the YAML "any extras" branch, so readiness
+    # stays conservative rather than redefining that callback's contract.
+    "whatsapp": PlatformConfigurationSpec(complete=False),
     "whatsapp_cloud": _one(
         _e(
             "extra.phone_number_id",
@@ -134,10 +124,7 @@ BUILTIN_PLATFORM_SPECS: dict[str, PlatformConfigurationSpec] = {
         ),
     ),
     "slack": _one(_e("token", env=("SLACK_BOT_TOKEN",))),
-    "signal": _one(
-        _e("extra.http_url", "http_url", env=("SIGNAL_HTTP_URL",)),
-        _e("extra.account", "account", env=("SIGNAL_ACCOUNT",)),
-    ),
+    "signal": _one(_e("extra.http_url", "http_url", env=("SIGNAL_HTTP_URL",))),
     "mattermost": _one(
         _e("token", env=("MATTERMOST_TOKEN",)),
         _e("extra.url", "url", env=("MATTERMOST_URL",)),
@@ -152,12 +139,7 @@ BUILTIN_PLATFORM_SPECS: dict[str, PlatformConfigurationSpec] = {
         ),
     ),
     "homeassistant": _one(_e("token", env=("HASS_TOKEN",))),
-    "email": _one(
-        _e("extra.address", "address", env=("EMAIL_ADDRESS",)),
-        _e("extra.password", "password", env=("EMAIL_PASSWORD",)),
-        _e("extra.imap_host", "imap_host", env=("EMAIL_IMAP_HOST",)),
-        _e("extra.smtp_host", "smtp_host", env=("EMAIL_SMTP_HOST",)),
-    ),
+    "email": _one(_e("extra.address", "address", env=("EMAIL_ADDRESS",))),
     "sms": _one(
         _e("extra.account_sid", "account_sid", env=("TWILIO_ACCOUNT_SID",)),
         _e("api_key", "extra.auth_token", env=("TWILIO_AUTH_TOKEN",)),

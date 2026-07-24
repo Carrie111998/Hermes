@@ -13,7 +13,7 @@ import os
 import json
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
@@ -406,7 +406,12 @@ def load_status_platform_states(
             entry = platform_registry.get_concrete_entry(name)
             if entry is None:
                 continue
-            if entry.static_configuration is None:
+            if name in BUILTIN_PLATFORM_SPECS and not entry.readiness_trusted:
+                # An unbundled override may own the runtime adapter, but it
+                # cannot replace Hermes' trusted static contract on the
+                # import-free path. Dynamic verification belongs to Gateway.
+                specs.pop(name, None)
+            elif entry.static_configuration is None:
                 # A concrete third-party override owns this name but has not
                 # supplied enough pure metadata. Do not apply the unrelated
                 # shipped adapter's built-in contract.
@@ -882,6 +887,38 @@ def _has_usable_api_server_key(key: object) -> bool:
     return has_usable_secret(key, min_length=16)
 
 
+# Full Gateway enrollment predicates retained from the parent contract. The
+# readiness table deliberately does not participate in this decision.
+_PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] = {
+    Platform.WEIXIN: lambda cfg: bool(
+        cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
+    ),
+    Platform.WHATSAPP_CLOUD: lambda cfg: bool(
+        cfg.extra.get("phone_number_id") and cfg.extra.get("access_token")
+    ),
+    Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
+    Platform.API_SERVER: lambda cfg: _has_usable_api_server_key(
+        cfg.extra.get("key") if cfg else None
+    ),
+    Platform.WEBHOOK: lambda cfg: True,
+    Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
+        str(cfg.extra.get("client_state") or "").strip()
+    ),
+    Platform.BLUEBUBBLES: lambda cfg: bool(
+        cfg.extra.get("server_url") and cfg.extra.get("password")
+    ),
+    Platform.QQBOT: lambda cfg: bool(
+        cfg.extra.get("app_id") and cfg.extra.get("client_secret")
+    ),
+    Platform.YUANBAO: lambda cfg: bool(
+        cfg.extra.get("app_id") and cfg.extra.get("app_secret")
+    ),
+    Platform.RELAY: lambda cfg: bool(
+        cfg.extra.get("relay_url") or cfg.extra.get("url")
+    ),
+}
+
+
 @dataclass
 class GatewayConfig:
     """
@@ -992,41 +1029,21 @@ class GatewayConfig:
 
     def _is_platform_connected(self, platform: Platform, config: PlatformConfig) -> bool:
         """Check whether a single platform is sufficiently configured."""
-        concrete_entry = None
-        try:
-            from gateway.platform_registry import platform_registry
-
-            concrete_entry = platform_registry.get_concrete_entry(platform.value)
-        except Exception:
-            pass
-
-        if concrete_entry is not None:
-            state = evaluate_static_configuration(
-                config,
-                concrete_entry.static_configuration,
-                getenv=_getenv,
-                home=get_hermes_home(),
+        # Keep the full Gateway lane compatible with the parent implementation.
+        # Static metadata is for import-free readiness only; it must never
+        # preempt these established enrollment predicates or plugin callbacks.
+        if platform == Platform.WEIXIN:
+            return bool(
+                config.extra.get("account_id")
+                and (config.token or config.extra.get("token"))
             )
-            if state is not StaticConfigurationState.UNKNOWN:
-                return state is StaticConfigurationState.CONFIGURED
-            if concrete_entry.is_connected is not None:
-                return concrete_entry.is_connected(config)
-            if concrete_entry.validate_config is not None:
-                return concrete_entry.validate_config(config)
-            return False
 
-        # Built-ins and bundled adapters share one pure declarative semantic
-        # oracle with core readiness.  This prevents /api/status from growing
-        # a parallel interpretation that drifts from Gateway enrollment.
-        spec = BUILTIN_PLATFORM_SPECS.get(platform.value)
-        if spec is not None:
-            state = evaluate_static_configuration(
-                config,
-                spec,
-                getenv=_getenv,
-                home=get_hermes_home(),
-            )
-            return state is StaticConfigurationState.CONFIGURED
+        if config.token or config.api_key:
+            return True
+
+        checker = _PLATFORM_CONNECTED_CHECKERS.get(platform)
+        if checker is not None:
+            return checker(config)
 
         # Plugin-registered platforms.  Force plugin discovery first so this
         # works even when GatewayConfig is constructed directly (e.g. in tests
@@ -1041,19 +1058,11 @@ class GatewayConfig:
                 pass
             entry = platform_registry.get(platform.value)
             if entry:
-                state = evaluate_static_configuration(
-                    config,
-                    entry.static_configuration,
-                    getenv=_getenv,
-                    home=get_hermes_home(),
-                )
-                if state is not StaticConfigurationState.UNKNOWN:
-                    return state is StaticConfigurationState.CONFIGURED
                 if entry.is_connected is not None:
                     return entry.is_connected(config)
                 if entry.validate_config is not None:
                     return entry.validate_config(config)
-                return False
+                return True
         except Exception:
             pass  # Registry not yet initialised during early import
 

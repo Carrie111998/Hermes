@@ -963,6 +963,10 @@ class PluginContext:
         from gateway.platform_registry import platform_registry, PlatformEntry
 
         entry_kwargs.setdefault("plugin_name", self.manifest.name)
+        # Manifest provenance is established by the plugin manager, not by a
+        # plugin's registration arguments. Do not let arbitrary plugin code
+        # bless an override of a built-in readiness contract.
+        entry_kwargs["readiness_trusted"] = self.manifest.source == "bundled"
         if (
             "static_configuration" not in entry_kwargs
             and self.manifest.source == "bundled"

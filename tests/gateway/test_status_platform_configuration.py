@@ -365,30 +365,6 @@ def test_builtin_full_loader_and_pure_evaluator_share_semantics(monkeypatch):
     assert gateway_config.get_connected_platforms() == [Platform.SIGNAL]
 
 
-def test_every_builtin_full_loader_decision_matches_shared_spec():
-    from gateway.config import GatewayConfig, Platform, PlatformConfig
-    from gateway.platform_configuration import (
-        BUILTIN_PLATFORM_SPECS,
-        StaticConfigurationState,
-        evaluate_static_configuration,
-    )
-
-    for name, spec in BUILTIN_PLATFORM_SPECS.items():
-        block = _synthetic_block(spec)
-
-        platform = Platform(name)
-        platform_config = PlatformConfig.from_dict(block)
-        full = GatewayConfig(platforms={platform: platform_config})
-        pure = evaluate_static_configuration(
-            platform_config,
-            spec,
-            getenv={}.get,
-        )
-
-        assert pure is StaticConfigurationState.CONFIGURED, name
-        assert full.get_connected_platforms() == [platform], name
-
-
 def test_every_builtin_rejects_credentialless_and_policy_only_declarations():
     from gateway.platform_configuration import (
         BUILTIN_PLATFORM_SPECS,
@@ -397,6 +373,8 @@ def test_every_builtin_rejects_credentialless_and_policy_only_declarations():
     )
 
     for name, spec in BUILTIN_PLATFORM_SPECS.items():
+        if not spec.complete:
+            continue
         expected = (
             StaticConfigurationState.CONFIGURED
             if not spec.any_of
@@ -420,6 +398,8 @@ def test_every_builtin_explicit_disable_wins_with_valid_evidence():
     )
 
     for name, spec in BUILTIN_PLATFORM_SPECS.items():
+        if not spec.complete:
+            continue
         block = _synthetic_block(spec, enabled=False)
         assert (
             evaluate_static_configuration(block, spec, getenv={}.get)
@@ -427,8 +407,7 @@ def test_every_builtin_explicit_disable_wins_with_valid_evidence():
         ), name
 
 
-def test_environment_only_evidence_matches_full_loader(monkeypatch):
-    from gateway.config import GatewayConfig, Platform, PlatformConfig
+def test_environment_only_evidence_is_a_static_readiness_projection(monkeypatch):
     from gateway.platform_configuration import (
         BUILTIN_PLATFORM_SPECS,
         StaticConfigurationState,
@@ -455,13 +434,9 @@ def test_environment_only_evidence_matches_full_loader(monkeypatch):
         for key, value in env.items():
             monkeypatch.setenv(key, value)
 
-        platform = Platform(name)
-        config = PlatformConfig(enabled=True)
-        pure = evaluate_static_configuration(config, spec, getenv=env.get)
-        full = GatewayConfig(platforms={platform: config})
+        pure = evaluate_static_configuration({"enabled": True}, spec, getenv=env.get)
 
         assert pure is StaticConfigurationState.CONFIGURED, name
-        assert full.get_connected_platforms() == [platform], name
         covered.add(name)
         for key in env:
             monkeypatch.delenv(key)
@@ -697,3 +672,109 @@ def test_full_loader_preserves_explicit_disable_against_env(
 
     assert loaded.platforms[Platform.WEBHOOK].enabled is False
     assert Platform.WEBHOOK not in loaded.get_connected_platforms()
+
+
+def test_full_loader_preserves_parent_signal_http_url_contract():
+    """Parent accepted enabled Signal with a URL; account was not required."""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+    config = GatewayConfig(
+        platforms={Platform.SIGNAL: PlatformConfig(enabled=True, extra={"http_url": "http://signal"})}
+    )
+
+    assert config.get_connected_platforms() == [Platform.SIGNAL]
+
+
+def test_readiness_uses_parent_compatible_signal_and_email_minima():
+    from gateway.platform_configuration import (
+        BUILTIN_PLATFORM_SPECS,
+        StaticConfigurationState,
+        evaluate_static_configuration,
+    )
+
+    assert evaluate_static_configuration(
+        {"enabled": True, "extra": {"http_url": "http://signal"}},
+        BUILTIN_PLATFORM_SPECS["signal"],
+        getenv={}.get,
+    ) is StaticConfigurationState.CONFIGURED
+    assert evaluate_static_configuration(
+        {"enabled": True, "extra": {"address": "user@example.test"}},
+        BUILTIN_PLATFORM_SPECS["email"],
+        getenv={}.get,
+    ) is StaticConfigurationState.CONFIGURED
+
+
+def test_readiness_returns_unknown_for_whatsapp_callback_contract():
+    from gateway.platform_configuration import (
+        BUILTIN_PLATFORM_SPECS,
+        StaticConfigurationState,
+        evaluate_static_configuration,
+    )
+
+    assert evaluate_static_configuration(
+        {"enabled": True, "extra": {"seeded": "value"}},
+        BUILTIN_PLATFORM_SPECS["whatsapp"],
+        getenv={}.get,
+    ) is StaticConfigurationState.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "extra"),
+    [
+        ("email", {"address": "user@example.test"}),
+        ("whatsapp", {"seeded": "value"}),
+    ],
+)
+def test_full_loader_never_allows_static_metadata_to_preempt_callback(
+    platform_name, extra
+):
+    """The parent lane invokes its registered callback after built-in checks."""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platform_configuration import PlatformConfigurationSpec
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    original = platform_registry.get_concrete_entry(platform_name)
+    platform_registry.register(
+        PlatformEntry(
+            name=platform_name, label="Callback contract", adapter_factory=lambda cfg: None,
+            check_fn=lambda: True, is_connected=lambda cfg: bool(cfg.extra),
+            static_configuration=PlatformConfigurationSpec(complete=False),
+        )
+    )
+    try:
+        loaded = GatewayConfig(
+            platforms={Platform(platform_name): PlatformConfig(enabled=True, extra=extra)}
+        )
+        assert loaded.get_connected_platforms() == [Platform(platform_name)]
+    finally:
+        platform_registry.unregister(platform_name)
+        if original is not None:
+            platform_registry.register(original)
+
+
+def test_forged_unbundled_builtin_metadata_is_unknown(tmp_path, monkeypatch):
+    from gateway.config import load_status_platform_states
+    from gateway.platform_configuration import (
+        BUILTIN_PLATFORM_SPECS,
+        StaticConfigurationState,
+    )
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    _write_yaml(tmp_path, {"platforms": {"telegram": {"enabled": True, "token": "token"}}})
+    monkeypatch.setattr("gateway.config.get_hermes_home", lambda: tmp_path)
+    original = platform_registry.get_concrete_entry("telegram")
+    platform_registry.register(
+        PlatformEntry(
+            name="telegram", label="Forged", adapter_factory=lambda cfg: None,
+            check_fn=lambda: True, static_configuration=BUILTIN_PLATFORM_SPECS["telegram"],
+            source="plugin", readiness_trusted=False,
+        )
+    )
+    try:
+        states = load_status_platform_states(["telegram"])
+    finally:
+        platform_registry.unregister("telegram")
+        if original is not None:
+            platform_registry.register(original)
+
+    assert states["telegram"] is StaticConfigurationState.UNKNOWN

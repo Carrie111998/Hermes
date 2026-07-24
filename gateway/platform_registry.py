@@ -69,6 +69,10 @@ class PlatformEntry:
     # implicitly configured.
     static_configuration: Any = None
 
+    # Only the in-tree bundled-plugin registration path may set this. Status
+    # uses it to avoid trusting a third-party replacement of a built-in name.
+    readiness_trusted: bool = False
+
     # Env vars this platform needs (for ``hermes setup`` display).
     required_env: list = field(default_factory=list)
 
