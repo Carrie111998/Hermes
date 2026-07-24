@@ -36,6 +36,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import html
 import json
 import logging
 import os
@@ -617,17 +618,23 @@ def _make_callback_handler() -> tuple[type, dict]:
             result["state"] = state
             result["error"] = error
 
+            safe_error = html.escape(str(error or "unknown"))
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
                 "<p>You can close this tab and return to Hermes.</p></body></html>"
             ) if code else (
                 "<html><body><h2>Authorization Failed</h2>"
-                f"<p>Error: {error or 'unknown'}</p></body></html>"
+                f"<p>Error: {safe_error}</p></body></html>"
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; frame-ancestors 'none'",
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            self.wfile.write(body.encode())
+            self.wfile.write(body.encode("utf-8"))
 
         def log_message(self, fmt: str, *args: Any) -> None:
             logger.debug("OAuth callback: %s", fmt % args)
