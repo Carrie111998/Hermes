@@ -39,6 +39,7 @@ import platform
 import re
 import time
 import threading
+import queue
 import atexit
 import shutil
 import subprocess
@@ -984,6 +985,18 @@ _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+# Count of in-flight *foreground* env.execute() calls per task_id. The reaper
+# (_cleanup_inactive_envs) only knows to keep an environment alive for
+# BACKGROUND processes via process_registry.has_active_processes() -- a
+# foreground call never registers there, so a single slow-but-legitimate
+# foreground command (model asked for a >lifetime_seconds timeout, or the
+# call is simply slow to return for any reason) can have its environment
+# torn out from under it mid-execution while _last_activity sits stale from
+# dispatch time. Tracked here so the reaper treats "someone is inside
+# env.execute() right now" the same as "there's a registered background
+# process" (root cause of a class of indefinite terminal-tool hangs where
+# the agent loop waits forever on a tool result that will never arrive).
+_inflight_foreground: Dict[str, int] = {}
 _cleanup_thread = None
 _cleanup_running = False
 
@@ -1637,6 +1650,15 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     """Clean up environments that have been inactive for longer than lifetime_seconds."""
     current_time = time.time()
 
+    # Skip cleanup for tasks with an in-flight foreground env.execute() call --
+    # otherwise a foreground command still running past lifetime_seconds (e.g.
+    # a model-requested long timeout) can have its environment reaped while a
+    # tool call is actively blocked waiting on it, permanently hanging that
+    # tool call (see _inflight_foreground docstring above).
+    for task_id in list(_last_activity.keys()):
+        if _inflight_foreground.get(task_id, 0) > 0:
+            _last_activity[task_id] = current_time
+
     # Check the process registry -- skip cleanup for sandboxes with active
     # background processes (their _last_activity gets refreshed to keep them alive).
     try:
@@ -2095,6 +2117,78 @@ def _resolve_command_cwd(
     if workdir:
         return workdir
     return get_session_cwd(session_key) or default_cwd
+
+
+# Extra grace period on top of the command's own effective_timeout before the
+# watchdog gives up on env.execute() and returns control to the caller. Covers
+# the time _wait_for_process needs to notice its own deadline, kill the
+# process group, and drain -- the watchdog should basically never fire in the
+# healthy case; it exists purely so a hang *anywhere* inside env.execute()
+# (lock contention, a Popen/PTY-level stall, or the reaper race documented on
+# _inflight_foreground) can't block the tool-executor thread, and therefore
+# the whole agent turn, forever. A dozen multi-hour freezes were traced to
+# exactly this: env.execute() never returning and nothing upstream able to
+# notice or recover.
+_WATCHDOG_MARGIN_SECONDS = 45
+
+
+def _execute_foreground_with_watchdog(env, command, execute_kwargs, *, task_id, env_type):
+    """Run env.execute() with a hard wall-clock ceiling.
+
+    env.execute() is expected to honor execute_kwargs["timeout"] internally
+    (see BaseEnvironment._wait_for_process), but that internal deadline lives
+    entirely inside the call we're waiting on -- if it's ever defeated (a
+    blocking syscall the poll loop never gets back to, a lock acquired
+    earlier in the call never releasing, etc.) there is nothing outside the
+    call to notice. Running it on a daemon worker thread and bounding *our*
+    wait on a queue.get(timeout=...) gives us an outside observer: if the
+    deadline passes we abandon the worker thread (best-effort; it may leak
+    if it's truly wedged) and return a normal timeout result instead of
+    hanging the caller -- which otherwise stalls the whole agent turn
+    indefinitely with no error, no log line, and no way to recover short of
+    killing the agent process.
+
+    Deliberately NOT concurrent.futures.ThreadPoolExecutor: its worker
+    threads are non-daemon and its atexit hook joins every thread any
+    executor ever created before the interpreter is allowed to exit, so an
+    abandoned/wedged call would make a *later, unrelated* clean shutdown of
+    the whole agent process hang too. A plain daemon thread has no such
+    hook -- it's simply dropped on process exit.
+    """
+    requested_timeout = execute_kwargs.get("timeout") or 180
+    hard_deadline = requested_timeout + _WATCHDOG_MARGIN_SECONDS
+
+    result_queue = queue.Queue(maxsize=1)
+
+    def _run():
+        try:
+            result_queue.put(("ok", env.execute(command, **execute_kwargs)))
+        except BaseException as e:  # noqa: BLE001 - must forward any failure to the waiter
+            result_queue.put(("error", e))
+
+    worker = threading.Thread(
+        target=_run, name=f"terminal-watchdog-{task_id}", daemon=True,
+    )
+    worker.start()
+    try:
+        kind, payload = result_queue.get(timeout=hard_deadline)
+    except queue.Empty:
+        logger.error(
+            "env.execute() watchdog fired after %ds (requested timeout=%ds) - "
+            "Command: %s - Task: %s, Backend: %s. The call never returned even "
+            "though its own internal timeout should have fired -- abandoning "
+            "the worker thread so the agent turn can continue.",
+            hard_deadline, requested_timeout, _safe_command_preview(command),
+            task_id, env_type,
+        )
+        raise TimeoutError(
+            f"env.execute() did not return within {hard_deadline}s "
+            f"(requested timeout={requested_timeout}s) -- watchdog aborted the wait"
+        ) from None
+
+    if kind == "error":
+        raise payload
+    return payload
 
 
 def terminal_tool(
@@ -2717,52 +2811,73 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
-            while retry_count <= max_retries:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                    )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while
-                        # streaming (head/tail window) so a verbose command
-                        # can't OOM the gateway before truncation (#64435).
-                        # Internal env.execute() consumers (file ops cat
-                        # reads, RPC reads) intentionally stay unbounded.
-                        "bounded_capture": True,
-                    }
-                    result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
+            # Mark this task_id as having an in-flight foreground execution so
+            # the idle-environment reaper (_cleanup_inactive_envs) won't tear
+            # the environment down out from under us mid-command. Must be
+            # decremented on every exit path (success, retry-exhausted error,
+            # or timeout return) -- hence the try/finally around the whole
+            # retry loop rather than a plain decrement after it.
+            with _env_lock:
+                _inflight_foreground[effective_task_id] = (
+                    _inflight_foreground.get(effective_task_id, 0) + 1
+                )
+            try:
+                while retry_count <= max_retries:
+                    try:
+                        command_cwd = _resolve_command_cwd(
+                            workdir=workdir,
+                            default_cwd=cwd,
+                            session_key=session_key,
+                        )
+                        execute_kwargs = {
+                            "timeout": effective_timeout,
+                            "cwd": command_cwd,
+                            # Foreground model-facing output: cap retention while
+                            # streaming (head/tail window) so a verbose command
+                            # can't OOM the gateway before truncation (#64435).
+                            # Internal env.execute() consumers (file ops cat
+                            # reads, RPC reads) intentionally stay unbounded.
+                            "bounded_capture": True,
+                        }
+                        result = _execute_foreground_with_watchdog(
+                            env, command, execute_kwargs,
+                            task_id=effective_task_id, env_type=env_type,
+                        )
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "timeout" in error_str:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": 124,
+                                "error": f"Command timed out after {effective_timeout} seconds"
+                            }, ensure_ascii=False)
+
+                        # Retry on transient errors
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            wait_time = 2 ** retry_count
+                            logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                           wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                            time.sleep(wait_time)
+                            continue
+
+                        logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                     max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
                         return json.dumps({
                             "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
+                            "exit_code": -1,
+                            "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
                         }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
-                        continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
+
+                    # Got a result
+                    break
+            finally:
+                with _env_lock:
+                    remaining = _inflight_foreground.get(effective_task_id, 1) - 1
+                    if remaining <= 0:
+                        _inflight_foreground.pop(effective_task_id, None)
+                    else:
+                        _inflight_foreground[effective_task_id] = remaining
 
             # Dual-write (cwd rearch step 1): the env's post-command tracking
             # (marker parse / local sync) has just updated env.cwd with the
