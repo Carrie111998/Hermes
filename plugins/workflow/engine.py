@@ -2634,6 +2634,19 @@ class WorkflowEngine:
         self._update_execution(workflow.run_id, status=final_status,
                               current_layer=layer_idx)
 
+        # Fire completion notification BEFORE clearing state
+        # (state file is needed for session info lookup)
+        if final_status == "completed":
+            try:
+                from plugins.workflow import _notify_workflow_complete
+                # Find the last completed card ID for the notification hook
+                for nid in reversed(list(states.keys())):
+                    if states[nid].status == "done" and states[nid].kanban_card_id:
+                        _notify_workflow_complete(states[nid].kanban_card_id, state=None)
+                        break
+            except Exception as _notify_exc:
+                print(f"   ⚠  Completion notification failed: {_notify_exc}")
+
         self._clear_state(workflow_name, run_id=workflow.run_id)
 
         return results
