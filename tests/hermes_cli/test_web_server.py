@@ -2747,14 +2747,6 @@ class TestWebServerEndpoints:
         import gateway.config as gateway_config
         import hermes_cli.web_server as web_server
 
-        class _Platform:
-            def __init__(self, value):
-                self.value = value
-
-        class _GatewayConfig:
-            def get_connected_platforms(self):
-                return [_Platform("telegram")]
-
         monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: 1234)
         monkeypatch.setattr(
             web_server,
@@ -2770,7 +2762,11 @@ class TestWebServerEndpoints:
             },
         )
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
-        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+        monkeypatch.setattr(
+            gateway_config,
+            "load_status_configured_platforms",
+            lambda candidates: frozenset({"telegram"}),
+        )
 
         resp = self.client.get("/api/status")
 
@@ -2782,10 +2778,6 @@ class TestWebServerEndpoints:
     def test_get_status_hides_stale_platforms_when_gateway_not_running(self, monkeypatch):
         import gateway.config as gateway_config
         import hermes_cli.web_server as web_server
-
-        class _GatewayConfig:
-            def get_connected_platforms(self):
-                return []
 
         monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: None)
         monkeypatch.setattr(
@@ -2801,7 +2793,11 @@ class TestWebServerEndpoints:
             },
         )
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
-        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+        monkeypatch.setattr(
+            gateway_config,
+            "load_status_configured_platforms",
+            lambda candidates: frozenset(),
+        )
 
         resp = self.client.get("/api/status")
 

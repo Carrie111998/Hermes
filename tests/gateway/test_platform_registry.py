@@ -790,15 +790,10 @@ class TestPluginEnablementGate:
         finally:
             _reg.unregister("myconfiguredplat")
 
-    def test_plugin_without_is_connected_falls_back_to_check_fn(
+    def test_plugin_without_declarative_metadata_is_not_auto_enabled(
         self, tmp_path, monkeypatch
     ):
-        """Legacy plugins that don't register is_connected keep working.
-
-        For plugins where ``is_connected is None``, gating on ``check_fn``
-        alone remains the contract — that's what callers without a
-        credential probe have always done.
-        """
+        """Dependency presence is not proof of third-party configuration."""
         from gateway.platform_registry import platform_registry as _reg
 
         _reg.register(PlatformEntry(
@@ -817,8 +812,7 @@ class TestPluginEnablementGate:
             cfg = load_gateway_config()
 
             plat = Platform("mylegacyplat")
-            assert plat in cfg.platforms
-            assert cfg.platforms[plat].enabled is True
+            assert plat not in cfg.platforms
         finally:
             _reg.unregister("mylegacyplat")
 

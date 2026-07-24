@@ -63,6 +63,12 @@ class PlatformEntry:
     # If None, falls back to ``validate_config`` or ``check_fn``.
     is_connected: Optional[Callable[[Any], bool]] = None
 
+    # Optional pure declarative configuration requirements.  Core readiness
+    # may inspect this object without invoking callbacks or resolving deferred
+    # adapter loaders.  Incomplete/absent metadata means UNKNOWN, never
+    # implicitly configured.
+    static_configuration: Any = None
+
     # Env vars this platform needs (for ``hermes setup`` display).
     required_env: list = field(default_factory=list)
 
@@ -256,6 +262,20 @@ class PlatformRegistry:
         """Look up a platform entry by name."""
         if name not in self._entries:
             self._resolve(name)
+        return self._entries.get(name)
+
+    def get_static_configuration(self, name: str) -> Any:
+        """Return already-registered declarative metadata without resolution.
+
+        This accessor deliberately never calls ``_resolve``.  It is safe for
+        readiness and other import-boundary paths that must not import an
+        adapter merely to classify persisted runtime state.
+        """
+        entry = self._entries.get(name)
+        return entry.static_configuration if entry is not None else None
+
+    def get_concrete_entry(self, name: str) -> Optional[PlatformEntry]:
+        """Return an already-registered entry without resolving a loader."""
         return self._entries.get(name)
 
     def all_entries(self) -> list[PlatformEntry]:

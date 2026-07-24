@@ -963,6 +963,20 @@ class PluginContext:
         from gateway.platform_registry import platform_registry, PlatformEntry
 
         entry_kwargs.setdefault("plugin_name", self.manifest.name)
+        if (
+            "static_configuration" not in entry_kwargs
+            and self.manifest.source == "bundled"
+        ):
+            # Shipped platform adapters consume the same pure enrollment
+            # contract as GatewayConfig and core readiness. User/project/
+            # entry-point plugins must opt in explicitly: assigning a built-in
+            # spec to a third-party override with the same name would turn an
+            # unproven plugin into a false CONFIGURED result.
+            from gateway.platform_configuration import BUILTIN_PLATFORM_SPECS
+
+            bundled_spec = BUILTIN_PLATFORM_SPECS.get(name)
+            if bundled_spec is not None:
+                entry_kwargs["static_configuration"] = bundled_spec
         entry = PlatformEntry(
             name=name,
             label=label,

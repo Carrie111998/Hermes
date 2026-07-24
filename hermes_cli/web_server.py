@@ -3098,16 +3098,6 @@ async def get_status(profile: Optional[str] = None):
         gateway_platforms: dict = {}
         gateway_exit_reason = None
         gateway_updated_at = None
-        configured_gateway_platforms: set[str] | None = None
-        try:
-            from gateway.config import load_gateway_config
-
-            gateway_config = load_gateway_config()
-            configured_gateway_platforms = {
-                platform.value for platform in gateway_config.get_connected_platforms()
-            }
-        except Exception:
-            configured_gateway_platforms = None
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
@@ -3148,12 +3138,23 @@ async def get_status(profile: Optional[str] = None):
         if runtime:
             gateway_state = runtime.get("gateway_state")
             gateway_platforms = runtime.get("platforms") or {}
-            if configured_gateway_platforms is not None:
-                gateway_platforms = {
-                    key: value
-                    for key, value in gateway_platforms.items()
-                    if key in configured_gateway_platforms
-                }
+            configured_gateway_platforms: frozenset[str] = frozenset()
+            try:
+                from gateway.config import load_status_configured_platforms
+
+                configured_gateway_platforms = load_status_configured_platforms(
+                    gateway_platforms
+                )
+            except Exception:
+                # Readiness stays available, but an unprovable candidate is
+                # never promoted to configured merely because runtime observed
+                # a stale record.
+                configured_gateway_platforms = frozenset()
+            gateway_platforms = {
+                key: value
+                for key, value in gateway_platforms.items()
+                if key in configured_gateway_platforms
+            }
             gateway_exit_reason = runtime.get("exit_reason")
             # Contract: gateway_updated_at is RFC3339 string | null, never a
             # number. ``runtime`` here may be the local gateway_state.json

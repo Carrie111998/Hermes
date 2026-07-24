@@ -579,14 +579,9 @@ class TestProfileScopedGateway:
             lambda payload, **k: 4242,
         )
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
-        from gateway.config import Platform
-
-        class _FakeGatewayConfig:
-            def get_connected_platforms(self):
-                return [Platform.TELEGRAM]
-
         monkeypatch.setattr(
-            "gateway.config.load_gateway_config", lambda: _FakeGatewayConfig()
+            "gateway.config.load_status_configured_platforms",
+            lambda candidates: frozenset({"telegram"}),
         )
 
         resp = client.get("/api/status", params={"profile": "worker_beta"})

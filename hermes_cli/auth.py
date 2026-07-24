@@ -49,6 +49,7 @@ from hermes_cli.config import (
     read_raw_config,
     require_readable_config_before_write,
 )
+from hermes_cli.secret_validation import has_usable_secret
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
@@ -546,34 +547,6 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
         return KIMI_CODE_BASE_URL
     return default_url
 
-
-
-_PLACEHOLDER_SECRET_VALUES = {
-    "*",
-    "**",
-    "***",
-    "changeme",
-    "your_api_key",
-    "your_api_key_here",
-    "your-api-key",
-    "placeholder",
-    "example",
-    "dummy",
-    "null",
-    "none",
-}
-
-
-def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
-    """Return True when a configured secret looks usable, not empty/placeholder."""
-    if not isinstance(value, str):
-        return False
-    cleaned = value.strip()
-    if len(cleaned) < min_length:
-        return False
-    if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
-        return False
-    return True
 
 
 def _resolve_api_key_provider_secret(
