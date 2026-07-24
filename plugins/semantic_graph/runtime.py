@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from . import graph as _graph
 from .config import SemanticGraphConfig, load_config
-from .export import ExportPathError, export_graph
+from .exporter import ExportPathError, export_graph
 from .inference import SemanticGraphInference, SemanticGraphInferenceError
 from .retrieval import render_context, search_and_rank
 from .sanitize import normalize_text, sanitize_metadata, sanitize_text

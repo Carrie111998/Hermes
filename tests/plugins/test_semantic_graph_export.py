@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from plugins.semantic_graph.config import SemanticGraphConfig
-from plugins.semantic_graph.export import ExportPathError, export_graph
+from plugins.semantic_graph.exporter import ExportPathError, export_graph
 from plugins.semantic_graph.runtime import SemanticGraphRuntime
 
 

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from plugins.semantic_graph.config import SemanticGraphConfig
-from plugins.semantic_graph.export import ExportPathError, export_graph
+from plugins.semantic_graph.exporter import ExportPathError, export_graph
 from plugins.semantic_graph.inference import SemanticGraphInference, SemanticGraphInferenceError
 from plugins.semantic_graph.runtime import SemanticGraphRuntime
 from plugins.semantic_graph.schemas import GRAPH_FRAGMENT_SCHEMA, OUTPUT_EVALUATION_SCHEMA
