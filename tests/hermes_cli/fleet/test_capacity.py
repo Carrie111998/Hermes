@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from hermes_cli.fleet.capacity import BridgeUsageAdapter
-from hermes_cli.fleet.types import Freshness, ReasonCode
+from hermes_cli.fleet.types import Confidence, Freshness, ReasonCode
 
 
 NOW = datetime(2026, 7, 24, 0, 0, tzinfo=timezone.utc)
@@ -159,3 +159,76 @@ def test_capacity_snapshot_is_immutable(tmp_path):
 
     with pytest.raises((AttributeError, TypeError)):
         snapshot.remaining_pct = Decimal("0")  # type: ignore[misc]
+
+
+def test_bridge_reads_live_plans_schema_with_deterministic_labels_and_row_times(
+    tmp_path,
+):
+    path = tmp_path / "usage-weekly.json"
+    _write(
+        path,
+        {
+            "checked_at": "2026-07-23T23:30:00Z",
+            "source": "live-bridge",
+            "plans": [
+                {
+                    "label": "ChatGPT Pro · Codex",
+                    "agents": ["codex"],
+                    "weekly_pct_used": 25,
+                    "resets": "weekly",
+                    "checked_at": "2026-07-23T23:45:00Z",
+                },
+                {
+                    "label": "Claude Max 20x",
+                    "agents": ["claude"],
+                    "weekly_pct_used": 40.5,
+                    "resets": "weekly",
+                },
+            ],
+        },
+    )
+
+    codex = BridgeUsageAdapter(path).read("chatgpt_codex", now=NOW).snapshot
+    claude = BridgeUsageAdapter(path).read("claude_code", now=NOW).snapshot
+
+    assert codex is not None and claude is not None
+    assert codex.used_pct == Decimal("25.000")
+    assert codex.captured_at.isoformat() == "2026-07-23T23:45:00+00:00"
+    assert claude.used_pct == Decimal("40.500")
+    assert claude.captured_at.isoformat() == "2026-07-23T23:30:00+00:00"
+    assert codex.overage_disabled is None
+
+
+@pytest.mark.parametrize(
+    ("label", "lane_id"),
+    [
+        ("SuperGrok", "grok"),
+        ("Google AI · Antigravity", "antigravity"),
+    ],
+)
+def test_bridge_missing_row_time_cannot_make_grok_or_agy_preempt(
+    tmp_path, label, lane_id
+):
+    path = tmp_path / "usage-weekly.json"
+    _write(
+        path,
+        {
+            "checked_at": "2026-07-23T23:55:00Z",
+            "source": "live-bridge",
+            "plans": [
+                {
+                    "label": label,
+                    "agents": [],
+                    "weekly_pct_used": 0,
+                    "resets": "weekly",
+                }
+            ],
+        },
+    )
+
+    result = BridgeUsageAdapter(path).read(lane_id, now=NOW)
+
+    assert result.snapshot is not None
+    assert result.snapshot.freshness is Freshness.STALE
+    assert result.snapshot.confidence is Confidence.LOW
+    assert result.reason is ReasonCode.CAPACITY_STALE

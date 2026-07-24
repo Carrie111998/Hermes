@@ -144,6 +144,7 @@ class Qualification:
     executable: str | None = None
     version: str | None = None
     evidence_id: str = ""
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,7 @@ class LaneEvaluation:
     selected_model: str | None
     selected_effort: str | None
     qualification_evidence_id: str = ""
+    qualification_detail: str = ""
 
 
 @dataclass(frozen=True)

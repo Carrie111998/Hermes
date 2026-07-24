@@ -116,8 +116,6 @@ def evaluate_lane(
     if snapshot is None:
         reasons.append(inputs.capacity.reason or ReasonCode.CAPACITY_MISSING)
     else:
-        if snapshot.overage_disabled is not True:
-            reasons.append(ReasonCode.OVERAGE_STATUS_UNKNOWN_OR_ON)
         if snapshot.freshness is not Freshness.FRESH:
             reasons.append(inputs.capacity.reason or ReasonCode.CAPACITY_STALE)
         if _CONFIDENCE_RANK[snapshot.confidence] < _CONFIDENCE_RANK[minimum_confidence]:
@@ -141,6 +139,9 @@ def evaluate_lane(
         selected_effort=selected_effort,
         qualification_evidence_id=(
             qualification.evidence_id if qualification is not None else ""
+        ),
+        qualification_detail=(
+            qualification.detail if qualification is not None else ""
         ),
     )
 

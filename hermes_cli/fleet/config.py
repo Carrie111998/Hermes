@@ -17,7 +17,7 @@ LANE_ORDER = (
     "antigravity",
     "kimi",
 )
-DEFERRED_LANES = frozenset({"antigravity", "kimi"})
+DEFERRED_LANES = frozenset({"kimi"})
 
 DEFAULT_FLEET_CONFIG: dict[str, Any] = {
     "enabled": False,

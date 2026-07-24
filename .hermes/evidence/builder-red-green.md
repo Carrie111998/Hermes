@@ -75,3 +75,42 @@ After the final CLI refinements, the mandated focused command was rerun:
 ```text
 91 passed in 4.67s
 ```
+
+## Live subscription correction RED/GREEN
+
+The uncommitted correction WIP was RED on inspection because it called the
+unsupported `agy auth status --json`, passed the human model label instead of
+the exact `gemini-3.1-pro-high` ID, and exposed incomplete effort orderings.
+Its successful qualifications also described `overage_disabled` too broadly
+instead of identifying it as fail-closed subscription-route policy evidence.
+
+The Claude live receipt was rechecked at 09:47 ICT and retained only these
+non-sensitive fields:
+
+```text
+{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}
+```
+
+Email and organization fields were neither printed nor persisted. The current
+worktree shell did not resolve `agy`, so the supplied live `agy --version`,
+`agy models`, and help receipts were incorporated through deterministic
+qualification tests without attempting the nonexistent auth command or an
+inference.
+
+GREEN at 09:49 ICT:
+
+```text
+uv run --with pytest pytest tests/hermes_cli/fleet -q
+101 passed in 7.49s
+```
+
+This includes exact Antigravity argv coverage, exact model-list qualification,
+second-highest effort selection for all four live profiles, API environment
+scrubbing, and fail-closed policy checks.
+
+The 198-test regression subset was rerun at 09:51 ICT:
+
+```text
+uv run --with pytest pytest tests/hermes_cli/test_config_validation.py tests/hermes_cli/test_subparser_routing_fallback.py tests/hermes_cli/test_commands.py -q
+198 passed in 13.25s
+```

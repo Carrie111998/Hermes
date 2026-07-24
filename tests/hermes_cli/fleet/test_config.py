@@ -24,7 +24,7 @@ def test_defaults_are_disabled_conservative_and_documented_in_main_config():
     assert DEFAULT_CONFIG["fleet"]["enabled"] is False
 
 
-def test_profiles_are_fixed_order_truthful_and_defer_unproven_lanes():
+def test_profiles_are_fixed_order_and_truthful_for_current_live_lanes():
     profiles = ordered_profiles()
 
     assert [profile.lane_id for profile in profiles] == [
@@ -36,10 +36,20 @@ def test_profiles_are_fixed_order_truthful_and_defer_unproven_lanes():
     ]
     assert profiles[0].adapter_kind is AdapterKind.NATIVE_PROVIDER
     assert profiles[0].provider_id == "openai-codex"
+    assert profiles[0].supported_efforts[-2:] == ("max", "ultra")
+    assert profiles[0].selected_effort == "max"
     assert profiles[1].adapter_kind is AdapterKind.EXTERNAL_CLI
     assert profiles[1].executable == "claude"
+    assert profiles[1].supported_efforts == ("low", "medium", "high", "max")
+    assert profiles[1].selected_effort == "high"
     assert profiles[2].provider_id == "xai-oauth"
-    assert not profiles[3].implemented
+    assert profiles[2].supported_efforts[-2:] == ("max", "ultra")
+    assert profiles[2].selected_effort == "max"
+    assert profiles[3].implemented
+    assert profiles[3].executable == "agy"
+    assert profiles[3].ordered_models == ("gemini-3.1-pro-high",)
+    assert profiles[3].supported_efforts == ("low", "medium", "high")
+    assert profiles[3].selected_effort == "medium"
     assert not profiles[4].implemented
 
 
@@ -65,10 +75,7 @@ def test_profiles_are_fixed_order_truthful_and_defer_unproven_lanes():
             {"lanes": {"chatgpt_codex": {"unexpected": True}}},
             "unknown lane option",
         ),
-        (
-            {"lanes": {"antigravity": {"enabled": True}}},
-            "deferred",
-        ),
+        ({"lanes": {"kimi": {"enabled": True}}}, "deferred"),
         ({"api_key": "secret"}, "credential"),
         (
             {"lanes": {"claude_code": {"auth_token": "secret"}}},

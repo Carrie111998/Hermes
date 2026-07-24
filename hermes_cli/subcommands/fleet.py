@@ -9,11 +9,13 @@ import uuid
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from hermes_cli.config import load_config_readonly
 from hermes_cli.fleet.capacity import BridgeUsageAdapter
+from hermes_cli.fleet.adapters.live_routes import live_adapters
 from hermes_cli.fleet.config import LANE_ORDER, parse_fleet_config
+from hermes_cli.fleet.live import FleetQualificationDoctor
 from hermes_cli.fleet.profiles import ordered_profiles
 from hermes_cli.fleet.service import FleetService
 from hermes_cli.fleet.state import FleetStore
@@ -93,20 +95,30 @@ def build_fleet_parser(subparsers) -> argparse.ArgumentParser:
     return fleet
 
 
-def _default_service() -> FleetService:
-    """Build a conservative service without inferring auth or billing state."""
+def _default_service(
+    *,
+    config_data: Mapping[str, Any] | None = None,
+    doctor: FleetQualificationDoctor | None = None,
+    adapters: Mapping[str, object] | None = None,
+    store_path: Path | None = None,
+    now=None,
+) -> FleetService:
+    """Build the live service from read-only, attributable qualifications."""
 
-    config = parse_fleet_config(load_config_readonly())
+    config = parse_fleet_config(
+        load_config_readonly() if config_data is None else config_data
+    )
+    profiles = ordered_profiles()
     return FleetService(
         config=config,
-        store=FleetStore(get_hermes_home() / "fleet" / "state.db"),
-        profiles=ordered_profiles(),
-        # V1 never converts credential presence into subscription qualification.
-        # Until an attributable qualification is supplied, every lane stays
-        # fail-closed and no adapter can start.
-        qualifications={},
-        adapters={},
+        store=FleetStore(
+            store_path or (get_hermes_home() / "fleet" / "state.db")
+        ),
+        profiles=profiles,
+        qualifications=(doctor or FleetQualificationDoctor()).qualify(profiles),
+        adapters=dict(adapters or live_adapters()),
         capacity_source=BridgeUsageAdapter(config.bridge_usage_file),
+        now=now,
     )
 
 
@@ -179,6 +191,7 @@ def _evaluation(item: LaneEvaluation) -> dict[str, Any]:
         "model_id": item.selected_model,
         "effort": item.selected_effort,
         "qualification_evidence_id": item.qualification_evidence_id,
+        "qualification_detail": item.qualification_detail,
         "capacity": _capacity(item.capacity),
     }
 

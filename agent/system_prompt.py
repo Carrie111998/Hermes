@@ -323,6 +323,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         stable_parts.append(skills_prompt)
 
+    # Fleet admission is a once-per-new-task workflow, not a per-call model
+    # router. Build this instruction once with the cached session prefix.
+    # Fleet workers are explicitly excluded to prevent recursive delegation.
+    if (agent.platform or "").lower().strip() != "subagent":
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _fleet = load_config_readonly().get("fleet") or {}
+            if isinstance(_fleet, dict) and _fleet.get("enabled") is True:
+                stable_parts.append(
+                    "Fleet default workflow is enabled. For each new substantive "
+                    "bounded task, load the fleet-balanced-router skill and use "
+                    "its plan/run workflow before doing that task locally. Do not "
+                    "route casual conversation, status questions, tiny edits, or "
+                    "continuations as new tasks. Reuse the existing task_id for "
+                    "continuations so lane pinning is preserved. Fleet selects a "
+                    "separate child only; never change this conversation's active "
+                    "provider/model and never intercept individual LLM calls."
+                )
+        except Exception:
+            pass
+
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).
