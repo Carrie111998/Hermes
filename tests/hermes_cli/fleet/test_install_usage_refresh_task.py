@@ -535,3 +535,220 @@ def test_repo_path_is_long_enough_to_matter() -> None:
     """Guard: staging makes /TR independent of REPO_ROOT length."""
     assert INSTALLER.is_file()
     assert "scripts" in str(INSTALLER)
+
+
+def test_refresher_source_preserves_filtered_candidates_as_array() -> None:
+    """Source invariant: filtered repoCandidates must stay wrapped in @(...).
+
+    A bare pipeline assignment collapses one survivor to a scalar string; then
+    $repoCandidates[0] is the drive letter 'C', not the full path.
+    """
+    text = _refresher_text()
+    code_only = _code_only(text)
+    assert "repoCandidates" in code_only
+    # Outer @() must wrap the Where-Object pipeline result.
+    assert re.search(
+        r"\$repoCandidates\s*=\s*@\s*\(",
+        code_only,
+    ), "repoCandidates assignment must use @() array subexpression"
+    assert "Where-Object" in code_only
+    # Defense-in-depth: force array before indexing.
+    assert "@($repoCandidates)[0]" in code_only or "@($repoCandidates )[0]" in code_only
+    # Must reject degenerate single-character repo (drive letter).
+    assert "degenerate" in text.lower() or "scalar-string" in text.lower()
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
+def test_powershell_pipeline_array_wrap_zero_one_multiple() -> None:
+    """Direct PS assertion: @($pipeline) preserves 0/1/N results (no string index)."""
+    # Mirrors the refresher pattern with concrete path-like strings.
+    ps = r"""
+$ErrorActionPreference = 'Stop'
+function Assert-True($cond, $msg) {
+  if (-not $cond) { throw $msg }
+}
+
+# ZERO survivors
+$zero = @(
+  @('C:\missing-a', 'C:\missing-b') | Where-Object { $false }
+)
+Assert-True ($zero -is [System.Array]) 'zero must be array'
+Assert-True ($zero.Count -eq 0) "zero count=$($zero.Count)"
+
+# ONE survivor (the bug class): must NOT unwrap to scalar string
+$onePath = 'C:\Users\HieuKa\AppData\Local\hermes\hermes-agent'
+$one = @(
+  @($onePath, 'C:\missing-other') | Where-Object { $_ -eq $onePath }
+)
+Assert-True ($one -is [System.Array]) 'one must remain System.Array'
+Assert-True ($one.Count -eq 1) "one count=$($one.Count)"
+$picked = [string](@($one)[0])
+Assert-True ($picked -eq $onePath) "one[0] expected full path, got '$picked'"
+Assert-True ($picked.Length -gt 1) 'one[0] must not be single char'
+Assert-True ($picked -ne 'C') 'one[0] must not be drive letter C'
+# Prove the BARE (buggy) form indexes the character:
+$bare = @($onePath, 'C:\missing-other') | Where-Object { $_ -eq $onePath }
+# $bare is a scalar string when one item survives
+$buggy = [string]$bare[0]
+Assert-True ($buggy -eq 'C') "control: bare scalar[0] must be 'C', got '$buggy'"
+
+# MULTIPLE survivors
+$multi = @(
+  @('C:\a\hermes-agent', 'C:\b\hermes-agent') | Where-Object { $_ }
+)
+Assert-True ($multi -is [System.Array]) 'multi must be array'
+Assert-True ($multi.Count -eq 2) "multi count=$($multi.Count)"
+$first = [string](@($multi)[0])
+Assert-True ($first -eq 'C:\a\hermes-agent') "multi[0] got '$first'"
+
+Write-Output 'ARRAY_WRAP_OK'
+"""
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ARRAY_WRAP_OK" in proc.stdout
+
+
+def _write_stub_hermes_agent(agent_root: Path) -> None:
+    """Minimal hermes-agent tree so the refresher locates usage_refresh.py.
+
+    hermes_cli.main is a no-network stub so controlled Python execution never
+    touches provider APIs.
+    """
+    fleet_dir = agent_root / "hermes_cli" / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    (agent_root / "hermes_cli" / "__init__.py").write_text(
+        '"""stub package"""\n', encoding="utf-8"
+    )
+    (fleet_dir / "__init__.py").write_text('"""stub fleet package"""\n', encoding="utf-8")
+    (fleet_dir / "usage_refresh.py").write_text(
+        '"""stub marker for path discovery only"""\n', encoding="utf-8"
+    )
+    # runpy.run_module('hermes_cli.main') — exit 0, print argv, no network.
+    (agent_root / "hermes_cli" / "main.py").write_text(
+        "import json\n"
+        "import sys\n"
+        "print('STUB_HERMES_MAIN=' + json.dumps(list(sys.argv)), flush=True)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+
+
+def _write_fake_python(path: Path) -> Path:
+    """Controlled Python launcher: no interpreter, no provider APIs.
+
+    Repo resolution and the repo= banner run before this process is invoked.
+    A .cmd shim keeps the test deterministic and offline regardless of whether
+    a real hermes package is installed on the host interpreter.
+    """
+    shim = path / "fake-python.cmd"
+    shim.write_text(
+        "@echo off\r\n"
+        "echo FAKE_PYTHON_OK\r\n"
+        "exit /b 0\r\n",
+        encoding="ascii",
+    )
+    return shim
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
+def test_staged_refresher_single_candidate_resolves_full_repo_path(
+    short_home: Path,
+) -> None:
+    """Stage to a default-like HermesHome with exactly one valid candidate.
+
+    Reproduces the live failure mode: staged script under HermesHome\\scripts,
+    sole valid repo at HermesHome\\hermes-agent. Pipeline must not unwrap to
+    scalar so repo= is the full directory, never drive letter 'C'.
+    """
+    agent_root = short_home / "hermes-agent"
+    _write_stub_hermes_agent(agent_root)
+    expected_repo = os.path.normcase(os.path.normpath(str(agent_root.resolve())))
+
+    # Exactly one discovery marker; parent of scripts is HermesHome (no marker).
+    assert (agent_root / "hermes_cli" / "fleet" / "usage_refresh.py").is_file()
+    assert not (short_home / "hermes_cli" / "fleet" / "usage_refresh.py").exists()
+
+    stage = _run_installer(hermes_home=str(short_home), extra=["-StageOnly"])
+    assert stage.returncode == 0, stage.stdout + stage.stderr
+    staged_path = Path(_parse_staged_path(stage.stdout))
+    assert staged_path.is_file()
+    assert staged_path.read_bytes() == REFRESHER.read_bytes()
+
+    py = _write_fake_python(short_home)
+    cmd = [
+        "pwsh",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        str(staged_path),
+        "-HermesHome",
+        str(short_home),
+        "-Python",
+        str(py),
+        "-NoMirror",
+    ]
+    # Strip ambient HERMES_HOME so -HermesHome alone drives resolution.
+    env = dict(os.environ)
+    env.pop("HERMES_HOME", None)
+    # Block accidental network-ish provider env use in case stub is bypassed.
+    for k in list(env):
+        if k.upper().endswith("_API_KEY") or k.upper().endswith("_TOKEN"):
+            env.pop(k, None)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+
+    # Banner proves full repo path (the live bug printed repo=C).
+    m = re.search(r"repo=([^\r\n]+)", combined)
+    assert m, f"missing repo= banner in output:\n{combined}"
+    resolved = m.group(1).strip()
+    assert resolved not in {"C", "c"}, f"scalar-index bug: repo={resolved!r}"
+    assert len(resolved) > 3, f"repo path too short: {resolved!r}"
+    assert os.path.normcase(os.path.normpath(resolved)) == expected_repo, (
+        f"repo={resolved!r} != expected {expected_repo!r}"
+    )
+    # Must look like a Windows directory path, not a single drive letter.
+    assert re.match(r"^[A-Za-z]:\\", resolved), f"repo not absolute path: {resolved!r}"
+    assert "hermes-agent" in resolved.replace("/", "\\").lower()
+    # Controlled fake Python ran after successful Set-Location/repo resolve.
+    assert "FAKE_PYTHON_OK" in combined
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not on PATH")
+def test_staged_refresher_zero_candidates_fails_closed(short_home: Path) -> None:
+    """No hermes-agent marker under HermesHome => refresher throws, no path 'C'."""
+    stage = _run_installer(hermes_home=str(short_home), extra=["-StageOnly"])
+    assert stage.returncode == 0, stage.stdout + stage.stderr
+    staged_path = Path(_parse_staged_path(stage.stdout))
+
+    py = _write_fake_python(short_home)
+    env = dict(os.environ)
+    env.pop("HERMES_HOME", None)
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(staged_path),
+            "-HermesHome",
+            str(short_home),
+            "-Python",
+            str(py),
+            "-NoMirror",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert "Could not locate hermes_cli.fleet.usage_refresh" in combined
+    assert "Cannot find path 'C'" not in combined

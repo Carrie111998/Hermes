@@ -53,17 +53,28 @@ $py = Resolve-Python -Preferred $Python
 # Prefer HermesHome\hermes-agent first so a staged copy under HermesHome\scripts
 # never binds to an ephemeral worktree checkout via PSScriptRoot\..
 # Never fall back to a dated worktree path — those are ephemeral build checkouts.
+#
+# CRITICAL: wrap the filtered pipeline in @(...). PowerShell unwraps a single
+# pipeline result to a scalar string; then $candidates[0] indexes the first
+# character ("C") instead of the full path, and Set-Location fails with
+# "Cannot find path 'C'".
 $repoCandidates = @(
-    (Join-Path $HermesHome "hermes-agent"),
-    (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue)
-) | Where-Object {
-    $_ -and (Test-Path -LiteralPath (Join-Path $_ "hermes_cli\fleet\usage_refresh.py"))
-}
+    @(
+        (Join-Path $HermesHome "hermes-agent"),
+        (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..") -ErrorAction SilentlyContinue)
+    ) | Where-Object {
+        $_ -and (Test-Path -LiteralPath (Join-Path $_ "hermes_cli\fleet\usage_refresh.py"))
+    }
+)
 
-if (-not $repoCandidates) {
+if ($repoCandidates.Count -lt 1) {
     throw "Could not locate hermes_cli.fleet.usage_refresh in known paths (expected under $HermesHome\hermes-agent)"
 }
-$repo = [string]$repoCandidates[0]
+# Force array index even if a future edit drops the outer @() wrap.
+$repo = [string](@($repoCandidates)[0])
+if ($repo.Length -lt 2 -or $repo -match '^[A-Za-z]$') {
+    throw "Resolved repo path is degenerate (scalar-string index bug?): '$repo'"
+}
 Set-Location -LiteralPath $repo
 
 $argLine = "fleet refresh-usage --json"
