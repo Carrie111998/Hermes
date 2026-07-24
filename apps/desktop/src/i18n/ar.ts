@@ -667,6 +667,30 @@ export const ar = defineLocale({
       // أعلام تُترك عمداً فتسقط إلى prettyName حرفياً
       'terminal.backend': { local: 'محلي' }
     },
+    // صفحة الفوترة — قسم اختياري كـ optionLabels: en وzh تتركانه فارغاً
+    // فيسقط المكوّن إلى نصه الإنجليزي الحرفي دون تعديل أي كتالوج آخر
+    billing: {
+      title: 'الفوترة',
+      planSection: 'الخطة',
+      paymentSection: 'الدفع والرصيد',
+      usageSection: 'الاستخدام',
+      connectTitle: 'اربط حساب Nous',
+      connectMessage: 'شغّل /portal في واجهة الطرفية أو افتح بوابة Nous لربط حسابك.',
+      connectAction: 'افتح البوابة ↗',
+      summaryBalance: 'الرصيد',
+      summaryPlan: 'الخطة',
+      summaryAutoRefill: 'التعبئة التلقائية',
+      buy: 'شراء',
+      customAmount: 'مبلغ رصيد مخصص',
+      processing: 'جار المعالجة… يجري التحقق من التسوية',
+      creditsAdded: amount => `أُضيف ${amount}. يجري تحديث الرصيد.`,
+      openPortal: 'افتح البوابة',
+      retry: 'إعادة المحاولة',
+      usageBarLabel: name => `استخدام ${name}`,
+      // نفس محرفي الإنجليزية (نقطتان ثم مسافة)، لكنه يمر عبر الكتالوج
+      // كي تضبط اللغات من اليمين لليسار فاصلها دون لمس المكوّن
+      labelSeparator: ': '
+    },
     about: {
       heading: 'حول Hermes',
       version: value => `الإصدار ${value}`,
