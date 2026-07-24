@@ -307,6 +307,29 @@ def test_registry_command_source_applies_and_records_source(tmp_path, monkeypatc
     )
 
 
+def test_registry_command_source_drops_whitespace_only_values(tmp_path, monkeypatch):
+    """Bulk registry fetches must not claim placeholder values as secrets."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    helper = _write_helper(
+        tmp_path,
+        "printf 'CMDTEST_API_KEY=\"  \"\\nCMDTEST_TOKEN=tok-real\\n'",
+    )
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  command:\n"
+        "    enabled: true\n"
+        f"    command: {helper}\n",
+        encoding="utf-8",
+    )
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert "CMDTEST_API_KEY" not in os.environ
+    assert env_loader.get_secret_source("CMDTEST_API_KEY") is None
+    assert os.environ.get("CMDTEST_TOKEN") == "tok-real"
+    assert env_loader.get_secret_source("CMDTEST_TOKEN") == "command"
+
+
 def test_registry_status_line_printed_once_per_home(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     helper = _write_helper(tmp_path, "printf 'CMDTEST_API_KEY=sk-once\\n'")

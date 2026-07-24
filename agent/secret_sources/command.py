@@ -265,7 +265,10 @@ def _parse_dotenv_map(stdout: str) -> Dict[str, str]:
         m = _ENV_LINE.match(line)
         if not m:
             continue
-        out[m.group(1)] = unquote_dotenv_value(m.group(2))
+        value = unquote_dotenv_value(m.group(2))
+        if value.strip() == "":
+            continue
+        out[m.group(1)] = value
     return out
 
 

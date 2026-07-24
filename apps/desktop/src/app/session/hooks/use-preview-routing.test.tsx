@@ -1,5 +1,5 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { useEffect, useRef } from 'react'
+import { type MutableRefObject, useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
@@ -37,8 +37,15 @@ function previewTarget(source: string): PreviewTarget {
 
 let handleEvent: (event: RpcEvent) => void = () => undefined
 
-function PreviewRoutingHarness({ onEvent }: { onEvent: (handler: (event: RpcEvent) => void) => void }) {
-  const activeSessionIdRef = useRef<string | null>('session-1')
+function PreviewRoutingHarness({
+  activeSessionIdRef: providedActiveSessionIdRef,
+  onEvent
+}: {
+  activeSessionIdRef?: MutableRefObject<string | null>
+  onEvent: (handler: (event: RpcEvent) => void) => void
+}) {
+  const defaultActiveSessionIdRef = useRef<string | null>('session-1')
+  const activeSessionIdRef = providedActiveSessionIdRef ?? defaultActiveSessionIdRef
 
   const routing = usePreviewRouting({
     activeSessionIdRef,
@@ -158,6 +165,44 @@ describe('usePreviewRouting', () => {
     // Give any (wrongly) scheduled async open a tick to resolve before asserting.
     await Promise.resolve()
     expect($previewTarget.get()).toBeNull()
+  })
+
+  it('does not open an old session preview after async normalization finishes', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'session-1' }
+    let resolveNormalization: (target: PreviewTarget) => void = () => undefined
+
+    window.hermesDesktop.normalizePreviewTarget = vi.fn(
+      () =>
+        new Promise<PreviewTarget>(resolve => {
+          resolveNormalization = resolve
+        })
+    )
+
+    render(
+      <PreviewRoutingHarness
+        activeSessionIdRef={activeSessionIdRef}
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com' },
+        session_id: 'session-1',
+        type: 'preview.open'
+      })
+    )
+
+    activeSessionIdRef.current = 'session-2'
+    await act(async () => {
+      resolveNormalization(previewTarget('https://www.cnn.com'))
+      await Promise.resolve()
+    })
+
+    expect($previewTarget.get()).toBeNull()
+    expect(window.localStorage.getItem('hermes.desktop.sessionPreviews.v1')).toBeNull()
   })
 
   it('does not auto-open a preview from tool results', async () => {

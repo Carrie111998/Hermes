@@ -11,8 +11,8 @@ import {
   getSessionPreviewRecord,
   progressPreviewServerRestart,
   requestPreviewReload,
-  setCurrentSessionPreviewTarget,
-  setPreviewTarget
+  setPreviewTarget,
+  setSessionPreviewTarget
 } from '@/store/preview'
 import { $currentCwd } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
@@ -111,14 +111,17 @@ export function usePreviewRouting({
         // browser so URLs, localhost, and file paths all resolve correctly.
         const { url, label } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
+        const intendedSessionId = event.session_id || activeSessionIdRef.current
 
-        if (target && (!event.session_id || event.session_id === activeSessionIdRef.current)) {
+        if (target && intendedSessionId && intendedSessionId === activeSessionIdRef.current) {
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(resolved => {
-            if (resolved) {
+            if (resolved && intendedSessionId === activeSessionIdRef.current) {
               const trimmedLabel = typeof label === 'string' ? label.trim() : ''
-              setCurrentSessionPreviewTarget(
+              setSessionPreviewTarget(
+                intendedSessionId,
                 trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved,
-                'tool-result'
+                'tool-result',
+                target
               )
             }
           })

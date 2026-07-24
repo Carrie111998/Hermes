@@ -9,6 +9,57 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_nix_wheel_metadata_includes_runtime_assets():
+    """The supported Nix wheel must retain every runtime-discovered asset."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    setuptools = data["tool"]["setuptools"]
+    data_files = setuptools["data-files"]
+    package_data = setuptools["package-data"]
+
+    assert data_files["locales"] == ["locales/*.yaml"]
+
+    catalog_dirs = sorted(
+        manifest.parent.relative_to(REPO_ROOT).as_posix()
+        for manifest in (REPO_ROOT / "optional-mcps").glob("*/manifest.yaml")
+    )
+    configured_catalog_dirs = sorted(
+        target for target in data_files if target.startswith("optional-mcps/")
+    )
+    assert configured_catalog_dirs == catalog_dirs
+    for catalog_dir in catalog_dirs:
+        assert data_files[catalog_dir] == [f"{catalog_dir}/manifest.yaml"]
+
+    assert {
+        "web_dist/**/*",
+        "tui_dist/**/*",
+        "scripts/install.sh",
+        "scripts/install.ps1",
+    }.issubset(package_data["hermes_cli"])
+    assert {
+        "*/dashboard/manifest.json",
+        "*/dashboard/dist/*",
+        "*/dashboard/dist/**/*",
+        "**/plugin.yaml",
+        "**/plugin.yml",
+        "**/README.md",
+    }.issubset(package_data["plugins"])
+
+
+def test_sdist_manifest_includes_runtime_assets():
+    """The supported Nix sdist must preserve bare data dirs and manifests."""
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    required_lines = {
+        "graft skills",
+        "graft optional-skills",
+        "graft optional-mcps",
+        "graft locales",
+        "recursive-include plugins plugin.yaml plugin.yml",
+        "recursive-include gateway/assets *",
+    }
+
+    assert required_lines.issubset(set(manifest.splitlines()))
+
+
 def _distribution_name(requirement: str) -> str:
     """Extract the PEP 508 distribution name from a requirement string.
 

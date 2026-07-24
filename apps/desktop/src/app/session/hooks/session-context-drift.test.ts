@@ -87,7 +87,7 @@ describe('sessionContextDrift', () => {
     expect(reason).toBe('route:sess-a->__new__')
   })
 
-  it('does not drift when the route moves to a non-chat route (null target)', () => {
+  it('drifts when the route moves to a non-chat route (null target)', () => {
     const reason = sessionContextDrift({
       startRouteToken: routeToken(sessionRoute(SESS_A)),
       nowRouteToken: routeToken(SETTINGS_ROUTE),
@@ -96,7 +96,19 @@ describe('sessionContextDrift', () => {
       submitTargetStoredId: SESS_A
     })
 
-    expect(reason).toBeNull()
+    expect(reason).toBe('route:sess-a->null')
+  })
+
+  it('drifts when a new-chat submit navigates to settings before create finishes', () => {
+    const reason = sessionContextDrift({
+      startRouteToken: routeToken(NEW_CHAT_ROUTE),
+      nowRouteToken: routeToken(SETTINGS_ROUTE),
+      startSelectedStoredId: null,
+      nowSelectedStoredId: null,
+      submitTargetStoredId: null
+    })
+
+    expect(reason).toBe('route:__new__->null')
   })
 
   it('does not drift when route and selection re-home onto the submit target (the create pipeline re-home)', () => {

@@ -61,11 +61,11 @@ export function sessionContextDrift({
   const targetStart = routeTargetFromToken(startRouteToken)
   const targetNow = routeTargetFromToken(nowRouteToken)
 
-  // Route prong: the routed chat moved to a different, real chat. A null target
-  // (navigated to settings / a non-chat overlay route) or a search/hash-only
-  // change (same target) is not drift, and neither is landing on the submit's
-  // own target.
-  if (targetNow !== targetStart && targetNow !== null && targetNow !== submitTargetStoredId) {
+  // Route prong: the routed chat changed. Navigating to a non-chat page is
+  // drift too — an in-flight create must not pull the user back from Settings.
+  // Search/hash-only churn retains the same target, and landing on the
+  // submit's own real session remains the create pipeline's expected re-home.
+  if (targetNow !== targetStart && (targetNow === null || targetNow !== submitTargetStoredId)) {
     return `route:${targetStart}->${targetNow}`
   }
 
