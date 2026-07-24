@@ -231,6 +231,7 @@ def _generate_init_script(
     tmpfs_mb: int = 64,
     base_prefix: Path | None = None,
     max_processes: int = 64,
+    cpu_seconds: int = 60,
 ) -> str:
     """Generate the mount plan executed as namespace-root."""
     jail = run_dir / "jail"
@@ -299,6 +300,8 @@ def _generate_init_script(
             "/venv/bin/python -I -c "
             + _q(
                 "import os,resource;"
+                f"resource.setrlimit(resource.RLIMIT_CPU, ({int(cpu_seconds)},"
+                f"{int(cpu_seconds) + 1}));"
                 f"resource.setrlimit(resource.RLIMIT_NPROC, ({int(max_processes)},"
                 f"{int(max_processes)}));"
                 "os.execv('/venv/bin/python', ['/venv/bin/python','-I','/script.py'])"
@@ -337,10 +340,6 @@ def _preexec(limits: Mapping[str, int]):
         if resource is None:
             raise RuntimeError("resource limits unavailable")
         os.setsid()
-        resource.setrlimit(
-            resource.RLIMIT_CPU,
-            (limits["cpu_seconds"], limits["cpu_seconds"] + 1),
-        )
         resource.setrlimit(
             resource.RLIMIT_AS, (limits["memory_mb"] * 1024**2,) * 2
         )
@@ -618,6 +617,7 @@ def python_sandbox(
             limits["file_size_mb"],
             Path(sys.base_prefix),
             limits["max_processes"],
+            limits["cpu_seconds"],
         ),
         encoding="utf-8",
     )

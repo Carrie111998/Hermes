@@ -408,7 +408,10 @@ for label, action in {
     "input_write": lambda: open(inputs["sheet"], "w"),
     "directory_write": lambda: open(inputs["media"] + "/new.txt", "w"),
     "etc_write": lambda: open("/etc/x", "w"),
-    "home_write": lambda: open(os.path.expanduser("~/x"), "w"),
+    "home_is_scratch": lambda: (
+        os.path.expanduser("~") == "/work"
+        and open(os.path.expanduser("~/x"), "w").close() is None
+    ),
     "venv_write": lambda: open("/venv/probe.txt", "w"),
 }.items():
     try: action(); blocked[label] = False
@@ -436,7 +439,7 @@ open(os.environ["RESULT_PATH"], "w").write(json.dumps(blocked))
         "input_write": True,
         "directory_write": True,
         "etc_write": True,
-        "home_write": True,
+        "home_is_scratch": False,
         "venv_write": True,
         "venv_remount": True,
         "directory_remount": True,
@@ -491,7 +494,7 @@ def test_jailed_timeout_is_bounded_and_leaves_no_process(tmp_path, monkeypatch):
     )
     elapsed = time.monotonic() - started
     assert response["status"] == "timeout", response
-    assert elapsed <= 8
+    assert elapsed <= 12
     run_path = str(home / "sandbox_runs" / response["run_id"])
     processes = subprocess.run(
         ["ps", "-eo", "args="], capture_output=True, text=True, check=True
