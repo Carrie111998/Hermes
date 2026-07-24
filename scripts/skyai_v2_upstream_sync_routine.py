@@ -382,6 +382,17 @@ def build_candidate(
         )
 
 
+def verification_check_name(command: Sequence[str]) -> str:
+    names = {Path(str(part)).name for part in command}
+    if "skyai_v2_upstream_sync_check.py" in names:
+        return "boundary"
+    if "run_tests.sh" in names:
+        return "tests"
+    if tuple(command[:3]) == ("git", "diff", "--check"):
+        return "diff_check"
+    return "verification"
+
+
 def run_skyai_checks(worktree: Path, upstream_ref: str) -> list[dict[str, Any]]:
     commands: tuple[tuple[str, ...], ...] = (
         (
@@ -399,13 +410,7 @@ def run_skyai_checks(worktree: Path, upstream_ref: str) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     for command in commands:
         result = run_command(command, cwd=worktree, check=False, timeout=1200)
-        check_name = (
-            "boundary"
-            if "skyai_v2_upstream_sync_check.py" in command
-            else "tests"
-            if "run_tests.sh" in command
-            else "diff_check"
-        )
+        check_name = verification_check_name(command)
         checks.append(
             {
                 "name": check_name,

@@ -121,6 +121,18 @@ def test_parse_github_repo_rejects_non_github_remote() -> None:
         raise AssertionError("unsupported remote must fail closed")
 
 
+def test_verification_check_names_are_stable() -> None:
+    assert routine.verification_check_name(
+        ("python3", "scripts/skyai_v2_upstream_sync_check.py", "origin/main")
+    ) == "boundary"
+    assert routine.verification_check_name(
+        ("scripts/run_tests.sh", "tests/example.py", "-q")
+    ) == "tests"
+    assert routine.verification_check_name(
+        ("git", "diff", "--check", "origin/main...HEAD")
+    ) == "diff_check"
+
+
 def test_dry_run_reports_candidate_required_without_creating_worktree(
     tmp_path: Path,
 ) -> None:
