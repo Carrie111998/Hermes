@@ -50,7 +50,7 @@ SHIELDNODE_CONFIG_KEY=shieldnode_config_...
 
 One virtual key maps to one service, hence `SHIELDNODE_<SERVICE>_KEY`. The optional `SHIELDNODE_CONFIG_KEY` unlocks proposing new services. Values can also be mapped in from Bitwarden or 1Password. Examples below write `$SHIELDNODE_KEY` as shorthand for whichever service variable applies.
 
-New accounts come with a keyless demo service, so the whole flow including approvals can be tested before wiring up a real API.
+New accounts come with a keyless demo service, so the whole flow including approvals can be tested before wiring up a real API. Ask the user for a key on it, resolve it with whoami like any other, and you have everything you need: no configuration, and no credential involved anywhere.
 
 ## How to Run
 
@@ -66,16 +66,18 @@ curl -sS -H "X-Api-Key: $SHIELDNODE_KEY" \
 ```json
 {
   "service": "OpenAI",
+  "alias": "production",
   "base_url": "https://api.openai.com/v1",
   "allowed_methods": ["GET", "POST"],
   "rate_limit_per_min": 60,
   "active": false,
+  "expired": false,
   "requires_approval": true,
   "default_approval_duration_minutes": 30
 }
 ```
 
-That gives you the upstream, the configured `base_url` (which fixes your path convention) and whether the next call goes straight through (`active: true`) or triggers an approval push. whoami never returns credentials, is never forwarded upstream, and fires no push.
+That gives you the upstream, the configured `base_url` (which fixes your path convention) and whether the next call goes straight through (`active: true`) or triggers an approval push. `alias` is the name the user gave the key, so refer to it by that rather than showing any part of its value. whoami never returns credentials, is never forwarded upstream, and fires no push.
 
 **Then write the service doc, without being asked.** If there is no `services/<slug>.md` for the service whoami just named, create one from the template in `references/service-docs.md`. No command and no question to the user: whoami already gave you the service, the base URL and the auth shape. Later sessions read that file instead of deriving it again.
 
@@ -192,7 +194,7 @@ More in `references/troubleshooting.md`.
 
 ## Verification
 
-Confirm the setup end to end without touching a real API, using the keyless demo service seeded on every account:
+Confirm the setup end to end without touching a real API, using a key on the keyless demo service seeded on every account:
 
 ```bash
 curl -sS -H "X-Api-Key: $SHIELDNODE_KEY" \
