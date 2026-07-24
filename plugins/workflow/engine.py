@@ -1310,16 +1310,15 @@ class WorkflowEngine:
         if session_info:
             state["session_info"] = session_info
         else:
-            # Preserve session_info from the existing state file.
-            # The supervisor subprocess writes to the same file, so we
-            # read the existing file before overwriting to carry forward
-            # session_info that the tool handler injected.
+            # Preserve session_info from any existing state file that has it.
+            # Different supervisors may use different run_ids, so scan all.
             try:
-                existing_path = self._state_path(workflow_name, run_id)
-                if existing_path.exists():
-                    existing = json.loads(existing_path.read_text())
+                for sf in sorted(self.STATE_DIR.glob(f"{workflow_name}_*_state.json"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True):
+                    existing = json.loads(sf.read_text())
                     if existing.get("session_info"):
                         state["session_info"] = existing["session_info"]
+                        break
             except Exception:
                 pass
         with open(self._state_path(workflow_name, run_id), "w") as f:
