@@ -8715,7 +8715,11 @@ async def _standalone_upload_file(
         kwargs["thread_ts"] = thread_id
     result = await client.files_upload_v2(**kwargs)
     if isinstance(result, dict) and result.get("ok") is False:
-        return {"error": f"Slack API error: {result.get('error', 'unknown')}"}
+        error_code = result.get("error", "unknown")
+        return {
+            "error": f"Slack API error: {error_code}",
+            "error_code": error_code,
+        }
     # files_upload_v2 responses vary by sdk version; prefer file timestamp when present.
     message_id = None
     if isinstance(result, dict):
@@ -8731,6 +8735,29 @@ async def _standalone_upload_file(
                 break
         message_id = message_id or file_obj.get("timestamp") or result.get("ts")
     return {"success": True, "message_id": message_id, "raw": result}
+
+
+_SLACK_STANDALONE_RETRYABLE_TOKEN_ERRORS = frozenset(
+    {
+        "invalid_auth",
+        "not_authed",
+        "token_revoked",
+        "account_inactive",
+        "not_in_channel",
+        "channel_not_found",
+    }
+)
+
+
+def _slack_standalone_error_code(value: Any) -> Optional[str]:
+    """Extract a Slack API error code from a response or SDK exception."""
+    for candidate in (value, getattr(value, "response", None)):
+        getter = getattr(candidate, "get", None)
+        if callable(getter):
+            code = getter("error")
+            if code:
+                return str(code)
+    return None
 
 
 async def _standalone_send(
@@ -8807,7 +8834,9 @@ async def _standalone_send(
                 )
             }
         chat_id = resolved
-
+        # The DM conversation belongs to the workspace token that opened it.
+        # Do not probe unrelated workspace clients with that conversation ID.
+        tokens = [token]
 
     media_files = media_files or []
     warnings: List[str] = []
@@ -8843,9 +8872,97 @@ async def _standalone_send(
                 )
             }
 
-        client = _AsyncWebClient(token=token)
-        _apply_slack_proxy(client, resolve_proxy_url())
+        clients = []
+        for candidate_token in tokens:
+            candidate_client = _AsyncWebClient(token=candidate_token)
+            _apply_slack_proxy(candidate_client, resolve_proxy_url())
+            clients.append(candidate_client)
+
+        selected_client = None
         last_message_id = None
+
+        async def _post_with_token_retry(
+            post_kwargs: Dict[str, Any],
+        ) -> tuple[Any, Optional[str]]:
+            """Post once in the matching workspace, without duplicating success."""
+            nonlocal selected_client
+            candidates = [selected_client] if selected_client is not None else clients
+            last_error = "unknown"
+
+            for candidate_client in candidates:
+                try:
+                    response = await candidate_client.chat_postMessage(**post_kwargs)
+                except Exception as exc:
+                    error_code = _slack_standalone_error_code(exc)
+                    last_error = error_code or str(exc)
+                    if (
+                        selected_client is None
+                        and error_code in _SLACK_STANDALONE_RETRYABLE_TOKEN_ERRORS
+                    ):
+                        continue
+                    return None, f"Slack send failed: {last_error}"
+
+                if isinstance(response, dict) and not response.get("ok", True):
+                    error_code = _slack_standalone_error_code(response) or "unknown"
+                    last_error = error_code
+                    if (
+                        selected_client is None
+                        and error_code in _SLACK_STANDALONE_RETRYABLE_TOKEN_ERRORS
+                    ):
+                        continue
+                    return None, f"Slack API error: {error_code}"
+
+                selected_client = candidate_client
+                return response, None
+
+            return None, f"Slack API error: {last_error}"
+
+        async def _upload_with_token_retry(
+            media_path: str,
+            *,
+            initial_comment: str,
+        ) -> Dict[str, Any]:
+            """Upload once through the client that owns ``chat_id``."""
+            nonlocal selected_client
+            candidates = [selected_client] if selected_client is not None else clients
+            last_result: Dict[str, Any] = {"error": "Slack API error: unknown"}
+
+            for candidate_client in candidates:
+                try:
+                    upload_result = await _standalone_upload_file(
+                        candidate_client,
+                        chat_id,
+                        media_path,
+                        initial_comment=initial_comment,
+                        thread_id=thread_id,
+                    )
+                except Exception as exc:
+                    error_code = _slack_standalone_error_code(exc)
+                    last_result = {
+                        "error": f"Slack send failed: {error_code or exc}",
+                        "error_code": error_code,
+                    }
+                    if (
+                        selected_client is None
+                        and error_code in _SLACK_STANDALONE_RETRYABLE_TOKEN_ERRORS
+                    ):
+                        continue
+                    return last_result
+
+                if upload_result.get("error"):
+                    last_result = upload_result
+                    if (
+                        selected_client is None
+                        and upload_result.get("error_code")
+                        in _SLACK_STANDALONE_RETRYABLE_TOKEN_ERRORS
+                    ):
+                        continue
+                    return upload_result
+
+                selected_client = candidate_client
+                return upload_result
+
+            return last_result
 
         # Caption mode: skip a separate text post; comment rides the upload.
         text_to_send = "" if formatted_caption else (formatted or "")
@@ -8857,17 +8974,12 @@ async def _standalone_send(
             }
             if thread_id:
                 post_kwargs["thread_ts"] = thread_id
-            try:
-                post_resp = await client.chat_postMessage(**post_kwargs)
-                if isinstance(post_resp, dict) and not post_resp.get("ok", True):
-                    return {
-                        "error": f"Slack API error: {post_resp.get('error', 'unknown')}"
-                    }
-                last_message_id = (
-                    post_resp.get("ts") if isinstance(post_resp, dict) else None
-                )
-            except Exception as e:
-                return {"error": f"Slack send failed: {e}"}
+            post_resp, post_error = await _post_with_token_retry(post_kwargs)
+            if post_error:
+                return {"error": post_error}
+            last_message_id = (
+                post_resp.get("ts") if isinstance(post_resp, dict) else None
+            )
 
         caption_pending = bool(formatted_caption)
         uploaded_any = False
@@ -8886,7 +8998,11 @@ async def _standalone_send(
                         }
                         if thread_id:
                             fallback_kwargs["thread_ts"] = thread_id
-                        fb = await client.chat_postMessage(**fallback_kwargs)
+                        fb, fallback_error = await _post_with_token_retry(
+                            fallback_kwargs
+                        )
+                        if fallback_error:
+                            raise RuntimeError(fallback_error)
                         if isinstance(fb, dict) and fb.get("ok", True):
                             last_message_id = fb.get("ts") or last_message_id
                             caption_pending = False
@@ -8896,26 +9012,18 @@ async def _standalone_send(
                             exc_info=True,
                         )
                 continue
-            try:
-                upload_result = await _standalone_upload_file(
-                    client,
-                    chat_id,
-                    media_path,
-                    initial_comment=formatted_caption if caption_pending else "",
-                    thread_id=thread_id,
+            upload_result = await _upload_with_token_retry(
+                media_path,
+                initial_comment=formatted_caption if caption_pending else "",
+            )
+            if upload_result.get("error"):
+                warnings.append(
+                    f"Failed to send media {media_path}: {upload_result['error']}"
                 )
-                if upload_result.get("error"):
-                    warnings.append(
-                        f"Failed to send media {media_path}: {upload_result['error']}"
-                    )
-                    continue
-                uploaded_any = True
-                caption_pending = False
-                last_message_id = upload_result.get("message_id") or last_message_id
-            except Exception as e:
-                warning = f"Failed to send media {media_path}: {e}"
-                logger.error("[Slack] %s", warning, exc_info=True)
-                warnings.append(warning)
+                continue
+            uploaded_any = True
+            caption_pending = False
+            last_message_id = upload_result.get("message_id") or last_message_id
 
         if last_message_id is None and not uploaded_any and not text_to_send.strip():
             error = "No deliverable text or media remained after processing"
@@ -8955,14 +9063,6 @@ async def _standalone_send(
         url = "https://slack.com/api/chat.postMessage"
         # Errors that mean "wrong workspace token for this channel" — worth
         # retrying with the next token. Anything else is terminal.
-        retryable_token_errors = {
-            "invalid_auth",
-            "not_authed",
-            "token_revoked",
-            "account_inactive",
-            "not_in_channel",
-            "channel_not_found",
-        }
         last_error = "unknown"
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
@@ -8987,7 +9087,7 @@ async def _standalone_send(
                         "message_id": data.get("ts"),
                     }
                 last_error = data.get("error", "unknown")
-                if last_error not in retryable_token_errors:
+                if last_error not in _SLACK_STANDALONE_RETRYABLE_TOKEN_ERRORS:
                     break
         return {"error": f"Slack API error: {last_error}"}
     except Exception as e:

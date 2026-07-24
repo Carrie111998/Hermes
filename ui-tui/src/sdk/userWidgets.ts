@@ -15,7 +15,7 @@ import { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
 
 import { openWidget, updateWidget } from './host.js'
-import { defineWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
+import { defineWidgetApp, getWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
 import { isCtrl, type WidgetApp } from './types.js'
 
 /**
@@ -72,7 +72,8 @@ export interface UserWidgetLoadResult {
 /** Which app ids each user file registered — the delete-sync source of
  *  truth (file gone on the next scan ⇒ its apps unregister). */
 const fileApps = new Map<string, string[]>()
-const appOwners = new Map<string, string>()
+const fileDefinitions = new Map<string, Map<string, WidgetApp<never>>>()
+const baseApps = new Map<string, undefined | WidgetApp<never>>()
 let widgetImportVersion = 0
 
 const listeners = new Set<(result: UserWidgetLoadResult) => void>()
@@ -91,6 +92,8 @@ export function onUserWidgets(listener: (result: UserWidgetLoadResult) => void):
  *  definitions). Files that vanished unregister their apps. */
 export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoadResult> {
   const result: UserWidgetLoadResult = { added: [], errors: [], loaded: [], removed: [] }
+  const beforeIds = new Set(listWidgetApps().map(app => app.id))
+  const affectedIds = new Set<string>()
 
   let files: string[] = []
 
@@ -103,30 +106,21 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
   for (const [file, ids] of fileApps) {
     if (!files.includes(file)) {
       fileApps.delete(file)
-
-      for (const id of ids) {
-        if (appOwners.get(id) === file) {
-          appOwners.delete(id)
-
-          if (removeWidgetApp(id)) {
-            result.removed.push(id)
-          }
-        }
-      }
+      fileDefinitions.delete(file)
+      ids.forEach(id => affectedIds.add(id))
     }
   }
 
   for (const file of files) {
-    const before = new Set(listWidgetApps().map(app => app.id))
     const previousIds = new Set(fileApps.get(file) ?? [])
-    const registeredIds = new Set<string>()
+    const registeredApps = new Map<string, WidgetApp<never>>()
 
     const scopedSdk: WidgetSdk = {
       ...widgetSdk,
       defineWidgetApp<S>(app: WidgetApp<S>): WidgetApp<S> {
-        registeredIds.add(app.id)
+        registeredApps.set(app.id, app as WidgetApp<never>)
 
-        return defineWidgetApp(app)
+        return app
       }
     }
 
@@ -144,30 +138,58 @@ export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoa
       mod.default(scopedSdk)
       result.loaded.push(file)
 
-      const ids = [...registeredIds]
+      const ids = [...registeredApps.keys()]
 
-      for (const id of previousIds) {
-        if (!registeredIds.has(id) && appOwners.get(id) === file) {
-          appOwners.delete(id)
-
-          if (removeWidgetApp(id)) {
-            result.removed.push(id)
-          }
+      for (const id of ids) {
+        if (!baseApps.has(id)) {
+          baseApps.set(id, getWidgetApp(id))
         }
       }
 
+      previousIds.forEach(id => affectedIds.add(id))
+      ids.forEach(id => affectedIds.add(id))
       fileApps.set(file, ids)
-
-      for (const id of ids) {
-        appOwners.set(id, file)
-      }
-
-      result.added.push(...ids.filter(id => !before.has(id)))
+      fileDefinitions.set(file, registeredApps)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
 
       result.errors.push({ file, message })
       recordParentLifecycle(`user widget ${file} failed to load: ${message}`)
+    }
+  }
+
+  const orderedFiles = [...fileDefinitions.keys()].sort()
+
+  for (const id of [...affectedIds].sort()) {
+    const baseApp = baseApps.get(id)
+
+    if (baseApp) {
+      defineWidgetApp(baseApp)
+    } else {
+      removeWidgetApp(id)
+    }
+
+    let hasUserDefinition = false
+
+    for (const file of orderedFiles) {
+      const userApp = fileDefinitions.get(file)?.get(id)
+
+      if (userApp) {
+        defineWidgetApp(userApp)
+        hasUserDefinition = true
+      }
+    }
+
+    const existsAfter = getWidgetApp(id) !== undefined
+
+    if (!beforeIds.has(id) && existsAfter) {
+      result.added.push(id)
+    } else if (beforeIds.has(id) && !existsAfter) {
+      result.removed.push(id)
+    }
+
+    if (!hasUserDefinition) {
+      baseApps.delete(id)
     }
   }
 

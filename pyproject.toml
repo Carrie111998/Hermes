@@ -314,36 +314,21 @@ hermes-acp = "acp_adapter.entry:main"
 # sealed venv is missing hermes_constants, run_agent, etc.
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
 
-[tool.setuptools.data-files]
-# These are bare runtime data directories, not Python packages. Preserve their
-# relative layout in the supported Nix wheel so locale and MCP discovery works
-# in the sealed store rather than only from a source checkout.
-locales = ["locales/*.yaml"]
-"optional-mcps/blender" = ["optional-mcps/blender/manifest.yaml"]
-"optional-mcps/linear" = ["optional-mcps/linear/manifest.yaml"]
-"optional-mcps/n8n" = ["optional-mcps/n8n/manifest.yaml"]
-"optional-mcps/unreal-engine" = ["optional-mcps/unreal-engine/manifest.yaml"]
-
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "cron.*", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
 
 [tool.setuptools.package-data]
-hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
+hermes_cli = ["web_dist/**/*", "tui_dist/**/*"]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —
 # status phrases fall back to the tiny hardcoded set and the Telegram
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
-plugins = [
-  "*/dashboard/manifest.json",
-  "*/dashboard/plugin_api.py",
-  "*/dashboard/dist/*",
-  "*/dashboard/dist/**/*",
-  "**/plugin.yaml",
-  "**/plugin.yml",
-  "**/README.md",
-]
+# Plugin directories deliberately include hyphenated names and runtime sidecars
+# that are data to setuptools rather than import packages. Ship the complete
+# tree so a discovered manifest never points at a partial plugin.
+plugins = ["**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

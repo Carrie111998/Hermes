@@ -2,7 +2,7 @@ graft skills
 graft optional-skills
 graft optional-mcps
 graft locales
-recursive-include plugins plugin.yaml plugin.yml
+graft plugins
 recursive-include gateway/assets *
 global-exclude __pycache__
 global-exclude *.py[cod]

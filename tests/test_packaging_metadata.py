@@ -9,41 +9,16 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_nix_wheel_metadata_includes_runtime_assets():
-    """The supported Nix wheel must retain every runtime-discovered asset."""
+def test_nix_wheel_package_data_includes_complete_plugin_trees():
+    """Hyphenated plugin directories must ship as complete runtime trees."""
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    setuptools = data["tool"]["setuptools"]
-    data_files = setuptools["data-files"]
-    package_data = setuptools["package-data"]
-
-    assert data_files["locales"] == ["locales/*.yaml"]
-
-    catalog_dirs = sorted(
-        manifest.parent.relative_to(REPO_ROOT).as_posix()
-        for manifest in (REPO_ROOT / "optional-mcps").glob("*/manifest.yaml")
-    )
-    configured_catalog_dirs = sorted(
-        target for target in data_files if target.startswith("optional-mcps/")
-    )
-    assert configured_catalog_dirs == catalog_dirs
-    for catalog_dir in catalog_dirs:
-        assert data_files[catalog_dir] == [f"{catalog_dir}/manifest.yaml"]
+    package_data = data["tool"]["setuptools"]["package-data"]
 
     assert {
         "web_dist/**/*",
         "tui_dist/**/*",
-        "scripts/install.sh",
-        "scripts/install.ps1",
     }.issubset(package_data["hermes_cli"])
-    assert {
-        "*/dashboard/manifest.json",
-        "*/dashboard/plugin_api.py",
-        "*/dashboard/dist/*",
-        "*/dashboard/dist/**/*",
-        "**/plugin.yaml",
-        "**/plugin.yml",
-        "**/README.md",
-    }.issubset(package_data["plugins"])
+    assert package_data["plugins"] == ["**/*"]
 
 
 def test_sdist_manifest_includes_runtime_assets():
@@ -54,7 +29,7 @@ def test_sdist_manifest_includes_runtime_assets():
         "graft optional-skills",
         "graft optional-mcps",
         "graft locales",
-        "recursive-include plugins plugin.yaml plugin.yml",
+        "graft plugins",
         "recursive-include gateway/assets *",
     }
 
