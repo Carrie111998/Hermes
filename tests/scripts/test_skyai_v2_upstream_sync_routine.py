@@ -92,6 +92,15 @@ def _passing_checks(worktree: Path, upstream_ref: str) -> list[dict[str, object]
     return [{"name": "synthetic", "returncode": 0, "passed": True}]
 
 
+def _failing_checks(worktree: Path, upstream_ref: str) -> list[dict[str, object]]:
+    assert worktree.is_dir()
+    assert upstream_ref == f"{routine.UPSTREAM_REMOTE}/{routine.UPSTREAM_BRANCH}"
+    raise routine.SyncBlocked(
+        "verification_failed",
+        details={"failed_check": "synthetic", "returncode": 1},
+    )
+
+
 def test_parse_github_repo_accepts_https_and_ssh() -> None:
     assert (
         routine.parse_github_repo("https://github.com/lomliev/hermes-agent.git")
@@ -160,6 +169,22 @@ def test_execute_blocks_unknown_merge_conflict_and_cleans_worktree(
     assert report["outcome"] == "fail_closed"
     assert report["blocker"] == "merge_conflicts"
     assert report["conflicted_files"] == ["shared.txt"]
+    assert list(config.worktree_root.iterdir()) == []
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_execute_blocks_failed_verification_and_cleans_worktree(
+    tmp_path: Path,
+) -> None:
+    repo, _, _ = _make_diverged_repo(tmp_path)
+    config = _config(repo, tmp_path, execute=True)
+
+    report = routine.run_sync(config, check_runner=_failing_checks)
+
+    assert report["status"] == "BLOCKED"
+    assert report["blocker"] == "verification_failed"
+    assert report["failed_check"] == "synthetic"
+    assert report["returncode"] == 1
     assert list(config.worktree_root.iterdir()) == []
     assert _git(repo, "status", "--porcelain") == ""
 
