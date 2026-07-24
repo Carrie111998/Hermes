@@ -27,6 +27,7 @@ import logging
 import copy
 import os
 import shutil
+import subprocess
 import sys
 import json
 import re
@@ -5208,6 +5209,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         idle = max(0.0, time.time() - last_finished_at)
         return f"✓ {format_duration_compact(idle)}"
 
+    def _get_status_bar_workspace(self) -> tuple[str, str]:
+        """Return ``(project, git_branch)`` with a short render-safe cache."""
+        cwd = Path(os.getenv("TERMINAL_CWD", os.getcwd())).resolve()
+        cwd_key = str(cwd)
+        now = time.monotonic()
+        cached = getattr(self, "_status_bar_workspace_cache", None)
+        if cached and cached[0] == cwd_key and now - cached[3] < 5.0:
+            return cached[1], cached[2]
+
+        project = cwd.name or cwd_key
+        branch = ""
+        try:
+            result = subprocess.run(
+                ["git", "-C", cwd_key, "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                timeout=0.2,
+                check=False,
+            )
+            if result.returncode == 0:
+                branch = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        self._status_bar_workspace_cache = (cwd_key, project, branch, now)
+        return project, branch
+
     def _get_status_bar_snapshot(self) -> Dict[str, Any]:
         # Prefer the agent's model name — it updates on fallback.
         # self.model reflects the originally configured model and never
@@ -5232,9 +5260,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             model_short = f"{model_short[:23]}..."
 
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
+        profile = os.getenv("HERMES_PROFILE") or ""
+        if not profile:
+            hermes_home = Path(os.getenv("HERMES_HOME", ""))
+            if hermes_home.parent.name == "profiles" and hermes_home.name:
+                profile = hermes_home.name
+        profile = profile or "default"
         snapshot = {
             "model_name": model_name,
             "model_short": model_short,
+            "profile": profile,
+            "reasoning_effort": "default",
+            "project": "",
+            "git_branch": "",
             "duration": format_duration_compact(elapsed_seconds),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
@@ -5292,6 +5330,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot["battery_category"] = battery_category(_batt)
             except Exception:
                 pass
+
+        reasoning_config = getattr(self, "reasoning_config", None)
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                snapshot["reasoning_effort"] = "none"
+            elif reasoning_config.get("effort"):
+                snapshot["reasoning_effort"] = str(reasoning_config["effort"])
+
+        try:
+            workspace_getter = getattr(self, "_get_status_bar_workspace", None)
+            if workspace_getter is not None:
+                project, branch = workspace_getter()
+            else:
+                cwd = Path(os.getenv("TERMINAL_CWD", os.getcwd()))
+                project, branch = cwd.name or str(cwd), ""
+            snapshot["project"] = project
+            snapshot["git_branch"] = branch
+        except Exception:
+            pass
 
         # Count live /background tasks. The dict entry is removed in the
         # task thread's finally block, so len() reflects truly-running tasks.
@@ -5944,9 +6001,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            parts = [f"⚕ {snapshot['model_short']}"]
             if battery_label:
                 parts.insert(0, battery_label)
+            if width >= 140:
+                parts.extend([
+                    f"@{snapshot['profile']}",
+                    f"think:{snapshot['reasoning_effort']}",
+                ])
+                workspace_label = snapshot.get("project", "")
+                if workspace_label and snapshot.get("git_branch"):
+                    workspace_label += f":{snapshot['git_branch']}"
+                if workspace_label:
+                    parts.append(workspace_label)
+            parts.extend([context_label, percent_label])
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -6066,13 +6134,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if width >= 140:
+                        workspace_label = snapshot.get("project", "")
+                        if workspace_label and snapshot.get("git_branch"):
+                            workspace_label += f":{snapshot['git_branch']}"
+                        for label in (
+                            f"@{snapshot['profile']}",
+                            f"think:{snapshot['reasoning_effort']}",
+                            workspace_label,
+                        ):
+                            if label:
+                                frags.append(("class:status-bar-dim", " │ "))
+                                frags.append(("class:status-bar-strong", label))
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
-                    ]
+                    ])
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))

@@ -1,3 +1,4 @@
+import subprocess
 import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -82,6 +83,73 @@ class TestCLIStatusBar:
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
 
+    def test_complete_status_bar_shows_profile_effort_project_and_git(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli(model="gpt-5.6-sol"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        cli_obj.reasoning_config = {"enabled": True, "effort": "max"}
+        cli_obj._get_status_bar_workspace = lambda: ("closematic", "feature/statusline")
+        monkeypatch.setenv("HERMES_PROFILE", "junia")
+
+        text = cli_obj._build_status_bar_text(width=180)
+
+        assert "@junia" in text
+        assert "think:max" in text
+        assert "closematic:feature/statusline" in text
+
+    def test_status_bar_workspace_reads_real_git_branch(self, tmp_path, monkeypatch):
+        repo = tmp_path / "my-project"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-q", "-b", "feature/statusline"],
+            check=True,
+        )
+        monkeypatch.chdir(repo)
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        cli_obj = _make_cli()
+
+        project, branch = cli_obj._get_status_bar_workspace()
+
+        assert project == "my-project"
+        assert branch == "feature/statusline"
+
+    def test_complete_status_bar_fragments_show_custom_fields(self, monkeypatch):
+        cli_obj = _attach_agent(
+            _make_cli(model="gpt-5.6-sol"),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=12_450,
+            context_length=200_000,
+        )
+        cli_obj._status_bar_visible = True
+        cli_obj.reasoning_config = {"enabled": True, "effort": "max"}
+        cli_obj._get_tui_terminal_width = lambda: 180
+        cli_obj._get_status_bar_workspace = lambda: ("closematic", "main")
+        monkeypatch.setenv("HERMES_PROFILE", "junia")
+
+        text = "".join(fragment for _style, fragment in cli_obj._get_status_bar_fragments())
+
+        assert "@junia" in text
+        assert "think:max" in text
+        assert "closematic:main" in text
+
+    def test_status_bar_derives_profile_from_hermes_home(self, monkeypatch):
+        cli_obj = _make_cli(model="gpt-5.6-sol")
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+        monkeypatch.setenv("HERMES_HOME", "/root/.hermes/profiles/junia")
+
+        snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["profile"] == "junia"
 
     def test_input_height_counts_prompt_only_on_first_wrapped_row(self):
         # Regression for prompt_toolkit classic CLI resize glitches: the prompt
