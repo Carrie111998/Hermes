@@ -64,6 +64,27 @@ cd apps/desktop
 npm run dev          # Vite renderer + Electron, which boots the Python backend
 ```
 
+#### Working in a git worktree
+
+A fresh `git worktree` (e.g. under `.claude/worktrees/<name>/`) needs its **own**
+install — it cannot borrow the main checkout's `node_modules`. `apps/desktop`
+pins older majors of a few deps than the repo root and the `web` workspace
+(`@types/node`, `@nous-research/ui`, `undici-types`), so npm nests them under
+`apps/desktop/node_modules`; Node's upward module resolution from a worktree
+never looks there, so imports like `@assistant-ui/react` fail to resolve. Run the
+setup step once per new worktree instead of hand-linking with junctions:
+
+```bash
+npm run setup:worktree   # from the worktree root — npm ci --ignore-scripts, idempotent
+cd apps/desktop
+npx vitest run           # now resolves cleanly, no junctions
+npm run typecheck
+```
+
+`setup:worktree` is a no-op in an already-installed checkout, so it is safe to
+wire into worktree-creation automation. `git worktree remove` reclaims the
+per-worktree `node_modules`.
+
 Point the app at a specific source checkout, or sandbox it away from your real config:
 
 ```bash
