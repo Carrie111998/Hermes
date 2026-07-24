@@ -131,6 +131,38 @@ class TestSessionLifecycle:
         assert session["model"] == "real-model"
         assert session["source"] == "cli"
 
+    def test_fork_session_rolls_back_every_mutation_when_copy_fails(self, db):
+        """A transcript-copy failure must not end the source or leave a child."""
+        db.create_session("source", source="api_server")
+        db.append_message("source", "user", "durable message")
+
+        db._execute_write(
+            lambda conn: conn.execute(
+                """CREATE TRIGGER fail_test_fork_copy
+                   BEFORE INSERT ON messages
+                   WHEN NEW.session_id = 'failed-fork'
+                   BEGIN
+                       SELECT RAISE(ABORT, 'copy failed');
+                   END"""
+            )
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="copy failed"):
+            db.fork_session(
+                "source",
+                "failed-fork",
+                source="api_server",
+                title="Failed fork",
+            )
+
+        assert db.get_session("failed-fork") is None
+        source = db.get_session("source")
+        assert source["ended_at"] is None
+        assert source["end_reason"] is None
+        assert [m["content"] for m in db.get_messages("source")] == [
+            "durable message"
+        ]
+
     def test_update_session_cwd_persists_git_branch(self, db):
         db.create_session(session_id="s1", source="cli")
         db.update_session_cwd("s1", "/work/repo", git_branch="pets-feature")
