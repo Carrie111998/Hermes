@@ -661,6 +661,8 @@ export function useSessionActions({
     async (
       dir: TileDock = 'right',
       options?: {
+        anchor?: string
+        before?: null | string
         cwd?: null | string
         listed?: boolean
         route?: AgentProfileRoute | null
@@ -752,7 +754,7 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
-        openSessionTile(stored, dir, undefined, undefined, workspaceScope)
+        openSessionTile(stored, dir, options?.anchor, options?.before, workspaceScope)
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {
