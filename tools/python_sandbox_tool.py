@@ -281,7 +281,7 @@ def _generate_init_script(
             'mount -t proc -o nosuid,nodev,noexec proc "$JAIL/proc"',
             # Assembly is complete. Freeze the tmpfs root before pivot;
             # nested /work stays a separate writable bind mount.
-            'mount -o remount,ro "$JAIL"',
+            'mount -o remount,bind,ro "$JAIL"',
             'pivot_root "$JAIL" "$JAIL/.oldroot"',
             "cd /",
             "umount -l /.oldroot",
