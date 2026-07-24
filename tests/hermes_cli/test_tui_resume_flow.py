@@ -254,6 +254,30 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     assert env["NODE_ENV"] == "production"
 
 
+def test_launch_tui_exit_code_43_relaunches_selected_profile(monkeypatch, main_mod):
+    from unittest.mock import patch
+
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(main_mod.subprocess, "call", lambda *args, **kwargs: 43)
+
+    with (
+        patch("hermes_cli.profiles.get_active_profile", return_value="coder"),
+        patch("hermes_cli.relaunch.relaunch") as mock_relaunch,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main_mod._launch_tui()
+
+    assert exc.value.code == 43
+    mock_relaunch.assert_called_once_with(
+        ["--profile", "coder", "--tui", "chat"],
+        preserve_inherited=False,
+    )
+
+
 
 
 def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):
