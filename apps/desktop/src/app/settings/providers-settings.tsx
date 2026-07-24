@@ -347,8 +347,11 @@ function CustomEndpointCard() {
     return () => { cancelled = true }
   }, [])
 
-  const isCustom = modelInfo?.provider?.toLowerCase() === 'custom'
+  // Check base_url presence rather than provider name — custom endpoint
+  // providers can be stored as "custom", "custom:<name>", or the bare name
+  // of a custom_providers entry. The reliable signal is base_url being set.
   const baseUrl = modelInfo?.baseUrl
+  const hasEndpoint = Boolean(baseUrl)
   const model = modelInfo?.model
 
   return (
@@ -361,13 +364,13 @@ function CustomEndpointCard() {
           type="button"
           variant="textStrong"
         >
-          {isCustom ? p.customEndpointEdit : p.customEndpointConfigure}
+          {hasEndpoint ? p.customEndpointEdit : p.customEndpointConfigure}
         </Button>
       </div>
       <p className="-mt-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
         {p.customEndpointDesc}
       </p>
-      {isCustom && baseUrl ? (
+      {hasEndpoint && baseUrl ? (
         <div className="grid gap-0.5 text-[length:var(--conversation-caption-font-size)]">
           <div className="flex items-center gap-2">
             <span className="text-muted-foreground">{p.customEndpointSet}:</span>

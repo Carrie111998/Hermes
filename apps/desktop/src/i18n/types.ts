@@ -463,6 +463,13 @@ export interface Translations {
       reasoning: string
       reasoningOff: string
       defaultsFailed: string
+      setUp: (name: string) => string
+      activate: string
+      activating: string
+      pasteApiKey: (name: string) => string
+      needsApiKey: (name: string) => string
+      signInBrowser: (name: string) => string
+      customEndpointNeedsKey: string
       auxiliaryTitle: string
       resetAllToMain: string
       auxiliaryDesc: string

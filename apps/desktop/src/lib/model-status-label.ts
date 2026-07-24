@@ -53,7 +53,75 @@ const VARIANT_TAGS: ReadonlyArray<readonly [RegExp, string]> = [
 
 const titleCase = (text: string): string => text.replace(/\b\w/g, char => char.toUpperCase()).trim()
 
+// Chinese-friendly display names for common model families.
+// Keyed by lowercased model-id prefix (after provider slash stripped).
+const MODEL_DISPLAY_NAMES: Record<string, string> = {
+  'qwen': '通义千问',
+  'qwen2': '通义千问',
+  'qwen3': '通义千问',
+  'qwq': '通义千问 QwQ',
+  'deepseek': 'DeepSeek',
+  'glm-4': '智谱 GLM-4',
+  'glm-4v': '智谱 GLM-4V',
+  'glm-5': '智谱 GLM-5',
+  'glm-5-turbo': '智谱 GLM-5 Turbo',
+  'glm-5.1': '智谱 GLM-5.1',
+  'glm': '智谱 GLM',
+  'ernie': '文心一言',
+  'moonshot': '月之暗面 Kimi',
+  'kimi': '月之暗面 Kimi',
+  'yi-': '零一万物 Yi',
+  'baichuan': '百川',
+  'spark': '讯飞星火',
+  'hunyuan': '腾讯混元',
+  'doubao': '字节豆包',
+  'abab': 'MiniMax',
+  'command': 'Cohere Command',
+  'llama': 'Llama',
+  'mistral': 'Mistral',
+  'mixtral': 'Mixtral'
+}
+
+function lookupDisplayName(base: string): string | null {
+  const lower = base.toLowerCase()
+
+  // Try exact match first, then prefix match
+  if (MODEL_DISPLAY_NAMES[lower]) {
+    return MODEL_DISPLAY_NAMES[lower]
+  }
+
+  for (const prefix of Object.keys(MODEL_DISPLAY_NAMES)) {
+    if (lower.startsWith(prefix)) {
+      return MODEL_DISPLAY_NAMES[prefix]
+    }
+  }
+
+  return null
+}
+
 function prettifyBase(base: string): string {
+  // Check Chinese display name table first
+  const displayName = lookupDisplayName(base)
+
+  if (displayName) {
+    // Append version/variant suffix if present (e.g. "qwen-2.5-72b" → "通义千问 2.5 72B")
+    const lower = base.toLowerCase()
+    const matchedPrefix = Object.keys(MODEL_DISPLAY_NAMES).find(p => lower.startsWith(p))
+
+    if (matchedPrefix) {
+      const suffix = base.slice(matchedPrefix.length).replace(/^-/, '').replace(/-/g, ' ').trim()
+
+      if (suffix) {
+        const upper = suffix.replace(/\b(\d+(?:\.\d+)?)b\b/i, '$1B')
+          .replace(/\b(\d+(?:\.\d+)?)k\b/i, '$1K')
+
+        return `${displayName} ${upper}`
+      }
+    }
+
+    return displayName
+  }
+
   if (/^claude-/i.test(base)) {
     return titleCase(base.replace(/^claude-/i, '').replace(/-/g, ' '))
   }

@@ -17,6 +17,7 @@ import {
 import type { AuxiliaryModelsResponse, ModelOptionProvider, StaleAuxAssignment } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
+import { displayModelName } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
@@ -442,7 +443,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                       void activateApiKeyProvider()
                     }
                   }}
-                  placeholder={`Paste ${selectedProviderRow?.key_env ?? 'API key'}`}
+                  placeholder={m.pasteApiKey(selectedProviderRow?.key_env ?? 'API key')}
                   type="password"
                   value={apiKeyDraft}
                 />
@@ -452,12 +453,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                   size="sm"
                 >
                   {activating && <Loader2 className="size-3.5 animate-spin" />}
-                  {activating ? 'Activating...' : 'Activate'}
+                  {activating ? m.activating : m.activate}
                 </Button>
               </>
             ) : (
               <Button onClick={startProviderSetup} size="sm" variant="textStrong">
-                Set up {selectedProviderRow?.name ?? 'provider'}
+                {m.setUp(selectedProviderRow?.name ?? 'provider')}
               </Button>
             )
           ) : (
@@ -469,7 +470,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                 <SelectContent>
                   {(selectedProviderModels.length ? selectedProviderModels : []).map(model => (
                     <SelectItem key={model} value={model}>
-                      {model}
+                      {displayModelName(model)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -488,8 +489,8 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         {needsSetup && !setupIsApiKey && (
           <p className="mt-2 text-xs text-muted-foreground">
             {selectedProviderRow?.auth_type === 'api_key'
-              ? `${selectedProviderRow?.name} needs an API key — set it up to choose a model.`
-              : `${selectedProviderRow?.name} signs in through your browser — 奇计 runs the flow for you.`}
+              ? m.needsApiKey(selectedProviderRow?.name ?? '')
+              : m.signInBrowser(selectedProviderRow?.name ?? '')}
           </p>
         )}
         {config && mainModel && (reasoningSupported || fastSupported) && (
@@ -621,7 +622,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
                         <SelectContent>
                           {(auxDraftProviderModels.length ? auxDraftProviderModels : []).map(model => (
                             <SelectItem key={model} value={model}>
-                              {model}
+                              {displayModelName(model)}
                             </SelectItem>
                           ))}
                         </SelectContent>
