@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import stat
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -1661,3 +1662,46 @@ class TestAsyncQueueLogging:
         # INFO must not reach the WARNING+ errors.log even through the queue.
         if errors_log.exists():
             assert "info-level line" not in errors_log.read_text()
+
+
+class TestNoEagerHeavyImports:
+    """Guard against ``hermes_logging`` re-acquiring a slow import graph.
+
+    On Windows ``hermes_logging`` aliases concurrent-log-handler's
+    ``ConcurrentRotatingFileHandler`` (the #44873 fix), which pulls in
+    ``portalocker``.  portalocker's ``__init__`` probes for its optional
+    Redis-backed lock via ``from .redis import RedisLock``; when ``redis`` is
+    installed that probe SUCCEEDS and eagerly imports the entire
+    ``redis`` → ``redis.observability`` → ``opentelemetry.sdk.metrics`` →
+    ``psutil`` stack — ~10–14s of import cost on this box on EVERY hermes
+    invocation, including ``hermes --version``.  ``hermes_logging`` blocks that
+    with a ``sys.modules['portalocker.redis'] = None`` sentinel.  This test
+    fails (returncode 1) if the sentinel is removed or stops working.
+    """
+
+    def test_importing_hermes_logging_stays_off_the_redis_stack(self):
+        # Run in a clean subprocess: within the pytest process these modules
+        # may already be imported by unrelated tests, which would mask the
+        # regression.  A fresh interpreter isolates hermes_logging's own graph.
+        code = (
+            "import sys, hermes_logging; "
+            "leaked = [m for m in ('redis', 'opentelemetry', 'psutil') "
+            "if m in sys.modules]; "
+            "print('LEAKED=' + ','.join(leaked)); "
+            "sys.exit(1 if leaked else 0)"
+        )
+        env = dict(os.environ)
+        repo_root = Path(hermes_logging.__file__).resolve().parent
+        env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            "importing hermes_logging eagerly pulled a heavy import stack "
+            f"(portalocker.redis sentinel regressed): {result.stdout.strip()!r} "
+            f"stderr={result.stderr.strip()!r}"
+        )

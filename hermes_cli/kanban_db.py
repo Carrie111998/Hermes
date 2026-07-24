@@ -6287,6 +6287,18 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     except OSError:
+        # Windows raises a bare OSError (WinError 87 "The parameter is
+        # incorrect") for a PID that no longer exists, not the
+        # ProcessLookupError POSIX raises for ESRCH. Fall back to the
+        # authoritative cross-platform liveness probe: if the worker is
+        # already gone, the termination effectively succeeded. Reporting
+        # terminated=False here would make _worker_survived_termination()
+        # misread a dead worker as a live one and defer the reclaim — which,
+        # in detect_stale_running(), lets the cruder crash detector steal a
+        # stale task and count a circuit-breaker failure against a merely
+        # long-running job. See test_dispatch_once_integrates_stale_detection.
+        if not _pid_alive(pid):
+            info["terminated"] = True
         return info
 
     for _ in range(10):

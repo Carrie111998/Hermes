@@ -72,6 +72,23 @@ from typing import Optional, Sequence
 # module (class declaration, ``isinstance`` checks, docstring) working
 # unchanged. See #44873.
 if sys.platform == "win32":
+    # ``concurrent_log_handler`` only needs portalocker's cross-process *file*
+    # lock; it never touches portalocker's optional Redis-backed lock.
+    # portalocker's ``__init__`` nonetheless runs ``from .redis import
+    # RedisLock`` inside a ``try/except ImportError`` — which SUCCEEDS whenever
+    # ``redis`` is installed (it always is in Hermes), eagerly importing the
+    # whole ``redis`` → ``redis.observability`` → ``opentelemetry.sdk.metrics``
+    # → ``psutil`` stack.  On this Windows box that is ~10–14s of pure import
+    # cost on EVERY hermes invocation (even ``hermes --version``), which blows
+    # past pytest's 30s per-test cap for the handful of tests that
+    # subprocess-spawn the CLI.  We short-circuit portalocker's optional-backend
+    # probe by planting a ``None`` sentinel in ``sys.modules`` so
+    # ``from .redis import RedisLock`` raises ``ImportError`` (which portalocker
+    # already catches → ``RedisLock = None``, its documented no-redis
+    # fallback).  Nothing in Hermes uses ``portalocker.RedisLock``.  The guard
+    # avoids clobbering a real submodule if portalocker was already imported.
+    if "portalocker.redis" not in sys.modules:
+        sys.modules["portalocker.redis"] = None  # type: ignore[assignment]
     from concurrent_log_handler import (  # noqa: E402
         ConcurrentRotatingFileHandler as RotatingFileHandler,
     )
