@@ -29,6 +29,7 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _is_telegram_thread_not_found,
     _parse_target_ref,
+    _resolve_slack_user_target,
     _send_matrix_via_adapter,
     _send_signal,
     _send_telegram,
@@ -318,6 +319,40 @@ class TestSendMessageTool:
             media_files=[],
             force_document=False,
         )
+
+    def test_slack_dm_delivery_uses_the_token_that_resolved_the_workspace(self):
+        slack_cfg = SimpleNamespace(enabled=True, token="tok-one,tok-two", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch(
+                 "tools.send_message_tool._resolve_slack_user_target",
+                 new=AsyncMock(return_value=("D123ABCDEF", None, "tok-two")),
+             ), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True}),
+             ) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:@alice",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        sent_config = send_mock.await_args.args[1]
+        assert sent_config.token == "tok-two"
+        assert slack_cfg.token == "tok-one,tok-two"
 
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
@@ -826,6 +861,46 @@ class TestSendToPlatformChunking:
             "C123",
             "*hello* from <https://example.com|Hermes>",
             thread_ts=None,
+        )
+
+    def test_slack_media_is_forwarded_to_standalone_plugin(self, monkeypatch, tmp_path):
+        """Out-of-process cron delivery must not silently drop Slack MEDIA files."""
+        _ensure_slack_mock(monkeypatch)
+        media_path = tmp_path / "daily-report.png"
+        media_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        media_files = [(str(media_path), False)]
+        pconfig = SimpleNamespace(enabled=True, token="***", extra={})
+
+        entry = _slack_entry()
+        assert entry is not None
+        original = entry.standalone_sender_fn
+        send = AsyncMock(
+            return_value={"success": True, "platform": "slack", "message_id": "1"}
+        )
+        entry.standalone_sender_fn = send
+        try:
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    pconfig,
+                    "C123",
+                    "daily report",
+                    media_files=media_files,
+                )
+            )
+        finally:
+            entry.standalone_sender_fn = original
+
+        assert result["success"] is True
+        # C8 caption-mode: short text rides the upload as `caption=` and the
+        # message slot is emptied — one Slack bubble, not text + bare file.
+        send.assert_awaited_once_with(
+            pconfig,
+            "C123",
+            "",
+            thread_id=None,
+            media_files=media_files,
+            caption="daily report",
         )
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
@@ -1693,7 +1768,7 @@ class TestParseTargetRefWhatsAppJID:
 
 
 class TestParseTargetRefSlack:
-    """_parse_target_ref recognizes Slack channel/user IDs as explicit."""
+    """_parse_target_ref recognizes Slack conversation and user targets."""
 
     def test_thread_target_is_explicit(self):
         chat_id, thread_id, is_explicit = _parse_target_ref("slack", "C0B0QV5434G:171.000001")
@@ -1713,12 +1788,22 @@ class TestParseTargetRefSlack:
     def test_dm_id_is_explicit(self):
         assert _parse_target_ref("slack", "D123ABCDEF")[2] is True
 
-    def test_user_id_is_not_explicit(self):
-        """Slack user IDs (U...) and workspace IDs (W...) are NOT explicit send
-        targets. chat.postMessage rejects them — a DM must be opened first via
-        conversations.open to obtain a D... conversation ID.
-        """
-        assert _parse_target_ref("slack", "U123ABCDEF")[2] is False
+    def test_user_id_is_explicit_dm_target(self):
+        """Slack user IDs are explicit user targets that must be opened as DMs."""
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "U123ABCDEF")
+        assert chat_id == "user:U123ABCDEF"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_at_username_is_explicit_dm_target(self):
+        """slack:@username targets resolve to DMs through users.list + conversations.open."""
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "@alice")
+        assert chat_id == "user_name:alice"
+        assert thread_id is None
+        assert is_explicit is True
+
+    def test_workspace_id_is_not_explicit(self):
+        """Slack workspace IDs (W...) are not sendable conversation/user targets."""
         assert _parse_target_ref("slack", "W123ABCDEF")[2] is False
 
     def test_whitespace_is_stripped(self):
@@ -1818,6 +1903,160 @@ class TestEmailHomeChannelErrorHint:
                 )
             )
         assert "TELEGRAM_HOME_CHANNEL" in result["error"]
+
+
+class TestResolveSlackUserTargets:
+    """_resolve_slack_user_target opens user targets as DMs before sending.
+
+    Adapted from #19237's ``_send_slack`` tests: main moved Slack delivery to
+    the plugin's ``_standalone_send`` (#41112), so the salvaged DM-open logic
+    lives in a resolution helper that runs before any send path.
+    """
+
+    @staticmethod
+    def _mock_response(data):
+        response = MagicMock()
+        response.json = AsyncMock(return_value=data)
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        return response
+
+    @staticmethod
+    def _mock_session(*responses):
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.post = MagicMock(side_effect=responses)
+        return session
+
+    def test_conversation_ids_pass_through_without_api_calls(self):
+        for cid in ("C0B0QV5434G", "G123ABCDEF", "D123ABCDEF"):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok", cid)
+            )
+            assert chat_id == cid
+            assert err is None
+            assert selected_token is None
+
+    def test_user_id_target_opens_dm(self):
+        session = self._mock_session(
+            self._mock_response({"ok": True, "channel": {"id": "D123ABCDEF"}}),
+        )
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok", "user:U123ABCDEF")
+            )
+
+        assert err is None
+        assert chat_id == "D123ABCDEF"
+        assert selected_token == "tok"
+        open_payload = session.post.call_args_list[0].kwargs["json"]
+        assert open_payload == {"users": "U123ABCDEF"}
+
+    def test_username_target_resolves_user_then_opens_dm(self):
+        session = self._mock_session(
+            self._mock_response({
+                "ok": True,
+                "members": [
+                    {"id": "UOTHER123", "name": "someone", "profile": {"display_name": "Other", "real_name": "Other User"}},
+                    {"id": "U123ABCDEF", "name": "alice", "profile": {"display_name": "Alice", "real_name": "Alice Example"}},
+                ],
+                "response_metadata": {},
+            }),
+            self._mock_response({"ok": True, "channel": {"id": "D123ABCDEF"}}),
+        )
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok", "user_name:alice")
+            )
+
+        assert err is None
+        assert chat_id == "D123ABCDEF"
+        assert selected_token == "tok"
+        assert session.post.call_args_list[1].kwargs["json"] == {"users": "U123ABCDEF"}
+
+    def test_username_target_tries_each_workspace_token(self):
+        session = self._mock_session(
+            self._mock_response({"ok": False, "error": "invalid_auth"}),
+            self._mock_response({
+                "ok": True,
+                "members": [{"id": "U123ABCDEF", "name": "alice", "profile": {}}],
+                "response_metadata": {},
+            }),
+            self._mock_response({"ok": True, "channel": {"id": "D123ABCDEF"}}),
+        )
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok-one, tok-two", "user_name:alice")
+            )
+
+        assert err is None
+        assert chat_id == "D123ABCDEF"
+        assert selected_token == "tok-two"
+        assert session.post.call_args_list[0].kwargs["headers"]["Authorization"] == "Bearer tok-one"
+        assert session.post.call_args_list[1].kwargs["headers"]["Authorization"] == "Bearer tok-two"
+        assert session.post.call_args_list[2].kwargs["headers"]["Authorization"] == "Bearer tok-two"
+
+    def test_username_target_does_not_match_display_or_real_name(self):
+        session = self._mock_session(
+            self._mock_response({
+                "ok": True,
+                "members": [
+                    {"id": "U123ABCDEF", "name": "notalice", "profile": {"display_name": "alice", "real_name": "alice"}},
+                ],
+                "response_metadata": {},
+            }),
+        )
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok", "user_name:alice")
+            )
+
+        assert chat_id is None
+        assert selected_token is None
+        assert "Could not resolve Slack user '@alice'" in err["error"]
+        assert session.post.call_count == 1
+
+    def test_ambiguous_username_returns_error_without_opening_dm(self):
+        session = self._mock_session(
+            self._mock_response({
+                "ok": True,
+                "members": [
+                    {"id": "U111AAAAA", "name": "alice", "profile": {}},
+                    {"id": "U222BBBBB", "name": "alice", "profile": {}},
+                ],
+                "response_metadata": {},
+            }),
+        )
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok", "user_name:alice")
+            )
+
+        assert chat_id is None
+        assert selected_token is None
+        assert "matched multiple Slack users" in err["error"]
+        assert session.post.call_count == 1
+
+    def test_conversations_open_failure_surfaces_error(self):
+        session = self._mock_session(
+            self._mock_response({"ok": False, "error": "missing_scope"}),
+        )
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            chat_id, err, selected_token = asyncio.run(
+                _resolve_slack_user_target("tok", "user:U123ABCDEF")
+            )
+
+        assert chat_id is None
+        assert selected_token is None
+        assert "missing_scope" in err["error"]
+        assert "im:write" in err["error"]
 
 
 class TestSendDiscordThreadId:

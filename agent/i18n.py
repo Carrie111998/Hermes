@@ -32,11 +32,12 @@ from __future__ import annotations
 
 import logging
 import os
-import sysconfig
 import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from hermes_constants import find_packaged_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +93,9 @@ def _locales_dir() -> Path:
 
     1. ``HERMES_BUNDLED_LOCALES`` env var -- set by the Nix wrapper (or any
        sealed-packaging system) to point at the installed catalog directory.
-    2. ``<repo-root>/locales`` -- source checkouts and ``pip install -e .``,
+    2. ``<repo-root>/locales`` -- source checkouts and editable installs,
        where the working tree sits next to ``agent/``.
-    3. ``<sysconfig data|purelib|platlib>/locales`` -- pip wheel installs.
-       setuptools ``data-files`` extracts ``locales/*.yaml`` under the
-       interpreter's ``data`` scheme; the other schemes are checked as a
-       safety net for nonstandard layouts.
+    3. The interpreter data scheme -- regular wheel installs.
 
     Falling through to the source-style path (even when missing) keeps
     ``_load_catalog`` error messages informative -- it logs the path it
@@ -118,23 +116,9 @@ def _locales_dir() -> Path:
     source_dir = Path(__file__).resolve().parent.parent / "locales"
     if source_dir.is_dir():
         return source_dir
-
-    # pip wheel install: data-files lands under the interpreter data scheme.
-    # ``data`` (== sys.prefix in a venv) is where setuptools data-files extract
-    # and is checked first. ``purelib``/``platlib`` (site-packages) are a safety
-    # net for nonstandard layouts. NOTE: this does NOT cover ``pip install
-    # --user`` (user scheme, ~/.local/locales) or ``pip install --target`` --
-    # both are out of scope; see the plan header.
-    for scheme in ("data", "purelib", "platlib"):
-        raw = sysconfig.get_path(scheme)
-        if not raw:
-            continue
-        candidate = Path(raw) / "locales"
-        if candidate.is_dir():
-            return candidate
-
-    # Last resort: return the source-style path so _load_catalog's catalog-missing
-    # log (logger.debug "i18n catalog missing for %s at %s") stays informative.
+    packaged_dir = find_packaged_data_dir("locales")
+    if packaged_dir is not None:
+        return packaged_dir
     return source_dir
 
 

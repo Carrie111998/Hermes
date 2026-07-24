@@ -1303,6 +1303,9 @@ class TestProfileRestoration:
         # Mock the wrapper dir to be inside tmp_path
         wrapper_dir = tmp_path / ".local" / "bin"
         wrapper_dir.mkdir(parents=True)
+        # Keep the collision check isolated from commands installed on the
+        # developer host (for example a real `researcher` wrapper).
+        monkeypatch.setenv("PATH", str(wrapper_dir))
 
         zip_path = tmp_path / "backup.zip"
         self._make_backup_zip(zip_path, {

@@ -248,7 +248,16 @@ class TestRunBackgroundTask:
 
         mock_result = {"final_response": "Hello from background!", "messages": []}
 
+        checkpoint_config = {
+            "checkpoints": {
+                "enabled": True,
+                "max_snapshots": 8,
+                "max_total_size_mb": 222,
+                "max_file_size_mb": 3,
+            }
+        }
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value=checkpoint_config), \
              patch("run_agent.AIAgent") as MockAgent:
             mock_agent_instance = MagicMock()
             mock_agent_instance.shutdown_memory_provider = MagicMock()
@@ -264,6 +273,11 @@ class TestRunBackgroundTask:
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "Background task complete" in content
         assert "Hello from background!" in content
+        agent_kwargs = MockAgent.call_args.kwargs
+        assert agent_kwargs["checkpoints_enabled"] is True
+        assert agent_kwargs["checkpoint_max_snapshots"] == 8
+        assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
+        assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
@@ -338,13 +352,13 @@ class TestRunBackgroundTask:
             await runner._run_background_task("make stuff", source, "bg_test")
 
             mock_adapter.send_voice.assert_called_once()
-            assert mock_adapter.send_voice.call_args.kwargs["audio_path"] == _ogg
+            assert mock_adapter.send_voice.call_args.kwargs["audio_path"] == _os.path.realpath(_ogg)
             mock_adapter.send_video.assert_called_once()
-            assert mock_adapter.send_video.call_args.kwargs["video_path"] == _mp4
+            assert mock_adapter.send_video.call_args.kwargs["video_path"] == _os.path.realpath(_mp4)
             mock_adapter.send_image_file.assert_called_once()
-            assert mock_adapter.send_image_file.call_args.kwargs["image_path"] == _png
+            assert mock_adapter.send_image_file.call_args.kwargs["image_path"] == _os.path.realpath(_png)
             mock_adapter.send_document.assert_called_once()
-            assert mock_adapter.send_document.call_args.kwargs["file_path"] == _pdf
+            assert mock_adapter.send_document.call_args.kwargs["file_path"] == _os.path.realpath(_pdf)
         finally:
             import shutil as _shutil
             _shutil.rmtree(_tmpdir, ignore_errors=True)

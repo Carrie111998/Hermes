@@ -46,6 +46,31 @@ def test_find_install_script_from_wheel(tmp_path):
     assert shell == "bash"
 
 
+def test_find_install_script_from_packaged_data(tmp_path):
+    """A sealed wheel resolves the namespaced data-files install script."""
+    from hermes_cli.dep_ensure import _find_install_script
+
+    packaged_root = tmp_path / "data" / "hermes-agent"
+    scripts_dir = packaged_root / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "install.sh").write_text("#!/bin/bash", encoding="utf-8")
+
+    with (
+        patch("hermes_cli.dep_ensure._IS_WINDOWS", False),
+        patch(
+            "hermes_cli.dep_ensure.find_packaged_data_dir",
+            return_value=packaged_root,
+        ),
+    ):
+        path, shell = _find_install_script(
+            package_dir=tmp_path / "purelib" / "hermes_cli",
+            repo_root=tmp_path / "purelib",
+        )
+
+    assert path == scripts_dir / "install.sh"
+    assert shell == "bash"
+
+
 def test_find_install_script_prefers_ps1_on_windows(tmp_path):
     """On Windows, _find_install_script should find install.ps1."""
     scripts_dir = tmp_path / "hermes_cli" / "scripts"
@@ -86,7 +111,10 @@ def test_find_install_script_falls_back_to_repo_root(tmp_path):
 
 def test_find_install_script_returns_none_when_missing(tmp_path):
     from hermes_cli.dep_ensure import _find_install_script
-    with patch("hermes_cli.dep_ensure._IS_WINDOWS", False):
+    with (
+        patch("hermes_cli.dep_ensure._IS_WINDOWS", False),
+        patch("hermes_cli.dep_ensure.find_packaged_data_dir", return_value=None),
+    ):
         result = _find_install_script(package_dir=tmp_path / "x", repo_root=tmp_path / "y")
         assert result == (None, None)
 

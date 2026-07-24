@@ -1,11 +1,12 @@
 import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { useEffect, useRef } from 'react'
+import { type MutableRefObject, useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { assistantTextPart, type ChatMessage } from '@/lib/chat-messages'
 import {
   $previewTarget,
   clearSessionPreviewRegistry,
+  getSessionPreviewRecord,
   type PreviewTarget,
   registerSessionPreview
 } from '@/store/preview'
@@ -37,17 +38,30 @@ function previewTarget(source: string): PreviewTarget {
 
 let handleEvent: (event: RpcEvent) => void = () => undefined
 
-function PreviewRoutingHarness({ onEvent }: { onEvent: (handler: (event: RpcEvent) => void) => void }) {
-  const activeSessionIdRef = useRef<string | null>('session-1')
+function PreviewRoutingHarness({
+  activeSessionIdRef: providedActiveSessionIdRef,
+  currentView = 'chat',
+  onEvent,
+  routedSessionId = 'session-1',
+  selectedStoredSessionId = null
+}: {
+  activeSessionIdRef?: MutableRefObject<string | null>
+  currentView?: 'chat' | 'settings'
+  onEvent: (handler: (event: RpcEvent) => void) => void
+  routedSessionId?: string | null
+  selectedStoredSessionId?: string | null
+}) {
+  const defaultActiveSessionIdRef = useRef<string | null>('session-1')
+  const activeSessionIdRef = providedActiveSessionIdRef ?? defaultActiveSessionIdRef
 
   const routing = usePreviewRouting({
     activeSessionIdRef,
     baseHandleGatewayEvent: vi.fn(),
     currentCwd: '/work',
-    currentView: 'chat',
+    currentView,
     requestGateway: vi.fn(),
-    routedSessionId: 'session-1',
-    selectedStoredSessionId: null
+    routedSessionId,
+    selectedStoredSessionId
   })
 
   useEffect(() => {
@@ -118,6 +132,168 @@ describe('usePreviewRouting', () => {
 
     expect($previewTarget.get()).toBeNull()
     expect(window.hermesDesktop.normalizePreviewTarget).not.toHaveBeenCalled()
+  })
+
+  it('opens the preview pane on a preview.open event for the active session', async () => {
+    render(
+      <PreviewRoutingHarness
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com', label: 'CNN' },
+        session_id: 'session-1',
+        type: 'preview.open'
+      })
+    )
+
+    await waitFor(() => {
+      expect($previewTarget.get()).toMatchObject({ kind: 'url', label: 'CNN', url: 'https://www.cnn.com' })
+    })
+  })
+
+  it('records preview.open under the durable stored session id', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'runtime-A' }
+
+    render(
+      <PreviewRoutingHarness
+        activeSessionIdRef={activeSessionIdRef}
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+        routedSessionId="stored-A"
+        selectedStoredSessionId="stored-A"
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com', label: 'CNN' },
+        session_id: 'runtime-A',
+        type: 'preview.open'
+      })
+    )
+
+    await waitFor(() => {
+      expect(getSessionPreviewRecord('stored-A')?.normalized).toMatchObject({
+        kind: 'url',
+        label: 'CNN',
+        url: 'https://www.cnn.com'
+      })
+    })
+    expect(getSessionPreviewRecord('runtime-A')).toBeNull()
+  })
+
+  it('ignores a preview.open event for a background session', async () => {
+    render(
+      <PreviewRoutingHarness
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+
+    act(() =>
+      handleEvent({ payload: { url: 'https://www.cnn.com' }, session_id: 'other-session', type: 'preview.open' })
+    )
+
+    // Give any (wrongly) scheduled async open a tick to resolve before asserting.
+    await Promise.resolve()
+    expect($previewTarget.get()).toBeNull()
+  })
+
+  it('does not open an old session preview after async normalization finishes', async () => {
+    const activeSessionIdRef: MutableRefObject<string | null> = { current: 'session-1' }
+    let resolveNormalization: (target: PreviewTarget) => void = () => undefined
+
+    window.hermesDesktop.normalizePreviewTarget = vi.fn(
+      () =>
+        new Promise<PreviewTarget>(resolve => {
+          resolveNormalization = resolve
+        })
+    )
+
+    render(
+      <PreviewRoutingHarness
+        activeSessionIdRef={activeSessionIdRef}
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com' },
+        session_id: 'session-1',
+        type: 'preview.open'
+      })
+    )
+
+    activeSessionIdRef.current = 'session-2'
+    await act(async () => {
+      resolveNormalization(previewTarget('https://www.cnn.com'))
+      await Promise.resolve()
+    })
+
+    expect($previewTarget.get()).toBeNull()
+    expect(window.localStorage.getItem('hermes.desktop.sessionPreviews.v1')).toBeNull()
+  })
+
+  it('does not reopen a preview after leaving chat during normalization', async () => {
+    let resolveNormalization: (target: PreviewTarget) => void = () => undefined
+
+    window.hermesDesktop.normalizePreviewTarget = vi.fn(
+      () =>
+        new Promise<PreviewTarget>(resolve => {
+          resolveNormalization = resolve
+        })
+    )
+
+    const view = render(
+      <PreviewRoutingHarness
+        currentView="chat"
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com' },
+        session_id: 'session-1',
+        type: 'preview.open'
+      })
+    )
+
+    view.rerender(
+      <PreviewRoutingHarness
+        currentView="settings"
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+    view.rerender(
+      <PreviewRoutingHarness
+        currentView="chat"
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+    await act(async () => {
+      resolveNormalization(previewTarget('https://www.cnn.com'))
+      await Promise.resolve()
+    })
+
+    expect($previewTarget.get()).toBeNull()
+    expect(window.localStorage.getItem('hermes.desktop.sessionPreviews.v1')).toBeNull()
   })
 
   it('does not auto-open a preview from tool results', async () => {

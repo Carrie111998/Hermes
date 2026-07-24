@@ -151,6 +151,40 @@ class TestGetProcessHermesHome:
             reset_hermes_home_override(token)
 
 
+class TestPackagedDataDirectories:
+    @pytest.mark.parametrize(
+        ("resolver_name", "directory_name"),
+        [
+            ("get_optional_skills_dir", "optional-skills"),
+            ("get_optional_mcps_dir", "optional-mcps"),
+            ("get_bundled_skills_dir", "skills"),
+        ],
+    )
+    def test_missing_source_default_falls_back_to_installed_data_scheme(
+        self, resolver_name, directory_name, tmp_path, monkeypatch
+    ):
+        source_default = tmp_path / "checkout" / directory_name
+        installed = tmp_path / "prefix" / directory_name
+        installed.mkdir(parents=True)
+        monkeypatch.delenv(
+            {
+                "get_optional_skills_dir": "HERMES_OPTIONAL_SKILLS",
+                "get_optional_mcps_dir": "HERMES_OPTIONAL_MCPS",
+                "get_bundled_skills_dir": "HERMES_BUNDLED_SKILLS",
+            }[resolver_name],
+            raising=False,
+        )
+        monkeypatch.setattr(
+            hermes_constants,
+            "find_packaged_data_dir",
+            lambda name: installed if name == directory_name else None,
+            raising=False,
+        )
+
+        resolver = getattr(hermes_constants, resolver_name)
+        assert resolver(source_default) == installed
+
+
 class TestHermesManagedNode:
     def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"

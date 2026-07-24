@@ -40,10 +40,12 @@ import os
 import re
 import subprocess
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Optional, Sequence
+from typing import Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence
 
 # Bump ONLY for breaking changes to the required contract surface
 # (abstract-method signatures, FetchResult required fields).  Additive
@@ -57,6 +59,31 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 
 # Default timeout for run_secret_cli() subprocess invocations.
 DEFAULT_CLI_TIMEOUT_SECONDS = 30.0
+
+_SOURCE_ENVIRON: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
+    "_SOURCE_ENVIRON", default=None
+)
+
+
+def source_environ() -> Mapping[str, str]:
+    """Return the environment visible to the active source fetch.
+
+    Registry-driven profile fetches install an isolated mapping here so
+    backends can resolve bootstrap credentials without reading or mutating
+    another profile's process-global environment.
+    """
+    scoped = _SOURCE_ENVIRON.get()
+    return scoped if scoped is not None else os.environ
+
+
+@contextmanager
+def use_source_environ(environ: Mapping[str, str]) -> Iterator[None]:
+    """Install an isolated source environment for one fetch worker."""
+    token = _SOURCE_ENVIRON.set(environ)
+    try:
+        yield
+    finally:
+        _SOURCE_ENVIRON.reset(token)
 
 
 class ErrorKind(str, Enum):
@@ -147,6 +174,9 @@ class SecretSource(ABC):
         ``cfg`` is the source's raw config section (``secrets.<name>``)
         from config.yaml — treat every field defensively, the section
         may be malformed.  ``home_path`` is the resolved HERMES_HOME.
+        Read bootstrap/process values through :func:`source_environ`, not
+        directly from ``os.environ``; multiplexed profile fetches install an
+        isolated mapping there to prevent cross-profile credential reads.
         """
 
     # -- optional hooks (defaults are correct for most sources) ------------
@@ -189,6 +219,45 @@ class SecretSource(ABC):
         knowledge.  Purely informational.
         """
         return {}
+
+    def remediation(self, kind: Optional["ErrorKind"], cfg: dict) -> str:
+        """One-line, actionable next step for a failed fetch.
+
+        Called by the startup status printer (and ``hermes secrets ...
+        status``) right after a fetch error is surfaced, so the user sees
+        *what to run* next to fix it — not just what broke.  Sources
+        should override this to point at their own CLI verbs (e.g.
+        ``hermes secrets bitwarden token`` for AUTH_FAILED).  Return an
+        empty string to suppress the hint.
+
+        Must never raise and must not perform I/O — it's a pure
+        kind→string mapping on the startup path.
+        """
+        generic = {
+            ErrorKind.NOT_CONFIGURED: (
+                f"Run `hermes secrets {self.name} setup` to finish configuration."
+            ),
+            ErrorKind.BINARY_MISSING: (
+                f"Run `hermes secrets {self.name} setup` to install the helper CLI."
+            ),
+            ErrorKind.AUTH_FAILED: (
+                f"Credentials rejected — run `hermes secrets {self.name} setup` "
+                "to re-authenticate."
+            ),
+            ErrorKind.AUTH_EXPIRED: (
+                f"Credentials expired — run `hermes secrets {self.name} setup` "
+                "to re-authenticate."
+            ),
+            ErrorKind.NETWORK: (
+                "Network problem reaching the secrets backend — check "
+                "connectivity and retry."
+            ),
+            ErrorKind.TIMEOUT: (
+                f"Backend was slow — raise secrets.{self.name}.timeout_seconds "
+                "if this recurs."
+            ),
+        }
+        return generic.get(kind, "") if kind is not None else ""
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +313,7 @@ def run_secret_cli(
                  "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
     env: Dict[str, str] = {}
     for key in (*base_keep, *allow_env):
-        val = os.environ.get(key)
+        val = source_environ().get(key)
         if val is not None:
             env[key] = val
     if extra_env:

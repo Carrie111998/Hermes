@@ -22,7 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hermes_constants import agent_browser_runnable
+from hermes_constants import agent_browser_runnable, find_packaged_data_dir
 from tools.environments.local import hermes_subprocess_env
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -84,6 +84,7 @@ def _find_install_script(
         package_dir = Path(__file__).parent
     if repo_root is None:
         repo_root = package_dir.parent
+    packaged_root = find_packaged_data_dir("hermes-agent")
 
     if _IS_WINDOWS:
         preferred = ("install.ps1", "powershell")
@@ -99,6 +100,10 @@ def _find_install_script(
         repo = repo_root / "scripts" / script_name
         if repo.is_file():
             return repo, shell
+        if packaged_root is not None:
+            packaged = packaged_root / "scripts" / script_name
+            if packaged.is_file():
+                return packaged, shell
 
     return None, None
 

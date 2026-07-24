@@ -156,3 +156,29 @@ class TestProfilePathResolutionUnderMultiplexScope:
             t.join()
 
         assert seen["home"] == str(prof_b)
+
+    def test_external_command_source_hydrates_scope_without_mutating_environ(
+        self, tmp_path, monkeypatch
+    ):
+        """Secondary profiles fetch configured sources into an isolated scope."""
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli import env_loader
+
+        profile = tmp_path / "profiles" / "secondary"
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text(
+            "secrets:\n"
+            "  command:\n"
+            "    enabled: true\n"
+            "    command: \"printf 'SECONDARY_API_KEY=from-command\\\\n'\"\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("SECONDARY_API_KEY", raising=False)
+        env_loader.reset_secret_source_cache()
+        try:
+            ss.set_multiplex_active(True)
+            with _profile_runtime_scope(profile):
+                assert ss.get_secret("SECONDARY_API_KEY") == "from-command"
+            assert "SECONDARY_API_KEY" not in __import__("os").environ
+        finally:
+            env_loader.reset_secret_source_cache()
