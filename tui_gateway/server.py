@@ -4075,6 +4075,8 @@ def _admit_fleet_parent_session(
     lineage_root_id: str,
     session_id: str,
     cwd: str,
+    preferred_lane_id: str | None = None,
+    preferred_model_id: str | None = None,
 ):
     """Profile-scoped gateway boundary for committed parent admission."""
 
@@ -4091,6 +4093,8 @@ def _admit_fleet_parent_session(
             lineage_root_id=lineage_root_id,
             session_id=session_id,
             cwd=cwd,
+            preferred_lane_id=preferred_lane_id,
+            preferred_model_id=preferred_model_id,
         )
     finally:
         if home_token is not None:
@@ -5479,8 +5483,10 @@ def _make_agent(
             if isinstance(model_override, dict)
             else ""
         )
+        from hermes_cli.fleet.adapters.live_routes import _AGY_MODEL_LABELS
+
         if (
-            route_model != "gemini-3.1-pro-high"
+            route_model not in _AGY_MODEL_LABELS
             or route_provider != "antigravity-subscription"
             or override_model != route_model
             or override_provider != route_provider
@@ -6488,6 +6494,22 @@ def _(rid, params: dict) -> dict:
     fleet_parent_on = (
         source == "desktop" and _fleet_parent_gates_open(profile_home=profile_home)
     )
+    preferred_fleet_lane_id = None
+    create_provider = (
+        str(params.get("provider") or "").strip()
+        if isinstance(params, dict)
+        else ""
+    )
+    preferred_fleet_model_id = None
+    if model_source == "manual" and create_provider == "antigravity-subscription":
+        from hermes_cli.fleet.adapters.live_routes import _AGY_MODEL_LABELS
+
+        requested = str(create_model or "").strip()
+        if requested in _AGY_MODEL_LABELS:
+            # Explicit Antigravity parent pick is a first-class parent route.
+            model_source = "fleet_auto"
+            preferred_fleet_lane_id = "antigravity"
+            preferred_fleet_model_id = requested
     if fleet_parent_on:
         from hermes_cli.fleet.parent_models import (
             is_sonnet_model,
@@ -6511,6 +6533,8 @@ def _(rid, params: dict) -> dict:
             lineage_root_id=key,
             session_id=key,
             cwd=resolved_cwd,
+            preferred_lane_id=preferred_fleet_lane_id,
+            preferred_model_id=preferred_fleet_model_id,
         )
         if admission.pin is None:
             return _err(rid, 5033, admission_error(admission))

@@ -868,6 +868,8 @@ class FleetStore:
         candidates: Sequence[LaneInputs],
         now: datetime,
         inject_failure: bool = False,
+        preferred_lane_id: str | None = None,
+        preferred_model_id: str | None = None,
     ) -> ParentAdmission:
         """Atomically select and persist one immutable Desktop parent pin."""
 
@@ -904,7 +906,26 @@ class FleetStore:
                 for candidate in live_inputs
             )
             cursor = self._rotation(connection, RoutePurpose.DESKTOP_PARENT)
-            decision = select_lane(evaluations, rotation_index=cursor)
+            preferred = str(preferred_lane_id or "").strip()
+            if preferred:
+                preferred_hits = tuple(
+                    item
+                    for item in evaluations
+                    if item.lane_id == preferred and item.eligible
+                )
+                if preferred_hits:
+                    from .types import RouteDecision
+
+                    decision = RouteDecision(
+                        lane_id=preferred_hits[0].lane_id,
+                        reason=ReasonCode.MANUAL_OVERRIDE,
+                        evaluations=evaluations,
+                        rotation_index=cursor,
+                    )
+                else:
+                    decision = select_lane(evaluations, rotation_index=cursor)
+            else:
+                decision = select_lane(evaluations, rotation_index=cursor)
             decision_evaluations = decision.evaluations
             if decision.lane_id is None:
                 self._audit(
@@ -937,6 +958,11 @@ class FleetStore:
             )
             assert winner.selected_model is not None
             assert winner.selected_effort is not None
+            preferred_model = str(preferred_model_id or "").strip()
+            if preferred_model and preferred_model in winner.profile.ordered_models:
+                from dataclasses import replace as _dc_replace
+
+                winner = _dc_replace(winner, selected_model=preferred_model)
             qualification_hash = hashlib.sha256(
                 winner.qualification_evidence_id.encode("utf-8")
             ).hexdigest()

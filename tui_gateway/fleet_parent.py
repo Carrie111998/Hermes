@@ -10,6 +10,7 @@ from typing import Any
 
 from hermes_cli.fleet.inspection import build_fleet_service
 from hermes_cli.fleet.state import FleetStore
+from hermes_cli.fleet.adapters.live_routes import _AGY_MODEL_LABELS
 from hermes_cli.fleet.types import (
     AdapterKind,
     ParentAdmission,
@@ -60,8 +61,10 @@ def admit_parent_session(
     lineage_root_id: str,
     session_id: str,
     cwd: str,
+    preferred_lane_id: str | None = None,
+    preferred_model_id: str | None = None,
 ) -> ParentAdmission:
-    """Commit one native parent route before the gateway builds an agent."""
+    """Commit one parent route before the gateway builds an agent."""
 
     service = build_fleet_service()
     task = TaskSpec(
@@ -75,6 +78,8 @@ def admit_parent_session(
         lineage_root_id=lineage_root_id,
         session_id=session_id,
         task=task,
+        preferred_lane_id=preferred_lane_id,
+        preferred_model_id=preferred_model_id,
     )
 
 
@@ -97,10 +102,10 @@ def parent_route_metadata(pin: ParentPin) -> dict[str, Any]:
         pin.adapter_kind is AdapterKind.EXTERNAL_CLI
         and pin.lane_id == "antigravity"
         and pin.provider_id == "antigravity-subscription"
-        and pin.model_id == "gemini-3.1-pro-high"
+        and pin.model_id in _AGY_MODEL_LABELS
     ):
         display_label = (
-            "Antigravity · Gemini 3.1 Pro High · external CLI"
+            f"Antigravity · {_AGY_MODEL_LABELS[pin.model_id]} · external CLI"
         )
     else:
         raise ValueError("unsupported external fleet parent")

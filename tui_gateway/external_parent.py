@@ -13,6 +13,7 @@ from typing import Any
 
 from hermes_cli.fleet.adapters.base import safe_child_environment
 from hermes_cli.fleet.adapters.live_routes import (
+    _AGY_MODEL_LABELS,
     _agy_log_path,
     _finalize_agy_log,
     inspect_agy_subscription_receipt,
@@ -23,6 +24,18 @@ from hermes_cli.fleet.state import FleetStore
 
 _MODEL_ID = "gemini-3.1-pro-high"
 _MODEL_LABEL = "Gemini 3.1 Pro (High)"
+
+def _route_model_id(route: Mapping[str, Any] | None = None) -> str:
+    model = str((route or {}).get("model") or _MODEL_ID).strip()
+    if model not in _AGY_MODEL_LABELS:
+        raise ValueError(f"unsupported antigravity model: {model}")
+    return model
+
+
+def _route_model_label(model_id: str) -> str:
+    return _AGY_MODEL_LABELS[model_id]
+
+
 _PROVIDER_ID = "antigravity-subscription"
 _DISPLAY_LABEL = "Antigravity · Gemini 3.1 Pro High · external CLI"
 _MAX_OUTPUT_CHARS = 1_000_000
@@ -43,11 +56,13 @@ def _parent_receipt(
     log_path: Path,
     *,
     expected_conversation_id: str | None,
+    canonical_model_id: str = _MODEL_ID,
+    expected_display_label: str = self.model_label,
 ) -> dict[str, object]:
     check = inspect_agy_subscription_receipt(
         log_path,
-        canonical_model_id=_MODEL_ID,
-        expected_display_label=_MODEL_LABEL,
+        canonical_model_id=canonical_model_id,
+        expected_display_label=expected_display_label,
     )
     if check.get("status") != "matched":
         return check
@@ -103,8 +118,8 @@ def _parent_receipt(
             "endpoint_kind": "antigravity_cloud_code",
             "conversation_id": conversation_id,
             "continued": continued,
-            "served_model_id": _MODEL_ID,
-            "served_model_label": _MODEL_LABEL,
+            "served_model_id": canonical_model_id,
+            "served_model_label": expected_display_label,
             "fallback_enabled": False,
         }
     )
@@ -134,8 +149,7 @@ class ExternalParentSessionDriver:
             or route.get("fleet_lane_id") != "antigravity"
             or route.get("fleet_route_purpose") != "desktop_parent"
             or route.get("provider") != _PROVIDER_ID
-            or route.get("model") != _MODEL_ID
-            or route.get("display_label") != _DISPLAY_LABEL
+            or str(route.get("model") or "") not in _AGY_MODEL_LABELS
             or any(
                 not str(route.get(key) or "").strip()
                 for key in (
@@ -157,7 +171,8 @@ class ExternalParentSessionDriver:
         self._process_lock = threading.Lock()
         self._active_process = None
         self._interrupt_requested = threading.Event()
-        self.model = _MODEL_ID
+        self.model = str(route.get("model") or _MODEL_ID)
+        self.model_label = _route_model_label(self.model)
         self.provider = _PROVIDER_ID
         self.requested_provider = _PROVIDER_ID
         self.base_url = ""
@@ -214,7 +229,7 @@ class ExternalParentSessionDriver:
         argv = [
             self.executable,
             "--model",
-            _MODEL_LABEL,
+            self.model_label,
         ]
         if conversation_id:
             argv.extend(("--conversation", conversation_id))
@@ -313,6 +328,8 @@ class ExternalParentSessionDriver:
 
         check = _parent_receipt(
             log_path,
+            canonical_model_id=self.model,
+            expected_display_label=self.model_label,
             expected_conversation_id=conversation_id,
         )
         if process.returncode != 0:
@@ -397,7 +414,7 @@ def build_external_parent_driver(
         or not qualification.paid_fallback_absent
         or qualification.auth_kind != "cli_subscription"
         or qualification.provider_id != _PROVIDER_ID
-        or _MODEL_ID not in qualification.models
+        or str(route.get("model") or _MODEL_ID) not in qualification.models
         or not qualification.executable
     ):
         raise RuntimeError(

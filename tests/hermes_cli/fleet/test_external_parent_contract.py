@@ -226,3 +226,97 @@ def test_live_service_uses_explicit_bridge_overage_for_antigravity_parent_catalo
     assert catalog["model_id"] == "gemini-3.1-pro-high"
     assert catalog["model_label"] == "Gemini 3.1 Pro (High)"
     assert catalog["supports_parent_session"] is True
+
+def test_bridge_overage_off_unblocks_native_grok(tmp_path, monkeypatch):
+    """Fresh bridge overage_disabled=false must not leave Grok on overage-unknown."""
+    from hermes_cli.fleet import inspection
+    from hermes_cli.fleet.inspection import build_fleet_service
+    from hermes_cli.fleet.live import FleetQualificationDoctor
+
+    bridge = tmp_path / "usage.json"
+    bridge.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "captured_at": NOW.isoformat(),
+                "lanes": {
+                    "grok": {
+                        "used_pct": "5.000",
+                        "remaining_pct": "95.000",
+                        "confidence": "high",
+                        "overage_disabled": True,
+                        "comparability_group": "prefer-full-usage",
+                        "quota_window_id": "test-window",
+                        "measurement_kind": "measured",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class BridgeAwareDoctor(FleetQualificationDoctor):
+        def __init__(self, **kwargs):
+            # Use the real billing_status injected by build_fleet_service.
+            super().__init__(
+                auth_status=lambda provider: {
+                    "logged_in": True,
+                    "auth_mode": (
+                        "chatgpt"
+                        if provider == "openai-codex"
+                        else "oauth_device_code"
+                    ),
+                    "source": "pool:test",
+                },
+                claude_oauth_status=lambda: {
+                    "logged_in": True,
+                    "auth_mode": "claude_code_oauth",
+                    "source": "claude_code_credentials_file",
+                },
+                which=lambda _: None,
+                command=lambda argv: (1, "", "unused"),
+                environment={},
+                billing_status=kwargs.get("billing_status"),
+                now=lambda: NOW,
+            )
+
+    monkeypatch.setattr(inspection, "FleetQualificationDoctor", BridgeAwareDoctor)
+    service = build_fleet_service(
+        config_data={
+            "fleet": {
+                "enabled": True,
+                "parent_desktop_enabled": True,
+                "bridge_usage_file": str(bridge),
+                "lanes": {
+                    "chatgpt_codex": {"enabled": False},
+                    "claude_code": {"enabled": False},
+                    "grok": {"enabled": True},
+                    "antigravity": {"enabled": False},
+                    "kimi": {"enabled": False},
+                },
+            }
+        },
+        adapters={"grok": object()},
+        store_path=tmp_path / "fleet" / "state.db",
+        now=lambda: NOW,
+    )
+
+    qualification = service.qualifications["grok"]
+    assert qualification.qualified is True
+    assert qualification.overage_state is OverageState.OFF
+    assert qualification.overage_disabled is True
+
+    evaluation = next(
+        item
+        for item in service.inspect_parent(
+            TaskSpec(
+                task_id="grok-overage-bridge",
+                cwd=tmp_path,
+                required_capabilities=frozenset({"workspace_write", "shell"}),
+            )
+        )
+        if item.lane_id == "grok"
+    )
+    assert evaluation.eligible is True
+    assert ReasonCode.OVERAGE_STATUS_UNKNOWN_OR_ON not in evaluation.reasons
+

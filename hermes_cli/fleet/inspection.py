@@ -36,6 +36,13 @@ DEFAULT_CAPABILITIES = frozenset({"workspace_write", "shell"})
 _MODEL_LABELS = {
     "claude-opus-4-8": "Claude Opus 4.8",
     "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+    "gemini-3.1-pro-low": "Gemini 3.1 Pro (Low)",
+    "gemini-3.6-flash-high": "Gemini 3.6 Flash (High)",
+    "gemini-3.6-flash-medium": "Gemini 3.6 Flash (Medium)",
+    "gemini-3.6-flash-low": "Gemini 3.6 Flash (Low)",
+    "gemini-3.5-flash-high": "Gemini 3.5 Flash (High)",
+    "gemini-3.5-flash-medium": "Gemini 3.5 Flash (Medium)",
+    "gemini-3.5-flash-low": "Gemini 3.5 Flash (Low)",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "grok-4.5": "Grok 4.5",
 }
@@ -57,9 +64,8 @@ def build_fleet_service(
     profiles = ordered_profiles()
     capacity_source = BridgeUsageAdapter(config.bridge_usage_file)
 
-    def antigravity_billing_status(lane_id: str) -> Mapping[str, object]:
-        if lane_id != "antigravity":
-            return {}
+    def bridge_billing_status(lane_id: str) -> Mapping[str, object]:
+        """Map fresh bridge capacity overage flags into doctor billing evidence."""
         read_at = now() if now is not None else None
         snapshot = capacity_source.read(lane_id, now=read_at).snapshot
         if (
@@ -75,7 +81,7 @@ def build_fleet_service(
         }
 
     live_doctor = doctor or FleetQualificationDoctor(
-        billing_status=antigravity_billing_status
+        billing_status=bridge_billing_status
     )
     qualifications = live_doctor.qualify(profiles)
     return FleetService(

@@ -37,6 +37,13 @@ _NATIVE_SUCCESS_FIELDS = frozenset(
 _MAX_STDERR_CHARS = 4096
 _AGY_MODEL_LABELS = {
     "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+    "gemini-3.1-pro-low": "Gemini 3.1 Pro (Low)",
+    "gemini-3.6-flash-high": "Gemini 3.6 Flash (High)",
+    "gemini-3.6-flash-medium": "Gemini 3.6 Flash (Medium)",
+    "gemini-3.6-flash-low": "Gemini 3.6 Flash (Low)",
+    "gemini-3.5-flash-high": "Gemini 3.5 Flash (High)",
+    "gemini-3.5-flash-medium": "Gemini 3.5 Flash (Medium)",
+    "gemini-3.5-flash-low": "Gemini 3.5 Flash (Low)",
 }
 _AGY_RECEIPT_RE = re.compile(
     r'Propagating selected model override to backend: label="([^"\r\n]+)"\s*$'

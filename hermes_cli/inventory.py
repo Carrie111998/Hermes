@@ -111,6 +111,42 @@ def load_picker_context() -> ConfigContext:
 # ─── Public: payload builder ────────────────────────────────────────────
 
 
+
+def _antigravity_parent_provider_row() -> dict | None:
+    """Expose Antigravity Gemini models as parent-selectable when lane is qualified."""
+    try:
+        from hermes_cli.fleet.adapters.live_routes import _AGY_MODEL_LABELS
+        from hermes_cli.fleet.live import FleetQualificationDoctor
+        from hermes_cli.fleet.profiles import profile_map
+
+        qualification = FleetQualificationDoctor().qualify(
+            (profile_map()["antigravity"],)
+        )["antigravity"]
+    except Exception:
+        return None
+    if not qualification.qualified:
+        return None
+    models = [m for m in qualification.models if m in _AGY_MODEL_LABELS]
+    if not models:
+        models = list(_AGY_MODEL_LABELS.keys())
+    return {
+        "slug": "antigravity-subscription",
+        "name": "Antigravity · Gemini",
+        "models": models,
+        "total_models": len(models),
+        "authenticated": True,
+        "auth_type": "external_cli",
+        "key_env": "",
+        "warning": "",
+        "is_current": False,
+        "is_user_defined": False,
+        "base_url": "",
+        "capabilities": {
+            m: {"fast": False, "reasoning": True} for m in models
+        },
+    }
+
+
 def build_models_payload(
     ctx: ConfigContext,
     *,
@@ -244,6 +280,14 @@ def build_models_payload(
                 if len(filtered) < len(original):
                     row["models"] = filtered
                     row["total_models"] = len(filtered)
+
+    antigravity_row = _antigravity_parent_provider_row()
+    if antigravity_row is not None:
+        rows = [antigravity_row] + [
+            r
+            for r in rows
+            if str(r.get("slug", "")).lower() != "antigravity-subscription"
+        ]
 
     if include_unconfigured:
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]

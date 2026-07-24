@@ -156,6 +156,8 @@ class FleetService:
         lineage_root_id: str,
         session_id: str,
         task: TaskSpec,
+        preferred_lane_id: str | None = None,
+        preferred_model_id: str | None = None,
     ) -> ParentAdmission:
         existing = self.store.read_parent_pin(profile_id, lineage_root_id)
         if existing is not None:
@@ -172,6 +174,8 @@ class FleetService:
                 at, purpose=RoutePurpose.DESKTOP_PARENT
             ),
             now=at,
+            preferred_lane_id=preferred_lane_id,
+            preferred_model_id=preferred_model_id,
         )
 
     def resolve_parent_pin(

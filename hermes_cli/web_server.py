@@ -9748,6 +9748,55 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     return {"logged_in": False, "source": None}
 
 
+
+def _antigravity_status() -> Dict[str, Any]:
+    """Surface Antigravity (agy) as a first-class Accounts provider.
+
+    Uses the same fail-closed live-receipt qualification path as Fleet doctor.
+    No tokens are returned — only sanitized connected/disconnected state.
+    """
+    try:
+        from hermes_cli.fleet.live import FleetQualificationDoctor
+        from hermes_cli.fleet.profiles import profile_map
+
+        qualification = FleetQualificationDoctor().qualify(
+            (profile_map()["antigravity"],)
+        )["antigravity"]
+    except Exception as exc:
+        return {
+            "logged_in": False,
+            "source": "antigravity_agy",
+            "source_label": "Antigravity CLI (agy)",
+            "error": str(exc),
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+        }
+    if qualification.qualified:
+        version = qualification.version or "agy"
+        return {
+            "logged_in": True,
+            "source": "antigravity_agy",
+            "source_label": f"{version} · consumer subscription",
+            "token_preview": None,
+            "expires_at": (
+                qualification.expires_at.isoformat()
+                if getattr(qualification, "expires_at", None) is not None
+                else None
+            ),
+            "has_refresh_token": False,
+        }
+    return {
+        "logged_in": False,
+        "source": "antigravity_agy",
+        "source_label": "Antigravity CLI (agy)",
+        "error": qualification.detail or "not qualified",
+        "token_preview": None,
+        "expires_at": None,
+        "has_refresh_token": False,
+    }
+
+
 def _claude_code_only_status() -> Dict[str, Any]:
     """Surface Claude Code CLI credentials as their own provider entry.
 
@@ -9869,6 +9918,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "cli_command": "hermes auth add anthropic",
         "docs_url": "https://docs.claude.com/en/api/getting-started",
         "status_fn": _anthropic_oauth_status,
+    },
+    {
+        "id": "antigravity",
+        "name": "Antigravity · Gemini 3.1 Pro High",
+        "flow": "external",
+        "cli_command": "agy",
+        "docs_url": "https://antigravity.google",
+        "status_fn": _antigravity_status,
     },
     {
         "id": "claude-code",
