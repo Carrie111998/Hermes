@@ -33,9 +33,6 @@ def _common_init_patches(stack: ExitStack) -> None:
     )
     stack.enter_context(patch("run_agent.get_tool_definitions", return_value=[]))
     stack.enter_context(
-        patch("agent.azure_identity_adapter.is_token_provider", return_value=False)
-    )
-    stack.enter_context(
         patch(
             "hermes_cli.model_normalize.normalize_model_for_provider",
             return_value="test-model",
@@ -112,3 +109,108 @@ def test_openai_wire_init_banner_masks_api_key(
         )
 
     _assert_secret_is_masked(capsys.readouterr().out, "Using API key:")
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "banner"),
+    [
+        ("anthropic", "https://api.anthropic.com", "Using credentials: Microsoft Entra ID"),
+        ("openai", "https://api.openai.com/v1", "Using credentials: Microsoft Entra ID"),
+    ],
+)
+def test_callable_token_provider_uses_static_label_without_invocation(
+    capsys: pytest.CaptureFixture[str], provider: str, base_url: str, banner: str
+) -> None:
+    from agent.agent_init import init_agent
+
+    calls = 0
+
+    def token_provider() -> str:
+        nonlocal calls
+        calls += 1
+        return _SECRET
+
+    agent = _new_agent()
+    with ExitStack() as stack:
+        _common_init_patches(stack)
+        if provider == "anthropic":
+            stack.enter_context(
+                patch(
+                    "agent.anthropic_adapter.build_anthropic_client",
+                    return_value=MagicMock(),
+                )
+            )
+            stack.enter_context(
+                patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="")
+            )
+            stack.enter_context(
+                patch("agent.anthropic_adapter._is_oauth_token", return_value=False)
+            )
+        else:
+            stack.enter_context(patch("run_agent.OpenAI", return_value=MagicMock()))
+
+        init_agent(
+            agent,
+            base_url=base_url,
+            api_key=token_provider,
+            provider=provider,
+            model="test-model",
+            skip_context_files=True,
+            skip_memory=True,
+            quiet_mode=False,
+        )
+
+    output = capsys.readouterr().out
+    assert banner in output
+    assert _SECRET not in output
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "unexpected_banner"),
+    [
+        ("anthropic", "https://api.anthropic.com", "Using token:"),
+        ("openai", "https://api.openai.com/v1", "Using API key:"),
+    ],
+)
+def test_short_credentials_do_not_print_raw_banner(
+    capsys: pytest.CaptureFixture[str],
+    provider: str,
+    base_url: str,
+    unexpected_banner: str,
+) -> None:
+    from agent.agent_init import init_agent
+
+    agent = _new_agent()
+    with ExitStack() as stack:
+        _common_init_patches(stack)
+        if provider == "anthropic":
+            stack.enter_context(
+                patch(
+                    "agent.anthropic_adapter.build_anthropic_client",
+                    return_value=MagicMock(),
+                )
+            )
+            stack.enter_context(
+                patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="")
+            )
+            stack.enter_context(
+                patch("agent.anthropic_adapter._is_oauth_token", return_value=False)
+            )
+        else:
+            stack.enter_context(patch("run_agent.OpenAI", return_value=MagicMock()))
+
+        init_agent(
+            agent,
+            base_url=base_url,
+            api_key="short",
+            provider=provider,
+            model="test-model",
+            skip_context_files=True,
+            skip_memory=True,
+            quiet_mode=False,
+        )
+
+    output = capsys.readouterr().out
+    assert unexpected_banner not in output
+    assert "short" not in output

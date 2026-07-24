@@ -3575,7 +3575,7 @@ def run_conversation(
                         print(f"{agent.log_prefix}   Auth method: {auth_method}")
                         from agent.redact import mask_secret as _mask_secret
 
-                        print(f"{agent.log_prefix}   Token: {_mask_secret(key)}" if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
+                        print(f"{agent.log_prefix}   Token prefix: {_mask_secret(key)}" if isinstance(key, str) and len(key) > 12 else f"{agent.log_prefix}   Token: (empty or short)")
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     from hermes_constants import display_hermes_home as _dhh_fn
                     _dhh = _dhh_fn()
