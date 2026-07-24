@@ -65,6 +65,34 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def test_session_work_remains_pending_until_completion_is_delivered():
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="g",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="route-a",
+        parent_session_id="session-a",
+        origin_session_id="session-a",
+        runner=runner,
+    )
+    delegation_id = result["delegation_id"]
+    assert ad.has_pending_completion_for_session("session-a") is True
+
+    gate.set()
+    assert _drain_for(delegation_id) is not None
+    assert ad.has_pending_completion_for_session("session-a") is True
+    assert ad.mark_completion_delivered(delegation_id) is True
+    assert ad.has_pending_completion_for_session("session-a") is False
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

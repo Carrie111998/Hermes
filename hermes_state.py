@@ -3983,6 +3983,32 @@ class SessionDB:
                     time.time(),
                 ),
             )
+            # Preserve the operator-facing metadata that ordinary linked
+            # session creation inherits. The gateway route CAS below remains
+            # the authoritative publication point for the successor.
+            conn.execute(
+                "UPDATE sessions SET "
+                "display_name = (SELECT display_name FROM sessions WHERE id = ?), "
+                "origin_json = (SELECT origin_json FROM sessions WHERE id = ?), "
+                "cwd = (SELECT cwd FROM sessions WHERE id = ?), "
+                "git_repo_root = (SELECT git_repo_root FROM sessions WHERE id = ?), "
+                "git_branch = (SELECT git_branch FROM sessions WHERE id = ?), "
+                "model = (SELECT model FROM sessions WHERE id = ?), "
+                "model_config = (SELECT model_config FROM sessions WHERE id = ?), "
+                "system_prompt = (SELECT system_prompt FROM sessions WHERE id = ?) "
+                "WHERE id = ?",
+                (
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    successor_session_id,
+                ),
+            )
             ended = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
+import hermes_state as hermes_state_module
 from agent.turn_context import compose_user_api_content
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
 from gateway.platforms.base import MessageEvent
@@ -71,6 +72,24 @@ def test_idle_renewal_is_linked_atomic_and_bounded(tmp_path):
     source = _source()
     predecessor = _seed(store, source)
     predecessor_id = predecessor.session_id
+    store._db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE sessions SET display_name = ?, origin_json = ?, cwd = ?, "
+            "git_repo_root = ?, git_branch = ?, model = ?, model_config = ?, "
+            "system_prompt = ? WHERE id = ?",
+            (
+                "Named lane",
+                '{"platform":"telegram"}',
+                "/tmp/work",
+                "/tmp/repo",
+                "feature/test",
+                "test-model",
+                '{"temperature":0}',
+                "frozen prompt",
+                predecessor_id,
+            ),
+        )
+    )
     _expire(store, predecessor)
 
     successor = store.get_or_create_session(source)
@@ -82,6 +101,17 @@ def test_idle_renewal_is_linked_atomic_and_bounded(tmp_path):
     assert predecessor_row["ended_at"] is not None
     assert successor_row["parent_session_id"] == predecessor_id
     assert successor_row["ended_at"] is None
+    for field in (
+        "display_name",
+        "origin_json",
+        "cwd",
+        "git_repo_root",
+        "git_branch",
+        "model",
+        "model_config",
+        "system_prompt",
+    ):
+        assert successor_row[field] == predecessor_row[field]
     assert successor.input_tokens == successor.output_tokens == successor.total_tokens == 0
     assert successor.estimated_cost_usd == 0
 
@@ -288,13 +318,14 @@ def test_active_work_and_pending_capsule_defer_further_renewal(tmp_path):
     assert store.get_or_create_session(source).session_id == successor.session_id
 
 
-def test_runner_defers_for_alias_route_and_session_lease(tmp_path):
+def test_runner_defers_for_alias_route_and_session_lease(tmp_path, monkeypatch):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._pending_messages = {}
     runner._pending_steer = {}
     runner._running_agents = {"route-b": object()}
     runner._turn_lease_tokens = {}
     runner.session_store = _store(tmp_path)
+    monkeypatch.setattr(runner, "_get_proxy_url", MagicMock(return_value=None))
     now = _now()
     runner.session_store._entries = {
         "route-a": SessionEntry("route-a", "shared", now, now),
@@ -318,6 +349,52 @@ def test_runner_defers_for_alias_route_and_session_lease(tmp_path):
     runner._agent_cache = {
         "route-a": (SimpleNamespace(api_mode="codex_app_server"), "sig")
     }
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
+    runner._agent_cache = {}
+    runner.session_store.set_session_metadata(
+        "route-a", "continuity_capsule_capable", False
+    )
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
+    runner.session_store.set_session_metadata(
+        "route-a", "continuity_capsule_capable", True
+    )
+    monkeypatch.setattr(
+        runner,
+        "_resolve_session_agent_runtime",
+        MagicMock(return_value=("codex", {"api_mode": "codex_app_server"})),
+    )
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
+    monkeypatch.setattr(runner, "_get_proxy_url", MagicMock(return_value="http://proxy"))
+    assert runner._renewal_should_defer("route-a", "shared") is True
+
+
+def test_runner_defers_for_active_async_delegation(tmp_path, monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._pending_messages = {}
+    runner._pending_steer = {}
+    runner._running_agents = {}
+    runner._turn_lease_tokens = {}
+    runner._agent_cache = {
+        "route-a": (
+            SimpleNamespace(api_mode="chat_completions", moa_config=None),
+            "sig",
+        )
+    }
+    runner.session_store = _store(tmp_path)
+    now = _now()
+    runner.session_store._entries = {
+        "route-a": SessionEntry("route-a", "shared", now, now),
+    }
+    runner.session_store._loaded = True
+    monkeypatch.setattr(runner, "_get_proxy_url", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        "tools.async_delegation.has_pending_completion_for_session",
+        lambda session_id: session_id == "shared",
+    )
+
     assert runner._renewal_should_defer("route-a", "shared") is True
 
 
@@ -415,6 +492,97 @@ def test_old_entry_without_capsule_remains_compatible():
     assert SessionEntry.from_dict(raw).continuity_capsule is None
 
 
+@pytest.mark.asyncio
+async def test_gateway_acknowledges_capsule_after_agent_session_rotation(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.async_delegation as async_delegation_module
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(hermes_state_module, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(
+        async_delegation_module,
+        "_db_path",
+        lambda: tmp_path / "async-delegations.db",
+    )
+    config = GatewayConfig()
+    config.default_reset_policy = SessionResetPolicy(
+        mode="idle",
+        idle_minutes=60,
+        at_hour=4,
+        notify=False,
+    )
+    runner = GatewayRunner(config)
+    runner.adapters = {}
+    runner._provider_routing = {}
+    runner.hooks.emit = AsyncMock()
+    runner._is_session_run_current = lambda _key, _generation: True
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+
+    source = _source()
+    predecessor = await runner.async_session_store.get_or_create_session(source)
+    runner.session_store._db.replace_messages(predecessor.session_id, PRED_MESSAGES)
+    _expire(runner.session_store, predecessor)
+    successor = await runner.async_session_store.get_or_create_session(source)
+    successor_id = successor.session_id
+    capsule = successor.continuity_capsule
+    assert capsule
+    rotated_id = f"{successor_id}_compressed"
+
+    async def rotate_and_persist(**_kwargs):
+        db = runner.session_store._db
+        db.end_session(successor_id, "compression")
+        db.create_session(
+            session_id=rotated_id,
+            source="telegram",
+            parent_session_id=successor_id,
+        )
+        api_content = compose_user_api_content("hello", "", capsule)
+        db.append_message(rotated_id, "user", "hello", api_content=api_content)
+        db.append_message(rotated_id, "assistant", "ack")
+        return {
+            "final_response": "ack",
+            "messages": [
+                {"role": "user", "content": api_content},
+                {"role": "assistant", "content": "ack"},
+            ],
+            "history_offset": 0,
+            "session_id": rotated_id,
+            "agent_persisted": True,
+            "completed": True,
+            "failed": False,
+            "last_prompt_tokens": 10,
+            "api_calls": 1,
+        }
+
+    runner._run_agent = rotate_and_persist
+    response = await runner._handle_message_with_agent(
+        MessageEvent(text="hello", source=source, message_id="msg-1"),
+        source,
+        successor.session_key,
+        1,
+    )
+
+    assert response == "ack"
+    assert successor.session_id == rotated_id
+    assert runner.session_store._db.get_session(rotated_id)["parent_session_id"] == (
+        successor_id
+    )
+    canonical = runner.session_store._db.load_gateway_routing_entries(
+        scope=runner.session_store._routing_scope()
+    )
+    routed = json.loads(canonical[successor.session_key])
+    assert routed["session_id"] == rotated_id
+    assert routed["continuity_capsule"] is None
+    assert runner.session_store._db.find_new_user_message_with_capsule(
+        rotated_id,
+        capsule,
+        after_message_id=0,
+    ) is not None
+
+
 def _stream_chunk(*, content=None, finish_reason=None, usage=None):
     return SimpleNamespace(
         choices=[
@@ -455,7 +623,19 @@ async def test_real_gateway_agent_provider_first_turn_persists_capsule(
     compression_mode,
 ):
     """Exercise AsyncSessionStore -> GatewayRunner -> real AIAgent -> provider."""
+    import tools.async_delegation as async_delegation_module
+
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        hermes_state_module,
+        "DEFAULT_DB_PATH",
+        tmp_path / "state.db",
+    )
+    monkeypatch.setattr(
+        async_delegation_module,
+        "_db_path",
+        lambda: tmp_path / "async-delegations.db",
+    )
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
@@ -496,6 +676,7 @@ async def test_real_gateway_agent_provider_first_turn_persists_capsule(
     predecessor.last_prompt_tokens = 100
     _expire(runner.session_store, predecessor)
     successor = await runner.async_session_store.get_or_create_session(source)
+    initial_successor_id = successor.session_id
     capsule = successor.continuity_capsule
     assert capsule
 
@@ -622,6 +803,8 @@ async def test_real_gateway_agent_provider_first_turn_persists_capsule(
     assert len(captured_requests) == (
         2 if compression_mode == "failure_retry_stale_exclusion" else 1
     )
+    if compression_mode in {"forced", "forced_noop"}:
+        assert successor.session_id == initial_successor_id
     if compression_mode == "failure_retry_stale_exclusion":
         debug_rows = runner.session_store._db.get_messages(successor.session_id)
         assert any(
@@ -648,6 +831,35 @@ async def test_real_gateway_agent_provider_first_turn_persists_capsule(
     refreshed = runner.session_store.get_or_create_session(source)
     if compression_mode == "highwater_failure":
         assert refreshed.continuity_capsule == capsule
+        retry_runner = GatewayRunner(config)
+        retry_runner.adapters = {}
+        retry_runner._provider_routing = {}
+        retry_runner.hooks.emit = AsyncMock()
+        retry_runner._is_session_run_current = lambda _key, _generation: True
+        retry_runner._reply_anchor_for_event = lambda _event: None
+        retry_runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+        retry_runner._resolve_session_agent_runtime = runner._resolve_session_agent_runtime
+        assert (
+            retry_runner.session_store.get_or_create_session(source).continuity_capsule
+            == capsule
+        )
+        retry_response = await retry_runner._handle_message_with_agent(
+            MessageEvent(text="retry", source=source, message_id="msg-2"),
+            source,
+            successor.session_key,
+            1,
+        )
+        assert retry_response == "ack"
+        retry_rows = retry_runner.session_store._db.get_messages(successor.session_id)
+        assert not any(
+            row["role"] == "assistant"
+            and "Previous provider attempt ended" in str(row["content"])
+            for row in retry_rows
+        )
+        assert (
+            retry_runner.session_store.get_or_create_session(source).continuity_capsule
+            is None
+        )
         return
     assert refreshed.continuity_capsule is None
     assert (
