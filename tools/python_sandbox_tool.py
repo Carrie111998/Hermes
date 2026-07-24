@@ -37,7 +37,6 @@ DEFAULTS = {
     "cpu_seconds": 60,
     "memory_mb": 1024,
     "file_size_mb": 64,
-    "max_processes": 64,
     "max_open_files": 256,
     "max_snapshot_mb": 512,
 }
@@ -134,7 +133,9 @@ def _probe(force: bool = False) -> tuple[bool, str]:
 
 
 def check_sandbox_available() -> bool:
-    return _probe()[0]
+    # Tool discovery must fail closed against current kernel state rather than
+    # inheriting a prior successful probe from another test or runtime phase.
+    return _probe(force=True)[0]
 
 
 def _dataset_config(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -324,7 +325,6 @@ def _preexec(limits: Mapping[str, int]):
         resource.setrlimit(
             resource.RLIMIT_FSIZE, (limits["file_size_mb"] * 1024**2,) * 2
         )
-        resource.setrlimit(resource.RLIMIT_NPROC, (limits["max_processes"],) * 2)
         resource.setrlimit(
             resource.RLIMIT_NOFILE, (limits["max_open_files"],) * 2
         )
