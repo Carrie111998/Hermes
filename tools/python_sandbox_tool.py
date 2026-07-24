@@ -292,7 +292,7 @@ def _generate_init_script(
             # Assembly is complete. Freeze the tmpfs root before pivot;
             # nested /work stays a separate writable bind mount.
             'mount -o remount,bind,ro "$JAIL"',
-            'pivot_root "$JAIL" "$JAIL/.oldroot"',
+            '/usr/sbin/pivot_root "$JAIL" "$JAIL/.oldroot"',
             "cd /",
             "umount -l /.oldroot",
             "exec /usr/bin/unshare --user --map-user=65534 --map-group=65534 "
@@ -316,7 +316,7 @@ def _build_env(
     # Do not inherit execute_code's configurable passthrough allowlist here:
     # this boundary is deliberately fixed and credential-blind.
     env = {
-        "PATH": "/usr/bin:/bin",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "SANDBOX_INPUTS": json.dumps(
             {name: f"/inputs/{name}" for name in mounts}, sort_keys=True
         ),

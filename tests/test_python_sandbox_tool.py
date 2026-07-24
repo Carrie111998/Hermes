@@ -189,7 +189,7 @@ def test_init_script_mount_plan_has_one_write_surface(tmp_path):
     assert script.count("remount,bind,rw") == 1
     assert "$HOME" not in script
     assert "HERMES_HOME" not in script
-    assert "pivot_root" in script
+    assert '/usr/sbin/pivot_root "$JAIL"' in script
     assert 'mount -o remount,bind,ro "$JAIL"' in script
     assert "exec /usr/bin/unshare --user --map-user=65534" in script
     assert "resource.setrlimit(resource.RLIMIT_NPROC" in script
@@ -219,7 +219,7 @@ def test_child_env_scrubs_secrets_and_exposes_contract_paths(tmp_path):
     assert env["RESULT_PATH"] == "/work/result.json"
     assert env["TMPDIR"] == "/work"
     assert env["HOME"] == "/work"
-    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["PATH"] == "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 def test_stdout_head_tail_truncation_preserves_both_ends():
