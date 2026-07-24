@@ -2591,6 +2591,26 @@ class TestAuxiliaryAuthRefreshRetry:
 
             assert _refresh_provider_credentials("vertex") is False
 
+    def test_resolve_provider_client_vertex_builds_client_from_minted_token(self):
+        """End-to-end: resolve_provider_client("vertex", ...) must reach the
+        auth_type == "vertex" branch and build a working client, not die at
+        the PROVIDER_REGISTRY lookup (a plain HERMES_OVERLAYS-only fix would
+        leave this branch dead code — PROVIDER_REGISTRY is what
+        resolve_provider_client actually gates on)."""
+        with (
+            patch("agent.vertex_adapter.has_vertex_credentials", return_value=True),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                return_value=("ya29.FRESH", "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"),
+            ),
+        ):
+            client, model = resolve_provider_client("vertex", "google/gemini-3-flash-preview")
+
+        assert client is not None
+        assert model == "google/gemini-3-flash-preview"
+        assert str(client.base_url).rstrip("/") == (
+            "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"
+        )
 
     def test_resolve_provider_client_vertex_none_when_no_credentials(self):
         with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
