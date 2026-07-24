@@ -40,11 +40,13 @@ let handleEvent: (event: RpcEvent) => void = () => undefined
 
 function PreviewRoutingHarness({
   activeSessionIdRef: providedActiveSessionIdRef,
+  currentView = 'chat',
   onEvent,
   routedSessionId = 'session-1',
   selectedStoredSessionId = null
 }: {
   activeSessionIdRef?: MutableRefObject<string | null>
+  currentView?: 'chat' | 'settings'
   onEvent: (handler: (event: RpcEvent) => void) => void
   routedSessionId?: string | null
   selectedStoredSessionId?: string | null
@@ -56,7 +58,7 @@ function PreviewRoutingHarness({
     activeSessionIdRef,
     baseHandleGatewayEvent: vi.fn(),
     currentCwd: '/work',
-    currentView: 'chat',
+    currentView,
     requestGateway: vi.fn(),
     routedSessionId,
     selectedStoredSessionId
@@ -233,6 +235,58 @@ describe('usePreviewRouting', () => {
     )
 
     activeSessionIdRef.current = 'session-2'
+    await act(async () => {
+      resolveNormalization(previewTarget('https://www.cnn.com'))
+      await Promise.resolve()
+    })
+
+    expect($previewTarget.get()).toBeNull()
+    expect(window.localStorage.getItem('hermes.desktop.sessionPreviews.v1')).toBeNull()
+  })
+
+  it('does not reopen a preview after leaving chat during normalization', async () => {
+    let resolveNormalization: (target: PreviewTarget) => void = () => undefined
+
+    window.hermesDesktop.normalizePreviewTarget = vi.fn(
+      () =>
+        new Promise<PreviewTarget>(resolve => {
+          resolveNormalization = resolve
+        })
+    )
+
+    const view = render(
+      <PreviewRoutingHarness
+        currentView="chat"
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+
+    act(() =>
+      handleEvent({
+        payload: { url: 'https://www.cnn.com' },
+        session_id: 'session-1',
+        type: 'preview.open'
+      })
+    )
+
+    view.rerender(
+      <PreviewRoutingHarness
+        currentView="settings"
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
+    view.rerender(
+      <PreviewRoutingHarness
+        currentView="chat"
+        onEvent={handler => {
+          handleEvent = handler
+        }}
+      />
+    )
     await act(async () => {
       resolveNormalization(previewTarget('https://www.cnn.com'))
       await Promise.resolve()

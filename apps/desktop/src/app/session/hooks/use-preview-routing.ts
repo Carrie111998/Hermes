@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type MutableRefObject, useCallback, useEffect } from 'react'
+import { type MutableRefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 
 import { gatewayEventCompletedFileDiff } from '@/lib/gateway-events'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
@@ -52,6 +52,12 @@ export function usePreviewRouting({
 }: PreviewRoutingOptions) {
   const previewRegistry = useStore($sessionPreviewRegistry)
   const previewSessionId = activePreviewSessionId(activeSessionIdRef, routedSessionId, selectedStoredSessionId)
+  const previewContextToken = useMemo(() => ({ currentView, previewSessionId }), [currentView, previewSessionId])
+  const activePreviewContextTokenRef = useRef(previewContextToken)
+
+  useLayoutEffect(() => {
+    activePreviewContextTokenRef.current = previewContextToken
+  }, [previewContextToken])
 
   // Restore a *user-opened* preview when its session becomes active. Tool
   // results no longer auto-register/open a preview — the inline preview card in
@@ -112,6 +118,7 @@ export function usePreviewRouting({
         const { url, label } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
         const intendedRuntimeSessionId = event.session_id || activeSessionIdRef.current
+        const intendedPreviewContextToken = previewContextToken
 
         const intendedPreviewSessionId = activePreviewSessionId(
           activeSessionIdRef,
@@ -123,10 +130,15 @@ export function usePreviewRouting({
           target &&
           intendedRuntimeSessionId &&
           intendedPreviewSessionId &&
+          currentView === 'chat' &&
           intendedRuntimeSessionId === activeSessionIdRef.current
         ) {
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(resolved => {
-            if (resolved && intendedRuntimeSessionId === activeSessionIdRef.current) {
+            if (
+              resolved &&
+              intendedRuntimeSessionId === activeSessionIdRef.current &&
+              activePreviewContextTokenRef.current === intendedPreviewContextToken
+            ) {
               const trimmedLabel = typeof label === 'string' ? label.trim() : ''
               setSessionPreviewTarget(
                 intendedPreviewSessionId,
@@ -166,7 +178,15 @@ export function usePreviewRouting({
         requestPreviewReload()
       }
     },
-    [activeSessionIdRef, baseHandleGatewayEvent, currentCwd, routedSessionId, selectedStoredSessionId]
+    [
+      activeSessionIdRef,
+      baseHandleGatewayEvent,
+      currentCwd,
+      currentView,
+      previewContextToken,
+      routedSessionId,
+      selectedStoredSessionId
+    ]
   )
 
   return { handleDesktopGatewayEvent, restartPreviewServer }

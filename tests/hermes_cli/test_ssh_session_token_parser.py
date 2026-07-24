@@ -2,8 +2,9 @@ import argparse
 import os
 
 import pytest
-from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
+from hermes_cli import windows_ssh_runtime
 from hermes_cli.main import _read_ssh_session_token_file, cmd_dashboard
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
 
@@ -44,6 +45,8 @@ def test_one_shot_token_file_rejects_non_starting_operations(operation):
 
 def test_token_file_is_read_and_unlinked_through_private_directory(tmp_path, monkeypatch):
     home = tmp_path / "home"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(home))
     hermes_home = home / ".hermes"
     token_dir = hermes_home / "desktop-ssh" / ("a" * 32)
     token_dir.mkdir(parents=True, mode=0o700)
@@ -58,9 +61,40 @@ def test_token_file_is_read_and_unlinked_through_private_directory(tmp_path, mon
         reset_hermes_home_override(override)
 
 
+def test_profile_process_accepts_machine_home_token_file(tmp_path, monkeypatch):
+    machine_home = tmp_path / "home"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(machine_home))
+    token_dir = machine_home / ".hermes" / "desktop-ssh" / ("a" * 32)
+    token_dir.mkdir(parents=True, mode=0o700)
+    token_path = token_dir / "0123456789abcdef.token"
+    token_path.write_text("b" * 64)
+    token_path.chmod(0o600)
+    profile_home = machine_home / ".hermes" / "profiles" / "work"
+    override = set_hermes_home_override(profile_home)
+    try:
+        assert _read_ssh_session_token_file(str(token_path)) == "b" * 64
+        assert not token_path.exists()
+    finally:
+        reset_hermes_home_override(override)
+
+
+def test_windows_runtime_uses_machine_root_in_profile_process(tmp_path, monkeypatch):
+    machine_root = tmp_path / "machine-hermes"
+    profile_home = machine_root / "profiles" / "work"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    override = set_hermes_home_override(profile_home)
+    try:
+        assert windows_ssh_runtime._root() == machine_root / "desktop-ssh"
+    finally:
+        reset_hermes_home_override(override)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink contract")
 def test_token_file_rejects_symlink(tmp_path, monkeypatch):
     home = tmp_path / "home"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(home))
     token_dir = home / ".hermes" / "desktop-ssh" / ("a" * 32)
     token_dir.mkdir(parents=True, mode=0o700)
     target = tmp_path / "token"
@@ -80,6 +114,8 @@ def test_token_file_rejects_symlink(tmp_path, monkeypatch):
 
 def test_token_file_rejects_parent_escape(tmp_path, monkeypatch):
     home = tmp_path / "home"
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(home))
     token_root = home / ".hermes" / "desktop-ssh"
     token_root.mkdir(parents=True, mode=0o700)
     escaped = token_root.parent / "0123456789abcdef.token"

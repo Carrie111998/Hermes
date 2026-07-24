@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root
 
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX16 = re.compile(r"[0-9a-f]{16}\Z")
@@ -50,7 +50,7 @@ def _nonce(value: str) -> str:
 
 
 def _root() -> Path:
-    return get_hermes_home() / "desktop-ssh"
+    return get_default_hermes_root() / "desktop-ssh"
 
 
 def _directory(ownership_id: str) -> Path:

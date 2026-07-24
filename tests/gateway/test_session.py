@@ -272,12 +272,16 @@ class TestBuildSessionContextPrompt:
 
         # Force the Discord IDs block on (it only emits when discord tools load).
         with patch.object(_gs, "_discord_tools_loaded", return_value=True):
-            p1 = _prompt_for("1001")
-            p2 = _prompt_for("2002")
-            p3 = _prompt_for("3003")
+            p1 = _prompt_for("123456789012345678")
+            p2 = _prompt_for("234567890123456789")
+            p3 = _prompt_for("345678901234567890")
 
         assert p1 == p2 == p3, "system prompt must be stable across message_id"
-        assert "1001" not in p1 and "2002" not in p2 and "3003" not in p3
+        assert (
+            "123456789012345678" not in p1
+            and "234567890123456789" not in p2
+            and "345678901234567890" not in p3
+        )
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
 
