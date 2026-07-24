@@ -859,6 +859,68 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
     ws._whatsapp_onboarding_sessions.clear()
 
 
+def test_prepare_pairing_fails_closed_when_stale_credentials_survive_removal(
+    monkeypatch,
+    tmp_path,
+):
+    from contextlib import contextmanager
+
+    from hermes_cli import web_server as ws
+    from hermes_cli import whatsapp_setup
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    creds = session_dir / "creds.json"
+    creds.write_text('{"still":"valid"}', encoding="utf-8")
+    paired = []
+
+    @contextmanager
+    def profile_scope(_profile):
+        yield
+
+    monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
+    monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: None)
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "resolve_whatsapp_gateway_profile",
+        lambda _profile: "default",
+    )
+    monkeypatch.setattr(
+        whatsapp_setup,
+        "prepare_whatsapp_pairing",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(ws.shutil, "rmtree", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        ws,
+        "_run_whatsapp_pairing",
+        lambda *_args: paired.append(True),
+    )
+    record = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+    )
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["pairing"] = record
+
+    ws._prepare_and_run_whatsapp_pairing(
+        "pairing",
+        session_dir,
+        "bot",
+        "work",
+    )
+
+    assert paired == []
+    assert creds.exists()
+    assert record.status == "error"
+    assert "credentials" in (record.error or "").lower()
+    ws._whatsapp_onboarding_sessions.clear()
+
+
 def test_session_replacement_is_atomic_with_whatsapp_cancellation(
     monkeypatch,
     tmp_path,
@@ -880,10 +942,10 @@ def test_session_replacement_is_atomic_with_whatsapp_cancellation(
     def profile_scope(_profile):
         yield
 
-    def blocking_rmtree(path, *, ignore_errors):
+    def blocking_rmtree(path):
         delete_entered.set()
         assert allow_delete.wait(timeout=2)
-        original_rmtree(path, ignore_errors=ignore_errors)
+        original_rmtree(path)
 
     monkeypatch.setattr(ws, "_config_profile_scope", profile_scope)
     monkeypatch.setattr(ws, "_ensure_whatsapp_pairing_ready", lambda: None)

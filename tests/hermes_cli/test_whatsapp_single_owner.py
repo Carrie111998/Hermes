@@ -93,6 +93,12 @@ def test_enable_env_failure_rolls_config_back_to_disabled(monkeypatch):
         "remove_env_value",
         lambda key: env_removes.append(key) or False,
     )
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    monkeypatch.setattr(
+        config,
+        "read_raw_config",
+        lambda: {"platforms": {"whatsapp": {"enabled": False}}},
+    )
 
     try:
         setup.persist_whatsapp_enabled(True)
@@ -107,6 +113,63 @@ def test_enable_env_failure_rolls_config_back_to_disabled(monkeypatch):
     ]
     assert env_writes == [("WHATSAPP_ENABLED", "true")]
     assert env_removes == ["WHATSAPP_ENABLED"]
+
+
+def test_enable_env_failure_restores_absent_yaml_field(monkeypatch):
+    from hermes_cli import config
+    from hermes_cli import whatsapp_setup as setup
+
+    whatsapp_config = {}
+    writes = []
+
+    def write_yaml(_platform, field, value):
+        writes.append(("yaml", field, value))
+        whatsapp_config[field] = value
+
+    def remove_yaml(_platform, field, *, raw=False):
+        assert raw is True
+        writes.append(("remove-yaml", field))
+        whatsapp_config.pop(field, None)
+
+    monkeypatch.setattr(config, "write_platform_config_field", write_yaml)
+    monkeypatch.setattr(
+        config,
+        "remove_platform_config_field",
+        remove_yaml,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        config,
+        "save_env_value",
+        lambda _key, _value: (_ for _ in ()).throw(
+            PermissionError("env is read-only")
+        ),
+    )
+    monkeypatch.setattr(
+        config,
+        "remove_env_value",
+        lambda key: writes.append(("remove-env", key)) or False,
+    )
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    monkeypatch.setattr(
+        config,
+        "read_raw_config",
+        lambda: {"platforms": {"whatsapp": dict(whatsapp_config)}},
+    )
+
+    try:
+        setup.persist_whatsapp_enabled(True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected activation persistence failure")
+
+    assert "enabled" not in whatsapp_config
+    assert writes == [
+        ("yaml", "enabled", True),
+        ("remove-yaml", "enabled"),
+        ("remove-env", "WHATSAPP_ENABLED"),
+    ]
 
 
 def test_persist_whatsapp_enabled_refuses_unapplied_managed_write(monkeypatch):

@@ -48,6 +48,7 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
         load_env,
         read_raw_config,
         remove_env_value,
+        remove_platform_config_field,
         save_env_value,
         write_platform_config_field,
     )
@@ -62,11 +63,14 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
         if isinstance(previous_platforms, dict)
         else None
     )
+    previous_yaml_had_enabled = (
+        isinstance(previous_whatsapp, dict)
+        and "enabled" in previous_whatsapp
+    )
     previous_yaml_value = (
         previous_whatsapp.get("enabled")
-        if isinstance(previous_whatsapp, dict)
-        and isinstance(previous_whatsapp.get("enabled"), bool)
-        else False
+        if previous_yaml_had_enabled
+        else None
     )
     try:
         # Write config first. A config failure must never leave the stronger
@@ -107,11 +111,18 @@ def persist_whatsapp_enabled(enabled: bool) -> None:
         # mutated. This is symmetric: a failed managed disable must not leave
         # config.yaml false while a protected env override remains true.
         try:
-            write_platform_config_field(
-                "whatsapp",
-                "enabled",
-                previous_yaml_value,
-            )
+            if previous_yaml_had_enabled:
+                write_platform_config_field(
+                    "whatsapp",
+                    "enabled",
+                    previous_yaml_value,
+                )
+            else:
+                remove_platform_config_field(
+                    "whatsapp",
+                    "enabled",
+                    raw=True,
+                )
         except Exception as rollback_exc:
             rollback_errors.append(f"config rollback failed: {rollback_exc}")
         try:

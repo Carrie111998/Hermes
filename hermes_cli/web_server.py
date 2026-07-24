@@ -8553,8 +8553,13 @@ def _prepare_and_run_whatsapp_pairing(
                 # one cancellation-critical section. A cancel that wins this
                 # lock preserves the existing credentials; it cannot interleave
                 # after the check and before deletion.
-                shutil.rmtree(session_path, ignore_errors=True)
-                session_path.mkdir(parents=True, exist_ok=True)
+                if session_path.exists() or session_path.is_symlink():
+                    shutil.rmtree(session_path)
+                if session_path.exists() or session_path.is_symlink():
+                    raise RuntimeError(
+                        "Existing WhatsApp session credentials could not be removed"
+                    )
+                session_path.mkdir(parents=True, exist_ok=False)
     except Exception as exc:
         with _whatsapp_onboarding_lock:
             record = _whatsapp_onboarding_sessions.get(pairing_id)
