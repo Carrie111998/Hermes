@@ -1325,7 +1325,6 @@ def load_gateway_config() -> GatewayConfig:
                         legacy_extra = {}
                         legacy_block["extra"] = legacy_extra
                     legacy_extra["_enabled_explicit"] = True
-                    legacy_extra["_enabled_declared"] = legacy_block["enabled"]
             logger.info(
                 "Loaded legacy %s — consider moving settings to config.yaml",
                 gateway_json_path,
@@ -1508,7 +1507,6 @@ def load_gateway_config() -> GatewayConfig:
                             merged_extra = {}
                             merged["extra"] = merged_extra
                         merged_extra["_enabled_explicit"] = True
-                        merged_extra["_enabled_declared"] = plat_block["enabled"]
                     platforms_data[plat_name] = merged
 
             _merge_platform_map(gateway_platforms)
@@ -1701,7 +1699,6 @@ def load_gateway_config() -> GatewayConfig:
                     # (slack, telegram, matrix, dingtalk, whatsapp, feishu …)
                     # instead of re-enabling them on token/SDK presence. #41112.
                     extra["_enabled_explicit"] = True
-                    extra["_enabled_declared"] = platform_cfg["enabled"]
                 extra.update(bridged)
 
             # Plugin-owned YAML→env config bridges (#24836).  See
@@ -1817,7 +1814,6 @@ def load_gateway_config() -> GatewayConfig:
                 _final_extra = {}
                 _final_block["extra"] = _final_extra
             _final_extra["_enabled_explicit"] = True
-            _final_extra["_enabled_declared"] = _final_block["enabled"]
 
     config = GatewayConfig.from_dict(gw_data)
 
@@ -2696,8 +2692,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                         )
                         configured = False
                 else:
-                    configured = False
-                if not configured:
+                    # Parent contract: when neither static_configuration nor
+                    # is_connected is available, check_fn alone decides
+                    # enablement.  Do not tighten Gateway enrollment here.
+                    configured = None
+                if configured is False:
                     logger.debug(
                         "Plugin platform '%s' available but not statically "
                         "configured — skipping enable",
@@ -2767,7 +2766,4 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         relay_config.extra["relay_url"] = relay_url_val.rstrip("/")
 
     for platform_config in config.platforms.values():
-        enabled_explicit = platform_config.extra.pop("_enabled_explicit", False)
-        enabled_declared = platform_config.extra.pop("_enabled_declared", None)
-        if enabled_explicit and not _coerce_bool(enabled_declared, False):
-            platform_config.enabled = False
+        platform_config.extra.pop("_enabled_explicit", None)

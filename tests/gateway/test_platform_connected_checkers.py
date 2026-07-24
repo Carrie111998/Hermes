@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from gateway.config import Platform
 from gateway.platform_configuration import (
     BUILTIN_PLATFORM_SPECS,
     StaticConfigurationState,
@@ -12,14 +11,10 @@ from gateway.platform_configuration import (
 
 def test_all_builtins_have_shared_pure_configuration_semantics():
     """Every shipped platform must be classified without adapter imports."""
-    expected = {
-        member.value
-        for member in Platform.__members__.values()
-        if member is not Platform.LOCAL
-    }
-    expected.update(Platform._scan_bundled_plugin_platforms())
+    from gateway.config import _BUILTIN_PLATFORM_VALUES
+    from gateway.platform_configuration import BUILTIN_PLATFORM_SPECS
 
-    assert expected <= BUILTIN_PLATFORM_SPECS.keys()
+    assert _BUILTIN_PLATFORM_VALUES - {"local"} <= BUILTIN_PLATFORM_SPECS.keys()
 
 
 def test_every_builtin_spec_handles_minimal_config():

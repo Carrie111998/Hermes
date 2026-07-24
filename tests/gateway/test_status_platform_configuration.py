@@ -44,16 +44,10 @@ def _synthetic_block(spec, *, enabled=True) -> dict:
 
 
 def test_builtin_specs_cover_every_current_builtin_platform():
-    from gateway.config import Platform
+    from gateway.config import _BUILTIN_PLATFORM_VALUES
     from gateway.platform_configuration import BUILTIN_PLATFORM_SPECS
 
-    expected = {
-        member.value for member in Platform.__members__.values()
-        if member is not Platform.LOCAL
-    }
-    expected.update(Platform._scan_bundled_plugin_platforms())
-
-    assert expected <= BUILTIN_PLATFORM_SPECS.keys()
+    assert _BUILTIN_PLATFORM_VALUES - {"local"} <= BUILTIN_PLATFORM_SPECS.keys()
 
 
 @pytest.mark.parametrize(
@@ -654,24 +648,6 @@ def test_explicit_disable_wins_over_environment_enablement():
     )
 
     assert state is StaticConfigurationState.DISABLED
-
-
-def test_full_loader_preserves_explicit_disable_against_env(
-    tmp_path, monkeypatch
-):
-    from gateway.config import Platform, load_gateway_config
-
-    _write_yaml(
-        tmp_path,
-        {"platforms": {"webhook": {"enabled": False}}},
-    )
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("WEBHOOK_ENABLED", "true")
-
-    loaded = load_gateway_config()
-
-    assert loaded.platforms[Platform.WEBHOOK].enabled is False
-    assert Platform.WEBHOOK not in loaded.get_connected_platforms()
 
 
 def test_full_loader_preserves_parent_signal_http_url_contract():

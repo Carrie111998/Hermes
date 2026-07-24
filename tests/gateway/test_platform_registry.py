@@ -790,10 +790,17 @@ class TestPluginEnablementGate:
         finally:
             _reg.unregister("myconfiguredplat")
 
-    def test_plugin_without_declarative_metadata_is_not_auto_enabled(
+    def test_plugin_without_declarative_metadata_falls_back_to_check_fn(
         self, tmp_path, monkeypatch
     ):
-        """Dependency presence is not proof of third-party configuration."""
+        """Legacy plugins without is_connected or static_configuration keep
+        working through the dependency-presence fallback (check_fn).
+
+        The parent contract: when neither static_configuration nor
+        is_connected is available, check_fn alone decides enablement.
+        Readiness may return UNKNOWN for the same plugin, but the full
+        Gateway enrollment path must not tighten this behavior.
+        """
         from gateway.platform_registry import platform_registry as _reg
 
         _reg.register(PlatformEntry(
@@ -812,9 +819,40 @@ class TestPluginEnablementGate:
             cfg = load_gateway_config()
 
             plat = Platform("mylegacyplat")
-            assert plat not in cfg.platforms
+            assert plat in cfg.platforms
+            assert cfg.platforms[plat].enabled is True
         finally:
             _reg.unregister("mylegacyplat")
+
+    def test_plugin_without_is_connected_or_check_fn_is_not_auto_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        """A plugin that provides neither is_connected nor check_fn must not
+        be auto-enabled.  This is the same as the parent behavior: no
+        check_fn means no dependency-presence proof, so the plugin stays
+        disabled.
+        """
+        from gateway.platform_registry import platform_registry as _reg
+
+        _reg.register(PlatformEntry(
+            name="mynocheckplat",
+            label="MyNoCheck",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: False,
+            # is_connected intentionally omitted (None)
+            source="plugin",
+        ))
+        try:
+            home = self._write_config(tmp_path)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+
+            from gateway.config import load_gateway_config, Platform
+            cfg = load_gateway_config()
+
+            plat = Platform("mynocheckplat")
+            assert plat not in cfg.platforms
+        finally:
+            _reg.unregister("mynocheckplat")
 
     def test_is_connected_raises_does_not_enable(self, tmp_path, monkeypatch):
         """A buggy is_connected must not silently enable the platform.
