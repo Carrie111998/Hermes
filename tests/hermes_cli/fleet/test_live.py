@@ -240,6 +240,16 @@ def test_default_service_qualifies_and_executes_each_live_lane(
                 {"result": "claude complete", "modelUsage": {model: {}}}
             )
         else:
+            log_path = Path(argv[argv.index("--log-file") + 1])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                (
+                    "I0724 11:02:16.509256 40296 model_config_manager.go:272] "
+                    "Propagating selected model override to backend: "
+                    'label="Gemini 3.1 Pro (High)"'
+                ),
+                encoding="utf-8",
+            )
             stdout = "antigravity complete"
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
@@ -280,19 +290,19 @@ def test_default_service_qualifies_and_executes_each_live_lane(
     assert result.pin is not None
     assert result.pin.lane_id == lane_id
     if lane_id == "antigravity":
-        assert process_calls == [
-            [
-                str(Path(sys.executable).resolve()),
-                "-p",
-                "--model",
-                "gemini-3.1-pro-high",
-                "--effort",
-                "medium",
-                "--print-timeout",
-                "1800s",
-            ]
+        assert len(process_calls) == 1
+        argv = process_calls[0]
+        assert argv[:3] == [
+            str(Path(sys.executable).resolve()),
+            "-p",
+            "bounded test task",
         ]
+        assert argv[argv.index("--model") + 1] == "Gemini 3.1 Pro (High)"
+        assert "--effort" not in argv
+        assert Path(argv[argv.index("--log-file") + 1]).is_absolute()
+        assert argv[-2:] == ["--print-timeout", "1800s"]
         route_proof = result.adapter_result.metadata["route_proof"]
         assert route_proof["requested_model_id"] == "gemini-3.1-pro-high"
         assert route_proof["model_qualification"] == "agy models"
-        assert route_proof["served_model_id"] is None
+        assert route_proof["served_model_id"] == "gemini-3.1-pro-high"
+        assert route_proof["served_model_label"] == "Gemini 3.1 Pro (High)"

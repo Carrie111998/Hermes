@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+from hermes_constants import get_hermes_home
 
 from .base import safe_child_environment, validate_execution
 from .external_cli import ExternalCliAdapter
@@ -31,6 +35,119 @@ _NATIVE_SUCCESS_FIELDS = frozenset(
     }
 )
 _MAX_STDERR_CHARS = 4096
+_AGY_MODEL_LABELS = {
+    "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
+}
+_AGY_RECEIPT_RE = re.compile(
+    r'Propagating selected model override to backend: label="([^"\r\n]+)"\s*$'
+)
+
+
+def _agy_log_path(run_id: str) -> Path:
+    return (
+        get_hermes_home()
+        / "fleet"
+        / "evidence"
+        / "agy"
+        / f"{run_id}.log"
+    )
+
+
+def _inspect_agy_receipt(
+    log_path: Path,
+    *,
+    canonical_model_id: str,
+    expected_display_label: str,
+) -> dict[str, object]:
+    check: dict[str, object] = {
+        "canonical_model_id": canonical_model_id,
+        "expected_display_label": expected_display_label,
+    }
+    try:
+        raw = log_path.read_bytes()
+    except FileNotFoundError:
+        check["status"] = "missing_log"
+        return check
+    except OSError:
+        check["status"] = "unreadable_log"
+        return check
+    check.update(
+        {
+            "log_bytes": len(raw),
+            "log_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        check["status"] = "malformed_log"
+        return check
+
+    labels: list[str] = []
+    marker_seen = False
+    for line in text.splitlines():
+        if "Propagating selected model override to backend:" not in line:
+            continue
+        marker_seen = True
+        match = _AGY_RECEIPT_RE.search(line)
+        if match is None:
+            check["status"] = "malformed_receipt"
+            return check
+        labels.append(match.group(1))
+    if not labels:
+        check["status"] = "malformed_receipt" if marker_seen else "missing_receipt"
+    elif any(label != expected_display_label for label in labels):
+        check["status"] = "display_label_mismatch"
+    else:
+        check["status"] = "matched"
+        check["receipt_count"] = len(labels)
+    return check
+
+
+def _finalize_agy_log(
+    log_path: Path,
+    receipt_check: Mapping[str, object],
+    *,
+    retain_evidence: bool,
+) -> str:
+    """Delete the raw log, optionally retaining a secret-free JSON receipt."""
+
+    if not retain_evidence:
+        try:
+            log_path.unlink(missing_ok=True)
+            return "removed"
+        except OSError:
+            return "not_persisted"
+
+    try:
+        log_path.unlink(missing_ok=True)
+    except OSError:
+        return "not_persisted"
+
+    receipt_path = log_path.with_suffix(".json")
+    temporary_path = receipt_path.with_name(
+        f".{receipt_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1",
+                    "receipt_check": dict(receipt_check),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        temporary_path.replace(receipt_path)
+        return f"agy:{receipt_path.name}"
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return "not_persisted"
 
 
 def _stderr_receipt(stderr: str | bytes | None) -> str:
@@ -102,17 +219,6 @@ class _SubscriptionCliAdapter(ExternalCliAdapter):
         self._run_process = run_process
 
     def _argv(self, executable: Path, request: AdapterRequest) -> list[str]:
-        if self.lane == "claude_code":
-            return [
-                str(executable),
-                "-p",
-                "--model",
-                request.model,
-                "--effort",
-                request.effort,
-                "--output-format",
-                "json",
-            ]
         return [
             str(executable),
             "-p",
@@ -120,9 +226,228 @@ class _SubscriptionCliAdapter(ExternalCliAdapter):
             request.model,
             "--effort",
             request.effort,
+            "--output-format",
+            "json",
+        ]
+
+    @staticmethod
+    def _agy_argv(
+        executable: Path,
+        request: AdapterRequest,
+        *,
+        display_label: str,
+        log_path: Path,
+    ) -> list[str]:
+        return [
+            str(executable),
+            "-p",
+            request.prompt,
+            "--model",
+            display_label,
+            "--log-file",
+            str(log_path),
             "--print-timeout",
             f"{request.timeout_seconds}s",
         ]
+
+    @staticmethod
+    def _agy_failure(
+        request: AdapterRequest,
+        qualification: Qualification,
+        reason: ReasonCode,
+        receipt_check: Mapping[str, object],
+    ) -> AdapterResult:
+        return AdapterResult(
+            ok=False,
+            reason=reason,
+            provider_id=request.profile.provider_id,
+            model_id=request.model,
+            auth_kind=qualification.auth_kind or "unknown",
+            adapter_kind=AdapterKind.EXTERNAL_CLI,
+            metadata={"receipt_check": dict(receipt_check)},
+        )
+
+    def _finish_agy_failure(
+        self,
+        request: AdapterRequest,
+        qualification: Qualification,
+        reason: ReasonCode,
+        *,
+        run_id: str,
+        log_path: Path,
+        receipt_check: dict[str, object],
+    ) -> AdapterResult:
+        receipt_check["evidence_id"] = _finalize_agy_log(
+            log_path, receipt_check, retain_evidence=True
+        )
+        return self._agy_failure(
+            request, qualification, reason, receipt_check
+        )
+
+    def _execute_agy(
+        self,
+        executable: Path,
+        request: AdapterRequest,
+        qualification: Qualification,
+    ) -> AdapterResult:
+        display_label = _AGY_MODEL_LABELS.get(request.model)
+        if display_label is None:
+            return self._agy_failure(
+                request,
+                qualification,
+                ReasonCode.MODEL_MISMATCH,
+                {
+                    "canonical_model_id": request.model,
+                    "status": "unsupported_model",
+                },
+            )
+
+        run_id = uuid.uuid4().hex
+        log_path = _agy_log_path(run_id)
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return self._agy_failure(
+                request,
+                qualification,
+                ReasonCode.EXECUTION_FAILED,
+                {
+                    "canonical_model_id": request.model,
+                    "expected_display_label": display_label,
+                    "status": "log_path_unavailable",
+                },
+            )
+
+        try:
+            completed = self._run_process(
+                self._agy_argv(
+                    executable,
+                    request,
+                    display_label=display_label,
+                    log_path=log_path,
+                ),
+                capture_output=True,
+                text=True,
+                cwd=request.cwd,
+                env=safe_child_environment(),
+                timeout=request.timeout_seconds,
+                shell=False,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            receipt_check = _inspect_agy_receipt(
+                log_path,
+                canonical_model_id=request.model,
+                expected_display_label=display_label,
+            )
+            receipt_check["receipt_status"] = receipt_check["status"]
+            receipt_check["status"] = "process_timeout"
+            return self._finish_agy_failure(
+                request,
+                qualification,
+                ReasonCode.EXECUTION_TIMEOUT,
+                run_id=run_id,
+                log_path=log_path,
+                receipt_check=receipt_check,
+            )
+        except OSError:
+            receipt_check = _inspect_agy_receipt(
+                log_path,
+                canonical_model_id=request.model,
+                expected_display_label=display_label,
+            )
+            receipt_check["receipt_status"] = receipt_check["status"]
+            receipt_check["status"] = "process_launch_failed"
+            return self._finish_agy_failure(
+                request,
+                qualification,
+                ReasonCode.EXECUTION_FAILED,
+                run_id=run_id,
+                log_path=log_path,
+                receipt_check=receipt_check,
+            )
+
+        receipt_check = _inspect_agy_receipt(
+            log_path,
+            canonical_model_id=request.model,
+            expected_display_label=display_label,
+        )
+        if completed.returncode != 0:
+            receipt_check["receipt_status"] = receipt_check["status"]
+            receipt_check["status"] = "process_exit_nonzero"
+            receipt_check["process_returncode"] = completed.returncode
+            return self._finish_agy_failure(
+                request,
+                qualification,
+                ReasonCode.EXECUTION_FAILED,
+                run_id=run_id,
+                log_path=log_path,
+                receipt_check=receipt_check,
+            )
+        if receipt_check["status"] != "matched":
+            reason = (
+                ReasonCode.MODEL_MISMATCH
+                if receipt_check["status"] == "display_label_mismatch"
+                else ReasonCode.MALFORMED_OUTPUT
+            )
+            return self._finish_agy_failure(
+                request,
+                qualification,
+                reason,
+                run_id=run_id,
+                log_path=log_path,
+                receipt_check=receipt_check,
+            )
+        if not isinstance(completed.stdout, str) or not completed.stdout.strip():
+            receipt_check["receipt_status"] = receipt_check["status"]
+            receipt_check["status"] = "malformed_output"
+            return self._finish_agy_failure(
+                request,
+                qualification,
+                ReasonCode.MALFORMED_OUTPUT,
+                run_id=run_id,
+                log_path=log_path,
+                receipt_check=receipt_check,
+            )
+
+        receipt_check["log_cleanup"] = _finalize_agy_log(
+            log_path, receipt_check, retain_evidence=False
+        )
+        if receipt_check["log_cleanup"] == "not_persisted":
+            receipt_check["receipt_status"] = receipt_check["status"]
+            receipt_check["status"] = "log_cleanup_failed"
+            return self._finish_agy_failure(
+                request,
+                qualification,
+                ReasonCode.EXECUTION_FAILED,
+                run_id=run_id,
+                log_path=log_path,
+                receipt_check=receipt_check,
+            )
+        return AdapterResult(
+            ok=True,
+            reason=ReasonCode.MET,
+            provider_id=request.profile.provider_id,
+            model_id=request.model,
+            auth_kind=qualification.auth_kind or "unknown",
+            adapter_kind=AdapterKind.EXTERNAL_CLI,
+            output=completed.stdout,
+            metadata={
+                "receipt_check": receipt_check,
+                "route_proof": {
+                    "executable": str(executable),
+                    "version": qualification.version,
+                    "requested_model_id": request.model,
+                    "served_model_id": request.model,
+                    "served_model_label": display_label,
+                    "effort": request.effort,
+                    "auth_kind": qualification.auth_kind,
+                    "fast_mode": False,
+                    "fallback_enabled": False,
+                    "model_qualification": "agy models",
+                },
+            },
+        )
 
     def execute(
         self, request: AdapterRequest, qualification: Qualification
@@ -137,6 +462,8 @@ class _SubscriptionCliAdapter(ExternalCliAdapter):
             or executable != Path(qualification.executable).resolve()
         ):
             return self._failure(request, qualification, ReasonCode.QUALIFICATION_FAILED)
+        if self.lane == "antigravity":
+            return self._execute_agy(executable, request, qualification)
         try:
             completed = self._run_process(
                 self._argv(executable, request),
@@ -167,29 +494,21 @@ class _SubscriptionCliAdapter(ExternalCliAdapter):
                 "fallback_enabled": False,
             }
         }
-        if self.lane == "claude_code":
-            try:
-                payload = json.loads(output)
-            except (TypeError, json.JSONDecodeError):
-                return self._failure(request, qualification, ReasonCode.MALFORMED_OUTPUT)
-            if not isinstance(payload, dict) or not isinstance(payload.get("result"), str):
-                return self._failure(request, qualification, ReasonCode.MALFORMED_OUTPUT)
-            usage = payload.get("modelUsage")
-            if isinstance(usage, dict) and usage and request.model not in usage:
-                return self._failure(request, qualification, ReasonCode.MODEL_MISMATCH)
-            output = payload["result"]
-            metadata["cli_receipt"] = {
-                key: payload[key]
-                for key in ("session_id", "is_error", "num_turns")
-                if key in payload
-            }
-        else:
-            if not isinstance(output, str) or not output.strip():
-                return self._failure(
-                    request, qualification, ReasonCode.MALFORMED_OUTPUT
-                )
-            metadata["route_proof"]["model_qualification"] = "agy models"
-            metadata["route_proof"]["served_model_id"] = None
+        try:
+            payload = json.loads(output)
+        except (TypeError, json.JSONDecodeError):
+            return self._failure(request, qualification, ReasonCode.MALFORMED_OUTPUT)
+        if not isinstance(payload, dict) or not isinstance(payload.get("result"), str):
+            return self._failure(request, qualification, ReasonCode.MALFORMED_OUTPUT)
+        usage = payload.get("modelUsage")
+        if isinstance(usage, dict) and usage and request.model not in usage:
+            return self._failure(request, qualification, ReasonCode.MODEL_MISMATCH)
+        output = payload["result"]
+        metadata["cli_receipt"] = {
+            key: payload[key]
+            for key in ("session_id", "is_error", "num_turns")
+            if key in payload
+        }
         return AdapterResult(
             ok=True,
             reason=ReasonCode.MET,
