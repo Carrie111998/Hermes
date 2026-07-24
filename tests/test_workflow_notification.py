@@ -6,12 +6,10 @@ Run: python3 -m pytest tests/test_workflow_notification.py -v
 """
 
 import pytest
-import tempfile
 import json
 import os
 import glob
 from pathlib import Path
-from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -159,17 +157,7 @@ class TestNotifyWorkflowComplete:
         """Marker includes the correct session key from the state file."""
         from plugins.workflow import _notify_workflow_complete
 
-        session_key = "agent:main:discord:thread:123456:123456"
-        state = _make_state(
-            session_info={
-                "platform": "discord",
-                "chat_id": "123456",
-                "thread_id": "123456",
-                "user_id": "789",
-                "profile": None,
-                "session_key": session_key,
-            }
-        )
+        state = _make_state()
         state_path = _write_state_file(tmp_path, state)
 
         with patch("plugins.workflow._find_state_for_card") as mock_find:
@@ -180,7 +168,8 @@ class TestNotifyWorkflowComplete:
 
         markers = glob.glob("/tmp/wf-complete-*.json")
         data = json.loads(Path(markers[-1]).read_text())
-        assert data["session_key"] == session_key
+        expected_key = "agent:main:discord:thread:123456:123456"
+        assert data["session_key"] == expected_key
         os.unlink(markers[-1])
 
     def test_marker_message_includes_node_status(self, tmp_path):
@@ -395,7 +384,7 @@ class TestChatTypeDerivation:
 class TestWatcherMarkerProcessing:
     """Test that the watcher thread correctly processes completion markers."""
 
-    def test_marker_json_is_valid(self):
+    def test_marker_json_is_valid(self, tmp_path):
         """A well-formed marker can be parsed and has all required fields."""
         marker = {
             "session_key": "agent:main:discord:thread:123:123",
@@ -409,16 +398,14 @@ class TestWatcherMarkerProcessing:
             "status": "completed",
             "message": "✅ Workflow 'ideation' completed on board 'adventours'",
         }
-        # Verify all required fields are present
-        assert marker["session_key"]
-        assert marker["platform"]
-        assert marker["chat_id"]
-        assert marker["workflow_name"]
-        assert marker["board"]
-        assert marker["status"] == "completed"
-        assert marker["message"]
+        marker_path = tmp_path / "wf-complete-test.json"
+        marker_path.write_text(json.dumps(marker))
+        data = json.loads(marker_path.read_text())
+        for key in ("session_key", "platform", "chat_id", "workflow_name", "board", "status", "message"):
+            assert key in data, f"Missing key: {key}"
+        assert data["status"] == "completed"
 
-    def test_marker_file_roundtrip(self):
+    def test_marker_file_roundtrip(self, tmp_path):
         """Marker can be written to disk and read back identically."""
         marker = {
             "session_key": "agent:main:discord:thread:123:123",
@@ -432,16 +419,10 @@ class TestWatcherMarkerProcessing:
             "status": "completed",
             "message": "Test message",
         }
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", prefix="wf-complete-", mode="w", delete=False
-        ) as f:
-            json.dump(marker, f)
-            f.flush()
-            # Read back
-            with open(f.name) as r:
-                data = json.load(r)
-            assert data == marker
-            os.unlink(f.name)
+        marker_path = tmp_path / "wf-complete-test.json"
+        marker_path.write_text(json.dumps(marker))
+        data = json.loads(marker_path.read_text())
+        assert data == marker
 
 
 # ── Tests: _find_state_for_card ────────────────────────────────────
@@ -499,16 +480,15 @@ class TestSimplifyCodeFixes:
         assert "workflow_name" in data
         os.unlink(markers[-1])
 
-    def test_stale_marker_detection(self):
+    def test_stale_marker_detection(self, tmp_path):
         """Markers older than 10 minutes are detected as stale."""
         import time
-        marker_path = Path("/tmp/wf-complete-stale-test.json")
+        marker_path = tmp_path / "wf-complete-stale-test.json"
         marker_path.write_text(json.dumps({"test": True}))
         old_time = time.time() - 1200
         os.utime(str(marker_path), (old_time, old_time))
         age = time.time() - os.path.getmtime(str(marker_path))
         assert age > 600
-        marker_path.unlink(missing_ok=True)
 
     def test_notify_with_preloaded_state(self, tmp_path):
         """When state is passed directly, _find_state_for_card is not called."""
