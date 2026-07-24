@@ -2264,6 +2264,14 @@ class WorkflowEngine:
             or (context or {}).get("_session_info")
             or self._get_session_info()
         )
+        # DEBUG: trace session_info
+        try:
+            Path("/tmp/wfe-debug.log").write_text(
+                f"session_info={bool(session_info)} context_si={bool((context or {}).get('_session_info'))} "
+                f"get_session_info={bool(self._get_session_info())} result={bool(_session_info)}\n"
+            )
+        except Exception:
+            pass
         if fire_and_forget:
             loop_layers = self._find_loop_zones(workflow, layers)
             has_loops = len(loop_layers) > 0
@@ -2793,13 +2801,17 @@ class WorkflowEngine:
                         except Exception as e:
                             print(f"   ⚠  {nid} done but result "
                                   f"capture failed: {e}")
-                        # Validate expected output artifacts
-                        validation = self._validate_outputs(node, state)
-                        state.validation_warnings = validation
-                        print(f"   ✓ {nid} completed ({elapsed:.0f}s)"
-                              + (f" [{len(validation)} validation warnings]"
-                                 if validation else ""))
                         pending.discard(nid)
+                        # Validate expected output artifacts
+                        try:
+                            validation = self._validate_outputs(node, state)
+                            state.validation_warnings = validation
+                            print(f"   ✓ {nid} completed ({elapsed:.0f}s)"
+                                  + (f" [{len(validation)} validation warnings]"
+                                     if validation else ""))
+                        except Exception as e:
+                            print(f"   ✓ {nid} completed ({elapsed:.0f}s)"
+                                  f" [validation error: {e}]")
 
                     # ── Review states (kanban has 'review' status) ──
                     elif card_status_lower == "review":
