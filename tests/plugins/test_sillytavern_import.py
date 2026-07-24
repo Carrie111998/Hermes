@@ -108,3 +108,52 @@ def test_scan_full_tree():
         assert result["chats"][0]["message_count"] == 1
         assert len(result["lorebooks"]) == 1
         assert result["lorebooks"][0]["entry_count"] == 1
+
+
+def _load_proxy():
+    spec = importlib.util.spec_from_file_location(
+        "codex_proxy",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "plugins", "sillytavern", "codex_proxy.py",
+        ),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_chat_to_responses_conversion():
+    mod = _load_proxy()
+    body = json.dumps(
+        {"model": "gpt-5.6-luna", "messages": [{"role": "user", "content": "hi"}]}
+    ).encode()
+    out = json.loads(mod._chat_to_responses(body))
+    assert out["store"] is False
+    assert out["stream"] is True
+    assert "max_output_tokens" not in out
+    assert out["input"][0]["role"] == "user"
+    assert out["input"][0]["content"][0]["type"] == "input_text"
+    assert out["input"][0]["content"][0]["text"] == "hi"
+
+
+def test_chat_to_responses_assistant_role():
+    mod = _load_proxy()
+    body = json.dumps(
+        {"messages": [{"role": "assistant", "content": "prev"}]}
+    ).encode()
+    out = json.loads(mod._chat_to_responses(body))
+    assert out["input"][0]["content"][0]["type"] == "output_text"
+
+
+def test_chat_to_responses_passthrough_non_chat():
+    mod = _load_proxy()
+    body = json.dumps({"input": "already responses"}).encode()
+    assert mod._chat_to_responses(body) == body
+
+
+def test_codex_headers_pins_originator():
+    mod = _load_proxy()
+    headers = mod._codex_headers("not.a.jwt")
+    assert headers["originator"] == "codex_cli_rs"
+    assert "codex_cli_rs" in headers["User-Agent"]

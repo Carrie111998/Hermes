@@ -105,6 +105,7 @@ def _configure() -> dict:
     secret_map = {
         "api_key_openai": env.get("OPENAI_API_KEY", ""),
         "api_key_makersuite": env.get("GEMINI_API_KEY", ""),
+        "api_key_xai": env.get("XAI_API_KEY", ""),
         "api_key_llamacpp": "local",
     }
     written = []
@@ -405,6 +406,141 @@ def sillytavern_import_memory(args, **kwargs) -> str:
         return json.dumps({"ok": False, "error": str(exc)})
 
 
+# ── Codex / xAI reverse-proxy bridge ────────────────────────────────
+
+_PROXY_PORT = int(os.environ.get("SILLYTAVERN_PROXY_PORT", "8199"))
+_PROXY_STATE: dict = {"proc": None}
+
+
+def _proxy_up(timeout: float = 2.0) -> bool:
+    try:
+        # Any response (even 401/404) means the listener is alive.
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{_PROXY_PORT}/", timeout=timeout
+        )
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def _codex_token_valid() -> dict:
+    """Return {present, expired, exp} for the Codex OAuth access token."""
+    auth_path = os.path.expanduser("~/.codex/auth.json")
+    if not os.path.exists(auth_path):
+        return {"present": False}
+    try:
+        with open(auth_path, encoding="utf-8") as f:
+            auth = json.load(f)
+        tok = (auth.get("tokens") or {}).get("access_token", "")
+        if not tok:
+            return {"present": False}
+        import base64 as _b64
+        import time as _time
+
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(_b64.urlsafe_b64decode(payload))
+        exp = claims.get("exp", 0)
+        return {
+            "present": True,
+            "expired": exp < _time.time(),
+            "exp": exp,
+        }
+    except Exception as exc:
+        return {"present": True, "error": str(exc)}
+
+
+def sillytavern_proxy_start(args, **kwargs) -> str:
+    """Start the local Codex/xAI reverse-proxy for SillyTavern."""
+    if _proxy_up():
+        return json.dumps(
+            {
+                "ok": True,
+                "already_running": True,
+                "port": _PROXY_PORT,
+                "routes": {
+                    "codex": f"http://127.0.0.1:{_PROXY_PORT}/codex/v1",
+                    "xai": f"http://127.0.0.1:{_PROXY_PORT}/xai/v1",
+                },
+            }
+        )
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex_proxy.py")
+    import sys as _sys
+
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    proc = subprocess.Popen(
+        [_sys.executable, script, "--port", str(_PROXY_PORT)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    _PROXY_STATE["proc"] = proc
+    import time
+
+    for _ in range(10):
+        time.sleep(0.5)
+        if _proxy_up():
+            return json.dumps(
+                {
+                    "ok": True,
+                    "pid": proc.pid,
+                    "port": _PROXY_PORT,
+                    "codex_token": _codex_token_valid(),
+                    "routes": {
+                        "codex": f"http://127.0.0.1:{_PROXY_PORT}/codex/v1",
+                        "xai": f"http://127.0.0.1:{_PROXY_PORT}/xai/v1",
+                    },
+                }
+            )
+    return json.dumps({"ok": False, "pid": proc.pid, "error": "proxy not ready in 5s"})
+
+
+def sillytavern_proxy_stop(args, **kwargs) -> str:
+    """Stop the local Codex/xAI reverse-proxy."""
+    proc = _PROXY_STATE.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()
+        _PROXY_STATE["proc"] = None
+        return json.dumps({"ok": True, "stopped_pid": proc.pid})
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano", "-p", "tcp"],
+            text=True,
+            encoding="cp932",
+            errors="replace",
+            timeout=15,
+        )
+        pids = {
+            line.split()[-1]
+            for line in out.splitlines()
+            if f":{_PROXY_PORT}" in line and "LISTENING" in line
+        }
+        for pid in pids:
+            subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
+        return json.dumps({"ok": True, "killed_pids": sorted(pids)})
+    except Exception as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
+def sillytavern_proxy_status(args, **kwargs) -> str:
+    """Report proxy state and Codex token validity."""
+    return json.dumps(
+        {
+            "running": _proxy_up(),
+            "port": _PROXY_PORT,
+            "codex_token": _codex_token_valid(),
+            "routes": {
+                "codex": f"http://127.0.0.1:{_PROXY_PORT}/codex/v1",
+                "xai": f"http://127.0.0.1:{_PROXY_PORT}/xai/v1",
+            },
+        }
+    )
+
+
 # ── Register ────────────────────────────────────────────────────────
 
 def register(ctx):
@@ -457,4 +593,22 @@ def register(ctx):
         schema=empty,
         handler=sillytavern_import_memory,
         check_fn=_installed,
+    )
+    ctx.register_tool(
+        name="sillytavern_proxy_start",
+        description="Start local reverse-proxy so SillyTavern can use Codex OAuth and xAI Grok.",
+        schema=empty,
+        handler=sillytavern_proxy_start,
+    )
+    ctx.register_tool(
+        name="sillytavern_proxy_stop",
+        description="Stop the Codex/xAI reverse-proxy.",
+        schema=empty,
+        handler=sillytavern_proxy_stop,
+    )
+    ctx.register_tool(
+        name="sillytavern_proxy_status",
+        description="Report Codex/xAI proxy state and Codex OAuth token validity.",
+        schema=empty,
+        handler=sillytavern_proxy_status,
     )
