@@ -1202,7 +1202,8 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     display_kind TEXT,
-    display_metadata TEXT
+    display_metadata TEXT,
+    tool_activity TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -6394,6 +6395,28 @@ class SessionDB:
             return None
         return meta
 
+    @staticmethod
+    def _encode_tool_activity(tool_activity: Any) -> Optional[str]:
+        """Serialize a whitelisted, display-safe activity replay sidecar."""
+        from agent.tool_activity import sanitize_persisted_tool_activity
+
+        safe = sanitize_persisted_tool_activity(tool_activity)
+        return json.dumps(safe, ensure_ascii=True, separators=(",", ":")) if safe else None
+
+    @staticmethod
+    def _decode_tool_activity(tool_activity: Any) -> Optional[Dict[str, Any]]:
+        """Decode and re-sanitize activity metadata from durable storage."""
+        if not isinstance(tool_activity, str) or not tool_activity:
+            return None
+        try:
+            value = json.loads(tool_activity)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to deserialize tool activity; omitting replay metadata")
+            return None
+        from agent.tool_activity import sanitize_persisted_tool_activity
+
+        return sanitize_persisted_tool_activity(value)
+
     def append_message(
         self,
         session_id: str,
@@ -6417,6 +6440,7 @@ class SessionDB:
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
+        tool_activity: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -6466,6 +6490,7 @@ class SessionDB:
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
+        tool_activity_json = self._encode_tool_activity(tool_activity)
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -6509,8 +6534,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content,
+                   display_kind, display_metadata, tool_activity)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6533,6 +6559,7 @@ class SessionDB:
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    tool_activity_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -6645,13 +6672,15 @@ class SessionDB:
             )
 
             api_content = msg.get("api_content")
+            tool_activity_json = self._encode_tool_activity(msg.get("_tool_activity"))
 
             conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content,
+                   display_kind, display_metadata, tool_activity)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6674,6 +6703,7 @@ class SessionDB:
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    tool_activity_json,
                 ),
             )
             inserted += 1
@@ -6881,6 +6911,8 @@ class SessionDB:
             msg = dict(row)
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_activity"):
+                msg["tool_activity"] = self._decode_tool_activity(msg["tool_activity"])
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -6950,6 +6982,8 @@ class SessionDB:
             msg = dict(row)
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_activity"):
+                msg["tool_activity"] = self._decode_tool_activity(msg["tool_activity"])
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -7074,6 +7108,8 @@ class SessionDB:
             msg = dict(row)
             if "content" in msg:
                 msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_activity"):
+                msg["tool_activity"] = self._decode_tool_activity(msg["tool_activity"])
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -7219,7 +7255,7 @@ class SessionDB:
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-                "api_content, display_kind, display_metadata "
+                "api_content, display_kind, display_metadata, tool_activity "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -7247,7 +7283,7 @@ class SessionDB:
         "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, tool_activity"
     )
 
     def _rows_to_conversation(
@@ -7285,6 +7321,9 @@ class SessionDB:
                 decoded = self._decode_display_metadata(row["display_metadata"])
                 if decoded is not None:
                     msg["display_metadata"] = decoded
+            tool_activity = self._decode_tool_activity(row["tool_activity"])
+            if tool_activity:
+                msg["_tool_activity"] = tool_activity
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:

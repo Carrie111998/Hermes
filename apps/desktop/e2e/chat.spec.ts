@@ -99,7 +99,14 @@ test.describe('chat interaction with mock backend', () => {
     await composer.click()
     await composer.type(BLOCKING_CLARIFY_TRIGGER)
     await page.keyboard.press('Enter')
-    await page.getByText(BLOCKING_CLARIFY_QUESTION).waitFor({ state: 'visible', timeout: 30_000 })
+    // Wait on the clarify card itself. Reason-first tool activity can surface the
+    // same question string in a sibling tool row, so a page-wide getByText() is
+    // no longer unique under Playwright strict mode.
+    await page
+      .locator('[data-slot="clarify-inline"]')
+      .filter({ hasText: BLOCKING_CLARIFY_QUESTION })
+      .first()
+      .waitFor({ state: 'visible', timeout: 30_000 })
 
     await expect(primary).toHaveAttribute('aria-label', 'Stop')
     await expect(primary.locator('span')).toHaveClass(/bg-current/)
