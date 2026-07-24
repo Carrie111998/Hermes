@@ -7,14 +7,22 @@ import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 const listOAuthProviders = vi.fn()
 const disconnectOAuthProvider = vi.fn()
 const getEnvVars = vi.fn()
+const getFleetStatus = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
 const onboarding = atom({ manual: false })
+const activeProfile = atom('default')
 
 vi.mock('@/hermes', () => ({
   disconnectOAuthProvider: (providerId: string) => disconnectOAuthProvider(providerId),
   getEnvVars: () => getEnvVars(),
+  getFleetStatus: () => getFleetStatus(),
   listOAuthProviders: () => listOAuthProviders()
+}))
+
+vi.mock('@/store/profile', () => ({
+  $activeGatewayProfile: activeProfile,
+  normalizeProfileKey: (name: null | string | undefined) => name?.trim() || 'default'
 }))
 
 vi.mock('@/store/onboarding', () => ({

@@ -47,7 +47,11 @@ export type GatewayEventPayload = {
   duration_s?: number
   todos?: unknown
   model?: string
+  display_label?: string
+  model_source?: string
   provider?: string
+  fleet_adapter_kind?: string
+  fleet_lane_id?: string
   reasoning_effort?: string
   service_tier?: string
   fast?: boolean

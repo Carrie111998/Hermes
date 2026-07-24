@@ -27,6 +27,7 @@ import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
 import { CustomEndpointsSettings } from './custom-endpoints-settings'
 import { SettingsCategoryHeading, useEnvCredentials } from './env-credentials'
+import { FleetRouterSettings } from './fleet-router-settings'
 import { providerGroup, providerMeta, providerPriority } from './helpers'
 import { SettingsContent, SettingsSkeleton } from './primitives'
 
@@ -44,8 +45,9 @@ function GroupLabel({ children }: { children: ReactNode }) {
   )
 }
 
-// Sub-views surfaced as a sidebar subnav: account sign-in vs raw API keys.
-export const PROVIDER_VIEWS = ['accounts', 'keys', 'custom-endpoints'] as const
+// Sub-views surfaced as a sidebar subnav: account sign-in, raw API keys, the
+// backend-authoritative fleet matrix, and custom endpoints.
+export const PROVIDER_VIEWS = ['accounts', 'keys', 'fleet', 'custom-endpoints'] as const
 
 export type ProviderView = (typeof PROVIDER_VIEWS)[number]
 
@@ -331,7 +333,7 @@ function LocalEndpointRow({ onOpen }: { onOpen: (reason: null | string) => void 
   )
 }
 
-export function ProvidersSettings({
+function ProviderCredentialsSettings({
   onClose,
   onConfigSaved,
   onMainModelChanged,
@@ -505,6 +507,14 @@ export function ProvidersSettings({
       />
     </SettingsContent>
   )
+}
+
+export function ProvidersSettings(props: ProvidersSettingsProps) {
+  if (props.view === 'fleet') {
+    return <FleetRouterSettings />
+  }
+
+  return <ProviderCredentialsSettings {...props} />
 }
 
 interface ProviderKeyGroup {

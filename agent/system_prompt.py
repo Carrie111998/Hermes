@@ -323,6 +323,38 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         stable_parts.append(skills_prompt)
 
+    # Fleet admission is a once-per-new-task workflow, not a per-call model
+    # router. Build this instruction once with the cached session prefix.
+    # Fleet workers are explicitly excluded to prevent recursive delegation.
+    if (agent.platform or "").lower().strip() == "subagent":
+        stable_parts.append(
+            "This worker is already admitted and pinned by its parent workflow. "
+            "Execute the assigned task directly. Do not load the "
+            "fleet-balanced-router skill, do not call `hermes fleet`, and do not "
+            "delegate the task back into the fleet."
+        )
+    else:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _fleet = load_config_readonly().get("fleet") or {}
+            if isinstance(_fleet, dict) and _fleet.get("enabled") is True:
+                stable_parts.append(
+                    "Fleet default workflow is enabled. Desktop Fleet Auto may "
+                    "admit and pin this parent before agent construction. If this "
+                    "parent was pre-admitted, execute the conversation normally. "
+                    "Do not call `hermes fleet run` to readmit or replace this "
+                    "parent. For a separate new substantive bounded child task, "
+                    "load the fleet-balanced-router skill and use its plan/run "
+                    "workflow. Do not route casual conversation, status questions, "
+                    "tiny edits, or continuations as new tasks. Reuse the existing "
+                    "task_id for child-task continuations so lane pinning is "
+                    "preserved. No active session migrates, and Fleet never "
+                    "intercepts individual LLM calls."
+                )
+        except Exception:
+            pass
+
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).

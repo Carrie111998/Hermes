@@ -12,7 +12,11 @@ import {
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
+  setCurrentFleetAdapterKind,
+  setCurrentFleetLaneId,
   setCurrentModel,
+  setCurrentModelDisplayLabel,
+  setCurrentModelSource,
   setCurrentPersonality,
   setCurrentProvider,
   setCurrentReasoningEffort,
@@ -540,7 +544,19 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'fleetAdapterKind'
+    | 'fleetLaneId'
+    | 'model'
+    | 'modelDisplayLabel'
+    | 'modelSource'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'serviceTier'
+    | 'yolo'
   >
 >
 
@@ -564,6 +580,24 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
   if (typeof info.model === 'string') {
     setCurrentModel(info.model)
     sessionState.model = info.model
+  }
+
+  if (typeof info.model_source === 'string') {
+    const displayLabel = typeof info.display_label === 'string' ? info.display_label : ''
+    const modelSource = info.model_source
+    const fleetAdapterKind = typeof info.fleet_adapter_kind === 'string' ? info.fleet_adapter_kind : ''
+    const fleetLaneId = typeof info.fleet_lane_id === 'string' ? info.fleet_lane_id : ''
+
+    setCurrentModelDisplayLabel(displayLabel)
+    setCurrentModelSource(
+      modelSource === 'fleet_auto' || modelSource === 'manual' || modelSource === 'default' ? modelSource : ''
+    )
+    setCurrentFleetAdapterKind(fleetAdapterKind)
+    setCurrentFleetLaneId(fleetLaneId)
+    sessionState.modelDisplayLabel = displayLabel
+    sessionState.modelSource = modelSource
+    sessionState.fleetAdapterKind = fleetAdapterKind
+    sessionState.fleetLaneId = fleetLaneId
   }
 
   if (typeof info.provider === 'string') {

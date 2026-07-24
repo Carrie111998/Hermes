@@ -6,7 +6,19 @@ import type { ClientSessionState } from '../../../types'
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'fleetAdapterKind'
+    | 'fleetLaneId'
+    | 'model'
+    | 'modelDisplayLabel'
+    | 'modelSource'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'serviceTier'
+    | 'yolo'
   >
 >
 
@@ -19,6 +31,22 @@ export function sessionInfoStatePatch(payload: GatewayEventPayload | undefined):
 
   if (typeof payload?.provider === 'string') {
     patch.provider = payload.provider || ''
+  }
+
+  if (typeof payload?.display_label === 'string') {
+    patch.modelDisplayLabel = payload.display_label
+  }
+
+  if (typeof payload?.model_source === 'string') {
+    patch.modelSource = payload.model_source
+  }
+
+  if (typeof payload?.fleet_adapter_kind === 'string') {
+    patch.fleetAdapterKind = payload.fleet_adapter_kind
+  }
+
+  if (typeof payload?.fleet_lane_id === 'string') {
+    patch.fleetLaneId = payload.fleet_lane_id
   }
 
   if (typeof payload?.cwd === 'string') {

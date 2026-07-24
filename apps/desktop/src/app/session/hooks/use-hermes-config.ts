@@ -11,6 +11,7 @@ import {
   setCurrentPersonality,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setFleetAutoComposerEnabled,
   setIntroPersonality
 } from '@/store/session'
 import { applyAutoSpeakFromConfig } from '@/store/voice-prefs'
@@ -89,6 +90,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
           (force || getCurrentModelSource() !== 'manual')
 
         if (shouldSeedComposer) {
+          setFleetAutoComposerEnabled(config.fleet?.parent_desktop_enabled === true)
           setCurrentReasoningEffort(reasoning)
           setCurrentFastMode(FAST_TIERS.has(tier.toLowerCase()))
         }

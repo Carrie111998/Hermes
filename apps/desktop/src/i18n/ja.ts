@@ -227,6 +227,7 @@ export const ja = defineLocale({
       providerAccounts: 'アカウント',
       providerApiKeys: 'API キー',
       providerCustomEndpoints: 'カスタムエンドポイント',
+      providerFleetRouter: 'フリートルーター',
       gateway: 'ゲートウェイ',
       apiKeys: 'ツールとキー',
       keybinds: 'キーボードショートカット',
@@ -875,6 +876,72 @@ export const ja = defineLocale({
       localEndpoint: {
         title: 'ローカル / カスタムエンドポイント',
         description: 'OpenAI 互換のエンドポイント（Zyphra、vLLM、llama.cpp、Ollama など）を指定します。'
+      },
+      fleet: {
+        title: 'フリートルーター',
+        intro:
+          'hermes fleet doctor と同じ認定・容量チェックによる読み取り専用のライブ状態です。このプロファイルではサーバーの結果が正となります。',
+        refresh: '更新',
+        refreshing: '更新中…',
+        tryAgain: '再試行',
+        checking: 'フリートルートを確認中…',
+        unsupportedTitle: 'フリート状態を利用できません',
+        unsupportedDescription:
+          'この Hermes バックエンドは Fleet Router 状態エンドポイントに対応していないか、未対応のスキーマを返しました。バックエンドを更新してから再試行してください。',
+        loadFailedTitle: 'フリート状態を読み込めませんでした',
+        loadFailedDescription: message =>
+          message
+            ? `バックエンドが Fleet Router の状態を確認できませんでした。${message}`
+            : 'バックエンドが Fleet Router の状態を確認できませんでした。',
+        fleetEnabled: 'Fleet 有効',
+        fleetDisabled: 'Fleet オフ',
+        healthy: '正常',
+        attention: '要確認',
+        fleetDisabledDetail:
+          'ルーターは全体でオフです。下のレーンチェックでは、有効にした場合に認定されるルートを引き続き確認できます。',
+        healthyDetail: '少なくとも 1 つのレーンが、必要な認定と容量のチェックをすべて満たしています。',
+        attentionDetail: '現在、必要なチェックをすべて満たすレーンはありません。下の理由コードを確認してください。',
+        fallbackSummary:
+          '完全に新しい容量情報を持つレーンはありませんが、設定済みのローテーションフォールバックにより、少なくとも 1 つの有効なレーンを選択できます。',
+        lanesTitle: 'サブスクリプションレーン',
+        parentLanesTitle: 'Desktop 親レーン',
+        workerLanesTitle: 'タスクワーカーレーン',
+        parent: '親',
+        worker: 'ワーカー',
+        parentAuto: '新しい Desktop セッションで Fleet Auto を使用',
+        parentAutoDescription:
+          'セッション作成時に認定済みのサブスクリプション親を選択して固定します。手動のモデル選択が常に優先されます。',
+        parentAutoFailed: 'Fleet Auto を更新できませんでした',
+        laneNames: {
+          chatgpt_codex: 'ChatGPT / Codex',
+          claude_code: 'Claude Code',
+          grok: 'Grok',
+          antigravity: 'Antigravity',
+          kimi: 'Kimi'
+        },
+        enabled: '有効',
+        disabled: '無効',
+        selectable: '選択可能',
+        blocked: 'ブロック',
+        rotationFallback: 'ローテーション対象',
+        fallbackDetail:
+          '容量テレメトリが古いか不足しているため、決定論的ローテーションに含まれます。これは通常のローテーションであり、プロバイダー障害時のフォールバックではありません。',
+        provider: 'プロバイダー',
+        model: 'モデル',
+        effort: '推論強度',
+        adapter: 'アダプター種別',
+        remaining: '残り容量',
+        freshness: '鮮度',
+        confidence: '信頼度',
+        capacitySource: '容量情報源',
+        reasons: '適格性の理由コード',
+        qualification: '認定の詳細',
+        evidence: '証拠',
+        noQualificationDetail: '認定の詳細は報告されていません。',
+        nativeProvider: 'ネイティブプロバイダー',
+        externalCli: '外部 CLI',
+        unavailable: '利用不可',
+        unknown: '不明'
       },
       loading: 'プロバイダーを読み込み中...'
     },
@@ -2627,6 +2694,7 @@ export const ja = defineLocale({
     cwdStagedMessage:
       'このアクティブなセッションへの cwd の変更を適用するにはデスクトップバックエンドを再起動してください。',
     modelSwitchFailed: 'モデルの切り替えに失敗しました',
+    fleetPinnedModelSwitchBlocked: 'Fleet 固定モデルを変更するには新しいセッションを開始してください',
     sessionExported: 'セッションをエクスポートしました',
     sessionExportFailed: 'セッションをエクスポートできませんでした',
     imageSaved: '画像を保存しました',

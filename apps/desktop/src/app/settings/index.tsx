@@ -11,6 +11,7 @@ import {
   BarChart3,
   Bell,
   Download,
+  GitBranch,
   Globe,
   Info,
   Keyboard,
@@ -176,6 +177,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
           id: 'pview:keys',
           label: t.settings.nav.providerApiKeys,
           onSelect: () => openProviderView('keys')
+        },
+        {
+          active: activeView === 'providers' && providerView === 'fleet',
+          icon: GitBranch,
+          id: 'pview:fleet',
+          label: t.settings.nav.providerFleetRouter,
+          onSelect: () => openProviderView('fleet')
         },
         {
           active: activeView === 'providers' && providerView === 'custom-endpoints',

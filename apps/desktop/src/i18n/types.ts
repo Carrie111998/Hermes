@@ -284,6 +284,7 @@ export interface Translations {
       providerAccounts: string
       providerApiKeys: string
       providerCustomEndpoints: string
+      providerFleetRouter: string
       gateway: string
       apiKeys: string
       keybinds: string
@@ -709,6 +710,57 @@ export interface Translations {
       localEndpoint: {
         title: string
         description: string
+      }
+      fleet: {
+        title: string
+        intro: string
+        refresh: string
+        refreshing: string
+        tryAgain: string
+        checking: string
+        unsupportedTitle: string
+        unsupportedDescription: string
+        loadFailedTitle: string
+        loadFailedDescription: (message: string) => string
+        fleetEnabled: string
+        fleetDisabled: string
+        healthy: string
+        attention: string
+        fleetDisabledDetail: string
+        healthyDetail: string
+        attentionDetail: string
+        fallbackSummary: string
+        lanesTitle: string
+        parentLanesTitle: string
+        workerLanesTitle: string
+        parent: string
+        worker: string
+        parentAuto: string
+        parentAutoDescription: string
+        parentAutoFailed: string
+        laneNames: Record<string, string>
+        enabled: string
+        disabled: string
+        selectable: string
+        blocked: string
+        rotationFallback: string
+        fallbackDetail: string
+        provider: string
+        model: string
+        effort: string
+        adapter: string
+        remaining: string
+        freshness: string
+        confidence: string
+        capacitySource: string
+        reasons: string
+        qualification: string
+        evidence: string
+        noQualificationDetail: string
+        nativeProvider: string
+        externalCli: string
+        unavailable: string
+        unknown: string
       }
       loading: string
     }
@@ -2252,6 +2304,7 @@ export interface Translations {
     cwdStagedTitle: string
     cwdStagedMessage: string
     modelSwitchFailed: string
+    fleetPinnedModelSwitchBlocked: string
     sessionExported: string
     sessionExportFailed: string
     imageSaved: string

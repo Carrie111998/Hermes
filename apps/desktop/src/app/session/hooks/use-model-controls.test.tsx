@@ -50,6 +50,7 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       desktop: {
+        fleetPinnedModelSwitchBlocked: 'Start a new session to change a Fleet-pinned model',
         modelSwitchFailed: 'Model switch failed'
       }
     }
@@ -203,6 +204,31 @@ describe('useModelControls', () => {
     expect(getCurrentModelSource()).toBe('manual')
     expect(requestGateway).not.toHaveBeenCalled()
     expect(setGlobalModel).not.toHaveBeenCalled()
+  })
+
+  it('never mutates a live Fleet-pinned parent through the ordinary model picker', async () => {
+    const requestGateway = vi.fn()
+    setCurrentModel('grok-4.5')
+    setCurrentProvider('xai-oauth')
+    setCurrentModelSource('fleet_auto')
+    $activeSessionId.set('fleet-runtime')
+
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient: new QueryClient(),
+        requestGateway
+      })
+    )
+
+    await expect(result.current.selectModel({ model: 'gpt-5.6-sol', provider: 'openai-codex' })).resolves.toBe(false)
+
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect($currentModel.get()).toBe('grok-4.5')
+    expect(getCurrentModelSource()).toBe('fleet_auto')
+    expect(notifyError).toHaveBeenCalledWith(
+      expect.any(Error),
+      'Start a new session to change a Fleet-pinned model'
+    )
   })
 
   it('updates only the active profile new-chat cache', async () => {

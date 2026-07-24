@@ -9,7 +9,11 @@ import {
   $busy,
   $messages,
   setCurrentFastMode,
+  setCurrentFleetAdapterKind,
+  setCurrentFleetLaneId,
   setCurrentModel,
+  setCurrentModelDisplayLabel,
+  setCurrentModelSource,
   setCurrentPersonality,
   setCurrentProvider,
   setCurrentReasoningEffort,
@@ -34,6 +38,14 @@ interface SessionStateCacheOptions {
 
 function syncRuntimeMetadataToView(state: ClientSessionState) {
   setCurrentModel(state.model ?? '')
+  setCurrentModelDisplayLabel(state.modelDisplayLabel ?? '')
+  setCurrentModelSource(
+    state.modelSource === 'fleet_auto' || state.modelSource === 'manual' || state.modelSource === 'default'
+      ? state.modelSource
+      : ''
+  )
+  setCurrentFleetAdapterKind(state.fleetAdapterKind ?? '')
+  setCurrentFleetLaneId(state.fleetLaneId ?? '')
   setCurrentProvider(state.provider ?? '')
   setCurrentReasoningEffort(state.reasoningEffort ?? '')
   setCurrentServiceTier(state.serviceTier ?? '')

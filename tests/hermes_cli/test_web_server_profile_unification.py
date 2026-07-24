@@ -643,3 +643,126 @@ class TestProfileScopedChatPty:
         with pytest.raises(web_server.HTTPException) as exc:
             web_server._resolve_chat_argv(profile="ghost")
         assert exc.value.status_code == 404
+
+
+class TestProfileScopedFleetStatus:
+    def test_status_returns_shared_doctor_payload_from_requested_profile(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal
+        from types import SimpleNamespace
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli.fleet import inspection
+        from hermes_cli.fleet.profiles import ordered_profiles
+        from hermes_cli.fleet.types import (
+            CapacitySnapshot,
+            Confidence,
+            Freshness,
+            LaneEvaluation,
+            ReasonCode,
+        )
+
+        now = datetime(2026, 7, 24, 5, 0, tzinfo=timezone.utc)
+        profiles = ordered_profiles()
+        capacity = CapacitySnapshot(
+            lane_id="chatgpt_codex",
+            used_pct=Decimal("20.000"),
+            remaining_pct=Decimal("80.000"),
+            reserved_pct=Decimal("5.000"),
+            effective_remaining_pct=Decimal("75.000"),
+            source_kind="bridge_file",
+            source_id="profile-test#abc123",
+            captured_at=now,
+            read_at=now,
+            expires_at=now + timedelta(minutes=5),
+            freshness=Freshness.FRESH,
+            confidence=Confidence.HIGH,
+            schema_version="1",
+            overage_disabled=True,
+        )
+        evaluations = tuple(
+            LaneEvaluation(
+                lane_id=profile.lane_id,
+                profile=profile,
+                capacity=capacity if profile.lane_id == "chatgpt_codex" else None,
+                eligible=profile.lane_id == "chatgpt_codex",
+                reasons=(
+                    (ReasonCode.MET,)
+                    if profile.lane_id == "chatgpt_codex"
+                    else (ReasonCode.LANE_DISABLED,)
+                ),
+                selected_model=profile.selected_model,
+                selected_effort=profile.selected_effort,
+                qualification_evidence_id=f"evidence:{profile.lane_id}",
+                qualification_detail=f"qualified {profile.lane_id}",
+            )
+            for profile in profiles
+        )
+        seen = {}
+
+        class FakeService:
+            config = SimpleNamespace(
+                default_reservation_pct=Decimal("5.000"),
+                enabled=True,
+                parent_desktop_enabled=True,
+            )
+
+            def inspect(self, task):
+                seen["task"] = task
+                return evaluations
+
+            def inspect_parent(self, task):
+                seen["parent_task"] = task
+                return evaluations
+
+        def fake_build_fleet_service():
+            seen["home"] = get_hermes_home()
+            return FakeService()
+
+        monkeypatch.setattr(
+            inspection,
+            "build_fleet_service",
+            fake_build_fleet_service,
+        )
+
+        response = client.get(
+            "/api/fleet/status",
+            params={"profile": "worker_beta"},
+        )
+
+        assert response.status_code == 200
+        assert seen["home"] == isolated_profiles["worker_beta"]
+        assert seen["task"].task_id == "read-only-doctor"
+        assert seen["parent_task"] is seen["task"]
+        payload = response.json()
+        assert payload["schema_version"] == 1
+        assert payload["command"] == "doctor"
+        assert payload["enabled"] is True
+        assert payload["ok"] is True
+        assert [item["lane_id"] for item in payload["evaluations"]] == [
+            "chatgpt_codex",
+            "claude_code",
+            "grok",
+            "antigravity",
+            "kimi",
+        ]
+        codex = payload["evaluations"][0]
+        assert codex["enabled"] is True
+        assert codex["selectable"] is True
+        assert codex["fallback_eligible"] is False
+        assert codex["model_label"] == "GPT-5.6 Sol"
+        assert codex["capacity"]["effective_remaining_pct"] == "75.000"
+        assert codex["qualification_detail"] == "qualified chatgpt_codex"
+        assert payload["purposes"]["task_worker"]["eligible"] is True
+        assert payload["purposes"]["desktop_parent"]["enabled"] is True
+        assert payload["purposes"]["desktop_parent"]["eligible"] is True
+
+    def test_unknown_profile_returns_404(self, client, isolated_profiles):
+        response = client.get(
+            "/api/fleet/status",
+            params={"profile": "ghost"},
+        )
+
+        assert response.status_code == 404

@@ -1388,6 +1388,7 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "fleet_parent_route": session.get("fleet_parent_route"),
         "source": _session_source(session),
         "attached_images": attached_images,
     }
@@ -1746,6 +1747,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                if exact_route := current.get("fleet_parent_route"):
+                    kw["exact_route"] = exact_route
+                    kw["cwd_override"] = current.get("cwd")
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2130,6 +2134,12 @@ def _ensure_session_db_row(session: dict) -> None:
         # service_tier value to the provider. Persist a durable marker so resume
         # can distinguish that choice from an omitted/inherited tier.
         model_config["service_tier"] = create_service_tier_override or "normal"
+    if session.get("fleet_parent_route"):
+        from tui_gateway.fleet_parent import persisted_parent_route
+
+        model_config.update(
+            persisted_parent_route(session.get("fleet_parent_route"))
+        )
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -4005,6 +4015,8 @@ def _probe_credentials(agent) -> str:
     warn when the key is genuinely missing.
     """
     try:
+        if getattr(agent, "external_subscription", False):
+            return ""
         key = getattr(agent, "api_key", "") or ""
         provider = getattr(agent, "provider", "") or ""
         if not key:
@@ -4054,6 +4066,78 @@ def _current_profile_name() -> str:
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
+
+
+def _admit_fleet_parent_session(
+    *,
+    profile_id: str,
+    profile_home: Path | None,
+    lineage_root_id: str,
+    session_id: str,
+    cwd: str,
+):
+    """Profile-scoped gateway boundary for committed parent admission."""
+
+    from tui_gateway.fleet_parent import admit_parent_session
+
+    home_token = (
+        set_hermes_home_override(str(profile_home))
+        if profile_home is not None
+        else None
+    )
+    try:
+        return admit_parent_session(
+            profile_id=profile_id,
+            lineage_root_id=lineage_root_id,
+            session_id=session_id,
+            cwd=cwd,
+        )
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _fleet_parent_gates_open(*, profile_home: Path | None) -> bool:
+    """True when Desktop parent admission is commissioned for this profile."""
+
+    home_token = (
+        set_hermes_home_override(str(profile_home))
+        if profile_home is not None
+        else None
+    )
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fleet.config import parse_fleet_config
+
+        config = parse_fleet_config(load_config_readonly())
+        return bool(config.enabled and config.parent_desktop_enabled)
+    except Exception:
+        return False
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _restore_fleet_parent_route(
+    *,
+    profile_id: str,
+    profile_home: Path | None,
+    session_row: dict,
+):
+    """Read a persisted lineage marker under the session's profile scope."""
+
+    from tui_gateway.fleet_parent import restore_parent_route
+
+    home_token = (
+        set_hermes_home_override(str(profile_home))
+        if profile_home is not None
+        else None
+    )
+    try:
+        return restore_parent_route(session_row, profile_id=profile_id)
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 # Monotonic GUI<->backend contract version. The desktop app refuses to drive a
@@ -4179,6 +4263,15 @@ def _session_info(agent, session: dict | None = None) -> dict:
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
     }
+    route = (session or {}).get("fleet_parent_route")
+    if route:
+        from tui_gateway.fleet_parent import persisted_parent_route
+
+        info.update(persisted_parent_route(route))
+    elif (session or {}).get("model_source"):
+        info["model_source"] = str(session.get("model_source"))
+        if session.get("model_source") == "manual":
+            info["fleet_selection_reason"] = "MANUAL_OVERRIDE"
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -5358,6 +5451,8 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    exact_route: dict | None = None,
+    cwd_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5367,6 +5462,38 @@ def _make_agent(
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
         return synthetic
+
+    if (
+        exact_route is not None
+        and exact_route.get("fleet_adapter_kind") == "external_cli"
+    ):
+        route_model = str(exact_route.get("model") or "").strip()
+        route_provider = str(exact_route.get("provider") or "").strip()
+        override_model = (
+            str(model_override.get("model") or "").strip()
+            if isinstance(model_override, dict)
+            else ""
+        )
+        override_provider = (
+            str(model_override.get("provider") or "").strip()
+            if isinstance(model_override, dict)
+            else ""
+        )
+        if (
+            route_model != "gemini-3.1-pro-high"
+            or route_provider != "antigravity-subscription"
+            or override_model != route_model
+            or override_provider != route_provider
+        ):
+            raise RuntimeError("external fleet parent override does not match its pin")
+        from tui_gateway.external_parent import build_external_parent_driver
+
+        return build_external_parent_driver(
+            route=exact_route,
+            cwd=Path(cwd_override or _default_session_cwd()),
+            session_id=session_id or key,
+            session_db=session_db if session_db is not None else _get_db(),
+        )
 
     from run_agent import AIAgent
 
@@ -5419,10 +5546,38 @@ def _make_agent(
             system_prompt = "\n\n".join(
                 part for part in (system_prompt, skills_prompt) if part
             ).strip()
+    # A fleet parent is already committed to one qualified provider/model.
+    # Resolve that exact subscription runtime without consulting startup or
+    # fallback chains, and reject any runtime identity substitution.
+    if exact_route is not None:
+        from tui_gateway.fleet_parent import resolve_exact_native_runtime
+
+        route_model = str(exact_route.get("model") or "").strip()
+        route_provider = str(exact_route.get("provider") or "").strip()
+        override_model = (
+            str(model_override.get("model") or "").strip()
+            if isinstance(model_override, dict)
+            else ""
+        )
+        override_provider = (
+            str(model_override.get("provider") or "").strip()
+            if isinstance(model_override, dict)
+            else ""
+        )
+        if (
+            not route_model
+            or not route_provider
+            or override_model != route_model
+            or override_provider != route_provider
+        ):
+            raise RuntimeError("fleet parent model override does not match its pin")
+        model = route_model
+        requested_provider = route_provider
+        runtime = resolve_exact_native_runtime(exact_route)
     # Prefer a per-session model override (set by a prior in-session /model
     # switch) over global config/env resolution. Resume-time stored sessions may
     # also pass scalar model/provider/runtime knobs from the persisted DB row.
-    if isinstance(model_override, dict) and model_override.get("model"):
+    elif isinstance(model_override, dict) and model_override.get("model"):
         model = str(model_override.get("model") or "")
         requested_provider = model_override.get("provider") or provider_override or None
         override_base_url = model_override.get("base_url")
@@ -5483,8 +5638,8 @@ def _make_agent(
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
-    _pr = _load_provider_routing()
-    return AIAgent(
+    _pr = {} if exact_route is not None else _load_provider_routing()
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
@@ -5506,9 +5661,13 @@ def _make_agent(
             else _load_reasoning_config(str(model or ""))
         ),
         service_tier=(
-            service_tier_override
-            if service_tier_override is not None
-            else _load_service_tier()
+            None
+            if exact_route is not None
+            else (
+                service_tier_override
+                if service_tier_override is not None
+                else _load_service_tier()
+            )
         ),
         enabled_toolsets=_load_enabled_toolsets(),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
@@ -5528,9 +5687,18 @@ def _make_agent(
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
-        fallback_model=_load_fallback_model(),
+        fallback_model=(
+            None if exact_route is not None else _load_fallback_model()
+        ),
         **_agent_cbs(sid),
     )
+    if exact_route is not None:
+        from tui_gateway.fleet_parent import persisted_parent_route
+
+        init_model_config = getattr(agent, "_session_init_model_config", None)
+        if isinstance(init_model_config, dict):
+            init_model_config.update(persisted_parent_route(exact_route))
+    return agent
 
 
 def _init_session(
@@ -6310,6 +6478,57 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    model_source = str(params.get("model_source") or "default").strip().lower()
+    if model_source not in {"default", "manual", "fleet_auto"}:
+        return _err(rid, 4004, "model_source must be default, manual, or fleet_auto")
+    fleet_parent_route = None
+    # When Desktop parent admission is commissioned, the backend — not stale
+    # composer localStorage — selects and pins the route before agent build.
+    # Stale/manual Sonnet state cannot create an uncommissioned parent.
+    fleet_parent_on = (
+        source == "desktop" and _fleet_parent_gates_open(profile_home=profile_home)
+    )
+    if fleet_parent_on:
+        from hermes_cli.fleet.parent_models import (
+            is_sonnet_model,
+            reject_sonnet_parent_reason,
+        )
+
+        if model_source == "manual" and is_sonnet_model(create_model):
+            return _err(rid, 4004, reject_sonnet_parent_reason(create_model))
+        if model_source != "manual":
+            model_source = "fleet_auto"
+    if model_source == "fleet_auto":
+        from hermes_constants import parse_reasoning_effort
+        from tui_gateway.fleet_parent import (
+            admission_error,
+            parent_route_metadata,
+        )
+
+        admission = _admit_fleet_parent_session(
+            profile_id=profile or _current_profile_name(),
+            profile_home=profile_home,
+            lineage_root_id=key,
+            session_id=key,
+            cwd=resolved_cwd,
+        )
+        if admission.pin is None:
+            return _err(rid, 5033, admission_error(admission))
+        try:
+            fleet_parent_route = parent_route_metadata(admission.pin)
+        except ValueError as exc:
+            return _err(rid, 5033, f"Fleet Auto parent admission failed: {exc}")
+        # Authoritative backend route wins over any stale composer model.
+        session_model_override = {
+            "model": fleet_parent_route["model"],
+            "provider": fleet_parent_route["provider"],
+        }
+        create_reasoning_override = parse_reasoning_effort(
+            fleet_parent_route["reasoning_effort"]
+        )
+        create_service_tier_override = ""
+        create_model = fleet_parent_route["model"]
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
@@ -6338,6 +6557,8 @@ def _(rid, params: dict) -> dict:
             "inflight_turn": None,
             "last_active": now,
             "model_override": session_model_override,
+            "model_source": model_source,
+            "fleet_parent_route": fleet_parent_route,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id,
@@ -6388,6 +6609,13 @@ def _(rid, params: dict) -> dict:
                 **(
                     {"provider": session_model_override["provider"]}
                     if session_model_override and session_model_override.get("provider")
+                    else {}
+                ),
+                **(fleet_parent_route or {}),
+                "model_source": model_source,
+                **(
+                    {"fleet_selection_reason": "MANUAL_OVERRIDE"}
+                    if model_source == "manual"
                     else {}
                 ),
                 "tools": {},
@@ -6551,6 +6779,7 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     profile: str | None = None,
+    fleet_parent_route: dict | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
@@ -6567,6 +6796,10 @@ def _lazy_resume_info(
     }
     if provider:
         info["provider"] = provider
+    if fleet_parent_route:
+        from tui_gateway.fleet_parent import persisted_parent_route
+
+        info.update(persisted_parent_route(fleet_parent_route))
     return info
 
 
@@ -6584,6 +6817,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    fleet_parent_route: dict | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -6609,6 +6843,10 @@ def _deferred_session_record(
         "last_active": now,
         "lazy": lazy,
         "model_override": model_override,
+        "model_source": (
+            "fleet_auto" if fleet_parent_route is not None else "default"
+        ),
+        "fleet_parent_route": fleet_parent_route,
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides,
@@ -6722,6 +6960,20 @@ def _(rid, params: dict) -> dict:
             target = tip
             found = db.get_session(target) or found
 
+    try:
+        fleet_parent_route = _restore_fleet_parent_route(
+            profile_id=profile or _current_profile_name(),
+            profile_home=profile_home,
+            session_row=found,
+        )
+    except RuntimeError as exc:
+        return _err(rid, 5033, f"Fleet parent resume failed: {exc}")
+    fleet_runtime_overrides = None
+    if fleet_parent_route is not None:
+        from tui_gateway.fleet_parent import parent_runtime_overrides
+
+        fleet_runtime_overrides = parent_runtime_overrides(fleet_parent_route)
+
     profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
         profile_home
     )
@@ -6788,6 +7040,13 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
+            model_override=(
+                fleet_runtime_overrides.get("model_override")
+                if fleet_runtime_overrides
+                else None
+            ),
+            resume_runtime_overrides=fleet_runtime_overrides,
+            fleet_parent_route=fleet_parent_route,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -6815,7 +7074,21 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd, profile=profile),
+                "info": _lazy_resume_info(
+                    cwd,
+                    model=(
+                        fleet_parent_route.get("model", "")
+                        if fleet_parent_route
+                        else ""
+                    ),
+                    provider=(
+                        fleet_parent_route.get("provider", "")
+                        if fleet_parent_route
+                        else ""
+                    ),
+                    profile=profile,
+                    fleet_parent_route=fleet_parent_route,
+                ),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -6868,7 +7141,11 @@ def _(rid, params: dict) -> dict:
         # Restore the model/provider/reasoning/tier this chat last used so the
         # deferred build (and the info below) match the eager path — without them
         # the build drops the provider ("No LLM provider configured").
-        overrides = _stored_session_runtime_overrides(found) or {}
+        overrides = (
+            fleet_runtime_overrides
+            or _stored_session_runtime_overrides(found)
+            or {}
+        )
         model_override = overrides.get("model_override") or {}
         cwd = profile_resume_cwd or _default_session_cwd()
         record = _deferred_session_record(
@@ -6883,6 +7160,7 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+            fleet_parent_route=fleet_parent_route,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
@@ -6903,6 +7181,7 @@ def _(rid, params: dict) -> dict:
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
                     profile=profile,
+                    fleet_parent_route=fleet_parent_route,
                 ),
                 "inflight": None,
                 "running": False,
@@ -6950,13 +7229,18 @@ def _(rid, params: dict) -> dict:
             # resolve to the profile too. Runtime identity is restored from the
             # stored session row so switching chats does not inherit whatever
             # global model another chat last selected.
-            stored_runtime_overrides = _stored_session_runtime_overrides(found)
+            stored_runtime_overrides = (
+                fleet_runtime_overrides
+                or _stored_session_runtime_overrides(found)
+            )
             agent = _make_agent(
                 sid,
                 target,
                 session_id=target,
                 session_db=db,
                 platform_override=source,
+                exact_route=fleet_parent_route,
+                cwd_override=cwd,
                 **stored_runtime_overrides,
             )
         finally:
@@ -7017,6 +7301,9 @@ def _(rid, params: dict) -> dict:
                     _sessions[sid]["model_override"] = stored_runtime_overrides[
                         "model_override"
                     ]
+                if fleet_parent_route is not None:
+                    _sessions[sid]["model_source"] = "fleet_auto"
+                    _sessions[sid]["fleet_parent_route"] = fleet_parent_route
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
                 # Remember the profile home so each turn re-binds HERMES_HOME (the
                 # agent persists to its own db, but mid-turn home reads — memory,
@@ -10777,6 +11064,10 @@ def _run_prompt_submit(
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
+        parent_turn_guard = None
+        turn_outcome = "failed"
+        provider_failure = False
+        agent_call_started = False
         goal_followup = None  # set by the post-turn goal hook below
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -10794,6 +11085,13 @@ def _run_prompt_submit(
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
+            if fleet_parent_route := session.get("fleet_parent_route"):
+                from tui_gateway.fleet_parent import acquire_parent_turn_guard
+
+                parent_turn_guard = acquire_parent_turn_guard(
+                    fleet_parent_route,
+                    cwd=Path(_session_cwd(session)),
+                )
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -10808,7 +11106,7 @@ def _run_prompt_submit(
             # once-override back to the config model before the turn runs
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
+            if not one_turn_restore and not session.get("fleet_parent_route"):
                 _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
@@ -10957,6 +11255,7 @@ def _run_prompt_submit(
                     run_kwargs["task_id"] = session["session_key"]
             except (TypeError, ValueError):
                 pass
+            agent_call_started = True
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -11066,6 +11365,12 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                turn_outcome = status
+                provider_failure = bool(
+                    result.get("failed")
+                    or result.get("billing_block")
+                    or result.get("failure_reason")
+                )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -11084,6 +11389,7 @@ def _run_prompt_submit(
             else:
                 raw = str(result)
                 status = "complete"
+                turn_outcome = status
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
@@ -11249,6 +11555,7 @@ def _run_prompt_submit(
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            provider_failure = agent_call_started
             import traceback
 
             trace = traceback.format_exc()
@@ -11277,6 +11584,14 @@ def _run_prompt_submit(
                     _persist_live_session_system_prompt(session)
                 except Exception:
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
+            if parent_turn_guard is not None:
+                try:
+                    parent_turn_guard.release(
+                        outcome=turn_outcome,
+                        provider_failure=provider_failure,
+                    )
+                except Exception:
+                    logger.exception("failed to release fleet parent turn lease")
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)

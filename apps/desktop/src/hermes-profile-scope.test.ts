@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   checkHermesUpdate,
   getActionStatus,
+  getFleetStatus,
   getMemoryProviderConfig,
   getStatus,
   restartGateway,
@@ -50,6 +51,7 @@ describe('backend action helpers are profile-scoped', () => {
     setApiRequestProfile('coder')
 
     void getStatus()
+    void getFleetStatus()
     void restartGateway()
     void updateHermes()
     void checkHermesUpdate()

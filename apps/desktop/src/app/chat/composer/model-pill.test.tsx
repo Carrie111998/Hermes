@@ -25,6 +25,17 @@ afterEach(() => {
 // #62055: a manual composer pick is sticky and silently overrides the
 // Settings → Model default for every NEW chat. The pill must say so.
 describe('ModelPill pinned-override badge', () => {
+  it('shows Fleet Auto honestly before a parent route is committed', () => {
+    setCurrentModel('stale/manual-model')
+    setCurrentModelSource('fleet_auto')
+    $activeSessionId.set(null)
+
+    render(<ModelPill disabled={false} model={modelState({ model: 'stale/manual-model' })} />)
+
+    expect(screen.getByText('Auto · Fleet on send')).toBeTruthy()
+    expect(screen.queryByText(/Stale/i)).toBeNull()
+  })
+
   it('shows the pin dot on a draft running a manual pick', () => {
     setCurrentModel('deepseek/deepseek-v4-flash')
     setCurrentModelSource('manual')
@@ -95,7 +106,11 @@ describe('ModelPill per-surface model label', () => {
       $messages: atom([]),
       $messagesEmpty: atom(true),
       $model: atom('tile/claude-sonnet'),
+      $modelDisplayLabel: atom(''),
+      $modelSource: atom('manual'),
       $provider: atom('anthropic'),
+      $fleetAdapterKind: atom(''),
+      $fleetLaneId: atom(''),
       $reasoningEffort: atom('high'),
       $runtimeId: atom('tile-runtime'),
       $storedId: atom('stored-tile')
@@ -112,5 +127,36 @@ describe('ModelPill per-surface model label', () => {
 
     expect(screen.getByText('Sonnet · High')).toBeTruthy()
     expect(screen.queryByText(/primary/i)).toBeNull()
+  })
+
+  it('renders the backend-authoritative Fleet route label after admission', () => {
+    const fleetView: SessionView = {
+      kind: 'tile',
+      $awaitingResponse: atom(false),
+      $busy: atom(false),
+      $cwd: atom(''),
+      $fast: atom(false),
+      $fleetAdapterKind: atom('external_cli'),
+      $fleetLaneId: atom('antigravity'),
+      $lastVisibleIsUser: atom(false),
+      $messages: atom([]),
+      $messagesEmpty: atom(true),
+      $model: atom('gemini-3.1-pro-high'),
+      $modelDisplayLabel: atom('Antigravity · Gemini 3.1 Pro High · external CLI'),
+      $modelSource: atom('fleet_auto'),
+      $provider: atom('antigravity-subscription'),
+      $reasoningEffort: atom('high'),
+      $runtimeId: atom('fleet-runtime'),
+      $storedId: atom('fleet-stored')
+    }
+
+    render(
+      <SessionViewProvider value={fleetView}>
+        <ModelPill disabled={false} model={modelState({ model: '', provider: '' })} />
+      </SessionViewProvider>
+    )
+
+    expect(screen.getByText('Antigravity · Gemini 3.1 Pro High · external CLI')).toBeTruthy()
+    expect(screen.getByTestId('fleet-route-badge').textContent).toBe('external CLI')
   })
 })
