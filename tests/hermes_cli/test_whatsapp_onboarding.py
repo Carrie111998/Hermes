@@ -652,6 +652,61 @@ def test_start_whatsapp_onboarding_replaces_existing_session_exclusively(monkeyp
     ws._whatsapp_onboarding_sessions.clear()
 
 
+def test_replacement_invalidates_stale_connected_onboarding_record(monkeypatch, tmp_path):
+    from hermes_cli import web_server as ws
+
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "creds.json").write_text('{"old":true}', encoding="utf-8")
+    stale = ws._WhatsAppOnboardingSession(
+        proc=None,
+        mode="bot",
+        allowed_users="",
+        session_path=str(session_dir),
+        expires_at="2099-01-01T00:00:00Z",
+        expires_at_ts=time.time() + 600,
+        status="connected",
+    )
+
+    class FakeThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    ws._whatsapp_onboarding_sessions.clear()
+    ws._whatsapp_onboarding_sessions["stale-connected"] = stale
+    monkeypatch.setattr(ws, "_whatsapp_session_path", lambda: session_dir)
+    monkeypatch.setattr(ws.secrets, "token_urlsafe", lambda size: "replacement")
+    monkeypatch.setattr(ws.threading, "Thread", FakeThread)
+
+    asyncio.run(
+        ws.start_whatsapp_onboarding(
+            ws.WhatsAppOnboardingStart(
+                mode="bot",
+                allowed_users="",
+                replace_existing=True,
+            )
+        )
+    )
+
+    assert stale.status == "cancelled"
+    try:
+        asyncio.run(
+            ws.apply_whatsapp_onboarding(
+                "stale-connected",
+                ws.WhatsAppOnboardingApply(mode="bot", allowed_users=""),
+            )
+        )
+    except ws.HTTPException as exc:
+        assert exc.status_code == 409
+        assert "not connected" in str(exc.detail)
+    else:
+        raise AssertionError("superseded connected records must not remain applyable")
+    ws._whatsapp_onboarding_sessions.clear()
+
+
 def test_start_whatsapp_onboarding_returns_before_bridge_spawn(monkeypatch, tmp_path):
     from hermes_cli import web_server as ws
 
@@ -790,7 +845,11 @@ def test_prepare_and_run_whatsapp_pairing_quiesces_before_deleting_session(
         ("profile", "work"),
         (
             "quiesced",
-            {"profile": "work", "gateway_profile": "default"},
+            {
+                "profile": "work",
+                "gateway_profile": "default",
+                "session_path": session_dir,
+            },
             True,
         ),
         ("paired", "pairing", session_dir, "bot", False),

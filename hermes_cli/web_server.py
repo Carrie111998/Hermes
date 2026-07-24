@@ -8540,6 +8540,7 @@ def _prepare_and_run_whatsapp_pairing(
             prepare_whatsapp_pairing(
                 profile=profile,
                 gateway_profile=gateway_profile,
+                session_path=session_path,
             )
             with _whatsapp_onboarding_lock:
                 record = _whatsapp_onboarding_sessions.get(pairing_id)
@@ -8593,7 +8594,10 @@ def _prune_whatsapp_onboarding_sessions() -> None:
 
 def _supersede_whatsapp_onboarding_sessions(session_path: Path) -> None:
     for existing in _whatsapp_onboarding_sessions.values():
-        if existing.session_path == str(session_path) and existing.status not in _WHATSAPP_ONBOARDING_TERMINAL_STATUSES:
+        if (
+            existing.session_path == str(session_path)
+            and existing.status not in {"error", "expired", "cancelled"}
+        ):
             existing.status = "cancelled"
             existing.error = "Superseded by a newer WhatsApp setup session."
             _terminate_whatsapp_pairing(existing.proc)

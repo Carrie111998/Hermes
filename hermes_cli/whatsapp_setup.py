@@ -9,10 +9,12 @@ after the pair-only process exits successfully.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Mapping, Optional
 
 from hermes_cli._subprocess_compat import (
@@ -267,6 +269,53 @@ def _preflight_gateway_restart(profile: Optional[str]) -> None:
         _raise_if_system_gateway_requires_root(get_running_pid(pid_path))
 
 
+def _configured_whatsapp_bridge_port() -> int:
+    """Resolve the selected profile's Baileys bridge port."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        platform = load_gateway_config().platforms.get(Platform.WHATSAPP)
+        return int(platform.extra.get("bridge_port", 3000)) if platform else 3000
+    except (TypeError, ValueError):
+        raise RuntimeError("WhatsApp bridge_port must be an integer")
+
+
+def _loopback_port_is_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def _quiesce_whatsapp_bridge(
+    session_path: Path,
+    *,
+    bridge_port: Optional[int] = None,
+    timeout: float = 5.0,
+    poll_interval: float = 0.1,
+) -> None:
+    """Stop and verify any pidfile/port-owned bridge before pair-only starts."""
+    from plugins.platforms.whatsapp.adapter import (
+        _kill_port_process,
+        _kill_stale_bridge_by_pidfile,
+    )
+
+    port = bridge_port if bridge_port is not None else _configured_whatsapp_bridge_port()
+    _kill_stale_bridge_by_pidfile(session_path)
+    _kill_port_process(port, session_path)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _loopback_port_is_listening(port):
+            return
+        time.sleep(poll_interval)
+    raise RuntimeError(
+        "WhatsApp pairing cannot start because the existing bridge still "
+        f"owns {session_path} on port {port}. Stop that bridge, then retry."
+    )
+
+
 def restart_gateway_if_running(
     *,
     profile: Optional[str] = None,
@@ -350,17 +399,34 @@ def prepare_whatsapp_pairing(
     restart_gateway: bool = True,
     profile: Optional[str] = None,
     gateway_profile: Optional[str] = None,
+    session_path: Optional[Path] = None,
+    bridge_port: Optional[int] = None,
 ) -> bool:
     """Disable WhatsApp and quiesce any gateway-managed bridge before pairing."""
     owner_profile = gateway_profile if gateway_profile is not None else profile
     if restart_gateway:
         _preflight_gateway_restart(owner_profile)
     persist_whatsapp_enabled(False)
-    return (
+    restarted = (
         restart_gateway_if_running(profile=owner_profile)
         if restart_gateway
         else False
     )
+    if session_path is None:
+        from hermes_constants import get_hermes_dir
+
+        session_path = get_hermes_dir(
+            "platforms/whatsapp/session",
+            "whatsapp/session",
+        )
+    if bridge_port is None:
+        _quiesce_whatsapp_bridge(Path(session_path))
+    else:
+        _quiesce_whatsapp_bridge(
+            Path(session_path),
+            bridge_port=bridge_port,
+        )
+    return restarted
 
 
 def activate_whatsapp_after_pairing(

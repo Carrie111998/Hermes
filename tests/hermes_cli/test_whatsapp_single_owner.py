@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def test_persist_whatsapp_enabled_updates_env_and_yaml(monkeypatch):
     from hermes_cli import config
@@ -153,9 +155,100 @@ def test_prepare_disables_before_gateway_restart(monkeypatch):
         "restart_gateway_if_running",
         lambda **kwargs: events.append(("restart", kwargs)) or True,
     )
+    monkeypatch.setattr(
+        setup,
+        "_quiesce_whatsapp_bridge",
+        lambda session_path, **kwargs: events.append(
+            ("quiesce", session_path, kwargs)
+        ),
+    )
 
-    assert setup.prepare_whatsapp_pairing() is True
-    assert events == [("enabled", False), ("restart", {"profile": None})]
+    session_path = Path("/tmp/whatsapp-session")
+    assert setup.prepare_whatsapp_pairing(session_path=session_path) is True
+    assert events == [
+        ("enabled", False),
+        ("restart", {"profile": None}),
+        ("quiesce", session_path, {}),
+    ]
+
+
+def test_prepare_refuses_pairing_when_reused_bridge_survives_restart(monkeypatch):
+    from hermes_cli import whatsapp_setup as setup
+
+    events: list[object] = []
+    monkeypatch.setattr(setup, "_preflight_gateway_restart", lambda profile: None)
+    monkeypatch.setattr(
+        setup,
+        "persist_whatsapp_enabled",
+        lambda enabled: events.append(("enabled", enabled)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "restart_gateway_if_running",
+        lambda **kwargs: events.append(("restart", kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        setup,
+        "_quiesce_whatsapp_bridge",
+        lambda session_path, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("bridge still owns the WhatsApp session")
+        ),
+    )
+
+    try:
+        setup.prepare_whatsapp_pairing(
+            profile="default",
+            session_path=Path("/tmp/whatsapp-session"),
+        )
+    except RuntimeError as exc:
+        assert "still owns" in str(exc)
+    else:
+        raise AssertionError("pairing must fail while a reused bridge survives")
+
+    assert events == [
+        ("enabled", False),
+        ("restart", {"profile": "default"}),
+    ]
+
+
+def test_quiesce_kills_known_bridge_owners_and_verifies_port_release(monkeypatch):
+    from hermes_cli import whatsapp_setup as setup
+    from plugins.platforms.whatsapp import adapter
+
+    session_path = Path("/tmp/whatsapp-session")
+    events: list[object] = []
+    listening = iter([True, False])
+    monkeypatch.setattr(
+        adapter,
+        "_kill_stale_bridge_by_pidfile",
+        lambda path: events.append(("pidfile", path)),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_kill_port_process",
+        lambda port, path: events.append(("port", port, path)),
+    )
+    monkeypatch.setattr(
+        setup,
+        "_loopback_port_is_listening",
+        lambda port: events.append(("probe", port)) or next(listening),
+    )
+    monkeypatch.setattr(setup.time, "sleep", lambda delay: events.append(("sleep", delay)))
+
+    setup._quiesce_whatsapp_bridge(
+        session_path,
+        bridge_port=3412,
+        timeout=1,
+        poll_interval=0.01,
+    )
+
+    assert events == [
+        ("pidfile", session_path),
+        ("port", 3412, session_path),
+        ("probe", 3412),
+        ("sleep", 0.01),
+        ("probe", 3412),
+    ]
 
 
 def test_prepare_system_gateway_preflight_runs_before_disable(monkeypatch):

@@ -262,7 +262,11 @@ def test_fresh_pairing_uses_canonical_whatsapp_session_path(isolated_home, monke
         ("resolve", "work"),
         (
             "prepare",
-            {"profile": "work", "gateway_profile": "default"},
+            {
+                "profile": "work",
+                "gateway_profile": "default",
+                "session_path": isolated_home / "platforms" / "whatsapp" / "session",
+            },
         ),
         ("restart", {"profile": "default"}),
     ]

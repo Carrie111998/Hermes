@@ -2842,6 +2842,7 @@ def cmd_whatsapp(args):
         gateway_restarted = prepare_whatsapp_pairing(
             profile=pairing_profile,
             gateway_profile=gateway_profile,
+            session_path=session_dir,
         )
     except Exception as exc:
         print(f"\n✗ Could not prepare WhatsApp pairing: {exc}")
