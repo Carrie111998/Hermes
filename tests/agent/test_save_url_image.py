@@ -74,6 +74,22 @@ class _TinyImageHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
+import sys as _sys
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_modules():
+    """http_server pops hermes_constants / agent.image_gen_provider modules so
+    they re-read HERMES_HOME. Restore the registry after each test so later
+    test files don't patch stale module objects (cross-test pollution)."""
+    snapshot = dict(_sys.modules)
+    try:
+        yield
+    finally:
+        _sys.modules.clear()
+        _sys.modules.update(snapshot)
+
+
 @pytest.fixture
 def http_server(tmp_path, monkeypatch):
     """Spin up a localhost HTTP server and isolate HERMES_HOME under tmp_path."""

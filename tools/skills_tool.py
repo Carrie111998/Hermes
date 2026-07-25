@@ -120,6 +120,7 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
             m = d.stat().st_mtime
         except OSError:
             continue
+        children_sig = []
         try:
             with os.scandir(d) as it:
                 for entry in it:
@@ -128,11 +129,21 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
                             em = entry.stat(follow_symlinks=False).st_mtime
                             if em > m:
                                 m = em
+                            # Entry-count of the child dir: NTFS applies
+                            # directory-mtime bumps lazily, so an add/remove
+                            # inside a category may not move its mtime in
+                            # time for the next scan. The count catches it.
+                            try:
+                                with os.scandir(entry.path) as it2:
+                                    n = sum(1 for _ in it2)
+                            except OSError:
+                                n = -1
+                            children_sig.append((entry.name, n))
                     except OSError:
                         continue
         except OSError:
             pass
-        sig.append((str(d), m))
+        sig.append((str(d), m, tuple(sorted(children_sig))))
     return (tuple(sig), frozenset(disabled), platform)
 
 

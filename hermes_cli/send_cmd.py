@@ -58,7 +58,10 @@ def _read_message_body(
         if file_path == "-":
             return sys.stdin.read()
         try:
-            return Path(file_path).read_text(encoding="utf-8", errors="replace")
+            # Strict decode on purpose: a binary file must fall into the
+            # UnicodeDecodeError branch below, which tells the user to use
+            # MEDIA: instead. errors="replace" would silently send mojibake.
+            return Path(file_path).read_text(encoding="utf-8")
         except UnicodeDecodeError:
             print(
                 f"hermes send: {file_path} is not a text file. --file reads the "

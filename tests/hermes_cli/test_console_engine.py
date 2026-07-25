@@ -421,8 +421,21 @@ def test_config_set_requires_confirmation_then_writes(_isolate_hermes_home):
     assert read_raw_config()["telegram"]["test"] is True
 
 
-def test_sessions_list_and_stats_use_isolated_session_store(_isolate_hermes_home):
+def test_sessions_list_and_stats_use_isolated_session_store(
+    _isolate_hermes_home, monkeypatch
+):
+    import hermes_state
+    from hermes_constants import get_hermes_home
     from hermes_state import SessionDB
+
+    # hermes_state.DEFAULT_DB_PATH is bound at module-import time.  If any
+    # test file imported hermes_state at module top (collection time, before
+    # the per-test HERMES_HOME redirect), the constant points at the real
+    # ~/.hermes/state.db instead of this test's isolated home.  Pin it to the
+    # isolated store so SessionDB() and the console engine agree.
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
+    )
 
     db = SessionDB()
     try:

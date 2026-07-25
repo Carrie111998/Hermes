@@ -262,6 +262,9 @@ def test_gateway_force_kill_hides_taskkill_window(monkeypatch):
             {
                 "capture_output": True,
                 "text": True,
+                # Decoding is pinned (P-051) rather than left to the locale
+                # default (GBK on zh-CN Windows).
+                "encoding": "utf-8",
                 # taskkill prints in the OEM/ANSI codepage (GBK on zh-CN
                 # Windows) — strict decoding would kill the reader thread.
                 "errors": "replace",

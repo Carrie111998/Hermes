@@ -31,6 +31,17 @@ def _reset_routing_state(monkeypatch):
     # Default: no CDP override, no Camofox
     monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    # Deterministic DNS: the routing oracle resolves hostnames live, and in
+    # environments with fake-ip DNS proxies every public hostname resolves to
+    # a private-range address. Pin "localhost" to loopback and everything
+    # else to a public IP so routing decisions are environment-independent.
+    import socket
+
+    def _fake_getaddrinfo(host, port=0, *args, **kwargs):
+        ip = "127.0.0.1" if host in ("localhost",) else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)
 
 
 class TestNavigationSessionKey:

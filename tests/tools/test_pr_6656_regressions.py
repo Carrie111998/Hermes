@@ -62,10 +62,20 @@ class TestUninstallPathTraversal:
         hub_dir.mkdir(parents=True)
         lock_path = hub_dir / "lock.json"
 
-        monkeypatch.setattr(hub, "SKILLS_DIR", skills_dir)
-        monkeypatch.setattr(hub, "HUB_DIR", hub_dir)
-        monkeypatch.setattr(hub, "LOCK_FILE", lock_path)
-        monkeypatch.setattr(hub, "AUDIT_LOG", hub_dir / "audit.log")
+        # tools.skills_hub exposes these paths via PEP 562 __getattr__ — they
+        # are NOT real module attributes. monkeypatch.setattr would restore
+        # them by writing the pre-test resolved value back as a REAL
+        # attribute, permanently freezing the dynamic resolution for every
+        # later test. Set/remove them in __dict__ directly instead.
+        _MISSING = object()
+        _pinned = {
+            "SKILLS_DIR": skills_dir,
+            "HUB_DIR": hub_dir,
+            "LOCK_FILE": lock_path,
+            "AUDIT_LOG": hub_dir / "audit.log",
+        }
+        _saved = {n: hub.__dict__.get(n, _MISSING) for n in _pinned}
+        hub.__dict__.update(_pinned)
         # Rebind HubLockFile.__init__'s default `path=` arg so
         # `HubLockFile()` (no args) picks up the new lock path.
         monkeypatch.setattr(
@@ -79,7 +89,14 @@ class TestUninstallPathTraversal:
         victim = tmp_path / "do-not-delete"
         victim.mkdir()
         (victim / "important.txt").write_text("data")
-        return skills_dir, hub_dir, victim
+        yield skills_dir, hub_dir, victim
+        # Restore the exact pre-test module state (usually: names absent, so
+        # PEP 562 __getattr__ dynamic resolution keeps working).
+        for _n, _v in _saved.items():
+            if _v is _MISSING:
+                hub.__dict__.pop(_n, None)
+            else:
+                hub.__dict__[_n] = _v
 
     def _write_lock(self, hub_dir: Path, entries: dict) -> None:
         lock_path = hub_dir / "lock.json"

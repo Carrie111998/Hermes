@@ -269,6 +269,15 @@ class TestResolveChannelName:
 
 
 class TestBuildFromSessions:
+    @pytest.fixture(autouse=True)
+    def _force_sessions_json_fallback(self):
+        """These tests assert sessions.json behavior. state.db is the primary
+        source and is the ambient real database in this test process — rows
+        written by other tests would shadow the fixtures. Force the fallback.
+        """
+        with patch("hermes_state.SessionDB", side_effect=Exception("no db in test")):
+            yield
+
     def _write_sessions(self, tmp_path, sessions_data):
         """Write sessions.json at the path _build_from_sessions expects."""
         sessions_path = tmp_path / "sessions" / "sessions.json"

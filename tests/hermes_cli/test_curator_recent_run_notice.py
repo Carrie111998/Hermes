@@ -27,18 +27,42 @@ def curator_env(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-    import hermes_constants
-    importlib.reload(hermes_constants)
-    from agent import curator
-    importlib.reload(curator)
-    from hermes_cli import main as hermes_main
-    importlib.reload(hermes_main)
+    # Evict + re-import (NOT importlib.reload): reload mutates the shared
+    # module __dict__ in place, so class/function objects imported by other
+    # test modules at collection time end up generation-split from the ones
+    # the reloaded module creates at call time (isinstance/monkeypatch
+    # breakage downstream). Snapshot/restore keeps module identity intact.
+    import sys
 
-    yield {
-        "curator": curator,
-        "main": hermes_main,
-        "capsys": capsys,
-    }
+    saved = {}
+    for mod in list(sys.modules.keys()):
+        if (
+            mod == "hermes_constants"
+            or mod.startswith("hermes_cli")
+            or mod == "curator"
+            or mod == "agent.curator"
+        ):
+            saved[mod] = sys.modules.pop(mod)
+    import hermes_constants  # noqa: F401 — fresh import picks up HERMES_HOME
+    from agent import curator
+    from hermes_cli import main as hermes_main
+
+    try:
+        yield {
+            "curator": curator,
+            "main": hermes_main,
+            "capsys": capsys,
+        }
+    finally:
+        for mod in list(sys.modules.keys()):
+            if (
+                mod == "hermes_constants"
+                or mod.startswith("hermes_cli")
+                or mod == "curator"
+                or mod == "agent.curator"
+            ):
+                del sys.modules[mod]
+        sys.modules.update(saved)
 
 
 def _set_state(curator_mod, **fields):

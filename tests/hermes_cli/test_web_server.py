@@ -1163,6 +1163,8 @@ class TestWebServerEndpoints:
     def test_put_honcho_first_save_merges_into_resolved_config(self, monkeypatch, tmp_path):
         # With no profile-local file, a save merges into the resolved global config.
         monkeypatch.setenv("HOME", str(tmp_path))
+        # Path.home() keys off USERPROFILE on Windows.
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         from hermes_constants import get_hermes_home
 
         global_path = tmp_path / ".honcho" / "config.json"

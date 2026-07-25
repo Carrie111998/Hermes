@@ -14,21 +14,37 @@ def test_no_duplicate_skills_subparser():
 
     if the duplicate 'skills' registration is reintroduced.
     """
-    # Force fresh import of the module where parser is constructed
-    # If there are duplicate 'skills' subparsers, this import will raise
-    # argparse.ArgumentError at module load time
+    # Import the module where the parser is constructed in a SUBPROCESS.
+    # If there are duplicate 'skills' subparsers, the import raises
+    # argparse.ArgumentError at module load time and the process exits
+    # non-zero.  A subprocess is used because importing hermes_cli.main
+    # executes module-level startup code (dotenv load, plugin discovery,
+    # config caches) with global side effects; a fresh in-process re-import
+    # leaks those into the shared interpreter and breaks later tests
+    # (cross-test pollution).
+    import os
+    import subprocess
     import sys
+    from pathlib import Path
 
-    # Remove cached module if present
-    if 'hermes_cli.main' in sys.modules:
-        del sys.modules['hermes_cli.main']
-
-    try:
-        import hermes_cli.main  # noqa: F401
-    except argparse.ArgumentError as e:
-        if "conflicting subparser" in str(e):
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [sys.executable, "-c", "import hermes_cli.main"],
+        env=env,
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        if "conflicting subparser" in result.stderr:
             raise AssertionError(
-                f"Duplicate subparser detected: {e}. "
+                f"Duplicate subparser detected: {result.stderr[-1000:]} "
                 "See issue #898 for details."
-            ) from e
-        raise
+            )
+        raise AssertionError(
+            "import hermes_cli.main failed in subprocess:\n"
+            f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
+        )

@@ -127,6 +127,8 @@ class TestPathCompletions:
 
     def test_home_expansion(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
+        # Path.home()/expanduser keys off USERPROFILE on Windows.
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         (tmp_path / "testfile.md").touch()
 
         completions = list(SlashCommandCompleter._path_completions("~/test"))
@@ -198,6 +200,10 @@ class TestIntegration:
         event = MagicMock()
         assert list(completer.get_completions(doc, event)) == []
 
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="asserts against /etc/hosts, a POSIX-only path",
+    )
     def test_absolute_path_triggers_completion(self, completer):
         doc = Document("check /etc/hos", cursor_position=14)
         event = MagicMock()

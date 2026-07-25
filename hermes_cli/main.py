@@ -12547,6 +12547,31 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
 
 
+def _compute_well_known_ports(dashboard_port: int) -> list[int]:
+    """Return the full port set to claim for a given dashboard port.
+
+    The dashboard port plus two satellite ports (webhook, proxy) are claimed
+    as an atomic set.  Satellite ports are offset from the dashboard port so
+    that multiple Hermes instances can coexist without colliding:
+
+        dashboard=9120 → [9120, 8644, 8645]
+        dashboard=9121 → [9121, 8646, 8647]
+        dashboard=9122 → [9122, 8648, 8649]
+        ...
+
+    Must be kept in sync with the Rust ``ports_to_claim`` in
+    ``Hermes-CN-Desktop/src/process/dashboard.rs``.
+    """
+    _SATELLITE_BASE: tuple[int, int] = (8644, 8645)
+    _DEFAULT_DASHBOARD_PORT: int = 9120
+    if dashboard_port <= 0:
+        return [dashboard_port] if dashboard_port else []
+    offset = (dashboard_port - _DEFAULT_DASHBOARD_PORT) * 2
+    webhook_port = _SATELLITE_BASE[0] + offset
+    proxy_port = _SATELLITE_BASE[1] + offset
+    return [dashboard_port, webhook_port, proxy_port]
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
@@ -12867,18 +12892,25 @@ def cmd_dashboard(args):
     from hermes_cli.port_lock import claim_port_set
 
     _dashboard_port = int(args.port)
-    _well_known_ports = [8644, 8645]
-    if _dashboard_port > 0:
-        _well_known_ports.insert(0, _dashboard_port)
-    _port_locks = claim_port_set(_well_known_ports)
-    if _port_locks is None:
-        print(
-            f"Error: port {_dashboard_port} (or associated webhook/proxy ports) "
-            f"is already claimed by another Hermes instance.\n"
-            f"Stop the other instance, or use `--port 0` to let the OS assign a free port.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+
+    # When the desktop spawns this backend, it _already_ holds the OS-level
+    # port locks (see try_claim_dashboard_ports in the Rust desktop).  Claiming
+    # them again from the child process would fail because the parent's locks
+    # are still held.  Desktop-managed backends skip the claim and trust the
+    # parent's coordination.
+    if os.environ.get("HERMES_DESKTOP_MANAGED") == "1":
+        _port_locks = []
+    else:
+        _well_known_ports = _compute_well_known_ports(_dashboard_port)
+        _port_locks = claim_port_set(_well_known_ports)
+        if _port_locks is None:
+            print(
+                f"Error: port {_dashboard_port} (or associated webhook/proxy ports) "
+                f"is already claimed by another Hermes instance.\n"
+                f"Stop the other instance, or use `--port 0` to let the OS assign a free port.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     try:
         start_server(

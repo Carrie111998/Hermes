@@ -7,7 +7,9 @@ handed to /init.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,8 @@ SHIM = REPO_ROOT / "docker" / "tini-shim.sh"
 @pytest.fixture
 def recorder(tmp_path: Path) -> tuple[Path, Path]:
     """Fake /init + wrapper that print argv, one token per line."""
+    if sys.platform == "win32" or shutil.which("sh") is None:
+        pytest.skip("tini-shim.sh is a POSIX shell script (Docker image); no sh on this host")
     init = tmp_path / "fake-init"
     wrapper = tmp_path / "fake-wrapper"
     init.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")

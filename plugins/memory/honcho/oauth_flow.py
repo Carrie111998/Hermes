@@ -49,7 +49,9 @@ def _display_config_path(path: object) -> str:
 
     p = _Path(str(path))
     try:
-        return "~/" + str(p.relative_to(_Path.home()))
+        # as_posix(): this string rides the authorize URL to the consent
+        # screen, so it must use forward slashes even on Windows.
+        return "~/" + p.relative_to(_Path.home()).as_posix()
     except ValueError:
         return p.name
 

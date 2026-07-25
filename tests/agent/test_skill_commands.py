@@ -8,6 +8,25 @@ from unittest.mock import patch
 import pytest
 
 import tools.skills_tool as skills_tool_module
+@pytest.fixture(autouse=True)
+def _reset_gateway_session_vars():
+    """Tests here exercise the real gateway ContextVar path via
+    ``set_session_vars``/``clear_session_vars``.  ``clear_session_vars`` latches
+    every var to ``""`` ("explicitly cleared"), which permanently suppresses
+    ``get_session_env``'s ``os.environ`` fallback on this thread — later,
+    unrelated tests (e.g. test_verification_stop) that set
+    ``HERMES_SESSION_PLATFORM`` via env then resolve an empty platform.
+    Restore the ``_UNSET`` sentinel after each test so the env fallback works
+    again for the rest of the suite."""
+    yield
+    try:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+    except Exception:
+        pass
+
+
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,

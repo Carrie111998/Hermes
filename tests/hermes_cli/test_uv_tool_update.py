@@ -264,6 +264,11 @@ class TestCmdUpdatePipInstallLayouts:
     - pipx-managed                   -> ``pipx upgrade``
     """
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="pipx-layout detection splits sys.prefix on os.sep; the test "
+        "simulates a POSIX layout ('/home/u/.local/pipx/venvs/...')",
+    )
     @patch("subprocess.run")
     def test_pipx_managed_uses_pipx_upgrade(self, mock_run, monkeypatch):
         from hermes_cli import main as hm

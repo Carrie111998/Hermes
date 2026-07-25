@@ -118,6 +118,7 @@ def test_removes_dangling_symlink_into_hermes_node(fake_home):
     assert not (local_bin / "node").is_symlink()
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: symlink operations unsupported")
 def test_only_some_links_present(fake_home):
     """Removes the Hermes links that exist; ignores the ones that don't."""
     hermes_home = fake_home / ".hermes"
@@ -137,6 +138,7 @@ def test_only_some_links_present(fake_home):
     assert not (local_bin / "npx").is_symlink()
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: symlink operations unsupported")
 def test_removes_fhs_symlinks_in_usr_local_bin(fake_home, tmp_path, monkeypatch):
     """Root FHS installs place node symlinks in /usr/local/bin.
 

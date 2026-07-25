@@ -42,7 +42,13 @@ def server():
     }):
         import importlib
         mod = importlib.import_module("tui_gateway.server")
+        # Several tests below swap _methods entries; tui_gateway.server is a
+        # shared process-global module, so restore the registry afterwards or
+        # later test files (e.g. test_subagent_child_mirror) see the stubs.
+        saved_methods = dict(mod._methods)
         yield mod
+        mod._methods.clear()
+        mod._methods.update(saved_methods)
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()

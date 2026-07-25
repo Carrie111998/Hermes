@@ -32,6 +32,8 @@ from __future__ import annotations
 import ast
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import orjson
 from pathlib import Path
 from unittest.mock import MagicMock, patch

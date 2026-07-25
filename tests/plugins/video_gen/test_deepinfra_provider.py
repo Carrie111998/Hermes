@@ -9,6 +9,8 @@ t2v vs i2v routing, download → save).
 
 from __future__ import annotations
 
+import sys
+
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch

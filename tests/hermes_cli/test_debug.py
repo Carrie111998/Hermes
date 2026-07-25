@@ -204,7 +204,9 @@ class TestCaptureLogSnapshot:
         # backward-reading loop so the truncation path actually fires.
         line = "A" * 99 + "\n"  # 100 bytes per line
         num_lines = 200  # 20000 bytes
-        (hermes_home / "logs" / "agent.log").write_text(line * num_lines)
+        # write bytes: text mode would translate \n → \r\n on Windows and
+        # break the 100-bytes-per-line boundary math below.
+        (hermes_home / "logs" / "agent.log").write_bytes((line * num_lines).encode())
 
         # max_bytes = 1000 = 100 * 10 → cut at byte 20000 - 1000 = 19000,
         # and byte 19000 - 1 is '\n'.  Boundary hit → keep all 10 lines.

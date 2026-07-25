@@ -8,6 +8,7 @@ import orjson
 import os
 import sys
 import pytest
+from pathlib import Path
 
 pytestmark = pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: timing/subprocess operations fail")
 

@@ -15,6 +15,25 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+_APP_STATE_KEYS = ("bound_host", "bound_port", "auth_required")
+
+
+@pytest.fixture(autouse=True)
+def _restore_app_state():
+    """start_server() stashes bound_host/bound_port/auth_required on the
+    global app.state. Snapshot and restore them so these tests don't leak
+    host-header/auth state into later TestClient-based tests."""
+    sentinel = object()
+    prev = {k: getattr(web_server.app.state, k, sentinel) for k in _APP_STATE_KEYS}
+    yield
+    for k, v in prev.items():
+        if v is sentinel:
+            if hasattr(web_server.app.state, k):
+                delattr(web_server.app.state, k)
+        else:
+            setattr(web_server.app.state, k, v)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with

@@ -8,6 +8,7 @@ from hermes_cli import relaunch as relaunch_mod
 
 
 class TestResolveHermesBin:
+    @pytest.mark.skipif(sys.platform == "win32", reason="relaunch via os.execvp of a POSIX hermes binary is POSIX-only")
     def test_prefers_absolute_argv0_when_executable(self, monkeypatch):
         fake = "/nix/store/abc/bin/hermes"
         monkeypatch.setattr(sys, "argv", [fake])
@@ -139,6 +140,7 @@ class TestBuildRelaunchArgv:
 
 
 class TestRelaunch:
+    @pytest.mark.skipif(sys.platform == "win32", reason="relaunch via os.execvp of a POSIX hermes binary is POSIX-only")
     def test_calls_execvp(self, monkeypatch):
         calls = []
 

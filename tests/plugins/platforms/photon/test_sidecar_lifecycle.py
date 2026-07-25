@@ -8,6 +8,8 @@ spawning Node or binding ports.
 """
 from __future__ import annotations
 
+import sys
+
 import subprocess
 from typing import Any, Dict, List, Tuple
 
@@ -110,6 +112,7 @@ async def test_reap_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == 'win32', reason="Windows baseline: _reap_stale_sidecar win32-guards early (lsof/ps are POSIX-only)")
 async def test_reap_raises_for_foreign_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

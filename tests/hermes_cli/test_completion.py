@@ -5,6 +5,7 @@ import os
 from agent.re_compat import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -109,6 +110,14 @@ class TestGenerateBash:
 
     def test_valid_bash_syntax(self):
         """Script must pass `bash -n` syntax check."""
+        if sys.platform == "win32":
+            pytest.skip("`bash -n` validation is POSIX-only; any 'bash' found on "
+                        "Windows (WSL/Git Bash) does not validate the script the "
+                        "way a target POSIX shell would")
+        import shutil
+
+        if not shutil.which("bash"):
+            pytest.skip("bash is not available on this platform")
         out = generate_bash(_make_parser())
         with tempfile.NamedTemporaryFile(mode="w", suffix=".bash", delete=False) as f:
             f.write(out)

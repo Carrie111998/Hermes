@@ -682,6 +682,12 @@ class TestSaveEnvValueSecure:
             assert load_env()["TERMINAL_SSH_KEY"] == path
 
             # Shell source must round-trip (this is what the bug broke).
+            # POSIX-only: there is no `sh` on Windows; dotenv round-trip above
+            # already covers the quoting contract there.
+            import shutil
+
+            if not shutil.which("sh"):
+                return
             r = subprocess.run(
                 [
                     "env",
@@ -716,6 +722,11 @@ class TestSaveEnvValueSecure:
             assert parsed["TABBY_KEY"] == value
             assert load_env()["TABBY_KEY"] == value
 
+            # POSIX-only shell-source check (see above).
+            import shutil
+
+            if not shutil.which("sh"):
+                return
             r = subprocess.run(
                 [
                     "env",

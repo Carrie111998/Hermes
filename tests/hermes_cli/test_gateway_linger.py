@@ -1,6 +1,9 @@
 """Tests for gateway linger auto-enable behavior on headless Linux installs."""
 
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 import hermes_cli.gateway as gateway
 
@@ -96,6 +99,9 @@ class TestEnsureLingerEnabled:
         out = capsys.readouterr().out
         assert "sudo loginctl enable-linger testuser" in out
         assert "Permission denied" in out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd/linger is Linux-only")
 
 
 def test_systemd_install_calls_linger_helper(monkeypatch, tmp_path, capsys):

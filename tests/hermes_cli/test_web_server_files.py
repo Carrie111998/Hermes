@@ -318,6 +318,11 @@ def test_query_token_does_not_authenticate_other_endpoints(forced_files_client):
     assert leaked.status_code == 401
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="hosted /opt/data lock-in is a Linux container deployment concept; "
+    "'/opt/data' is not an absolute path on Windows",
+)
 def test_hosted_policy_locks_to_opt_data(monkeypatch):
     monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
     monkeypatch.setenv("HERMES_HOME", "/opt/data")

@@ -1,4 +1,10 @@
 """Tests for hermes_cli.gateway."""
+import sys
+
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only: requires pty/termios", allow_module_level=True)
 
 import argparse
 import os

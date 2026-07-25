@@ -11,7 +11,7 @@ import orjson
 import os
 import asyncio
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 from tests.tools.conftest import register_all_web_providers
 
@@ -213,8 +213,12 @@ class TestWebExtractTavily:
         }
         mock_response.raise_for_status = MagicMock()
 
+        # async_is_safe_url resolves DNS live; under fake-ip DNS proxies every
+        # hostname resolves to a private range and the extract is blocked
+        # before dispatch. Tavily dispatch — not SSRF — is under test here.
         with patch("tools.web_tools._get_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
+             patch("tools.web_tools.async_is_safe_url", new_callable=AsyncMock, return_value=True), \
              patch("tools.web_tools.httpx.post", return_value=mock_response):
             from tools.web_tools import web_extract_tool
             result = orjson.loads(asyncio.get_event_loop().run_until_complete(

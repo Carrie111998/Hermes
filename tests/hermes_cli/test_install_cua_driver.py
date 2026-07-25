@@ -21,7 +21,10 @@ cleanly on missing-arch assets, and the upgrade path uses
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import patch
+
+import pytest
 
 
 class TestInstallCuaDriverUpgrade:
@@ -213,6 +216,8 @@ class TestStaleInstallLockClear:
         import os
         os.environ.pop("CUA_DRIVER_RS_HOME", None)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="cua-driver install lock / process-group kill is POSIX-only (impl early-returns on win32)")
+
     def test_dead_holder_lock_is_cleared(self, tmp_path):
         from hermes_cli import tools_config
 
@@ -237,6 +242,8 @@ class TestStaleInstallLockClear:
         tools_config._clear_stale_cua_install_lock()
         assert lock.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="cua-driver install lock / process-group kill is POSIX-only (impl early-returns on win32)")
+
     def test_pidless_old_lock_is_cleared(self, tmp_path):
         import os
         import time
@@ -259,6 +266,8 @@ class TestStaleInstallLockClear:
 class TestInstallerTimeoutKillsProcessGroup:
     """On timeout the whole installer process group must be killed, so the
     `curl | bash` grandchildren can't survive holding the install lock."""
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="cua-driver install lock / process-group kill is POSIX-only (impl early-returns on win32)")
 
     def test_timeout_kills_process_group_and_returns_false(self, tmp_path):
         import os

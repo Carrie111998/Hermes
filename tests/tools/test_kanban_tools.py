@@ -23,6 +23,13 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
     zero kanban_* tools in their schema."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # Drop any session identity leaked into this context by earlier gateway
+    # tests, so HERMES_SESSION_* env vars set by the test actually resolve.
+    try:
+        from gateway import session_context
+        session_context.reset_session_vars()
+    except Exception:
+        pass
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

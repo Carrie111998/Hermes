@@ -9,6 +9,7 @@ Verifies that the agent cache correctly:
 - Preserves frozen system prompt across turns
 """
 
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -382,6 +383,11 @@ class TestExtractCacheBustingConfig:
         assert parse_calls == [config_path]
 
         config_path.write_text("{\n  \"changed\": true\n}")
+        # The memo is keyed on (path, st_mtime_ns); Windows mtime ticks are
+        # coarse enough that this rewrite can share the previous timestamp,
+        # so bump it explicitly to assert the memoization contract.
+        _st = config_path.stat()
+        os.utime(config_path, ns=(_st.st_atime_ns, _st.st_mtime_ns + 1_000_000))
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first

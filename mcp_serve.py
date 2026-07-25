@@ -75,10 +75,20 @@ def _get_sessions_dir() -> Path:
 
 
 def _get_session_db():
-    """Get a SessionDB instance for reading message transcripts."""
+    """Get a SessionDB instance for reading message transcripts.
+
+    Read-only attach: this poller only SELECTs, and opening the DB
+    read-write would run schema init / WAL checkpoint on every tick,
+    bumping state.db's mtime and defeating the EventBridge's own
+    mtime-based change detection (plus taking a write lock against the
+    live gateway backend).  ``read_only`` requires an existing,
+    initialised DB, so guard on existence first.
+    """
     try:
-        from hermes_state import SessionDB
-        return SessionDB()
+        from hermes_state import SessionDB, DEFAULT_DB_PATH
+        if not DEFAULT_DB_PATH.exists():
+            return None
+        return SessionDB(read_only=True)
     except Exception as e:
         logger.debug("SessionDB unavailable: %s", e)
         return None

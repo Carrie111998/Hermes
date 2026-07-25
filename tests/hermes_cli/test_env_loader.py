@@ -1,7 +1,8 @@
 import codecs
-import importlib
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -87,7 +88,15 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
 
 
-def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
+def test_main_import_applies_user_env_over_shell_values(tmp_path):
+    """Importing hermes_cli.main applies ~/.hermes/.env over stale shell values.
+
+    Runs in a subprocess: importing hermes_cli.main executes module-level
+    startup code (dotenv load, plugin discovery, config caches) with global
+    side effects.  Doing that in-process — even with sys.modules
+    pop/restore around it — leaks those side effects into the shared
+    interpreter and breaks later tests (cross-test pollution).
+    """
     home = tmp_path / "hermes"
     home.mkdir()
     (home / ".env").write_text(
@@ -95,15 +104,32 @@ def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://old.example/v1")
-    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["OPENAI_BASE_URL"] = "https://old.example/v1"
+    env["HERMES_INFERENCE_PROVIDER"] = "openrouter"
+    # Ensure the repo (not an installed hermes_cli) is importable.
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
 
-    sys.modules.pop("hermes_cli.main", None)
-    importlib.import_module("hermes_cli.main")
-
-    assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
-    assert os.getenv("HERMES_INFERENCE_PROVIDER") == "custom"
+    probe = (
+        "import os;"
+        "import hermes_cli.main;"
+        "assert os.getenv('OPENAI_BASE_URL') == 'https://new.example/v1', os.getenv('OPENAI_BASE_URL');"
+        "assert os.getenv('HERMES_INFERENCE_PROVIDER') == 'custom', os.getenv('HERMES_INFERENCE_PROVIDER')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=env,
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, (
+        f"subprocess import of hermes_cli.main did not apply user env:\n"
+        f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,9 @@ def _patch_mcp_server():
     # ~L2008) to serialize JSON-RPC against the server — build it inside the
     # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
     fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
+    # Close any circuit breaker left open for this server name by earlier
+    # tests — breaker state is process-global and keyed by server name.
+    mcp_tool._reset_server_error("test-server")
     with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
          patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
         yield fake_session

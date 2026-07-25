@@ -224,15 +224,30 @@ def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path)
     _repo, url = served_repo
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Clear any context-local Hermes-home override leaked by an earlier test
+    # — it takes precedence over the HERMES_HOME env var above.
+    import hermes_constants
+    _home_tok = hermes_constants.set_hermes_home_override(None)
     monkeypatch.setattr("tools.skills_hub.is_safe_url", lambda _url: True)
     monkeypatch.setattr("tools.skills_hub.check_website_access", lambda _url: None)
     monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [UrlSource()])
 
     sink = StringIO()
-    do_install(url, console=Console(file=sink, force_terminal=False), skip_confirm=True)
+    try:
+        do_install(url, console=Console(file=sink, force_terminal=False), skip_confirm=True)
+    finally:
+        hermes_constants.reset_hermes_home_override(_home_tok)
 
     installed = home / "skills" / "demo-bundle"
-    assert (installed / "references" / "guide.md").read_text() == "safe guide\n"
+    import tools.skills_hub as hub
+    _diag = (
+        f"\ninstall output:\n{sink.getvalue()}\n"
+        f"skills_hub path attrs in __dict__: "
+        f"{ {n: str(v) for n, v in hub.__dict__.items() if n in ('SKILLS_DIR','HUB_DIR','LOCK_FILE','QUARANTINE_DIR','AUDIT_LOG')} }\n"
+        f"resolved _skills_dir(): {hub._skills_dir()}\n"
+    )
+    assert (installed / "references" / "guide.md").is_file(), _diag
+    assert (installed / "references" / "guide.md").read_text() == "safe guide\n", _diag
     assert (installed / "templates" / "report.md").is_file()
     assert (installed / "scripts" / "run.py").is_file()
     assert (installed / "examples" / "endpoint-inventory.md").is_file()

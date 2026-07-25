@@ -16,6 +16,32 @@ def main_mod():
     return main_mod
 
 
+def _patch_reexec(main_mod, monkeypatch, execs):
+    """Mock the machine-dashboard re-exec on every platform.
+
+    POSIX uses ``os.execvpe``; Windows uses ``subprocess.Popen`` +
+    ``proc.wait()`` (see the comment in ``cmd_dashboard`` — execvpe does not
+    truly replace the process on Windows).  Mocking only execvpe lets a
+    Windows test run spawn a REAL dashboard subprocess and wait on it
+    forever, hanging the whole pytest session.
+    """
+    def fake_exec(exe, argv, env):
+        execs.append((exe, argv, env))
+        raise SystemExit(0)  # execvpe never returns
+
+    monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+
+    class _FakeProc:
+        def wait(self):
+            return 0
+
+    def fake_popen(argv, env=None, **_kw):
+        execs.append((argv[0], argv, env or {}))
+        return _FakeProc()
+
+    monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
+
+
 def _args(**kw):
     defaults = dict(
         status=False, stop=False, host="127.0.0.1", port=9119,
@@ -63,12 +89,7 @@ class TestUnifiedDashboardRouting:
         )
         monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
         execs = []
-
-        def fake_exec(exe, argv, env):
-            execs.append((exe, argv, env))
-            raise SystemExit(0)  # execvpe never returns
-
-        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+        _patch_reexec(main_mod, monkeypatch, execs)
 
         with pytest.raises(SystemExit):
             main_mod.cmd_dashboard(_args())
@@ -103,12 +124,7 @@ class TestUnifiedDashboardRouting:
         )
         monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
         execs = []
-
-        def fake_exec(exe, argv, env):
-            execs.append((exe, argv, env))
-            raise SystemExit(0)
-
-        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+        _patch_reexec(main_mod, monkeypatch, execs)
 
         with pytest.raises(SystemExit):
             main_mod.cmd_dashboard(_args())
@@ -117,7 +133,10 @@ class TestUnifiedDashboardRouting:
         _exe, _argv, env = execs[0]
         # The child binds /opt/data — where the real default/oracle/saga
         # profiles and the .install_method stamp actually live.
-        assert env.get("HERMES_HOME") == "/opt/data"
+        # (Path comparison: on Windows the env value is drive-resolved to
+        # \opt\data by get_default_hermes_root().)
+        from pathlib import Path
+        assert Path(env.get("HERMES_HOME", "")) == Path("/opt/data")
 
     def test_profile_home_skips_machine_dashboard_reroute(self, main_mod, monkeypatch):
         """A process already pinned to profiles/<name> is a routed backend."""

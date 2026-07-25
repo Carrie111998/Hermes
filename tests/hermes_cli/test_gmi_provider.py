@@ -11,9 +11,12 @@ from unittest.mock import patch
 
 import pytest
 
-if "dotenv" not in sys.modules:
+_dotenv_was_loaded = "dotenv" in sys.modules
+_fake_load_dotenv = None
+if not _dotenv_was_loaded:
     fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    _fake_load_dotenv = lambda *args, **kwargs: None
+    fake_dotenv.load_dotenv = _fake_load_dotenv
     sys.modules["dotenv"] = fake_dotenv
 
 from hermes_cli.auth import resolve_provider
@@ -27,6 +30,24 @@ from hermes_cli.models import (
 )
 from agent.auxiliary_client import resolve_provider_client
 from agent.model_metadata import get_model_context_length
+
+# Restore the real ``dotenv`` module after the import block above.  The fake
+# no-op ``dotenv`` exists only to keep import-time ``load_dotenv()`` calls
+# from reading the developer's real ``~/.hermes/.env`` while this module's
+# imports resolve.  Leaving the fake in ``sys.modules`` would permanently
+# poison modules that did ``from dotenv import load_dotenv`` during that
+# window (e.g. ``hermes_cli.env_loader``), breaking later tests that rely on
+# dotenv actually loading values (cross-test pollution).
+if not _dotenv_was_loaded:
+    sys.modules.pop("dotenv", None)
+    try:
+        import dotenv as _real_dotenv
+    except ImportError:  # pragma: no cover - dotenv missing entirely
+        _real_dotenv = None
+    if _real_dotenv is not None:
+        for _mod in list(sys.modules.values()):
+            if _mod is not None and getattr(_mod, "load_dotenv", None) is _fake_load_dotenv:
+                _mod.load_dotenv = _real_dotenv.load_dotenv
 
 
 @pytest.fixture(autouse=True)

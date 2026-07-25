@@ -11,6 +11,7 @@ from __future__ import annotations
 import orjson
 import json
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -409,6 +410,13 @@ class TestDispatchersTriggerPluginDiscovery:
             monkeypatch.setattr(
                 web_tools, "_ensure_web_plugins_loaded", mock_hook
             )
+            # The SSRF gate resolves DNS live; under fake-ip DNS proxies every
+            # hostname looks private. Dispatch, not URL safety, is under test
+            # here (SSRF is covered by test_url_safety.py).
+            monkeypatch.setattr(
+                web_tools, "async_is_safe_url",
+                AsyncMock(return_value=True),
+            )
             monkeypatch.setattr(
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
@@ -571,6 +579,13 @@ class TestDisabledPluginDiagnostic:
         restore = self._clear_registry()
         try:
             monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
+            # Bypass the live-DNS SSRF gate (fake-ip DNS environments resolve
+            # every host to a private range); the disabled-plugin diagnostic
+            # is what is under test here.
+            monkeypatch.setattr(
+                web_tools, "async_is_safe_url",
+                AsyncMock(return_value=True),
+            )
             monkeypatch.setattr(
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
