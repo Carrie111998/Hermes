@@ -761,8 +761,8 @@ def test_reference_failure_controls_are_normalized_per_preset_and_flattened():
 
 @pytest.mark.parametrize("value", [None, "", 0, -1, "bad"])
 def test_reference_timeout_invalid_values_fall_back_to_default(value):
-    # None = inherit auxiliary.moa_reference.timeout (no per-preset override).
-    assert resolve_moa_preset(_preset(reference_timeout=value), "p")["reference_timeout"] is None
+    # Invalid/blank values fall back to DEFAULT_MOA_REFERENCE_TIMEOUT (180 s).
+    assert resolve_moa_preset(_preset(reference_timeout=value), "p")["reference_timeout"] == 180.0
 
 
 def test_reference_timeout_is_uncapped_and_unknown_policy_is_loud():

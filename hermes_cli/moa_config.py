@@ -21,7 +21,7 @@ DEFAULT_MOA_AGGREGATOR: dict[str, str] = {
     "model": "anthropic/claude-opus-4.8",
 }
 
-DEFAULT_MOA_REFERENCE_TIMEOUT: float | None = None
+DEFAULT_MOA_REFERENCE_TIMEOUT: float | None = 180.0
 
 
 def _default_reference_models() -> list[dict[str, Any]]:
@@ -47,12 +47,14 @@ def _coerce_float_or_none(value: Any) -> float | None:
 def _coerce_reference_timeout(value: Any) -> float | None:
     """Return a finite positive advisor timeout, or None to inherit.
 
-    ``None`` (the default) means "no per-preset override": the reference
-    fan-out inherits the ``auxiliary.moa_reference.timeout`` config value
-    (900s by default) via ``call_llm``'s own resolution, exactly like every
-    other auxiliary task. An explicit finite positive per-preset value is
-    honored as-is — no artificial cap, since long-thinking advisor models
-    legitimately run far beyond five minutes.
+    ``None`` means "no per-preset override": the reference fan-out inherits
+    the ``auxiliary.moa_reference.timeout`` config value via ``call_llm``'s
+    own resolution, exactly like every other auxiliary task.  The module
+    default is **180 s** (down from the inherited 900 s) so that a stuck
+    advisor degrades in a bounded window instead of hanging for 15 minutes
+    (#71243).  An explicit finite positive per-preset value is honored
+    as-is — no artificial cap, since long-thinking advisor models
+    legitimately run far beyond three minutes.
     """
     if value is None or value == "" or isinstance(value, bool):
         return DEFAULT_MOA_REFERENCE_TIMEOUT
