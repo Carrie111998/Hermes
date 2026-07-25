@@ -50,6 +50,15 @@ from .models import (
     SubmissionRequest,
 )
 from .policy import ExecutionPolicy
+from .live_certification import (
+    LiveTradingCertification,
+    LiveTradingCertificationPolicy,
+    LiveTradingCertificationRequest,
+    LiveTradingCertificationStatus,
+    certify_live_trading,
+    effective_certification_status,
+    revoke_live_trading_certification,
+)
 from .live_eligibility import (
     LiveTradingEligibilityPolicy,
     LiveTradingEligibilityRequest,
@@ -156,4 +165,11 @@ __all__ = [
     "LiveTradingEligibilityReview",
     "LiveTradingEligibilityStatus",
     "review_live_trading_eligibility",
+    "LiveTradingCertification",
+    "LiveTradingCertificationPolicy",
+    "LiveTradingCertificationRequest",
+    "LiveTradingCertificationStatus",
+    "certify_live_trading",
+    "effective_certification_status",
+    "revoke_live_trading_certification",
 ]
