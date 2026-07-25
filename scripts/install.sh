@@ -1654,12 +1654,26 @@ setup_path() {
     # the rm, `cat >` follows the symlink and overwrites the venv pip entry
     # point with this shim — making `exec "$HERMES_BIN"` self-recurse. (#21454)
     rm -f "$command_link_dir/hermes"
-    cat > "$command_link_dir/hermes" <<EOF
+    # For venv installs, bypass the uv-generated console script entrypoint
+    # and launch through the venv interpreter directly. The uv-generated
+    # entrypoint uses `realpath` which is not available on stock macOS
+    # (requires Homebrew coreutils). Launching via the venv python preserves
+    # venv dependencies and works on all platforms. (#71320)
+    if [ "$USE_VENV" = true ]; then
+        cat > "$command_link_dir/hermes" <<EOF
+#!/usr/bin/env bash
+unset PYTHONPATH
+unset PYTHONHOME
+exec "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/hermes" "\$@"
+EOF
+    else
+        cat > "$command_link_dir/hermes" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
 unset PYTHONHOME
 exec "$HERMES_BIN" "\$@"
 EOF
+    fi
     chmod +x "$command_link_dir/hermes"
     log_success "Installed hermes launcher → $command_link_display_dir/hermes"
 
