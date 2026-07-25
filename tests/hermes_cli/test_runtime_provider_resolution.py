@@ -86,6 +86,39 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_explicit_openai_runtime_rejects_stale_anthropic_api_mode(monkeypatch):
+    """A session-scoped provider switch must not reuse the persisted wire mode.
+
+    CLI ``/model`` stores the target key/base URL as explicit runtime overrides
+    even when the switch is session-only. If config.yaml still describes the
+    previous Anthropic provider, the explicit-runtime path must derive the OpenAI
+    transport from the target endpoint rather than carrying ``anthropic_messages``
+    into ``api.openai.com/v1/messages``. Regression for #71333.
+    """
+    stale_model_cfg = {
+        "provider": "anthropic",
+        "default": "claude-opus-4-8",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+    }
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-api")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: stale_model_cfg)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"model": stale_model_cfg}
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-api",
+        explicit_api_key="sk-openai-session-switch",
+        explicit_base_url="https://api.openai.com/v1",
+        target_model="gpt-5.6-sol",
+    )
+
+    assert resolved["provider"] == "openai-api"
+    assert resolved["base_url"] == "https://api.openai.com/v1"
+    assert resolved["api_mode"] == "codex_responses"
+
+
 def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     """When requested_provider is 'auto' and Qwen creds fail, fall through."""
     from hermes_cli.auth import AuthError
