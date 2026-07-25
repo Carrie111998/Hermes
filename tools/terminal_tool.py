@@ -1346,12 +1346,60 @@ def _ensure_terminal_env_bridged() -> None:
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
 
 
+def _resolve_terminal_backend() -> str:
+    """Resolve the terminal backend with correct config.yaml > .env precedence.
+
+    Issue #71137: ``hermes setup`` writes ``TERMINAL_ENV`` to ``.env``.  When
+    a user later changes ``terminal.backend`` in config.yaml but the stale
+    ``.env`` value survives, ``os.getenv("TERMINAL_ENV", "local")`` silently
+    picks up the old env var and overrides the user's explicit config choice —
+    bricking the session when the old backend (e.g. ssh) is unreachable.
+
+    Precedence (highest → lowest):
+      1. ``terminal.backend`` in config.yaml (explicit user choice, non-empty)
+      2. ``TERMINAL_ENV`` env var (from .env or a launcher bridge)
+      3. ``"local"`` (historical default)
+
+    A warning is logged when config.yaml overrides a *different* TERMINAL_ENV,
+    so the previously-silent override is surfaced.  TERMINAL_ENV is left
+    untouched in os.environ — callers that still read it directly (e.g. the
+    container-backend branches in ``_get_env_config``) are unaffected; only
+    the backend selection itself is redirected.
+
+    Any failure reading config falls back to TERMINAL_ENV / local so a broken
+    config never takes the terminal tool down.
+    """
+    env_backend = os.getenv("TERMINAL_ENV")
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw = read_raw_config() or {}
+        terminal_cfg = raw.get("terminal") or {}
+        config_backend = (terminal_cfg.get("backend") or "").strip() if isinstance(terminal_cfg, dict) else ""
+    except Exception:
+        logger.debug("terminal backend config read failed; falling back to TERMINAL_ENV", exc_info=True)
+        return env_backend or "local"
+
+    if config_backend:
+        if env_backend and env_backend != config_backend:
+            logger.warning(
+                "config.yaml terminal.backend=%r overrides TERMINAL_ENV=%r from .env; "
+                "clear TERMINAL_ENV in .env to silence this.",
+                config_backend,
+                env_backend,
+            )
+        return config_backend
+
+    # No explicit config.backend — TERMINAL_ENV / default wins (unchanged).
+    return env_backend or "local"
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    env_type = _resolve_terminal_backend()
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
     container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
