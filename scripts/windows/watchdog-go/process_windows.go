@@ -400,15 +400,28 @@ func stopOrphanDesktopBackends(logger *Logger, cfg Config, skipPIDs ...uint32) i
 	if err == nil && len(desktop) > 0 {
 		return 0
 	}
-	skip := make(map[uint32]struct{}, len(skipPIDs))
+	skipPort := cfg.ManagedBackendPort
+	if skipPort <= 0 {
+		skipPort = DefaultManagedBackendPort
+	}
+	// If the managed serve is healthy, never reap backend candidates.
+	// Candidates often include a non-listening python/hermes wrapper; taskkill
+	// /T on that wrapper kills the child that still holds :9119 and produces
+	// the Desktop↔backend flap (ECONNRESET → Desktop DOWN → relaunch loop).
+	if testBackendStatus(skipPort) {
+		if logger != nil {
+			logger.Infof("skip orphan reap; managed port %d is healthy", skipPort)
+		}
+		return 0
+	}
+	skip := make(map[uint32]struct{}, len(skipPIDs)+4)
 	for _, pid := range skipPIDs {
 		if pid > 0 {
 			skip[pid] = struct{}{}
 		}
 	}
-	skipPort := cfg.ManagedBackendPort
-	if skipPort <= 0 {
-		skipPort = DefaultManagedBackendPort
+	for _, pid := range listeningPIDsOnPort(skipPort) {
+		skip[pid] = struct{}{}
 	}
 	candidates, err := getDesktopBackendCandidates()
 	if err != nil {
@@ -420,7 +433,11 @@ func stopOrphanDesktopBackends(logger *Logger, cfg Config, skipPIDs ...uint32) i
 			logger.Infof("skip reap pid=%d (managed backend)", proc.ProcessID)
 			continue
 		}
-		ports, _ := getListeningPorts(proc.ProcessID)
+		ports, perr := getListeningPorts(proc.ProcessID)
+		if perr != nil || len(ports) == 0 {
+			logger.Infof("skip reap pid=%d (listening ports unknown)", proc.ProcessID)
+			continue
+		}
 		skipProc := false
 		for _, port := range ports {
 			if port == skipPort {

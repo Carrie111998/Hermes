@@ -126,7 +126,7 @@ func resolveServeWorkDir(cfg Config, python string) string {
 	return ""
 }
 
-func buildServeCommand(cfg Config) (*exec.Cmd, string, int, error) {
+func buildServeCommand(cfg Config, preferredToken string) (*exec.Cmd, string, int, error) {
 	python := resolvePythonExe(cfg.HermesRoot)
 	if python == "" {
 		return nil, "", 0, fmt.Errorf("python not found under %s (.venv or venv)", cfg.HermesRoot)
@@ -135,9 +135,17 @@ func buildServeCommand(cfg Config) (*exec.Cmd, string, int, error) {
 	if workDir == "" {
 		return nil, "", 0, fmt.Errorf("no valid workdir for hermes serve (hermes-root=%q)", cfg.HermesRoot)
 	}
-	token, err := generateSessionToken()
-	if err != nil {
-		return nil, "", 0, err
+	// Reuse the previous session token when restarting managed serve so a live
+	// Desktop process (HERMES_DESKTOP_REMOTE_TOKEN from launch env) keeps
+	// unlocking /api/sessions after a backend flap. Mint a new token only when
+	// the caller has no preferred value (cold start or intentional drift replace).
+	token := strings.TrimSpace(preferredToken)
+	if token == "" {
+		var err error
+		token, err = generateSessionToken()
+		if err != nil {
+			return nil, "", 0, err
+		}
 	}
 	port := cfg.ManagedBackendPort
 	if port <= 0 {
@@ -230,7 +238,9 @@ func (bm *BackendManager) stopLocked() {
 	bm.cmd = nil
 	bm.pid = 0
 	bm.port = 0
-	bm.token = ""
+	// Intentionally keep bm.token: Desktop may still hold this value via
+	// HERMES_DESKTOP_REMOTE_TOKEN until the next relaunch. Clearing it here
+	// forced a new mint on every serve restart and produced sessions 401 drift.
 }
 
 func (bm *BackendManager) waitForReadyPort(port int, timeout time.Duration) error {
@@ -294,9 +304,15 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 		// Only reuse when token unlocks gated APIs. Otherwise we'd publish a
 		// fresh token while the live serve still expects the old one (Desktop 401).
 		if bm.token != "" && testBackendAuth(port, bm.token) {
-			_ = bm.publishManifestLocked(port, 0)
-			bm.logger.Infof("reusing healthy managed backend on port %d (auth ok)", port)
-			return &backendInfo{Port: port, Cmd: "existing serve on managed port"}, nil
+			pid := 0
+			if listeners := listeningPIDsOnPort(port); len(listeners) > 0 {
+				pid = int(listeners[0])
+			}
+			bm.port = port
+			bm.pid = pid
+			_ = bm.publishManifestLocked(port, pid)
+			bm.logger.Infof("reusing healthy managed backend on port %d (auth ok pid=%d)", port, pid)
+			return &backendInfo{PID: uint32(pid), Port: port, Cmd: "existing serve on managed port"}, nil
 		}
 		if bm.token == "" {
 			bm.logger.Infof("managed port %d is up but no reusable session token; replacing occupant", port)
@@ -308,13 +324,23 @@ func (bm *BackendManager) EnsureHealthy() (*backendInfo, error) {
 			return nil, fmt.Errorf("managed port %d still occupied after token-drift replace", port)
 		}
 		bm.port = 0
+		// Drift replace must mint a fresh token; the live occupant rejected ours.
 		bm.token = ""
 	}
 
-	cmd, token, port, err := buildServeCommand(bm.cfg)
+	preferredToken := strings.TrimSpace(bm.token)
+	if preferredToken == "" {
+		if manifest, err := bm.readManifest(); err == nil {
+			preferredToken = strings.TrimSpace(manifest.Token)
+		}
+	}
+	cmd, token, port, err := buildServeCommand(bm.cfg, preferredToken)
 	if err != nil {
 		bm.clearManifest()
 		return nil, err
+	}
+	if preferredToken != "" && token == preferredToken {
+		bm.logger.Infof("reusing session token for managed serve restart on port %d", port)
 	}
 	hideWindowsProcess(cmd)
 

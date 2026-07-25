@@ -42,7 +42,7 @@ func TestBuildServeCommandIncludesSkipBuild(t *testing.T) {
 		HermesHome:         dir,
 		ManagedBackendPort: DefaultManagedBackendPort,
 	}
-	cmd, token, port, err := buildServeCommand(cfg)
+	cmd, token, port, err := buildServeCommand(cfg, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +52,17 @@ func TestBuildServeCommandIncludesSkipBuild(t *testing.T) {
 	joined := strings.Join(cmd.Args, " ")
 	if !strings.Contains(joined, "serve") || !strings.Contains(joined, "--skip-build") {
 		t.Fatalf("expected serve --skip-build in args, got %v", cmd.Args)
+	}
+	reused, reusedToken, _, err := buildServeCommand(cfg, "stable-session-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reusedToken != "stable-session-token" {
+		t.Fatalf("expected preferred token reuse, got %q", reusedToken)
+	}
+	envJoined := strings.Join(reused.Env, ";")
+	if !strings.Contains(envJoined, "HERMES_DASHBOARD_SESSION_TOKEN=stable-session-token") {
+		t.Fatalf("preferred token missing from serve env: %q", envJoined)
 	}
 }
 
