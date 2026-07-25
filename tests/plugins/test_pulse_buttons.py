@@ -247,6 +247,36 @@ def test_build_review_command_uses_slash_and_url():
     assert any("/review-pr https://github.com/x/pull/9" == a for a in cmd)
 
 
+def test_build_review_command_passes_fallback_model():
+    """A capacity blip on the primary must not lose the whole 25-min review.
+
+    ``--fallback-model`` is the mechanism that works for a headless ``-p`` run
+    (the flag's own help notes it applies to ``--print``). Verified end-to-end
+    against the real settings.json: with the primary forced to fail, the run
+    emitted "Opus 5 not available — using Opus 4.8 for this session" and billed
+    ``us.anthropic.claude-opus-4-8``, exit 0.
+    """
+    cmd = local_review.build_review_command("https://github.com/x/pull/9", Path("/tmp"))
+    assert "--fallback-model" in cmd
+    fallback = cmd[cmd.index("--fallback-model") + 1]
+    assert fallback == local_review._REVIEW_FALLBACK_MODEL
+    # The fallback must be a DIFFERENT model than the primary, or it buys nothing.
+    assert fallback != cmd[cmd.index("--model") + 1]
+
+
+def test_review_models_are_bedrock_inference_profile_ids():
+    """Bare Anthropic slugs silently resolve to the WRONG model on Bedrock.
+
+    Verified: `--model claude-sonnet-5` under CLAUDE_CODE_USE_BEDROCK=1 billed
+    `us.anthropic.claude-opus-5` at a 200k window — not Sonnet, and not 1M. Only
+    full `us.anthropic.*` inference-profile ids resolve as written, and only the
+    `[1m]` suffix yields the 1M context this box standardizes on.
+    """
+    for value in (local_review._REVIEW_MODEL, local_review._REVIEW_FALLBACK_MODEL):
+        assert value.startswith("us.anthropic."), f"{value} is not a profile id"
+        assert value.endswith("[1m]"), f"{value} would run at 200k, not 1M"
+
+
 def test_clone_dir_returns_none_for_unknown_repo():
     assert local_review.clone_dir("nobody/nothing") is None
 
