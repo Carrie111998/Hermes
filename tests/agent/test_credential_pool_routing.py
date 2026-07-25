@@ -384,6 +384,18 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # The canonical runner intentionally uses the installed Hermes venv,
+        # whose shell may already have loaded real user OAuth credentials.
+        # This fixture exercises only its explicit temp-store rows; allowing a
+        # live Anthropic token to auto-seed here makes a nominal one-entry pool
+        # rotate into the user's account and invalidates the recovery contract.
+        for name in (
+            "ANTHROPIC_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            monkeypatch.delenv(name, raising=False)
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
