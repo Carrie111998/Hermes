@@ -52,6 +52,21 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+# Cross-process advisory file locking for OAuth token refresh critical
+# sections. fcntl is Unix-only; on Windows fall back to msvcrt. Either may
+# be absent, in which case the cross-process lock degrades to a no-op
+# (in-process asyncio lock still applies). Matches the convention used in
+# cron/jobs.py, gateway/status.py, and hermes_cli/kanban_db.py (#71335).
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — non-Unix
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover — non-Windows
+    msvcrt = None
+
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -378,6 +393,17 @@ def _write_json(path: Path, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on waiting for the cross-process token-refresh flock (#71335).
+# A plain blocking fcntl.flock(LOCK_EX) has NO timeout. If another process
+# wedges while holding the lock (e.g. a crashed gateway that never released),
+# every other process's OAuth refresh silently hangs forever — the gateway
+# stops serving MCP requests with no error logged. Poll LOCK_NB against a
+# deadline instead; on timeout, log loudly and proceed without the
+# cross-process lock (relying on in-process locking only). A briefly-raced
+# refresh is strictly better than a permanently dead MCP connection.
+_TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS = 5.0
+
+
 class HermesTokenStorage:
     """Persist OAuth tokens and client registration to JSON files.
 
@@ -386,6 +412,7 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
+        HERMES_HOME/mcp-tokens/.<server_name>.lock         -- cross-process refresh lock
     """
 
     def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
@@ -400,6 +427,89 @@ class HermesTokenStorage:
 
     def _meta_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+
+    def _lock_path(self) -> Path:
+        """Return the advisory lock file path for this server's token file."""
+        return _get_token_dir(self._hermes_home) / f".{self._server_name}.lock"
+
+    @contextmanager
+    def _cross_process_lock(self):
+        """Acquire a bounded cross-process exclusive lock on the token file.
+
+        Uses ``fcntl.flock(LOCK_EX | LOCK_NB)`` with a polling loop against a
+        deadline, matching the pattern in ``cron/jobs.py`` (#60703) and
+        ``hermes_cli/kanban_db.py``. On Windows, falls back to ``msvcrt.locking``.
+        If neither is available or the lock times out, degrades to no
+        cross-process locking (in-process asyncio lock still applies).
+
+        A hung lock-holder doesn't permanently wedge — after
+        ``_TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS`` we log and proceed unlocked.
+        A briefly-raced refresh is strictly better than a permanently dead
+        MCP connection (#71335).
+        """
+        lock_path = self._lock_path()
+        lock_fd = None
+        acquired = False
+        try:
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_fd = open(lock_path, "a+", encoding="utf-8")
+            except OSError as exc:
+                logger.warning(
+                    "MCP OAuth '%s': could not open cross-process lock file %s (%s); "
+                    "proceeding without cross-process lock (#71335)",
+                    self._server_name, lock_path, exc,
+                )
+                yield False
+                return
+
+            if fcntl is not None:
+                deadline = time.monotonic() + _TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS
+                while True:
+                    try:
+                        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except (OSError, IOError):
+                        if time.monotonic() >= deadline:
+                            logger.error(
+                                "MCP OAuth '%s': timed out after %.0fs waiting for "
+                                "cross-process token refresh lock (%s) — another "
+                                "process is holding it. Proceeding without "
+                                "cross-process lock so the MCP connection stays "
+                                "alive (#71335).",
+                                self._server_name,
+                                _TOKEN_REFRESH_LOCK_TIMEOUT_SECONDS,
+                                lock_path,
+                            )
+                            break
+                        time.sleep(0.05)
+            elif msvcrt is not None:
+                try:
+                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    acquired = True
+                except OSError as exc:
+                    logger.warning(
+                        "MCP OAuth '%s': msvcrt lock failed (%s); proceeding "
+                        "without cross-process lock (#71335)",
+                        self._server_name, exc,
+                    )
+
+            yield acquired
+        finally:
+            if acquired and lock_fd is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                    elif msvcrt is not None:
+                        getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+                except (OSError, IOError):
+                    pass
+            if lock_fd is not None:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
 
     # -- tokens ------------------------------------------------------------
 
@@ -461,6 +571,93 @@ class HermesTokenStorage:
                 pass
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
+
+    async def locked_refresh(
+        self,
+        refresh_fn: "Any",
+        *,
+        stale_refresh_token: str | None = None,
+    ) -> "OAuthToken | None":
+        """Refresh OAuth tokens under a cross-process lock with re-read-after-acquire.
+
+        This is the core correctness fix for #71335: multiple Hermes processes
+        (gateway + desktop + dashboard) sharing one ``HERMES_HOME`` can race to
+        refresh the SAME rotating OAuth refresh token. Whichever refreshes
+        second presents a rotated-away refresh token → the provider revokes the
+        entire grant. The in-process ``asyncio.Lock`` in the MCP SDK is useless
+        across OS processes.
+
+        The fix has two parts:
+
+        1. **Cross-process lock**: ``fcntl.flock`` on a per-server ``.lock``
+           file serializes the read→refresh→write critical section across
+           processes. Bounded wait (5s) so a hung lock-holder doesn't wedge.
+
+        2. **Re-read-after-acquire (single-flight)**: after acquiring the lock,
+           re-read the token file from disk. If another process already
+           refreshed (the on-disk ``refresh_token`` differs from the
+           ``stale_refresh_token`` we were about to use), return the fresh
+           on-disk tokens instead of doing a redundant — and dangerous —
+           refresh with the rotated-away token. This is the key insight: the
+           second process's refresh would present the old refresh token that
+           the first process's refresh already invalidated.
+
+        Args:
+            refresh_fn: An async callable that performs the actual HTTP token
+                refresh and returns an ``OAuthToken`` (or None on failure).
+                Only called if no concurrent process has already refreshed.
+            stale_refresh_token: The refresh token this process was about to
+                use. If the on-disk token's ``refresh_token`` differs from
+                this after re-reading, another process already refreshed —
+                we skip the refresh and return the fresh on-disk tokens.
+
+        Returns:
+            The fresh ``OAuthToken`` (either from ``refresh_fn`` or from disk
+            if another process already refreshed), or None if the refresh
+            failed and no fresh tokens are on disk.
+        """
+        with self._cross_process_lock() as lock_acquired:
+            if not lock_acquired:
+                # Cross-process lock unavailable (timed out or platform
+                # lacks fcntl/msvcrt). Proceed with the refresh anyway —
+                # better to attempt a refresh than to leave the MCP
+                # connection dead. The in-process asyncio lock still
+                # prevents same-process races.
+                logger.debug(
+                    "MCP OAuth '%s': cross-process lock unavailable, "
+                    "proceeding with refresh without re-read guard (#71335)",
+                    self._server_name,
+                )
+                return await refresh_fn()
+
+            # ── Re-read-after-acquire (single-flight-via-re-read) ──
+            # Another process may have refreshed between our initial read
+            # and acquiring the lock. If the on-disk refresh_token no longer
+            # matches the one we were about to use, the old one is rotated
+            # away — refreshing with it would revoke the entire grant.
+            if stale_refresh_token is not None:
+                fresh_tokens = await self.get_tokens()
+                if (
+                    fresh_tokens is not None
+                    and fresh_tokens.refresh_token is not None
+                    and fresh_tokens.refresh_token != stale_refresh_token
+                ):
+                    logger.info(
+                        "MCP OAuth '%s': another process already refreshed the "
+                        "token (on-disk refresh_token changed). Using the fresh "
+                        "tokens instead of doing a redundant refresh — prevents "
+                        "revocation from presenting a rotated-away refresh token "
+                        "(#71335).",
+                        self._server_name,
+                    )
+                    return fresh_tokens
+
+            # We hold the lock and no concurrent refresh happened — proceed
+            # with the actual token refresh.
+            new_tokens = await refresh_fn()
+            if new_tokens is not None:
+                await self.set_tokens(new_tokens)
+            return new_tokens
 
     # -- client info -------------------------------------------------------
 

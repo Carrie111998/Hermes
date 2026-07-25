@@ -111,6 +111,7 @@ def _make_hermes_provider_class() -> Optional[type]:
     """
     try:
         from mcp.client.auth.oauth2 import OAuthClientProvider
+        from mcp.shared.auth import OAuthToken
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
 
@@ -387,6 +388,76 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+        async def _handle_refresh_response(self, response: Any) -> bool:  # type: ignore[override]
+            """Override that persists refreshed tokens under a cross-process lock.
+
+            The SDK's base implementation calls ``storage.set_tokens()``
+            directly after a successful refresh. With multiple Hermes processes
+            sharing one ``HERMES_HOME`` (gateway + desktop + dashboard), two
+            can race to refresh the SAME rotating refresh token — the second
+            refresh presents a rotated-away token and the provider revokes the
+            entire grant (#71335).
+
+            We capture the ``refresh_token`` this process used (in
+            ``async_auth_flow`` below) before the HTTP refresh request. After
+            the response comes back, we delegate to
+            ``HermesTokenStorage.locked_refresh`` which acquires a
+            cross-process ``fcntl.flock``, re-reads the token file, and either:
+
+              * skips the write and returns the fresh on-disk tokens (another
+                process already refreshed), or
+              * writes our refreshed tokens (we were first).
+
+            If the SDK's response parsing fails or returns non-200, we fall
+            through to the base implementation so the SDK's error handling
+            (clear_tokens, return False) runs normally.
+            """
+            if response.status_code != 200:
+                return await super()._handle_refresh_response(response)
+
+            try:
+                content = await response.aread()
+            except Exception:
+                return await super()._handle_refresh_response(response)
+
+            storage = self.context.storage
+            from tools.mcp_oauth import HermesTokenStorage as _HTS
+            if not isinstance(storage, _HTS):
+                # Non-Hermes storage — can't lock. Fall back to base behavior.
+                self.context.current_tokens = OAuthToken.model_validate_json(content)
+                self.context.update_token_expiry(self.context.current_tokens)
+                await self.context.storage.set_tokens(self.context.current_tokens)
+                return True
+
+            # The refresh_token we used for the HTTP request (captured in
+            # async_auth_flow before yielding the refresh request). If another
+            # process refreshed between then and now, the on-disk token's
+            # refresh_token will differ — locked_refresh detects this and
+            # returns the fresh on-disk tokens instead of writing ours.
+            stale_rt = getattr(self, "_hermes_stale_refresh_token", None)
+
+            try:
+                new_token = OAuthToken.model_validate_json(content)
+            except Exception:
+                # Parse failure — let the base class handle it (clears tokens).
+                return await super()._handle_refresh_response(response)
+
+            async def _do_refresh():
+                return new_token
+
+            result = await storage.locked_refresh(
+                _do_refresh,
+                stale_refresh_token=stale_rt,
+            )
+            # Clear the captured stale token — only used once per refresh.
+            self._hermes_stale_refresh_token = None
+
+            if result is not None:
+                self.context.current_tokens = result
+                self.context.update_token_expiry(result)
+                return True
+            return False
+
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
@@ -401,6 +472,20 @@ def _make_hermes_provider_class() -> Optional[type]:
                     "MCP OAuth '%s': pre-flow disk-watch failed (non-fatal): %s",
                     self._hermes_server_name, exc,
                 )
+
+            # Capture the refresh_token we're about to use BEFORE the SDK
+            # sends the HTTP refresh request. _handle_refresh_response uses
+            # this to detect if another process already refreshed concurrently
+            # (cross-process lock + re-read-after-acquire, #71335).
+            if (
+                self.context.current_tokens is not None
+                and self.context.current_tokens.refresh_token
+            ):
+                self._hermes_stale_refresh_token = (
+                    self.context.current_tokens.refresh_token
+                )
+            else:
+                self._hermes_stale_refresh_token = None
 
             # Manually bridge the bidirectional generator protocol. httpx's
             # auth_flow driver (httpx._client._send_handling_auth) calls
