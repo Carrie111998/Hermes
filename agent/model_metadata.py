@@ -137,6 +137,16 @@ MINIMUM_CONTEXT_LENGTH = 64_000
 # all miss. Replaced the previous 80+ entry dict.
 # For provider-specific context lengths, models.dev is the primary source.
 DEFAULT_CONTEXT_LENGTHS = {
+    # Anthropic Claude 5 family (opus-5, sonnet-5, fable-5). No context-window
+    # number has been published for these yet (mirrors the situation in
+    # anthropic_adapter.py's _ANTHROPIC_OUTPUT_LIMITS, which also carries
+    # forward a prior generation's value for the same reason). Extrapolated
+    # from the 4.6/4.7/4.8 entries below, which are all 1M — not a confirmed
+    # Anthropic-published figure for the 5-family. Update once real numbers
+    # are documented.
+    "claude-opus-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-fable-5": 1000000,
     # Anthropic Claude 4.6 (1M context) — bare IDs only to avoid
     # fuzzy-match collisions (e.g. "anthropic/claude-sonnet-4" is a
     # substring of "anthropic/claude-sonnet-4.6").

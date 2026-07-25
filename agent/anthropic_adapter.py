@@ -77,16 +77,27 @@ ADAPTIVE_EFFORT_MAP = {
 # xhigh as a distinct level between high and max; older adaptive-thinking
 # models (4.6) reject it with a 400.  Keep this substring list in sync with
 # the Anthropic migration guide as new model families ship.
-_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
+#
+# NOTE: the 5-family entries below are full model-name substrings
+# ("claude-opus-5", "claude-sonnet-5", "claude-fable-5"), not bare version
+# tags like "-5". A bare "-5" tag would also match inside "claude-haiku-4-5"
+# / "claude-sonnet-4-5" (the "...4-5" family), wrongly flagging those older
+# models as 5-family. Use the full name until/unless a dated suffix scheme
+# requires a shorter prefix.
+# claude-sonnet-5 is included alongside opus-5/fable-5 because
+# hermes-workspace swarm.yaml (2026-07-25 model-tiering fix) assigns it to
+# the strategist worker; leaving it out would reintroduce the same
+# "unrecognized 5-family model" gap this patch exists to close.
+_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5")
 
 # Models where extended thinking is deprecated/removed (4.6+ behavior: adaptive
 # is the only supported mode; 4.7 additionally forbids manual thinking entirely
 # and drops temperature/top_p/top_k).
-_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8")
+_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
 # This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8")
+_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8", "claude-opus-5", "claude-sonnet-5", "claude-fable-5")
 _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 
 # ── Max output token limits per Anthropic model ───────────────────────
@@ -94,6 +105,15 @@ _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 # max_tokens as a mandatory field.  Previously we hardcoded 16384, which
 # starves thinking-enabled models (thinking tokens count toward the limit).
 _ANTHROPIC_OUTPUT_LIMITS = {
+    # Claude 5 (orchestrator/strategist tier introduced in hermes-workspace
+    # swarm.yaml 2026-07-25; no documented output-limit change from 4.8 yet,
+    # so carrying the opus value forward until Anthropic publishes a real one).
+    "claude-opus-5":     128_000,
+    # claude-sonnet-5 has no upstream number yet either; using the last
+    # documented opus/sonnet split (Claude 4.6: opus 128k / sonnet 64k) as
+    # the best available estimate rather than guessing at parity with opus.
+    "claude-sonnet-5":    64_000,
+    "claude-fable-5":    128_000,
     # Claude 4.8
     "claude-opus-4-8":   128_000,
     # Claude 4.7
