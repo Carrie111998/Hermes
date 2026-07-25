@@ -25,15 +25,10 @@ it can execute.
 """
 from __future__ import annotations
 
-import os
 import re
-import shlex
 from typing import Any
 
-# Basenames without a trailing ``.exe``. Windows Git-Bash / MSYS / Cygwin
-# launchers are ``bash.exe`` / ``sh.exe`` / etc.; membership strips that suffix
-# so POSIX and Windows spellings share one set (previously only cmd/powershell/
-# pwsh listed ``.exe`` forms, which let ``bash.exe`` skip egress/persistence).
+# Basenames only; trailing ``.exe`` is stripped in ``_command_basename``.
 _SHELL_INTERPRETERS = frozenset({
     "bash",
     "sh",
@@ -90,15 +85,23 @@ _IOC_SUBSTRINGS = (
 
 
 def _command_basename(command: Any) -> str:
-    text = str(command or "").strip()
+    """Return interpreter basename for membership checks.
+
+    Uses the final path segment after normalizing ``\\`` → ``/`` so Windows
+    paths with spaces (e.g. ``C:\\Program Files\\Git\\bin\\bash.exe``) still
+    resolve to ``bash`` without depending on shlex tokenization. Trailing
+    ``.exe`` is stripped so POSIX and Windows spellings share one set.
+    """
+    text = str(command or "").strip().strip('"').strip("'")
     if not text:
         return ""
-    try:
-        parts = shlex.split(text, posix=(os.name != "nt"))
-    except ValueError:
-        parts = text.split()
-    first = parts[0] if parts else text
-    return os.path.basename(first).lower()
+    segment = text.replace("\\", "/").rsplit("/", 1)[-1]
+    # Allow ``bash.exe -c ...`` stuffed into the command field.
+    token = segment.split()[0] if segment else segment
+    name = token.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
 
 def _inline_script(args: Any) -> str:
@@ -149,8 +152,6 @@ def validate_mcp_server_entry(name: str, entry: dict[str, Any]) -> list[str]:
 
     command = entry.get("command")
     basename = _command_basename(command)
-    if basename.endswith(".exe"):
-        basename = basename[:-4]
     if basename not in _SHELL_INTERPRETERS:
         return issues
 
