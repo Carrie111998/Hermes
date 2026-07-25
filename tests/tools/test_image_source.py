@@ -248,3 +248,158 @@ class TestSvgNormalization:
             path, mime, err = vt._normalize_to_supported_image(svg, "image/svg+xml")
         assert path is None
         assert "rasterizer" in err
+
+    @pytest.mark.parametrize(
+        "content,error",
+        [
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<script>alert(1)</script></svg>',
+                "active",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="urn:test">'
+                b"<x:script/></svg>",
+                "active",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>',
+                "event-handler",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<image href="https://example.com/tracker.png"/></svg>',
+                "external references",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<image href="&#x68;ttps://example.com/tracker.png"/></svg>',
+                "external references",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<image href="data:image/svg+xml;base64,PHN2Zy8+"/></svg>',
+                "external references",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<style>@import url("https://example.com/style.css");</style></svg>',
+                "external CSS",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<rect fill="url(https://example.com/pattern.svg)"/></svg>',
+                "external CSS",
+            ),
+            (
+                b'<svg xmlns="http://www.w3.org/2000/svg">'
+                b'<rect fill="u/**/rl(https://example.com/pattern.svg)"/></svg>',
+                "external CSS",
+            ),
+            (
+                b'<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+                b'<svg xmlns="http://www.w3.org/2000/svg">&xxe;</svg>',
+                "declarations",
+            ),
+        ],
+    )
+    def test_svg_unsafe_content_rejected_before_renderer(
+        self, tmp_path, monkeypatch, content, error
+    ):
+        from tools import vision_tools as vt
+        _reload(monkeypatch, tmp_path / "hermes")
+        svg = tmp_path / "unsafe.svg"
+        svg.write_bytes(content)
+
+        with patch.object(vt, "_rasterize_svg_to_png") as rasterize:
+            path, mime, err = vt._normalize_to_supported_image(
+                svg, "image/svg+xml"
+            )
+
+        assert path is None
+        assert mime is None
+        assert error in err
+        rasterize.assert_not_called()
+
+    def test_svg_allows_local_fragments_and_embedded_raster(
+        self, tmp_path, monkeypatch
+    ):
+        from tools import vision_tools as vt
+        _reload(monkeypatch, tmp_path / "hermes")
+        svg = tmp_path / "self-contained.svg"
+        svg.write_bytes(
+            b'<svg xmlns="http://www.w3.org/2000/svg">'
+            b'<defs><clipPath id="clip"><rect width="4" height="4"/>'
+            b'</clipPath></defs><image href="data:image/png;base64,iVBORw0KGgo="/>'
+            b'<rect width="4" height="4" clip-path="url(#clip)"/></svg>'
+        )
+
+        with patch.object(vt, "_rasterize_svg_to_png") as rasterize:
+            rasterize.side_effect = lambda _source, output: (
+                output.write_bytes(PNG) is not None
+            )
+            path, mime, err = vt._normalize_to_supported_image(
+                svg, "image/svg+xml"
+            )
+
+        assert err is None
+        assert mime == "image/png"
+        assert path.read_bytes() == PNG
+        path.unlink()
+
+    def test_stock_macos_quicklook_rasterizer(self, tmp_path):
+        import sys
+        from tools import vision_tools as vt
+
+        svg = tmp_path / "art.svg"
+        svg.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+        output = tmp_path / "art.png"
+
+        def fake_which(command):
+            return "/usr/bin/qlmanage" if command == "qlmanage" else None
+
+        def fake_run(command, **_kwargs):
+            preview_dir = Path(command[command.index("-o") + 1])
+            (preview_dir / "art.svg.png").write_bytes(PNG)
+            return SimpleNamespace(returncode=0)
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"cairosvg": None, "svglib": None, "svglib.svglib": None},
+            ),
+            patch("shutil.which", side_effect=fake_which),
+            patch("subprocess.run", side_effect=fake_run) as run,
+        ):
+            assert vt._rasterize_svg_to_png(svg, output) is True
+
+        assert output.read_bytes() == PNG
+        assert run.call_args.args[0][0] == "qlmanage"
+
+    def test_quicklook_invalid_output_is_rejected(self, tmp_path):
+        import sys
+        from tools import vision_tools as vt
+
+        svg = tmp_path / "art.svg"
+        svg.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+        output = tmp_path / "art.png"
+
+        def fake_which(command):
+            return "/usr/bin/qlmanage" if command == "qlmanage" else None
+
+        def fake_run(command, **_kwargs):
+            preview_dir = Path(command[command.index("-o") + 1])
+            (preview_dir / "art.svg.png").write_bytes(b"not a PNG")
+            return SimpleNamespace(returncode=0)
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"cairosvg": None, "svglib": None, "svglib.svglib": None},
+            ),
+            patch("shutil.which", side_effect=fake_which),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            assert vt._rasterize_svg_to_png(svg, output) is False
+
+        assert not output.exists()

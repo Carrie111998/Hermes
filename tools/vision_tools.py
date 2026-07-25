@@ -274,22 +274,141 @@ _ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset(
 )
 
 
+def _validate_svg_for_rasterization(svg_path: Path) -> None:
+    """Reject active or externally-referenced SVG before invoking a renderer."""
+    import re as _re
+    from xml.parsers import expat as _expat
+
+    if svg_path.stat().st_size > _VISION_MAX_DOWNLOAD_BYTES:
+        raise ValueError("SVG exceeds the 50 MB vision ingest limit")
+
+    forbidden_elements = {
+        "script",
+        "foreignobject",
+        "iframe",
+        "object",
+        "embed",
+        "audio",
+        "video",
+    }
+    embedded_raster = _re.compile(
+        r"data:image/(?:png|jpeg|gif|webp);base64,[a-z0-9+/=\s]+",
+        flags=_re.IGNORECASE,
+    )
+    root_seen = False
+    style_depth = 0
+    style_chunks = []
+
+    def local_name(name: str) -> str:
+        return name.rsplit("}", 1)[-1].rsplit(":", 1)[-1].lower()
+
+    def reject_external_reference(value: str) -> None:
+        target = value.strip()
+        if target.startswith("#") or embedded_raster.fullmatch(target):
+            return
+        raise ValueError("SVG external references are not allowed")
+
+    def validate_css(value: str) -> None:
+        normalized = _re.sub(r"/\*.*?\*/", "", value, flags=_re.DOTALL)
+        if "\\" in normalized or _re.search(
+            r"@import\b", normalized, flags=_re.IGNORECASE
+        ):
+            raise ValueError("SVG external CSS references are not allowed")
+        for match in _re.finditer(
+            r"url\s*\(\s*([^)]+?)\s*\)",
+            normalized,
+            flags=_re.IGNORECASE,
+        ):
+            target = match.group(1).strip().strip("'\"").strip()
+            if not target.startswith("#"):
+                raise ValueError("SVG external CSS references are not allowed")
+
+    def start_element(name: str, attrs: dict[str, str]) -> None:
+        nonlocal root_seen, style_depth
+        element = local_name(name)
+        if not root_seen:
+            if element != "svg":
+                raise ValueError("SVG input must have an <svg> root element")
+            root_seen = True
+        if element in forbidden_elements:
+            raise ValueError("SVG contains active or unsupported content")
+        if element == "style":
+            style_depth += 1
+
+        for attr_name, value in attrs.items():
+            attr = local_name(attr_name)
+            if attr.startswith("on"):
+                raise ValueError("SVG event-handler attributes are not allowed")
+            if attr in {"href", "src"}:
+                reject_external_reference(value)
+            if attr == "base":
+                raise ValueError("SVG xml:base references are not allowed")
+            validate_css(value)
+
+    def end_element(name: str) -> None:
+        nonlocal style_depth
+        if local_name(name) == "style":
+            style_depth -= 1
+
+    def character_data(value: str) -> None:
+        if style_depth:
+            style_chunks.append(value)
+
+    def reject_declaration(*_args: Any) -> None:
+        raise ValueError("SVG declarations and entities are not allowed")
+
+    parser = _expat.ParserCreate(namespace_separator="}")
+    parser.SetParamEntityParsing(_expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
+    parser.CharacterDataHandler = character_data
+    parser.StartDoctypeDeclHandler = reject_declaration
+    parser.EntityDeclHandler = reject_declaration
+    parser.ExternalEntityRefHandler = reject_declaration
+    parser.ProcessingInstructionHandler = reject_declaration
+
+    try:
+        with svg_path.open("rb") as source:
+            parser.ParseFile(source)
+    except _expat.ExpatError as exc:
+        raise ValueError(f"SVG is not well-formed XML: {exc}") from exc
+
+    if not root_seen:
+        raise ValueError("SVG input must have an <svg> root element")
+    validate_css("".join(style_chunks))
+
+
+def _is_png_file(path: Path) -> bool:
+    try:
+        with path.open("rb") as image:
+            return image.read(8) == b"\x89PNG\r\n\x1a\n"
+    except OSError:
+        return False
+
+
 def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
     """Best-effort SVG → PNG rasterization. Returns True on success.
 
     Tries, in order: cairosvg, svglib+reportlab, then system rasterizers
-    (rsvg-convert, inkscape).  All are soft dependencies; if none is available
-    we return False and the caller rejects the image with an actionable error
-    rather than embedding an unsupported media_type that would wedge the
-    session.
+    (rsvg-convert, inkscape), then macOS Quick Look. All are soft dependencies;
+    if none is available we return False and the caller rejects the image with
+    an actionable error rather than embedding an unsupported media_type that
+    would wedge the session.
     """
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
     # 1) cairosvg (pure-python-ish, most common)
     try:
         import cairosvg  # type: ignore
         cairosvg.svg2png(url=str(svg_path), write_to=str(out_path))
-        return out_path.exists() and out_path.stat().st_size > 0
+        if _is_png_file(out_path):
+            return True
     except Exception:
         pass
+    out_path.unlink(missing_ok=True)
+
     # 2) svglib + reportlab
     try:
         from svglib.svglib import svg2rlg  # type: ignore
@@ -297,12 +416,13 @@ def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
         drawing = svg2rlg(str(svg_path))
         if drawing is not None:
             renderPM.drawToFile(drawing, str(out_path), fmt="PNG")
-            return out_path.exists() and out_path.stat().st_size > 0
+            if _is_png_file(out_path):
+                return True
     except Exception:
         pass
+    out_path.unlink(missing_ok=True)
+
     # 3) system rasterizers
-    import shutil as _shutil
-    import subprocess as _subprocess
     for cmd in (
         ["rsvg-convert", "-o", str(out_path), str(svg_path)],
         ["inkscape", str(svg_path), "--export-type=png",
@@ -314,10 +434,40 @@ def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
                     cmd, check=True, capture_output=True, timeout=30,
                     stdin=_subprocess.DEVNULL,
                 )
-                if out_path.exists() and out_path.stat().st_size > 0:
+                if _is_png_file(out_path):
                     return True
             except Exception:
-                continue
+                pass
+            out_path.unlink(missing_ok=True)
+
+    # 4) macOS ships Quick Look even when no third-party SVG converter exists.
+    if _shutil.which("qlmanage"):
+        try:
+            with _tempfile.TemporaryDirectory(prefix="hermes-svg-quicklook-") as tmp:
+                _subprocess.run(
+                    [
+                        "qlmanage",
+                        "-t",
+                        "-s",
+                        "2048",
+                        "-o",
+                        tmp,
+                        str(svg_path),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                    stdin=_subprocess.DEVNULL,
+                )
+                candidates = list(Path(tmp).glob("*.png"))
+                if len(candidates) == 1:
+                    _shutil.move(str(candidates[0]), out_path)
+                    if _is_png_file(out_path):
+                        return True
+        except Exception:
+            pass
+        out_path.unlink(missing_ok=True)
+
     return False
 
 
@@ -346,6 +496,10 @@ def _normalize_to_supported_image(
 
     # SVG: needs a rasterizer (Pillow cannot render SVG).
     if detected_mime == "image/svg+xml":
+        try:
+            _validate_svg_for_rasterization(image_path)
+        except (OSError, ValueError) as exc:
+            return None, None, str(exc)
         if _rasterize_svg_to_png(image_path, out_path):
             return out_path, "image/png", None
         return (
@@ -353,8 +507,8 @@ def _normalize_to_supported_image(
             None,
             "This is an SVG, which vision models cannot read directly, and no "
             "SVG rasterizer is installed (tried cairosvg, svglib, rsvg-convert, "
-            "inkscape). Convert the SVG to PNG first — e.g. open it in a browser "
-            "and screenshot it, or install a rasterizer "
+            "inkscape, and macOS Quick Look). Convert the SVG to PNG first — "
+            "e.g. open it in a browser and screenshot it, or install a rasterizer "
             "(`pip install cairosvg`) — then re-run vision_analyze on the PNG.",
         )
 
