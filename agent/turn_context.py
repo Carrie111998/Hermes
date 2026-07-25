@@ -1292,8 +1292,6 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
-    _preflight_compression_blocked = False
-
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
