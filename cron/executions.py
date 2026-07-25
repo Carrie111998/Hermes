@@ -3,11 +3,19 @@
 The ledger records what is known about each attempt; it is not a retry queue.
 Interrupted attempts become ``unknown`` only after their exact owner process is
 proved gone. Terminal states are immutable.
+
+The ledger also records structured delivery outcomes per target per execution,
+so ``last_delivery_error: null`` is no longer the only signal — callers can
+query whether a platform sent a transport acknowledgement, whether delivery was
+ambiguous (e.g. write-timeout after a possible dispatch), or whether a definite
+pre-dispatch rejection occurred.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -19,9 +27,18 @@ from typing import Any, Dict, Iterator, List, Optional
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
+logger = logging.getLogger(__name__)
+
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
+# Delivery outcome statuses: ordered by precedence for aggregation.
+# Confirmation outranks ambiguity; ambiguity outranks failure.
+DELIVERY_CONFIRMED = "delivered_confirmed"
+DELIVERY_UNKNOWN = "delivery_unknown"
+DELIVERY_FAILED = "delivery_failed"
+_DELIVERY_STATES = (DELIVERY_CONFIRMED, DELIVERY_UNKNOWN, DELIVERY_FAILED)
+_DELIVERY_STATE_SQL = "','".join(_DELIVERY_STATES)
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -61,6 +78,32 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
+    )
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS delivery_outcomes (
+             id TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL REFERENCES executions(id),
+             target TEXT NOT NULL,
+             platform TEXT NOT NULL,
+             chat_id TEXT,
+             thread_id TEXT,
+             actual_platform TEXT,
+             actual_chat_id TEXT,
+             actual_thread_id TEXT,
+             status TEXT NOT NULL CHECK(status IN ('{_DELIVERY_STATE_SQL}')),
+             provider_message_id TEXT,
+             content_hash TEXT,
+             confirmed_at TEXT,
+             created_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_outcomes_exec "
+        "ON delivery_outcomes(execution_id, target)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_outcomes_exec_status "
+        "ON delivery_outcomes(execution_id, status)"
     )
 
 
@@ -119,6 +162,11 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
+    )
+    # Prune orphaned delivery_outcomes whose parent execution was pruned.
+    conn.execute(
+        """DELETE FROM delivery_outcomes
+           WHERE execution_id NOT IN (SELECT id FROM executions)"""
     )
 
 
@@ -252,3 +300,152 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Delivery-outcome storage
+# ---------------------------------------------------------------------------
+
+def register_delivery_target(
+    execution_id: str,
+    *,
+    target: str,
+    platform: str,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pre-register one expected delivery target before the send attempt.
+
+    Every fan-out target is pre-registered so that an exception during
+    delivery never silently omits a target from the audit record.
+
+    Raises a constraint violation if the same ``(execution_id, target)``
+    pair is registered twice (content-hash conflict guard — each target
+    row must represent exactly one send attempt per execution).
+    """
+    now = _hermes_now().isoformat()
+    outcome_id = uuid.uuid4().hex
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT INTO delivery_outcomes
+               (id, execution_id, target, platform, chat_id, thread_id,
+                status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'delivery_unknown', ?)""",
+            (outcome_id, execution_id, target, platform, chat_id, thread_id, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM delivery_outcomes WHERE id=?", (outcome_id,)
+        ).fetchone()
+    return _record(row)  # type: ignore[return-value]
+
+
+def confirm_delivery_outcome(
+    execution_id: str,
+    target: str,
+    *,
+    status: str,
+    provider_message_id: Optional[str] = None,
+    actual_platform: Optional[str] = None,
+    actual_chat_id: Optional[str] = None,
+    actual_thread_id: Optional[str] = None,
+    content: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Record the outcome for a previously-registered delivery target.
+
+    The status must be one of ``DELIVERY_CONFIRMED``, ``DELIVERY_UNKNOWN``,
+    or ``DELIVERY_FAILED`` (constants defined at module level).
+
+    ``content``, when provided, is hashed (SHA-256) and stored as
+    ``content_hash`` — the message body itself is never persisted.
+
+    Confirmation outranks ambiguity: if the row already has a higher-precedence
+    status, this update is silently skipped (no-op).  Ambiguity outranks
+    failure, so a ``delivery_failed`` write is skipped if the row is already
+    ``delivery_unknown`` or ``delivered_confirmed``.
+    """
+    now = _hermes_now().isoformat()
+    content_hash = hashlib.sha256(content.encode()).hexdigest() if content else None
+
+    # Precedence: confirmed > unknown > failed.
+    # Only update if the new status outranks the existing one.
+    precedence = {DELIVERY_CONFIRMED: 3, DELIVERY_UNKNOWN: 2, DELIVERY_FAILED: 1}
+    new_rank = precedence.get(status, 0)
+
+    with _transaction() as conn:
+        existing = conn.execute(
+            "SELECT * FROM delivery_outcomes WHERE execution_id=? AND target=?",
+            (execution_id, target),
+        ).fetchone()
+        if existing is None:
+            logger.warning(
+                "No delivery_outcome row for execution=%s target=%s — "
+                "did pre-registration succeed?",
+                execution_id, target,
+            )
+            return None
+        old_rank = precedence.get(existing["status"], 0)
+        if new_rank <= old_rank:
+            # Current row has equal or higher precedence; keep it.
+            logger.debug(
+                "Skipping delivery_outcome update for %s/%s: "
+                "existing=%s (rank %d) >= new=%s (rank %d)",
+                execution_id, target,
+                existing["status"], old_rank, status, new_rank,
+            )
+            return _record(existing)
+
+        cur = conn.execute(
+            """UPDATE delivery_outcomes
+               SET status=?, provider_message_id=?,
+                   actual_platform=COALESCE(?, actual_platform),
+                   actual_chat_id=COALESCE(?, actual_chat_id),
+                   actual_thread_id=COALESCE(?, actual_thread_id),
+                   content_hash=COALESCE(?, content_hash),
+                   confirmed_at=?
+               WHERE execution_id=? AND target=?""",
+            (status, provider_message_id,
+             actual_platform, actual_chat_id, actual_thread_id,
+             content_hash, now,
+             execution_id, target),
+        )
+        if cur.rowcount < 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM delivery_outcomes WHERE execution_id=? AND target=?",
+            (execution_id, target),
+        ).fetchone()
+    return _record(row)
+
+
+def get_delivery_outcomes(
+    execution_id: str,
+) -> List[Dict[str, Any]]:
+    """Return all delivery outcomes for one execution, one per target."""
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT * FROM delivery_outcomes WHERE execution_id=? "
+            "ORDER BY created_at ASC",
+            (execution_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_delivery_outcomes_for_job(job_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Return delivery outcomes grouped by execution for a job.
+
+    Useful for CLI/API display: returns ``{execution_id: [outcome, ...]}``
+    for the latest executions of the given job.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT do.* FROM delivery_outcomes do
+                INNER JOIN executions e ON e.id = do.execution_id
+                WHERE e.job_id=?
+                ORDER BY e.claimed_at DESC, do.created_at ASC""",
+            (str(job_id),),
+        ).fetchall()
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        d = dict(row)
+        result.setdefault(d["execution_id"], []).append(d)
+    return result
