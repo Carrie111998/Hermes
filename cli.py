@@ -16409,6 +16409,15 @@ def main(
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:
+            # Single-query (including chat -q) prints one response and exits:
+            # there is no later turn for a detached subagent's completion to
+            # re-enter, and nothing here drains the completion queue. Left
+            # unset, async_delivery_supported() defaults True, delegate_task is
+            # forced background, and every subagent result is discarded. The
+            # oneshot path already does this (herses_cli/oneshot.py:231);
+            # single-query chat was missed. See declare_stateless_channel().
+            from gateway.session_context import declare_stateless_channel
+            declare_stateless_channel()
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
             # the actual task description lives in the task body. Mirror the
