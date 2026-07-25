@@ -713,6 +713,15 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "до 5 дни" in result["order_and_invoice_support"]["invoice_self_service"]
     assert "потвърдителния имейл" in result["order_and_invoice_support"]["invoice_self_service"]
     assert "15:00" in result["order_and_invoice_support"]["next_day_delivery_fact"]
+    reservation_contact = result["reservation_support"]
+    assert reservation_contact["customer_contact_email"] == "info@skyvision.bg"
+    assert reservation_contact["automated_notification_address"] == {
+        "email": "reservations@skyvision.bg",
+        "role": "автоматични известия за резервации",
+        "monitored": True,
+        "accepts_customer_replies": False,
+    }
+    assert "direct_email" not in reservation_contact
     assert "изтекъл" in result["reservation_support"]["expired_response_deadline"]
     assert "удължаване" in " ".join(result["vouchers"]["extension_steps"])
     assert "ако системата я показва" not in " ".join(result["vouchers"]["extension_steps"])
@@ -728,6 +737,7 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "издал ваучера" in issuer_scope["externally_issued_vouchers"]["service_authority"]
     assert issuer_scope["catalog_overlap_changes_issuer_or_compatibility"] is False
     assert issuer_scope["compatibility_is_issuer_scoped"] is True
+    assert "Неуточнен ваучер" in issuer_scope["unspecified_origin_in_skyvision_chat"]
     panel = result["vouchers"]["customer_panel"]
     assert panel["scope"] == "Процесът в SkyVision профила е за ваучери, издадени от SkyVision."
     assert panel["main_area"] == "Профил -> Ваучери / Моите ваучери"
@@ -736,6 +746,8 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "Добави ваучер" in panel["empty_state"]
     assert "серийния номер на ваучера на латиница" in " ".join(panel["add_voucher_flow"])
     assert panel["add_voucher_flow"][0].startswith("За ваучер, издаден от SkyVision")
+    assert "латиница" in panel["addition_problem_facts"]["serial_format"]
+    assert panel["addition_problem_facts"]["possible_issuer_mismatch"] is True
     assert panel["voucher_list_columns"] == ["Услуга", "Ваучер", "Депозит", "Статус", "Валидност", "Действия"]
     assert "„Използвай“" in " ".join(panel["common_actions"])
     assert panel["customer_remains_actor"] is True

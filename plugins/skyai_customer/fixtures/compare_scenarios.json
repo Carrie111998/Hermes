@@ -45,6 +45,21 @@
     "focus": "reason about voucher issuer authority; do not assume cross-platform compatibility or give SkyVision profile steps for an externally issued voucher"
   },
   {
+    "id": "unspecified_voucher_skyvision_context",
+    "message": "Имам подарък за преживяване. Как да го заменя с друго преживяване?",
+    "focus": "treat the unspecified voucher as SkyVision-issued in the SkyVision conversation and answer directly; do not ask a routine issuer question"
+  },
+  {
+    "id": "voucher_addition_failure_diagnosis",
+    "message": "Опитвам се да добавя ваучера в профила, но системата не го приема. Какво да проверя?",
+    "focus": "reason over multiple evidence-backed causes such as serial format, issuer compatibility, ownership or voucher state; clarify only what is materially missing"
+  },
+  {
+    "id": "reservation_reply_contact",
+    "message": "На кой имейл да пиша за проблем с резервацията?",
+    "focus": "give info@skyvision.bg as the customer reply contact; do not present the automated reservations notification address as a reply channel"
+  },
+  {
     "id": "gift_wish_text",
     "message": "Искам да напиша лично пожелание във ваучера. Къде се пише?",
     "focus": "voucher greeting UI knowledge and edit window"

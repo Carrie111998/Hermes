@@ -191,6 +191,58 @@ def test_evaluate_voucher_extend_rejects_conditional_availability() -> None:
     assert "weak_or_conditional_extension_availability" in result["issues"]
 
 
+def test_evaluate_unspecified_voucher_rejects_routine_issuer_question() -> None:
+    scenario = {"id": "unspecified_voucher_skyvision_context"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "Ваучерът от SkyVision ли е, или е закупен от друга платформа?",
+            "cards": [],
+        },
+    )
+
+    assert "asks_routine_issuer_question" in result["issues"]
+    assert "missing_direct_skyvision_voucher_help" in result["issues"]
+
+
+def test_evaluate_external_voucher_requires_issuer_boundary() -> None:
+    scenario = {"id": "external_voucher_issuer_boundary"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "Добавете ваучера в профила си и натиснете Използвай.",
+            "cards": [],
+        },
+    )
+
+    assert result["issues"] == [
+        "missing_external_voucher_boundary",
+        "missing_external_issuer_next_step",
+    ]
+
+
+def test_evaluate_reservation_contact_rejects_automated_sender() -> None:
+    scenario = {"id": "reservation_reply_contact"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "Пишете на reservations@skyvision.bg.",
+            "cards": [],
+        },
+    )
+
+    assert result["issues"] == [
+        "missing_customer_reply_email",
+        "presents_automated_address_to_customer",
+    ]
+
+
 def test_evaluate_gift_wish_rejects_recipient_name_warning_template() -> None:
     scenario = {"id": "gift_wish_text"}
 

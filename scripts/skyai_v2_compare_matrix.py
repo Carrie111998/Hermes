@@ -185,6 +185,30 @@ def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, A
             issues.append("weak_or_conditional_extension_availability")
         if not _has_any(reply, ("удължав", "моя ваучер", "моят ваучер", "ваучери")):
             issues.append("missing_profile_extension_flow")
+    elif scenario_id == "external_voucher_issuer_boundary":
+        if not _has_any(reply, ("не може да се добав", "не е съвместим", "не важи в skyvision")):
+            issues.append("missing_external_voucher_boundary")
+        if not _has_any(reply, ("издател", "платформ", "продавач", "доставчик")):
+            issues.append("missing_external_issuer_next_step")
+    elif scenario_id == "unspecified_voucher_skyvision_context":
+        if _has_any(
+            reply,
+            (
+                "издаден ли е от skyvision",
+                "от skyvision ли е",
+                "ваучерът от skyvision ли е",
+                "или е закупен от друга платформа",
+                "кой е издал ваучера",
+            ),
+        ):
+            issues.append("asks_routine_issuer_question")
+        if not _has_any(reply, ("профил", "използвай", "замени", "друго преживяване")):
+            issues.append("missing_direct_skyvision_voucher_help")
+    elif scenario_id == "reservation_reply_contact":
+        if "info@skyvision.bg" not in reply:
+            issues.append("missing_customer_reply_email")
+        if "reservations@skyvision.bg" in reply:
+            issues.append("presents_automated_address_to_customer")
     elif scenario_id == "gift_packaging":
         if not _has_any(reply, ("син плик", "лукс")):
             issues.append("missing_signature_blue_lux_envelope")

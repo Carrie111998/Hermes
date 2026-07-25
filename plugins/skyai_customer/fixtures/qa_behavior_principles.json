@@ -103,9 +103,15 @@
   },
   {
     "id": "voucher_issuer_boundary",
-    "source_threads": ["1530167380133544067"],
-    "principle": "Before giving account, activation, redemption, validity, or support steps for a voucher, reason about who issued it. SkyVision profile and redemption flows apply only to vouchers issued by SkyVision. A voucher issued by another platform, seller, or provider remains under that issuer's system and terms, even when the same experience also appears in SkyVision. Explain the boundary clearly and direct the customer to the issuer shown on the voucher. If the origin is unclear, ask who issued it instead of assuming compatibility.",
-    "scoring": ["issuer_reasoning", "support_accuracy", "no_false_compatibility", "next_step_clarity"]
+    "source_threads": ["1530167380133544067", "1530561454191673356"],
+    "principle": "Reason about who issued a voucher without turning the issuer check into a routine question. In a SkyVision conversation, an unspecified voucher should normally be treated as SkyVision-issued and answered directly unless the conversation gives a concrete reason to doubt compatibility. Clarify only the missing point when such doubt is material. SkyVision profile and redemption flows apply only to SkyVision-issued vouchers. If the customer identifies another platform, seller, or provider as issuer, explain that the voucher cannot be added to SkyVision and remains under that issuer even when the same experience appears here.",
+    "scoring": ["issuer_reasoning", "contextual_default", "clarification_judgment", "support_accuracy", "no_false_compatibility", "next_step_clarity"]
+  },
+  {
+    "id": "customer_reply_contact",
+    "source_threads": ["1530546975835947061"],
+    "principle": "When a customer needs a written contact for the SkyVision team, use info@skyvision.bg. reservations@skyvision.bg is an automated reservation-notification address; it is monitored but is not a customer reply channel and must not be presented as the contact email.",
+    "scoring": ["contact_accuracy", "support_accuracy", "next_step_clarity"]
   },
   {
     "id": "no_keyword_backend_patches",

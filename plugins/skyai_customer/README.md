@@ -57,6 +57,13 @@ Current line:
   profile flows apply only to SkyVision-issued vouchers; externally issued
   vouchers remain under their issuer even when the same experience is listed
   by SkyVision. No brand-specific classifier or router is added.
+- `v2.7` - contextual voucher and contact judgment: an unspecified voucher in a
+  SkyVision conversation is normally treated as SkyVision-issued, while Hermes
+  asks about the issuer only when the conversation creates a concrete
+  compatibility doubt. Written customer contact uses `info@skyvision.bg`;
+  `reservations@skyvision.bg` remains an automated notification sender, not a
+  reply channel. No issuer classifier, keyword guard, or contact router is
+  added.
 
 ## Canonical Source
 
